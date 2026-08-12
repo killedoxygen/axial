@@ -114,9 +114,7 @@ pub fn preferred_runtime_component(java_version: &JavaVersion) -> String {
 }
 
 pub fn is_known_runtime_component(value: &str) -> bool {
-    known_runtime_components()
-        .iter()
-        .any(|component| *component == value)
+    known_runtime_components().contains(&value)
 }
 
 impl ManagedRuntimeCache {

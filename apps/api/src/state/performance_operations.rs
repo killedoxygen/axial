@@ -2128,7 +2128,7 @@ fn performance_operation_status_target(
 ) -> crate::state::contracts::TargetDescriptor {
     classify_current_artifact(
         CurrentArtifact::PerformanceOperationStatus,
-        &operation_id.to_string(),
+        operation_id.to_string(),
     )
     .target
 }

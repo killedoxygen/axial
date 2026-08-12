@@ -128,7 +128,7 @@ mod tests {
         .expect("write status");
         let driver_id = "benchmark-suite-driver-0000000000000001";
         let driver_dir = paths.benchmark_suite_drivers_dir();
-        fs::create_dir_all(&driver_dir).expect("create driver dir");
+        fs::create_dir_all(driver_dir).expect("create driver dir");
         fs::write(driver_dir.join(format!("{driver_id}.json")), b"{")
             .expect("write malformed driver");
         let suite_id =

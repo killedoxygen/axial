@@ -589,10 +589,8 @@ where
     }
     let preflight = crate::state::preflight_managed_inspection_reconciliation(instance_mods)
         .map_err(|error| ManagedMutationError::indeterminate("inspect_reconcile", error))?;
-    if preflight.state_publication_required() {
-        if mutation_permit.is_none() {
-            mutation_permit = Some(admit_inspection_mutation(&mut admit_mutation)?);
-        }
+    if preflight.state_publication_required() && mutation_permit.is_none() {
+        mutation_permit = Some(admit_inspection_mutation(&mut admit_mutation)?);
     }
     crate::state::reconcile_managed_inspection_publication(instance_mods, preflight)
         .map_err(|error| ManagedMutationError::indeterminate("inspect_reconcile", error))?;

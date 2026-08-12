@@ -456,9 +456,9 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
     .await?;
     let install_root = install_directory.path();
     install_directory
-        .validate_absolute_projection(&install_root)
+        .validate_absolute_projection(install_root)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-    let java_path = super::layout::java_executable(&install_root);
+    let java_path = super::layout::java_executable(install_root);
     admit_processor_program(install_directory, &java_path)?;
     let probe_receipt = run_runtime_probe_work(
         "processor runtime probe task stopped unexpectedly",
@@ -466,7 +466,7 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
     )
     .await?;
     install_directory
-        .validate_absolute_projection(&install_root)
+        .validate_absolute_projection(install_root)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let probe_receipt = probe_receipt?;
     let program_path = probe_receipt.revalidate_cli_executable()?;

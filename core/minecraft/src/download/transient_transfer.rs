@@ -2587,13 +2587,13 @@ async fn run_producer(
         return ProducerExit::Failed(TransferFailureKind::ContentEncodingRejected);
     }
     let declared_length = response.content_length();
-    if let Some(declared) = declared_length {
-        if !contract.bytes.admits_final(declared) {
-            return ProducerExit::Failed(TransferFailureKind::ContentLengthContractMismatch {
-                declared,
-                contract: contract.bytes,
-            });
-        }
+    if let Some(declared) = declared_length
+        && !contract.bytes.admits_final(declared)
+    {
+        return ProducerExit::Failed(TransferFailureKind::ContentLengthContractMismatch {
+            declared,
+            contract: contract.bytes,
+        });
     }
 
     let mut produced = 0_u64;
@@ -2630,13 +2630,13 @@ async fn run_producer(
         }
     }
 
-    if let Some(declared) = declared_length {
-        if declared != produced {
-            return ProducerExit::Failed(TransferFailureKind::ContentLengthMismatch {
-                declared,
-                observed: produced,
-            });
-        }
+    if let Some(declared) = declared_length
+        && declared != produced
+    {
+        return ProducerExit::Failed(TransferFailureKind::ContentLengthMismatch {
+            declared,
+            observed: produced,
+        });
     }
     if !contract.bytes.admits_final(produced) {
         return ProducerExit::Failed(final_size_failure(contract.bytes, produced));
@@ -2836,16 +2836,16 @@ fn run_writer(
                         },
                     );
                 }
-                if let Some(declared) = declared_length {
-                    if declared != written {
-                        return discard_writer_stage(
-                            stage,
-                            TransferFailureKind::ContentLengthMismatch {
-                                declared,
-                                observed: written,
-                            },
-                        );
-                    }
+                if let Some(declared) = declared_length
+                    && declared != written
+                {
+                    return discard_writer_stage(
+                        stage,
+                        TransferFailureKind::ContentLengthMismatch {
+                            declared,
+                            observed: written,
+                        },
+                    );
                 }
                 if !contract.bytes.admits_final(written) {
                     return discard_writer_stage(
@@ -2854,21 +2854,21 @@ fn run_writer(
                     );
                 }
                 let digests = hashers.finish();
-                if let Some(expected) = contract.digests.sha1.as_ref() {
-                    if digests.sha1.as_ref() != Some(expected) {
-                        return discard_writer_stage(
-                            stage,
-                            TransferFailureKind::DigestMismatch(TransferDigestAlgorithm::Sha1),
-                        );
-                    }
+                if let Some(expected) = contract.digests.sha1.as_ref()
+                    && digests.sha1.as_ref() != Some(expected)
+                {
+                    return discard_writer_stage(
+                        stage,
+                        TransferFailureKind::DigestMismatch(TransferDigestAlgorithm::Sha1),
+                    );
                 }
-                if let Some(expected) = contract.digests.sha512.as_ref() {
-                    if digests.sha512.as_ref() != Some(expected) {
-                        return discard_writer_stage(
-                            stage,
-                            TransferFailureKind::DigestMismatch(TransferDigestAlgorithm::Sha512),
-                        );
-                    }
+                if let Some(expected) = contract.digests.sha512.as_ref()
+                    && digests.sha512.as_ref() != Some(expected)
+                {
+                    return discard_writer_stage(
+                        stage,
+                        TransferFailureKind::DigestMismatch(TransferDigestAlgorithm::Sha512),
+                    );
                 }
                 if cancellation.is_cancelled() {
                     return discard_writer_stage(stage, TransferFailureKind::Cancelled);

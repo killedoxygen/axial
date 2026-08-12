@@ -353,6 +353,10 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
     })
 }
 
+fn registered_artifact_recovery_error(message: &'static str) -> OperationJournalStoreError {
+    OperationJournalStoreError::Persistence(std::io::Error::other(message))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,8 +425,4 @@ mod tests {
             Err(axial_minecraft::ManagedVersionBundleRebuildError::Indeterminate(_))
         ));
     }
-}
-
-fn registered_artifact_recovery_error(message: &'static str) -> OperationJournalStoreError {
-    OperationJournalStoreError::Persistence(std::io::Error::other(message))
 }

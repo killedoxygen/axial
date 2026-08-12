@@ -1812,17 +1812,17 @@ pub(crate) async fn managed_assets_reconstruction_fixture_for_test(
 }
 
 #[cfg(any(test, feature = "test-support"))]
+type ManagedVersionBundleFixtureParts = (
+    PendingKnownGoodInstallAuthority,
+    Vec<u8>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+);
+
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn managed_version_bundle_fixture_parts_for_test(
     version_id: &str,
-) -> Result<
-    (
-        PendingKnownGoodInstallAuthority,
-        Vec<u8>,
-        Vec<u8>,
-        Option<Vec<u8>>,
-    ),
-    DownloadError,
-> {
+) -> Result<ManagedVersionBundleFixtureParts, DownloadError> {
     const CLIENT_BYTES: &[u8] = b"axial managed VersionBundle client fixture";
     const LOG_ID: &str = "guardian-version-bundle.xml";
     const LOG_BYTES: &[u8] = b"<Configuration/>";
@@ -2844,7 +2844,7 @@ impl KnownGoodLoaderBaseDerivation {
             .saturating_add(authenticated.environment.os_name.len())
             .saturating_add(authenticated.environment.os_arch.len())
             .saturating_add(authenticated.environment.os_version.len());
-        for (feature, _) in &authenticated.environment.features {
+        for feature in authenticated.environment.features.keys() {
             contract_bytes = contract_bytes.saturating_add(feature.len() + 1);
         }
         if authenticated.inventory.entries.len() > MAX_KNOWN_GOOD_ENTRIES {

@@ -831,9 +831,7 @@ impl BenchmarkSuiteRetention {
                 io::Error::from(error),
             )),
         };
-        if let Err(error) = deletion {
-            return Err(error);
-        }
+        deletion?;
 
         drop(writer);
         persistence.remove_writer(&target.suite_id);

@@ -2342,10 +2342,6 @@ fn verified_transfer_unwind_member(
     }
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "each cold branch must retain one complete linear transaction owner without indirection"
-)]
 enum StageChunkOutcome {
     Published(TransactionState),
     Unwind(ManagedContentTransactionOutcome),
@@ -3435,7 +3431,7 @@ fn cleanup_committed(mut state: TransactionState) -> ManagedContentTransactionOu
         state.mutations[index].claimed = false;
     }
     if state.manifest_claimed {
-        let removal_failed = state.manifest.guard.as_ref().map_or(true, |guard| {
+        let removal_failed = state.manifest.guard.as_ref().is_none_or(|guard| {
             state
                 .backup
                 .remove_guarded_file("manifest-old", guard)

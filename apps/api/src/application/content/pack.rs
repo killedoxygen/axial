@@ -1379,12 +1379,10 @@ async fn prepare_pack_manifest(
             if let Some(existing) = manifest_indexes
                 .get(&canonical_id)
                 .map(|index| &manifest.entries()[*index])
+                && (existing.kind() != kind || existing.managed_filename() != Some(&filename))
+                && stale_ids.insert(existing.canonical_id().clone())
             {
-                if (existing.kind() != kind || existing.managed_filename() != Some(&filename))
-                    && stale_ids.insert(existing.canonical_id().clone())
-                {
-                    stale_entries.push(existing.clone());
-                }
+                stale_entries.push(existing.clone());
             }
             entries.push(
                 PendingManifestEntry::managed_file(

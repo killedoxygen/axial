@@ -1309,15 +1309,17 @@ mod tests {
     #[test]
     fn managed_encoder_enforces_the_aggregate_serialized_bound() {
         let title = "x".repeat(MAX_TITLE_BYTES);
-        let mut manifest = ContentManifest::default();
-        manifest.entries = (0..MAX_MANIFEST_ENTRIES)
-            .map(|index| {
-                let mut entry =
-                    managed_entry(&format!("project-{index}"), &format!("managed-{index}.jar"));
-                entry.title = Some(title.clone());
-                entry
-            })
-            .collect();
+        let manifest = ContentManifest {
+            entries: (0..MAX_MANIFEST_ENTRIES)
+                .map(|index| {
+                    let mut entry =
+                        managed_entry(&format!("project-{index}"), &format!("managed-{index}.jar"));
+                    entry.title = Some(title.clone());
+                    entry
+                })
+                .collect(),
+            ..ContentManifest::default()
+        };
 
         assert!(matches!(
             manifest.encode_managed(),
@@ -1498,19 +1500,21 @@ mod tests {
 
     #[test]
     fn enabled_transition_is_atomic_at_the_serialized_bound() {
-        let mut manifest = ContentManifest::default();
-        manifest.entries = (0..MAX_MANIFEST_ENTRIES)
-            .map(|index| {
-                ManifestEntry::provenance(
-                    CanonicalId::for_project(ProviderId::Modrinth, &format!("project-{index}")),
-                    ProviderId::Modrinth,
-                    format!("project-{index}"),
-                    "version".to_string(),
-                    None,
-                )
-                .expect("valid provenance entry")
-            })
-            .collect();
+        let mut manifest = ContentManifest {
+            entries: (0..MAX_MANIFEST_ENTRIES)
+                .map(|index| {
+                    ManifestEntry::provenance(
+                        CanonicalId::for_project(ProviderId::Modrinth, &format!("project-{index}")),
+                        ProviderId::Modrinth,
+                        format!("project-{index}"),
+                        "version".to_string(),
+                        None,
+                    )
+                    .expect("valid provenance entry")
+                })
+                .collect(),
+            ..ContentManifest::default()
+        };
 
         let base_size = serde_json::to_vec_pretty(&manifest)
             .expect("serialize base manifest")
@@ -1554,12 +1558,14 @@ mod tests {
 
     #[test]
     fn pending_projection_models_replacements_at_the_entry_limit() {
-        let mut manifest = ContentManifest::default();
-        manifest.entries = (0..MAX_MANIFEST_ENTRIES)
-            .map(|index| {
-                managed_entry(&format!("project-{index}"), &format!("managed-{index}.jar"))
-            })
-            .collect();
+        let manifest = ContentManifest {
+            entries: (0..MAX_MANIFEST_ENTRIES)
+                .map(|index| {
+                    managed_entry(&format!("project-{index}"), &format!("managed-{index}.jar"))
+                })
+                .collect(),
+            ..ContentManifest::default()
+        };
         manifest.validate().expect("full manifest");
         let pending = PendingManifestEntry::managed_file(
             CanonicalId::for_project(ProviderId::Modrinth, "project-0"),

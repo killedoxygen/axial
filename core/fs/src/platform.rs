@@ -141,10 +141,6 @@ impl PublicationReceipt {
         matches!(self.state, PublicationReceiptState::Attempted)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the constructor binds every exact proof coordinate in one private transition"
-    )]
     fn attempted(
         attempt_id: u64,
         staged_file: Identity,
@@ -316,10 +312,6 @@ impl PublicationReceipt {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "publication preparation must receive every exact proof coordinate together"
-)]
 pub(crate) fn prepare_publication(
     attempt_id: u64,
     staged_file: &File,
@@ -1152,10 +1144,6 @@ mod native {
         Ok(names)
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 128-byte error is a once-per-session carrier consumed immediately by reconciliation and is never stored"
-    )]
     pub(crate) fn open_or_create_root(
         path: &Path,
     ) -> Result<RootConstruction, RootConstructionError> {
@@ -1511,10 +1499,6 @@ mod native {
             .expect("completed root construction retains its guard")
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 128-byte error stays in the cold root-recovery loop and is never stored in a resident collection"
-    )]
     pub(crate) fn reconcile_root_construction(
         mut construction: RootConstruction,
     ) -> Result<RootConstruction, RootConstructionError> {
@@ -1601,10 +1585,6 @@ mod native {
         }
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 128-byte error stays in the cold root-cleanup loop and is never stored in a resident collection"
-    )]
     pub(crate) fn cleanup_root_construction(
         mut construction: RootConstruction,
     ) -> Result<(), RootConstructionError> {
@@ -3219,10 +3199,6 @@ mod native {
         )
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "settlement revalidates the complete bound observation and exact endpoints"
-    )]
     fn settle_publication_observation(
         receipt: &mut PublicationReceipt,
         attempt_id: u64,
@@ -6756,10 +6732,6 @@ mod native {
         )
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "settlement revalidates the complete bound observation and exact endpoints"
-    )]
     fn settle_publication_observation(
         receipt: &mut PublicationReceipt,
         attempt_id: u64,

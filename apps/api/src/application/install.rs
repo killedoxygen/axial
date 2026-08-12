@@ -1865,11 +1865,13 @@ async fn activate_recovering_vanilla_authority(
             Ok(Some(acknowledgement))
         }
         None if checkpoint_recorded => {
+            #[cfg(test)]
             let receipt = match authority {
-                #[cfg(test)]
                 RecoveringVanillaAuthority::Installed(_) => return Err(()),
                 RecoveringVanillaAuthority::Reconstructed(receipt) => receipt,
             };
+            #[cfg(not(test))]
+            let RecoveringVanillaAuthority::Reconstructed(receipt) = authority;
             let verified =
                 verify_managed_install_reconstruction_checkpoint(expected_contract, receipt)
                     .map_err(|_| ())?;
@@ -2176,9 +2178,7 @@ where
         return None;
     }
     let version_id = journal.identity.target_version_id().to_string();
-    let Some(foreground) = retain_install_foreground(state, foreground).await else {
-        return None;
-    };
+    let foreground = retain_install_foreground(state, foreground).await?;
     let Ok(mutation) = state.admit_managed_artifact_mutation() else {
         return None;
     };

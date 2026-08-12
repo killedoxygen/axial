@@ -1420,10 +1420,6 @@ impl ParkedFile {
         Ok(())
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 160-byte public failure is immediately unpacked to recover the park and is never stored"
-    )]
     pub fn acknowledge_preserved(mut self) -> Result<(), FileParkPreservationError> {
         let (operation, guard) = match self.checkout_current() {
             Ok(current) => current,
@@ -2260,10 +2256,6 @@ impl RootStateSuccessor {
 
 #[must_use = "root acquisition effects must be explicitly acquired, reconciled, cleaned up, or preserved"]
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the linear platform lease/startup obligation is a cold once-per-session carrier consumed immediately; it is not stored in a resident collection"
-)]
 pub enum RootSessionAcquireOutcome {
     Acquired(RootSession),
     NoEffect(RootSessionError),
@@ -2280,10 +2272,6 @@ pub enum AbsoluteDirectoryOutsideRootAdmission {
 
 #[must_use = "admitted root acquisition effects must be explicitly settled"]
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the linear platform lease/startup obligation is a cold once-per-session carrier consumed immediately; it is not stored in a resident collection"
-)]
 pub enum AdmittedRootSessionAcquireOutcome {
     Acquired(AdmittedRootSession),
     NoEffect(RootSessionError),
@@ -2334,10 +2322,6 @@ impl AdmittedRootSessionAcquireObligation {
         }
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 192-byte obligation remains in a once-per-session cleanup loop and is never stored in a resident collection"
-    )]
     pub fn cleanup(mut self) -> Result<(), Self> {
         let obligation = self
             .obligation
@@ -2352,10 +2336,6 @@ impl AdmittedRootSessionAcquireObligation {
         }
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 192-byte obligation remains in a once-per-session acknowledgement path and is never stored in a resident collection"
-    )]
     pub fn acknowledge_preserved(mut self) -> Result<(), Self> {
         let obligation = self
             .obligation
@@ -2637,10 +2617,6 @@ impl RootSessionAcquireObligation {
         }
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 184-byte obligation remains in a once-per-session cleanup loop and is never stored in a resident collection"
-    )]
     pub fn cleanup(mut self) -> Result<(), Self> {
         let construction = self
             .construction
@@ -2683,10 +2659,6 @@ impl RootSessionAcquireObligation {
         }
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 184-byte obligation remains in a once-per-session acknowledgement path and is never stored in a resident collection"
-    )]
     pub fn acknowledge_preserved(mut self) -> Result<(), Self> {
         let construction = self
             .construction
@@ -6596,10 +6568,6 @@ impl CapabilityAuthority {
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the registry transition validates every publication proof coordinate together"
-    )]
     fn prepare_stage_promotion(
         &self,
         id: u64,
@@ -8603,10 +8571,6 @@ fn seal_recovery_stage(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "recovery admission binds the complete live publication carrier in one check"
-)]
 fn validate_recovery_publication(
     authority: &Arc<CapabilityAuthority>,
     operation: &CapabilityOperation,
@@ -11253,10 +11217,6 @@ impl FileRevisionReaderStartFailure {
             .expect("reader start failure retains its error")
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 144-byte public failure is immediately retried or unpacked; boxing would allocate again on repeated reader admission failure"
-    )]
     pub fn retry(mut self) -> Result<FileRevisionReader, Self> {
         let file = self
             .file
@@ -11309,10 +11269,6 @@ impl FileRevisionReaderFinishFailure {
             .expect("reader finish failure retains its error")
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 152-byte public failure is immediately retried or unpacked; boxing would allocate again on repeated reader validation failure"
-    )]
     pub fn retry(mut self) -> Result<FileCapability, Self> {
         self.reader
             .take()
@@ -11446,10 +11402,6 @@ impl FileParkRequest {
         Ok(())
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 168-byte public failure is immediately unpacked to recover the request and is never stored"
-    )]
     pub fn classify_source(
         self,
         parent: &Directory,
@@ -11861,10 +11813,6 @@ impl FileCapability {
         Ok(bytes)
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 144-byte failure preserves a hot-path file capability for immediate retry without allocating on admission failure"
-    )]
     pub fn into_revision_reader(
         self,
         expected: FileRevision,
@@ -12058,10 +12006,6 @@ impl Seek for FileRevisionReader {
 }
 
 impl FileRevisionReader {
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 152-byte failure preserves the hot-path armed reader for immediate retry without allocating on validation failure"
-    )]
     pub fn finish(mut self) -> Result<FileCapability, FileRevisionReaderFinishFailure> {
         let validation = {
             let state = self
@@ -12990,10 +12934,6 @@ fn cancel_state_file_batch(
         .collect())
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "the failure must return every move-only batch and successor owner"
-)]
 fn prepare_state_file_batch(
     mut preparation: StateBatchPreparation,
     mut successor: Option<SuccessorOwner>,
@@ -18125,10 +18065,6 @@ mod tests {
         )
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the fixture names every durable record field and physical carrier"
-    )]
     fn persist_test_recovery_fixture_in(
         session: &RootSession,
         root_path: &Path,
@@ -18195,10 +18131,6 @@ mod tests {
         (registration, stage)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the fixture names every durable record field and physical carrier"
-    )]
     fn persist_test_replacement_fixture(
         session: &RootSession,
         root_path: &Path,

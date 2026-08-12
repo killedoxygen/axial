@@ -1048,10 +1048,6 @@ impl TransientStage {
         self.position
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "the 144-byte failure is immediately retried or unpacked on a per-artifact path; boxing would allocate on recoverable seal failures"
-    )]
     pub fn seal(mut self) -> Result<TransientStageSealed, TransientStageSealFailure> {
         let file = self
             .file

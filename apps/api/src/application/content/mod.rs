@@ -313,11 +313,11 @@ fn project_ambient_live_content(
     let entries = manifest
         .entries()
         .iter()
-        .filter_map(|entry| {
+        .filter(|entry| {
             let selected = candidate_ids
                 .map(|ids| ids.contains(entry.canonical_id()))
                 .unwrap_or(true);
-            (selected && entry_file_present(game_dir, entry)).then_some(entry)
+            selected && entry_file_present(game_dir, entry)
         })
         .collect::<Vec<_>>();
     LiveManagedContent::from_entries(entries)
@@ -603,11 +603,13 @@ pub async fn instance_content_updates(
     let installed = manifest
         .entries()
         .iter()
-        .filter_map(|entry| live_content.contains(entry).then(|| entry.clone()))
+        .filter(|entry| live_content.contains(entry))
+        .cloned()
         .collect::<Vec<_>>();
     let update_entries = installed
         .iter()
-        .filter_map(|entry| (entry.kind() != ContentKind::Modpack).then(|| entry.clone()))
+        .filter(|entry| entry.kind() != ContentKind::Modpack)
+        .cloned()
         .collect::<Vec<_>>();
 
     let candidates: Vec<(ManifestEntry, ContentVersion)> =

@@ -662,10 +662,6 @@ fn scan_parent(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "carrier admission binds its exact recovery coordinate and retained authority in one transition"
-)]
 fn open_observed(
     admission: &mut ReplayAdmission,
     registration: RecoveryRegistration,
@@ -938,10 +934,6 @@ fn carrier(entry: &ObservedEntry, unsealed: bool, record: &RecoveryRecord) -> Re
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "cold admission errors transfer the complete linear recovery authority"
-)]
 fn plan_replay_records(
     root: &platform::RootGuard,
     records: Vec<(RecoveryRegistration, RecoveryRecord)>,
@@ -1833,10 +1825,6 @@ fn retire_replay_record(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the cold replay effect keeps linear authority and successor retirement policy explicit"
-)]
 fn replay_replacement(
     root: &platform::RootGuard,
     lease: &platform::LeaseHandle,
@@ -2071,10 +2059,6 @@ fn replay_publication(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the cold replay effect keeps linear authority and successor retirement policy explicit"
-)]
 fn replay_removal(
     root: &platform::RootGuard,
     lease: &platform::LeaseHandle,
@@ -2126,10 +2110,6 @@ fn replay_removal(
     Ok(())
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "cold effect errors return the complete armed replay admission"
-)]
 fn replay(
     root: &platform::RootGuard,
     lease: &platform::LeaseHandle,
@@ -2272,11 +2252,6 @@ fn into_orphans(admission: ReplayAdmission) -> Vec<crate::RecoveryOrphan> {
         .collect()
 }
 
-#[expect(
-    clippy::result_large_err,
-    clippy::too_many_arguments,
-    reason = "cold replay attempts transfer every linear carrier and their admission phase"
-)]
 fn attempt_replay(
     root: &platform::RootGuard,
     lease: &platform::LeaseHandle,

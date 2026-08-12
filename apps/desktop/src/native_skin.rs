@@ -323,10 +323,10 @@ fn expire_pending(shared: &Arc<Mutex<NativeSkinDropState>>, generation: u64, tok
     let (pending, expiry_task) = {
         let mut state = shared.lock().expect(SKIN_DROP_LOCK_INVARIANT);
         if state.generation != generation
-            || !state
+            || state
                 .pending
                 .as_ref()
-                .is_some_and(|pending| pending.token == token)
+                .is_none_or(|pending| pending.token != token)
         {
             return;
         }

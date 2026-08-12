@@ -84,9 +84,7 @@ async fn settle_loader_base_publication(
         ManagedInstallDurableOutcome::Mismatch => DurableLoaderBasePublication::Refused(
             super::managed_install_publication_mismatch_error(),
         ),
-        ManagedInstallDurableOutcome::NoEffect => {
-            return DurableLoaderBasePublication::DeferredNonterminal;
-        }
+        ManagedInstallDurableOutcome::NoEffect => DurableLoaderBasePublication::DeferredNonterminal,
         ManagedInstallDurableOutcome::Committed(evidence)
             if evidence.id().matches_version_id(expected_version_id)
                 && commit.base_version_id() == expected_version_id =>
@@ -1845,17 +1843,16 @@ pub(super) fn spawn_recovering_loader_install<Reconstruct, Reconstruction>(
                         }
                     };
                     drop(activation_mutation);
-                    if let Some(acknowledgement) = acknowledgement {
-                        if !super::acknowledge_startup_managed_install_publication(
+                    if let Some(acknowledgement) = acknowledgement
+                        && !super::acknowledge_startup_managed_install_publication(
                             acknowledgement.acknowledge(),
                             &mut request_drain,
                         )
                         .await
-                        {
-                            drop(progress_tx);
-                            let _ = finish_install_progress_task(progress_task).await;
-                            return InstallStore::worker_exit_deferred_nonterminal();
-                        }
+                    {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(progress_task).await;
+                        return InstallStore::worker_exit_deferred_nonterminal();
                     }
                     if startup_settled.is_some()
                         && super::signal_startup_install_settled(&mut startup_settled).is_err()

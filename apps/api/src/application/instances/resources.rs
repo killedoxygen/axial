@@ -1097,7 +1097,7 @@ fn scan_instance_screenshots(
         let Some(name) = entry.name.to_str() else {
             continue;
         };
-        if !is_screenshot_name(&name) {
+        if !is_screenshot_name(name) {
             continue;
         }
         if !names.insert(portable_resource_key(name).expect("admitted screenshot name")) {
@@ -1131,7 +1131,7 @@ pub(super) fn scan_instance_logs(
         let Some(name) = entry.name.to_str() else {
             continue;
         };
-        if !is_safe_resource_name(&name) {
+        if !is_safe_resource_name(name) {
             continue;
         }
         if !names.insert(portable_resource_key(name).expect("admitted log name")) {

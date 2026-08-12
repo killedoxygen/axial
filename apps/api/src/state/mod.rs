@@ -253,6 +253,10 @@ pub(crate) use update_admission::{
 };
 pub use updater::{UpdateFlowPhase, UpdateFlowSnapshot, UpdaterStore};
 
+#[cfg(test)]
+type KnownGoodFinalValidationHook =
+    Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>;
+
 #[derive(Clone)]
 pub struct AppState {
     app_name: String,
@@ -301,8 +305,7 @@ pub struct AppState {
     known_good_candidates_captured_hook:
         Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     #[cfg(test)]
-    known_good_before_final_validation_hook:
-        Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    known_good_before_final_validation_hook: KnownGoodFinalValidationHook,
     #[cfg(test)]
     auth_chain_client_override: Arc<RwLock<Option<crate::auth_chain::AuthChainClient>>>,
 }
@@ -689,13 +692,13 @@ impl ConfigCommitAdmission for ManagedLibraryConfigAdmission {
     type Committed = CommittedManagedLibraryConfigAdmission;
 
     fn commit(self) -> Self::Committed {
-        if let Some(prepared) = self.prepared {
-            if let ManagedLibraryCommitOutcome::Degraded(reason) = prepared.commit() {
-                tracing::warn!(
-                    reason = ?reason,
-                    "managed library authority degraded after config persistence"
-                );
-            }
+        if let Some(prepared) = self.prepared
+            && let ManagedLibraryCommitOutcome::Degraded(reason) = prepared.commit()
+        {
+            tracing::warn!(
+                reason = ?reason,
+                "managed library authority degraded after config persistence"
+            );
         }
         CommittedManagedLibraryConfigAdmission {
             _mutation: self.mutation,

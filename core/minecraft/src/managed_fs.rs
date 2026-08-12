@@ -5545,10 +5545,10 @@ impl ManagedTreeDirectory {
             }
         };
         #[cfg(any(test, feature = "test-support"))]
-        if let Some(after_stage) = after_stage {
-            if let Err(error) = after_stage() {
-                return cleanup_tree_failure(&self.directory, &stage_name, stage, error.into());
-            }
+        if let Some(after_stage) = after_stage
+            && let Err(error) = after_stage()
+        {
+            return cleanup_tree_failure(&self.directory, &stage_name, stage, error.into());
         }
         let mut budget = ManagedTreeBudget {
             remaining_entries: limits.max_entries,

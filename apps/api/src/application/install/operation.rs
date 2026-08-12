@@ -441,9 +441,7 @@ fn checkpoint_sequence_matches_identity(
 }
 
 fn canonical_nonterminal_install_progress_phase(step: &OperationJournalStep) -> Option<&str> {
-    let Some(phase) = step.step_id.strip_prefix("install_progress_") else {
-        return None;
-    };
+    let phase = step.step_id.strip_prefix("install_progress_")?;
     (!phase.is_empty()
         && step.phase
             == install_operation_phase(&DownloadProgress {
@@ -3735,7 +3733,7 @@ mod operation_id_tests {
             ),
         ] {
             let journals = OperationJournalStore::new();
-            let operation_id = OperationId::deterministic_test(&format!("loader-child-{suffix}"));
+            let operation_id = OperationId::deterministic_test(format!("loader-child-{suffix}"));
             begin_install_operation_journal_for_session(
                 &journals,
                 &operation_id,

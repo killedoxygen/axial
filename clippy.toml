@@ -1,0 +1,4 @@
+# Linear recovery and verification errors retain bounded filesystem authority.
+large-error-threshold = 2048
+enum-variant-size-threshold = 2048
+too-many-arguments-threshold = 11

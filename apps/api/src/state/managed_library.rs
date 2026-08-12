@@ -26,6 +26,7 @@ struct ManagedLibraryOwnerInner {
     state: Mutex<ManagedLibraryState>,
 }
 
+#[derive(Default)]
 struct ManagedLibraryState {
     closed: bool,
     revision: u64,
@@ -402,8 +403,10 @@ impl ManagedLibraryOwner {
         paths: AppPaths,
         reason: ManagedLibraryDegradedReason,
     ) -> Self {
-        let mut state = ManagedLibraryState::default();
-        state.degraded = Some(reason);
+        let state = ManagedLibraryState {
+            degraded: Some(reason),
+            ..ManagedLibraryState::default()
+        };
         Self::from_state(root_session, paths, state)
     }
 
@@ -503,13 +506,13 @@ impl ManagedLibraryOwner {
             let retirement = {
                 let mut state = self.lock_state();
                 state.closed = true;
-                if state.retiring.is_none() {
-                    if let Some(current) = state.current.take() {
-                        state.retiring = Some(RetiringLibraryGeneration {
-                            id: current.id,
-                            retirement: Arc::new(current.root.begin_retirement()),
-                        });
-                    }
+                if state.retiring.is_none()
+                    && let Some(current) = state.current.take()
+                {
+                    state.retiring = Some(RetiringLibraryGeneration {
+                        id: current.id,
+                        retirement: Arc::new(current.root.begin_retirement()),
+                    });
                 }
                 state
                     .retiring
@@ -834,19 +837,6 @@ impl PreparedManagedLibraryChange {
     }
 }
 
-impl Default for ManagedLibraryState {
-    fn default() -> Self {
-        Self {
-            closed: false,
-            revision: 0,
-            publishing_revision: None,
-            current: None,
-            retiring: None,
-            degraded: None,
-        }
-    }
-}
-
 impl LibraryOperation {
     pub(crate) fn generation(&self) -> LibraryGenerationId {
         self.generation
@@ -898,13 +888,13 @@ fn prepare_configured_change(
     let binding = ManagedLibraryRoot::admitted_binding(&admission)?;
     if expected.is_some_and(|current| current.binding == binding) {
         let witness = witness.unwrap_or_else(|| std::process::abort());
-        if expected.is_some_and(|current| current.fingerprint == fingerprint) {
-            if let Ok(operation) = witness.try_acquire() {
-                if fingerprint.mode == LibraryMode::Managed {
-                    operation.prepare_layout()?;
-                }
-                return Ok(PreparedManagedLibraryWorkerOutcome::NoChange);
+        if expected.is_some_and(|current| current.fingerprint == fingerprint)
+            && let Ok(operation) = witness.try_acquire()
+        {
+            if fingerprint.mode == LibraryMode::Managed {
+                operation.prepare_layout()?;
             }
+            return Ok(PreparedManagedLibraryWorkerOutcome::NoChange);
         }
         if expected.is_some_and(|current| current.fingerprint.mode != fingerprint.mode) {
             return Err(io::Error::new(

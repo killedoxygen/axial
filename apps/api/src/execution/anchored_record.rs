@@ -1422,14 +1422,13 @@ impl AnchoredRecordTarget {
             .mutation
             .lock()
             .expect("anchored record mutation lock poisoned");
-        if let Some(published) = mutation.published.as_ref() {
-            if published
+        if let Some(published) = mutation.published.as_ref()
+            && published
                 .file
                 .validate_revision(&published.revision)
                 .is_ok()
-            {
-                return Ok(published.sha256 == sha256 && published.size == size);
-            }
+        {
+            return Ok(published.sha256 == sha256 && published.size == size);
         }
         if mutation.source_latched {
             return Ok(false);

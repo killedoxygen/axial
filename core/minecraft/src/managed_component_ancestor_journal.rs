@@ -399,10 +399,10 @@ fn validate_targets(
 }
 
 fn validate_target(target: &ComponentCreatedAncestor) -> Result<(), ComponentAncestorJournalError> {
-    if let ComponentCreatedAncestor::Relative(path) = target {
-        if path.as_str().is_empty() || path.as_str().len() > MAX_COMPONENT_PATH_BYTES {
-            return Err(ComponentAncestorJournalError);
-        }
+    if let ComponentCreatedAncestor::Relative(path) = target
+        && (path.as_str().is_empty() || path.as_str().len() > MAX_COMPONENT_PATH_BYTES)
+    {
+        return Err(ComponentAncestorJournalError);
     }
     Ok(())
 }

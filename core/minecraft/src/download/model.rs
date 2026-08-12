@@ -41,7 +41,7 @@ pub struct DownloadProgress {
 
 #[must_use = "dropping recovery releases the exact managed install publication authority"]
 pub struct ManagedInstallPublicationRecovery {
-    pub(crate) state: ManagedInstallPublicationRecoveryState,
+    pub(crate) state: Box<ManagedInstallPublicationRecoveryState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -883,7 +883,7 @@ pub(crate) enum ManagedInstallPublicationRecoveryState {
 
 impl std::fmt::Debug for ManagedInstallPublicationRecovery {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = match &self.state {
+        let state = match self.state.as_ref() {
             ManagedInstallPublicationRecoveryState::Active { .. } => "active",
             ManagedInstallPublicationRecoveryState::Recover { .. } => "recover",
             #[cfg(any(test, feature = "test-support"))]
@@ -902,7 +902,7 @@ impl ManagedInstallPublicationRecovery {
         publication: VersionBundleTransactionRecovery,
     ) -> Self {
         Self {
-            state: ManagedInstallPublicationRecoveryState::Active { seed, publication },
+            state: Box::new(ManagedInstallPublicationRecoveryState::Active { seed, publication }),
         }
     }
 
@@ -916,9 +916,9 @@ impl ManagedInstallPublicationRecovery {
         remaining_indeterminate_retries: usize,
     ) -> Self {
         Self {
-            state: ManagedInstallPublicationRecoveryState::Fixture {
+            state: Box::new(ManagedInstallPublicationRecoveryState::Fixture {
                 remaining_indeterminate_retries,
-            },
+            }),
         }
     }
 }
