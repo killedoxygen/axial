@@ -92,14 +92,14 @@ async fn own_launch_proof_and_benchmark_outcome(
         );
         return;
     };
-    let report =
-        state
-            .launch_reports()
-            .persist(record, launched_at, outcome.clone(), proof_context);
-    let benchmark = state
+    let report_result = state
+        .launch_reports()
+        .persist(record, launched_at, outcome.clone(), proof_context)
+        .await;
+    let benchmark_result = state
         .benchmark_suites()
-        .update_run_state_for_session(&session_id, &outcome);
-    let (report_result, benchmark_result) = tokio::join!(report, benchmark);
+        .update_run_state_for_session(&session_id, &outcome)
+        .await;
     if let Err(error) = report_result {
         tracing::warn!(
             session_id,

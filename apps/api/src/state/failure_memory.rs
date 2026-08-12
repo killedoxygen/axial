@@ -1181,7 +1181,7 @@ impl GuardianFailureMemoryStore {
         })
     }
 
-    pub(super) async fn settle_reconciliation_pending(
+    pub(crate) async fn settle_reconciliation_pending(
         &self,
     ) -> Result<(), FailureMemoryStoreError> {
         let retry_pending = {

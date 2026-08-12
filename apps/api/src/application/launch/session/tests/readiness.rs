@@ -67,6 +67,12 @@ async fn launch_preflight_surfaces_current_instance_crash_memory_without_creatin
                 &relative_timestamp(Duration::minutes(-5)),
             ))
             .expect("record current launch failure memory");
+        fixture
+            .state
+            .failure_memory()
+            .flush()
+            .await
+            .expect("flush current launch failure memory");
 
         let preflight = prepare_launch_preflight(&fixture.state, instance_id.clone())
             .await
@@ -134,6 +140,12 @@ async fn launch_preflight_ignores_unrelated_mode_instance_and_stale_crash_memory
             .record(entry)
             .expect("record filtered launch failure memory");
     }
+    fixture
+        .state
+        .failure_memory()
+        .flush()
+        .await
+        .expect("flush filtered launch failure memory");
 
     let preflight = prepare_launch_preflight(&fixture.state, instance_id.clone())
         .await
@@ -200,6 +212,12 @@ async fn launch_preflight_surfaces_only_active_suppression_for_the_exact_current
                 .with_suppression_until(relative_timestamp(suppression_offset)),
             )
             .expect("record launch repair suppression");
+        fixture
+            .state
+            .failure_memory()
+            .flush()
+            .await
+            .expect("flush launch repair suppression");
 
         let preflight = prepare_launch_preflight(&fixture.state, instance_id.clone())
             .await

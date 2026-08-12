@@ -232,6 +232,7 @@ pub(super) async fn record_successful_self_healing_if_any(
             }
         }
     }
+    settle_launch_recovery_memory(state).await?;
     Ok(())
 }
 
@@ -281,6 +282,7 @@ pub(super) async fn record_failed_self_healing_if_any(
             }
         }
     }
+    settle_launch_recovery_memory(state).await?;
     state
         .sessions()
         .emit_log(
@@ -290,6 +292,19 @@ pub(super) async fn record_failed_self_healing_if_any(
         )
         .await;
     Ok(())
+}
+
+async fn settle_launch_recovery_memory(state: &AppState) -> Result<(), OperationJournalStoreError> {
+    state
+        .failure_memory()
+        .settle_reconciliation_pending()
+        .await
+        .map_err(|error| {
+            OperationJournalStoreError::Persistence(std::io::Error::other(format!(
+                "Guardian launch-recovery failure-memory persistence failed ({})",
+                error.class()
+            )))
+        })
 }
 
 async fn retry_launch_recovery_journal(

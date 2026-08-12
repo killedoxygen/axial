@@ -449,13 +449,15 @@ async fn settle_observed_process_exit(
         }
 
         let observed_at = timestamp_utc();
-        if let Err(error) = record_launch_failure_observation(
-            state.failure_memory(),
+        if let Err(error) = persist_launch_failure_observation(
+            state,
             instance_id,
             guardian_mode,
             failure_class,
             &observed_at,
-        ) {
+        )
+        .await
+        {
             tracing::warn!(
                 error_kind = error.class(),
                 failure_class = failure_class.as_str(),
@@ -468,6 +470,23 @@ async fn settle_observed_process_exit(
     persist_terminal_proof(state, session_id, launched_at, proof_context, proof_record).await;
     let _ = lease.finalize(event).await;
     lease.release().await;
+}
+
+async fn persist_launch_failure_observation(
+    state: &AppState,
+    instance_id: &str,
+    guardian_mode: crate::guardian::GuardianMode,
+    failure_class: LaunchFailureClass,
+    observed_at: &str,
+) -> Result<(), crate::state::failure_memory::FailureMemoryStoreError> {
+    record_launch_failure_observation(
+        state.failure_memory(),
+        instance_id,
+        guardian_mode,
+        failure_class,
+        observed_at,
+    )?;
+    state.failure_memory().flush().await
 }
 
 async fn persist_terminal_proof(
@@ -1345,13 +1364,15 @@ async fn launch_session_inner_with_control(
                 let failure_class = startup_outcome.failure_class;
                 if is_guardian_launch_crash_class(failure_class) {
                     let observed_at = timestamp_utc();
-                    if let Err(error) = record_launch_failure_observation(
-                        state.failure_memory(),
+                    if let Err(error) = persist_launch_failure_observation(
+                        &state,
                         &instance_id,
                         guardian_mode,
                         failure_class,
                         &observed_at,
-                    ) {
+                    )
+                    .await
+                    {
                         tracing::warn!(
                             error_kind = error.class(),
                             failure_class = failure_class.as_str(),
