@@ -182,10 +182,11 @@ pub(crate) async fn settle_startup_version_bundle_publications(state: &AppState)
     }
 }
 
-pub(crate) fn spawn_startup_known_good_rebuilds(state: &AppState, producer: ProducerLease) {
-    let _ = spawn_startup_known_good_rebuilds_with(state, producer, |version_id| async move {
+pub(crate) fn spawn_startup_known_good_rebuilds(state: &AppState, producer: ProducerLease) -> bool {
+    spawn_startup_known_good_rebuilds_with(state, producer, |version_id| async move {
         axial_minecraft::reconstruct_known_good(&version_id).await
-    });
+    })
+    .is_some()
 }
 
 fn spawn_startup_known_good_rebuilds_with<Reconstruct, ReconstructFuture>(

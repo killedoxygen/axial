@@ -104,8 +104,8 @@ async fn handle_health(
     Extension(handoff): Extension<RequestProducerHandoff>,
     ApiQuery(query): ApiQuery<HealthQuery>,
 ) -> Result<Json<PerformanceHealthResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     application::performance_health(
         &state,

@@ -70,6 +70,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 
+use crate::execution::persistence::PersistenceCoordinator;
 use crate::observability::telemetry::TelemetryHub;
 use config::{ConfigCommitAdmission, ConfigCommitAdmissionContext, ConfigCommitAdmissionFuture};
 pub(crate) use managed_library::{
@@ -297,6 +298,7 @@ pub struct AppState {
     instance_deletions: instance_deletions::InstanceDeletionCoordinator,
     instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates,
     lifecycle: AppLifecycle,
+    _persistence: PersistenceCoordinator,
     shutdown_coordinator: AppShutdownCoordinator,
     setup_plans: Arc<setup_plans::SetupPlanStore>,
     startup_warnings: Arc<Vec<String>>,
@@ -874,58 +876,66 @@ impl AppState {
 
     #[cfg(test)]
     fn try_new_for_test(init: AppStateInit) -> std::io::Result<Self> {
-        let root_session = validate_app_state_init_authority(&init)?;
-        let application_root = root_session.root_directory()?;
-        let config = Arc::new(
-            AppConfigStore::claim(
-                &init.config,
-                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
-                    Arc::clone(&root_session),
-                    application_root,
-                ),
-            )
-            .unwrap_or_else(|error| panic!("failed to initialize config persistence: {error}")),
-        );
-        let managed_runtime_cache = ManagedRuntimeCache::from_directory(
-            root_session.prepare_runtime_directory()?,
-            config.paths().runtimes_dir().to_path_buf(),
-        )?;
-        let telemetry = Arc::new(TelemetryHub::from_env(config.clone()));
-        assert!(
-            !config.current().telemetry_enabled
-                || !telemetry.export_configured()
-                || !config.current().telemetry_install_id.is_empty(),
-            "synchronous test state requires a committed telemetry install id"
-        );
-        Self::new_with_telemetry_inner(
-            init,
-            root_session,
-            config,
-            telemetry,
-            Arc::new(AuthLoginStore::new()),
-            managed_runtime_cache,
-            RejectionStreakStartupMode::Discard,
-        )
-    }
-
-    pub async fn load(init: AppStateInit) -> std::io::Result<Self> {
-        let (mut init, root_session, config) =
-            run_state_physical_work(PhysicalIoClass::Write, 0, move || {
-                let root_session = validate_app_state_init_authority(&init)?;
-                let application_root = root_session.root_directory()?;
-                let config = AppConfigStore::claim(
+        let persistence = PersistenceCoordinator::current();
+        persistence.clone().with_application(|| {
+            let root_session = validate_app_state_init_authority(&init)?;
+            let application_root = root_session.root_directory()?;
+            let config = Arc::new(
+                AppConfigStore::claim(
                     &init.config,
                     crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
                         Arc::clone(&root_session),
                         application_root,
                     ),
                 )
-                .map_err(|error| {
-                    std::io::Error::other(format!(
-                        "failed to initialize config persistence: {error}"
-                    ))
-                })?;
-                Ok::<_, std::io::Error>((init, root_session, Arc::new(config)))
+                .unwrap_or_else(|error| panic!("failed to initialize config persistence: {error}")),
+            );
+            let managed_runtime_cache = ManagedRuntimeCache::from_directory(
+                root_session.prepare_runtime_directory()?,
+                config.paths().runtimes_dir().to_path_buf(),
+            )?;
+            let telemetry = Arc::new(TelemetryHub::from_env(config.clone()));
+            assert!(
+                !config.current().telemetry_enabled
+                    || !telemetry.export_configured()
+                    || !config.current().telemetry_install_id.is_empty(),
+                "synchronous test state requires a committed telemetry install id"
+            );
+            Self::new_with_telemetry_inner(
+                init,
+                root_session,
+                config,
+                telemetry,
+                Arc::new(AuthLoginStore::new()),
+                managed_runtime_cache,
+                RejectionStreakStartupMode::Discard,
+                persistence,
+            )
+        })
+    }
+
+    pub async fn load(init: AppStateInit) -> std::io::Result<Self> {
+        let persistence = PersistenceCoordinator::application(tokio::runtime::Handle::current());
+        let config_persistence = persistence.clone();
+        let (mut init, root_session, config) =
+            run_state_physical_work(PhysicalIoClass::Write, 0, move || {
+                config_persistence.with_application(|| {
+                    let root_session = validate_app_state_init_authority(&init)?;
+                    let application_root = root_session.root_directory()?;
+                    let config = AppConfigStore::claim(
+                        &init.config,
+                        crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                            Arc::clone(&root_session),
+                            application_root,
+                        ),
+                    )
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "failed to initialize config persistence: {error}"
+                        ))
+                    })?;
+                    Ok::<_, std::io::Error>((init, root_session, Arc::new(config)))
+                })
             })
             .await
             .map_err(|_| std::io::Error::other("config persistence startup task stopped"))??;
@@ -949,16 +959,20 @@ impl AppState {
             root_session.prepare_runtime_directory()?,
             config.paths().runtimes_dir().to_path_buf(),
         )?;
+        let state_persistence = persistence.clone();
         let state = run_state_physical_work(PhysicalIoClass::Heavy, 0, move || {
-            Self::new_with_telemetry_inner(
-                init,
-                root_session,
-                config,
-                telemetry,
-                Arc::new(auth_logins),
-                managed_runtime_cache,
-                RejectionStreakStartupMode::Progress,
-            )
+            state_persistence.clone().with_application(|| {
+                Self::new_with_telemetry_inner(
+                    init,
+                    root_session,
+                    config,
+                    telemetry,
+                    Arc::new(auth_logins),
+                    managed_runtime_cache,
+                    RejectionStreakStartupMode::Progress,
+                    state_persistence,
+                )
+            })
         })
         .await
         .map_err(|_| std::io::Error::other("persisted state startup task stopped"))??;
@@ -983,7 +997,7 @@ impl AppState {
         state.reconcile_persisted_state_repair_startup().await?;
         state
             .persisted_state_rejection_streaks
-            .progress_startup()
+            .progress_startup_with_coordinator(persistence)
             .await;
         startup_waiter.mark_app_owned();
         Ok(state)
@@ -991,41 +1005,45 @@ impl AppState {
 
     #[cfg(test)]
     pub(crate) fn new_with_telemetry(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
-        let root_session = validate_app_state_init_authority(&init).unwrap_or_else(|error| {
-            panic!("failed to initialize application root authority: {error}")
-        });
-        let application_root = root_session
-            .root_directory()
-            .expect("open test application root");
-        let config = Arc::new(
-            AppConfigStore::claim(
-                &init.config,
-                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
-                    Arc::clone(&root_session),
-                    application_root,
-                ),
+        let persistence = PersistenceCoordinator::current();
+        persistence.clone().with_application(|| {
+            let root_session = validate_app_state_init_authority(&init).unwrap_or_else(|error| {
+                panic!("failed to initialize application root authority: {error}")
+            });
+            let application_root = root_session
+                .root_directory()
+                .expect("open test application root");
+            let config = Arc::new(
+                AppConfigStore::claim(
+                    &init.config,
+                    crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                        Arc::clone(&root_session),
+                        application_root,
+                    ),
+                )
+                .unwrap_or_else(|error| panic!("failed to initialize config persistence: {error}")),
+            );
+            let managed_runtime_cache = ManagedRuntimeCache::from_directory(
+                root_session
+                    .prepare_runtime_directory()
+                    .expect("prepare test runtime directory"),
+                config.paths().runtimes_dir().to_path_buf(),
             )
-            .unwrap_or_else(|error| panic!("failed to initialize config persistence: {error}")),
-        );
-        let managed_runtime_cache = ManagedRuntimeCache::from_directory(
-            root_session
-                .prepare_runtime_directory()
-                .expect("prepare test runtime directory"),
-            config.paths().runtimes_dir().to_path_buf(),
-        )
-        .expect("test app paths must provide an admitted managed runtime root");
-        telemetry.replace_config_source(config.clone());
-        Self::new_with_telemetry_inner(
-            init,
-            root_session,
-            config,
-            telemetry,
-            Arc::new(AuthLoginStore::new()),
-            managed_runtime_cache,
-            RejectionStreakStartupMode::Discard,
-        )
-        .unwrap_or_else(|error| {
-            panic!("failed to initialize known-good inventory persistence: {error}")
+            .expect("test app paths must provide an admitted managed runtime root");
+            telemetry.replace_config_source(config.clone());
+            Self::new_with_telemetry_inner(
+                init,
+                root_session,
+                config,
+                telemetry,
+                Arc::new(AuthLoginStore::new()),
+                managed_runtime_cache,
+                RejectionStreakStartupMode::Discard,
+                persistence,
+            )
+            .unwrap_or_else(|error| {
+                panic!("failed to initialize known-good inventory persistence: {error}")
+            })
         })
     }
 
@@ -1140,6 +1158,7 @@ impl AppState {
         auth_logins: Arc<AuthLoginStore>,
         managed_runtime_cache: ManagedRuntimeCache,
         rejection_streak_startup_mode: RejectionStreakStartupMode,
+        persistence: PersistenceCoordinator,
     ) -> std::io::Result<Self> {
         let persisted_state_directories = root_session.prepare_persisted_state_directories()?;
         // No producers exist yet, so initial layout admission precedes the runtime mutation epoch.
@@ -1392,6 +1411,7 @@ impl AppState {
             instance_deletions: instance_deletions::InstanceDeletionCoordinator::new(),
             instance_lifecycle_gates,
             lifecycle: AppLifecycle::new(),
+            _persistence: persistence,
             shutdown_coordinator: AppShutdownCoordinator::new(),
             setup_plans: Arc::new(setup_plans::SetupPlanStore::new()),
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
@@ -2222,6 +2242,13 @@ impl AppState {
         self.lifecycle.try_claim_producer()
     }
 
+    pub(crate) fn try_claim_request_producer(
+        &self,
+        handoff: &RequestProducerHandoff,
+    ) -> Result<ProducerLease, LifecycleAdmissionError> {
+        self.lifecycle.try_claim_handoff(handoff)
+    }
+
     pub(crate) fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
         self.lifecycle.subscribe_shutdown()
     }
@@ -2289,6 +2316,16 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn lifecycle_phase(&self) -> AppLifecyclePhase {
         self.lifecycle.phase()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_producer_count(&self) -> usize {
+        self.lifecycle.active_producers()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_persistence_worker_count(&self) -> usize {
+        self._persistence.active_worker_count()
     }
 
     pub fn startup_warnings(&self) -> Vec<String> {

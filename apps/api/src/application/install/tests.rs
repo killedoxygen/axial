@@ -10030,7 +10030,7 @@ async fn persistent_retry_startup_serves_restart_loaded_status_without_reassessm
                 crate::app::start_application_background_workflows(&state),
             )
             .await;
-        assert!(startup_ready);
+        assert!(startup_ready.is_ok());
         assert_eq!(first_startup_policy_evaluations, 0);
         let restored_memory = state.failure_memory().list();
         assert_eq!(restored_memory.len(), 1);
@@ -10052,7 +10052,7 @@ async fn persistent_retry_startup_serves_restart_loaded_status_without_reassessm
                 crate::app::start_application_background_workflows(&reloaded),
             )
             .await;
-        assert!(startup_ready);
+        assert!(startup_ready.is_ok());
         assert_eq!(second_startup_policy_evaluations, 0);
         assert_eq!(reloaded.failure_memory().list(), restored_memory);
 
@@ -10164,7 +10164,12 @@ async fn startup_retry_persistence_failure_stops_later_workflow_hooks() {
     let staging_marker = staging_dir.join("must-survive-blocked-startup");
     fs::write(&staging_marker, b"pending").expect("write update staging marker");
 
-    assert!(!crate::app::start_application_background_workflows(&state).await);
+    assert_eq!(
+        crate::app::start_application_background_workflows(&state)
+            .await
+            .expect_err("unsettled Guardian startup barrier must block serving"),
+        crate::app::ApplicationStartupError::GuardianFailureMemory
+    );
     assert_eq!(backend.attempts.load(Ordering::SeqCst), 4);
     assert!(
         staging_marker.is_file(),

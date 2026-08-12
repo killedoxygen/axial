@@ -8,11 +8,12 @@ const repositoryRoot = basename(process.cwd()) === 'frontend' ? resolve(process.
 const read = (path) => readFile(resolve(repositoryRoot, path), 'utf8');
 
 test('production API authority precedes lifecycle and body handling', async () => {
-  const [routes, transport, main, app] = await Promise.all([
+  const [routes, transport, main, app, bootstrap] = await Promise.all([
     read('apps/api/src/routes/mod.rs'),
     read('apps/api/src/transport.rs'),
     read('apps/api/src/main.rs'),
     read('apps/api/src/app.rs'),
+    read('apps/api/src/bootstrap.rs'),
   ]);
   assert.match(routes, /lifecycle_admission,[\s\S]*?local_cors_layer\(authority\)[\s\S]*?authenticate_request,/);
   assert.match(transport, /const MAX_LIVE_TICKETS: usize = 256;/);
@@ -20,7 +21,8 @@ test('production API authority precedes lifecycle and body handling', async () =
   assert.match(transport, /TicketKind::Media[\s\S]*?is_media_path\(uri\.path\(\)\)/);
   assert.match(transport, /request\.uri\(\)\.path\(\) == "\/api\/v1\/transport\/bootstrap"/);
   assert.doesNotMatch(transport, /derive\([^)]*Debug[^)]*\)[\s\S]{0,80}ApiTransportBootstrap/);
-  assert.match(main, /api_addr_from_environment\(\)\?[\s\S]*?open_app_root_session/);
+  assert.match(main, /api_addr_from_environment\(\)\?[\s\S]*?load_application/);
+  assert.match(bootstrap, /pub async fn load_application[\s\S]*?open_app_root_session/);
   assert.match(main, /if !addr\.ip\(\)\.is_loopback\(\)/);
   assert.match(app, /LocalApiAuthority::new\(addr, origin\)/);
 });

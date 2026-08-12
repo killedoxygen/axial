@@ -99,8 +99,8 @@ async fn handle_loader_install_events(
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     loader_install_events_stream(&state, &id, producer).await
 }

@@ -668,7 +668,7 @@ impl GuardianFailureMemoryStore {
     pub(crate) fn try_load_from_directory(
         directory: AnchoredRecordDirectory,
     ) -> Result<Self, FailureMemoryStoreError> {
-        Self::try_load_with_coordinator_and_directory(PersistenceCoordinator::global(), directory)
+        Self::try_load_with_coordinator_and_directory(PersistenceCoordinator::current(), directory)
     }
 
     #[cfg(test)]

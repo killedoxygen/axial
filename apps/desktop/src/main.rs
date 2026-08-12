@@ -6,16 +6,13 @@ mod physical_work;
 mod smoke;
 mod state;
 
-use axial_api::app::{spawn_background_for_origin, start_application_background_workflows};
+use axial_api::app::spawn_background_for_origin;
 use axial_api::bootstrap::{
-    desktop_app_root_selection_from_environment, open_app_root_session, resolve_app_paths,
+    ApplicationLoadRequest, desktop_app_root_selection_from_environment, load_application,
 };
 use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
-use axial_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
-use axial_config::{ConfigStore, InstanceStore};
-use axial_performance::PerformanceManager;
 use axial_resource::PhysicalIoClass;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, WebviewWindowBuilder, WindowEvent};
@@ -48,51 +45,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let main_window_dev_origin = dev_origin.clone();
     tracing_subscriber::fmt::init();
 
-    let paths = resolve_app_paths(desktop_app_root_selection_from_environment(
-        context.config().identifier.as_str(),
-    )?)?;
-    let root_session = open_app_root_session(&paths)?;
-    let root_session = Arc::new(root_session);
-    let config_paths = paths.clone();
-    let config_root_session = Arc::clone(&root_session);
-    let config_startup = physical_work::run(PhysicalIoClass::Write, 0, move || {
-        ConfigStore::load_for_startup(config_paths, config_root_session)
-    })
-    .await??;
-    let instance_paths = paths.clone();
-    let instance_root_session = Arc::clone(&root_session);
-    let instance_startup = physical_work::run(PhysicalIoClass::Write, 0, move || {
-        InstanceStore::load_for_startup(instance_paths, instance_root_session)
-    })
-    .await??;
-    let mut startup_warnings = config_startup.warnings;
-    startup_warnings.extend(instance_startup.warnings);
-    let config = Arc::new(config_startup.store);
-    let instances = Arc::new(instance_startup.store);
-    let installs = Arc::new(InstallStore::new());
-    let sessions = Arc::new(SessionStore::new());
-    drop(root_session.prepare_performance_directory()?);
-    let performance_dir = paths.performance_dir().to_path_buf();
-    let performance = Arc::new(
-        physical_work::run(PhysicalIoClass::Heavy, 0, move || {
-            PerformanceManager::load_for_startup(&performance_dir)
-        })
-        .await??,
-    );
-    let state = AppState::load(AppStateInit {
+    let loaded = load_application(ApplicationLoadRequest {
+        root: desktop_app_root_selection_from_environment(context.config().identifier.as_str())?,
         app_name: "Axial".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        config,
-        instances,
-        installs,
-        sessions,
-        performance,
-        startup_warnings,
     })
     .await?;
-    if !start_application_background_workflows(&state).await {
-        return Err(std::io::Error::other("startup background ownership was refused").into());
-    }
+    let state = loaded.state;
+    tracing::debug!(health = ?loaded.health, "application startup settled");
     let telemetry = state.telemetry().clone();
     let discord_presence = discord_presence::spawn(state.clone());
     let close_event_state = state.clone();

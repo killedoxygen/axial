@@ -378,7 +378,7 @@ async fn queue_saved_skin_apply(
 ) -> Result<Json<SkinApplyResponse>, ApiError> {
     let change = prepare_pending_saved_skin_apply(state, texture_key).await?;
     let texture_key = change.texture_key.clone();
-    let producer = handoff.try_claim().map_err(|_| {
+    let producer = state.try_claim_request_producer(&handoff).map_err(|_| {
         json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Skin changes are unavailable while the application is shutting down",

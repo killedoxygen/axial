@@ -421,8 +421,8 @@ pub(crate) async fn handle_create_instance_owned(
     payload: CreateInstanceRequest,
     handoff: RequestProducerHandoff,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(instance_shutdown_error_response)?;
     handle_create_instance_owned_with_rebuild(
         state,

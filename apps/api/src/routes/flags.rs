@@ -53,7 +53,11 @@ mod tests {
     #[tokio::test]
     async fn p00_b10_contract_cross_owner_local_override_round_trips_api_config_and_shutdown() {
         let fixture = TestFixture::load("mounted").await;
-        assert!(crate::app::start_application_background_workflows(&fixture.state).await);
+        assert!(
+            crate::app::start_application_background_workflows(&fixture.state)
+                .await
+                .is_ok()
+        );
         let app = crate::routes::router(fixture.state.clone());
 
         let response = app

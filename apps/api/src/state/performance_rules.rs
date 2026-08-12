@@ -33,7 +33,7 @@ struct RulesPersistence {
 
 impl RulesPersistence {
     fn claim(directory: AnchoredRecordDirectory) -> Result<Self, RulesRefreshError> {
-        Self::claim_with_coordinator(directory, PersistenceCoordinator::global())
+        Self::claim_with_coordinator(directory, PersistenceCoordinator::current())
     }
 
     fn claim_with_coordinator(

@@ -24,8 +24,8 @@ async fn handle_version_info(
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(version_id): Path<String>,
 ) -> Result<Json<VersionInfoResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     application::version_info(&state, &producer, &version_id)
         .await
@@ -45,8 +45,8 @@ async fn handle_delete_version(
     Path(version_id): Path<String>,
     ApiJson(payload): ApiJson<DeleteVersionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     application::delete_version(&state, &producer, &version_id, payload)
         .await

@@ -78,7 +78,7 @@ pub(crate) async fn start_update_download(
     let Some(asset_name) = asset_file_name(&check.action_url) else {
         return Err(flow_error(StatusCode::CONFLICT, RELEASE_CHANGED_MESSAGE));
     };
-    let producer = handoff.try_claim().map_err(|_| {
+    let producer = state.try_claim_request_producer(&handoff).map_err(|_| {
         flow_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "application shutdown is in progress",
@@ -127,7 +127,7 @@ where
     Apply: FnOnce(PathBuf) -> Result<(), ApplyError> + Send + 'static,
     ApplyError: std::fmt::Display + Send + 'static,
 {
-    let producer = handoff.try_claim().map_err(|_| {
+    let producer = state.try_claim_request_producer(&handoff).map_err(|_| {
         flow_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "application shutdown is in progress",

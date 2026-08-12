@@ -428,8 +428,8 @@ pub(crate) async fn refresh_performance_rules(
     state: &AppState,
     handoff: RequestProducerHandoff,
 ) -> Result<PerformanceRulesStatusResponse, RefreshPerformanceRulesError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(|_| RefreshPerformanceRulesError::ShuttingDown)?;
     let state = state.clone();
     let abandoned = Arc::new(AtomicBool::new(false));

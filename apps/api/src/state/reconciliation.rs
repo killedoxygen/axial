@@ -6917,7 +6917,8 @@ mod tests {
                     }
                 }
             })
-            .await,
+            .await
+            .is_ok(),
             "install startup recovery must settle its exact marker before Guardian retries",
         );
         assert_eq!(

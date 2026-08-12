@@ -127,7 +127,9 @@ pub async fn execute_instance_setup(
     mut request: InstanceSetupExecuteRequest,
     handoff: RequestProducerHandoff,
 ) -> Result<CreateInstanceResponse, ApiError> {
-    let producer = handoff.try_claim().map_err(|_| shutdown())?;
+    let producer = state
+        .try_claim_request_producer(&handoff)
+        .map_err(|_| shutdown())?;
     let plan_id = request.plan_id.trim();
     if plan_id.is_empty() || plan_id.len() > 128 {
         return Err(bad_request("plan_id is invalid"));
@@ -220,7 +222,9 @@ pub async fn execute_modpack_instance_setup(
     mut request: ModpackInstanceSetupRequest,
     handoff: RequestProducerHandoff,
 ) -> Result<CreateInstanceResponse, ApiError> {
-    let producer = handoff.try_claim().map_err(|_| shutdown())?;
+    let producer = state
+        .try_claim_request_producer(&handoff)
+        .map_err(|_| shutdown())?;
     let target = modpack_target(state, &request.canonical_id, Some(&request.version_id)).await?;
     let selection = resolve_create_selection(state, &request.create).await?;
     let target_ref = TargetRef::Draft {

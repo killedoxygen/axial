@@ -80,8 +80,17 @@ impl PersistedStateRejectionStreaks {
         }
     }
 
-    pub(super) async fn progress_startup(&self) {
-        self.progress_startup_with(PersistenceCoordinator::global(), encode_snapshot)
+    pub(super) async fn progress_startup_with_coordinator(
+        &self,
+        coordinator: PersistenceCoordinator,
+    ) {
+        self.progress_startup_with(coordinator, encode_snapshot)
+            .await;
+    }
+
+    #[cfg(test)]
+    async fn progress_startup(&self) {
+        self.progress_startup_with(PersistenceCoordinator::current(), encode_snapshot)
             .await;
     }
 

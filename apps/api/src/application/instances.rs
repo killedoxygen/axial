@@ -773,8 +773,8 @@ where
         + 'static,
     RebuildFuture: Future<Output = Result<(), KnownGoodRebuildError>> + Send + 'static,
 {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(instance_shutdown_error_response)?;
     let foreground = state
         .register_integrity_foreground()
@@ -899,8 +899,8 @@ pub(crate) async fn handle_update_instance_owned(
     patch: InstancePatch,
     handoff: RequestProducerHandoff,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(instance_shutdown_error_response)?;
     let foreground = state
         .register_integrity_foreground()
@@ -963,8 +963,8 @@ pub(crate) async fn handle_delete_instance_owned(
     query: std::collections::HashMap<String, String>,
     handoff: RequestProducerHandoff,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(instance_shutdown_error_response)?;
     let foreground = state
         .register_integrity_foreground()

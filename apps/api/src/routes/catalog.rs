@@ -15,8 +15,8 @@ async fn handle_catalog(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<Json<CatalogResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     application::catalog(&state, &producer).await.map(Json)
 }

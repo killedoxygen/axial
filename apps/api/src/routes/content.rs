@@ -110,8 +110,8 @@ async fn handle_compatibility(
     Extension(handoff): Extension<RequestProducerHandoff>,
     ApiJson(payload): ApiJson<ContentCompatRequest>,
 ) -> Result<Json<ContentCompatResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     application::content_compatibility(&state, &producer, payload)
         .await

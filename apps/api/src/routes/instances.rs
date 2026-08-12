@@ -111,8 +111,8 @@ async fn handle_list_instances(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<Json<instances::InstancesResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     Ok(Json(
         instances::handle_list_instances(&state, &producer).await,
@@ -134,8 +134,8 @@ async fn handle_get_instance(
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
 ) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     instances::handle_get_instance(&state, &producer, &id)
         .await
@@ -147,8 +147,8 @@ async fn handle_create_instance_view(
     Extension(handoff): Extension<RequestProducerHandoff>,
     ApiQuery(query): ApiQuery<CreateInstanceViewQuery>,
 ) -> Result<Json<CreateInstanceViewResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     Ok(Json(
         instances::handle_create_instance_view(&state, &producer, query.source.as_deref()).await,
@@ -160,8 +160,8 @@ async fn handle_create_loader_builds_view(
     Extension(handoff): Extension<RequestProducerHandoff>,
     ApiQuery(query): ApiQuery<CreateLoaderBuildsViewQuery>,
 ) -> Result<Json<CreateLoaderBuildsViewResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     instances::handle_create_loader_builds_view(
         &state,

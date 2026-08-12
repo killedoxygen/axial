@@ -355,7 +355,7 @@ impl KnownGoodInventoryStore {
     pub(super) fn claim(directory: AnchoredRecordDirectory) -> io::Result<Self> {
         Self::claim_root_with_coordinator(
             directory,
-            PersistenceCoordinator::global(),
+            PersistenceCoordinator::current(),
             #[cfg(test)]
             None,
         )

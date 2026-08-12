@@ -201,7 +201,7 @@ struct OperationJournalPersistence {
 
 impl OperationJournalPersistence {
     fn claim(directory: AnchoredRecordDirectory) -> Result<Self, OperationJournalStoreError> {
-        Self::claim_with_coordinator(directory, PersistenceCoordinator::global())
+        Self::claim_with_coordinator(directory, PersistenceCoordinator::current())
     }
 
     fn claim_with_coordinator(

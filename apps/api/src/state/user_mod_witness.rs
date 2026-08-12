@@ -105,7 +105,7 @@ impl UserModWitnessStore {
             directory,
             registered,
             registry_authoritative,
-            PersistenceCoordinator::global(),
+            PersistenceCoordinator::current(),
         )
     }
 

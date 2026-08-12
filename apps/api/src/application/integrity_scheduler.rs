@@ -2331,12 +2331,12 @@ mod tests {
         assert!(publication_barriers < install_rehydration);
         assert!(install_rehydration < repair);
         for call in [
-            "spawn_known_good_rebuilds(state);",
-            "spawn_idle_integrity_scheduler(state);",
-            "spawn_performance_operations_resume(state);",
-            "spawn_benchmark_suite_drivers_resume(state);",
-            "spawn_performance_rules_refresh(state);",
-            "spawn_telemetry_export(state);",
+            "known_good_rebuilds: spawn_known_good_rebuilds(state),",
+            "idle_integrity: spawn_idle_integrity_scheduler(state),",
+            "performance_operations: spawn_performance_operations_resume(state),",
+            "benchmark_suite_drivers: spawn_benchmark_suite_drivers_resume(state),",
+            "performance_rules: spawn_performance_rules_refresh(state),",
+            "telemetry: spawn_telemetry_export(state),",
         ] {
             assert!(repair < startup.find(call).expect("aggregated startup call"));
         }
@@ -2344,7 +2344,8 @@ mod tests {
             include_str!("../main.rs"),
             include_str!("../../../desktop/src/main.rs"),
         ] {
-            assert!(source.contains("start_application_background_workflows(&state).await"));
+            assert!(source.contains("load_application(ApplicationLoadRequest"));
+            assert!(!source.contains("start_application_background_workflows(&state).await"));
             assert!(!source.contains("spawn_performance_operations_resume"));
             assert!(!source.contains("spawn_benchmark_suite_drivers_resume"));
         }

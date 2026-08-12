@@ -1,46 +1,20 @@
 import { render } from 'preact';
 import './styles';
-import { App, preloadDeferredViews } from './App';
+import { App } from './App';
+import { startApplicationBootstrap } from './bootstrap';
 import { local } from './state';
-import {
-  appVersion,
-  bootstrapError,
-  bootstrapState,
-  config,
-  instances,
-  lastInstanceId,
-  systemInfo,
-  versions,
-  devMode,
-} from './store';
-import { api, initializeApiBase } from './api';
 import { initErrorReporting } from './error-reporting';
 import { applyTheme } from './theme';
 import { Sound, bindButtonSounds } from './sound';
-import { Music } from './music';
 import {
   applyDesktopChromeAttributes,
-  getNativeAppVersion,
   hasNativeDesktopRuntime,
   nativeDesktopCloseBlockedEventName,
   onNativeEvent,
 } from './native';
-import { refreshAccountSkin } from './player-skin';
-import { scheduleAutoUpdateCheck } from './updater';
-import { refreshInstallQueue } from './machines/downloads';
 import { toast } from './toast';
-import { errMessage } from './utils';
-import { restoreRoute, showOnboardingOverlay } from './ui-state';
-import { startupWarningMessages } from './startup-warnings';
-import {
-  configResponse,
-  instancesResponse,
-  launcherStatusResponse,
-  musicStatusResponse,
-  systemInfoResponse,
-  versionsResponse,
-} from './dto-core';
-import { dtoError, dtoRecord } from './dto-contract';
+import { restoreRoute } from './ui-state';
+import { dtoRecord } from './dto-contract';
 
 async function init(): Promise<void> {
   initErrorReporting();
@@ -61,94 +35,7 @@ async function init(): Promise<void> {
   void Sound.warmup();
   bindButtonSounds();
 
-  try {
-    await initializeApiBase();
-
-    const nativeVersion = await getNativeAppVersion();
-    if (nativeVersion) appVersion.value = nativeVersion;
-
-    let [configRes, systemRes, statusRes, musicStatusRes] = await Promise.all([
-      api('GET', '/config').then(configResponse),
-      api('GET', '/system')
-        .then(systemInfoResponse)
-        .catch(() => null),
-      api('GET', '/status')
-        .then(launcherStatusResponse)
-        .catch(() => null),
-      api('GET', '/music/status')
-        .then(musicStatusResponse)
-        .catch(() => null),
-    ]);
-    config.value = configRes;
-    systemInfo.value = systemRes;
-    devMode.value = statusRes?.dev_mode === true;
-    Music.setTrackCount(musicStatusRes?.count);
-
-    let setupRequired = statusRes?.setup_required === true;
-    if (setupRequired) {
-      try {
-        const setupError = dtoError(await api('POST', '/setup/init'));
-        if (setupError) throw new Error(setupError);
-        if (statusRes) statusRes = { ...statusRes, setup_required: false };
-        setupRequired = false;
-      } catch (err: unknown) {
-        toast(`Could not create the managed library: ${errMessage(err)}`, 'error');
-      }
-    }
-
-    if (!setupRequired) {
-      const [versionsRes, instancesRes] = await Promise.all([
-        api('GET', '/versions').then(versionsResponse),
-        api('GET', '/instances').then(instancesResponse),
-      ]);
-      versions.value = versionsRes.versions;
-      instances.value = instancesRes.instances;
-      lastInstanceId.value = instancesRes.last_instance_id;
-      await refreshInstallQueue({ connectActive: true });
-    } else {
-      versions.value = [];
-      instances.value = [];
-      lastInstanceId.value = null;
-    }
-
-    // Apply backend-persisted theme if our local default won
-    if (configRes.theme && local.theme === 'obsidian' && configRes.theme !== 'obsidian') {
-      applyTheme(configRes.theme, configRes.custom_hue ?? local.customHue, {
-        silent: true,
-        vibrancy: configRes.custom_vibrancy ?? local.customVibrancy,
-        lightness: configRes.lightness ?? local.lightness,
-      });
-    }
-
-    Music.applyConfig(configRes);
-    bootstrapError.value = null;
-    bootstrapState.value = 'ready';
-    scheduleDeferredViewWarmup();
-    if (!setupRequired) refreshAccountSkin();
-
-    for (const startupWarning of startupWarningMessages(statusRes?.warnings)) {
-      toast(startupWarning, 'info');
-    }
-
-    if (!setupRequired && configRes && configRes.onboarding_done === false) {
-      showOnboardingOverlay.value = true;
-    } else if (!setupRequired && Music.enabled) {
-      const startMusic = (): void => {
-        void Music.play();
-      };
-      window.addEventListener('pointerdown', startMusic, { once: true, capture: true });
-      window.addEventListener('keydown', startMusic, { once: true, capture: true });
-    }
-
-    try {
-      scheduleAutoUpdateCheck();
-    } catch (err: unknown) {
-      console.error('Failed to schedule update check', err);
-    }
-  } catch (err: unknown) {
-    bootstrapError.value = errMessage(err);
-    bootstrapState.value = 'error';
-  }
+  await startApplicationBootstrap();
 
   const activateSound = (): void => {
     Sound.activate();
@@ -156,17 +43,6 @@ async function init(): Promise<void> {
   window.addEventListener('pointerdown', activateSound, { once: true, capture: true });
   window.addEventListener('touchstart', activateSound, { once: true, capture: true });
   window.addEventListener('keydown', activateSound, { once: true, capture: true });
-}
-
-function scheduleDeferredViewWarmup(): void {
-  const warm = (): void => preloadDeferredViews();
-  // WebKitGTK lacks requestIdleCallback; a short delay keeps the warmup off
-  // the first interactive frames there.
-  if (typeof window.requestIdleCallback === 'function') {
-    window.requestIdleCallback(warm, { timeout: 3000 });
-  } else {
-    window.setTimeout(warm, 400);
-  }
 }
 
 function registerNativeCloseBlockedToast(): void {

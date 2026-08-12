@@ -954,7 +954,7 @@ impl BenchmarkSuiteStore {
     ) -> Result<Self, BenchmarkSuiteStoreError> {
         Self::try_load_from_paths_with_coordinator_and_claims(
             directory,
-            PersistenceCoordinator::global(),
+            PersistenceCoordinator::current(),
             retention_claims,
         )
     }

@@ -497,7 +497,7 @@ impl PreparedBenchmarkSuiteDriverStore {
     ) -> Result<LoadedBenchmarkSuiteDriverStore, BenchmarkSuiteDriverStoreError> {
         BenchmarkSuiteDriverStore::finish_load(
             self,
-            PersistenceCoordinator::global(),
+            PersistenceCoordinator::current(),
             suite_retention,
         )
     }
@@ -595,7 +595,7 @@ impl BenchmarkSuiteDriverStore {
                 suite_retention_claims,
             )
             .retention_handle();
-        Self::finish_load(prepared, PersistenceCoordinator::global(), suite_retention)
+        Self::finish_load(prepared, PersistenceCoordinator::current(), suite_retention)
             .map(LoadedBenchmarkSuiteDriverStore::into_store)
             .unwrap_or_else(|error| {
                 panic!("failed to initialize benchmark suite driver persistence: {error}")
@@ -5544,7 +5544,7 @@ mod tests {
             .retention_handle();
         let loaded = BenchmarkSuiteDriverStore::finish_load(
             prepared,
-            PersistenceCoordinator::global(),
+            PersistenceCoordinator::current(),
             suite_retention,
         )
         .expect("finish driver load");

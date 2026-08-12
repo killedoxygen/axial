@@ -197,6 +197,15 @@ impl AppLifecycle {
             .phase
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_producers(&self) -> usize {
+        self.shared
+            .state
+            .lock()
+            .expect(LIFECYCLE_LOCK_INVARIANT)
+            .active_producers
+    }
+
     async fn coordinate_quiesce(&self) {
         self.wait_for_requests_to_drain().await;
         {
@@ -282,6 +291,16 @@ impl AppLifecycle {
             return Err(LifecycleAdmissionError);
         }
         Ok(self.claim_producer(&mut state))
+    }
+
+    pub(super) fn try_claim_handoff(
+        &self,
+        handoff: &RequestProducerHandoff,
+    ) -> Result<ProducerLease, LifecycleAdmissionError> {
+        if !Arc::ptr_eq(&self.shared, &handoff.lifecycle.shared) {
+            return Err(LifecycleAdmissionError);
+        }
+        self.try_claim_request_producer(&handoff.authorization)
     }
 
     fn claim_producer(&self, state: &mut AppLifecycleState) -> ProducerLease {
@@ -414,6 +433,7 @@ impl RequestLease {
 }
 
 impl RequestProducerHandoff {
+    #[cfg(test)]
     pub(crate) fn try_claim(&self) -> Result<ProducerLease, LifecycleAdmissionError> {
         self.lifecycle
             .try_claim_request_producer(&self.authorization)

@@ -125,7 +125,7 @@ struct InstanceRegistryPersistence {
 
 impl InstanceRegistryPersistence {
     fn claim(directory: AnchoredRecordDirectory) -> Result<Self, InstanceStoreError> {
-        Self::claim_with_coordinator(directory, PersistenceCoordinator::global())
+        Self::claim_with_coordinator(directory, PersistenceCoordinator::current())
     }
 
     fn claim_with_coordinator(

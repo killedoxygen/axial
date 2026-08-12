@@ -65,7 +65,7 @@ struct AccountPersistence {
 
 impl AccountPersistence {
     fn claim(directory: AnchoredRecordDirectory) -> io::Result<Self> {
-        Self::claim_with_coordinator(directory, PersistenceCoordinator::global())
+        Self::claim_with_coordinator(directory, PersistenceCoordinator::current())
     }
 
     fn claim_with_coordinator(

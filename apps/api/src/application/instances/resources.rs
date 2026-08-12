@@ -355,7 +355,7 @@ async fn handle_backup_instance_world_inner(
         .admit_instance_content_authority(lifecycle_guard)
         .await
         .map_err(world_file_write_error_response)?;
-    let producer = handoff.try_claim().map_err(|_| {
+    let producer = state.try_claim_request_producer(&handoff).map_err(|_| {
         json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "application shutdown is in progress; try the backup again",
@@ -440,7 +440,7 @@ pub(crate) async fn handle_update_instance_mod(
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     validate_mod_name(name)?;
     let update_admission = admit_instance_mod_mutation(state)?;
-    let producer = handoff.try_claim().map_err(|_| {
+    let producer = state.try_claim_request_producer(&handoff).map_err(|_| {
         json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "application shutdown is in progress; try the mod update again",
@@ -475,7 +475,7 @@ pub(crate) async fn handle_delete_instance_mod(
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     validate_mod_name(name)?;
     let update_admission = admit_instance_mod_mutation(state)?;
-    let producer = handoff.try_claim().map_err(|_| {
+    let producer = state.try_claim_request_producer(&handoff).map_err(|_| {
         json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "application shutdown is in progress; try the mod deletion again",

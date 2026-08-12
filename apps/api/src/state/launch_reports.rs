@@ -406,7 +406,7 @@ impl LaunchReportStore {
     ) -> io::Result<Self> {
         Self::load_from_paths_with_coordinator_and_retention(
             directory,
-            PersistenceCoordinator::global(),
+            PersistenceCoordinator::current(),
             proof_retention,
         )
     }

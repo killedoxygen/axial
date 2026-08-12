@@ -57,7 +57,7 @@ pub(crate) async fn handle_open_instance_folder(
         .admit_instance_content_authority(lifecycle)
         .await
         .map_err(instance_folder_prepare_error_response)?;
-    let producer = handoff.try_claim().map_err(|_| {
+    let producer = state.try_claim_request_producer(&handoff).map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({

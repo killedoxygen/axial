@@ -2949,7 +2949,9 @@ mod tests {
             .await
             .expect("reconcile reloaded Guardian state");
         assert!(
-            crate::app::start_application_background_workflows(&restarted_state).await,
+            crate::app::start_application_background_workflows(&restarted_state)
+                .await
+                .is_ok(),
             "full application startup adopts exact Core VersionBundle settlement"
         );
         let acknowledged_terminal = restarted_journals

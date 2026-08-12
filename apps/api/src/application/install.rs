@@ -3076,8 +3076,8 @@ pub(crate) async fn enqueue_install_owned(
     request: InstallQueueRequest,
     handoff: RequestProducerHandoff,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(|_| install_shutdown_error_response())?;
     enqueue_install_with_dependency(state, request, None, None, producer).await
 }
@@ -3189,8 +3189,8 @@ pub(crate) async fn retry_install_owned(
     request: InstallQueueRequest,
     handoff: RequestProducerHandoff,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(|_| install_shutdown_error_response())?;
     let update_admission = state
         .try_admit_update_sensitive_operation()
@@ -3212,8 +3212,8 @@ pub(crate) async fn remove_queued_install_owned(
     queue_id: &str,
     handoff: RequestProducerHandoff,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(|_| install_shutdown_error_response())?;
     let cleanup_foreground = state
         .register_integrity_foreground()
@@ -3598,8 +3598,8 @@ async fn maybe_start_next_queued_install(
     state: &AppState,
     handoff: RequestProducerHandoff,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(|_| install_shutdown_error_response())?;
     maybe_start_next_queued_install_owned(state, &producer).await
 }

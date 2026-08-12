@@ -57,7 +57,9 @@ pub(crate) async fn music_status(
     state: &AppState,
     handoff: RequestProducerHandoff,
 ) -> Result<MusicStatusResponse, MusicStatusUnavailable> {
-    let producer = handoff.try_claim().map_err(|_| MusicStatusUnavailable)?;
+    let producer = state
+        .try_claim_request_producer(&handoff)
+        .map_err(|_| MusicStatusUnavailable)?;
     let owner = state.music_cache().clone();
     let cached = producer
         .spawn_joinable(async move {
@@ -98,9 +100,14 @@ pub(crate) async fn music_track(
     let worker_name = name.clone();
     let owner = state.music_cache().clone();
     let claim = owner
-        .claim_flight(track.id, &handoff, move |owner, track, id, producer| {
-            spawn_music_worker(owner, track, id, worker_name, producer);
-        })
+        .claim_flight_for_state(
+            state,
+            track.id,
+            &handoff,
+            move |owner, track, id, producer| {
+                spawn_music_worker(owner, track, id, worker_name, producer);
+            },
+        )
         .map_err(|_| MusicTrackError::Unavailable)?;
 
     let completion = match claim {
@@ -110,13 +117,15 @@ pub(crate) async fn music_track(
         MusicFlightClaim::Unsettled => MusicFlightCompletion::Unsettled,
     };
     match completion {
-        MusicFlightCompletion::Ready => read_track_owned(owner, name, handoff).await,
+        MusicFlightCompletion::Ready => read_track_owned(state, owner, name, handoff).await,
         MusicFlightCompletion::Failed => Err(download_failed()),
-        MusicFlightCompletion::Unsettled => match read_track_owned(owner, name, handoff).await {
-            Ok(track) => Ok(track),
-            Err(MusicTrackError::Unavailable) => Err(MusicTrackError::Unavailable),
-            Err(_) => Err(download_failed()),
-        },
+        MusicFlightCompletion::Unsettled => {
+            match read_track_owned(state, owner, name, handoff).await {
+                Ok(track) => Ok(track),
+                Err(MusicTrackError::Unavailable) => Err(MusicTrackError::Unavailable),
+                Err(_) => Err(download_failed()),
+            }
+        }
         MusicFlightCompletion::Running => Err(download_failed()),
     }
 }
@@ -312,12 +321,13 @@ async fn read_cached_on_blocking(owner: MusicCacheOwner, name: LeafName) -> Bloc
 }
 
 async fn read_track_owned(
+    state: &AppState,
     owner: MusicCacheOwner,
     name: LeafName,
     handoff: RequestProducerHandoff,
 ) -> Result<MusicTrackBytes, MusicTrackError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(|_| MusicTrackError::Unavailable)?;
     let blocking = producer
         .spawn_joinable(async move {

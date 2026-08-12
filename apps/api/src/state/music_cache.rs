@@ -222,10 +222,30 @@ impl MusicCacheOwner {
         }
     }
 
+    pub(crate) fn claim_flight_for_state(
+        &self,
+        state: &super::AppState,
+        track: MusicTrackId,
+        handoff: &RequestProducerHandoff,
+        start: impl FnOnce(MusicCacheOwner, MusicTrackId, u64, ProducerLease),
+    ) -> Result<MusicFlightClaim, LifecycleAdmissionError> {
+        self.claim_flight_with(track, || state.try_claim_request_producer(handoff), start)
+    }
+
+    #[cfg(test)]
     pub(crate) fn claim_flight(
         &self,
         track: MusicTrackId,
         handoff: &RequestProducerHandoff,
+        start: impl FnOnce(MusicCacheOwner, MusicTrackId, u64, ProducerLease),
+    ) -> Result<MusicFlightClaim, LifecycleAdmissionError> {
+        self.claim_flight_with(track, || handoff.try_claim(), start)
+    }
+
+    fn claim_flight_with(
+        &self,
+        track: MusicTrackId,
+        claim_producer: impl FnOnce() -> Result<ProducerLease, LifecycleAdmissionError>,
         start: impl FnOnce(MusicCacheOwner, MusicTrackId, u64, ProducerLease),
     ) -> Result<MusicFlightClaim, LifecycleAdmissionError> {
         let mut flight = music_lock(self.shared.flights.get(track));
@@ -241,7 +261,7 @@ impl MusicCacheOwner {
             flight.state = MusicFlightState::Unsettled;
             return Ok(MusicFlightClaim::Unsettled);
         }
-        let producer = handoff.try_claim()?;
+        let producer = claim_producer()?;
         let id = flight.next_id;
         flight.next_id += 1;
         let (completion, receiver) = watch::channel(MusicFlightCompletion::Running);

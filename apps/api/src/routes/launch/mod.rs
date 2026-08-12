@@ -85,8 +85,8 @@ async fn handle_launch(
     Extension(handoff): Extension<RequestProducerHandoff>,
     ApiJson(payload): ApiJson<launch_app::LaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(launch_app::launch_shutdown_error_response)?;
     let prepared = launch_app::prepare_launch_session_owned(&state, payload, &producer).await?;
     let initial_status = launch_app::launch_status(&state, &prepared.task.session_id.0).await?;
@@ -119,8 +119,8 @@ async fn handle_benchmark_launch(
     Extension(handoff): Extension<RequestProducerHandoff>,
     ApiJson(payload): ApiJson<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(launch_app::launch_shutdown_error_response)?;
     launch_app::launch_benchmark(state, payload, producer)
         .await
@@ -132,8 +132,8 @@ async fn handle_benchmark_suite_launch(
     Extension(handoff): Extension<RequestProducerHandoff>,
     ApiJson(payload): ApiJson<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(launch_app::launch_shutdown_error_response)?;
     launch_app::launch_benchmark_suite(state, payload, producer)
         .await
@@ -145,8 +145,8 @@ async fn handle_benchmark_suite_tick(
     Extension(handoff): Extension<RequestProducerHandoff>,
     ApiJson(payload): ApiJson<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(launch_app::launch_shutdown_error_response)?;
     launch_app::tick_benchmark_suite(state, payload, producer)
         .await
@@ -158,8 +158,8 @@ async fn handle_benchmark_suite_driver_start(
     Extension(handoff): Extension<RequestProducerHandoff>,
     ApiJson(payload): ApiJson<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(launch_app::launch_shutdown_error_response)?;
     launch_app::start_benchmark_suite_driver(state, payload, producer)
         .await
@@ -197,8 +197,8 @@ async fn handle_benchmark_suite_driver_resume(
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(launch_app::launch_shutdown_error_response)?;
     launch_app::resume_benchmark_suite_driver(state, id, producer)
         .await
@@ -251,8 +251,8 @@ async fn handle_launch_events(
     >,
     (StatusCode, Json<serde_json::Value>),
 > {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     stream::launch_events_sse(state, id, producer).await
 }
@@ -278,8 +278,8 @@ async fn handle_launch_kill(
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    let producer = handoff
-        .try_claim()
+    let producer = state
+        .try_claim_request_producer(&handoff)
         .map_err(launch_app::launch_shutdown_error_response)?;
     launch_app::stop_launch_session(&state, &id, &producer)
         .await

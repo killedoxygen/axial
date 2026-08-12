@@ -457,14 +457,14 @@ impl PerformanceOperationStore {
 
     #[cfg(test)]
     pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, PerformanceOperationStoreError> {
-        Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::global())
+        Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::current())
     }
 
     pub(super) fn load_from_paths_for_startup(
         directory: AnchoredRecordDirectory,
     ) -> Result<LoadedPerformanceOperationStore, PerformanceOperationStoreError> {
         Self::try_load_from_paths_with_coordinator_for_startup(
-            PersistenceCoordinator::global(),
+            PersistenceCoordinator::current(),
             directory,
         )
     }

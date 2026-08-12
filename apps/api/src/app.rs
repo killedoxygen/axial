@@ -44,53 +44,82 @@ pub fn build_router(state: AppState, authority: LocalApiAuthority) -> Router {
     }
 }
 
-pub async fn start_application_background_workflows(state: &AppState) -> bool {
-    if !settle_startup_publication_barriers(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptionalWorkflowState {
+    Disabled,
+    Started,
+    AdmissionFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApplicationStartupHealth {
+    pub known_good_rebuilds: OptionalWorkflowState,
+    pub idle_integrity: OptionalWorkflowState,
+    pub performance_operations: OptionalWorkflowState,
+    pub benchmark_suite_drivers: OptionalWorkflowState,
+    pub performance_rules: OptionalWorkflowState,
+    pub telemetry: OptionalWorkflowState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum ApplicationStartupError {
+    #[error("Guardian failure-memory startup settlement is incomplete")]
+    GuardianFailureMemory,
+    #[error("install startup recovery is incomplete")]
+    InstallRecovery,
+    #[error("version-bundle startup settlement is incomplete")]
+    VersionBundlePublications,
+    #[error("persisted-state startup repair is incomplete")]
+    PersistedStateRepairs,
+}
+
+pub async fn start_application_background_workflows(
+    state: &AppState,
+) -> Result<ApplicationStartupHealth, ApplicationStartupError> {
+    settle_startup_publication_barriers(
         state,
         crate::application::rehydrate_startup_installs(state),
     )
-    .await
-    {
-        return false;
-    }
+    .await?;
     if !crate::application::settle_startup_persisted_state_repairs(state).await {
-        return false;
+        return Err(ApplicationStartupError::PersistedStateRepairs);
     }
     crate::application::cleanup_update_staging(state).await;
-    spawn_known_good_rebuilds(state);
-    spawn_idle_integrity_scheduler(state);
-    spawn_performance_operations_resume(state);
-    spawn_benchmark_suite_drivers_resume(state);
-    spawn_performance_rules_refresh(state);
-    spawn_telemetry_export(state);
-    true
+    Ok(ApplicationStartupHealth {
+        known_good_rebuilds: spawn_known_good_rebuilds(state),
+        idle_integrity: spawn_idle_integrity_scheduler(state),
+        performance_operations: spawn_performance_operations_resume(state),
+        benchmark_suite_drivers: spawn_benchmark_suite_drivers_resume(state),
+        performance_rules: spawn_performance_rules_refresh(state),
+        telemetry: spawn_telemetry_export(state),
+    })
 }
 
 pub(crate) async fn settle_startup_publication_barriers<InstallRecovery>(
     state: &AppState,
     install_recovery: InstallRecovery,
-) -> bool
+) -> Result<(), ApplicationStartupError>
 where
     InstallRecovery: Future<Output = bool>,
 {
     if !crate::application::settle_startup_install_guardian_failure_memory(state).await {
-        return false;
+        return Err(ApplicationStartupError::GuardianFailureMemory);
     }
     if !install_recovery.await {
-        return false;
+        return Err(ApplicationStartupError::InstallRecovery);
     }
     if !crate::application::settle_startup_version_bundle_publications(state).await {
-        return false;
+        return Err(ApplicationStartupError::VersionBundlePublications);
     }
-    true
+    Ok(())
 }
 
-fn spawn_performance_rules_refresh(state: &AppState) -> bool {
+fn spawn_performance_rules_refresh(state: &AppState) -> OptionalWorkflowState {
     if !state.performance().remote_refresh_enabled() {
-        return false;
+        return OptionalWorkflowState::Disabled;
     }
     let Ok(producer) = state.try_claim_producer() else {
-        return false;
+        return OptionalWorkflowState::AdmissionFailed;
     };
     let shutdown = state.subscribe_shutdown();
 
@@ -111,26 +140,26 @@ fn spawn_performance_rules_refresh(state: &AppState) -> bool {
         shutdown,
     ));
 
-    true
+    OptionalWorkflowState::Started
 }
 
-fn spawn_telemetry_export(state: &AppState) -> bool {
+fn spawn_telemetry_export(state: &AppState) -> OptionalWorkflowState {
     install_panic_capture(state.telemetry().clone());
     state.telemetry().emit(TelemetryEvent::app_started(
         state.version(),
         &state.config().current(),
     ));
     if !state.telemetry().export_configured() {
-        return false;
+        return OptionalWorkflowState::Disabled;
     }
     let Ok(producer) = state.try_claim_producer() else {
-        return false;
+        return OptionalWorkflowState::AdmissionFailed;
     };
 
     let telemetry = state.telemetry().clone();
     let shutdown = state.subscribe_shutdown();
     producer.spawn(run_telemetry_flush_loop(telemetry, shutdown));
-    true
+    OptionalWorkflowState::Started
 }
 
 async fn run_periodic_refresh_loop<F, Fut>(
@@ -212,32 +241,39 @@ fn parse_performance_rules_refresh_interval(value: Option<&str>) -> Duration {
     )
 }
 
-fn spawn_performance_operations_resume(state: &AppState) -> bool {
+fn spawn_performance_operations_resume(state: &AppState) -> OptionalWorkflowState {
     let Ok(producer) = state.try_claim_producer() else {
-        return false;
+        return OptionalWorkflowState::AdmissionFailed;
     };
     crate::application::spawn_pending_performance_operations(state, producer);
-    true
+    OptionalWorkflowState::Started
 }
 
-fn spawn_known_good_rebuilds(state: &AppState) -> bool {
+fn spawn_known_good_rebuilds(state: &AppState) -> OptionalWorkflowState {
     let Ok(producer) = state.try_claim_producer() else {
-        return false;
+        return OptionalWorkflowState::AdmissionFailed;
     };
-    crate::application::spawn_startup_known_good_rebuilds(state, producer);
-    true
+    if crate::application::spawn_startup_known_good_rebuilds(state, producer) {
+        OptionalWorkflowState::Started
+    } else {
+        OptionalWorkflowState::Disabled
+    }
 }
 
-fn spawn_idle_integrity_scheduler(state: &AppState) -> bool {
+fn spawn_idle_integrity_scheduler(state: &AppState) -> OptionalWorkflowState {
     let Ok(producer) = state.try_claim_producer() else {
-        return false;
+        return OptionalWorkflowState::AdmissionFailed;
     };
     crate::application::spawn_idle_integrity_scheduler(state, producer);
-    true
+    OptionalWorkflowState::Started
 }
 
-fn spawn_benchmark_suite_drivers_resume(state: &AppState) -> bool {
-    crate::application::launch::spawn_restart_interrupted_benchmark_suite_drivers(state)
+fn spawn_benchmark_suite_drivers_resume(state: &AppState) -> OptionalWorkflowState {
+    if crate::application::launch::spawn_restart_interrupted_benchmark_suite_drivers(state) {
+        OptionalWorkflowState::Started
+    } else {
+        OptionalWorkflowState::AdmissionFailed
+    }
 }
 
 #[derive(Debug)]
@@ -749,7 +785,10 @@ mod tests {
     async fn performance_rules_refresh_spawns_only_when_remote_url_is_configured() {
         let unset_root = axial_api_test_support::test_root("app-refresh-unset");
         let unset_state = build_test_state(&unset_root, None);
-        assert!(!spawn_performance_rules_refresh(&unset_state));
+        assert_eq!(
+            spawn_performance_rules_refresh(&unset_state),
+            OptionalWorkflowState::Disabled
+        );
         unset_state
             .shutdown()
             .await
@@ -762,7 +801,10 @@ mod tests {
             &configured_root,
             Some("http://127.0.0.1:9/rules.json".to_string()),
         );
-        assert!(spawn_performance_rules_refresh(&configured_state));
+        assert_eq!(
+            spawn_performance_rules_refresh(&configured_state),
+            OptionalWorkflowState::Started
+        );
         configured_state
             .quiesce()
             .await
@@ -776,7 +818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn performance_resume_root_is_rejected_once_request_drain_begins() {
+    async fn p02_b07_contract_optional_workflow_reports_admission_failure_during_request_drain() {
         let root = axial_api_test_support::test_root("performance-resume-draining");
         let state = build_test_state(&root, None);
         let request = state.try_admit_request().expect("admit held request");
@@ -790,7 +832,10 @@ mod tests {
         .await
         .expect("request drain begins");
 
-        assert!(!spawn_performance_operations_resume(&state));
+        assert_eq!(
+            spawn_performance_operations_resume(&state),
+            OptionalWorkflowState::AdmissionFailed
+        );
         drop(request);
         quiesce
             .await

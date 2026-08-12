@@ -23,7 +23,9 @@ pub(crate) async fn setup_init_owned(
     state: &AppState,
     handoff: RequestProducerHandoff,
 ) -> Result<SetupLibraryResponse, ApiError> {
-    let producer = handoff.try_claim().map_err(|_| setup_shutdown_error())?;
+    let producer = state
+        .try_claim_request_producer(&handoff)
+        .map_err(|_| setup_shutdown_error())?;
     let foreground = state
         .register_integrity_foreground()
         .map_err(|_| setup_shutdown_error())?;

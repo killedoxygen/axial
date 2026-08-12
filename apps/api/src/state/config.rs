@@ -25,7 +25,7 @@ struct ConfigPersistence {
 
 impl ConfigPersistence {
     fn claim(directory: AnchoredRecordDirectory) -> Result<Self, ConfigStoreError> {
-        Self::claim_with_coordinator(directory, PersistenceCoordinator::global())
+        Self::claim_with_coordinator(directory, PersistenceCoordinator::current())
     }
 
     fn claim_with_coordinator(

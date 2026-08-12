@@ -1,17 +1,12 @@
-use axial_api::app::{DEFAULT_API_PORT, build_router, start_application_background_workflows};
+use axial_api::app::{DEFAULT_API_PORT, build_router};
 use axial_api::bootstrap::{
-    app_root_selection_from_environment, open_app_root_session, resolve_app_paths,
+    ApplicationLoadRequest, app_root_selection_from_environment, load_application,
 };
 use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
-use axial_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
+use axial_api::state::AppState;
 use axial_api::transport::LocalApiAuthority;
-use axial_config::{ConfigStore, InstanceStore};
-use axial_performance::PerformanceManager;
-use axial_resource::{
-    PhysicalIoClass, PhysicalWorkError, PhysicalWorkRequest, process_physical_work,
-};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -32,49 +27,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let addr = api_addr_from_environment()?;
 
-    let paths = resolve_app_paths(app_root_selection_from_environment()?)?;
-    let root_session = open_app_root_session(&paths)?;
-    let root_session = Arc::new(root_session);
-    let config_paths = paths.clone();
-    let config_root_session = Arc::clone(&root_session);
-    let config_startup = run_startup_blocking(PhysicalIoClass::Write, move || {
-        ConfigStore::load_for_startup(config_paths, config_root_session)
-    })
-    .await??;
-    let instance_paths = paths.clone();
-    let instance_root_session = Arc::clone(&root_session);
-    let instance_startup = run_startup_blocking(PhysicalIoClass::Write, move || {
-        InstanceStore::load_for_startup(instance_paths, instance_root_session)
-    })
-    .await??;
-    let mut startup_warnings = config_startup.warnings;
-    startup_warnings.extend(instance_startup.warnings);
-    let config = Arc::new(config_startup.store);
-    let instances = Arc::new(instance_startup.store);
-    let installs = Arc::new(InstallStore::new());
-    let sessions = Arc::new(SessionStore::new());
-    drop(root_session.prepare_performance_directory()?);
-    let performance_dir = paths.performance_dir().to_path_buf();
-    let performance = Arc::new(
-        run_startup_blocking(PhysicalIoClass::Heavy, move || {
-            PerformanceManager::load_for_startup(&performance_dir)
-        })
-        .await??,
-    );
-    let state = AppState::load(AppStateInit {
+    let loaded = load_application(ApplicationLoadRequest {
+        root: app_root_selection_from_environment()?,
         app_name: "Axial".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        config,
-        instances,
-        installs,
-        sessions,
-        performance,
-        startup_warnings,
     })
     .await?;
-    if !start_application_background_workflows(&state).await {
-        return Err(std::io::Error::other("startup background ownership was refused").into());
-    }
+    let state = loaded.state;
+    tracing::debug!(health = ?loaded.health, "application startup settled");
 
     let telemetry = state.telemetry().clone();
     let result = serve_api(state, addr).await;
@@ -98,21 +58,6 @@ fn api_addr_from_environment() -> Result<SocketAddr, Box<dyn std::error::Error>>
         .into());
     }
     Ok(addr)
-}
-
-async fn run_startup_blocking<T, Work>(
-    io_class: PhysicalIoClass,
-    work: Work,
-) -> Result<T, PhysicalWorkError>
-where
-    T: Send + 'static,
-    Work: FnOnce() -> T + Send + 'static,
-{
-    process_physical_work()
-        .admit(PhysicalWorkRequest::foreground(io_class, 0))
-        .await?
-        .run(move |_| work())
-        .await
 }
 
 async fn serve_api(state: AppState, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {

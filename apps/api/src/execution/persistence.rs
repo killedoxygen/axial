@@ -14,16 +14,22 @@ use axial_fs::{
     leaf_names_equivalent,
 };
 use axial_resource::{PhysicalIoClass, PhysicalWorkError, process_physical_work};
+use std::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::ffi::OsStr;
 use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicUsize as SyncAtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
+use std::sync::{Arc, Mutex, Weak};
+#[cfg(test)]
+use std::sync::{OnceLock, mpsc};
+#[cfg(test)]
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tokio::runtime::{Builder, Handle};
+#[cfg(test)]
+use tokio::runtime::Builder;
+use tokio::runtime::Handle;
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot, watch};
 use tokio::time::Instant;
 
@@ -133,10 +139,12 @@ struct CoordinatorExecutor {
 
 struct CoordinatorExecutorInner {
     handle: Handle,
+    #[cfg(test)]
     _thread: Option<JoinHandle<()>>,
 }
 
 impl CoordinatorExecutor {
+    #[cfg(test)]
     fn process_lifetime() -> Self {
         let (handle_tx, handle_rx) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
@@ -163,11 +171,11 @@ impl CoordinatorExecutor {
         }
     }
 
-    #[cfg(test)]
     fn captured(handle: Handle) -> Self {
         Self {
             inner: Arc::new(CoordinatorExecutorInner {
                 handle,
+                #[cfg(test)]
                 _thread: None,
             }),
         }
@@ -199,8 +207,49 @@ struct CoordinatorInner {
     executor: CoordinatorExecutor,
 }
 
+thread_local! {
+    static APPLICATION_COORDINATOR: RefCell<Option<PersistenceCoordinator>> = const { RefCell::new(None) };
+}
+
+struct ApplicationCoordinatorScope(Option<PersistenceCoordinator>);
+
+impl Drop for ApplicationCoordinatorScope {
+    fn drop(&mut self) {
+        APPLICATION_COORDINATOR.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
 impl PersistenceCoordinator {
-    pub(crate) fn global() -> Self {
+    pub(crate) fn application(handle: Handle) -> Self {
+        Self::new(
+            Arc::new(FileAtomicWriteBackend),
+            PersistenceSchedule::default(),
+            CoordinatorExecutor::captured(handle),
+        )
+    }
+
+    pub(crate) fn with_application<T>(self, work: impl FnOnce() -> T) -> T {
+        APPLICATION_COORDINATOR.with(|slot| {
+            let previous = slot.replace(Some(self));
+            let _scope = ApplicationCoordinatorScope(previous);
+            work()
+        })
+    }
+
+    pub(crate) fn current() -> Self {
+        if let Some(coordinator) = APPLICATION_COORDINATOR.with(|slot| slot.borrow().clone()) {
+            return coordinator;
+        }
+        #[cfg(not(test))]
+        panic!("application persistence coordinator was not installed");
+        #[cfg(test)]
+        return Self::test_process_lifetime();
+    }
+
+    #[cfg(test)]
+    fn test_process_lifetime() -> Self {
         static COORDINATOR: OnceLock<PersistenceCoordinator> = OnceLock::new();
         COORDINATOR
             .get_or_init(|| {
@@ -240,6 +289,34 @@ impl PersistenceCoordinator {
         target: AnchoredRecordTarget,
     ) -> Result<PersistenceOwnerLease, PersistenceError> {
         self.claim(target.directory(), OwnerScope::Record(target))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_worker_count(&self) -> usize {
+        let mut owners = self
+            .inner
+            .owners
+            .lock()
+            .expect("persistence owner registry lock poisoned");
+        owners.retain(|_, claims| claims.retain_live());
+        owners
+            .values()
+            .flat_map(|claims| {
+                claims
+                    .directory
+                    .iter()
+                    .chain(claims.records.iter().map(|(_, owner)| owner))
+            })
+            .filter_map(Weak::upgrade)
+            .flat_map(|owner| {
+                let mut state = owner
+                    .state
+                    .lock()
+                    .expect("persistence owner state lock poisoned");
+                live_owner_lanes(&mut state)
+            })
+            .map(|lane| lane.worker_tasks.active.load(AtomicOrdering::Acquire))
+            .sum()
     }
 
     fn claim(
@@ -1827,7 +1904,7 @@ mod tests {
     fn process_executor_survives_the_accepting_runtime_shutdown() {
         let root = unique_root("process-executor");
         let destination = root.join("snapshot.json");
-        let owner = PersistenceCoordinator::global()
+        let owner = PersistenceCoordinator::current()
             .claim_directory(test_directory(&root))
             .expect("claim process owner");
         let writer = test_writer(&owner, &destination).expect("process writer");
