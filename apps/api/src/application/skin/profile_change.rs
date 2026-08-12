@@ -376,6 +376,22 @@ async fn queue_saved_skin_apply(
     texture_key: String,
     handoff: RequestProducerHandoff,
 ) -> Result<Json<SkinApplyResponse>, ApiError> {
+    let change = prepare_pending_saved_skin_apply(state, texture_key).await?;
+    let texture_key = change.texture_key.clone();
+    let producer = handoff.try_claim().map_err(|_| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Skin changes are unavailable while the application is shutting down",
+        )
+    })?;
+    set_pending_saved_skin_apply(state.clone(), change, producer).await;
+    Ok(queued_skin_apply_response(texture_key))
+}
+
+async fn prepare_pending_saved_skin_apply(
+    state: &AppState,
+    texture_key: String,
+) -> Result<PendingSkinApplyChange, ApiError> {
     let texture_key = validate_texture_key(&texture_key)?;
     let account = active_ready_minecraft_account_for_skin_apply(state).await?;
     let saved_skins = list_saved_skins(state).await?;
@@ -385,31 +401,32 @@ async fn queue_saved_skin_apply(
     {
         return Err(json_error(StatusCode::NOT_FOUND, "saved skin not found"));
     }
+    Ok(PendingSkinApplyChange {
+        login_id: account.login_id,
+        texture_key,
+    })
+}
 
-    let producer = handoff.try_claim().map_err(|_| {
-        json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Skin changes are unavailable while the application is shutting down",
-        )
-    })?;
-    set_pending_saved_skin_apply(
-        state.clone(),
-        PendingSkinApplyChange {
-            login_id: account.login_id,
-            texture_key: texture_key.clone(),
-        },
-        producer,
-    )
-    .await;
+#[cfg(test)]
+pub(super) async fn queue_saved_skin_apply_for_test(
+    state: &AppState,
+    texture_key: String,
+) -> Result<Json<SkinApplyResponse>, ApiError> {
+    let change = prepare_pending_saved_skin_apply(state, texture_key).await?;
+    let texture_key = change.texture_key.clone();
+    insert_pending_saved_skin_apply(change).await;
+    Ok(queued_skin_apply_response(texture_key))
+}
 
-    Ok(Json(SkinApplyResponse {
+fn queued_skin_apply_response(texture_key: String) -> Json<SkinApplyResponse> {
+    Json(SkinApplyResponse {
         status: "queued",
         texture_key,
         profile_updated: false,
         view_model: SkinCommandViewModel {
             summary: "Skin will apply shortly.",
         },
-    }))
+    })
 }
 
 async fn active_ready_minecraft_account_for_skin_apply(

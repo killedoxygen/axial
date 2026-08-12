@@ -14,7 +14,9 @@ pub(crate) use saved::{
 };
 
 #[cfg(test)]
-pub(crate) use saved::test_set_pending_saved_skin_apply_for_login_id;
+pub(crate) use saved::{
+    pending_saved_skin_apply_test_guard, test_set_pending_saved_skin_apply_for_login_id,
+};
 
 #[cfg(test)]
 use crate::state::skins::SavedSkinRecord;
@@ -96,6 +98,8 @@ pub(crate) use profile_media::{
     handle_skin_lookup_head, handle_skin_profile, handle_skin_profile_file,
 };
 
+#[cfg(test)]
+use profile_change::queue_saved_skin_apply_for_test;
 #[cfg(test)]
 pub(crate) use profile_change::{
     SkinApplyResponse, SkinCapeResetResponse, SkinCommandViewModel, SkinFlushResponse,
@@ -490,14 +494,7 @@ mod tests {
             &self,
             texture_key: &str,
         ) -> Result<Json<SkinApplyResponse>, (StatusCode, Json<serde_json::Value>)> {
-            let request = self.state.try_admit_request().expect("admit skin request");
-            handle_apply_saved_skin(
-                &self.state,
-                texture_key.to_string(),
-                ApplySavedSkinQuery { defer: Some(true) },
-                request.producer_handoff(),
-            )
-            .await
+            queue_saved_skin_apply_for_test(&self.state, texture_key.to_string()).await
         }
 
         async fn clear_pending_saved_skin_apply(

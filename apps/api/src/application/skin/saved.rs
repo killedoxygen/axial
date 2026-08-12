@@ -19,6 +19,9 @@ static PENDING_SKIN_APPLIES: LazyLock<tokio::sync::Mutex<PendingSkinApplyState>>
     LazyLock::new(|| tokio::sync::Mutex::new(PendingSkinApplyState::default()));
 static PENDING_SKIN_APPLY_FLUSH_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+#[cfg(test)]
+static PENDING_SKIN_APPLY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Debug, Default)]
 struct PendingSkinApplyState {
@@ -175,6 +178,11 @@ pub(super) async fn clear_pending_saved_skin_apply_for_texture(texture_key: &str
 
 pub(super) async fn pending_saved_skin_apply_flush_guard() -> tokio::sync::MutexGuard<'static, ()> {
     PENDING_SKIN_APPLY_FLUSH_LOCK.lock().await
+}
+
+#[cfg(test)]
+pub(crate) async fn pending_saved_skin_apply_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    PENDING_SKIN_APPLY_TEST_LOCK.lock().await
 }
 
 pub(super) async fn take_pending_saved_skin_apply(

@@ -644,6 +644,7 @@ async fn skin_saved_replace_texture_clears_stale_applied_state() {
 
 #[tokio::test]
 async fn skin_saved_replace_texture_retargets_pending_apply() {
+    let _pending_skin_applies = pending_saved_skin_apply_test_guard().await;
     let fixture = TestFixture::new("saved-replace-retargets-pending", "ConfigUser");
     fixture
         .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
@@ -715,6 +716,7 @@ async fn skin_saved_delete_removes_local_skin() {
 
 #[tokio::test]
 async fn skin_saved_delete_clears_matching_pending_apply() {
+    let _pending_skin_applies = pending_saved_skin_apply_test_guard().await;
     let fixture = TestFixture::new("saved-delete-clears-pending", "ConfigUser");
     fixture
         .add_minecraft_account(test_profile("MinecraftName", Vec::new()))

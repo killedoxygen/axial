@@ -1472,6 +1472,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_logout_clears_active_msa_auth() {
+        let _pending_skin_applies = skin::pending_saved_skin_apply_test_guard().await;
         let store = Arc::new(AuthLoginStore::new());
         store
             .replace_with_msa_token(NewAuthLoginMsaToken {
@@ -1501,6 +1502,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_logout_clears_all_pending_skin_applies() {
+        let _pending_skin_applies = skin::pending_saved_skin_apply_test_guard().await;
         let store = Arc::new(AuthLoginStore::new());
         skin::clear_all_pending_saved_skin_applies().await;
         skin::test_set_pending_saved_skin_apply_for_login_id("login-a").await;
@@ -1515,6 +1517,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_logout_clears_launcher_accounts_and_online_config() {
+        let _pending_skin_applies = skin::pending_saved_skin_apply_test_guard().await;
         let fixture = TestFixture::new("logout-clears-accounts", "Player");
         let offline = fixture
             .state

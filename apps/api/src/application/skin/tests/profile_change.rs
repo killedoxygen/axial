@@ -64,6 +64,7 @@ async fn skin_apply_rejects_invalid_texture_key() {
 
 #[tokio::test]
 async fn skin_profile_reset_preserves_current_skin_and_clears_local_apply_state() {
+    let _pending_skin_applies = pending_saved_skin_apply_test_guard().await;
     let fixture = TestFixture::new("profile-reset-success", "ConfigUser");
     let external_png = test_slim_skin_png();
     let external_normalized = normalize_skin_png(&external_png).expect("external normalized");
@@ -229,6 +230,7 @@ async fn skin_profile_reset_upstream_429_maps_to_bounded_rate_limit() {
 
 #[tokio::test]
 async fn skin_cape_reset_preserves_current_skin_and_clears_local_apply_state() {
+    let _pending_skin_applies = pending_saved_skin_apply_test_guard().await;
     let fixture = TestFixture::new("cape-reset-success", "ConfigUser");
     let external_png = test_slim_skin_png();
     let external_normalized = normalize_skin_png(&external_png).expect("external normalized");
@@ -509,6 +511,7 @@ async fn skin_apply_success_marks_saved_skin_applied_and_clears_prior_marker() {
 
 #[tokio::test]
 async fn skin_apply_defer_queues_until_flush() {
+    let _pending_skin_applies = pending_saved_skin_apply_test_guard().await;
     let fixture = TestFixture::new("apply-defer-flush", "ConfigUser");
     fixture
         .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
@@ -570,6 +573,7 @@ async fn skin_apply_defer_queues_until_flush() {
 
 #[tokio::test]
 async fn skin_apply_shutdown_flushes_active_pending_change() {
+    let _pending_skin_applies = pending_saved_skin_apply_test_guard().await;
     let fixture = TestFixture::new("apply-shutdown-flush", "ConfigUser");
     fixture
         .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
@@ -614,6 +618,7 @@ async fn skin_apply_shutdown_flushes_active_pending_change() {
 
 #[tokio::test]
 async fn skin_apply_defer_clear_removes_pending_for_active_account() {
+    let _pending_skin_applies = pending_saved_skin_apply_test_guard().await;
     let fixture = TestFixture::new("apply-defer-clear", "ConfigUser");
     fixture
         .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
@@ -647,6 +652,7 @@ async fn skin_apply_defer_clear_removes_pending_for_active_account() {
 
 #[tokio::test]
 async fn skin_apply_clear_for_login_id_removes_pending_apply() {
+    let _pending_skin_applies = pending_saved_skin_apply_test_guard().await;
     let fixture = TestFixture::new("apply-clear-login-id", "ConfigUser");
     fixture
         .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
@@ -677,6 +683,7 @@ async fn skin_apply_clear_for_login_id_removes_pending_apply() {
 
 #[tokio::test]
 async fn skin_apply_defer_keeps_latest_for_same_account() {
+    let _pending_skin_applies = pending_saved_skin_apply_test_guard().await;
     let fixture = TestFixture::new("apply-defer-latest-wins", "ConfigUser");
     fixture
         .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
@@ -738,6 +745,7 @@ async fn skin_apply_defer_keeps_latest_for_same_account() {
 
 #[tokio::test]
 async fn skin_apply_defer_flushes_against_queued_login_after_account_switch() {
+    let _pending_skin_applies = pending_saved_skin_apply_test_guard().await;
     let fixture = TestFixture::new("apply-defer-original-login", "ConfigUser");
     let first_account = fixture
         .add_minecraft_account_with_tokens(
@@ -812,6 +820,7 @@ async fn skin_apply_defer_flushes_against_queued_login_after_account_switch() {
 
 #[tokio::test]
 async fn skin_apply_flush_requeues_failed_pending_change() {
+    let _pending_skin_applies = pending_saved_skin_apply_test_guard().await;
     let fixture = TestFixture::new("apply-defer-requeues-failure", "ConfigUser");
     fixture
         .add_minecraft_account(test_profile("MinecraftName", Vec::new()))
