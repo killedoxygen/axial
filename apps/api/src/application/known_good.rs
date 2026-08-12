@@ -10,6 +10,7 @@ use axial_minecraft::{
 use futures_util::{StreamExt, future::join_all, stream};
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 
 const MAX_STARTUP_REBUILD_GROUPS: usize = 2;
 
@@ -224,16 +225,33 @@ where
                     if *shutdown.borrow() {
                         return;
                     }
+                    let source_failure = Arc::new(Mutex::new(None));
                     let rebuilds = instance_ids.into_iter().map(|instance_id| {
                         let state = state.clone();
                         let reconstruct = reconstruct.clone();
+                        let source_failure = source_failure.clone();
                         async move {
                             let _ = state
                                 .rehydrate_known_good_for_registered_instance(
                                     foreground,
                                     rebuild_owner,
                                     &instance_id,
-                                    reconstruct,
+                                    move |version_id| async move {
+                                        if let Some(error) = *source_failure
+                                            .lock()
+                                            .expect("startup source failure lock")
+                                        {
+                                            return Err(error);
+                                        }
+                                        let result = reconstruct(version_id).await;
+                                        if let Err(error) = &result {
+                                            *source_failure
+                                                .lock()
+                                                .expect("startup source failure lock") =
+                                                Some(*error);
+                                        }
+                                        result
+                                    },
                                 )
                                 .await;
                         }
@@ -819,7 +837,7 @@ mod tests {
         let source_entered = Arc::new(Notify::new());
         let source_release = Arc::new(Semaphore::new(0));
         let producer = state.try_claim_producer().expect("claim startup owner");
-        let _ = spawn_startup_known_good_rebuilds_with(&state, producer, {
+        let rebuild = spawn_startup_known_good_rebuilds_with(&state, producer, {
             let source_calls = source_calls.clone();
             let source_entered = source_entered.clone();
             let source_release = source_release.clone();
@@ -835,7 +853,8 @@ mod tests {
                     Err(KnownGoodReconstructionError::Vanilla)
                 }
             }
-        });
+        })
+        .expect("spawn same-version startup rebuild");
 
         timeout(Duration::from_secs(5), source_entered.notified())
             .await
@@ -845,11 +864,13 @@ mod tests {
         let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
         assert!(!quiesce.is_finished());
         source_release.add_permits(1);
-        timeout(Duration::from_secs(5), quiesce)
-            .await
-            .expect("startup owner drains")
-            .expect("quiesce task")
-            .expect("quiesce succeeds");
+        let (quiesce, rebuild) = timeout(Duration::from_secs(5), async {
+            tokio::join!(quiesce, rebuild)
+        })
+        .await
+        .expect("startup owner drains");
+        quiesce.expect("quiesce task").expect("quiesce succeeds");
+        rebuild.expect("startup rebuild task");
 
         assert_eq!(source_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.startup_warnings(), warnings_before);

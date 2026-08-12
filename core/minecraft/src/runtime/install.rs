@@ -1948,8 +1948,8 @@ pub(crate) fn block_runtime_publication_for_test(install_root: &Path) -> Runtime
     arm_runtime_test_hook(RuntimeTestHookPoint::Publication, install_root)
 }
 
-#[cfg(test)]
-pub(crate) fn runtime_publication_lock_available_for_test(
+#[cfg(any(test, feature = "test-support"))]
+pub fn runtime_publication_lock_available_for_test(
     cache: &ManagedRuntimeCache,
     component: &RuntimeId,
 ) -> bool {

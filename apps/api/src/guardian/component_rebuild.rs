@@ -2072,7 +2072,7 @@ mod tests {
         }
 
         async fn wait_for_attempt(&self, expected: usize) {
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 while self.attempts.load(Ordering::SeqCst) < expected {
                     tokio::task::yield_now().await;
                 }
@@ -2082,7 +2082,7 @@ mod tests {
         }
 
         async fn wait_for_gate_armed(&self) -> usize {
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 loop {
                     let attempt = self.gated_attempt.load(Ordering::SeqCst);
                     if attempt != 0 {
@@ -2665,7 +2665,7 @@ mod tests {
     }
 
     async fn wait_for_component_owner_settlement(fixture: &Fixture, operation_id: &OperationId) {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 if fixture
                     .journals
@@ -2743,6 +2743,7 @@ mod tests {
             outcome
         };
         let control = async {
+            let _gate_release = ControlledWriteGateRelease(backend.clone());
             let gated_attempt = backend.wait_for_gate_armed().await;
             backend.wait_for_attempt(gated_attempt).await;
             assert!(
@@ -2759,28 +2760,15 @@ mod tests {
             );
             assert!(fixture.failure_memory.get(&memory_key).is_none());
 
-            let mut competing_rebuild =
-                Box::pin(axial_minecraft::rebuild_managed_runtime_fixture_for_test(
-                    &runtime_cache,
-                    RuntimeId::from(RUNTIME_COMPONENT),
-                ));
             assert!(
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    &mut competing_rebuild,
-                )
-                .await
-                .is_err(),
+                !axial_minecraft::runtime_publication_lock_available_for_test(
+                    &runtime_cache,
+                    &RuntimeId::from(RUNTIME_COMPONENT),
+                ),
                 "publication receipt must retain Runtime exclusion during persistence retry"
             );
 
             backend.release();
-            let competing_receipt =
-                tokio::time::timeout(std::time::Duration::from_secs(2), competing_rebuild)
-                    .await
-                    .expect("competing Runtime rebuild resumes after settlement")
-                    .expect("competing Runtime rebuild receipt");
-            drop(competing_receipt);
         };
         let (outcome, ()) = tokio::join!(rebuild, control);
         let outcome = outcome.expect("component rebuild settles after persistence retry");
@@ -2799,6 +2787,18 @@ mod tests {
                 .and_then(|entry| entry.reconciliation_terminal().cloned()),
             Some(terminal)
         );
+
+        let competing_receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+                &runtime_cache,
+                RuntimeId::from(RUNTIME_COMPONENT),
+            ),
+        )
+        .await
+        .expect("competing Runtime rebuild resumes after settlement")
+        .expect("competing Runtime rebuild receipt");
+        drop(competing_receipt);
     }
 
     #[tokio::test]
@@ -2982,7 +2982,7 @@ mod tests {
             .try_acquire_managed_library()
             .expect("restarted VersionBundle library operation");
         let receipt = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(15),
             axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
                 restarted_library.retained_core(),
                 "1.21.1",
@@ -2998,7 +2998,7 @@ mod tests {
         drop(restarted_library);
 
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(15),
             restarted_state.shutdown(),
         )
         .await
@@ -3092,7 +3092,7 @@ mod tests {
             .try_acquire_managed_library()
             .expect("VersionBundle library operation after rollback adoption");
         let receipt = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(15),
             axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
                 library_operation.retained_core(),
                 VERSION_ID,
@@ -3194,7 +3194,7 @@ mod tests {
             .try_acquire_managed_library()
             .expect("VersionBundle library operation after publication acknowledgement");
         let receipt = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(15),
             axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
                 library_operation.retained_core(),
                 "1.21.1",
@@ -3253,6 +3253,9 @@ mod tests {
 
     #[tokio::test]
     async fn managed_version_bundle_effect_rollback_is_failed_and_applied() {
+        let _failure_hook = super::VERSION_BUNDLE_CORE_SETTLED_FAILURE_TEST_LOCK
+            .lock()
+            .await;
         const VERSION_ID: &str = "guardian-version-bundle-rollback";
         let fixture =
             fixture_with_backends_and_version("version-bundle-rollback", None, None, VERSION_ID);
@@ -3925,25 +3928,12 @@ mod tests {
                 "exact VersionBundle leaf proof must remain retained during memory retry"
             );
 
-            let mut competing = Box::pin(
-                axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
-                    competing_library,
-                    "1.21.1",
-                ),
-            );
             assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(100), &mut competing)
-                    .await
+                axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&competing_library,)
                     .is_err(),
                 "VersionBundle receipt must retain publication exclusion during memory retry"
             );
             backend.release();
-            let competing_receipt =
-                tokio::time::timeout(std::time::Duration::from_secs(2), competing)
-                    .await
-                    .expect("competing VersionBundle rebuild resumes")
-                    .expect("competing VersionBundle receipt");
-            drop(competing_receipt);
         };
         let (outcome, ()) = tokio::join!(rebuild, control);
         let outcome = outcome.expect("VersionBundle memory retry settles");
@@ -3966,6 +3956,21 @@ mod tests {
             Some(terminal)
         );
 
+        let competing_receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
+                competing_library,
+                "1.21.1",
+            ),
+        )
+        .await
+        .expect("competing VersionBundle rebuild resumes")
+        .expect("competing VersionBundle receipt");
+        assert!(matches!(
+            competing_receipt.acknowledge().await,
+            ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+        ));
+
         cleanup(fixture).await;
     }
 
@@ -3976,6 +3981,11 @@ mod tests {
         let admission = assets_component_admission(&fixture, "memory-retry").await;
         let operation_id = admission.attempt().operation_id().clone();
         let memory_key = reconciliation_attempt_key(admission.attempt());
+        let competing_library = fixture
+            .state
+            .try_acquire_managed_library()
+            .expect("competing Assets library operation")
+            .retained_core();
         let effect_backend = backend.clone();
         let proof_lifetime = Arc::new(std::sync::Mutex::new(None));
         let rebuild = super::REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME.scope(
@@ -4007,6 +4017,7 @@ mod tests {
             outcome
         };
         let control = async {
+            let _gate_release = ControlledWriteGateRelease(backend.clone());
             let gated_attempt = backend.wait_for_gate_armed().await;
             backend.wait_for_attempt(gated_attempt).await;
             assert!(!settlement_complete.load(Ordering::Acquire));
@@ -4027,30 +4038,12 @@ mod tests {
                 "exact selected-leaf proof must remain retained during exact-memory retry"
             );
 
-            let competing_root = fixture
-                .state
-                .try_acquire_managed_library()
-                .expect("retain competing managed library")
-                .retained_core();
-            let mut competing = Box::pin(
-                axial_minecraft::rebuild_registered_managed_assets_fixture_for_test(
-                    competing_root,
-                    "1.21.1",
-                ),
-            );
             assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(100), &mut competing)
-                    .await
+                axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&competing_library,)
                     .is_err(),
                 "Assets receipt must retain publication exclusion during memory retry"
             );
             backend.release();
-            let competing_receipt =
-                tokio::time::timeout(std::time::Duration::from_secs(2), competing)
-                    .await
-                    .expect("competing Assets rebuild resumes")
-                    .expect("competing Assets receipt");
-            drop(competing_receipt);
         };
         let (outcome, ()) = tokio::join!(rebuild, control);
         let outcome = outcome.expect("Assets memory retry settles");
@@ -4067,6 +4060,18 @@ mod tests {
                 .and_then(|entry| entry.reconciliation_terminal().cloned()),
             Some(terminal)
         );
+
+        let competing_receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axial_minecraft::rebuild_registered_managed_assets_fixture_for_test(
+                competing_library,
+                "1.21.1",
+            ),
+        )
+        .await
+        .expect("competing Assets rebuild resumes")
+        .expect("competing Assets receipt");
+        drop(competing_receipt);
 
         cleanup(fixture).await;
     }

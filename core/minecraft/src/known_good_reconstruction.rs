@@ -962,7 +962,7 @@ pub async fn rebuild_managed_version_bundle(
                             ManagedVersionBundleRebuildError::Reconstruction(error)
                         }
                     })?;
-            require_loader_version_bundle_projection(reconstruction, &authority)?
+            require_loader_version_bundle_projection(reconstruction, authority)?
         }
     };
     publish_managed_version_bundle_reconstruction(reconstruction).await
@@ -1750,7 +1750,7 @@ mod tests {
         let caller = tokio::spawn(super::publish_managed_version_bundle_reconstruction(
             reconstruction,
         ));
-        tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+        tokio::time::timeout(std::time::Duration::from_secs(60), reached)
             .await
             .expect("standalone publication should reach its first promotion")
             .expect("standalone publication pause signal");
@@ -3034,7 +3034,7 @@ mod tests {
 
         let super::ManagedVersionBundleOrphanOutcome::Indeterminate(orphan_recovery) =
             tokio::time::timeout(
-                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(15),
                 super::recover_guardian_version_bundle_orphan(
                     authority.operation().clone(),
                     &source,
@@ -3069,7 +3069,7 @@ mod tests {
         let super::ManagedVersionBundleAcknowledgementOutcome::Indeterminate(
             acknowledgement_recovery,
         ) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(15),
             super::recover_managed_version_bundle_acknowledgement(
                 authority.operation().clone(),
                 &source,

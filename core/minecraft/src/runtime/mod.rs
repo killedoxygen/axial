@@ -39,13 +39,13 @@ pub(crate) use ensure::{
     rebuild_managed_runtime_component_from_source,
 };
 pub use ensure::{ensure_runtime_with_events, rebuild_managed_runtime_component};
+#[cfg(test)]
+pub(crate) use install::block_runtime_publication_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use install::runtime_publication_lock_available_for_test;
 pub use install::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
     ManagedRuntimeQuarantineObservation, ManagedRuntimeRebuildError,
-};
-#[cfg(test)]
-pub(crate) use install::{
-    block_runtime_publication_for_test, runtime_publication_lock_available_for_test,
 };
 #[cfg(test)]
 pub(crate) use install::{
