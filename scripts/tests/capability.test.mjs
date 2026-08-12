@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -176,6 +176,10 @@ async function evidenceAbsent(root) {
 }
 
 async function waitForPidExit(pid) {
+  if (process.platform === "linux") {
+    await waitForLinuxPidSettlement(pid);
+    return;
+  }
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     try {
@@ -727,6 +731,9 @@ test("POSIX zombie, Darwin unknown-state, and Linux process-group inspection are
     await writeFile(path.join(procRoot, String(pid), "stat"), source, "utf8");
   }
   await mkdir(path.join(procRoot, "23"));
+  await mkdir(path.join(procRoot, "24"));
+  await writeFile(path.join(procRoot, "24/stat"), "24 (hidden) S 1 9 9 0", "utf8");
+  await chmod(path.join(procRoot, "24/stat"), 0o000);
   assert.deepEqual((await listLinuxProcessGroup(7, procRoot)).map(({ pid }) => pid), [21, 22]);
   await mkdir(path.join(procRoot, "31"));
   await writeFile(path.join(procRoot, "31/stat"), "malformed", "utf8");

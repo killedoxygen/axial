@@ -283,11 +283,22 @@ export async function listLinuxProcessGroup(groupId, procRoot = "/proc") {
       );
       if (member.processGroup === groupId) members.push(member);
     } catch (error) {
-      if (error.code === "ENOENT") continue;
+      if (["ENOENT", "EACCES", "EPERM"].includes(error.code)) continue;
       throw error;
     }
   }
   return members;
+}
+
+function posixProcessGroupExists(groupId) {
+  try {
+    process.kill(-groupId, 0);
+    return true;
+  } catch (error) {
+    if (error.code === "ESRCH") return false;
+    if (error.code === "EPERM") return true;
+    throw error;
+  }
 }
 
 async function listPosixProcessGroup(groupId) {
@@ -346,11 +357,9 @@ async function settleWorkerTree(child, closeState) {
     await sleep(settlementGraceMs);
     if (!closeState.closed) signalPosixProcess(child.pid, "SIGKILL");
     const leaderGone = await waitForCondition(() => closeState.closed, settlementDeadlineMs);
-    if (livePosixGroupMembers(await listPosixProcessGroup(child.pid)).length > 0) {
-      signalPosixGroup(child.pid, "SIGKILL");
-    }
+    signalPosixGroup(child.pid, "SIGKILL");
     const groupSettled = await waitForCondition(
-      async () => livePosixGroupMembers(await listPosixProcessGroup(child.pid)).length === 0,
+      () => !posixProcessGroupExists(child.pid),
       settlementDeadlineMs,
     );
     return descendantsGone && leaderGone && groupSettled;
