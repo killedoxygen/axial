@@ -32,6 +32,7 @@ http-body-util = "0.1.3"
 libc = "0.2.184"
 lzma-rs = "0.3.0"
 md5 = "0.8.0"
+mime_guess = "2.0.5"
 p256 = { version = "0.13.2", features = ["ecdsa"] }
 png = "0.17.16"
 rand = "0.8.5"

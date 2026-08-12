@@ -554,15 +554,35 @@ test('the real development server starts and serves the frontend within a bound'
     const response = await fetch(`http://127.0.0.1:${port}/`);
     assert.equal(response.status, 200);
     assert.match(await response.text(), /src="\/?app\.js"/);
-    for (const [asset, expectedType] of /** @type {Array<[string, RegExp]>} */ ([
-      ['app.js', /^(?:application|text)\/javascript/],
-      ['app.css', /^text\/css/],
+    for (const [asset, expectedType] of /** @type {Array<[string, string]>} */ ([
+      ['app.js', 'text/javascript'],
+      ['app.css', 'text/css'],
+      ['fonts/GeistMono-Variable.woff2', 'font/woff2'],
+      ['sounds/snd01/audioSprite.json', 'application/json'],
+      ['sounds/snd01/audioSprite.mp3', 'audio/mpeg'],
     ])) {
       const assetResponse = await fetch(`http://127.0.0.1:${port}/${asset}`);
       assert.equal(assetResponse.status, 200);
-      assert.match(assetResponse.headers.get('content-type') ?? '', expectedType);
+      assert.equal(assetResponse.headers.get('content-type'), expectedType);
       assert.ok((await assetResponse.arrayBuffer()).byteLength > 0);
     }
+    const deepLink = await fetch(`http://127.0.0.1:${port}/instances/example/settings`);
+    assert.equal(deepLink.status, 200);
+    assert.match(deepLink.headers.get('content-type') ?? '', /^text\/html/);
+    assert.match(await deepLink.text(), /src="\/?app\.js"/);
+
+    const deepLinkHead = await fetch(`http://127.0.0.1:${port}/instances/example/settings`, {
+      method: 'HEAD',
+    });
+    assert.equal(deepLinkHead.status, 200);
+    assert.match(deepLinkHead.headers.get('content-type') ?? '', /^text\/html/);
+    assert.equal((await deepLinkHead.arrayBuffer()).byteLength, 0);
+
+    const deepLinkPost = await fetch(`http://127.0.0.1:${port}/instances/example/settings`, {
+      method: 'POST',
+    });
+    assert.equal(deepLinkPost.status, 405);
+    assert.equal((await deepLinkPost.arrayBuffer()).byteLength, 0);
   } finally {
     if (child.exitCode === null) {
       child.kill('SIGTERM');

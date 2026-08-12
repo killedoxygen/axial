@@ -291,6 +291,7 @@ dependencies = [
  "include_dir",
  "keyring",
  "libc",
+ "mime_guess",
  "p256",
  "png 0.17.16",
  "rand 0.8.7",

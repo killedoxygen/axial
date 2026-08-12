@@ -75,7 +75,9 @@ pub(crate) fn router_with_authority(state: AppState, authority: LocalApiAuthorit
             "/api/v1/transport/tickets",
             post(crate::transport::create_ticket),
         )
-        .route("/api/v1/{*path}", any(api_not_found))
+        .route("/api", any(api_not_found))
+        .route("/api/{*path}", any(api_not_found))
+        .method_not_allowed_fallback(api_method_not_allowed)
         .with_state(state)
         .layer(Extension(authority.clone()))
         .layer(middleware::from_fn_with_state(
@@ -93,6 +95,13 @@ async fn api_not_found() -> impl IntoResponse {
     (
         axum::http::StatusCode::NOT_FOUND,
         Json(serde_json::json!({ "error": "API route was not found" })),
+    )
+}
+
+async fn api_method_not_allowed() -> impl IntoResponse {
+    (
+        axum::http::StatusCode::METHOD_NOT_ALLOWED,
+        Json(serde_json::json!({ "error": "API method is not allowed" })),
     )
 }
 
@@ -249,6 +258,67 @@ mod tests {
                 "{uri}"
             );
             assert!(!String::from_utf8_lossy(&bytes).contains(private), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn p02_b06_contract_api_fallthrough_is_json_and_method_specific() {
+        let fixture = TestFixture::new("api-routing-contract");
+        let app = router(fixture.state.clone());
+
+        for (method, uri, status, error) in [
+            (
+                Method::GET,
+                "/api/v1/not-a-real-route",
+                axum::http::StatusCode::NOT_FOUND,
+                "API route was not found",
+            ),
+            (
+                Method::POST,
+                "/api/v1/not-a-real-route",
+                axum::http::StatusCode::NOT_FOUND,
+                "API route was not found",
+            ),
+            (
+                Method::GET,
+                "/api/v2/status",
+                axum::http::StatusCode::NOT_FOUND,
+                "API route was not found",
+            ),
+            (
+                Method::POST,
+                "/api/v1/status",
+                axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                "API method is not allowed",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("routing contract request"),
+                )
+                .await
+                .expect("routing contract response");
+            assert_eq!(response.status(), status, "{uri}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&axum::http::HeaderValue::from_static("application/json")),
+                "{uri}"
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(
+                    &to_bytes(response.into_body(), 1024)
+                        .await
+                        .expect("bounded routing body")
+                )
+                .expect("routing JSON"),
+                serde_json::json!({ "error": error }),
+                "{uri}"
+            );
         }
     }
 

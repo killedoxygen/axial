@@ -477,19 +477,11 @@ fn normalized_embedded_path(path: &str) -> String {
 }
 
 #[cfg(feature = "embedded-frontend")]
-fn content_type_for_path(path: &str) -> &'static str {
-    match path.rsplit('.').next().unwrap_or_default() {
-        "html" => "text/html; charset=utf-8",
-        "js" => "application/javascript; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "json" => "application/json; charset=utf-8",
-        "png" => "image/png",
-        "svg" => "image/svg+xml",
-        "woff2" => "font/woff2",
-        "mp3" => "audio/mpeg",
-        "txt" => "text/plain; charset=utf-8",
-        _ => "application/octet-stream",
-    }
+fn content_type_for_path(path: &str) -> String {
+    mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -562,11 +554,15 @@ mod tests {
 
     #[cfg(feature = "embedded-frontend")]
     #[tokio::test]
-    async fn embedded_frontend_serves_exact_mime_and_index_fallback() {
+    async fn p02_b06_contract_cross_owner_embedded_static_routing_and_mime_are_exact() {
         for (request_path, expected_type) in [
+            ("/index.html", "text/html"),
+            ("/app.js", "text/javascript"),
+            ("/app.css", "text/css"),
             ("/fonts/GeistMono-Variable.woff2", "font/woff2"),
             ("/sounds/snd01/audioSprite.mp3", "audio/mpeg"),
-            ("/generation.json", "application/json; charset=utf-8"),
+            ("/sounds/snd01/audioSprite.json", "application/json"),
+            ("/generation.json", "application/json"),
         ] {
             let response = serve_embedded_frontend(request_path.parse::<Uri>().unwrap())
                 .await
@@ -586,14 +582,81 @@ mod tests {
         let response = serve_embedded_frontend(Uri::from_static("/missing/route"))
             .await
             .into_response();
-        assert_eq!(
-            response.headers()[header::CONTENT_TYPE],
-            "text/html; charset=utf-8"
-        );
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/html");
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
             EMBEDDED_FRONTEND.get_file("index.html").unwrap().contents()
         );
+
+        let root = super::axial_api_test_support::test_root("routing-static-contract");
+        let app = build_router(
+            build_test_state(&root, None),
+            LocalApiAuthority::bypass_for_test(),
+        );
+        let api_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v2/not-a-real-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            api_response.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_eq!(
+            api_response.into_body().collect().await.unwrap().to_bytes(),
+            r#"{"error":"API route was not found"}"#
+        );
+
+        let head_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::HEAD)
+                    .uri("/instances/example/settings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head_response.status(), StatusCode::OK);
+        assert_eq!(head_response.headers()[header::CONTENT_TYPE], "text/html");
+        assert!(
+            head_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty()
+        );
+
+        let post_response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/instances/example/settings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_ne!(
+            post_response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+            EMBEDDED_FRONTEND.get_file("index.html").unwrap().contents()
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(feature = "embedded-frontend")]

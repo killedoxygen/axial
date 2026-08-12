@@ -25,6 +25,7 @@
     "@types/react": "19.2.14",
     "@types/three": "^0.184.1",
     "esbuild": "^0.25.0",
+    "mime-types": "3.0.2",
     "prettier": "^3.8.4",
     "typescript": "^5.7.0",
     "yaml": "2.9.0"
