@@ -2125,7 +2125,7 @@ mod tests {
     }
 
     #[test]
-    fn state_successor_singleton_delegates_for_vacant_and_existing_records() {
+    fn p01_b03_contract_state_successor_delegates_for_vacant_and_existing_records() {
         let temporary = tempfile::tempdir().expect("temporary anchored-record root");
         let directory = AnchoredRecordDirectory::for_test_directory(temporary.path())
             .expect("anchored-record directory");
@@ -2169,7 +2169,7 @@ mod tests {
     }
 
     #[test]
-    fn state_successor_no_effect_restores_vacant_and_existing_mutations() {
+    fn p01_b03_contract_cross_owner_restores_vacant_and_existing_mutations() {
         let temporary = tempfile::tempdir().expect("temporary anchored-record root");
         let directory = AnchoredRecordDirectory::for_test_directory(temporary.path())
             .expect("anchored-record directory");
