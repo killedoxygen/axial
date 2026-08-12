@@ -2,13 +2,12 @@ use super::{
     BASE_INSTALL_FAILED_MESSAGE, DurableInstallPublication, InstallApplicationError,
     InstallForegroundActivity, InstallProgressCommand, InstallProgressSender,
     InstallProgressViewModel, InstallQueueStartFailure, InstallRequestDrain, InstallStartResponse,
-    LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
-    ManagedPublicationConvergence, RecoveringInstallAdmission,
-    await_managed_install_settlement_retaining, begin_install_journal_with_owned_reconciliation,
-    emit_install_failed, finish_install_progress_task, generate_install_id,
-    install_journal_error_response, mint_available_install_operation_id,
-    operation::InstallJournalIdentity, operation::InstallPublicationCheckpointKind,
-    operation::install_progress_with_terminal_error,
+    LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderInstallStartRequest, ManagedPublicationConvergence,
+    RecoveringInstallAdmission, await_managed_install_settlement_retaining,
+    begin_install_journal_with_owned_reconciliation, emit_install_failed,
+    finish_install_progress_task, generate_install_id, install_journal_error_response,
+    mint_available_install_operation_id, operation::InstallJournalIdentity,
+    operation::InstallPublicationCheckpointKind, operation::install_progress_with_terminal_error,
     operation::publication_indeterminate_install_progress, own_install_progress,
     publish_install_progress, publish_install_progress_durably,
     reconcile_install_operation_terminal, reconcile_install_worker_interruption,
@@ -17,10 +16,6 @@ use super::{
     record_loader_install_operation_guardian_failure_outcome, register_install_foreground,
     retain_install_foreground, sanitize_install_progress, settle_managed_install_publication,
     spawn_install_foreground_retention,
-};
-use crate::application::instances::invalidate_create_view_source;
-use crate::dto::loaders::{
-    LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
 use crate::state::{
     AppState, InstallAdmissionMarker, InstallInitializationStatus, InstallProgressRecord,
@@ -32,13 +27,12 @@ use axial_minecraft::loaders::{
     LoaderInstallPublicationRecovery,
 };
 use axial_minecraft::{
-    DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallError, LoaderInstallFailureKind,
+    DownloadProgress, LoaderError, LoaderInstallError, LoaderInstallFailureKind,
     LoaderPreOperationFailureKind, LoaderProviderFailureKind, ManagedInstallCommittedEvidence,
     ManagedInstallDurableOutcome, ManagedInstallPublicationCandidates,
     ManagedInstallRolledBackEvidence, classify_managed_install_publication,
     classify_managed_install_publication_candidates, continue_install_build_after_base,
-    fetch_builds, fetch_components, fetch_supported_versions, install_build,
-    resolve_build_record_for_install, resume_install_build_after_base,
+    install_build, resolve_build_record_for_install, resume_install_build_after_base,
     verify_managed_install_loader_base_checkpoint,
     verify_managed_install_publication_evidence_root,
     verify_managed_install_reconstruction_checkpoint,
@@ -2214,54 +2208,6 @@ pub(super) async fn dispatch_loader_install_failure(
             .ok();
         }
     }
-}
-
-pub fn loader_components() -> LoaderComponentsResponse {
-    LoaderComponentsResponse {
-        components: fetch_components(),
-    }
-}
-
-pub async fn loader_builds(
-    state: &AppState,
-    request: LoaderBuildsRequest,
-) -> Result<LoaderBuildsResponse, InstallApplicationError> {
-    if request.mc_version.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "mc_version query parameter is required" })),
-        ));
-    }
-    let operation = state.try_acquire_managed_library().map_err(|_| {
-        (
-            StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Axial library is not configured" })),
-        )
-    })?;
-
-    let (builds, catalog) =
-        fetch_builds(operation.core(), request.component_id, &request.mc_version)
-            .await
-            .map_err(loader_pre_operation_error_response)?;
-    invalidate_create_view_source(operation.configured_path(), request.component_id.as_str());
-    Ok(LoaderBuildsResponse { builds, catalog })
-}
-
-pub async fn loader_game_versions(
-    state: &AppState,
-    component_id: LoaderComponentId,
-) -> Result<LoaderGameVersionsResponse, InstallApplicationError> {
-    let operation = state.try_acquire_managed_library().map_err(|_| {
-        (
-            StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Axial library is not configured" })),
-        )
-    })?;
-
-    fetch_supported_versions(operation.core(), component_id)
-        .await
-        .map(|(versions, catalog)| LoaderGameVersionsResponse { versions, catalog })
-        .map_err(loader_pre_operation_error_response)
 }
 
 pub(super) struct ObservedVanillaBaseInstall {

@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
     extract::{Extension, Path, State},
     http::StatusCode,
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use serde::Deserialize;
 
@@ -32,10 +32,6 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/instances/{id}/content",
             get(handle_instance_content),
-        )
-        .route(
-            "/api/v1/instances/{id}/content",
-            delete(handle_instance_content_delete),
         )
         .route(
             "/api/v1/instances/{id}/content/updates",
@@ -163,17 +159,6 @@ async fn handle_instance_content_updates(
     Path(id): Path<String>,
 ) -> Result<Json<ContentUpdatesResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::instance_content_updates(&state, &id)
-        .await
-        .map(Json)
-}
-
-async fn handle_instance_content_delete(
-    State(state): State<AppState>,
-    Extension(handoff): Extension<RequestProducerHandoff>,
-    Path(id): Path<String>,
-    ApiQuery(query): ApiQuery<CanonicalIdQuery>,
-) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::queue_content_uninstall(&state, &id, &query.id, handoff)
         .await
         .map(Json)
 }

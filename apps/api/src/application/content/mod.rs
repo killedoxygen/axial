@@ -501,15 +501,6 @@ pub(crate) async fn content_compatibility(
     })
 }
 
-pub(crate) async fn queue_content_uninstall(
-    state: &AppState,
-    instance_id: &str,
-    canonical_id: &str,
-    handoff: RequestProducerHandoff,
-) -> Result<InstallQueueStateResponse, ContentApiError> {
-    queue_content_uninstalls(state, instance_id, vec![canonical_id.to_string()], handoff).await
-}
-
 pub(crate) async fn queue_content_uninstalls(
     state: &AppState,
     instance_id: &str,

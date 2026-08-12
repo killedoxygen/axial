@@ -15,20 +15,18 @@ const requestRouteFiles = [
   'install.rs',
   'instances.rs',
   'launch/mod.rs',
-  'loaders.rs',
   'music.rs',
   'performance.rs',
   'skin.rs',
   'telemetry.rs',
   'update.rs',
-  'version_info.rs',
 ];
 
 test('all JSON and query inputs use the bounded API extractors', async () => {
   const routes = (await Promise.all(requestRouteFiles.map((path) => read(`apps/api/src/routes/${path}`)))).join('\n');
 
-  assert.equal(routes.match(/ApiJson\([^)]*\): ApiJson</g)?.length, 31);
-  assert.equal(routes.match(/ApiQuery\([^)]*\): ApiQuery</g)?.length, 26);
+  assert.equal(routes.match(/ApiJson\([^)]*\): ApiJson</g)?.length, 28);
+  assert.equal(routes.match(/ApiQuery\([^)]*\): ApiQuery</g)?.length, 24);
   assert.equal(routes.match(/Option<ApiJson</g)?.length, 1);
   assert.doesNotMatch(routes, /\bJson\([^)]*\): Json</);
   assert.doesNotMatch(routes, /\bQuery\([^)]*\): Query</);

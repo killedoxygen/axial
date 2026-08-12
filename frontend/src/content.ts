@@ -135,13 +135,6 @@ export function checkContentUpdates(instanceId: string): Promise<ContentUpdatesR
   return api('GET', `/instances/${encodeURIComponent(instanceId)}/content/updates`).then(contentUpdatesResponse);
 }
 
-export function uninstallContent(instanceId: string, canonicalId: string): Promise<InstallQueueStateResponse> {
-  return api(
-    'DELETE',
-    `/instances/${encodeURIComponent(instanceId)}/content?id=${encodeURIComponent(canonicalId)}`,
-  ).then(installQueueStateResponse);
-}
-
 export function uninstallContents(instanceId: string, canonicalIds: string[]): Promise<InstallQueueStateResponse> {
   return api('POST', `/instances/${encodeURIComponent(instanceId)}/content/uninstall`, {
     canonical_ids: canonicalIds,

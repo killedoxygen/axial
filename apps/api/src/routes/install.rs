@@ -1,3 +1,4 @@
+use super::ApiJson;
 use crate::application::{
     InstallQueueRequest, InstallQueueStateResponse, InstallStatusResponse, enqueue_install_owned,
     install_events_stream, install_queue_status_owned, install_status, remove_queued_install_owned,
@@ -10,19 +11,9 @@ use axum::{
     http::StatusCode,
     routing::{delete, get, post},
 };
-use serde::Deserialize;
-
-use super::ApiJson;
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InstallRequest {
-    version_id: String,
-}
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/v1/install", post(handle_install))
         .route(
             "/api/v1/install/queue",
             get(handle_install_queue_status).post(handle_install_queue_enqueue),
@@ -37,22 +28,6 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/install/{id}/status", get(handle_install_status))
         .route("/api/v1/install/{id}/events", get(handle_install_events))
-}
-
-async fn handle_install(
-    State(state): State<AppState>,
-    Extension(handoff): Extension<RequestProducerHandoff>,
-    ApiJson(payload): ApiJson<InstallRequest>,
-) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    enqueue_install_owned(
-        &state,
-        InstallQueueRequest::Vanilla {
-            version_id: payload.version_id,
-        },
-        handoff,
-    )
-    .await
-    .map(Json)
 }
 
 async fn handle_install_status(
@@ -126,7 +101,7 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
-    async fn install_routes_reject_removed_and_cross_kind_fields() {
+    async fn install_queue_rejects_cross_kind_fields() {
         let fixture = RouteInstallFixture::new("install-route-strict-request-shape");
         let build_id = axial_minecraft::build_id_for(
             axial_minecraft::LoaderComponentId::Fabric,
@@ -134,13 +109,6 @@ mod tests {
             "0.16.10",
         );
         let requests = [
-            (
-                "/api/v1/install",
-                serde_json::json!({
-                    "version_id": "1.21.6",
-                    "manifest_url": "https://example.invalid/version.json"
-                }),
-            ),
             (
                 "/api/v1/install/queue",
                 serde_json::json!({
@@ -158,22 +126,6 @@ mod tests {
                     "version_id": "1.21.6"
                 }),
             ),
-            (
-                "/api/v1/loaders/install",
-                serde_json::json!({
-                    "component_id": "net.fabricmc.fabric-loader",
-                    "build_id": &build_id,
-                    "manifest_url": "https://example.invalid/version.json"
-                }),
-            ),
-            (
-                "/api/v1/loaders/install",
-                serde_json::json!({
-                    "component_id": "net.fabricmc.fabric-loader",
-                    "build_id": &build_id,
-                    "version_id": "1.21.6"
-                }),
-            ),
         ];
 
         for (path, payload) in requests {
@@ -182,76 +134,6 @@ mod tests {
                 .await;
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         }
-    }
-
-    #[tokio::test]
-    async fn public_install_route_enqueues_behind_active_lane() {
-        let fixture = RouteInstallFixture::new("public-install-route-queue-lane");
-        fixture.state.configure_managed_library_for_test().await;
-        fixture
-            .state
-            .installs()
-            .enqueue_queued_install(
-                "queue-active".to_string(),
-                crate::state::InstallQueueSpec::vanilla("1.21.5".to_string()),
-                crate::state::InstallQueuePlacement::Back,
-            )
-            .await;
-        fixture
-            .state
-            .installs()
-            .reserve_next_queued_install()
-            .await
-            .reserved()
-            .expect("active queue item");
-        fixture
-            .state
-            .installs()
-            .insert_or_existing_vanilla("active-install".to_string(), "1.21.5".to_string())
-            .await;
-        let install_started_at_ms = fixture
-            .state
-            .installs()
-            .install_started_at_ms("active-install")
-            .await
-            .expect("active install start time");
-        assert!(
-            fixture
-                .state
-                .installs()
-                .mark_queued_install_started("queue-active", "active-install".to_string())
-                .await
-        );
-
-        let (status, payload) = fixture
-            .request_json_body(
-                Method::POST,
-                "/api/v1/install",
-                serde_json::json!({
-                    "version_id": "1.21.6"
-                }),
-            )
-            .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["active"]["queue_id"], "queue-active");
-        assert_eq!(payload["active"]["install_id"], "active-install");
-        assert_eq!(
-            payload["active"]["install_started_at_ms"].as_u64(),
-            Some(install_started_at_ms)
-        );
-        assert_eq!(payload["items"].as_array().expect("queue items").len(), 1);
-        assert_eq!(payload["items"][0]["label"], "Minecraft 1.21.6");
-        assert!(payload["started_install"].is_null());
-        let snapshot = fixture.state.installs().queue_snapshot().await;
-        assert_eq!(
-            snapshot
-                .active
-                .as_ref()
-                .map(|active| active.queue_id.as_str()),
-            Some("queue-active")
-        );
-        assert_eq!(snapshot.pending.len(), 1);
     }
 
     #[tokio::test]

@@ -17,12 +17,6 @@ pub struct LoaderInstallStartRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LoaderBuildsRequest {
-    pub component_id: LoaderComponentId,
-    pub mc_version: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstallStartResponse {
     pub install_id: String,
     pub operation_id: OperationId,

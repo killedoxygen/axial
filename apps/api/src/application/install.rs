@@ -1137,15 +1137,13 @@ struct InstallQueueSelection {
     outcome: InstallQueueEnqueueOutcome,
 }
 
+pub use loader::loader_pre_operation_error_response;
 use loader::start_loader_install_with_foreground;
 #[cfg(test)]
 use loader::{
     LoaderInstallFailureRequest, dispatch_loader_install_failure, loader_install_done_progress,
     loader_install_error_progress, observe_active_vanilla_base_install,
     wait_for_observed_vanilla_base_install,
-};
-pub use loader::{
-    loader_builds, loader_components, loader_game_versions, loader_pre_operation_error_response,
 };
 pub use model::{
     InstallActionViewModel, InstallFailureViewModel, InstallProgressStepViewModel,
@@ -1154,7 +1152,7 @@ pub use model::{
     InstallQueueInstallItemViewModel, InstallQueueLoaderItemViewModel, InstallQueueNoticeViewModel,
     InstallQueueRequest, InstallQueueStateResponse, InstallQueueViewModel,
     InstallQueuedItemViewModel, InstallStartResponse, InstallStatusResponse,
-    InstallVersionStartRequest, LoaderBuildsRequest, LoaderInstallStartRequest,
+    InstallVersionStartRequest, LoaderInstallStartRequest,
 };
 use operation::{
     ContentDownloadFactAccumulator, ContentFailureOutcomeRequest, InstallProgressCoalescer,

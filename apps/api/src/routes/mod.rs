@@ -1,6 +1,5 @@
 mod accounts;
 mod auth;
-mod catalog;
 mod config;
 mod content;
 mod extract;
@@ -18,7 +17,6 @@ mod status;
 mod system;
 mod telemetry;
 mod update;
-mod version_info;
 mod versions;
 
 use extract::{ApiJson, ApiQuery};
@@ -54,7 +52,6 @@ pub(crate) fn router_with_authority(state: AppState, authority: LocalApiAuthorit
         .merge(config::router())
         .merge(flags::router())
         .merge(setup::router())
-        .merge(catalog::router())
         .merge(content::router())
         .merge(instances::router())
         .merge(install::router())
@@ -65,7 +62,6 @@ pub(crate) fn router_with_authority(state: AppState, authority: LocalApiAuthorit
         .merge(launch::router())
         .merge(loaders::router())
         .merge(versions::router())
-        .merge(version_info::router())
         .merge(java::router())
         .route(
             "/api/v1/transport/bootstrap",
@@ -178,6 +174,202 @@ mod tests {
     use tokio::sync::Notify;
     use tower::ServiceExt;
 
+    #[derive(Clone, Copy)]
+    struct FrozenRoute {
+        method: &'static str,
+        template: &'static str,
+        probe: &'static str,
+        audience: &'static str,
+        auth: &'static str,
+        origin: &'static str,
+        registration_source: &'static str,
+        consumer_source: &'static str,
+        consumer_fragment: &'static str,
+    }
+
+    fn retained_p02_b08_routes() -> Vec<FrozenRoute> {
+        let mut lines = include_str!("P02_B08_ROUTES.tsv").lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "method\ttemplate\tprobe\taudience\tauth\torigin\tregistration_source\tconsumer_source\tconsumer_fragment"
+            )
+        );
+        lines
+            .map(|line| {
+                let mut fields = line.split('\t');
+                let route = FrozenRoute {
+                    method: fields.next().expect("route method"),
+                    template: fields.next().expect("route template"),
+                    probe: fields.next().expect("route probe"),
+                    audience: fields.next().expect("route audience"),
+                    auth: fields.next().expect("route auth mode"),
+                    origin: fields.next().expect("route origin policy"),
+                    registration_source: fields.next().expect("route registration source"),
+                    consumer_source: fields.next().expect("route consumer source"),
+                    consumer_fragment: fields.next().expect("route consumer fragment"),
+                };
+                assert!(
+                    fields.next().is_none(),
+                    "route manifest row has extra fields"
+                );
+                route
+            })
+            .collect()
+    }
+
+    const REMOVED_P02_B08_ROUTES: &[(&str, &str, u16)] = &[
+        ("GET", "/api/v1/catalog", 404),
+        ("GET", "/api/v1/versions/watch", 404),
+        ("GET", "/api/v1/versions/missing/info", 404),
+        ("DELETE", "/api/v1/versions/missing", 404),
+        ("POST", "/api/v1/versions/missing/open-folder", 404),
+        ("POST", "/api/v1/install", 404),
+        ("GET", "/api/v1/loaders/components", 404),
+        (
+            "GET",
+            "/api/v1/loaders/components/fabric/builds?mc_version=1.21.6",
+            404,
+        ),
+        (
+            "GET",
+            "/api/v1/loaders/components/fabric/game-versions",
+            404,
+        ),
+        ("POST", "/api/v1/loaders/install", 404),
+        ("DELETE", "/api/v1/instances/missing/content", 405),
+    ];
+
+    #[tokio::test]
+    async fn p02_b08_contract_supported_and_removed_routes_match_manifest() {
+        let fixture = TestFixture::new("route-manifest");
+        let app = router(fixture.state.clone());
+        let retained = retained_p02_b08_routes();
+
+        assert_eq!(retained.len(), 122);
+        for route in &retained {
+            assert!(matches!(
+                route.audience,
+                "product-ui" | "developer-diagnostic" | "internal-runtime" | "transport-internal"
+            ));
+            assert!(!route.auth.is_empty());
+            assert!(!route.origin.is_empty());
+            assert!(
+                route
+                    .registration_source
+                    .starts_with("apps/api/src/routes/")
+            );
+            assert!(!route.consumer_source.is_empty());
+            assert!(!route.consumer_fragment.is_empty());
+            assert!(route.template.starts_with("/api/v1/"));
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(route.method)
+                        .uri(route.probe)
+                        .body(Body::empty())
+                        .expect("manifest request"),
+                )
+                .await
+                .expect("manifest response");
+            if response.status() == axum::http::StatusCode::NOT_FOUND {
+                let body = to_bytes(response.into_body(), 4096)
+                    .await
+                    .expect("bounded retained route response");
+                assert_ne!(
+                    serde_json::from_slice::<serde_json::Value>(&body)
+                        .expect("retained route JSON response"),
+                    serde_json::json!({ "error": "API route was not found" }),
+                    "{} {}",
+                    route.method,
+                    route.template
+                );
+                continue;
+            }
+            assert_ne!(
+                response.status(),
+                axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                "{} {}",
+                route.method,
+                route.template
+            );
+        }
+
+        for (method, path, expected_status) in REMOVED_P02_B08_ROUTES {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(*method)
+                        .uri(*path)
+                        .body(Body::empty())
+                        .expect("removed route request"),
+                )
+                .await
+                .expect("removed route response");
+            assert_eq!(
+                response.status().as_u16(),
+                *expected_status,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn p02_b08_contract_cross_owner_callers_and_gates_match_manifest() {
+        let fixture = TestFixture::new("route-manifest-auth");
+        let authority = LocalApiAuthority::new("127.0.0.1:43431".parse().unwrap(), None).unwrap();
+        let app = router_with_authority(fixture.state.clone(), authority.clone());
+        let retained = retained_p02_b08_routes();
+
+        for route in &retained {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(route.method)
+                        .uri(route.probe)
+                        .body(Body::empty())
+                        .expect("unauthenticated manifest request"),
+                )
+                .await
+                .expect("unauthenticated manifest response");
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{} {}",
+                route.method,
+                route.template
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(route.method)
+                        .uri(route.probe)
+                        .header(CAPABILITY_HEADER, authority.capability_for_test())
+                        .header(header::ORIGIN, "https://public.example")
+                        .body(Body::empty())
+                        .expect("cross-origin manifest request"),
+                )
+                .await
+                .expect("cross-origin manifest response");
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::FORBIDDEN,
+                "{} {}",
+                route.method,
+                route.template
+            );
+        }
+
+        let settings =
+            include_str!("../../../../frontend/src/views/settings/AdvancedSettingsSection.tsx");
+        assert!(settings.contains("const loadPerformanceLabCard = __AXIAL_ENABLE_DEV_LAB__"));
+        assert!(settings.contains("__AXIAL_ENABLE_DEV_LAB__ && isDev && <PerformanceLabSlot />"));
+    }
+
     #[tokio::test]
     async fn p02_b03_contract_cross_owner_production_routes_share_bounded_rejections() {
         let fixture = TestFixture::new("bounded-extraction");
@@ -207,7 +399,7 @@ mod tests {
             ),
             (
                 Method::GET,
-                "/api/v1/loaders/components/fabric/builds",
+                "/api/v1/content/search",
                 None,
                 String::new(),
                 axum::http::StatusCode::BAD_REQUEST,
@@ -496,55 +688,6 @@ mod tests {
             .await
             .expect("quiesce task")
             .expect("dropping stream releases request");
-    }
-
-    #[tokio::test]
-    async fn live_version_watch_finishes_when_request_drain_begins() {
-        let fixture = TestFixture::new("version-watch-request-drain");
-        fixture.state.configure_managed_library_for_test().await;
-
-        let response = router(fixture.state.clone())
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/versions/watch")
-                    .body(Body::empty())
-                    .expect("version watch request"),
-            )
-            .await
-            .expect("version watch response");
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let mut body = response.into_body();
-        let initial_frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
-            .await
-            .expect("initial version event arrives")
-            .expect("version watch remains open")
-            .expect("initial version frame");
-        let initial_event = String::from_utf8(
-            initial_frame
-                .into_data()
-                .expect("initial version event is data")
-                .to_vec(),
-        )
-        .expect("initial version event is utf-8");
-        assert!(initial_event.contains("event: versions_changed"));
-        assert!(initial_event.contains("\"versions\":[]"));
-
-        let shutdown_state = fixture.state.clone();
-        let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
-        let (remaining, quiesce_result) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(to_bytes(body, 1024), quiesce)
-        })
-        .await
-        .expect("version watch and quiescence complete");
-
-        assert!(remaining.expect("remaining version watch body").is_empty());
-        quiesce_result
-            .expect("quiesce task")
-            .expect("quiesce follows version watch completion");
-        assert_eq!(
-            fixture.state.lifecycle_phase(),
-            crate::state::AppLifecyclePhase::Quiesced
-        );
     }
 
     #[tokio::test]

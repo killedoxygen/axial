@@ -23,9 +23,9 @@ It produces:
 
 Those fields are attached to:
 
-- vanilla catalog entries from `/api/v1/catalog`
+- vanilla catalog entries from the backend-authored `/api/v1/instances/create-view`
 - installed/local versions from `/api/v1/versions`
-- loader-supported Minecraft versions from `/api/v1/loaders/components/{id}/game-versions`
+- loader-supported Minecraft versions from the same create-view projection
 
 ## Record model
 Minecraft-version records expose:

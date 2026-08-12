@@ -1,97 +1,17 @@
-use crate::application::{
-    InstallQueueRequest, InstallQueueStateResponse, LoaderBuildsRequest, enqueue_install_owned,
-    loader_builds, loader_components, loader_game_versions, loader_install_events_stream,
-};
+use crate::application::loader_install_events_stream;
 use crate::state::{AppState, RequestProducerHandoff};
-use axial_minecraft::LoaderComponentId;
 use axum::{
     Json, Router,
     extract::{Extension, Path, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::get,
 };
-use serde::Deserialize;
-
-use super::{ApiJson, ApiQuery};
-
-#[derive(Debug, Deserialize)]
-struct LoaderBuildQuery {
-    mc_version: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LoaderInstallRequest {
-    component_id: String,
-    build_id: String,
-}
 
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/api/v1/loaders/components", get(handle_loader_components))
-        .route(
-            "/api/v1/loaders/components/{id}/builds",
-            get(handle_loader_builds),
-        )
-        .route(
-            "/api/v1/loaders/components/{id}/game-versions",
-            get(handle_loader_game_versions),
-        )
-        .route("/api/v1/loaders/install", post(handle_loader_install))
-        .route(
-            "/api/v1/loaders/install/{id}/events",
-            get(handle_loader_install_events),
-        )
-}
-
-async fn handle_loader_components() -> Json<crate::dto::loaders::LoaderComponentsResponse> {
-    Json(loader_components())
-}
-
-async fn handle_loader_builds(
-    Path(component_id): Path<String>,
-    ApiQuery(query): ApiQuery<LoaderBuildQuery>,
-    State(state): State<AppState>,
-) -> Result<Json<crate::dto::loaders::LoaderBuildsResponse>, (StatusCode, Json<serde_json::Value>)>
-{
-    let component_id = parse_component_id(&component_id)?;
-    loader_builds(
-        &state,
-        LoaderBuildsRequest {
-            component_id,
-            mc_version: query.mc_version,
-        },
+    Router::new().route(
+        "/api/v1/loaders/install/{id}/events",
+        get(handle_loader_install_events),
     )
-    .await
-    .map(Json)
-}
-
-async fn handle_loader_game_versions(
-    Path(component_id): Path<String>,
-    State(state): State<AppState>,
-) -> Result<
-    Json<crate::dto::loaders::LoaderGameVersionsResponse>,
-    (StatusCode, Json<serde_json::Value>),
-> {
-    let component_id = parse_component_id(&component_id)?;
-    loader_game_versions(&state, component_id).await.map(Json)
-}
-
-async fn handle_loader_install(
-    State(state): State<AppState>,
-    Extension(handoff): Extension<RequestProducerHandoff>,
-    ApiJson(payload): ApiJson<LoaderInstallRequest>,
-) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    enqueue_install_owned(
-        &state,
-        InstallQueueRequest::Loader {
-            component_id: parse_component_id(&payload.component_id)?,
-            build_id: payload.build_id,
-        },
-        handoff,
-    )
-    .await
-    .map(Json)
 }
 
 async fn handle_loader_install_events(
@@ -103,36 +23,4 @@ async fn handle_loader_install_events(
         .try_claim_request_producer(&handoff)
         .map_err(super::producer_claim_error_response)?;
     loader_install_events_stream(&state, &id, producer).await
-}
-
-fn parse_component_id(
-    component_id: &str,
-) -> Result<LoaderComponentId, (StatusCode, Json<serde_json::Value>)> {
-    LoaderComponentId::parse(component_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "unknown loader component"
-            })),
-        )
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_component_id;
-    use axum::Json;
-    use serde_json::json;
-
-    #[test]
-    fn parse_component_id_error_does_not_echo_raw_component() {
-        let (status, Json(body)) =
-            parse_component_id(r"C:\Users\Alice\.minecraft --accessToken raw-secret")
-                .expect_err("invalid component should fail");
-
-        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
-        assert_eq!(body["error"], json!("unknown loader component"));
-        assert!(!body.to_string().contains(r"C:\Users"));
-        assert!(!body.to_string().contains("raw-secret"));
-    }
 }

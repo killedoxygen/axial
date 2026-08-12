@@ -12,26 +12,30 @@ import { errMessage } from '../../utils';
 
 type PerformanceLabCardComponent = (typeof import('./PerformanceLabCard'))['PerformanceLabCard'];
 
+const loadPerformanceLabCard = __AXIAL_ENABLE_DEV_LAB__
+  ? async (): Promise<PerformanceLabCardComponent> => (await import('./PerformanceLabCard')).PerformanceLabCard
+  : null;
+
 function PerformanceLabSlot(): JSX.Element | null {
   const isDev = devMode.value;
   const [Lab, setLab] = useState<PerformanceLabCardComponent | null>(null);
 
   useEffect(() => {
-    if (!isDev) {
+    if (!isDev || !loadPerformanceLabCard) {
       setLab(null);
       return;
     }
 
     let alive = true;
-    void import('./PerformanceLabCard').then((module) => {
-      if (alive) setLab(() => module.PerformanceLabCard);
+    void loadPerformanceLabCard().then((component) => {
+      if (alive) setLab(() => component);
     });
     return () => {
       alive = false;
     };
   }, [isDev]);
 
-  if (!isDev || !Lab) return null;
+  if (!loadPerformanceLabCard || !isDev || !Lab) return null;
   return <Lab />;
 }
 
@@ -119,7 +123,7 @@ export function AdvancedSettingsSection(): JSX.Element {
           }
         />
       )}
-      {isDev && <PerformanceLabSlot />}
+      {__AXIAL_ENABLE_DEV_LAB__ && isDev && <PerformanceLabSlot />}
       {isDev && hasNativeDesktopRuntime() && (
         <SettingRow
           title="Reset launcher"

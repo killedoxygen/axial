@@ -251,10 +251,9 @@ Earliest pre-installer Forge client archives are overlays, not complete replacem
 
 Current backend endpoints:
 
-- `GET /api/v1/loaders/components`
-- `GET /api/v1/loaders/components/{id}/game-versions`
-- `GET /api/v1/loaders/components/{id}/builds?mc_version=...`
-- `POST /api/v1/loaders/install`
+- `GET /api/v1/instances/create-view` owns loader component, supported-version,
+  and build selection for the create workflow.
+- `POST /api/v1/install/queue` accepts the selected loader component and build.
 - `GET /api/v1/loaders/install/{id}/events`
 
 Install requests use:

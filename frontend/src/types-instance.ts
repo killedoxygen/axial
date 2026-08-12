@@ -44,26 +44,6 @@ export interface EnrichedInstance extends Instance {
   shader_count: number;
 }
 
-export interface WorldInfo {
-  name: string;
-  size: number;
-  last_played?: string;
-}
-
-export interface SharedDataInfo {
-  name: string;
-  count: number;
-  size: number;
-}
-
-export interface VersionInfo {
-  id: string;
-  folder_size: number;
-  dependents: string[];
-  worlds: WorldInfo[];
-  shared_data: SharedDataInfo[];
-}
-
 export interface InstanceWorld {
   name: string;
   size: number;
