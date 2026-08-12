@@ -34,6 +34,8 @@ use tokio::sync::{
     Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
 };
 
+type ManagedTreeRetirementOwner = (Arc<ManagedTreeRetirement>, Arc<AsyncMutex<()>>);
+
 const INSTANCE_REGISTRY_LOCK_INVARIANT: &str =
     "application instance registry lock poisoned; visible state may diverge from persistence";
 const INSTANCE_CONTENT_ROOT_LIMIT: usize = 64;
@@ -493,14 +495,13 @@ fn prove_instance_directory_topology(
             }
             recognized_tombstone = Some(allowed);
         }
-        if let Some(allowed) = recognized_tombstone {
-            if entry.name() != std::ffi::OsStr::new(&allowed_tombstones[allowed])
-                || entry.kind() != EntryKind::Directory
-            {
-                return Err(invalid_instance_deletion_topology(
-                    "instance tombstone sibling has an alias or wrong kind",
-                ));
-            }
+        if let Some(allowed) = recognized_tombstone
+            && (entry.name() != std::ffi::OsStr::new(&allowed_tombstones[allowed])
+                || entry.kind() != EntryKind::Directory)
+        {
+            return Err(invalid_instance_deletion_topology(
+                "instance tombstone sibling has an alias or wrong kind",
+            ));
         }
         if utf8_name
             .to_ascii_lowercase()
@@ -1509,7 +1510,7 @@ impl AppInstanceStore {
         &self,
         instance_id: &str,
         incarnation: &InstanceLifecycleIncarnation,
-    ) -> io::Result<Option<(Arc<ManagedTreeRetirement>, Arc<AsyncMutex<()>>)>> {
+    ) -> io::Result<Option<ManagedTreeRetirementOwner>> {
         let mut roots = self.instance_content_roots.lock().map_err(|_| {
             io::Error::other("managed instance content root pool lock was poisoned")
         })?;
@@ -1668,7 +1669,7 @@ impl AppInstanceStore {
         if !is_canonical_instance_id(&instance.id)
             || self.get(&instance.id).as_ref() != Some(instance)
         {
-            return Err(instance_not_found_error().into());
+            return Err(instance_not_found_error());
         }
         let game_dir = self.game_dir(&instance.id);
         for path in [self.paths.instances_dir(), &game_dir] {
@@ -1681,7 +1682,7 @@ impl AppInstanceStore {
             }
         }
         if self.get(&instance.id).as_ref() != Some(instance) {
-            return Err(instance_not_found_error().into());
+            return Err(instance_not_found_error());
         }
         Ok(game_dir)
     }
