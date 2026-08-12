@@ -4414,10 +4414,10 @@ async fn run_managed_install_publication_seed(
                 })?;
             Err(DownloadError::PublicationIndeterminate(
                 ManagedInstallPublicationRecovery {
-                    state: ManagedInstallPublicationRecoveryState::Recover {
+                    state: Box::new(ManagedInstallPublicationRecoveryState::Recover {
                         seed,
                         classification: None,
-                    },
+                    }),
                 },
             ))
         }
@@ -4622,7 +4622,7 @@ fn managed_projection_sequence_error(
 
 impl ManagedInstallPublicationRecovery {
     pub async fn retry(self) -> Result<KnownGoodInstallReceipt, DownloadError> {
-        match self.state {
+        match *self.state {
             ManagedInstallPublicationRecoveryState::Active { seed, publication } => {
                 retry_active_managed_install_publication(seed, publication).await
             }
@@ -4717,10 +4717,10 @@ async fn retry_active_managed_install_publication(
                 })?;
             Err(DownloadError::PublicationIndeterminate(
                 ManagedInstallPublicationRecovery {
-                    state: ManagedInstallPublicationRecoveryState::Recover {
+                    state: Box::new(ManagedInstallPublicationRecoveryState::Recover {
                         seed: owner.seed,
                         classification: None,
-                    },
+                    }),
                 },
             ))
         }
@@ -4782,10 +4782,10 @@ async fn retry_recovered_managed_install_publication(
                 let owner = guard.take_owner()?;
                 Err(DownloadError::PublicationIndeterminate(
                     ManagedInstallPublicationRecovery {
-                        state: ManagedInstallPublicationRecoveryState::Recover {
+                        state: Box::new(ManagedInstallPublicationRecoveryState::Recover {
                             seed: owner.seed,
                             classification: owner.classification,
-                        },
+                        }),
                     },
                 ))
             }
@@ -4806,10 +4806,10 @@ async fn retry_recovered_managed_install_publication(
                 })?;
             Err(DownloadError::PublicationIndeterminate(
                 ManagedInstallPublicationRecovery {
-                    state: ManagedInstallPublicationRecoveryState::Recover {
+                    state: Box::new(ManagedInstallPublicationRecoveryState::Recover {
                         seed: owner.seed,
                         classification: owner.classification,
-                    },
+                    }),
                 },
             ))
         }
