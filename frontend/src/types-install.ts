@@ -28,14 +28,6 @@ export interface InstallProgressViewModel {
   active_step?: InstallProgressStepViewModel | null;
 }
 
-export interface InstallGuardianOutcome {
-  diagnosis_id: string;
-  decision: string;
-  label: string;
-  detail?: string;
-  guidance?: string[];
-}
-
 export interface InstallActionViewModel {
   action: string;
   label: string;
@@ -58,12 +50,8 @@ export interface InstallStatusResponse {
   install_id: string;
   operation_id: string;
   done: boolean;
-  progress: unknown[];
   view_model: InstallProgressViewModel;
   failure_view_model?: InstallFailureViewModel | null;
-  failure_point?: string | null;
-  guardian?: InstallGuardianOutcome | null;
-  proof?: unknown;
 }
 
 export interface InstallStartResponse {
@@ -76,7 +64,6 @@ export type InstallQueueRequest =
   | {
       kind: 'vanilla';
       version_id: string;
-      manifest_url?: string;
     }
   | {
       kind: 'loader';
@@ -86,8 +73,8 @@ export type InstallQueueRequest =
   | {
       kind: 'content';
       instance_id: string;
-      label?: string;
-      content_action: InstallQueueContentAction;
+      label: string;
+      action: InstallQueueContentAction;
     };
 
 export interface InstallQueueLoaderItemViewModel {
@@ -126,6 +113,7 @@ export type InstallQueueContentAction =
 
 export interface InstallQueueContentItemViewModel {
   instance_id: string;
+  label: string;
   action: InstallQueueContentAction;
 }
 

@@ -5,8 +5,11 @@ import { navigate } from './ui-state';
 import { addInstance } from './actions';
 import { applyInstallQueueResponse } from './machines/downloads';
 import { createResultToastMessage, createToastKind, type CreateResultPresentationSource } from './create-presenters';
-import type { Instance } from './types-instance';
+import type { EnrichedInstance } from './types-instance';
 import type { InstallQueueStateResponse } from './types-install';
+import { dtoError, dtoOptionalString, dtoRecord, dtoString } from './dto-contract';
+import { enrichedInstanceResponse } from './dto-core';
+import { installQueueStateResponse } from './dto-install';
 
 export interface InitialInstanceSettings {
   max_memory_mb?: number;
@@ -29,7 +32,7 @@ export interface CreateInstanceArgs {
 
 export interface CreateInstanceResult {
   ok: boolean;
-  instance?: Instance;
+  instance?: EnrichedInstance;
   error?: string;
 }
 
@@ -39,31 +42,16 @@ interface CreateResponse extends CreateResultPresentationSource {
   install_queue?: InstallQueueStateResponse;
 }
 
-function isInstance(value: CreateResponse & Partial<Instance>): value is CreateResponse & Instance {
-  return (
-    typeof value.id === 'string' &&
-    value.id.trim().length > 0 &&
-    typeof value.name === 'string' &&
-    value.name.trim().length > 0 &&
-    typeof value.version_id === 'string' &&
-    value.version_id.trim().length > 0 &&
-    typeof value.created_at === 'string' &&
-    value.created_at.trim().length > 0 &&
-    typeof value.view_model?.summary === 'string' &&
-    value.view_model.summary.trim().length > 0
-  );
-}
-
 export async function createInstance(args: CreateInstanceArgs): Promise<CreateInstanceResult> {
   const { selectionId, icon, accent } = args;
   const baseName = args.name.trim();
   if (!baseName) return { ok: false, error: 'Name is required' };
   if (!selectionId) return { ok: false, error: 'Version is required' };
 
-  let res: CreateResponse & Partial<Instance>;
+  let res: CreateResponse & EnrichedInstance;
   try {
     const endpoint = args.modpack ? '/instances/modpack' : args.setupPlanId ? '/instances/setup' : '/instances';
-    res = (await api('POST', endpoint, {
+    const payload = await api('POST', endpoint, {
       ...(args.setupPlanId ? { plan_id: args.setupPlanId } : {}),
       ...(args.modpack ? { canonical_id: args.modpack.canonicalId, version_id: args.modpack.versionId } : {}),
       name: baseName,
@@ -71,18 +59,36 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
       icon,
       accent,
       ...(args.initialSettings ?? {}),
-    })) as CreateResponse & Partial<Instance>;
+    });
+    const responseError = dtoError(payload);
+    if (responseError) throw new Error(responseError);
+    const record = dtoRecord(payload, 'Create instance');
+    const view = dtoRecord(record.view_model, 'Create instance view');
+    const guardian =
+      record.guardian_notice == null ? null : dtoRecord(record.guardian_notice, 'Create Guardian notice');
+    res = {
+      ...enrichedInstanceResponse(record),
+      view_model: {
+        state_id: dtoOptionalString(view.state_id, 'Create result state'),
+        tone: dtoOptionalString(view.tone, 'Create result tone'),
+        title: dtoOptionalString(view.title, 'Create result title'),
+        summary: dtoString(view.summary, 'Create result summary'),
+        detail: view.detail == null ? null : dtoString(view.detail, 'Create result detail'),
+      },
+      guardian_notice: guardian
+        ? {
+            state_id: dtoOptionalString(guardian.state_id, 'Create Guardian state'),
+            tone: dtoOptionalString(guardian.tone, 'Create Guardian tone'),
+            message: dtoOptionalString(guardian.message, 'Create Guardian message'),
+            detail: guardian.detail == null ? null : dtoString(guardian.detail, 'Create Guardian detail'),
+          }
+        : undefined,
+      install_queue: record.install_queue == null ? undefined : installQueueStateResponse(record.install_queue),
+    };
   } catch (err: unknown) {
     const message = errMessage(err);
     toast(`Failed to create instance: ${message}`, 'error');
     return { ok: false, error: message };
-  }
-
-  if (res.error || !isInstance(res)) {
-    const error = res.error || 'server returned an incomplete instance';
-    if (!res.error) console.error('Create instance returned invalid payload');
-    toast(`Failed to create instance: ${error}`, 'error');
-    return { ok: false, error };
   }
 
   const created = res;

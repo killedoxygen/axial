@@ -10,6 +10,7 @@ import { minecraftVersionLabel } from '../../version-display';
 import type { LaunchReportsState } from './PerformanceLabTypes';
 import { launchProofGuardianEvidence } from '../../launch-proof-presenters';
 import { formatDurationMs, formatProofDate, labelFromToken } from './PerformanceLabFormat';
+import { dtoError } from '../../dto-contract';
 
 function stableJsonValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableJsonValue);
@@ -49,7 +50,8 @@ export function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }
     setCopyingSessionId(sessionId);
     try {
       const proof = await api('GET', `/launch/reports/${encodeURIComponent(sessionId)}`);
-      if (proof?.error) throw new Error(proof.error);
+      const error = dtoError(proof);
+      if (error) throw new Error(error);
       await navigator.clipboard.writeText(stablePrettyJson(proof));
       toast('Sanitized launch proof copied');
     } catch (err) {

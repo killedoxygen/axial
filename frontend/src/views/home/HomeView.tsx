@@ -135,7 +135,7 @@ function EmptyHome(): JSX.Element {
 
 export function HomeView(): JSX.Element {
   const cfg = config.value;
-  const all = instances.value as EnrichedInstance[];
+  const all = instances.value;
   const now = new Date();
   const recent = useMemo(() => {
     return [...all]

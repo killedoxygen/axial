@@ -443,9 +443,73 @@ fn content_queue_view_model_retains_semantic_intent_without_urls() {
     let encoded = serde_json::to_string(&content).expect("serialize content item");
 
     assert_eq!(content.instance_id, "0000000000000001");
+    assert_eq!(content.label, "Updating Sodium");
     assert!(encoded.contains("modrinth:sodium"));
     assert!(!encoded.contains("https://"));
     assert!(!encoded.contains("remove_instance_on_failure"));
+}
+
+#[test]
+fn p02_b04_contract_content_queue_item_round_trips_as_retry_request() {
+    let spec = InstallQueueSpec::Content {
+        instance_id: "0000000000000001".to_string(),
+        label: "Updating Sodium".to_string(),
+        prerequisite_queue_id: None,
+        action: ContentQueueAction::Install {
+            selections: vec![QueuedContentSelection {
+                canonical_id: "modrinth:sodium".to_string(),
+                kind: axial_content::ContentKind::Mod,
+                version_id: Some("version-2".to_string()),
+            }],
+            allow_incompatible: false,
+            setup_cleanup: None,
+        },
+    };
+
+    let content = install_queue_install_item(&spec)
+        .content
+        .expect("content queue item");
+    let retry = serde_json::json!({
+        "kind": "content",
+        "instance_id": content.instance_id,
+        "label": content.label,
+        "action": content.action,
+    });
+
+    assert_eq!(
+        serde_json::from_value::<InstallQueueRequest>(retry).expect("strict retry request"),
+        InstallQueueRequest::Content {
+            instance_id: "0000000000000001".to_string(),
+            label: "Updating Sodium".to_string(),
+            action: InstallQueueContentActionRequest::Install {
+                selections: vec![InstallQueueContentSelection {
+                    canonical_id: "modrinth:sodium".to_string(),
+                    kind: axial_content::ContentKind::Mod,
+                    version_id: Some("version-2".to_string()),
+                }],
+                allow_incompatible: false,
+            },
+        }
+    );
+}
+
+#[test]
+fn p02_b04_contract_cross_owner_rejects_parallel_content_request_shapes() {
+    for payload in [
+        serde_json::json!({
+            "kind": "content",
+            "instance_id": "0000000000000001",
+            "action": { "kind": "uninstall", "canonical_ids": ["modrinth:sodium"] }
+        }),
+        serde_json::json!({
+            "kind": "content",
+            "instance_id": "0000000000000001",
+            "label": "Removing Sodium",
+            "content_action": { "kind": "uninstall", "canonical_ids": ["modrinth:sodium"] }
+        }),
+    ] {
+        assert!(serde_json::from_value::<InstallQueueRequest>(payload).is_err());
+    }
 }
 
 #[test]

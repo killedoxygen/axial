@@ -46,7 +46,8 @@ export function installQueueRequestFromItem(item: InstallItem): InstallQueueRequ
     return {
       kind: 'content',
       instance_id: item.content.instance_id,
-      content_action: item.content.action,
+      label: item.content.label,
+      action: item.content.action,
     };
   }
   if (!item.loader) {

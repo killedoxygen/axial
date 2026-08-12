@@ -10,6 +10,7 @@ import type { Config } from '../../types-settings';
 import type { GuardianMode } from '../../types-guardian';
 import type { PerformanceMode } from '../../types-performance';
 import { GUARDIAN_OPTIONS, guardianModeFrom } from '../../guardian-settings';
+import { configResponse } from '../../dto-core';
 
 const PERFORMANCE_OPTIONS: Array<ChoicePillOption<PerformanceMode>> = [
   { value: 'managed', label: 'Managed', note: 'Axial applies recommended tuning and optimizations for you.' },
@@ -38,7 +39,7 @@ export function PerformanceSection(): JSX.Element {
   }, [savedPerformance, savedGuardian, savedIdleIntegrity]);
 
   const { commit, saving } = useAutoSave<Config & { error?: string }>({
-    send: (patch) => api('PUT', '/config', patch),
+    send: (patch) => api('PUT', '/config', patch).then(configResponse),
     apply: (res) => {
       config.value = res;
     },

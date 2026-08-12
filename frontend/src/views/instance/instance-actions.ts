@@ -6,12 +6,14 @@ import { addInstance, removeInstance, updateInstanceInList } from '../../actions
 import type { Instance } from '../../types-instance';
 import { partialFailureMessage, runBulkMutation } from './bulk-actions';
 import { clearModProvenance } from './mod-provenance-cache';
+import { dtoError } from '../../dto-contract';
+import { enrichedInstanceResponse } from '../../dto-core';
 
 export async function openInstanceFolder(id: string, sub?: string): Promise<void> {
   try {
     const suffix = sub ? `?sub=${encodeURIComponent(sub)}` : '';
-    const res: any = await api('POST', `/instances/${encodeURIComponent(id)}/open-folder${suffix}`);
-    if (res?.error) toast(`Could not open the instance folder: ${res.error}`, 'error');
+    const error = dtoError(await api('POST', `/instances/${encodeURIComponent(id)}/open-folder${suffix}`));
+    if (error) toast(`Could not open the instance folder: ${error}`, 'error');
   } catch (err) {
     toast(`Could not open the instance folder: ${errMessage(err)}`, 'error');
   }
@@ -24,8 +26,7 @@ export async function renameInstance(inst: Instance): Promise<void> {
   });
   if (!next || next === inst.name) return;
   try {
-    const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, { name: next });
-    if (res.error) throw new Error(res.error);
+    const res = enrichedInstanceResponse(await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, { name: next }));
     updateInstanceInList(res);
     toast('Renamed');
   } catch (err) {
@@ -35,8 +36,7 @@ export async function renameInstance(inst: Instance): Promise<void> {
 
 export async function duplicateInstance(inst: Instance): Promise<void> {
   try {
-    const res: any = await api('POST', `/instances/${encodeURIComponent(inst.id)}/duplicate`, {});
-    if (res.error) throw new Error(res.error);
+    const res = enrichedInstanceResponse(await api('POST', `/instances/${encodeURIComponent(inst.id)}/duplicate`, {}));
     addInstance(res);
     toast('Duplicated');
   } catch (err) {
@@ -57,8 +57,8 @@ export async function deleteInstanceFlow(inst: Instance, onDone?: () => void): P
   const keepFiles = choice === 'keep-files';
   try {
     const suffix = keepFiles ? '?keep_files=true' : '';
-    const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}${suffix}`);
-    if (res?.error) throw new Error(res.error);
+    const error = dtoError(await api('DELETE', `/instances/${encodeURIComponent(inst.id)}${suffix}`));
+    if (error) throw new Error(error);
     removeInstance(inst.id);
     clearModProvenance(inst.id);
     toast(keepFiles ? 'Removed from launcher; files kept on disk' : 'Instance deleted');
@@ -88,8 +88,8 @@ export async function deleteInstancesFlow(selected: Instance[], onDone?: () => v
     items: selected,
     action: async (inst) => {
       const suffix = keepFiles ? '?keep_files=true' : '';
-      const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}${suffix}`);
-      if (res?.error) throw new Error(res.error);
+      const error = dtoError(await api('DELETE', `/instances/${encodeURIComponent(inst.id)}${suffix}`));
+      if (error) throw new Error(error);
       removeInstance(inst.id);
       clearModProvenance(inst.id);
     },

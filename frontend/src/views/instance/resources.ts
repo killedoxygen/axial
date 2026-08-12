@@ -1,5 +1,6 @@
 import { api } from '../../api';
 import type { InstanceResourceSummary } from '../../types-instance';
+import { instanceResourcesResponse } from '../../dto-core';
 
 export type ResourceLoadState =
   | { status: 'loading'; data: InstanceResourceSummary | null; error?: undefined }
@@ -20,14 +21,5 @@ export function emptyResources(): InstanceResourceSummary {
 }
 
 export async function fetchInstanceResources(id: string): Promise<InstanceResourceSummary> {
-  const res: any = await api('GET', `/instances/${encodeURIComponent(id)}/resources`);
-  if (res?.error) throw new Error(res.error);
-  return {
-    ...emptyResources(),
-    ...res,
-    worlds: Array.isArray(res?.worlds) ? res.worlds : [],
-    mods: Array.isArray(res?.mods) ? res.mods : [],
-    screenshots: Array.isArray(res?.screenshots) ? res.screenshots : [],
-    logs: Array.isArray(res?.logs) ? res.logs : [],
-  };
+  return instanceResourcesResponse(await api('GET', `/instances/${encodeURIComponent(id)}/resources`));
 }

@@ -1,5 +1,6 @@
 import { api } from '../../api';
 import type { InstanceResourceSummary, InstanceLogTail } from '../../types-instance';
+import { instanceLogTailResponse } from '../../dto-launch';
 
 export type InstanceLogEntry = InstanceResourceSummary['logs'][number];
 export type LogFilter = 'all' | 'important' | 'errors' | 'warnings' | 'system-info';
@@ -95,10 +96,7 @@ export function logLineMatchesFilter(line: ClassifiedLogLine, filter: LogFilter)
 }
 
 export async function fetchLogTail(id: string, name: string): Promise<InstanceLogTail> {
-  const res: InstanceLogTail & { error?: string } = await api(
-    'GET',
-    `/instances/${encodeURIComponent(id)}/logs/${encodeURIComponent(name)}`,
+  return instanceLogTailResponse(
+    await api('GET', `/instances/${encodeURIComponent(id)}/logs/${encodeURIComponent(name)}`),
   );
-  if (res?.error) throw new Error(res.error);
-  return res;
 }

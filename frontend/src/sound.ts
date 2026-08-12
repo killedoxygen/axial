@@ -1,3 +1,5 @@
+import { dtoNumber, dtoRecord } from './dto-contract';
+
 let lastMemorySoundAt = 0;
 let lastHueSoundAt = 0;
 
@@ -90,9 +92,18 @@ export const Sound = {
           fetch('sounds/snd01/audioSprite.json'),
           fetch('sounds/snd01/audioSprite.mp3'),
         ]);
-        const manifest = await manifestRes.json();
+        const manifest: unknown = await manifestRes.json();
         const spriteArray = await spriteRes.arrayBuffer();
-        this.spriteMap = (manifest.spritemap || {}) as SpriteMap;
+        const spriteMap = dtoRecord(dtoRecord(manifest, 'Sound manifest').spritemap, 'Sound sprite map');
+        this.spriteMap = Object.fromEntries(
+          Object.entries(spriteMap).map(([name, value]) => {
+            const entry = dtoRecord(value, 'Sound sprite');
+            return [
+              name,
+              { start: dtoNumber(entry.start, 'Sound sprite start'), end: dtoNumber(entry.end, 'Sound sprite end') },
+            ];
+          }),
+        );
         this.spriteBuffer = await this.ctx!.decodeAudioData(spriteArray.slice(0));
       } catch {}
     })();

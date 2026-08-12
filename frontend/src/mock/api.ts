@@ -1147,14 +1147,14 @@ const instanceFixtures: EnrichedInstance[] = [
 
 let lastInstanceId: string | null = 'mock-fabric-lab';
 
-export async function mockApi<T>(method: string, path: string, body?: unknown): Promise<T> {
+export async function mockApi(method: string, path: string, body?: unknown): Promise<unknown> {
   const normalizedMethod = method.toUpperCase();
   const request = normalizeRequest(path);
   const normalizedPath = request.path;
   const key = handlerKey(normalizedMethod, normalizedPath);
   const handler = handlers[key];
   if (!handler) throw missingHandlerError(key);
-  return cloneJsonResponse(await handler(body, normalizedPath, request)) as T;
+  return cloneJsonResponse(await handler(body, normalizedPath, request));
 }
 
 function handlerKey(method: string, path: string): string {
@@ -1655,6 +1655,6 @@ function nextArtSeed(name: string): number {
   return Math.abs(hash) || 1;
 }
 
-function isRecord(value: unknown): value is Record<string, any> {
+function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

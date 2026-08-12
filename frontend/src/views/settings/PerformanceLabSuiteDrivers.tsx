@@ -3,13 +3,12 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { api } from '../../api';
 import { instances, lastInstanceId, selectedInstanceId, versionById } from '../../store';
 import { toast } from '../../toast';
-import type {
-  BenchmarkQualificationResponse,
-  BenchmarkSuiteDriverResponse,
-  BenchmarkSuiteDriverStatus,
-  BenchmarkSuiteDriverSuiteStatus,
-  BenchmarkSuiteDriversResponse,
-} from '../../types-performance';
+import type { BenchmarkSuiteDriverStatus, BenchmarkSuiteDriverSuiteStatus } from '../../types-performance';
+import {
+  benchmarkQualificationResponse,
+  benchmarkSuiteDriverResponse,
+  benchmarkSuiteDriversResponse,
+} from '../../dto-performance';
 import { Button, Pill } from '../../ui/Atoms';
 import { SelectField } from '../../ui/Select';
 import { errMessage } from '../../utils';
@@ -105,11 +104,9 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
     requestRef.current = requestId;
     setDriversState((prev) => ({ status: 'loading', data: prev.data }));
     try {
-      const res = await api('GET', '/launch/benchmark/suite/drivers');
-      if (res?.error) throw new Error(res.error);
+      const res = benchmarkSuiteDriversResponse(await api('GET', '/launch/benchmark/suite/drivers'));
       if (!aliveRef.current || requestId !== requestRef.current) return;
-      const drivers = (res as BenchmarkSuiteDriversResponse).drivers;
-      setDriversState({ status: 'ready', data: Array.isArray(drivers) ? drivers : [] });
+      setDriversState({ status: 'ready', data: res.drivers });
     } catch (err) {
       if (!aliveRef.current || requestId !== requestRef.current) return;
       setDriversState((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
@@ -131,9 +128,9 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
       return next;
     });
     try {
-      const res = await api('POST', `/launch/benchmark/suite/drivers/${encodeURIComponent(id)}/stop`);
-      if (res?.error) throw new Error(res.error);
-      const nextDriver = res as BenchmarkSuiteDriverResponse;
+      const nextDriver = benchmarkSuiteDriverResponse(
+        await api('POST', `/launch/benchmark/suite/drivers/${encodeURIComponent(id)}/stop`),
+      );
       if (!aliveRef.current) return;
       setDriversState((prev) => ({
         status: prev.status === 'error' ? 'ready' : prev.status,
@@ -159,9 +156,9 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
       return next;
     });
     try {
-      const res = await api('POST', `/launch/benchmark/suite/drivers/${encodeURIComponent(id)}/resume`);
-      if (res?.error) throw new Error(res.error);
-      const nextDriver = res as BenchmarkSuiteDriverResponse;
+      const nextDriver = benchmarkSuiteDriverResponse(
+        await api('POST', `/launch/benchmark/suite/drivers/${encodeURIComponent(id)}/resume`),
+      );
       if (!aliveRef.current) return;
       setDriversState((prev) => ({
         status: 'ready',
@@ -188,12 +185,13 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
       [driverId]: { status: 'loading', data: prev[driverId]?.data ?? null },
     }));
     try {
-      const res = await api('GET', `/launch/benchmark/qualification/family-c-1-12-2/${encodeURIComponent(suiteId)}`);
-      if (res?.error) throw new Error(res.error);
+      const res = benchmarkQualificationResponse(
+        await api('GET', `/launch/benchmark/qualification/family-c-1-12-2/${encodeURIComponent(suiteId)}`),
+      );
       if (!aliveRef.current || qualificationRequestRef.current[driverId] !== requestId) return;
       setQualificationChecks((prev) => ({
         ...prev,
-        [driverId]: { status: 'ready', data: normalizeBenchmarkQualification(res as BenchmarkQualificationResponse) },
+        [driverId]: { status: 'ready', data: normalizeBenchmarkQualification(res) },
       }));
     } catch (err) {
       if (!aliveRef.current || qualificationRequestRef.current[driverId] !== requestId) return;
@@ -228,13 +226,13 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
     setStarting(true);
     try {
       const intervalMs = Math.round(parsedIntervalSeconds * 1000);
-      const res = await api('POST', '/launch/benchmark/suite/driver', {
-        instance_id: selectedStartInstance.id,
-        suite_mode: startSuiteMode,
-        interval_ms: intervalMs,
-      });
-      if (res?.error) throw new Error(res.error);
-      const nextDriver = res as BenchmarkSuiteDriverResponse;
+      const nextDriver = benchmarkSuiteDriverResponse(
+        await api('POST', '/launch/benchmark/suite/driver', {
+          instance_id: selectedStartInstance.id,
+          suite_mode: startSuiteMode,
+          interval_ms: intervalMs,
+        }),
+      );
       if (!aliveRef.current) return;
       setDriversState((prev) => ({
         status: 'ready',

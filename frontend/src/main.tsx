@@ -32,6 +32,15 @@ import { toast } from './toast';
 import { errMessage } from './utils';
 import { restoreRoute, showOnboardingOverlay } from './ui-state';
 import { startupWarningMessages } from './startup-warnings';
+import {
+  configResponse,
+  instancesResponse,
+  launcherStatusResponse,
+  musicStatusResponse,
+  systemInfoResponse,
+  versionsResponse,
+} from './dto-core';
+import { dtoError, dtoRecord } from './dto-contract';
 
 async function init(): Promise<void> {
   initErrorReporting();
@@ -59,10 +68,16 @@ async function init(): Promise<void> {
     if (nativeVersion) appVersion.value = nativeVersion;
 
     let [configRes, systemRes, statusRes, musicStatusRes] = await Promise.all([
-      api('GET', '/config'),
-      api('GET', '/system').catch(() => null),
-      api('GET', '/status').catch(() => null),
-      api('GET', '/music/status').catch(() => null),
+      api('GET', '/config').then(configResponse),
+      api('GET', '/system')
+        .then(systemInfoResponse)
+        .catch(() => null),
+      api('GET', '/status')
+        .then(launcherStatusResponse)
+        .catch(() => null),
+      api('GET', '/music/status')
+        .then(musicStatusResponse)
+        .catch(() => null),
     ]);
     config.value = configRes;
     systemInfo.value = systemRes;
@@ -72,12 +87,9 @@ async function init(): Promise<void> {
     let setupRequired = statusRes?.setup_required === true;
     if (setupRequired) {
       try {
-        const setupRes = await api('POST', '/setup/init');
-        if (setupRes?.error) throw new Error(setupRes.error);
-        statusRes = {
-          ...statusRes,
-          setup_required: false,
-        };
+        const setupError = dtoError(await api('POST', '/setup/init'));
+        if (setupError) throw new Error(setupError);
+        if (statusRes) statusRes = { ...statusRes, setup_required: false };
         setupRequired = false;
       } catch (err: unknown) {
         toast(`Could not create the managed library: ${errMessage(err)}`, 'error');
@@ -85,10 +97,13 @@ async function init(): Promise<void> {
     }
 
     if (!setupRequired) {
-      const [versionsRes, instancesRes] = await Promise.all([api('GET', '/versions'), api('GET', '/instances')]);
-      versions.value = versionsRes.versions || [];
-      instances.value = instancesRes.instances || [];
-      lastInstanceId.value = instancesRes.last_instance_id || null;
+      const [versionsRes, instancesRes] = await Promise.all([
+        api('GET', '/versions').then(versionsResponse),
+        api('GET', '/instances').then(instancesResponse),
+      ]);
+      versions.value = versionsRes.versions;
+      instances.value = instancesRes.instances;
+      lastInstanceId.value = instancesRes.last_instance_id;
       await refreshInstallQueue({ connectActive: true });
     } else {
       versions.value = [];
@@ -156,10 +171,11 @@ function scheduleDeferredViewWarmup(): void {
 
 function registerNativeCloseBlockedToast(): void {
   if (!hasNativeDesktopRuntime()) return;
-  void onNativeEvent(nativeDesktopCloseBlockedEventName, (data: any) => {
+  void onNativeEvent(nativeDesktopCloseBlockedEventName, (data) => {
+    const record = dtoRecord(data, 'Desktop close event');
     const message =
-      typeof data?.error === 'string' && data.error.trim()
-        ? data.error.trim()
+      typeof record.error === 'string' && record.error.trim()
+        ? record.error.trim()
         : 'Close is blocked while installs or launches are active.';
     toast(message, 'error');
   }).catch((err: unknown) => {

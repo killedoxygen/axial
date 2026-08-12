@@ -1,13 +1,13 @@
 import { signal, computed } from '@preact/signals';
 import type { LaunchSession, InstanceLaunchDraft, LaunchNotice } from './types-launch';
 import type { Version } from './types-version';
-import type { Instance } from './types-instance';
+import type { EnrichedInstance } from './types-instance';
 import type { Config, SystemInfo } from './types-settings';
 import type { ToastItem } from './types-ui';
 import type { UpdateInfo } from './types-update';
 import type { FeatureFlagViewModel, FeatureFlagsLoadState } from './types-flags';
 
-export const instances = signal<Instance[]>([]);
+export const instances = signal<EnrichedInstance[]>([]);
 export const versions = signal<Version[]>([]);
 export const config = signal<Config | null>(null);
 export const systemInfo = signal<SystemInfo | null>(null);
@@ -18,7 +18,7 @@ export const lastInstanceId = signal<string | null>(null);
 
 export const selectedInstanceId = signal<string | null>(null);
 
-export const selectedInstance = computed<Instance | null>(() => {
+export const selectedInstance = computed<EnrichedInstance | null>(() => {
   const id = selectedInstanceId.value;
   if (!id) return null;
   return instances.value.find((i) => i.id === id) ?? null;

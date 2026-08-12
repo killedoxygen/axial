@@ -1,14 +1,15 @@
 import { apiEventSourceUrl } from '../api';
+import { isDtoRecord } from '../dto-contract';
 
 export async function connectLoaderInstallSSE(
   installId: string,
-  onProgress: (data: any) => void,
+  onProgress: (data: unknown) => void,
   onError: (message: string) => void,
 ): Promise<EventSource> {
   const es = new EventSource(await apiEventSourceUrl(`/loaders/install/${installId}/events`));
 
   es.addEventListener('progress', (e: MessageEvent) => {
-    let data: any;
+    let data: unknown;
     try {
       data = JSON.parse(e.data);
     } catch {
@@ -17,7 +18,9 @@ export async function connectLoaderInstallSSE(
       return;
     }
     onProgress(data);
-    if (data.done || data.view_model?.terminal) {
+    const record = isDtoRecord(data) ? data : null;
+    const view = isDtoRecord(record?.view_model) ? record.view_model : null;
+    if (record?.done === true || view?.terminal === true) {
       es.close();
     }
   });

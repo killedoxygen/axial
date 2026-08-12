@@ -1,7 +1,7 @@
 import { batch } from '@preact/signals';
 import { instances, config, selectedInstanceId, launchState, launchSessions, launchNotices } from './store';
 import type { LaunchSession, LaunchNotice, LaunchStatusUpdate } from './types-launch';
-import type { Instance } from './types-instance';
+import type { EnrichedInstance } from './types-instance';
 import type { Config } from './types-settings';
 import type { LaunchStatusViewModel } from './types-launch';
 import { launchStatusUpdate } from './launch-response-adapters';
@@ -110,7 +110,7 @@ export function setConfig(c: Config): void {
   config.value = c;
 }
 
-export function addInstance(inst: Instance): void {
+export function addInstance(inst: EnrichedInstance): void {
   instances.value = [...instances.value, inst];
 }
 
@@ -121,6 +121,6 @@ export function removeInstance(id: string): void {
   });
 }
 
-export function updateInstanceInList(updated: Instance): void {
+export function updateInstanceInList(updated: EnrichedInstance): void {
   instances.value = instances.value.map((i) => (i.id === updated.id ? updated : i));
 }

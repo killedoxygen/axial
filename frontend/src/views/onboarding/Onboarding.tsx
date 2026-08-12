@@ -10,6 +10,8 @@ import { local } from '../../state';
 import { Music } from '../../music';
 import { Sound } from '../../sound';
 import { api } from '../../api';
+import { configResponse } from '../../dto-core';
+import { dtoError } from '../../dto-contract';
 import { config, systemInfo } from '../../store';
 import { showOnboardingOverlay } from '../../ui-state';
 import { toast } from '../../toast';
@@ -277,9 +279,7 @@ export function Onboarding(): JSX.Element | null {
         patch.username = username.trim();
         patch.launch_auth_mode = 'offline';
       }
-      const r: any = await api('PUT', '/config', patch);
-      if (r.error) throw new Error(r.error);
-      config.value = r;
+      config.value = configResponse(await api('PUT', '/config', patch));
       if (patch.launch_auth_mode === 'online') {
         try {
           await api('POST', '/skins/from-profile', { mark_current: true });
@@ -289,8 +289,8 @@ export function Onboarding(): JSX.Element | null {
       }
       refreshAccountSkin();
       const complete = async (): Promise<void> => {
-        const res: any = await api('POST', '/onboarding/complete');
-        if (res?.error) throw new Error(res.error);
+        const error = dtoError(await api('POST', '/onboarding/complete'));
+        if (error) throw new Error(error);
       };
       try {
         await complete();

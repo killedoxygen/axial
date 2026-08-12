@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'preact/hooks';
 import { api } from '../api';
+import { dtoArray, dtoBoolean, dtoOptionalString, dtoRecord, dtoString } from '../dto-contract';
 
 export interface JvmPresetOption {
   id: string;
@@ -16,17 +17,17 @@ async function loadPresets(): Promise<JvmPresetOption[]> {
   if (presetCache) return presetCache;
   presetRequest ??= (async () => {
     try {
-      const res = (await api('GET', '/instances/create-view')) as {
-        preset_options?: JvmPresetOption[];
-        error?: string;
-      };
-      if (res.error) return [];
-      const list = Array.isArray(res.preset_options)
-        ? res.preset_options.filter(
-            (option): option is JvmPresetOption =>
-              typeof option.id === 'string' && typeof option.label === 'string' && typeof option.detail === 'string',
-          )
-        : [];
+      const response = dtoRecord(await api('GET', '/instances/create-view'), 'Create presets');
+      const list = dtoArray(response.preset_options, 'Create presets').map((value): JvmPresetOption => {
+        const option = dtoRecord(value, 'Create preset');
+        return {
+          id: dtoString(option.id, 'Create preset id'),
+          label: dtoString(option.label, 'Create preset label'),
+          detail: dtoString(option.detail, 'Create preset detail'),
+          default: dtoBoolean(option.default, 'Create preset default'),
+          disabled_reason: dtoOptionalString(option.disabled_reason, 'Create preset disabled reason'),
+        };
+      });
       if (list.length > 0) presetCache = list;
       return list;
     } catch {

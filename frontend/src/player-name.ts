@@ -4,12 +4,10 @@ import { config } from './store';
 import { toast } from './toast';
 import { prompt } from './ui/Dialog';
 import { USERNAME_MAX_LEN, errMessage, validateUsername } from './utils';
-
-type LauncherAccountLike = {
-  account_id: string;
-  kind: 'microsoft' | 'offline';
-  active: boolean;
-};
+import { configResponse } from './dto-core';
+import { dtoError } from './dto-contract';
+import { launcherAccountsResponse } from './views/accounts/api';
+import type { LauncherAccount } from './views/accounts/types';
 
 export function clampPlayerNameInput(value: string): string {
   return value.slice(0, USERNAME_MAX_LEN);
@@ -52,15 +50,14 @@ export async function savePlayerName(raw: string, successMessage = 'Player name 
       return false;
     }
     if (activeAccount?.kind === 'offline') {
-      const response: any = await api('PATCH', `/accounts/${encodeURIComponent(activeAccount.account_id)}`, {
+      const response = await api('PATCH', `/accounts/${encodeURIComponent(activeAccount.account_id)}`, {
         username: nextName,
       });
-      if (response.error) throw new Error(response.error);
-      config.value = await api('GET', '/config');
+      const error = dtoError(response);
+      if (error) throw new Error(error);
+      config.value = configResponse(await api('GET', '/config'));
     } else {
-      const res: any = await api('PUT', '/config', { username: nextName });
-      if (res.error) throw new Error(res.error);
-      config.value = res;
+      config.value = configResponse(await api('PUT', '/config', { username: nextName }));
     }
     refreshAccountSkin();
     toast(successMessage);
@@ -71,29 +68,9 @@ export async function savePlayerName(raw: string, successMessage = 'Player name 
   }
 }
 
-async function readActiveLauncherAccount(): Promise<LauncherAccountLike | null> {
+async function readActiveLauncherAccount(): Promise<LauncherAccount | null> {
   const response = await api('GET', '/accounts');
-  if (!response || typeof response !== 'object' || !Array.isArray(response.accounts)) return null;
-  for (const account of response.accounts) {
-    const parsed = launcherAccountLike(account);
-    if (parsed?.active) return parsed;
-  }
-  return null;
-}
-
-function launcherAccountLike(value: unknown): LauncherAccountLike | null {
-  if (!value || typeof value !== 'object') return null;
-  const account = value as Record<string, unknown>;
-  if (
-    typeof account.account_id !== 'string' ||
-    (account.kind !== 'microsoft' && account.kind !== 'offline') ||
-    typeof account.active !== 'boolean'
-  ) {
-    return null;
-  }
-  return {
-    account_id: account.account_id,
-    kind: account.kind,
-    active: account.active,
-  };
+  const accounts = launcherAccountsResponse(response);
+  if (!accounts) throw new Error('Launcher accounts response was invalid.');
+  return accounts.accounts.find((account) => account.active) ?? null;
 }

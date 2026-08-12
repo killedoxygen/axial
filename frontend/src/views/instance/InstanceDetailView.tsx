@@ -57,7 +57,7 @@ function defaultTabFor(inst: EnrichedInstance | undefined): Tab {
 
 export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const theme = useTheme();
-  const inst = instances.value.find((i) => i.id === id) as EnrichedInstance | undefined;
+  const inst = instances.value.find((i) => i.id === id);
   const [selectedTab, setSelectedTab] = useState<TabSelection>(null);
   const selectedTabForCurrentInstance = selectedTab?.instanceId === id ? selectedTab.tab : null;
   const [resources, setResources] = useState<ResourceLoadState>({ status: 'loading', data: null });

@@ -8,7 +8,6 @@ import { Music } from '../music';
 import { local, saveLocalState } from '../state';
 import { Sound } from '../sound';
 import { applyTheme } from '../theme';
-import type { EnrichedInstance } from '../types-instance';
 import { useDraggableOverlay } from '../hooks/use-draggable-overlay';
 import { shortcutHint } from '../shortcuts';
 import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
@@ -83,7 +82,7 @@ function buildCommands(): Command[] {
   );
 
   const sessions = launchSessions.value;
-  const list2 = instances.value as EnrichedInstance[];
+  const list2 = instances.value;
   for (const inst of list2.slice(0, 12)) {
     const session = sessions[inst.id];
     const isPlaying = launchSessionIsPlaying(session);

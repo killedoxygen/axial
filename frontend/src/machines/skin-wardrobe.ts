@@ -381,7 +381,7 @@ export async function uploadSkinPng(
     headers: { 'Content-Type': 'image/png' },
     body: file,
   });
-  const payload = await response.json().catch(() => undefined);
+  const payload: unknown = await response.json().catch(() => undefined);
   if (!response.ok) throw apiResponseError(response, payload, `Upload failed with HTTP ${response.status}`);
   const saved = savedSkinRecord(payload);
   if (saved && options.select !== false) selectSavedSkin(saved.texture_key);

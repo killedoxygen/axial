@@ -16,6 +16,7 @@ import {
   isCurrentModProvenanceRefresh,
   type ModProvenance,
 } from './mod-provenance-cache';
+import { dtoError } from '../../dto-contract';
 const CONTENT_INSTALL_BATCH_LIMIT = 40;
 
 export { cachedModProvenance, type ModProvenance } from './mod-provenance-cache';
@@ -125,15 +126,18 @@ async function queueManagedModRemovals(
 }
 
 async function updateModEnabled(inst: EnrichedInstance, modName: string, enabled: boolean): Promise<void> {
-  const res: any = await api('PUT', `/instances/${encodeURIComponent(inst.id)}/mods/${encodeURIComponent(modName)}`, {
+  const res = await api('PUT', `/instances/${encodeURIComponent(inst.id)}/mods/${encodeURIComponent(modName)}`, {
     enabled,
   });
-  if (res?.error) throw new Error(res.error);
+  const error = dtoError(res);
+  if (error) throw new Error(error);
 }
 
 async function removeMod(inst: EnrichedInstance, modName: string): Promise<void> {
-  const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}/mods/${encodeURIComponent(modName)}`);
-  if (res?.error) throw new Error(res.error);
+  const error = dtoError(
+    await api('DELETE', `/instances/${encodeURIComponent(inst.id)}/mods/${encodeURIComponent(modName)}`),
+  );
+  if (error) throw new Error(error);
 }
 
 export async function setModEnabled(inst: EnrichedInstance, mod: InstanceMod, onDone: () => void): Promise<void> {

@@ -35,7 +35,12 @@ test('frontend fetch, SSE, media, and restart paths carry bounded authority', as
     read('frontend/src/music.ts'),
     read('frontend/esbuild.mjs'),
   ]);
-  assert.match(native, /invoke<NativeApiTransportBootstrap>\('api_transport_bootstrap'\)/);
+  assert.match(native, /invoke\(cmd: string, args\?: Record<string, unknown>\): Promise<unknown>/);
+  assert.match(
+    native,
+    /invoke\('api_transport_bootstrap'\)[\s\S]*?dtoRecord\(value, 'Native API transport bootstrap'\)/,
+  );
+  assert.doesNotMatch(native, /invoke<[^>]+>/);
   assert.doesNotMatch(api, /catch[\s\S]{0,120}getNativeApiTransportBootstrap/);
   assert.match(api, /headers\.set\('X-Axial-Capability', requireApiCapability\(\)\)/);
   assert.match(api, /response\.status === 401 && \(await recoverBrowserTransport\(\)\)/);

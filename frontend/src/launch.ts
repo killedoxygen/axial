@@ -24,10 +24,12 @@ import {
   updateLaunchPrepView,
   updateLaunchSessionState,
 } from './actions';
-import type { LaunchNotice, LaunchSessionOutcome } from './types-launch';
+import type { LaunchSessionOutcome } from './types-launch';
 import { createBackendLaunchNoticeTracker, type BackendLaunchNoticeTracker } from './launch-notice-tracker';
 import { launchStatusUpdate } from './launch-response-adapters';
 import { establishNativeLaunchTransport } from './launch-live-transport';
+import { dtoError, dtoRecord, dtoString } from './dto-contract';
+import { enrichedInstanceResponse } from './dto-core';
 
 function rollbackLaunch(instanceId: string): void {
   endSession(instanceId);
@@ -73,21 +75,13 @@ export async function launchGame(): Promise<void> {
     const launchDraft = instanceLaunchDrafts.value[inst.id];
     if (launchDraft?.dirty) {
       updateLaunchPrep(inst.id, 0, 'Saving launch settings');
-      const saved = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
-        java_path: launchDraft.javaPath.trim(),
-        jvm_preset: launchDraft.jvmPreset,
-        extra_jvm_args: launchDraft.extraJvmArgs.trim(),
-      });
-      if (saved.error) {
-        setLaunchNotice(inst.id, {
-          message: 'Axial could not save the pending launch overrides.',
-          detail: saved.error,
-          tone: 'error',
-        });
-        showError(saved.error);
-        rollbackLaunch(inst.id);
-        return;
-      }
+      const saved = enrichedInstanceResponse(
+        await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
+          java_path: launchDraft.javaPath.trim(),
+          jvm_preset: launchDraft.jvmPreset,
+          extra_jvm_args: launchDraft.extraJvmArgs.trim(),
+        }),
+      );
       launchInst = saved;
       updateInstanceInList(saved);
       instanceLaunchDrafts.value = {
@@ -103,27 +97,32 @@ export async function launchGame(): Promise<void> {
     }
 
     updateLaunchPrep(inst.id, 0, 'Requesting launch');
-    const res = await api('POST', '/launch', {
-      instance_id: launchInst.id,
-      username,
-      client_started_at_ms: Date.now(),
-    });
+    const res = dtoRecord(
+      await api('POST', '/launch', {
+        instance_id: launchInst.id,
+        username,
+        client_started_at_ms: Date.now(),
+      }),
+      'Launch',
+    );
 
-    if (res.error) {
+    const launchError = dtoError(res);
+    if (launchError) {
       if (!surfaceBackendLaunchNotice(res.notice, inst.id, inst.name, noticeTracker)) {
-        showError(res.error);
+        showError(launchError);
       }
       launchCommitted = false;
       rollbackLaunch(inst.id);
       return;
     }
-    const initialStatus = launchStatusUpdate(res, res.session_id);
+    const sessionId = dtoString(res.session_id, 'Launch session id');
+    const initialStatus = launchStatusUpdate(res, sessionId);
     if (!initialStatus) throw new Error('Launch response did not match the status contract.');
     updateLaunchPrepView(inst.id, initialStatus.viewModel);
 
-    const launchedAt = res.launched_at || new Date().toISOString();
+    const launchedAt = res.launched_at == null ? new Date().toISOString() : dtoString(res.launched_at, 'Launch time');
     confirmLaunch(inst.id, {
-      sessionId: res.session_id,
+      sessionId,
       launchedAt,
       viewModel: initialStatus.viewModel,
       statusRevision: initialStatus.revision,
@@ -134,7 +133,7 @@ export async function launchGame(): Promise<void> {
     Music.suppress();
     let launchStarted = false;
     try {
-      await connectLaunchEvents(res.session_id, inst.id, inst.name, noticeTracker, () => {
+      await connectLaunchEvents(sessionId, inst.id, inst.name, noticeTracker, () => {
         if (launchStarted) return;
         launchStarted = true;
         Sound.ui('launchSuccess');
@@ -158,12 +157,9 @@ export async function launchGame(): Promise<void> {
     }
   } catch (err: unknown) {
     if (isApiError(err) && err.payload && typeof err.payload === 'object') {
-      const payload = err.payload as {
-        error?: string;
-        notice?: LaunchNotice;
-      };
+      const payload = dtoRecord(err.payload, 'Launch error');
       if (!surfaceBackendLaunchNotice(payload.notice, inst.id, inst.name, noticeTracker)) {
-        showError(payload.error || err.message);
+        showError(dtoError(payload) || err.message);
       }
       if (!launchCommitted) rollbackLaunch(inst.id);
       return;
@@ -176,7 +172,7 @@ export async function launchGame(): Promise<void> {
 function makeLaunchStatusPoller(
   sessionId: string,
   instanceId: string,
-  onStatus: (data: any, handle: { close(): void }) => void,
+  onStatus: (data: unknown, handle: { close(): void }) => void,
 ): { close(): void } {
   let stopped = false;
   let timerId = 0;
@@ -199,7 +195,7 @@ function makeLaunchStatusPoller(
     inFlight = true;
     try {
       const data = await api('GET', `/launch/${sessionId}/status`);
-      if (!stopped && !data?.error) onStatus(data, handle);
+      if (!stopped && !dtoError(data)) onStatus(data, handle);
     } catch {
       // Native events remain primary. Polling is only a convergence fallback.
     } finally {
@@ -221,7 +217,7 @@ async function connectLaunchEvents(
   noticeTracker: BackendLaunchNoticeTracker,
   onStarted?: () => void,
 ): Promise<void> {
-  const onStatus = (data: any, handle: { close(): void }): void => {
+  const onStatus = (data: unknown, handle: { close(): void }): void => {
     const session = launchSessions.value[instanceId];
     if (session?.sessionId !== sessionId) return;
     const update = convergeLaunchStatus(instanceId, sessionId, data);
@@ -233,9 +229,15 @@ async function connectLaunchEvents(
     }
   };
 
-  const onLog = (data: any): void => {
+  const onLog = (data: unknown): void => {
     if (launchSessions.value[instanceId]?.sessionId !== sessionId) return;
-    appendLog(data.source, data.text, instanceId, instanceName);
+    const record = dtoRecord(data, 'Launch log event');
+    appendLog(
+      dtoString(record.source, 'Launch log source'),
+      dtoString(record.text, 'Launch log text'),
+      instanceId,
+      instanceName,
+    );
   };
 
   if (hasNativeDesktopRuntime()) {
@@ -322,10 +324,10 @@ export async function killGame(): Promise<void> {
 
   try {
     updateLaunchSessionState(inst.id, { stopping: true });
-    const res = await api('POST', `/launch/${session.sessionId}/kill`);
-    if (res?.error) {
+    const error = dtoError(await api('POST', `/launch/${session.sessionId}/kill`));
+    if (error) {
       updateLaunchSessionState(inst.id, { stopping: false });
-      showError(`Could not stop the game: ${res.error}`);
+      showError(`Could not stop the game: ${error}`);
       return;
     }
   } catch (err: unknown) {

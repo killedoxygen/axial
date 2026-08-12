@@ -109,7 +109,7 @@ function ListRow({
 export function InstancesView(): JSX.Element {
   const [view, setView] = useState<'grid' | 'list'>('grid');
   const [q, setQ] = useState('');
-  const all = instances.value as EnrichedInstance[];
+  const all = instances.value;
   const query = q.trim().toLowerCase();
   const filtered = all.filter((i) => i.name.toLowerCase().includes(query));
   const selection = useSelection(

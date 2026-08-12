@@ -163,6 +163,7 @@ pub struct InstallQueueInstallItemViewModel {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstallQueueContentItemViewModel {
     pub instance_id: String,
+    pub label: String,
     pub action: InstallQueueContentActionRequest,
 }
 

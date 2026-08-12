@@ -13,6 +13,9 @@ import {
 } from '../native';
 import { instances, lastInstanceId, versions } from '../store';
 import { markContentChanged } from '../content-activity';
+import { dtoBoolean, dtoNumber, dtoOptionalString, dtoRecord } from '../dto-contract';
+import { installProgressViewModelResponse, installQueueStateResponse, installStatusResponse } from '../dto-install';
+import { instancesResponse, versionsResponse } from '../dto-core';
 import {
   cloneInstallItem,
   installItemFromQueueInstallItem,
@@ -105,6 +108,19 @@ type InstallProgressEvent = {
   done?: boolean;
   view_model?: InstallProgressViewModel;
 };
+
+function installProgressEvent(value: unknown): InstallProgressEvent {
+  const record = dtoRecord(value, 'Install progress event');
+  return {
+    phase: dtoOptionalString(record.phase, 'Install progress phase'),
+    current: record.current == null ? undefined : dtoNumber(record.current, 'Install progress current'),
+    total: record.total == null ? undefined : dtoNumber(record.total, 'Install progress total'),
+    file: dtoOptionalString(record.file, 'Install progress file'),
+    error: dtoOptionalString(record.error, 'Install progress error'),
+    done: record.done == null ? undefined : dtoBoolean(record.done, 'Install progress done'),
+    view_model: record.view_model == null ? undefined : installProgressViewModelResponse(record.view_model),
+  };
+}
 
 let progressStream: CloseableSource | null = null;
 let connectedInstallId: string | null = null;
@@ -365,7 +381,7 @@ async function installFailureViewModelForStatus(
     if (!isCurrent()) return null;
     try {
       const ownedStatus = await awaitOwnedInstallValue(
-        () => api<InstallStatusResponse>('GET', `/install/${encodeURIComponent(installId)}/status`),
+        () => api('GET', `/install/${encodeURIComponent(installId)}/status`).then(installStatusResponse),
         isCurrent,
       );
       if (!ownedStatus.current) return null;
@@ -389,7 +405,7 @@ function showInstallQueueNotice(notice: InstallQueueNoticeViewModel | null | und
 export async function refreshInstallQueue(
   options: { connectActive?: boolean } = {},
 ): Promise<InstallQueueStateResponse> {
-  const response = await api<InstallQueueStateResponse>('GET', '/install/queue');
+  const response = installQueueStateResponse(await api('GET', '/install/queue'));
   await applyInstallQueueResponse(response, { connectActive: options.connectActive });
   return response;
 }
@@ -399,7 +415,7 @@ async function refreshInstallQueueWhileCurrent(
   options: { connectActive?: boolean } = {},
 ): Promise<boolean> {
   const ownedResponse = await awaitOwnedInstallValue(
-    () => api<InstallQueueStateResponse>('GET', '/install/queue'),
+    () => api('GET', '/install/queue').then(installQueueStateResponse),
     isCurrent,
   );
   if (!ownedResponse.current) return false;
@@ -501,7 +517,7 @@ async function reconcileInstallStatus(
     let status: InstallStatusResponse;
     try {
       const ownedStatus = await awaitOwnedInstallValue(
-        () => api<InstallStatusResponse>('GET', `/install/${encodeURIComponent(claim.installId)}/status`),
+        () => api('GET', `/install/${encodeURIComponent(claim.installId)}/status`).then(installStatusResponse),
         isCurrent,
       );
       if (!ownedStatus.current) return 'stale';
@@ -671,7 +687,7 @@ async function connectNativeInstallEventSource(
 
   let subscription: CloseableSource | null = null;
   try {
-    subscription = await onNativeEvent(eventName, onData);
+    subscription = await onNativeEvent(eventName, (data) => onData(installProgressEvent(data)));
   } catch (err: unknown) {
     if (!isActiveInstallSource(installId, item, controller)) return;
     throw err;
@@ -824,7 +840,7 @@ async function connectInstallEvents(
     const es = await connectLoaderInstallSSE(
       installId,
       (data) => {
-        void onProgress(data as InstallProgressEvent);
+        void onProgress(installProgressEvent(data));
       },
       (message) => {
         reconcileIssue(`${message} Refreshed backend status.`);
@@ -844,7 +860,7 @@ async function connectInstallEvents(
   es.addEventListener('progress', (e: MessageEvent) => {
     let data: InstallProgressEvent;
     try {
-      data = JSON.parse(e.data) as InstallProgressEvent;
+      data = installProgressEvent(JSON.parse(e.data));
     } catch {
       reconcileIssue(copy.invalid);
       return;
@@ -878,7 +894,7 @@ export function retryFailedInstall(): void {
 export async function removeQueuedInstall(queueId: string): Promise<void> {
   if (!queueId) return;
   try {
-    const response = await api<InstallQueueStateResponse>('DELETE', `/install/queue/${encodeURIComponent(queueId)}`);
+    const response = installQueueStateResponse(await api('DELETE', `/install/queue/${encodeURIComponent(queueId)}`));
     await applyInstallQueueResponse(response, { showNotice: true, connectActive: true });
   } catch (err: unknown) {
     showError(`Install queue update failed: ${errMessage(err)}`);
@@ -895,10 +911,8 @@ async function enqueueBackendInstallItem(
   item: InstallItem,
   options: { retry?: boolean } = {},
 ): Promise<InstallQueueStateResponse> {
-  const response = await api<InstallQueueStateResponse>(
-    'POST',
-    options.retry ? '/install/queue/retry' : '/install/queue',
-    installQueueRequestFromItem(item),
+  const response = installQueueStateResponse(
+    await api('POST', options.retry ? '/install/queue/retry' : '/install/queue', installQueueRequestFromItem(item)),
   );
   await applyInstallQueueResponse(response, { showNotice: true, connectActive: true });
   if (installQueueResponseContainsItem(response, item)) clearDownloadFailureForItem(item);
@@ -918,14 +932,15 @@ async function onInstallDone(completedItem: InstallItem | undefined, isCurrent: 
   if (completedItem?.content) markContentChanged();
 
   try {
-    const [versionsRes, instancesRes] = await Promise.all([api('GET', '/versions'), api('GET', '/instances')]);
+    const [versionsRes, instancesRes] = await Promise.all([
+      api('GET', '/versions').then(versionsResponse),
+      api('GET', '/instances').then(instancesResponse),
+    ]);
     if (installOwnershipRevision !== completionRevision) return true;
-    if (versionsRes.error) throw new Error(versionsRes.error);
-    if (instancesRes.error) throw new Error(instancesRes.error);
-    const nextVersions = versionsRes.versions || [];
+    const nextVersions = versionsRes.versions;
     versions.value = nextVersions;
-    instances.value = instancesRes.instances || [];
-    lastInstanceId.value = instancesRes.last_instance_id || null;
+    instances.value = instancesRes.instances;
+    lastInstanceId.value = instancesRes.last_instance_id;
   } catch (err: unknown) {
     if (installOwnershipRevision !== completionRevision) return true;
     showError(`Install completed, but failed to refresh launcher state: ${errMessage(err)}`);

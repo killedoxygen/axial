@@ -1,4 +1,16 @@
 import { api } from './api';
+import {
+  contentCompatResponse,
+  contentDetailResponse,
+  contentPageResponse,
+  contentUpdatesResponse,
+  instanceContentResponse,
+  instanceSetupPlanResponse,
+  modpackFilesResponse,
+  modpackTargetResponse,
+  resolutionPlanResponse,
+} from './dto-content';
+import { installQueueStateResponse } from './dto-install';
 import type {
   ContentCompatResponse,
   ContentDetail,
@@ -40,15 +52,15 @@ export function searchContent(input: ContentSearchInput): Promise<ContentPage> {
   if (input.offset) params.set('offset', String(input.offset));
   if (input.limit) params.set('limit', String(input.limit));
   if (input.instanceId) params.set('instance_id', input.instanceId);
-  return api<ContentPage>('GET', `/content/search?${params.toString()}`);
+  return api('GET', `/content/search?${params.toString()}`).then(contentPageResponse);
 }
 
 export function getContentDetail(canonicalId: string): Promise<ContentDetail> {
-  return api<ContentDetail>('GET', `/content/item?id=${encodeURIComponent(canonicalId)}`);
+  return api('GET', `/content/item?id=${encodeURIComponent(canonicalId)}`).then(contentDetailResponse);
 }
 
 export function planContent(target: TargetRef, selections: ContentSelection[]): Promise<ResolutionPlan> {
-  return api<ResolutionPlan>('POST', '/content/plan', { target, selections });
+  return api('POST', '/content/plan', { target, selections }).then(resolutionPlanResponse);
 }
 
 export function planInstanceSetup(
@@ -56,11 +68,11 @@ export function planInstanceSetup(
   target: TargetRef,
   selections: ContentSelection[],
 ): Promise<InstanceSetupPlanResponse> {
-  return api<InstanceSetupPlanResponse>('POST', '/instances/setup/plan', {
+  return api('POST', '/instances/setup/plan', {
     selection_id: selectionId,
     target,
     selections,
-  });
+  }).then(instanceSetupPlanResponse);
 }
 
 export function installContent(
@@ -68,23 +80,23 @@ export function installContent(
   selections: ContentSelection[],
   allowIncompatible = false,
 ): Promise<InstallQueueStateResponse> {
-  return api<InstallQueueStateResponse>('POST', '/content/install', {
+  return api('POST', '/content/install', {
     instance_id: instanceId,
     selections,
     allow_incompatible: allowIncompatible,
-  });
+  }).then(installQueueStateResponse);
 }
 
 /** Which instances a staged set could live in, ranked by how little each one drops. */
 export function contentCompatibility(selections: ContentSelection[]): Promise<ContentCompatResponse> {
-  return api<ContentCompatResponse>('POST', '/content/compatibility', { selections });
+  return api('POST', '/content/compatibility', { selections }).then(contentCompatResponse);
 }
 
 /** What a modpack needs, so an instance can be created for it before importing. */
 export function getModpackTarget(canonicalId: string, versionId?: string): Promise<ModpackTarget> {
   const params = new URLSearchParams({ id: canonicalId });
   if (versionId) params.set('version_id', versionId);
-  return api<ModpackTarget>('GET', `/content/modpack/target?${params.toString()}`);
+  return api('GET', `/content/modpack/target?${params.toString()}`).then(modpackTargetResponse);
 }
 
 export function getModpackFiles(
@@ -94,7 +106,7 @@ export function getModpackFiles(
 ): Promise<ModpackFilesPlan> {
   const params = new URLSearchParams({ instance_id: instanceId, id: canonicalId });
   if (versionId) params.set('version_id', versionId);
-  return api<ModpackFilesPlan>('GET', `/content/modpack/files?${params.toString()}`);
+  return api('GET', `/content/modpack/files?${params.toString()}`).then(modpackFilesResponse);
 }
 
 export function installModpack(
@@ -106,32 +118,32 @@ export function installModpack(
     includeOverrides?: boolean;
   } = {},
 ): Promise<InstallQueueStateResponse> {
-  return api<InstallQueueStateResponse>('POST', '/content/modpack/install', {
+  return api('POST', '/content/modpack/install', {
     instance_id: instanceId,
     canonical_id: canonicalId,
     version_id: versionId,
     selected_file_ids: options.selectedFileIds ?? [],
     include_overrides: options.includeOverrides ?? true,
-  });
+  }).then(installQueueStateResponse);
 }
 
 export function listInstanceContent(instanceId: string): Promise<InstanceContentResponse> {
-  return api<InstanceContentResponse>('GET', `/instances/${encodeURIComponent(instanceId)}/content`);
+  return api('GET', `/instances/${encodeURIComponent(instanceId)}/content`).then(instanceContentResponse);
 }
 
 export function checkContentUpdates(instanceId: string): Promise<ContentUpdatesResponse> {
-  return api<ContentUpdatesResponse>('GET', `/instances/${encodeURIComponent(instanceId)}/content/updates`);
+  return api('GET', `/instances/${encodeURIComponent(instanceId)}/content/updates`).then(contentUpdatesResponse);
 }
 
 export function uninstallContent(instanceId: string, canonicalId: string): Promise<InstallQueueStateResponse> {
-  return api<InstallQueueStateResponse>(
+  return api(
     'DELETE',
     `/instances/${encodeURIComponent(instanceId)}/content?id=${encodeURIComponent(canonicalId)}`,
-  );
+  ).then(installQueueStateResponse);
 }
 
 export function uninstallContents(instanceId: string, canonicalIds: string[]): Promise<InstallQueueStateResponse> {
-  return api<InstallQueueStateResponse>('POST', `/instances/${encodeURIComponent(instanceId)}/content/uninstall`, {
+  return api('POST', `/instances/${encodeURIComponent(instanceId)}/content/uninstall`, {
     canonical_ids: canonicalIds,
-  });
+  }).then(installQueueStateResponse);
 }

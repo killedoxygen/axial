@@ -1,4 +1,5 @@
 import { getNativeApiTransportBootstrap } from './native';
+import { dtoNumber, dtoRecord, dtoString, isDtoRecord } from './dto-contract';
 
 declare const __AXIAL_WEB_API_BASE__: string;
 declare const __AXIAL_TEST_API_CAPABILITY__: string;
@@ -44,16 +45,9 @@ async function resolveApiBase(): Promise<void> {
       const response = await fetch(apiUrl('/transport/bootstrap'), { method: 'POST' });
       const payload = await readJsonPayload(response);
       if (!response.ok) throw makeApiError(response, payload);
-      if (
-        typeof payload !== 'object' ||
-        payload === null ||
-        typeof (payload as Partial<{ base_url: string }>).base_url !== 'string' ||
-        typeof (payload as Partial<{ capability: string }>).capability !== 'string'
-      ) {
-        throw new Error('API transport bootstrap response was invalid.');
-      }
-      setApiBaseUrl((payload as { base_url: string }).base_url);
-      apiCapability = (payload as { capability: string }).capability.trim();
+      const bootstrap = dtoRecord(payload, 'API transport bootstrap');
+      setApiBaseUrl(dtoString(bootstrap.base_url, 'API transport base URL'));
+      apiCapability = dtoString(bootstrap.capability, 'API transport capability').trim();
     }
   }
   if (!__AXIAL_MOCK_API__) {
@@ -102,10 +96,10 @@ export function isApiError(error: unknown): error is ApiError {
   return error instanceof Error && error.name === 'ApiError' && typeof (error as Partial<ApiError>).status === 'number';
 }
 
-export async function api<T = any>(method: string, path: string, body?: unknown): Promise<T> {
+export async function api(method: string, path: string, body?: unknown): Promise<unknown> {
   if (__AXIAL_MOCK_API__) {
     const { mockApi } = await import('./mock/api');
-    return mockApi<T>(method, path, body);
+    return mockApi(method, path, body);
   }
   const opts: RequestInit = { method };
   if (body !== undefined) {
@@ -117,7 +111,7 @@ export async function api<T = any>(method: string, path: string, body?: unknown)
   if (!response.ok) {
     throw makeApiError(response, payload);
   }
-  return payload as T;
+  return payload;
 }
 
 export async function apiFetch(input: string, init: RequestInit = {}): Promise<Response> {
@@ -183,15 +177,11 @@ async function mintTicket(audience: 'media' | 'stream', target?: string): Promis
   }
   const payload = await readJsonPayload(response);
   if (!response.ok) throw makeApiError(response, payload);
-  if (
-    typeof payload !== 'object' ||
-    payload === null ||
-    typeof (payload as Partial<TicketGrant>).ticket !== 'string' ||
-    typeof (payload as Partial<TicketGrant>).expires_in_seconds !== 'number'
-  ) {
-    throw new Error('API transport ticket response was invalid.');
-  }
-  return payload as TicketGrant;
+  const ticket = dtoRecord(payload, 'API transport ticket');
+  return {
+    ticket: dtoString(ticket.ticket, 'API transport ticket'),
+    expires_in_seconds: dtoNumber(ticket.expires_in_seconds, 'API transport ticket expiry'),
+  };
 }
 
 async function recoverBrowserTransport(): Promise<boolean> {
@@ -296,12 +286,21 @@ function looksJson(response: Response, text: string): boolean {
 }
 
 function makeApiError(response: Response, payload: unknown): ApiError {
-  const error = new Error(apiErrorMessage(response, payload)) as ApiError;
-  error.name = 'ApiError';
-  error.status = response.status;
-  error.statusText = response.statusText;
-  if (payload !== undefined) error.payload = payload;
-  return error;
+  return new ApiRequestError(response, payload);
+}
+
+class ApiRequestError extends Error implements ApiError {
+  readonly name = 'ApiError';
+  readonly status: number;
+  readonly statusText: string;
+  readonly payload?: unknown;
+
+  constructor(response: Response, payload: unknown) {
+    super(apiErrorMessage(response, payload));
+    this.status = response.status;
+    this.statusText = response.statusText;
+    if (payload !== undefined) this.payload = payload;
+  }
 }
 
 function apiErrorMessage(response: Response, payload: unknown): string {
@@ -311,12 +310,7 @@ function apiErrorMessage(response: Response, payload: unknown): string {
 }
 
 function isErrorPayload(payload: unknown): payload is { error: string } {
-  return (
-    typeof payload === 'object' &&
-    payload !== null &&
-    typeof (payload as { error?: unknown }).error === 'string' &&
-    (payload as { error: string }).error.trim().length > 0
-  );
+  return isDtoRecord(payload) && typeof payload.error === 'string' && payload.error.trim().length > 0;
 }
 
 function boundedErrorMessage(value: string): string {

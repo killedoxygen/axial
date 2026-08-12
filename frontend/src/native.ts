@@ -1,9 +1,11 @@
+import { dtoRecord, dtoString, isDtoRecord } from './dto-contract';
+
 interface TauriInvokeBinding {
-  invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T>;
+  invoke(cmd: string, args?: Record<string, unknown>): Promise<unknown>;
 }
 
 interface TauriEventBinding {
-  listen(eventName: string, callback: (event: { payload: any }) => void): Promise<() => void>;
+  listen(eventName: string, callback: (event: { payload: unknown }) => void): Promise<() => void>;
 }
 
 interface TauriOpenerBinding {
@@ -76,18 +78,17 @@ function desktopChromeModeFromPayload(value: unknown): DesktopChromeMode {
 }
 
 function desktopChromeFromPayload(payload: unknown): NativeDesktopChrome {
-  if (!payload || typeof payload !== 'object') return browserDesktopChrome;
-  const record = payload as { platform?: unknown; chrome_mode?: unknown };
+  if (!isDtoRecord(payload)) return browserDesktopChrome;
   return {
-    platform: desktopPlatformFromPayload(record.platform),
-    chrome_mode: desktopChromeModeFromPayload(record.chrome_mode),
+    platform: desktopPlatformFromPayload(payload.platform),
+    chrome_mode: desktopChromeModeFromPayload(payload.chrome_mode),
   };
 }
 
 async function getNativeDesktopChrome(): Promise<NativeDesktopChrome> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return browserDesktopChrome;
-  const payload = await tauri.core.invoke<unknown>('desktop_chrome');
+  const payload = await tauri.core.invoke('desktop_chrome');
   return desktopChromeFromPayload(payload);
 }
 
@@ -128,7 +129,7 @@ export const nativeDesktopCloseBlockedEventName = 'axial:desktop:close-blocked';
 
 export async function onNativeEvent(
   eventName: string,
-  callback: (data: any) => void,
+  callback: (data: unknown) => void,
 ): Promise<{ close(): void } | null> {
   const tauri = getTauriBinding();
   if (!tauri?.event) return null;
@@ -144,19 +145,23 @@ export async function onNativeEvent(
   };
 }
 
-function nativeDragDropPayload(payload: any): NativeDragDropPayload | null {
-  const type = payload?.type;
+function nativeDragDropPayload(payload: unknown): NativeDragDropPayload | null {
+  if (!isDtoRecord(payload)) return null;
+  const record = payload;
+  const type = record.type;
   if (type !== 'enter' && type !== 'over' && type !== 'drop' && type !== 'leave') return null;
-  const x = payload?.position?.x;
-  const y = payload?.position?.y;
+  const rawPosition = record.position;
+  const positionRecord = isDtoRecord(rawPosition) ? rawPosition : null;
+  const x = positionRecord?.x;
+  const y = positionRecord?.y;
   const position =
     typeof x === 'number' && typeof y === 'number' && Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
   return {
     type,
-    eligible: payload?.eligible === true,
-    token: typeof payload?.token === 'string' && payload.token ? payload.token : null,
+    eligible: record.eligible === true,
+    token: typeof record.token === 'string' && record.token ? record.token : null,
     position,
-    error: typeof payload?.error === 'string' && payload.error ? payload.error : null,
+    error: typeof record.error === 'string' && record.error ? record.error : null,
   };
 }
 
@@ -181,7 +186,9 @@ export async function onNativeDragDrop(
 export async function getNativeAppVersion(): Promise<string | null> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return null;
-  return tauri.core.invoke<string>('app_version');
+  const value = await tauri.core.invoke('app_version');
+  if (typeof value !== 'string' || !value.trim()) throw new Error('Native app version response was invalid.');
+  return value;
 }
 
 export interface NativeApiTransportBootstrap {
@@ -192,13 +199,56 @@ export interface NativeApiTransportBootstrap {
 export async function getNativeApiTransportBootstrap(): Promise<NativeApiTransportBootstrap | null> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return null;
-  return tauri.core.invoke<NativeApiTransportBootstrap>('api_transport_bootstrap');
+  const value = await tauri.core.invoke('api_transport_bootstrap');
+  const record = dtoRecord(value, 'Native API transport bootstrap');
+  const baseUrl = dtoString(record.base_url, 'Native API transport base URL');
+  const capability = dtoString(record.capability, 'Native API transport capability');
+  if (!baseUrl || !capability) {
+    throw new Error('Native API transport bootstrap was invalid.');
+  }
+  return { base_url: baseUrl, capability };
 }
 
 export async function signInWithMicrosoft(): Promise<NativeMicrosoftSignInResult | undefined> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return undefined;
-  return tauri.core.invoke<NativeMicrosoftSignInResult>('microsoft_sign_in');
+  const value = await tauri.core.invoke('microsoft_sign_in');
+  const record = dtoRecord(value, 'Native Microsoft sign-in');
+  if (record.status !== 'authenticated' && record.status !== 'cancelled') {
+    throw new Error('Native Microsoft sign-in response was invalid.');
+  }
+  for (const key of ['login_id', 'profile_name'] as const) {
+    if (record[key] !== undefined && record[key] !== null && typeof record[key] !== 'string') {
+      throw new Error('Native Microsoft sign-in response was invalid.');
+    }
+  }
+  if (
+    record.owns_minecraft_java !== undefined &&
+    record.owns_minecraft_java !== null &&
+    typeof record.owns_minecraft_java !== 'boolean'
+  ) {
+    throw new Error('Native Microsoft sign-in response was invalid.');
+  }
+  const loginId =
+    record.login_id == null ? (record.login_id === null ? null : undefined) : dtoString(record.login_id, 'Login id');
+  const profileName =
+    record.profile_name == null
+      ? record.profile_name === null
+        ? null
+        : undefined
+      : dtoString(record.profile_name, 'Profile name');
+  const ownsMinecraftJava =
+    record.owns_minecraft_java == null
+      ? record.owns_minecraft_java === null
+        ? null
+        : undefined
+      : record.owns_minecraft_java;
+  return {
+    status: record.status,
+    login_id: loginId,
+    profile_name: profileName,
+    owns_minecraft_java: ownsMinecraftJava,
+  };
 }
 
 export async function requestNativeAppRestart(): Promise<boolean> {
@@ -216,11 +266,7 @@ export async function requestNativeAppReset(): Promise<boolean> {
 }
 
 function nativeSkinFileFromPayload(payload: unknown): File {
-  if (!payload || typeof payload !== 'object') {
-    throw new Error('Native skin picker returned an invalid file.');
-  }
-
-  const record = payload as { name?: unknown; bytes?: unknown };
+  const record = dtoRecord(payload, 'Native skin picker');
   if (!Array.isArray(record.bytes)) {
     throw new Error('Native skin picker returned an invalid file.');
   }
@@ -241,7 +287,7 @@ function nativeSkinFileFromPayload(payload: unknown): File {
 export async function pickNativeSkinFile(): Promise<File | null | undefined> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return undefined;
-  const payload = await tauri.core.invoke<unknown>('pick_skin_file');
+  const payload = await tauri.core.invoke('pick_skin_file');
   return payload === null ? null : nativeSkinFileFromPayload(payload);
 }
 
@@ -249,7 +295,7 @@ export async function consumeNativeSkinDrop(token: string): Promise<File | undef
   const tauri = getTauriBinding();
   if (!tauri?.core) return undefined;
 
-  const payload = await tauri.core.invoke<unknown>('consume_skin_drop', { token });
+  const payload = await tauri.core.invoke('consume_skin_drop', { token });
   return nativeSkinFileFromPayload(payload);
 }
 
@@ -305,7 +351,9 @@ export async function windowMinimize(): Promise<boolean> {
 export async function windowToggleMaximize(): Promise<boolean | null> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return null;
-  return tauri.core.invoke<boolean>('window_toggle_maximize');
+  const value = await tauri.core.invoke('window_toggle_maximize');
+  if (typeof value !== 'boolean') throw new Error('Native maximize response was invalid.');
+  return value;
 }
 
 export async function windowClose(): Promise<boolean> {
@@ -318,7 +366,9 @@ export async function windowClose(): Promise<boolean> {
 export async function windowIsMaximized(): Promise<boolean> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return false;
-  return tauri.core.invoke<boolean>('window_is_maximized');
+  const value = await tauri.core.invoke('window_is_maximized');
+  if (typeof value !== 'boolean') throw new Error('Native maximize state was invalid.');
+  return value;
 }
 
 export async function windowStartDragging(): Promise<boolean> {

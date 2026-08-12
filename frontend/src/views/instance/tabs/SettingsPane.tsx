@@ -22,6 +22,7 @@ import {
   performanceModeFrom,
   performanceModeLabel,
 } from '../performance-mode';
+import { enrichedInstanceResponse } from '../../../dto-core';
 
 function instancePerformanceModeFrom(value: string | undefined): InstancePerformanceMode {
   return performanceModeFrom(value) ?? '';
@@ -40,7 +41,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const [recMin, recMax] = recommendedHeapRange(totalGb);
 
   const { commit, saving } = useAutoSave<EnrichedInstance & { error?: string }>({
-    send: (patch) => api('PUT', `/instances/${encodeURIComponent(inst.id)}`, patch),
+    send: (patch) => api('PUT', `/instances/${encodeURIComponent(inst.id)}`, patch).then(enrichedInstanceResponse),
     apply: (res) => updateInstanceInList(res),
     errorLabel: 'instance settings',
   });
@@ -89,9 +90,10 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   useEffect(() => {
     let cancelled = false;
     void api('GET', `/instances/${encodeURIComponent(inst.id)}`)
-      .then((res: any) => {
-        if (cancelled || !res || res.error) return;
-        updateInstanceInList(res as EnrichedInstance);
+      .then(enrichedInstanceResponse)
+      .then((res) => {
+        if (cancelled) return;
+        updateInstanceInList(res);
       })
       .catch(() => {});
     return () => {

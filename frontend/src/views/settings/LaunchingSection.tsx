@@ -12,6 +12,7 @@ import { api } from '../../api';
 import { config, systemInfo } from '../../store';
 import { fmtMem } from '../../format';
 import type { Config } from '../../types-settings';
+import { configResponse } from '../../dto-core';
 
 export function LaunchingSection(): JSX.Element {
   const cfg = config.value;
@@ -20,7 +21,7 @@ export function LaunchingSection(): JSX.Element {
   const [recMin, recMax] = recommendedHeapRange(totalGb);
 
   const { commit } = useAutoSave<Config & { error?: string }>({
-    send: (patch) => api('PUT', '/config', patch),
+    send: (patch) => api('PUT', '/config', patch).then(configResponse),
     apply: (res) => {
       config.value = res;
     },

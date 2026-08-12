@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { api } from '../../api';
+import { configResponse } from '../../dto-core';
 import { hasNativeDesktopRuntime, requestNativeAppReset } from '../../native';
 import { Button, Toggle } from '../../ui/Atoms';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
@@ -53,9 +54,7 @@ export function AdvancedSettingsSection(): JSX.Element {
     setTelemetryEnabled(next);
     setSavingTelemetry(true);
     try {
-      const res: any = await api('PUT', '/config', { telemetry_enabled: next });
-      if (res?.error) throw new Error(res.error);
-      config.value = res;
+      config.value = configResponse(await api('PUT', '/config', { telemetry_enabled: next }));
       toast('Saved');
     } catch (err) {
       setTelemetryEnabled(savedTelemetry);

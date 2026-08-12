@@ -6,6 +6,7 @@ import { Sound } from './sound';
 import { buildTheme, type Theme } from './tokens';
 import { toast } from './toast';
 import { windowSetResizeBackground } from './native';
+import { configResponse } from './dto-core';
 
 const initialThemeHue = local.theme === 'custom' ? local.customHue : (PRESET_HUES[local.theme] ?? local.customHue);
 
@@ -144,8 +145,8 @@ export function applyTheme(theme: string, hue: number | null, options: ApplyOpti
       payload.custom_vibrancy = vibrancy;
     }
     api('PUT', '/config', payload)
-      .then((r: any) => {
-        if (r.error) throw new Error(r.error);
+      .then(configResponse)
+      .then((r) => {
         config.value = r;
         saveLocalState();
         Sound.ui('theme');
@@ -196,8 +197,8 @@ export function resetThemeToDefault(): void {
     custom_hue: nextHue,
     custom_vibrancy: nextVibrancy,
   })
-    .then((r: any) => {
-      if (r.error) throw new Error(r.error);
+    .then(configResponse)
+    .then((r) => {
       config.value = r;
       saveLocalState();
       Sound.ui('theme');

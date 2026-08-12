@@ -2,8 +2,8 @@ import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { api } from '../../api';
 import { devMode } from '../../store';
-import type { LaunchReportsResponse } from '../../types-launch';
-import type { BenchmarkMatrixResponse, BenchmarkQualificationPreviewResponse } from '../../types-performance';
+import { launchReportsResponse } from '../../dto-launch';
+import { benchmarkMatrixResponse, benchmarkQualificationResponse } from '../../dto-performance';
 import { Button } from '../../ui/Atoms';
 import { SettingRow } from '../../ui/SettingsSheet';
 import { errMessage } from '../../utils';
@@ -39,11 +39,10 @@ export function PerformanceLabCard(): JSX.Element | null {
     let alive = true;
     setLaunchReports({ status: 'loading', data: [] });
     api('GET', '/launch/reports')
+      .then(launchReportsResponse)
       .then((res) => {
         if (!alive) return;
-        if (res?.error) throw new Error(res.error);
-        const reports = (res as LaunchReportsResponse).reports;
-        setLaunchReports({ status: 'ready', data: Array.isArray(reports) ? reports : [] });
+        setLaunchReports({ status: 'ready', data: res.reports });
       })
       .catch((err) => {
         if (!alive) return;
@@ -59,10 +58,10 @@ export function PerformanceLabCard(): JSX.Element | null {
     let alive = true;
     setBenchmarkMatrix((prev) => ({ status: 'loading', data: prev.data }));
     api('GET', '/launch/benchmark/matrix')
+      .then(benchmarkMatrixResponse)
       .then((res) => {
         if (!alive) return;
-        if (res?.error) throw new Error(res.error);
-        setBenchmarkMatrix({ status: 'ready', data: res as BenchmarkMatrixResponse });
+        setBenchmarkMatrix({ status: 'ready', data: res });
       })
       .catch((err) => {
         if (!alive) return;
@@ -78,12 +77,12 @@ export function PerformanceLabCard(): JSX.Element | null {
     let alive = true;
     setQualificationPreview((prev) => ({ status: 'loading', data: prev.data }));
     api('GET', '/launch/benchmark/qualification/family-c-1-12-2/preview')
+      .then(benchmarkQualificationResponse)
       .then((res) => {
         if (!alive) return;
-        if (res?.error) throw new Error(res.error);
         setQualificationPreview({
           status: 'ready',
-          data: normalizeBenchmarkQualification(res as BenchmarkQualificationPreviewResponse),
+          data: normalizeBenchmarkQualification(res),
         });
       })
       .catch((err) => {

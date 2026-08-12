@@ -6,6 +6,7 @@ import type { ContextMenuItem } from '../../ui/ContextMenu';
 import type { EnrichedInstance, InstanceScreenshot } from '../../types-instance';
 import { openInstanceFolder } from './instance-actions';
 import { confirmDeleteItems, partialFailureMessage, runBulkMutation } from './bulk-actions';
+import { dtoError } from '../../dto-contract';
 
 function screenshotKind(name: string): 'png' | 'jpeg' | 'webp' | '' {
   const lower = name.toLowerCase();
@@ -25,11 +26,12 @@ function screenshotNameError(value: string, currentName?: string): string | null
 }
 
 async function removeScreenshot(inst: EnrichedInstance, screenshotName: string): Promise<void> {
-  const res: any = await api(
+  const res = await api(
     'DELETE',
     `/instances/${encodeURIComponent(inst.id)}/screenshots/${encodeURIComponent(screenshotName)}`,
   );
-  if (res?.error) throw new Error(res.error);
+  const error = dtoError(res);
+  if (error) throw new Error(error);
 }
 
 export function screenshotFileUrl(inst: EnrichedInstance, name: string): string {
@@ -49,12 +51,13 @@ export async function renameScreenshot(
   const nextName = next ?? '';
   if (!nextName || nextName === screenshotName) return;
   try {
-    const res: any = await api(
+    const res = await api(
       'PUT',
       `/instances/${encodeURIComponent(inst.id)}/screenshots/${encodeURIComponent(screenshotName)}`,
       { name: nextName },
     );
-    if (res?.error) throw new Error(res.error);
+    const error = dtoError(res);
+    if (error) throw new Error(error);
     toast('Screenshot renamed');
     onDone(nextName);
   } catch (err) {

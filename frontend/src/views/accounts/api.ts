@@ -102,8 +102,10 @@ export function savedSkinsResponse(value: unknown): SavedSkinsData | null {
   ) {
     return null;
   }
+  const skins = value.skins.map(savedSkinRecord);
+  if (skins.some((skin) => skin === null)) return null;
   return {
-    skins: value.skins.map(savedSkinRecord).filter((skin): skin is SavedSkinRecord => Boolean(skin)),
+    skins: skins as SavedSkinRecord[],
     pendingApplyKey: typeof value.pending_apply_texture_key === 'string' ? value.pending_apply_texture_key : null,
   };
 }
@@ -324,7 +326,7 @@ export async function normalizeSkinUpload(file: File): Promise<SkinNormalizeMeta
     headers: { 'Content-Type': 'image/png' },
     body: file,
   });
-  const payload = await response.json().catch(() => undefined);
+  const payload: unknown = await response.json().catch(() => undefined);
   if (!response.ok) {
     throw apiResponseError(response, payload, `Skin validation failed with HTTP ${response.status}`);
   }
@@ -354,7 +356,7 @@ export async function replaceSavedSkinTexture(
     headers: { 'Content-Type': 'image/png' },
     body: file,
   });
-  const payload = await response.json().catch(() => undefined);
+  const payload: unknown = await response.json().catch(() => undefined);
   if (!response.ok) {
     throw apiResponseError(response, payload, `Texture replacement failed with HTTP ${response.status}`);
   }
@@ -373,17 +375,24 @@ export function uploadSkinName(file: File): string {
 
 function minecraftProfile(value: unknown): MinecraftProfile | undefined {
   if (!isRecord(value)) return undefined;
-  if (typeof value.id !== 'string' || typeof value.name !== 'string') return undefined;
+  if (
+    typeof value.id !== 'string' ||
+    typeof value.name !== 'string' ||
+    !Array.isArray(value.skins) ||
+    !Array.isArray(value.capes)
+  ) {
+    return undefined;
+  }
+
+  const skins = value.skins.map(minecraftSkin);
+  const capes = value.capes.map(minecraftCape);
+  if (skins.some((skin) => skin === null) || capes.some((cape) => cape === null)) return undefined;
 
   return {
     id: value.id,
     name: value.name,
-    skins: Array.isArray(value.skins)
-      ? value.skins.map(minecraftSkin).filter((skin): skin is MinecraftSkin => Boolean(skin))
-      : [],
-    capes: Array.isArray(value.capes)
-      ? value.capes.map(minecraftCape).filter((cape): cape is MinecraftCape => Boolean(cape))
-      : [],
+    skins: skins as MinecraftSkin[],
+    capes: capes as MinecraftCape[],
   };
 }
 
@@ -422,13 +431,23 @@ export async function lookupMinecraftSkin(username: string): Promise<MinecraftSk
   return parsed;
 }
 
-export function minecraftReadiness(record: Record<string, unknown>): MinecraftAuthReadiness {
+function minecraftReadiness(record: Record<string, unknown>): MinecraftAuthReadiness | null {
+  if (
+    typeof record.minecraft_profile_ready !== 'boolean' ||
+    typeof record.minecraft_ownership_verified !== 'boolean' ||
+    (record.minecraft_token_expires_in !== undefined &&
+      record.minecraft_token_expires_in !== null &&
+      maybeNumber(record.minecraft_token_expires_in) === undefined)
+  ) {
+    return null;
+  }
+  const profile = record.minecraft_profile == null ? undefined : minecraftProfile(record.minecraft_profile);
+  if ((record.minecraft_profile != null && !profile) || record.minecraft_profile_ready !== Boolean(profile))
+    return null;
   return {
-    minecraft_profile_ready:
-      typeof record.minecraft_profile_ready === 'boolean' ? record.minecraft_profile_ready : undefined,
-    minecraft_ownership_verified:
-      typeof record.minecraft_ownership_verified === 'boolean' ? record.minecraft_ownership_verified : undefined,
-    minecraft_profile: minecraftProfile(record.minecraft_profile),
+    minecraft_profile_ready: record.minecraft_profile_ready,
+    minecraft_ownership_verified: record.minecraft_ownership_verified,
+    minecraft_profile: profile,
     minecraft_token_expires_in:
       record.minecraft_token_expires_in === null ? null : maybeNumber(record.minecraft_token_expires_in),
   };
@@ -464,7 +483,27 @@ function launcherAccount(value: unknown): LauncherAccount | null {
     typeof value.display_name !== 'string' ||
     typeof value.active !== 'boolean' ||
     typeof value.msa_authenticated !== 'boolean' ||
-    typeof value.msa_refresh_available !== 'boolean'
+    typeof value.msa_refresh_available !== 'boolean' ||
+    (value.login_id !== undefined && typeof value.login_id !== 'string') ||
+    (value.minecraft_profile_id !== undefined && typeof value.minecraft_profile_id !== 'string') ||
+    (value.offline_uuid !== undefined && typeof value.offline_uuid !== 'string')
+  ) {
+    return null;
+  }
+  const readiness = minecraftReadiness(value);
+  const onlineAction = accountActionState(value.online_action);
+  const refreshAction = accountActionState(value.refresh_action);
+  const profileSyncAction = accountActionState(value.profile_sync_action);
+  if (
+    !readiness ||
+    !onlineAction ||
+    !refreshAction ||
+    !profileSyncAction ||
+    !isRecord(value.view_model) ||
+    typeof value.view_model.detail !== 'string' ||
+    (value.msa_token_expires_in !== undefined &&
+      value.msa_token_expires_in !== null &&
+      maybeNumber(value.msa_token_expires_in) === undefined)
   ) {
     return null;
   }
@@ -480,22 +519,22 @@ function launcherAccount(value: unknown): LauncherAccount | null {
     msa_authenticated: value.msa_authenticated,
     msa_token_expires_in: value.msa_token_expires_in === null ? null : maybeNumber(value.msa_token_expires_in),
     msa_refresh_available: value.msa_refresh_available,
-    online_action: accountActionState(value.online_action),
-    refresh_action: accountActionState(value.refresh_action),
-    profile_sync_action: accountActionState(value.profile_sync_action),
-    view_model: isRecord(value.view_model)
-      ? { detail: typeof value.view_model.detail === 'string' ? value.view_model.detail : undefined }
-      : undefined,
-    ...minecraftReadiness(value),
+    online_action: onlineAction,
+    refresh_action: refreshAction,
+    profile_sync_action: profileSyncAction,
+    view_model: { detail: value.view_model.detail },
+    ...readiness,
   };
 }
 
 export function launcherAccountsResponse(value: unknown): LauncherAccountsData | null {
   if (!isRecord(value) || !Array.isArray(value.accounts)) return null;
   if (value.active_account_id !== null && typeof value.active_account_id !== 'string') return null;
+  const accounts = value.accounts.map(launcherAccount);
+  if (accounts.some((account) => account === null)) return null;
   return {
     active_account_id: value.active_account_id,
-    accounts: value.accounts.map(launcherAccount).filter((account): account is LauncherAccount => account !== null),
+    accounts: accounts as LauncherAccount[],
   };
 }
 
@@ -511,10 +550,21 @@ export function authStatusResponse(value: unknown): AuthStatusRecord | null {
     typeof value.skin_source !== 'string' ||
     typeof value.login_available !== 'boolean' ||
     typeof value.login_reason !== 'string' ||
-    typeof value.msa_refresh_available !== 'boolean'
+    typeof value.msa_authenticated !== 'boolean' ||
+    typeof value.msa_refresh_available !== 'boolean' ||
+    (value.msa_provider !== undefined && typeof value.msa_provider !== 'string') ||
+    (value.msa_token_expires_in !== undefined &&
+      value.msa_token_expires_in !== null &&
+      maybeNumber(value.msa_token_expires_in) === undefined)
   ) {
     return null;
   }
+  const readiness = minecraftReadiness(value);
+  const onlineAction = accountActionState(value.online_action);
+  const refreshAction = accountActionState(value.refresh_action);
+  const profileSyncAction = accountActionState(value.profile_sync_action);
+  const skinAction = accountActionState(value.skin_action);
+  if (!readiness || !onlineAction || !refreshAction || !profileSyncAction || !skinAction) return null;
 
   return {
     launch_auth_mode: value.launch_auth_mode,
@@ -526,16 +576,15 @@ export function authStatusResponse(value: unknown): AuthStatusRecord | null {
     skin_source: value.skin_source,
     login_available: value.login_available,
     login_reason: value.login_reason,
-    msa_authenticated: typeof value.msa_authenticated === 'boolean' ? value.msa_authenticated : undefined,
-    msa_provider:
-      typeof value.msa_provider === 'string' ? value.msa_provider : value.msa_provider === null ? null : undefined,
+    msa_authenticated: value.msa_authenticated,
+    msa_provider: value.msa_provider,
     msa_token_expires_in: value.msa_token_expires_in === null ? null : maybeNumber(value.msa_token_expires_in),
     msa_refresh_available: value.msa_refresh_available,
-    online_action: accountActionState(value.online_action),
-    refresh_action: accountActionState(value.refresh_action),
-    profile_sync_action: accountActionState(value.profile_sync_action),
-    skin_action: accountActionState(value.skin_action),
-    ...minecraftReadiness(value),
+    online_action: onlineAction,
+    refresh_action: refreshAction,
+    profile_sync_action: profileSyncAction,
+    skin_action: skinAction,
+    ...readiness,
   };
 }
 

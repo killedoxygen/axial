@@ -20,6 +20,7 @@ import {
   logoutErrorMessage,
 } from '../views/accounts/auth';
 import type { AccountActionState, AuthStatusRecord, AuthStatusState, LauncherAccount } from '../views/accounts/types';
+import { configResponse } from '../dto-core';
 
 export interface AccountsSnapshot {
   state: AuthStatusState;
@@ -92,7 +93,7 @@ function parseAuthStatus(value: unknown): AuthStatusRecord | null {
 
 async function afterAccountsChange(): Promise<void> {
   try {
-    setConfig(await api('GET', '/config'));
+    setConfig(configResponse(await api('GET', '/config')));
   } catch (err: unknown) {
     console.warn('Could not refresh config after account change.', err);
   }

@@ -6,6 +6,12 @@ import { errMessage } from '../../utils';
 import type { EnrichedInstance } from '../../types-instance';
 import { openInstanceFolder } from './instance-actions';
 import { confirmDeleteItems, partialFailureMessage, runBulkMutation } from './bulk-actions';
+import { dtoError, dtoOptionalString, dtoRecord } from '../../dto-contract';
+
+function requireCommandSuccess(value: unknown): void {
+  const error = dtoError(value);
+  if (error) throw new Error(error);
+}
 
 function worldNameError(value: string): string | null {
   return value ? null : 'Use a world name.';
@@ -20,12 +26,10 @@ export async function renameWorld(inst: EnrichedInstance, worldName: string, onD
   const nextName = next ?? '';
   if (!nextName || nextName === worldName) return;
   try {
-    const res: any = await api(
-      'PUT',
-      `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`,
-      { name: nextName },
-    );
-    if (res?.error) throw new Error(res.error);
+    const res = await api('PUT', `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`, {
+      name: nextName,
+    });
+    requireCommandSuccess(res);
     toast('World renamed');
     onDone();
   } catch (err) {
@@ -41,11 +45,11 @@ export async function deleteWorld(inst: EnrichedInstance, worldName: string, onD
   );
   if (choice !== 'delete') return;
   try {
-    const res: any = await api(
+    const res = await api(
       'DELETE',
       `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`,
     );
-    if (res?.error) throw new Error(res.error);
+    requireCommandSuccess(res);
     toast('World deleted');
     onDone();
   } catch (err) {
@@ -66,11 +70,11 @@ export async function deleteWorlds(inst: EnrichedInstance, worldNames: string[],
   await runBulkMutation({
     items: worldNames,
     action: async (worldName) => {
-      const res: any = await api(
+      const res = await api(
         'DELETE',
         `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`,
       );
-      if (res?.error) throw new Error(res.error);
+      requireCommandSuccess(res);
     },
     success: (count) => (count === 1 ? 'World deleted' : `${count} worlds deleted`),
     partial: (done, total, err) => partialFailureMessage('Deleted', done, total, err),
@@ -80,13 +84,14 @@ export async function deleteWorlds(inst: EnrichedInstance, worldNames: string[],
 
 export async function backupWorld(inst: EnrichedInstance, worldName: string, onDone: () => void): Promise<void> {
   try {
-    const res: any = await api(
+    const res = await api(
       'POST',
       `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}/backup`,
       {},
     );
-    if (res?.error) throw new Error(res.error);
-    toast(res?.location ? `World backed up to ${res.location}` : 'World backed up');
+    requireCommandSuccess(res);
+    const location = dtoOptionalString(dtoRecord(res, 'World backup').location, 'World backup location');
+    toast(location ? `World backed up to ${location}` : 'World backed up');
     onDone();
   } catch (err) {
     toast(`Could not back up the world: ${errMessage(err)}`, 'error');

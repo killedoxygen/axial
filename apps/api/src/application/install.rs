@@ -5347,6 +5347,7 @@ fn install_queue_install_item(spec: &InstallQueueSpec) -> InstallQueueInstallIte
         },
         InstallQueueSpec::Content {
             instance_id,
+            label,
             action,
             ..
         } => InstallQueueInstallItemViewModel {
@@ -5354,6 +5355,7 @@ fn install_queue_install_item(spec: &InstallQueueSpec) -> InstallQueueInstallIte
             loader: None,
             content: Some(InstallQueueContentItemViewModel {
                 instance_id: instance_id.clone(),
+                label: label.clone(),
                 action: content_action_request(action),
             }),
         },
