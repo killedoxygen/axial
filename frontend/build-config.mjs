@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
  * @property {boolean} enableDevLab
  * @property {boolean} enableMockApi
  * @property {string} webApiBase
+ * @property {string} [testApiCapability]
  */
 
 const defaultDependencyRoot = fileURLToPath(new URL('.', import.meta.url));
@@ -38,13 +39,20 @@ export function createFrontendResolverPlugins({ dependencyRoot = defaultDependen
  * @param {BuildSemanticsOptions} options
  * @returns {Pick<import('esbuild').BuildOptions, 'define' | 'jsx' | 'jsxImportSource' | 'plugins' | 'target'>}
  */
-export function createFrontendBuildSemantics({ dependencyRoot, enableDevLab, enableMockApi, webApiBase }) {
+export function createFrontendBuildSemantics({
+  dependencyRoot,
+  enableDevLab,
+  enableMockApi,
+  webApiBase,
+  testApiCapability = '',
+}) {
   return {
     target: ['es2020'],
     jsx: 'automatic',
     jsxImportSource: 'preact',
     define: {
       __AXIAL_WEB_API_BASE__: JSON.stringify(webApiBase),
+      __AXIAL_TEST_API_CAPABILITY__: JSON.stringify(testApiCapability),
       __AXIAL_ENABLE_DEV_LAB__: JSON.stringify(enableDevLab),
       __AXIAL_MOCK_API__: JSON.stringify(enableMockApi),
     },

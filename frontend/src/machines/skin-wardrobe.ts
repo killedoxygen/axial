@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { api, apiUrl } from '../api';
+import { api, apiFetch, apiUrl } from '../api';
 import { DEFAULT_SKINS, type DefaultSkin } from '../default-skins';
 import {
   hasSelectedSkinForAccount,
@@ -376,7 +376,7 @@ export async function uploadSkinPng(
   const params = new URLSearchParams({ name: options.name, variant: options.variant });
   if (options.capeId) params.set('cape_id', options.capeId);
   if (options.source) params.set('source', options.source);
-  const response = await fetch(apiUrl(`/skins?${params.toString()}`), {
+  const response = await apiFetch(apiUrl(`/skins?${params.toString()}`), {
     method: 'POST',
     headers: { 'Content-Type': 'image/png' },
     body: file,

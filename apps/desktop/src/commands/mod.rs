@@ -80,8 +80,10 @@ fn desktop_chrome_mode() -> &'static str {
 }
 
 #[tauri::command]
-pub fn api_base_url(state: State<'_, ApiRuntimeState>) -> String {
-    format!("http://{}", state.addr())
+pub fn api_transport_bootstrap(
+    state: State<'_, ApiRuntimeState>,
+) -> axial_api::transport::ApiTransportBootstrap {
+    state.transport_bootstrap()
 }
 
 #[tauri::command]

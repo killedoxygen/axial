@@ -23,6 +23,7 @@ declare global {
 }
 
 function getTauriBinding(): TauriBinding | null {
+  if (typeof window === 'undefined') return null;
   return window.__TAURI__ ?? null;
 }
 
@@ -183,10 +184,15 @@ export async function getNativeAppVersion(): Promise<string | null> {
   return tauri.core.invoke<string>('app_version');
 }
 
-export async function getNativeApiBaseUrl(): Promise<string | null> {
+export interface NativeApiTransportBootstrap {
+  base_url: string;
+  capability: string;
+}
+
+export async function getNativeApiTransportBootstrap(): Promise<NativeApiTransportBootstrap | null> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return null;
-  return tauri.core.invoke<string>('api_base_url');
+  return tauri.core.invoke<NativeApiTransportBootstrap>('api_transport_bootstrap');
 }
 
 export async function signInWithMicrosoft(): Promise<NativeMicrosoftSignInResult | undefined> {

@@ -4,7 +4,8 @@
   "description": "Main desktop capability for the Axial rewrite shell",
   "windows": ["main"],
   "permissions": [
-    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     {
       "identifier": "opener:allow-open-url",
       "allow": [
@@ -13,11 +14,5 @@
         }
       ]
     }
-  ],
-  "remote": {
-    "urls": [
-      "http://127.0.0.1:*/*",
-      "http://localhost:*/*"
-    ]
-  }
+  ]
 }

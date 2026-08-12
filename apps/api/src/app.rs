@@ -3,6 +3,7 @@ use crate::observability::telemetry::{
 };
 use crate::routes;
 use crate::state::AppState;
+use crate::transport::{ApiTransportBootstrap, LocalApiAuthority};
 use axum::Router;
 #[cfg(feature = "embedded-frontend")]
 use axum::{
@@ -31,8 +32,8 @@ const EMBEDDED_API_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 #[cfg(feature = "embedded-frontend")]
 static EMBEDDED_FRONTEND: Dir<'_> = include_dir!("$OUT_DIR/embedded-frontend");
 
-pub fn build_router(state: AppState) -> Router {
-    let api = routes::router(state);
+pub fn build_router(state: AppState, authority: LocalApiAuthority) -> Router {
+    let api = routes::router_with_authority(state, authority);
     #[cfg(feature = "embedded-frontend")]
     {
         api.fallback(get(serve_embedded_frontend))
@@ -242,12 +243,15 @@ fn spawn_benchmark_suite_drivers_resume(state: &AppState) -> bool {
 #[derive(Debug)]
 pub struct ServerHandle {
     pub addr: SocketAddr,
+    authority: LocalApiAuthority,
     shutdown: watch::Sender<bool>,
     completion: watch::Receiver<ServerCompletion>,
 }
 
 #[derive(Debug, Error)]
 pub enum ApiServerError {
+    #[error("invalid local API authority: {0}")]
+    Authority(String),
     #[error("failed to bind listener: {0}")]
     Bind(#[from] io::Error),
 }
@@ -272,6 +276,10 @@ enum ServerCompletion {
 }
 
 impl ServerHandle {
+    pub fn transport_bootstrap(&self) -> ApiTransportBootstrap {
+        self.authority.bootstrap()
+    }
+
     pub async fn wait(&self) -> Result<(), ApiServerShutdownError> {
         let mut completion = self.completion.clone();
         loop {
@@ -304,16 +312,44 @@ impl Drop for ServerHandle {
 }
 
 pub async fn spawn_background(state: AppState) -> Result<ServerHandle, ApiServerError> {
-    spawn_background_on(state, SocketAddr::from(([127, 0, 0, 1], 0))).await
+    spawn_background_for_origin(state, None).await
+}
+
+pub async fn spawn_background_for_origin(
+    state: AppState,
+    origin: Option<&str>,
+) -> Result<ServerHandle, ApiServerError> {
+    spawn_background_on_with_origin(state, SocketAddr::from(([127, 0, 0, 1], 0)), origin).await
 }
 
 pub async fn spawn_background_on(
     state: AppState,
     addr: SocketAddr,
 ) -> Result<ServerHandle, ApiServerError> {
-    spawn_background_router(build_router(state), addr).await
+    spawn_background_on_with_origin(state, addr, None).await
 }
 
+async fn spawn_background_on_with_origin(
+    state: AppState,
+    addr: SocketAddr,
+    origin: Option<&str>,
+) -> Result<ServerHandle, ApiServerError> {
+    require_loopback(addr)?;
+    let listener = TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
+    let authority = LocalApiAuthority::new(addr, origin).map_err(ApiServerError::Authority)?;
+    let router = build_router(state, authority.clone());
+    spawn_bound_router(
+        router,
+        listener,
+        addr,
+        authority,
+        EMBEDDED_API_SHUTDOWN_GRACE,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn spawn_background_router(
     router: Router,
     addr: SocketAddr,
@@ -321,13 +357,26 @@ async fn spawn_background_router(
     spawn_background_router_with_grace(router, addr, EMBEDDED_API_SHUTDOWN_GRACE).await
 }
 
+#[cfg(test)]
 async fn spawn_background_router_with_grace(
     router: Router,
     addr: SocketAddr,
     shutdown_grace: Duration,
 ) -> Result<ServerHandle, ApiServerError> {
+    require_loopback(addr)?;
     let listener = TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
+    let authority = LocalApiAuthority::new(addr, None).map_err(ApiServerError::Authority)?;
+    spawn_bound_router(router, listener, addr, authority, shutdown_grace).await
+}
+
+async fn spawn_bound_router(
+    router: Router,
+    listener: TcpListener,
+    addr: SocketAddr,
+    authority: LocalApiAuthority,
+    shutdown_grace: Duration,
+) -> Result<ServerHandle, ApiServerError> {
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (completion_tx, completion) = watch::channel(ServerCompletion::Running);
     let mut server_shutdown_rx = shutdown_rx.clone();
@@ -379,9 +428,20 @@ async fn spawn_background_router_with_grace(
 
     Ok(ServerHandle {
         addr,
+        authority,
         shutdown,
         completion,
     })
+}
+
+fn require_loopback(addr: SocketAddr) -> Result<(), ApiServerError> {
+    if addr.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(ApiServerError::Authority(
+            "local API address must be loopback".to_string(),
+        ))
+    }
 }
 
 #[cfg(feature = "embedded-frontend")]
@@ -540,15 +600,18 @@ mod tests {
     #[tokio::test]
     async fn standalone_router_owns_only_the_embedded_frontend_fallback() {
         let root = super::axial_api_test_support::test_root("embedded-router");
-        let response = build_router(build_test_state(&root, None))
-            .oneshot(
-                Request::builder()
-                    .uri("/not-an-api-route")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = build_router(
+            build_test_state(&root, None),
+            LocalApiAuthority::bypass_for_test(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/not-an-api-route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
@@ -561,15 +624,18 @@ mod tests {
     #[tokio::test]
     async fn desktop_api_router_has_no_frontend_fallback() {
         let root = super::axial_api_test_support::test_root("no-frontend-router");
-        let response = build_router(build_test_state(&root, None))
-            .oneshot(
-                Request::builder()
-                    .uri("/index.html")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = build_router(
+            build_test_state(&root, None),
+            LocalApiAuthority::bypass_for_test(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/index.html")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let _ = fs::remove_dir_all(root);
     }

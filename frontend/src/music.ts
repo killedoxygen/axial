@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { api, apiUrl } from './api';
+import { api, apiResourceUrl } from './api';
 
 const DEFAULT_TRACK_COUNT = 2;
 let trackCount = DEFAULT_TRACK_COUNT;
@@ -149,7 +149,7 @@ export const Music = {
       audio.preload = 'none';
     }
     if (!this.ready) {
-      audio.src = apiUrl(`/music/track?t=${this.track}`);
+      audio.src = apiResourceUrl(`/music/track?t=${this.track}`);
       this.ready = true;
     }
     if (!audio.paused) return;
@@ -177,7 +177,7 @@ export const Music = {
     if (audio && !audio.paused) {
       startFade(0, () => {
         audio!.pause();
-        audio!.src = apiUrl(`/music/track?t=${this.track}`);
+        audio!.src = apiResourceUrl(`/music/track?t=${this.track}`);
         this.ready = true;
         void this.play();
       });

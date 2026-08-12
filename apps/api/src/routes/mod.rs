@@ -21,19 +21,27 @@ mod version_info;
 mod versions;
 
 use crate::state::{AppState, LifecycleAdmissionError, RequestLease};
+use crate::transport::{CAPABILITY_HEADER, LocalApiAuthority};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Request, State},
-    http::{HeaderValue, Method, header},
+    extract::{Extension, Request, State},
+    http::{HeaderName, Method, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    routing::{any, post},
 };
 use http_body_util::BodyExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+#[cfg(test)]
 pub fn router(state: AppState) -> Router {
+    router_with_authority(state, LocalApiAuthority::bypass_for_test())
+}
+
+pub(crate) fn router_with_authority(state: AppState, authority: LocalApiAuthority) -> Router {
     let admission_state = state.clone();
+    let auth_state = authority.clone();
     Router::new()
         .merge(status::router())
         .merge(accounts::router())
@@ -56,12 +64,33 @@ pub fn router(state: AppState) -> Router {
         .merge(versions::router())
         .merge(version_info::router())
         .merge(java::router())
+        .route(
+            "/api/v1/transport/bootstrap",
+            post(crate::transport::create_bootstrap),
+        )
+        .route(
+            "/api/v1/transport/tickets",
+            post(crate::transport::create_ticket),
+        )
+        .route("/api/v1/{*path}", any(api_not_found))
         .with_state(state)
+        .layer(Extension(authority.clone()))
         .layer(middleware::from_fn_with_state(
             admission_state,
             lifecycle_admission,
         ))
-        .layer(local_cors_layer())
+        .layer(local_cors_layer(authority))
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            crate::transport::authenticate_request,
+        ))
+}
+
+async fn api_not_found() -> impl IntoResponse {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "API route was not found" })),
+    )
 }
 
 async fn lifecycle_admission(
@@ -101,10 +130,10 @@ pub(super) fn producer_claim_error_response(
     )
 }
 
-fn local_cors_layer() -> CorsLayer {
+fn local_cors_layer(authority: LocalApiAuthority) -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin, _| {
-            is_allowed_local_origin(origin)
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            authority.allows_origin(origin)
         }))
         .allow_methods([
             Method::GET,
@@ -114,30 +143,10 @@ fn local_cors_layer() -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([header::CONTENT_TYPE])
-}
-
-fn is_allowed_local_origin(origin: &HeaderValue) -> bool {
-    let Ok(origin) = origin.to_str() else {
-        return false;
-    };
-
-    origin == "tauri://localhost"
-        || origin == "http://tauri.localhost"
-        || origin == "https://tauri.localhost"
-        || origin
-            .strip_prefix("http://127.0.0.1:")
-            .is_some_and(is_port_suffix)
-        || origin
-            .strip_prefix("http://localhost:")
-            .is_some_and(is_port_suffix)
-        || origin
-            .strip_prefix("http://[::1]:")
-            .is_some_and(is_port_suffix)
-}
-
-fn is_port_suffix(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        .allow_headers([
+            header::CONTENT_TYPE,
+            HeaderName::from_static(CAPABILITY_HEADER),
+        ])
 }
 
 #[cfg(test)]

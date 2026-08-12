@@ -1,11 +1,11 @@
-import { apiUrl } from '../api';
+import { apiEventSourceUrl } from '../api';
 
-export function connectLoaderInstallSSE(
+export async function connectLoaderInstallSSE(
   installId: string,
   onProgress: (data: any) => void,
   onError: (message: string) => void,
-): EventSource {
-  const es = new EventSource(apiUrl(`/loaders/install/${installId}/events`));
+): Promise<EventSource> {
+  const es = new EventSource(await apiEventSourceUrl(`/loaders/install/${installId}/events`));
 
   es.addEventListener('progress', (e: MessageEvent) => {
     let data: any;

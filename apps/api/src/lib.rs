@@ -12,3 +12,4 @@ pub mod microsoft_auth;
 pub mod observability;
 pub mod routes;
 pub mod state;
+pub mod transport;

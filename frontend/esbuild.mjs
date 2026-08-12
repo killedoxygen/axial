@@ -18,7 +18,7 @@ const publicRoot = path.join(frontendRoot, 'static');
 const outputRoot = path.join(frontendRoot, 'dist');
 const portOverride = process.env.PORT;
 const defaultDevPort = 3000;
-const webApiBase = process.env.AXIAL_WEB_API_BASE ?? 'http://127.0.0.1:43430';
+const webApiBase = process.env.AXIAL_WEB_API_BASE ?? (invocation.mode === 'serve' ? 'http://127.0.0.1:43430' : '');
 const enableDevLab = invocation.mode === 'serve';
 const enableMockApi = invocation.mode === 'serve' && invocation.mock;
 const semantics = createFrontendBuildSemantics({ enableDevLab, enableMockApi, webApiBase });

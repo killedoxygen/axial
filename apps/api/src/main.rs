@@ -6,6 +6,7 @@ use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
 use axial_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
+use axial_api::transport::LocalApiAuthority;
 use axial_config::{ConfigStore, InstanceStore};
 use axial_performance::PerformanceManager;
 use axial_resource::{
@@ -29,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
+    let addr = api_addr_from_environment()?;
 
     let paths = resolve_app_paths(app_root_selection_from_environment()?)?;
     let root_session = open_app_root_session(&paths)?;
@@ -74,17 +76,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(std::io::Error::other("startup background ownership was refused").into());
     }
 
-    let addr = std::env::var("AXIAL_API_ADDR")
-        .ok()
-        .and_then(|value| value.parse::<SocketAddr>().ok())
-        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], DEFAULT_API_PORT)));
-
     let telemetry = state.telemetry().clone();
     let result = serve_api(state, addr).await;
     if result.is_err() {
         emit_startup_failed(&telemetry);
     }
     result
+}
+
+fn api_addr_from_environment() -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let addr = match std::env::var("AXIAL_API_ADDR") {
+        Ok(value) => value.parse::<SocketAddr>()?,
+        Err(std::env::VarError::NotPresent) => SocketAddr::from(([127, 0, 0, 1], DEFAULT_API_PORT)),
+        Err(error) => return Err(error.into()),
+    };
+    if !addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "AXIAL_API_ADDR must be a loopback address",
+        )
+        .into());
+    }
+    Ok(addr)
 }
 
 async fn run_startup_blocking<T, Work>(
@@ -103,6 +116,13 @@ where
 }
 
 async fn serve_api(state: AppState, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    if !addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "AXIAL_API_ADDR must be a loopback address",
+        )
+        .into());
+    }
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(error) => return Err(listener_startup_error(&state, error).await),
@@ -111,12 +131,19 @@ async fn serve_api(state: AppState, addr: SocketAddr) -> Result<(), Box<dyn std:
         Ok(addr) => addr,
         Err(error) => return Err(listener_startup_error(&state, error).await),
     };
+    let web_origin = match std::env::var("AXIAL_WEB_ORIGIN") {
+        Ok(origin) => Some(origin),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let authority = LocalApiAuthority::new(addr, web_origin.as_deref())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     info!("axial api listening on http://{addr}");
 
     let (stop_ingress, mut ingress_stopping) = tokio::sync::watch::channel(false);
     let server_state = state.clone();
     let mut server = std::pin::pin!(async move {
-        axum::serve(listener, build_router(server_state))
+        axum::serve(listener, build_router(server_state, authority))
             .with_graceful_shutdown(async move {
                 while !*ingress_stopping.borrow_and_update() {
                     if ingress_stopping.changed().await.is_err() {

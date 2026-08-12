@@ -1333,6 +1333,26 @@ test("Task exposes bounded reporting and fixed Cargo-owned cleanup tiers", () =>
       },
       devUrl: "http://localhost:1420",
     },
+    app: {
+      security: {
+        capabilities: [
+          {
+            identifier: "main-development-capability",
+            description: "Exact development webview authority",
+            windows: ["main"],
+            permissions: [
+              "core:event:allow-listen",
+              "core:event:allow-unlisten",
+              {
+                identifier: "opener:allow-open-url",
+                allow: [{ url: "https://*" }],
+              },
+            ],
+            remote: { urls: ["http://localhost:1420/*"] },
+          },
+        ],
+      },
+    },
   }).replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
   assert.match(
     windowsDev,

@@ -1,5 +1,6 @@
 use crate::native_skin::NativeSkinDropCoordinator;
 use axial_api::app::{ApiServerShutdownError, ServerHandle};
+use axial_api::transport::ApiTransportBootstrap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -207,6 +208,10 @@ impl ApiRuntimeState {
 
     pub fn addr(&self) -> SocketAddr {
         self.server.addr
+    }
+
+    pub fn transport_bootstrap(&self) -> ApiTransportBootstrap {
+        self.server.transport_bootstrap()
     }
 
     pub async fn wait(&self) -> Result<(), ApiServerShutdownError> {

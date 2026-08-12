@@ -1,5 +1,5 @@
 import { batch, signal } from '@preact/signals';
-import { api, apiUrl } from '../api';
+import { api, apiEventSourceUrl } from '../api';
 import { showError, errMessage } from '../utils';
 import { toast } from '../toast';
 import { connectLoaderInstallSSE } from '../loaders/api';
@@ -821,7 +821,7 @@ async function connectInstallEvents(
   }
 
   if (kind === 'loader') {
-    const es = connectLoaderInstallSSE(
+    const es = await connectLoaderInstallSSE(
       installId,
       (data) => {
         void onProgress(data as InstallProgressEvent);
@@ -836,7 +836,7 @@ async function connectInstallEvents(
     return;
   }
 
-  const es = new EventSource(apiUrl(`/install/${installId}/events`));
+  const es = new EventSource(await apiEventSourceUrl(`/install/${installId}/events`));
   source = es;
   setProgressStream(es);
   startWatchdog();

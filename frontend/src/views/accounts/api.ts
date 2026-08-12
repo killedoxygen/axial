@@ -1,4 +1,4 @@
-import { api, apiResourceUrl, apiUrl, isApiError } from '../../api';
+import { api, apiFetch, apiResourceUrl, apiUrl, isApiError } from '../../api';
 import { DEFAULT_SKINS, type DefaultSkin } from '../../default-skins';
 import type { NativeDragDropPayload } from '../../native';
 import type {
@@ -280,7 +280,7 @@ async function detectSkinVariantFromPng(file: File): Promise<SkinVariant> {
 }
 
 export async function detectSkinVariantFromSavedSkin(skin: SavedSkinRecord): Promise<SkinVariant> {
-  const response = await fetch(savedSkinFileUrl(skin));
+  const response = await apiFetch(savedSkinFileUrl(skin));
   if (!response.ok) {
     throw new Error(`Could not load saved skin PNG (${response.status}).`);
   }
@@ -295,7 +295,7 @@ export async function detectSkinVariantFromSavedSkin(skin: SavedSkinRecord): Pro
 }
 
 export async function fetchSavedSkinPng(skin: SavedSkinRecord): Promise<Blob> {
-  const response = await fetch(savedSkinFileUrl(skin), { cache: 'no-store' });
+  const response = await apiFetch(savedSkinFileUrl(skin), { cache: 'no-store' });
   if (!response.ok) {
     throw new Error(`Saved skin PNG download failed with HTTP ${response.status}.`);
   }
@@ -319,7 +319,7 @@ export function downloadBlob(blob: Blob, filename: string): void {
 }
 
 export async function normalizeSkinUpload(file: File): Promise<SkinNormalizeMetadata> {
-  const response = await fetch(apiUrl('/skins/normalize'), {
+  const response = await apiFetch(apiUrl('/skins/normalize'), {
     method: 'POST',
     headers: { 'Content-Type': 'image/png' },
     body: file,
@@ -349,7 +349,7 @@ export async function replaceSavedSkinTexture(
       params.set('clear_cape', 'true');
     }
   }
-  const response = await fetch(apiUrl(`/skins/${textureKey}/texture?${params.toString()}`), {
+  const response = await apiFetch(apiUrl(`/skins/${textureKey}/texture?${params.toString()}`), {
     method: 'PUT',
     headers: { 'Content-Type': 'image/png' },
     body: file,

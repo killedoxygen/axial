@@ -1,4 +1,4 @@
-import { api, apiUrl, isApiError } from './api';
+import { api, apiEventSourceUrl, isApiError } from './api';
 import { Sound } from './sound';
 import { Music } from './music';
 import { showError, appendLog, errMessage } from './utils';
@@ -254,7 +254,7 @@ async function connectLaunchEvents(
     return;
   }
 
-  const es = new EventSource(apiUrl(`/launch/${sessionId}/events`));
+  const es = new EventSource(await apiEventSourceUrl(`/launch/${sessionId}/events`));
   let pollSubscription: { close(): void } | null = null;
   const streamHandle = {
     close(): void {

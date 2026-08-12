@@ -389,6 +389,7 @@ async function compileTests({ dependencyRoot, entries, frontendRoot, outputRoot,
     enableDevLab: false,
     enableMockApi: false,
     webApiBase: '',
+    testApiCapability: 'frontend-test-capability',
   });
   const runnerModule = resolve(dependencyRoot, 'test/runner.mjs');
   const result = await build({

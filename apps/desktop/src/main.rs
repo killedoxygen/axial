@@ -6,7 +6,7 @@ mod physical_work;
 mod smoke;
 mod state;
 
-use axial_api::app::{spawn_background, start_application_background_workflows};
+use axial_api::app::{spawn_background_for_origin, start_application_background_workflows};
 use axial_api::bootstrap::{
     desktop_app_root_selection_from_environment, open_app_root_session, resolve_app_paths,
 };
@@ -39,6 +39,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &mut context.config_mut().app.windows,
         webview_data_directory,
     )?;
+    let dev_origin = context
+        .config()
+        .build
+        .dev_url
+        .as_ref()
+        .map(|url| url.origin().ascii_serialization());
+    let main_window_dev_origin = dev_origin.clone();
     tracing_subscriber::fmt::init();
 
     let paths = resolve_app_paths(desktop_app_root_selection_from_environment(
@@ -93,7 +100,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let desktop_state = state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string());
     let close_event_desktop = desktop_state.clone();
 
-    let api = match spawn_background(state.clone()).await {
+    let api = match spawn_background_for_origin(state.clone(), dev_origin.as_deref()).await {
         Ok(api) => api,
         Err(error) => {
             emit_startup_failed(&telemetry);
@@ -122,7 +129,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::app_version,
             commands::app_restart,
             commands::app_reset,
-            commands::api_base_url,
+            commands::api_transport_bootstrap,
             commands::desktop_chrome,
             commands::microsoft_sign_in,
             commands::pick_skin_file,
@@ -182,8 +189,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .setup(move |app| {
             app.manage(setup_api_runtime.clone());
             if let Some(window) = isolated_main_window {
+                let allowed_dev_origin = main_window_dev_origin.clone();
                 WebviewWindowBuilder::from_config(app.handle(), &window.config)?
                     .data_directory(window.data_directory)
+                    .on_navigation(move |url| {
+                        main_window_navigation_allowed(url, allowed_dev_origin.as_deref())
+                    })
                     .build()?;
             }
             let handle = app.handle().clone();
@@ -215,6 +226,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(std::io::Error::other)?;
 
     Ok(())
+}
+
+fn main_window_navigation_allowed(url: &tauri::Url, dev_origin: Option<&str>) -> bool {
+    matches!(
+        (url.scheme(), url.host_str(), url.port()),
+        ("tauri", Some("localhost"), None) | ("http", Some("tauri.localhost"), None)
+    ) || dev_origin.is_some_and(|origin| url.origin().ascii_serialization() == origin)
 }
 
 fn emit_startup_failed(telemetry: &Arc<TelemetryHub>) {

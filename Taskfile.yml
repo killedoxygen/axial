@@ -21,7 +21,7 @@ vars:
   TAURI_CLI_VERSION: "2.11.2"
   # override with `DEV_PORT=3001 task dev` or `task dev DEV_PORT=3001`
   DEV_PORT: '{{.DEV_PORT | default "1420"}}'
-  DEV_TAURI_CONFIG: '{"build":{"beforeDevCommand":{"script":"pnpm run dev:desktop","cwd":"{{toSlash .ROOT_DIR}}/frontend"},"devUrl":"http://localhost:{{.DEV_PORT}}"}}'
+  DEV_TAURI_CONFIG: '{"build":{"beforeDevCommand":{"script":"pnpm run dev:desktop","cwd":"{{toSlash .ROOT_DIR}}/frontend"},"devUrl":"http://localhost:{{.DEV_PORT}}"},"app":{"security":{"capabilities":[{"identifier":"main-development-capability","description":"Exact development webview authority","windows":["main"],"permissions":["core:event:allow-listen","core:event:allow-unlisten",{"identifier":"opener:allow-open-url","allow":[{"url":"https://*"}]}],"remote":{"urls":["http://localhost:{{.DEV_PORT}}/*"]}}]}}}'
   BUNDLE_TAURI_CONFIG: '{"build":{"beforeBuildCommand":{"script":"pnpm run build","cwd":"{{toSlash .ROOT_DIR}}/frontend"}}}'
   NATIVE_VERIFY_TAURI_CONFIG: '{"build":{"devUrl":"http://localhost:1420"}}'
 
