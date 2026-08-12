@@ -8407,8 +8407,17 @@ mod macos_native_probe {
         let barrier_error = std::io::Error::last_os_error();
         let full = unsafe { libc::fcntl(parent.as_raw_fd(), libc::F_FULLFSYNC) };
         let full_error = std::io::Error::last_os_error();
+        let mut path = [0_u8; libc::PATH_MAX as usize];
+        let get_path = unsafe {
+            libc::fcntl(
+                child.as_raw_fd(),
+                libc::F_GETPATH,
+                path.as_mut_ptr().cast::<libc::c_char>(),
+            )
+        };
+        let get_path_error = std::io::Error::last_os_error();
         eprintln!(
-            "macOS retained-directory probe: nlink={}, fsync={fsync}/{fsync_error:?}, barrier={barrier}/{barrier_error:?}, full={full}/{full_error:?}",
+            "macOS retained-directory probe: nlink={}, fsync={fsync}/{fsync_error:?}, barrier={barrier}/{barrier_error:?}, full={full}/{full_error:?}, get_path={get_path}/{get_path_error:?}",
             child
                 .metadata()
                 .expect("stat retained native probe child")
