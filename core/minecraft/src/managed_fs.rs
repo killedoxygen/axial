@@ -1246,9 +1246,7 @@ fn retain_tree_cleanup(
     }
     let parent_directory = parent.restore(transition.root);
     let stage_directory = stage.restore_with(opened, transition.root);
-    let cleanup = stage_directory
-        .clear_contents_locked(transition)
-        .and_then(|()| parent_directory.remove_empty_child_locked(transition, &stage_directory));
+    let cleanup = parent_directory.retain_child_tree_removal_locked(transition, &stage_directory);
     if let Err(_error) = cleanup {
         #[cfg(any(test, feature = "test-support"))]
         eprintln!("retained tree cleanup attempt failed: {_error:?}");
@@ -1850,16 +1848,6 @@ impl ManagedDir {
         self.child_from_directory(name, directory)
     }
 
-    fn open_observed_child_locked(
-        &self,
-        transition: &ManagedEffectTransition<'_>,
-        entry: &DirectoryEntry,
-    ) -> Result<Self, LoaderError> {
-        self.revalidate_locked(transition)?;
-        let (name, directory) = self.open_observed_child_parts(entry)?;
-        self.child_from_directory_locked(transition, name, directory)
-    }
-
     fn open_observed_child_parts<'a>(
         &self,
         entry: &'a DirectoryEntry,
@@ -2413,15 +2401,6 @@ impl ManagedDir {
         Err(LoaderError::Verify(
             "managed relative path has no file name".to_string(),
         ))
-    }
-
-    fn inspect_regular_file_locked(
-        &self,
-        transition: &ManagedEffectTransition<'_>,
-        name: &str,
-    ) -> Result<Option<ManagedFileGuard>, LoaderError> {
-        self.revalidate_locked(transition)?;
-        self.inspect_regular_file_after_revalidation(name)
     }
 
     fn inspect_regular_file_after_revalidation(
@@ -3744,6 +3723,55 @@ impl ManagedDir {
         }
     }
 
+    fn retain_child_tree_removal_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        child: &ManagedDir,
+    ) -> Result<(), LoaderError> {
+        self.inner.root.require_transition(transition);
+        if !Arc::ptr_eq(&self.inner.root, &child.inner.root)
+            || child.inner.path.parent() != Some(self.inner.path.as_path())
+            || child.inner.is_root
+        {
+            return Err(LoaderError::Verify(
+                "managed tree removal target is not an admitted child".to_string(),
+            ));
+        }
+        match child.inner.directory.clone().park() {
+            DirectoryParkOutcome::Parked(parked) => match parked.remove_tree() {
+                DirectoryTreeRemovalOutcome::Removed => Ok(()),
+                DirectoryTreeRemovalOutcome::Retained { retained, .. } => {
+                    self.inner.root.retain_linear_locked(
+                        transition,
+                        retained,
+                        EffectOwner::retain_parked_directory_tree_removal,
+                    );
+                    Ok(())
+                }
+                DirectoryTreeRemovalOutcome::Indeterminate(obligation) => {
+                    self.inner.root.retain_linear_locked(
+                        transition,
+                        obligation,
+                        EffectOwner::retain_directory_tree_removal,
+                    );
+                    Ok(())
+                }
+            },
+            DirectoryParkOutcome::NoEffect {
+                error,
+                directory: _,
+            } => Err(error.into()),
+            DirectoryParkOutcome::AppliedUnverified(obligation) => {
+                self.inner.root.retain_linear_locked(
+                    transition,
+                    obligation,
+                    EffectOwner::retain_directory_park_removal,
+                );
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn clear_owned_contents(self) -> Result<(), LoaderError> {
         if self.inner.is_root {
             return Err(LoaderError::Verify(
@@ -3794,72 +3822,6 @@ impl ManagedDir {
                     }
                     let child = frame.directory.open_observed_child(&entry)?;
                     let entries = child.listing(MAX_MANAGED_TREE_OPERATION_ENTRIES)?;
-                    frames.push(ManagedClearContentsFrame::new(child, entries));
-                }
-                EntryKind::Link | EntryKind::Other => {
-                    return Err(LoaderError::Verify(
-                        "managed cleanup refuses links and unsupported entries".to_string(),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn clear_contents_locked(
-        &self,
-        transition: &ManagedEffectTransition<'_>,
-    ) -> Result<(), LoaderError> {
-        let frame_capacity = MAX_MANAGED_TREE_OPERATION_DEPTH + 1;
-        let mut frames = Vec::with_capacity(frame_capacity);
-        frames.push(ManagedClearContentsFrame::new(
-            self.clone(),
-            self.listing_locked(transition, MAX_MANAGED_TREE_OPERATION_ENTRIES)?,
-        ));
-        loop {
-            let child_depth = frames.len();
-            let Some(frame) = frames.last_mut() else {
-                break;
-            };
-            let Some(entry) = frame.next_entry() else {
-                let frame = frames.pop().expect("cleanup frame remains present");
-                frame.directory.revalidate_locked(transition)?;
-                if let Some(parent) = frames.last() {
-                    parent
-                        .directory
-                        .remove_empty_child_locked(transition, &frame.directory)?;
-                }
-                continue;
-            };
-            let name = entry.utf8_name().ok_or_else(|| {
-                LoaderError::Verify("managed cleanup contains a non-UTF-8 name".to_string())
-            })?;
-            PortableFileName::new_exact(name).map_err(|_| {
-                LoaderError::Verify("managed cleanup contains a non-portable name".to_string())
-            })?;
-            match entry.kind() {
-                EntryKind::File => {
-                    let guard = frame
-                        .directory
-                        .inspect_regular_file_locked(transition, name)?
-                        .ok_or_else(|| {
-                            LoaderError::Verify("managed cleanup file disappeared".to_string())
-                        })?;
-                    frame
-                        .directory
-                        .remove_guarded_file_locked(transition, name, &guard)?;
-                }
-                EntryKind::Directory => {
-                    if child_depth >= frame_capacity {
-                        return Err(LoaderError::Verify(
-                            "managed cleanup tree exceeds its depth bound".to_string(),
-                        ));
-                    }
-                    let child = frame
-                        .directory
-                        .open_observed_child_locked(transition, &entry)?;
-                    let entries =
-                        child.listing_locked(transition, MAX_MANAGED_TREE_OPERATION_ENTRIES)?;
                     frames.push(ManagedClearContentsFrame::new(child, entries));
                 }
                 EntryKind::Link | EntryKind::Other => {
@@ -7060,8 +7022,7 @@ mod effect_transition_tests {
 
     #[cfg(unix)]
     #[test]
-    fn immediate_tree_cleanup_failure_is_retained_until_retry() {
-        use std::fs as test_fs;
+    fn private_tree_cleanup_removes_unsupported_entries_without_following_them() {
         use std::os::unix::fs::symlink;
 
         let (temporary, root) = managed_test_root("cleanup-retention");
@@ -7077,7 +7038,7 @@ mod effect_transition_tests {
         );
         assert!(matches!(
             outcome,
-            ManagedTreeCopyOutcome::CleanupRetained { .. }
+            ManagedTreeCopyOutcome::RefusedBeforeMove(_)
         ));
         assert_eq!(
             root.inner
@@ -7087,11 +7048,8 @@ mod effect_transition_tests {
                 .expect("continuation registry")
                 .receipts
                 .len(),
-            1
+            0
         );
-
-        test_fs::remove_file(link).expect("remove unsupported entry");
-        root.inner.root.settle().expect("retry retained cleanup");
         assert!(parent.open_child("stage").is_err_and(|error| {
             matches!(error, LoaderError::Io(error) if error.kind() == io::ErrorKind::NotFound)
         }));
