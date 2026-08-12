@@ -292,6 +292,7 @@ tasks:
     desc: run the P01 native filesystem, resource, transfer, and owner matrix
     cmds:
       - task: verify:contracts
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-fs reports_retained_directory_removal_primitives -- --nocapture
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-api --lib --no-default-features p01_b0 -- --test-threads=1
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-fs --lib -- --test-threads=1
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-resource --lib -- --test-threads=1
