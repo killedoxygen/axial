@@ -238,6 +238,7 @@ impl PhysicalWorkOwner {
         request: PhysicalWorkRequest,
     ) -> Result<PhysicalWorkAdmission, PhysicalWorkError> {
         validate_parallelism(&self.inner, request.parallelism)?;
+        let scratch = self.reserve_scratch_inner(request.scratch_bytes).await?;
         let mut class_permits = Vec::with_capacity(2);
         if matches!(
             request.class,
@@ -248,7 +249,6 @@ impl PhysicalWorkOwner {
         if request.class == PhysicalWorkClass::CrashCollection {
             class_permits.push(acquire_one(&self.inner.crash).await?);
         }
-        let scratch = self.reserve_scratch_inner(request.scratch_bytes).await?;
         let heavy = if request.io == PhysicalIoClass::Heavy {
             Some(acquire_one(&self.inner.heavy).await?)
         } else {
@@ -310,6 +310,7 @@ impl PhysicalWorkOwner {
         request: PhysicalWorkRequest,
     ) -> Result<PhysicalWorkAdmission, PhysicalWorkError> {
         validate_parallelism(&self.inner, request.parallelism)?;
+        let scratch = self.try_reserve_scratch_inner(request.scratch_bytes)?;
         let mut class_permits = Vec::with_capacity(2);
         if matches!(
             request.class,
@@ -320,7 +321,6 @@ impl PhysicalWorkOwner {
         if request.class == PhysicalWorkClass::CrashCollection {
             class_permits.push(try_acquire_one(&self.inner.crash)?);
         }
-        let scratch = self.try_reserve_scratch_inner(request.scratch_bytes)?;
         let heavy = if request.io == PhysicalIoClass::Heavy {
             Some(try_acquire_one(&self.inner.heavy)?)
         } else {
@@ -814,6 +814,57 @@ mod tests {
         let snapshot = owner.snapshot(PhysicalWorkClass::Foreground);
         assert_eq!(snapshot.active_admissions, 0);
         assert_eq!(snapshot.running_workers, 0);
+    }
+
+    #[tokio::test]
+    async fn p01_b04_contract_scratch_waiter_does_not_hold_background_capacity() {
+        let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
+            workers: 2,
+            background: 1,
+            crash: 1,
+            heavy: 1,
+            scratch_bytes: SCRATCH_UNIT_BYTES,
+        });
+        let scratch = owner
+            .reserve_scratch(SCRATCH_UNIT_BYTES)
+            .await
+            .expect("reserve process scratch")
+            .expect("nonzero scratch permit");
+        let waiting = owner.group();
+        let waiting_task = tokio::spawn({
+            let waiting = waiting.clone();
+            async move {
+                waiting
+                    .run(
+                        PhysicalWorkRequest::background(PhysicalIoClass::Read, SCRATCH_UNIT_BYTES),
+                        |_| (),
+                    )
+                    .await
+            }
+        });
+        while waiting.active() == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(owner.inner.background.available_permits(), 1);
+
+        let immediate = owner.group();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            immediate.run(
+                PhysicalWorkRequest::background(PhysicalIoClass::Read, 0),
+                |_| (),
+            ),
+        )
+        .await
+        .expect("scratch waiter must not occupy background capacity")
+        .expect("independent background work");
+
+        drop(scratch);
+        waiting_task
+            .await
+            .expect("join scratch waiter")
+            .expect("scratch waiter");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
