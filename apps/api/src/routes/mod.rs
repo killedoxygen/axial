@@ -3,6 +3,7 @@ mod auth;
 mod catalog;
 mod config;
 mod content;
+mod extract;
 mod flags;
 mod install;
 mod instances;
@@ -19,6 +20,8 @@ mod telemetry;
 mod update;
 mod version_info;
 mod versions;
+
+use extract::{ApiJson, ApiQuery};
 
 use crate::state::{AppState, LifecycleAdmissionError, RequestLease};
 use crate::transport::{CAPABILITY_HEADER, LocalApiAuthority};
@@ -165,6 +168,89 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn p02_b03_contract_cross_owner_production_routes_share_bounded_rejections() {
+        let fixture = TestFixture::new("bounded-extraction");
+        let app = router(fixture.state.clone());
+        let private = "private-request-token";
+        let oversized = format!(
+            "{{\"theme\":\"system\",\"padding\":\"{}\"}}",
+            "x".repeat(2 * 1024 * 1024)
+        );
+
+        for (method, uri, content_type, body, status, error) in [
+            (
+                Method::PUT,
+                "/api/v1/config",
+                Some("application/json"),
+                format!("{{\"theme\":\"obsidian\"}}{private}"),
+                axum::http::StatusCode::BAD_REQUEST,
+                "Invalid JSON syntax.",
+            ),
+            (
+                Method::PUT,
+                "/api/v1/config",
+                Some("application/json"),
+                format!("{{\"unknown\":\"{private}\"}}"),
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "Invalid JSON request.",
+            ),
+            (
+                Method::GET,
+                "/api/v1/loaders/components/fabric/builds",
+                None,
+                String::new(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "Invalid query request.",
+            ),
+            (
+                Method::GET,
+                "/api/v1/music/track?t=private-query-token",
+                None,
+                String::new(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "Invalid query request.",
+            ),
+            (
+                Method::PUT,
+                "/api/v1/config",
+                Some("application/json"),
+                oversized,
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "JSON request is too large.",
+            ),
+        ] {
+            let mut request = Request::builder().method(method).uri(uri);
+            if let Some(content_type) = content_type {
+                request = request.header(header::CONTENT_TYPE, content_type);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).expect("bounded request"))
+                .await
+                .expect("bounded extraction response");
+            assert_eq!(response.status(), status, "{uri}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json"),
+                "{uri}"
+            );
+            let bytes = to_bytes(response.into_body(), 1024)
+                .await
+                .expect("bounded extraction body");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .expect("bounded extraction JSON"),
+                serde_json::json!({ "error": error }),
+                "{uri}"
+            );
+            assert!(!String::from_utf8_lossy(&bytes).contains(private), "{uri}");
+        }
+    }
 
     #[tokio::test]
     async fn api_router_rejects_requests_after_lifecycle_drain_begins() {

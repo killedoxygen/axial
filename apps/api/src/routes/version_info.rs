@@ -7,6 +7,8 @@ use axum::{
     routing::{delete, get, post},
 };
 
+use super::ApiJson;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/versions/{id}/info", get(handle_version_info))
@@ -41,7 +43,7 @@ async fn handle_delete_version(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(version_id): Path<String>,
-    Json(payload): Json<DeleteVersionRequest>,
+    ApiJson(payload): ApiJson<DeleteVersionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let producer = handoff
         .try_claim()

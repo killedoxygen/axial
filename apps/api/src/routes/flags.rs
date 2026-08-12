@@ -2,6 +2,8 @@ use crate::{
     application::{self, FlagOverridePatch},
     state::AppState,
 };
+
+use super::ApiJson;
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -22,7 +24,7 @@ async fn handle_list_flags(State(state): State<AppState>) -> Json<application::F
 async fn handle_update_flag(
     State(state): State<AppState>,
     Path(key): Path<String>,
-    Json(patch): Json<FlagOverridePatch>,
+    ApiJson(patch): ApiJson<FlagOverridePatch>,
 ) -> Result<Json<application::FlagsResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::update_flag(&state, &key, patch)
         .await

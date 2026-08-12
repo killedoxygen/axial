@@ -2,11 +2,13 @@ use crate::application::{self, UpdateDownloadRequest, UpdateFlowResponse, Update
 use crate::state::{AppState, RequestProducerHandoff};
 use axum::{
     Json, Router,
-    extract::{Extension, Query, State},
+    extract::{Extension, State},
     http::StatusCode,
     routing::{get, post},
 };
 use serde::Deserialize;
+
+use super::{ApiJson, ApiQuery};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -28,7 +30,7 @@ fn force_requested(query: &UpdateQuery) -> bool {
 
 async fn handle_update(
     State(state): State<AppState>,
-    Query(query): Query<UpdateQuery>,
+    ApiQuery(query): ApiQuery<UpdateQuery>,
 ) -> Result<Json<UpdateResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::update_status(&state, force_requested(&query))
         .await
@@ -42,7 +44,7 @@ async fn handle_update_flow(State(state): State<AppState>) -> Json<UpdateFlowRes
 async fn handle_update_download(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(request): Json<UpdateDownloadRequest>,
+    ApiJson(request): ApiJson<UpdateDownloadRequest>,
 ) -> Result<Json<UpdateFlowResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::start_update_download(&state, request, handoff).await
 }

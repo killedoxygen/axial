@@ -6,11 +6,13 @@ use crate::application::{
 use crate::state::{AppState, RequestProducerHandoff};
 use axum::{
     Json, Router,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{get, post},
 };
 use serde::Deserialize;
+
+use super::{ApiJson, ApiQuery};
 
 #[derive(Debug, Deserialize)]
 struct PlanQuery {
@@ -82,7 +84,7 @@ async fn handle_rules_refresh(
 
 async fn handle_plan(
     State(state): State<AppState>,
-    Query(query): Query<PlanQuery>,
+    ApiQuery(query): ApiQuery<PlanQuery>,
 ) -> Result<Json<PerformancePlanResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::performance_plan(
         &state,
@@ -100,7 +102,7 @@ async fn handle_plan(
 async fn handle_health(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Query(query): Query<HealthQuery>,
+    ApiQuery(query): ApiQuery<HealthQuery>,
 ) -> Result<Json<PerformanceHealthResponse>, (StatusCode, Json<serde_json::Value>)> {
     let producer = handoff
         .try_claim()
@@ -118,7 +120,7 @@ async fn handle_health(
 
 async fn handle_rollback_list(
     State(state): State<AppState>,
-    Query(query): Query<RollbackQuery>,
+    ApiQuery(query): ApiQuery<RollbackQuery>,
 ) -> Result<Json<PerformanceRollbackListResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::performance_rollback_list(
         &state,
@@ -133,7 +135,7 @@ async fn handle_rollback_list(
 async fn handle_install(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<InstallRequest>,
+    ApiJson(payload): ApiJson<InstallRequest>,
 ) -> Result<Json<PerformanceInstallResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::performance_install(
         state,

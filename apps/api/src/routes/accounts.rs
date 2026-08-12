@@ -12,6 +12,8 @@ use axum::{
     routing::{get, patch, post},
 };
 
+use super::ApiJson;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/accounts", get(handle_accounts))
@@ -37,7 +39,7 @@ async fn handle_accounts(
 
 async fn handle_offline_account_create(
     State(state): State<AppState>,
-    Json(request): Json<OfflineAccountCreateRequest>,
+    ApiJson(request): ApiJson<OfflineAccountCreateRequest>,
 ) -> Result<Json<AccountActionResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::create_offline_account(&state, request).await
 }
@@ -45,7 +47,7 @@ async fn handle_offline_account_create(
 async fn handle_account_patch(
     Path(account_id): Path<String>,
     State(state): State<AppState>,
-    Json(request): Json<AccountPatchRequest>,
+    ApiJson(request): ApiJson<AccountPatchRequest>,
 ) -> Result<Json<AccountActionResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::patch_account(&state, &account_id, request).await
 }

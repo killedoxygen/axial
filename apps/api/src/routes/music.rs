@@ -3,10 +3,12 @@ use crate::{
     routes::producer_claim_error_response,
     state::{AppState, RequestProducerHandoff},
 };
+
+use super::ApiQuery;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Extension, Query, State},
+    extract::{Extension, State},
     http::{Response, StatusCode, header},
     response::IntoResponse,
     routing::get,
@@ -37,7 +39,7 @@ async fn handle_music_status(
 
 async fn handle_music_track(
     State(state): State<AppState>,
-    Query(query): Query<TrackQuery>,
+    ApiQuery(query): ApiQuery<TrackQuery>,
     Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> impl IntoResponse {
     match application::music_track(&state, MusicTrackRequest { index: query.t }, handoff).await {

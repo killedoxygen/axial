@@ -4,6 +4,8 @@ use crate::{
 };
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 
+use super::ApiJson;
+
 pub fn router() -> Router<AppState> {
     Router::new().route(
         "/api/v1/telemetry/frontend-error",
@@ -13,7 +15,7 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_frontend_error(
     State(state): State<AppState>,
-    Json(request): Json<FrontendErrorReportRequest>,
+    ApiJson(request): ApiJson<FrontendErrorReportRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     application::report_frontend_error(&state, request)?;
     Ok(StatusCode::NO_CONTENT)

@@ -12,6 +12,8 @@ use axum::{
 };
 use serde::Deserialize;
 
+use super::ApiJson;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallRequest {
@@ -40,7 +42,7 @@ pub fn router() -> Router<AppState> {
 async fn handle_install(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<InstallRequest>,
+    ApiJson(payload): ApiJson<InstallRequest>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     enqueue_install_owned(
         &state,
@@ -70,7 +72,7 @@ async fn handle_install_queue_status(
 async fn handle_install_queue_enqueue(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<InstallQueueRequest>,
+    ApiJson(payload): ApiJson<InstallQueueRequest>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     enqueue_install_owned(&state, payload, handoff)
         .await
@@ -80,7 +82,7 @@ async fn handle_install_queue_enqueue(
 async fn handle_install_queue_retry(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<InstallQueueRequest>,
+    ApiJson(payload): ApiJson<InstallQueueRequest>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     retry_install_owned(&state, payload, handoff)
         .await

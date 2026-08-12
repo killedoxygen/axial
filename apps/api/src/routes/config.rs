@@ -4,14 +4,11 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
+    extract::State,
     routing::{get, put},
 };
 
-const CONFIG_REQUEST_ERROR_MESSAGE: &str = "Invalid settings request.";
-
-type ApiError = (StatusCode, Json<serde_json::Value>);
+use super::ApiJson;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -25,27 +22,13 @@ async fn handle_get_config(State(state): State<AppState>) -> Json<application::C
 
 async fn handle_update_config(
     State(state): State<AppState>,
-    payload: Result<Json<ConfigPatch>, JsonRejection>,
-) -> Result<Json<application::ConfigView>, ApiError> {
-    let Json(patch) = payload.map_err(config_request_error)?;
+    ApiJson(patch): ApiJson<ConfigPatch>,
+) -> Result<Json<application::ConfigView>, (axum::http::StatusCode, Json<serde_json::Value>)> {
     application::update_config(&state, patch).await.map(Json)
-}
-
-fn config_request_error(rejection: JsonRejection) -> ApiError {
-    let status = if matches!(rejection, JsonRejection::JsonDataError(_)) {
-        StatusCode::UNPROCESSABLE_ENTITY
-    } else {
-        StatusCode::BAD_REQUEST
-    };
-    (
-        status,
-        Json(serde_json::json!({ "error": CONFIG_REQUEST_ERROR_MESSAGE })),
-    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CONFIG_REQUEST_ERROR_MESSAGE;
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
@@ -97,7 +80,7 @@ mod tests {
                 serde_json::from_slice(&bytes).expect("config rejection body should be json");
             assert_eq!(
                 body,
-                serde_json::json!({ "error": CONFIG_REQUEST_ERROR_MESSAGE })
+                serde_json::json!({ "error": "Invalid JSON request." })
             );
 
             let rendered = String::from_utf8(bytes.to_vec()).expect("json should be utf-8");
@@ -124,10 +107,7 @@ mod tests {
             .expect("config syntax rejection body should read");
         let body: serde_json::Value =
             serde_json::from_slice(&bytes).expect("config syntax rejection body should be json");
-        assert_eq!(
-            body,
-            serde_json::json!({ "error": CONFIG_REQUEST_ERROR_MESSAGE })
-        );
+        assert_eq!(body, serde_json::json!({ "error": "Invalid JSON syntax." }));
         assert!(!String::from_utf8_lossy(&bytes).contains(sensitive_value));
     }
 
@@ -203,7 +183,7 @@ mod tests {
         .expect("unknown mode response json");
         assert_eq!(
             unknown_body,
-            serde_json::json!({ "error": CONFIG_REQUEST_ERROR_MESSAGE })
+            serde_json::json!({ "error": "Invalid JSON request." })
         );
 
         let extreme = app

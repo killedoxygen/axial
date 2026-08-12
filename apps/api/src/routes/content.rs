@@ -8,11 +8,13 @@ use crate::state::{AppState, RequestProducerHandoff};
 use axial_content::{ContentDetail, Page};
 use axum::{
     Json, Router,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{delete, get, post},
 };
 use serde::Deserialize;
+
+use super::{ApiJson, ApiQuery};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -72,14 +74,14 @@ struct ModpackFilesQuery {
 
 async fn handle_search(
     State(state): State<AppState>,
-    Query(params): Query<ContentSearchParams>,
+    ApiQuery(params): ApiQuery<ContentSearchParams>,
 ) -> Result<Json<Page<SearchHit>>, (StatusCode, Json<serde_json::Value>)> {
     application::content_search(&state, params).await.map(Json)
 }
 
 async fn handle_detail(
     State(state): State<AppState>,
-    Query(query): Query<CanonicalIdQuery>,
+    ApiQuery(query): ApiQuery<CanonicalIdQuery>,
 ) -> Result<Json<ContentDetail>, (StatusCode, Json<serde_json::Value>)> {
     application::content_detail(&state, &query.id)
         .await
@@ -88,7 +90,7 @@ async fn handle_detail(
 
 async fn handle_plan(
     State(state): State<AppState>,
-    Json(payload): Json<ContentPlanRequest>,
+    ApiJson(payload): ApiJson<ContentPlanRequest>,
 ) -> Result<Json<ResolutionPlan>, (StatusCode, Json<serde_json::Value>)> {
     application::content_plan(&state, payload).await.map(Json)
 }
@@ -96,7 +98,7 @@ async fn handle_plan(
 async fn handle_install(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<ContentInstallRequest>,
+    ApiJson(payload): ApiJson<ContentInstallRequest>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::queue_content_install(&state, payload, handoff)
         .await
@@ -106,7 +108,7 @@ async fn handle_install(
 async fn handle_compatibility(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<ContentCompatRequest>,
+    ApiJson(payload): ApiJson<ContentCompatRequest>,
 ) -> Result<Json<ContentCompatResponse>, (StatusCode, Json<serde_json::Value>)> {
     let producer = handoff
         .try_claim()
@@ -118,7 +120,7 @@ async fn handle_compatibility(
 
 async fn handle_modpack_target(
     State(state): State<AppState>,
-    Query(query): Query<ModpackTargetQuery>,
+    ApiQuery(query): ApiQuery<ModpackTargetQuery>,
 ) -> Result<Json<ModpackTarget>, (StatusCode, Json<serde_json::Value>)> {
     application::modpack_target(&state, &query.id, query.version_id.as_deref())
         .await
@@ -127,7 +129,7 @@ async fn handle_modpack_target(
 
 async fn handle_modpack_files(
     State(state): State<AppState>,
-    Query(query): Query<ModpackFilesQuery>,
+    ApiQuery(query): ApiQuery<ModpackFilesQuery>,
 ) -> Result<Json<ModpackFilesPlan>, (StatusCode, Json<serde_json::Value>)> {
     application::modpack_files(
         &state,
@@ -142,7 +144,7 @@ async fn handle_modpack_files(
 async fn handle_modpack_install(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<ModpackInstallRequest>,
+    ApiJson(payload): ApiJson<ModpackInstallRequest>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::queue_modpack_install(&state, payload, handoff)
         .await
@@ -169,7 +171,7 @@ async fn handle_instance_content_delete(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
-    Query(query): Query<CanonicalIdQuery>,
+    ApiQuery(query): ApiQuery<CanonicalIdQuery>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::queue_content_uninstall(&state, &id, &query.id, handoff)
         .await
@@ -180,7 +182,7 @@ async fn handle_instance_content_uninstalls(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
-    Json(payload): Json<CanonicalIdsRequest>,
+    ApiJson(payload): ApiJson<CanonicalIdsRequest>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::queue_content_uninstalls(&state, &id, payload.canonical_ids, handoff)
         .await

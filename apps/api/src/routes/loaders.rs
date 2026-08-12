@@ -6,11 +6,13 @@ use crate::state::{AppState, RequestProducerHandoff};
 use axial_minecraft::LoaderComponentId;
 use axum::{
     Json, Router,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{get, post},
 };
 use serde::Deserialize;
+
+use super::{ApiJson, ApiQuery};
 
 #[derive(Debug, Deserialize)]
 struct LoaderBuildQuery {
@@ -48,7 +50,7 @@ async fn handle_loader_components() -> Json<crate::dto::loaders::LoaderComponent
 
 async fn handle_loader_builds(
     Path(component_id): Path<String>,
-    Query(query): Query<LoaderBuildQuery>,
+    ApiQuery(query): ApiQuery<LoaderBuildQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<crate::dto::loaders::LoaderBuildsResponse>, (StatusCode, Json<serde_json::Value>)>
 {
@@ -78,7 +80,7 @@ async fn handle_loader_game_versions(
 async fn handle_loader_install(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<LoaderInstallRequest>,
+    ApiJson(payload): ApiJson<LoaderInstallRequest>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     enqueue_install_owned(
         &state,

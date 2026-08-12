@@ -9,6 +9,8 @@ use axum::{
     routing::{get, post},
 };
 
+use super::ApiJson;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/launch", post(handle_launch))
@@ -81,7 +83,7 @@ async fn handle_launch_preflight(
 async fn handle_launch(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<launch_app::LaunchRequest>,
+    ApiJson(payload): ApiJson<launch_app::LaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
     let producer = handoff
         .try_claim()
@@ -115,7 +117,7 @@ fn spawn_launch_session(
 async fn handle_benchmark_launch(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<launch_app::BenchmarkLaunchRequest>,
+    ApiJson(payload): ApiJson<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
     let producer = handoff
         .try_claim()
@@ -128,7 +130,7 @@ async fn handle_benchmark_launch(
 async fn handle_benchmark_suite_launch(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<launch_app::BenchmarkLaunchRequest>,
+    ApiJson(payload): ApiJson<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
     let producer = handoff
         .try_claim()
@@ -141,7 +143,7 @@ async fn handle_benchmark_suite_launch(
 async fn handle_benchmark_suite_tick(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<launch_app::BenchmarkLaunchRequest>,
+    ApiJson(payload): ApiJson<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
     let producer = handoff
         .try_claim()
@@ -154,7 +156,7 @@ async fn handle_benchmark_suite_tick(
 async fn handle_benchmark_suite_driver_start(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<launch_app::BenchmarkLaunchRequest>,
+    ApiJson(payload): ApiJson<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
     let producer = handoff
         .try_claim()

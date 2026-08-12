@@ -11,12 +11,14 @@ use crate::{
 use axial_config::EnrichedInstance;
 use axum::{
     Json, Router,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::Response,
     routing::{get, post, put},
 };
 use std::collections::HashMap;
+
+use super::{ApiJson, ApiQuery};
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct CreateInstanceViewQuery {
@@ -120,7 +122,7 @@ async fn handle_list_instances(
 async fn handle_modpack_instance_setup(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<instances::ModpackInstanceSetupRequest>,
+    ApiJson(payload): ApiJson<instances::ModpackInstanceSetupRequest>,
 ) -> Result<Json<CreateInstanceResponse>, (StatusCode, Json<serde_json::Value>)> {
     instances::execute_modpack_instance_setup(&state, payload, handoff)
         .await
@@ -143,7 +145,7 @@ async fn handle_get_instance(
 async fn handle_create_instance_view(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Query(query): Query<CreateInstanceViewQuery>,
+    ApiQuery(query): ApiQuery<CreateInstanceViewQuery>,
 ) -> Result<Json<CreateInstanceViewResponse>, (StatusCode, Json<serde_json::Value>)> {
     let producer = handoff
         .try_claim()
@@ -156,7 +158,7 @@ async fn handle_create_instance_view(
 async fn handle_create_loader_builds_view(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Query(query): Query<CreateLoaderBuildsViewQuery>,
+    ApiQuery(query): ApiQuery<CreateLoaderBuildsViewQuery>,
 ) -> Result<Json<CreateLoaderBuildsViewResponse>, (StatusCode, Json<serde_json::Value>)> {
     let producer = handoff
         .try_claim()
@@ -173,7 +175,7 @@ async fn handle_create_loader_builds_view(
 
 async fn handle_instance_setup_plan(
     State(state): State<AppState>,
-    Json(payload): Json<instances::InstanceSetupPlanRequest>,
+    ApiJson(payload): ApiJson<instances::InstanceSetupPlanRequest>,
 ) -> Result<Json<instances::InstanceSetupPlanResponse>, (StatusCode, Json<serde_json::Value>)> {
     instances::plan_instance_setup(&state, payload)
         .await
@@ -183,7 +185,7 @@ async fn handle_instance_setup_plan(
 async fn handle_instance_setup(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<instances::InstanceSetupExecuteRequest>,
+    ApiJson(payload): ApiJson<instances::InstanceSetupExecuteRequest>,
 ) -> Result<Json<CreateInstanceResponse>, (StatusCode, Json<serde_json::Value>)> {
     instances::execute_instance_setup(&state, payload, handoff)
         .await
@@ -193,7 +195,7 @@ async fn handle_instance_setup(
 async fn handle_create_instance(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
-    Json(payload): Json<CreateInstanceRequest>,
+    ApiJson(payload): ApiJson<CreateInstanceRequest>,
 ) -> Result<Json<CreateInstanceResponse>, (StatusCode, Json<serde_json::Value>)> {
     instances::handle_create_instance_owned(&state, payload, handoff)
         .await
@@ -204,12 +206,12 @@ async fn handle_duplicate_instance(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
-    payload: Option<Json<DuplicateInstanceRequest>>,
+    payload: Option<ApiJson<DuplicateInstanceRequest>>,
 ) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
     instances::handle_duplicate_instance_owned(
         &state,
         &id,
-        payload.map(|Json(payload)| payload),
+        payload.map(|ApiJson(payload)| payload),
         handoff,
     )
     .await
@@ -220,7 +222,7 @@ async fn handle_update_instance(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
-    Json(patch): Json<InstancePatch>,
+    ApiJson(patch): ApiJson<InstancePatch>,
 ) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
     instances::handle_update_instance_owned(&state, &id, patch, handoff)
         .await
@@ -231,7 +233,7 @@ async fn handle_open_instance_folder(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
-    Query(query): Query<OpenFolderQuery>,
+    ApiQuery(query): ApiQuery<OpenFolderQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     instances::handle_open_instance_folder(&state, &id, query, handoff)
         .await
@@ -259,7 +261,7 @@ async fn handle_instance_worlds(
 async fn handle_rename_instance_world(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
-    Json(payload): Json<RenameWorldRequest>,
+    ApiJson(payload): ApiJson<RenameWorldRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     instances::handle_rename_instance_world(&state, &id, &name, payload)
         .await
@@ -296,7 +298,7 @@ async fn handle_update_instance_mod(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path((id, name)): Path<(String, String)>,
-    Json(payload): Json<UpdateModRequest>,
+    ApiJson(payload): ApiJson<UpdateModRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     instances::handle_update_instance_mod(&state, &id, &name, payload, handoff)
         .await
@@ -332,7 +334,7 @@ async fn handle_instance_screenshot_file(
 async fn handle_rename_instance_screenshot(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
-    Json(payload): Json<RenameScreenshotRequest>,
+    ApiJson(payload): ApiJson<RenameScreenshotRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     instances::handle_rename_instance_screenshot(&state, &id, &name, payload)
         .await
@@ -367,7 +369,7 @@ async fn handle_instance_log_tail(
 async fn handle_delete_instance(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
+    ApiQuery(query): ApiQuery<HashMap<String, String>>,
     Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     instances::handle_delete_instance_owned(&state, &id, query, handoff)

@@ -1,12 +1,14 @@
 use crate::application::skin as application_skin;
 use crate::state::{AppState, RequestProducerHandoff};
 use axum::{
-    Json, Router,
+    Router,
     body::Body,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, State},
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
+
+use super::{ApiJson, ApiQuery};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -61,7 +63,7 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_skin_profile(
     State(state): State<AppState>,
-    Query(query): Query<application_skin::SkinQuery>,
+    ApiQuery(query): ApiQuery<application_skin::SkinQuery>,
 ) -> impl IntoResponse {
     application_skin::handle_skin_profile(&state, query).await
 }
@@ -72,14 +74,14 @@ async fn handle_skin_profile_reset(State(state): State<AppState>) -> impl IntoRe
 
 async fn handle_skin_profile_file(
     State(state): State<AppState>,
-    Query(query): Query<application_skin::SkinProfileFileQuery>,
+    ApiQuery(query): ApiQuery<application_skin::SkinProfileFileQuery>,
 ) -> impl IntoResponse {
     application_skin::handle_skin_profile_file(&state, query).await
 }
 
 async fn handle_skin_cape_file(
     State(state): State<AppState>,
-    Query(query): Query<application_skin::SkinCapeFileQuery>,
+    ApiQuery(query): ApiQuery<application_skin::SkinCapeFileQuery>,
 ) -> impl IntoResponse {
     application_skin::handle_skin_cape_file(&state, query).await
 }
@@ -90,34 +92,34 @@ async fn handle_skin_cape_reset(State(state): State<AppState>) -> impl IntoRespo
 
 async fn handle_skin_head(
     State(state): State<AppState>,
-    Query(query): Query<application_skin::SkinQuery>,
+    ApiQuery(query): ApiQuery<application_skin::SkinQuery>,
 ) -> impl IntoResponse {
     application_skin::handle_skin_head(&state, query).await
 }
 
 async fn handle_skin_lookup(
-    Query(query): Query<application_skin::SkinLookupQuery>,
+    ApiQuery(query): ApiQuery<application_skin::SkinLookupQuery>,
 ) -> impl IntoResponse {
     application_skin::handle_skin_lookup(query).await
 }
 
 async fn handle_skin_lookup_file(
     State(state): State<AppState>,
-    Query(query): Query<application_skin::SkinLookupQuery>,
+    ApiQuery(query): ApiQuery<application_skin::SkinLookupQuery>,
 ) -> impl IntoResponse {
     application_skin::handle_skin_lookup_file(&state, query).await
 }
 
 async fn handle_skin_lookup_head(
     State(state): State<AppState>,
-    Query(query): Query<application_skin::SkinLookupQuery>,
+    ApiQuery(query): ApiQuery<application_skin::SkinLookupQuery>,
 ) -> impl IntoResponse {
     application_skin::handle_skin_lookup_head(&state, query).await
 }
 
 async fn handle_skin_lookup_cape(
     State(state): State<AppState>,
-    Query(query): Query<application_skin::SkinLookupQuery>,
+    ApiQuery(query): ApiQuery<application_skin::SkinLookupQuery>,
 ) -> impl IntoResponse {
     application_skin::handle_skin_lookup_cape(&state, query).await
 }
@@ -132,7 +134,7 @@ async fn handle_saved_skins(State(state): State<AppState>) -> impl IntoResponse 
 
 async fn handle_save_skin(
     State(state): State<AppState>,
-    Query(query): Query<application_skin::SaveSkinQuery>,
+    ApiQuery(query): ApiQuery<application_skin::SaveSkinQuery>,
     body: Body,
 ) -> impl IntoResponse {
     application_skin::handle_save_skin(&state, query, body).await
@@ -166,7 +168,7 @@ async fn handle_delete_skin(
 async fn handle_update_saved_skin(
     State(state): State<AppState>,
     Path(texture_key): Path<String>,
-    Json(payload): Json<application_skin::UpdateSavedSkinRequest>,
+    ApiJson(payload): ApiJson<application_skin::UpdateSavedSkinRequest>,
 ) -> impl IntoResponse {
     application_skin::handle_update_saved_skin(&state, texture_key, payload).await
 }
@@ -174,7 +176,7 @@ async fn handle_update_saved_skin(
 async fn handle_replace_saved_skin_texture(
     State(state): State<AppState>,
     Path(texture_key): Path<String>,
-    Query(query): Query<application_skin::ReplaceSavedSkinTextureQuery>,
+    ApiQuery(query): ApiQuery<application_skin::ReplaceSavedSkinTextureQuery>,
     body: Body,
 ) -> impl IntoResponse {
     application_skin::handle_replace_saved_skin_texture(&state, texture_key, query, body).await
@@ -191,7 +193,7 @@ async fn handle_apply_saved_skin(
     State(state): State<AppState>,
     Extension(handoff): Extension<RequestProducerHandoff>,
     Path(texture_key): Path<String>,
-    Query(query): Query<application_skin::ApplySavedSkinQuery>,
+    ApiQuery(query): ApiQuery<application_skin::ApplySavedSkinQuery>,
 ) -> impl IntoResponse {
     application_skin::handle_apply_saved_skin(&state, texture_key, query, handoff).await
 }
