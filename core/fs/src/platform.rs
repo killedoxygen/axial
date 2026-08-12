@@ -8388,6 +8388,7 @@ pub(crate) use native::*;
 
 #[cfg(all(test, target_os = "macos"))]
 mod macos_native_probe {
+    use std::ffi::CStr;
     use std::fs::File;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
@@ -8416,8 +8417,13 @@ mod macos_native_probe {
             )
         };
         let get_path_error = std::io::Error::last_os_error();
+        let retained_path = CStr::from_bytes_until_nul(&path)
+            .expect("decode retained native probe path")
+            .to_string_lossy();
+        let retained_path_metadata = std::fs::symlink_metadata(retained_path.as_ref())
+            .map(|metadata| (metadata.dev(), metadata.ino()));
         eprintln!(
-            "macOS retained-directory probe: nlink={}, fsync={fsync}/{fsync_error:?}, barrier={barrier}/{barrier_error:?}, full={full}/{full_error:?}, get_path={get_path}/{get_path_error:?}",
+            "macOS retained-directory probe: nlink={}, fsync={fsync}/{fsync_error:?}, barrier={barrier}/{barrier_error:?}, full={full}/{full_error:?}, get_path={get_path}/{get_path_error:?}, path={retained_path:?}, path_metadata={retained_path_metadata:?}",
             child
                 .metadata()
                 .expect("stat retained native probe child")
