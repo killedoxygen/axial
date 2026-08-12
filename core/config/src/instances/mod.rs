@@ -517,6 +517,8 @@ pub struct InstanceStoreStartup {
 
 #[derive(Debug, Error)]
 pub enum InstanceStoreError {
+    #[error(transparent)]
+    Domain(#[from] InstanceStoreDomainError),
     #[error("failed to read instances: {0}")]
     Read(#[from] std::io::Error),
     #[error("failed to parse instances: {0}")]
@@ -529,6 +531,69 @@ pub enum InstanceStoreError {
     Persistence(std::io::Error),
     #[error("failed to open application root: {0}")]
     Root(std::io::Error),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum InstanceStoreDomainError {
+    #[error("instance not found")]
+    NotFound,
+    #[error("an instance with this name already exists")]
+    NameConflict,
+    #[error("direct version changes are not supported")]
+    DirectVersionChangeUnsupported,
+    #[error("cannot delete a running instance; stop the game first")]
+    RunningInstance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstanceStoreFailureClass {
+    DomainNotFound,
+    Conflict,
+    InvalidInput,
+    PermissionDenied,
+    StorageFull,
+    PersistenceNotFound,
+    Interrupted,
+    Unsettled,
+    InvalidData,
+    Other,
+}
+
+impl InstanceStoreError {
+    pub fn failure_class(&self) -> InstanceStoreFailureClass {
+        use std::io::ErrorKind;
+
+        let classify_io = |kind| match kind {
+            ErrorKind::PermissionDenied => InstanceStoreFailureClass::PermissionDenied,
+            ErrorKind::StorageFull => InstanceStoreFailureClass::StorageFull,
+            ErrorKind::Interrupted => InstanceStoreFailureClass::Interrupted,
+            ErrorKind::WouldBlock => InstanceStoreFailureClass::Unsettled,
+            _ => InstanceStoreFailureClass::Other,
+        };
+
+        match self {
+            Self::Domain(InstanceStoreDomainError::NotFound) => {
+                InstanceStoreFailureClass::DomainNotFound
+            }
+            Self::Domain(InstanceStoreDomainError::NameConflict) => {
+                InstanceStoreFailureClass::Conflict
+            }
+            Self::Domain(InstanceStoreDomainError::DirectVersionChangeUnsupported) => {
+                InstanceStoreFailureClass::InvalidInput
+            }
+            Self::Domain(InstanceStoreDomainError::RunningInstance) => {
+                InstanceStoreFailureClass::Conflict
+            }
+            Self::Read(error) | Self::Persistence(error) if error.kind() == ErrorKind::NotFound => {
+                InstanceStoreFailureClass::PersistenceNotFound
+            }
+            Self::Read(error) | Self::Persistence(error) => classify_io(error.kind()),
+            Self::Root(error) => classify_io(error.kind()),
+            Self::Validation(_) => InstanceStoreFailureClass::InvalidInput,
+            Self::Parse(_) => InstanceStoreFailureClass::InvalidData,
+            Self::TooLarge { .. } => InstanceStoreFailureClass::InvalidData,
+        }
+    }
 }
 
 impl InstanceStore {

@@ -72,6 +72,33 @@ pub struct SavedSkinStore {
     defer_next_file_retirement: std::sync::atomic::AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SavedSkinStoreFailureClass {
+    NotFound,
+    Conflict,
+    PermissionDenied,
+    StorageFull,
+    Interrupted,
+    Unsettled,
+    InvalidData,
+    Other,
+}
+
+impl SavedSkinStoreFailureClass {
+    pub(crate) fn from_error(error: &io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::NotFound => Self::NotFound,
+            io::ErrorKind::AlreadyExists => Self::Conflict,
+            io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            io::ErrorKind::StorageFull => Self::StorageFull,
+            io::ErrorKind::Interrupted => Self::Interrupted,
+            io::ErrorKind::WouldBlock => Self::Unsettled,
+            io::ErrorKind::InvalidData => Self::InvalidData,
+            _ => Self::Other,
+        }
+    }
+}
+
 struct PendingSavedSkinFileRetirement {
     texture_key: String,
     retirement: Option<AnchoredRecordRetirement>,

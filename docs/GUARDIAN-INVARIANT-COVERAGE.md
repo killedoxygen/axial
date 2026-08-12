@@ -24,13 +24,13 @@ This document is a deterministic human-readable projection of Guardian's strict 
 ## Coverage Summary
 | Surface | Covered |
 | --- | --- |
-| Failure classes | 15 |
+| Failure classes | 16 |
 | Operation phases | 12 |
 | Guardian modes | 3 |
-| Kernel cells | 540 |
+| Kernel cells | 576 |
 | Persisted-state Startup cells | 3 |
 | Persisted-state repair hands | 1 |
-| Public kernel cells | 90 |
+| Public kernel cells | 96 |
 | Diagnosis rules | 56 |
 | Registered facts | 116 |
 | Preflight senses | 7 |
@@ -44,7 +44,7 @@ The complete kernel matrix remains in the JSON artifact.
 | Decision | All cells | Public cells |
 | --- | --- | --- |
 | AskUser | 30 | 0 |
-| Block | 160 | 90 |
+| Block | 196 | 96 |
 | Fallback | 20 | 0 |
 | RecordOnly | 300 | 0 |
 | Strip | 30 | 0 |

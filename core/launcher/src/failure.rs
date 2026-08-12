@@ -139,17 +139,18 @@ fn failure_class_precedence(class: LaunchFailureClass) -> u8 {
         LaunchFailureClass::JvmUnsupportedOption => 1,
         LaunchFailureClass::JvmExperimentalUnlock => 2,
         LaunchFailureClass::JvmOptionOrdering => 3,
-        LaunchFailureClass::JavaRuntimeMismatch => 4,
-        LaunchFailureClass::OutOfMemory => 5,
-        LaunchFailureClass::LauncherManagedArtifactSignature => 6,
-        LaunchFailureClass::GraphicsDriverCrash => 7,
-        LaunchFailureClass::MissingDependency => 8,
-        LaunchFailureClass::ModTransformationFailure => 9,
-        LaunchFailureClass::ModAttributedCrash => 10,
-        LaunchFailureClass::ClasspathModuleConflict => 11,
-        LaunchFailureClass::LoaderBootstrapFailure => 12,
-        LaunchFailureClass::AuthModeIncompatible => 13,
-        LaunchFailureClass::Unknown => 14,
+        LaunchFailureClass::RosettaRequired => 4,
+        LaunchFailureClass::JavaRuntimeMismatch => 5,
+        LaunchFailureClass::OutOfMemory => 6,
+        LaunchFailureClass::LauncherManagedArtifactSignature => 7,
+        LaunchFailureClass::GraphicsDriverCrash => 8,
+        LaunchFailureClass::MissingDependency => 9,
+        LaunchFailureClass::ModTransformationFailure => 10,
+        LaunchFailureClass::ModAttributedCrash => 11,
+        LaunchFailureClass::ClasspathModuleConflict => 12,
+        LaunchFailureClass::LoaderBootstrapFailure => 13,
+        LaunchFailureClass::AuthModeIncompatible => 14,
+        LaunchFailureClass::Unknown => 15,
     }
 }
 
@@ -286,11 +287,12 @@ mod tests {
     use super::*;
     use crate::crash::{MAX_CRASH_ARTIFACT_BYTES, parse_crash_evidence};
 
-    const RANKED_FAILURES: [LaunchFailureClass; 15] = [
+    const RANKED_FAILURES: [LaunchFailureClass; 16] = [
         LaunchFailureClass::StartupStalled,
         LaunchFailureClass::JvmUnsupportedOption,
         LaunchFailureClass::JvmExperimentalUnlock,
         LaunchFailureClass::JvmOptionOrdering,
+        LaunchFailureClass::RosettaRequired,
         LaunchFailureClass::JavaRuntimeMismatch,
         LaunchFailureClass::OutOfMemory,
         LaunchFailureClass::LauncherManagedArtifactSignature,

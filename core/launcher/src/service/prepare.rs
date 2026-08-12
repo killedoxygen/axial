@@ -138,13 +138,14 @@ where
     .map_err(|error| {
         // Admission refusal is an execution-coordination failure, not evidence
         // that the selected Java runtime is incompatible.
-        let failure_class = if matches!(
-            &error,
-            axial_minecraft::JavaRuntimeLookupError::ManagedMutationRefused
-        ) {
-            LaunchFailureClass::Unknown
-        } else {
-            LaunchFailureClass::JavaRuntimeMismatch
+        let failure_class = match &error {
+            axial_minecraft::JavaRuntimeLookupError::ManagedMutationRefused => {
+                LaunchFailureClass::Unknown
+            }
+            axial_minecraft::JavaRuntimeLookupError::RosettaRequired { .. } => {
+                LaunchFailureClass::RosettaRequired
+            }
+            _ => LaunchFailureClass::JavaRuntimeMismatch,
         };
         LaunchPreparationError {
             message: format!("resolve java: {error}"),

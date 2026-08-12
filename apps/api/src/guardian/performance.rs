@@ -66,6 +66,11 @@ pub fn plan_performance_supervision(
     if request.target.ownership != OwnershipClass::CompositionManaged {
         return Err(GuardianPerformanceSupervisionRejection::UnsafeOwnership);
     }
+    if request.operation == GuardianPerformanceOperationKind::RollbackManagedComposition
+        && request.rollback_state != RollbackState::Available
+    {
+        return Err(GuardianPerformanceSupervisionRejection::RollbackUnavailable);
+    }
     let safety_case = if request.facts.is_empty() {
         SafetyCase {
             operation_id: request.operation_id.clone(),
@@ -482,8 +487,8 @@ mod tests {
     }
 
     #[test]
-    fn performance_supervision_marks_unavailable_rollback_without_blocking_preflight_error() {
-        let supervision = plan_performance_supervision(GuardianPerformanceSupervisionRequest {
+    fn p02_b05_contract_cross_owner_performance_rejects_unavailable_rollback() {
+        let rejection = plan_performance_supervision(GuardianPerformanceSupervisionRequest {
             operation_id: None,
             mode: GuardianMode::Managed,
             phase: OperationPhase::RollingBack,
@@ -493,13 +498,12 @@ mod tests {
             rollback_state: RollbackState::Unavailable,
             context: GuardianPolicyContext::current_operation(),
         })
-        .expect("rollback supervision plan");
+        .expect_err("rollback without a verified snapshot must reject");
 
-        assert!(!supervision.rollback_authorized);
-        assert_eq!(supervision.decision.kind(), GuardianActionKind::Allow);
-        assert_eq!(supervision.decision.mode(), GuardianMode::Managed);
-        assert!(supervision.decision.diagnoses().is_empty());
-        assert!(supervision.decision.action_plan().is_none());
+        assert_eq!(
+            rejection,
+            GuardianPerformanceSupervisionRejection::RollbackUnavailable
+        );
     }
 
     fn performance_target(id: &str, ownership: OwnershipClass) -> TargetDescriptor {

@@ -44,7 +44,7 @@ mod user_mod_witness;
 use axial_config::{
     AppConfig, AppRootSession, ConfigStore as StartupConfigStore, ConfigStoreError,
     INSTANCE_REGISTRY_MAX_ENTRIES, Instance, InstanceStore as StartupInstanceStore,
-    InstanceStoreError, generate_instance_id, is_canonical_instance_id,
+    InstanceStoreDomainError, InstanceStoreError, generate_instance_id, is_canonical_instance_id,
 };
 use axial_content::ContentService;
 pub use axial_launcher::{
@@ -2590,20 +2590,14 @@ impl AppState {
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
         let deletion = self.instance_deletions.admit(self).await?;
         if self.sessions.has_active_instance(&instance_id).await {
-            return Err(InstanceStoreError::Persistence(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "cannot delete a running instance; stop the game first",
-            )));
+            return Err(InstanceStoreDomainError::RunningInstance.into());
         }
         let lifecycle = self
             .acquire_integrity_instance_lifecycle(foreground, &instance_id)
             .await
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
         if self.sessions.has_active_instance(&instance_id).await {
-            return Err(InstanceStoreError::Persistence(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "cannot delete a running instance; stop the game first",
-            )));
+            return Err(InstanceStoreDomainError::RunningInstance.into());
         }
         if self.instances.get(&instance_id).is_none() {
             return Err(instance_not_found_error());

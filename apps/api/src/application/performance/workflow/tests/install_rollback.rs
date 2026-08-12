@@ -435,7 +435,9 @@ async fn rollback_without_snapshot_returns_json_error() {
     assert_eq!(error.0, StatusCode::BAD_REQUEST);
     assert_eq!(
         error.1.0,
-        serde_json::json!({ "error": "no performance rollback snapshot available" })
+        serde_json::json!({
+            "error": "Guardian blocked the performance rollback because no verified snapshot is available."
+        })
     );
     fixture.close().await;
 }
@@ -1085,7 +1087,9 @@ async fn rollback_invalid_snapshot_id_returns_json_error() {
     assert_eq!(error.0, StatusCode::BAD_REQUEST);
     assert_eq!(
         error.1.0,
-        serde_json::json!({ "error": "invalid performance rollback snapshot id" })
+        serde_json::json!({
+            "error": "Guardian blocked the performance rollback because no verified snapshot is available."
+        })
     );
     fixture.close().await;
 }
@@ -1113,7 +1117,9 @@ async fn rollback_missing_snapshot_id_returns_json_error() {
     assert_eq!(error.0, StatusCode::BAD_REQUEST);
     assert_eq!(
         error.1.0,
-        serde_json::json!({ "error": "performance rollback snapshot not found" })
+        serde_json::json!({
+            "error": "Guardian blocked the performance rollback because no verified snapshot is available."
+        })
     );
     fixture.close().await;
 }

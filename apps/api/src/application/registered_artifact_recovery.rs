@@ -263,6 +263,14 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
                         ) => effect.failed_before_effect([
                             "version_bundle_component_local_preparation_failed".into(),
                         ]),
+                        Err(axial_minecraft::ManagedVersionBundleRebuildError::Interrupted) => {
+                            effect.failed_before_effect([
+                                "version_bundle_component_rebuild_interrupted".into(),
+                            ])
+                        }
+                        Err(axial_minecraft::ManagedVersionBundleRebuildError::Unsettled) => {
+                            effect.indeterminate()
+                        }
                         Err(axial_minecraft::ManagedVersionBundleRebuildError::Indeterminate(
                             recovery,
                         )) => {
@@ -361,6 +369,22 @@ fn registered_artifact_recovery_error(message: &'static str) -> OperationJournal
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn p02_b05_contract_cross_owner_known_good_interrupted_and_unsettled_remain_distinct() {
+        let interrupted = axial_minecraft::ManagedVersionBundleRebuildError::Interrupted;
+        let unsettled = axial_minecraft::ManagedVersionBundleRebuildError::Unsettled;
+
+        assert_eq!(
+            interrupted.to_string(),
+            "managed VersionBundle rebuild was interrupted"
+        );
+        assert_eq!(
+            unsettled.to_string(),
+            "managed VersionBundle rebuild could not settle its effect"
+        );
+        assert_ne!(interrupted.to_string(), unsettled.to_string());
+    }
 
     #[tokio::test]
     async fn version_bundle_rebuild_convergence_consumes_retained_recovery() {

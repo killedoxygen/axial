@@ -352,7 +352,7 @@ pub(crate) async fn launch_benchmark(
     });
     result_rx
         .await
-        .unwrap_or_else(|_| Err(benchmark_suite_storage_error_response()))
+        .unwrap_or_else(|_| Err(benchmark_launch_owner_stopped_response()))
 }
 
 pub(crate) async fn launch_benchmark_suite(
@@ -712,7 +712,7 @@ async fn launch_benchmark_suite_run_owned(
 
     result_rx
         .await
-        .unwrap_or_else(|_| Err(benchmark_suite_storage_error_response()))
+        .unwrap_or_else(|_| Err(benchmark_launch_owner_stopped_response()))
 }
 
 struct OwnedBenchmarkSuiteLaunchInput {
@@ -1076,6 +1076,15 @@ fn benchmark_suite_storage_error_response() -> (StatusCode, Json<serde_json::Val
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE })),
+    )
+}
+
+fn benchmark_launch_owner_stopped_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "Benchmark launch stopped before completion. Try again."
+        })),
     )
 }
 
@@ -1817,6 +1826,25 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
+
+    #[test]
+    fn p02_b05_contract_cross_owner_benchmark_task_loss_is_not_a_storage_failure() {
+        let (status, Json(owner_body)) = benchmark_launch_owner_stopped_response();
+        let (_, Json(storage_body)) = benchmark_suite_storage_error_response();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            owner_body["error"],
+            "Benchmark launch stopped before completion. Try again."
+        );
+        assert_ne!(owner_body["error"], storage_body["error"]);
+        assert!(
+            !owner_body["error"]
+                .as_str()
+                .expect("owner message")
+                .contains("permissions")
+        );
+    }
 
     #[tokio::test]
     async fn startup_driver_resume_is_not_admitted_after_quiescence() {

@@ -1,3 +1,4 @@
+use super::operation::install_failure_target_and_kind_from_download_error;
 use super::*;
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
 use crate::guardian::{DiagnosisId, GuardianInstallArtifactFailureKind};
@@ -509,6 +510,56 @@ fn p02_b04_contract_cross_owner_rejects_parallel_content_request_shapes() {
         }),
     ] {
         assert!(serde_json::from_value::<InstallQueueRequest>(payload).is_err());
+    }
+}
+
+#[test]
+fn p02_b05_contract_cross_owner_download_io_classes_select_exact_guardian_evidence() {
+    let cases = [
+        (
+            io::ErrorKind::PermissionDenied,
+            axial_minecraft::DownloadFileFailureClass::PermissionDenied,
+            GuardianInstallArtifactFailureKind::PermissionDenied,
+        ),
+        (
+            io::ErrorKind::StorageFull,
+            axial_minecraft::DownloadFileFailureClass::StorageFull,
+            GuardianInstallArtifactFailureKind::TempWriteFailed,
+        ),
+        (
+            io::ErrorKind::NotFound,
+            axial_minecraft::DownloadFileFailureClass::NotFound,
+            GuardianInstallArtifactFailureKind::DependencyFailed,
+        ),
+        (
+            io::ErrorKind::AlreadyExists,
+            axial_minecraft::DownloadFileFailureClass::Conflict,
+            GuardianInstallArtifactFailureKind::PromotionFailed,
+        ),
+        (
+            io::ErrorKind::WouldBlock,
+            axial_minecraft::DownloadFileFailureClass::Unsettled,
+            GuardianInstallArtifactFailureKind::PromotionFailed,
+        ),
+        (
+            io::ErrorKind::Interrupted,
+            axial_minecraft::DownloadFileFailureClass::Interrupted,
+            GuardianInstallArtifactFailureKind::ExecutionFailed,
+        ),
+        (
+            io::ErrorKind::Other,
+            axial_minecraft::DownloadFileFailureClass::Other,
+            GuardianInstallArtifactFailureKind::ExecutionFailed,
+        ),
+    ];
+
+    for (io_kind, expected_class, expected_evidence) in cases {
+        let error = DownloadError::FileOperation(io::Error::new(io_kind, "private detail"));
+        assert_eq!(error.file_failure_class(), Some(expected_class));
+        assert_eq!(
+            install_failure_target_and_kind_from_download_error(&error),
+            Some(("install_filesystem", expected_evidence))
+        );
     }
 }
 

@@ -34,33 +34,105 @@ use std::{
 fn instance_write_error_mapper_preserves_safe_status_messages() {
     let cases = [
         (
-            io::ErrorKind::NotFound,
-            "instance not found",
+            InstanceStoreError::from(InstanceStoreDomainError::NotFound),
             StatusCode::NOT_FOUND,
             "instance not found",
         ),
         (
-            io::ErrorKind::AlreadyExists,
-            "an instance with this name already exists",
+            InstanceStoreError::from(InstanceStoreDomainError::NameConflict),
             StatusCode::CONFLICT,
             "an instance with this name already exists",
         ),
         (
-            io::ErrorKind::InvalidInput,
-            "version_id is required",
+            InstanceStoreError::Validation("version_id is required"),
             StatusCode::BAD_REQUEST,
             "version_id is required",
         ),
     ];
 
-    for (kind, store_message, expected_status, expected_message) in cases {
-        let (status, Json(body)) = instance_write_error_response(
-            InstanceWriteOperation::Create,
-            InstanceStoreError::Read(io::Error::new(kind, store_message)),
-        );
+    for (error, expected_status, expected_message) in cases {
+        let (status, Json(body)) =
+            instance_write_error_response(InstanceWriteOperation::Create, error);
 
         assert_eq!(status, expected_status);
         assert_bounded_error_body(&body, expected_message);
+    }
+}
+
+#[test]
+fn p02_b05_contract_instance_failures_preserve_domain_and_persistence_classes() {
+    let cases = [
+        (
+            InstanceStoreError::from(InstanceStoreDomainError::NotFound),
+            InstanceStoreFailureClass::DomainNotFound,
+            StatusCode::NOT_FOUND,
+            "instance not found",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::NotFound)),
+            InstanceStoreFailureClass::PersistenceNotFound,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Instance storage is unavailable. Restart Axial and try again.",
+        ),
+        (
+            InstanceStoreError::from(InstanceStoreDomainError::NameConflict),
+            InstanceStoreFailureClass::Conflict,
+            StatusCode::CONFLICT,
+            "an instance with this name already exists",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::AlreadyExists)),
+            InstanceStoreFailureClass::Other,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not save the instance. Try again.",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::PermissionDenied)),
+            InstanceStoreFailureClass::PermissionDenied,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Instance storage access was denied. Check app data permissions and try again.",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::StorageFull)),
+            InstanceStoreFailureClass::StorageFull,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Instance storage is full. Free disk space and try again.",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::Interrupted)),
+            InstanceStoreFailureClass::Interrupted,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The instance update was interrupted. Try again.",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::WouldBlock)),
+            InstanceStoreFailureClass::Unsettled,
+            StatusCode::CONFLICT,
+            "Another instance update is still settling. Try again.",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::other(
+                "/private/path must never cross the boundary",
+            )),
+            InstanceStoreFailureClass::Other,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not save the instance. Try again.",
+        ),
+        (
+            InstanceStoreError::Root(io::Error::from(io::ErrorKind::NotFound)),
+            InstanceStoreFailureClass::Other,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not save the instance. Try again.",
+        ),
+    ];
+
+    for (error, expected_class, expected_status, expected_message) in cases {
+        assert_eq!(error.failure_class(), expected_class);
+        let (status, Json(body)) =
+            instance_write_error_response(InstanceWriteOperation::Update, error);
+        assert_eq!(status, expected_status);
+        assert_bounded_error_body(&body, expected_message);
+        assert!(!error_body_text(&body).contains("/private/path"));
     }
 }
 
@@ -84,17 +156,17 @@ fn instance_write_error_mapper_bounds_internal_operation_errors() {
         (
             InstanceWriteOperation::Create,
             "failed to initialize instance files: /home/zero/.config/Axial/instances/new/logs",
-            "Could not create the instance. Check app data permissions and try again.",
+            "Could not create the instance. Try again.",
         ),
         (
             InstanceWriteOperation::Update,
             "failed to persist /home/zero/.config/Axial/instances.json",
-            "Could not save the instance. Check app data permissions and try again.",
+            "Could not save the instance. Try again.",
         ),
         (
             InstanceWriteOperation::Delete,
             "failed to delete C:\\Users\\Zero\\AppData\\Roaming\\Axial\\instances\\old",
-            "Could not delete the instance. Check app data permissions and try again.",
+            "Could not delete the instance. Try again.",
         ),
     ];
 
@@ -121,10 +193,7 @@ fn instance_root_errors_are_classified_and_redacted() {
 
     let (status, Json(body)) = instance_write_error_response(InstanceWriteOperation::Create, error);
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_bounded_error_body(
-        &body,
-        "Could not create the instance. Check app data permissions and try again.",
-    );
+    assert_bounded_error_body(&body, "Could not create the instance. Try again.");
     assert!(!error_body_text(&body).contains("/home/zero"));
 }
 
@@ -143,10 +212,7 @@ fn duplicate_instance_write_error_hides_layout_and_persist_paths() {
     );
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_bounded_error_body(
-        &body,
-        "Could not duplicate the instance. Check app data permissions and try again.",
-    );
+    assert_bounded_error_body(&body, "Could not duplicate the instance. Try again.");
     let public_message = error_body_text(&body);
     for hidden_fragment in [
         "/home/zero",

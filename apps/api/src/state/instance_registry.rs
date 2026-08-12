@@ -10,8 +10,8 @@ use crate::execution::persistence::{
 use axial_config::generate_instance_id;
 use axial_config::{
     AppPaths, AppRootSession, INSTANCE_REGISTRY_MAX_BYTES, Instance, InstanceRegistrySnapshot,
-    InstanceStore, InstanceStoreError, PendingInstanceDeletion, StartupFileProvenance,
-    derive_instance_art_seed, is_canonical_instance_id,
+    InstanceStore, InstanceStoreDomainError, InstanceStoreError, PendingInstanceDeletion,
+    StartupFileProvenance, derive_instance_art_seed, is_canonical_instance_id,
 };
 use axial_fs::{
     Directory, DirectoryEntry, DirectoryListingState, DirectoryParkObligation,
@@ -1759,10 +1759,7 @@ impl AppInstanceStore {
             .filter(|value| !value.trim().is_empty())
             && version_id != instance.version_id
         {
-            return Err(InstanceStoreError::Persistence(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "direct version changes are not supported",
-            )));
+            return Err(InstanceStoreDomainError::DirectVersionChangeUnsupported.into());
         }
         if let Some(value) = update.art_seed {
             instance.art_seed = value;
@@ -3008,17 +3005,11 @@ fn pending_instance_deletion_recovery_error() -> InstanceDeletionPreparationFail
 }
 
 pub(crate) fn instance_not_found_error() -> InstanceStoreError {
-    InstanceStoreError::Persistence(io::Error::new(
-        io::ErrorKind::NotFound,
-        "instance not found",
-    ))
+    InstanceStoreDomainError::NotFound.into()
 }
 
 pub(crate) fn instance_name_conflict_error() -> InstanceStoreError {
-    InstanceStoreError::Persistence(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "an instance with this name already exists",
-    ))
+    InstanceStoreDomainError::NameConflict.into()
 }
 
 fn closed_instance_registry_error() -> InstanceStoreError {

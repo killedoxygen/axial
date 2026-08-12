@@ -235,6 +235,11 @@ fn prepare_failure_facts(request: &GuardianPrepareFailureRequest<'_>) -> Vec<Gua
             java_override_ownership(request.explicit_java_override_present),
             "explicit_java_override",
         ),
+        LaunchFailureClass::RosettaRequired => (
+            GuardianDomain::Runtime,
+            OwnershipClass::LauncherManaged,
+            "managed_java_runtime",
+        ),
         LaunchFailureClass::JvmUnsupportedOption
         | LaunchFailureClass::JvmExperimentalUnlock
         | LaunchFailureClass::JvmOptionOrdering => (
@@ -304,6 +309,11 @@ fn startup_failure_facts(
             GuardianDomain::Runtime,
             java_override_ownership(request.explicit_java_override_present),
             "startup_java_runtime",
+        ),
+        LaunchFailureClass::RosettaRequired => (
+            GuardianDomain::Runtime,
+            OwnershipClass::LauncherManaged,
+            "managed_java_runtime",
         ),
         LaunchFailureClass::OutOfMemory
         | LaunchFailureClass::GraphicsDriverCrash
@@ -645,6 +655,7 @@ fn startup_failure_class(observation: GuardianStartupFailureObservation) -> Laun
 pub(super) fn failure_class_fact_id(failure_class: LaunchFailureClass) -> GuardianFactId {
     match failure_class {
         LaunchFailureClass::JavaRuntimeMismatch => GuardianFactId::JavaMajorMismatch,
+        LaunchFailureClass::RosettaRequired => GuardianFactId::ManagedRuntimeRosettaRequired,
         LaunchFailureClass::JvmUnsupportedOption => GuardianFactId::JvmArgUnsupported,
         LaunchFailureClass::JvmExperimentalUnlock => {
             GuardianFactId::JvmArgExperimentalUnlockMissing
@@ -673,7 +684,9 @@ pub(super) fn failure_class_matrix_decision(
     mode: GuardianMode,
 ) -> GuardianDecision {
     let domain = match failure_class {
-        LaunchFailureClass::JavaRuntimeMismatch => GuardianDomain::Runtime,
+        LaunchFailureClass::JavaRuntimeMismatch | LaunchFailureClass::RosettaRequired => {
+            GuardianDomain::Runtime
+        }
         LaunchFailureClass::JvmUnsupportedOption
         | LaunchFailureClass::JvmExperimentalUnlock
         | LaunchFailureClass::JvmOptionOrdering => GuardianDomain::Jvm,
@@ -734,7 +747,8 @@ mod tests {
         GuardianObservedLaunchFailurePhase, GuardianPrepareFailureRequest,
         GuardianStartupFailureObservation, GuardianStartupFailureRequest, StartupRecoveryOptions,
         guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-        guardian_startup_failure_outcome, startup_failure_facts, user_mod_set_drift_fact,
+        guardian_startup_failure_outcome, prepare_failure_facts, startup_failure_facts,
+        user_mod_set_drift_fact,
     };
     use crate::guardian::{
         DiagnosisId, FactReliability, GuardianActionKind, GuardianCopyRequest, GuardianDirective,
@@ -1398,6 +1412,40 @@ mod tests {
         assert!(!lower.contains("-xmx"));
         assert!(!lower.contains("--username"));
         assert!(!lower.contains("secret"));
+    }
+
+    #[test]
+    fn p02_b05_contract_cross_owner_rosetta_keeps_its_runtime_fact_and_blocking_copy() {
+        let request = GuardianPrepareFailureRequest {
+            mode: GuardianMode::Managed,
+            failure_class: LaunchFailureClass::RosettaRequired,
+            public_error: "untrusted lower-level runtime text",
+            requested_java_present: true,
+            explicit_java_override_present: false,
+            explicit_jvm_args_present: false,
+            runtime_intervention_applied: false,
+            raw_jvm_args_intervention_applied: false,
+        };
+        let facts = prepare_failure_facts(&request);
+        let outcome = guardian_prepare_failure_outcome(request);
+
+        assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Block);
+        assert_eq!(
+            outcome.safety_case.diagnoses[0].id(),
+            DiagnosisId::ManagedRuntimeRosettaRequired
+        );
+        assert_eq!(facts[0].domain, GuardianDomain::Runtime);
+        assert_eq!(facts[0].ownership, OwnershipClass::LauncherManaged);
+        assert_eq!(facts[0].id, GuardianFactId::ManagedRuntimeRosettaRequired);
+        assert!(
+            outcome
+                .user_outcome
+                .details()
+                .iter()
+                .chain(outcome.user_outcome.guidance())
+                .any(|line| line.contains("Rosetta 2"))
+        );
+        assert!(outcome.directive.is_none());
     }
 
     #[test]

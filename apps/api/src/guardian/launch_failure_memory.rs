@@ -332,6 +332,7 @@ pub(super) fn launch_failure_diagnosis_id(failure_class: LaunchFailureClass) -> 
         LaunchFailureClass::JvmExperimentalUnlock => DiagnosisId::JvmExperimentalUnlock,
         LaunchFailureClass::JvmOptionOrdering => DiagnosisId::JvmOptionOrdering,
         LaunchFailureClass::JavaRuntimeMismatch => DiagnosisId::JavaRuntimeMismatch,
+        LaunchFailureClass::RosettaRequired => DiagnosisId::ManagedRuntimeRosettaRequired,
         LaunchFailureClass::OutOfMemory => DiagnosisId::OutOfMemory,
         LaunchFailureClass::GraphicsDriverCrash => DiagnosisId::GraphicsDriverCrash,
         LaunchFailureClass::MissingDependency => DiagnosisId::MissingDependency,
@@ -356,6 +357,7 @@ pub(super) fn launch_failure_class_for_diagnosis(
         DiagnosisId::JvmExperimentalUnlock => LaunchFailureClass::JvmExperimentalUnlock,
         DiagnosisId::JvmOptionOrdering => LaunchFailureClass::JvmOptionOrdering,
         DiagnosisId::JavaRuntimeMismatch => LaunchFailureClass::JavaRuntimeMismatch,
+        DiagnosisId::ManagedRuntimeRosettaRequired => LaunchFailureClass::RosettaRequired,
         DiagnosisId::OutOfMemory => LaunchFailureClass::OutOfMemory,
         DiagnosisId::GraphicsDriverCrash => LaunchFailureClass::GraphicsDriverCrash,
         DiagnosisId::MissingDependency => LaunchFailureClass::MissingDependency,
@@ -451,6 +453,22 @@ mod tests {
                     && entry.occurrence_count == 1
             }));
         }
+    }
+
+    #[test]
+    fn p02_b05_contract_rosetta_memory_round_trips_without_java_major_collapse() {
+        assert_eq!(
+            launch_failure_diagnosis_id(LaunchFailureClass::RosettaRequired),
+            DiagnosisId::ManagedRuntimeRosettaRequired
+        );
+        assert_eq!(
+            launch_failure_class_for_diagnosis(DiagnosisId::ManagedRuntimeRosettaRequired),
+            Some(LaunchFailureClass::RosettaRequired)
+        );
+        assert_ne!(
+            launch_failure_diagnosis_id(LaunchFailureClass::RosettaRequired),
+            launch_failure_diagnosis_id(LaunchFailureClass::JavaRuntimeMismatch)
+        );
     }
 
     #[test]

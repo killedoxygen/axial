@@ -32,9 +32,9 @@ use axial_minecraft::LoaderInstallFailureKind;
 use axial_minecraft::download::{ExecutionDownloadFact, ExecutionDownloadFactKind};
 use axial_minecraft::loaders::LoaderActiveInstallFailure;
 use axial_minecraft::{
-    DownloadError, DownloadProgress, LoaderBuildRecord, LoaderComponentId,
-    ManagedInstallPublicationEvidenceId, RuntimeSourceFailureKind, installed_version_id_for,
-    parse_build_id,
+    DownloadError, DownloadFileFailureClass, DownloadProgress, LoaderBuildRecord,
+    LoaderComponentId, ManagedInstallPublicationEvidenceId, RuntimeSourceFailureKind,
+    installed_version_id_for, parse_build_id,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashSet};
@@ -2402,14 +2402,30 @@ fn install_failure_evidence_from_download_error(
     ))
 }
 
-fn install_failure_target_and_kind_from_download_error(
+pub(super) fn install_failure_target_and_kind_from_download_error(
     error: &DownloadError,
 ) -> Option<(&'static str, GuardianInstallArtifactFailureKind)> {
     let evidence = match error {
-        DownloadError::FileOperation(_) => (
-            "install_filesystem",
-            GuardianInstallArtifactFailureKind::PermissionDenied,
-        ),
+        DownloadError::FileOperation(_) => {
+            let kind = match error.file_failure_class()? {
+                DownloadFileFailureClass::PermissionDenied => {
+                    GuardianInstallArtifactFailureKind::PermissionDenied
+                }
+                DownloadFileFailureClass::StorageFull => {
+                    GuardianInstallArtifactFailureKind::TempWriteFailed
+                }
+                DownloadFileFailureClass::NotFound => {
+                    GuardianInstallArtifactFailureKind::DependencyFailed
+                }
+                DownloadFileFailureClass::Conflict | DownloadFileFailureClass::Unsettled => {
+                    GuardianInstallArtifactFailureKind::PromotionFailed
+                }
+                DownloadFileFailureClass::Interrupted | DownloadFileFailureClass::Other => {
+                    GuardianInstallArtifactFailureKind::ExecutionFailed
+                }
+            };
+            ("install_filesystem", kind)
+        }
         DownloadError::ResolveManifest(_) => (
             "version_manifest",
             GuardianInstallArtifactFailureKind::ProviderFailure,

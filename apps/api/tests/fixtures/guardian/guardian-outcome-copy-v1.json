@@ -96,9 +96,11 @@
         "phase": "Repairing",
         "summary": "Guardian could not repair the launcher-managed artifact.",
         "details": [
-          "Check connection and storage permissions before trying again."
+          "The repair attempt stopped before a verified artifact could be published."
         ],
-        "guidance": []
+        "guidance": [
+          "Retry the repair. If it repeats, reinstall the affected version or runtime."
+        ]
       }
     },
     {
@@ -414,9 +416,13 @@
       "outcome": {
         "decision": "Block",
         "phase": "Installing",
-        "summary": "performance update was blocked by Guardian safety supervision",
-        "details": [],
-        "guidance": []
+        "summary": "Guardian blocked the performance update to protect files it does not own.",
+        "details": [
+          "The selected target is user-owned or has unknown ownership."
+        ],
+        "guidance": [
+          "Remove the conflicting custom files or choose a launcher-managed target before retrying."
+        ]
       }
     },
     {
@@ -429,9 +435,13 @@
       "outcome": {
         "decision": "Block",
         "phase": "Installing",
-        "summary": "performance update was blocked by Guardian safety supervision",
-        "details": [],
-        "guidance": []
+        "summary": "Guardian blocked the performance update because recovery journaling is unavailable.",
+        "details": [
+          "Axial could not retain the recovery record required for a safe performance change."
+        ],
+        "guidance": [
+          "Restart Axial, then retry after app storage is available."
+        ]
       }
     },
     {
@@ -444,9 +454,13 @@
       "outcome": {
         "decision": "Block",
         "phase": "Installing",
-        "summary": "performance update was blocked by Guardian safety supervision",
-        "details": [],
-        "guidance": []
+        "summary": "Guardian blocked the performance update because safe public evidence is unavailable.",
+        "details": [
+          "The operation could not produce the bounded evidence required for a safe result."
+        ],
+        "guidance": [
+          "Refresh the instance state and retry the operation."
+        ]
       }
     },
     {
@@ -459,9 +473,13 @@
       "outcome": {
         "decision": "Block",
         "phase": "Installing",
-        "summary": "performance update was blocked by Guardian safety supervision",
-        "details": [],
-        "guidance": []
+        "summary": "Guardian blocked the performance update after diagnosing an unsafe state.",
+        "details": [
+          "A confirmed Guardian diagnosis prevents this performance mutation."
+        ],
+        "guidance": [
+          "Resolve the reported safety issue before retrying the performance update."
+        ]
       }
     },
     {
@@ -474,9 +492,13 @@
       "outcome": {
         "decision": "Block",
         "phase": "Installing",
-        "summary": "performance update was blocked by Guardian safety supervision",
-        "details": [],
-        "guidance": []
+        "summary": "Guardian blocked the performance rollback because no verified snapshot is available.",
+        "details": [
+          "Axial does not have a trusted prior composition to restore."
+        ],
+        "guidance": [
+          "Apply a verified performance profile instead of retrying this rollback."
+        ]
       }
     },
     {

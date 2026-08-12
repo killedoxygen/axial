@@ -1227,40 +1227,44 @@ mod tests {
     use axum::http::StatusCode;
 
     #[test]
-    fn performance_supervision_rejections_use_exact_bounded_copy() {
+    fn p02_b05_contract_cross_owner_performance_rejections_use_exact_distinct_copy() {
         let cases = [
             (
                 GuardianPerformanceSupervisionRejection::UnsafeOwnership,
                 StatusCode::BAD_REQUEST,
+                "Guardian blocked the performance update to protect files it does not own.",
             ),
             (
                 GuardianPerformanceSupervisionRejection::MissingJournal,
                 StatusCode::INTERNAL_SERVER_ERROR,
+                "Guardian blocked the performance update because recovery journaling is unavailable.",
             ),
             (
                 GuardianPerformanceSupervisionRejection::UnsafePublicBoundary,
                 StatusCode::INTERNAL_SERVER_ERROR,
+                "Guardian blocked the performance update because safe public evidence is unavailable.",
             ),
             (
                 GuardianPerformanceSupervisionRejection::GuardianBlocked,
                 StatusCode::BAD_REQUEST,
+                "Guardian blocked the performance update after diagnosing an unsafe state.",
             ),
             (
                 GuardianPerformanceSupervisionRejection::RollbackUnavailable,
                 StatusCode::BAD_REQUEST,
+                "Guardian blocked the performance rollback because no verified snapshot is available.",
             ),
         ];
 
-        for (rejection, expected_status) in cases {
+        let mut messages = std::collections::HashSet::new();
+        for (rejection, expected_status, expected_message) in cases {
             let (status, body) =
                 performance_supervision_error(rejection, OperationPhase::RollingBack);
             let message = body.0["error"].as_str().expect("bounded error string");
 
             assert_eq!(status, expected_status);
-            assert_eq!(
-                message,
-                "performance update was blocked by Guardian safety supervision"
-            );
+            assert_eq!(message, expected_message);
+            assert!(messages.insert(message.to_string()));
             assert_ne!(message, PERFORMANCE_INSTALL_INTERNAL_ERROR);
         }
     }

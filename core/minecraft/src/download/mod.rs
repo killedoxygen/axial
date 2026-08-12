@@ -57,12 +57,12 @@ pub use libraries::{
 };
 pub(crate) use model::ExactLibraryDownloadProof;
 pub use model::{
-    DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
-    ExecutionDownloadFactKind, ExpectedIntegrity, KnownGoodActivationRejected, LibraryPlanError,
-    ManagedInstallAcknowledgementOutcome, ManagedInstallAcknowledgementRecovery,
-    ManagedInstallActivationContractId, ManagedInstallActivationContractIdError,
-    ManagedInstallCheckpointVerificationFailure, ManagedInstallCommittedEvidence,
-    ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
+    DownloadError, DownloadFileFailureClass, DownloadProgress, ExecutionDownloadError,
+    ExecutionDownloadFact, ExecutionDownloadFactKind, ExpectedIntegrity,
+    KnownGoodActivationRejected, LibraryPlanError, ManagedInstallAcknowledgementOutcome,
+    ManagedInstallAcknowledgementRecovery, ManagedInstallActivationContractId,
+    ManagedInstallActivationContractIdError, ManagedInstallCheckpointVerificationFailure,
+    ManagedInstallCommittedEvidence, ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
     ManagedInstallPostActivationAcknowledgement, ManagedInstallPublicationCandidates,
     ManagedInstallPublicationCandidatesError, ManagedInstallPublicationEvidenceId,
     ManagedInstallPublicationEvidenceIdError, ManagedInstallPublicationRecovery,

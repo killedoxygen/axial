@@ -2327,8 +2327,6 @@ const fn fixed_rule(
     }
 }
 
-const PERFORMANCE_SUMMARY: &str = "performance update was blocked by Guardian safety supervision";
-
 const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
     fixed_rule(
         key(
@@ -2408,9 +2406,11 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
         OperationPhase::Repairing,
         "Guardian could not repair the launcher-managed artifact.",
         &[CopyLine::Static(
-            "Check connection and storage permissions before trying again.",
+            "The repair attempt stopped before a verified artifact could be published.",
         )],
-        &[],
+        &[CopyLine::Static(
+            "Retry the repair. If it repeats, reinstall the affected version or runtime.",
+        )],
     ),
     fixed_rule(
         key(
@@ -2610,9 +2610,13 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
             CopyContextKey::PerformanceUnsafeOwnership,
         ),
         phase: CopyPhase::PerformanceContext,
-        summary: PERFORMANCE_SUMMARY,
-        details: &[],
-        guidance: &[],
+        summary: "Guardian blocked the performance update to protect files it does not own.",
+        details: &[CopyLine::Static(
+            "The selected target is user-owned or has unknown ownership.",
+        )],
+        guidance: &[CopyLine::Static(
+            "Remove the conflicting custom files or choose a launcher-managed target before retrying.",
+        )],
     },
     GuardianCopyRule {
         key: key(
@@ -2621,9 +2625,13 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
             CopyContextKey::PerformanceMissingJournal,
         ),
         phase: CopyPhase::PerformanceContext,
-        summary: PERFORMANCE_SUMMARY,
-        details: &[],
-        guidance: &[],
+        summary: "Guardian blocked the performance update because recovery journaling is unavailable.",
+        details: &[CopyLine::Static(
+            "Axial could not retain the recovery record required for a safe performance change.",
+        )],
+        guidance: &[CopyLine::Static(
+            "Restart Axial, then retry after app storage is available.",
+        )],
     },
     GuardianCopyRule {
         key: key(
@@ -2632,9 +2640,13 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
             CopyContextKey::PerformanceUnsafePublicBoundary,
         ),
         phase: CopyPhase::PerformanceContext,
-        summary: PERFORMANCE_SUMMARY,
-        details: &[],
-        guidance: &[],
+        summary: "Guardian blocked the performance update because safe public evidence is unavailable.",
+        details: &[CopyLine::Static(
+            "The operation could not produce the bounded evidence required for a safe result.",
+        )],
+        guidance: &[CopyLine::Static(
+            "Refresh the instance state and retry the operation.",
+        )],
     },
     GuardianCopyRule {
         key: key(
@@ -2643,9 +2655,13 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
             CopyContextKey::PerformanceGuardianBlocked,
         ),
         phase: CopyPhase::PerformanceContext,
-        summary: PERFORMANCE_SUMMARY,
-        details: &[],
-        guidance: &[],
+        summary: "Guardian blocked the performance update after diagnosing an unsafe state.",
+        details: &[CopyLine::Static(
+            "A confirmed Guardian diagnosis prevents this performance mutation.",
+        )],
+        guidance: &[CopyLine::Static(
+            "Resolve the reported safety issue before retrying the performance update.",
+        )],
     },
     GuardianCopyRule {
         key: key(
@@ -2654,9 +2670,13 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
             CopyContextKey::PerformanceRollbackUnavailable,
         ),
         phase: CopyPhase::PerformanceContext,
-        summary: PERFORMANCE_SUMMARY,
-        details: &[],
-        guidance: &[],
+        summary: "Guardian blocked the performance rollback because no verified snapshot is available.",
+        details: &[CopyLine::Static(
+            "Axial does not have a trusted prior composition to restore.",
+        )],
+        guidance: &[CopyLine::Static(
+            "Apply a verified performance profile instead of retrying this rollback.",
+        )],
     },
     fixed_rule(
         key(
@@ -3442,6 +3462,7 @@ fn accepted_failure_copy(
         | LaunchFailureClass::JvmExperimentalUnlock
         | LaunchFailureClass::JvmOptionOrdering
         | LaunchFailureClass::JavaRuntimeMismatch
+        | LaunchFailureClass::RosettaRequired
         | LaunchFailureClass::ClasspathModuleConflict
         | LaunchFailureClass::LauncherManagedArtifactSignature
         | LaunchFailureClass::AuthModeIncompatible
@@ -3459,6 +3480,9 @@ fn prepare_failure_reason(failure_class: LaunchFailureClass) -> &'static str {
     match failure_class {
         LaunchFailureClass::JavaRuntimeMismatch => {
             "The selected Java runtime is not compatible with this version."
+        }
+        LaunchFailureClass::RosettaRequired => {
+            "This Minecraft version needs Rosetta 2 before its Java runtime can start."
         }
         LaunchFailureClass::JvmUnsupportedOption
         | LaunchFailureClass::JvmExperimentalUnlock
@@ -3545,6 +3569,10 @@ fn launch_failure_guidance(
         ),
         LaunchFailureClass::JavaRuntimeMismatch => trusted_line(
             "Use a compatible Java runtime or let Axial use the managed runtime.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::RosettaRequired => trusted_line(
+            "Install Rosetta 2, then retry with the managed Java runtime.",
             MAX_LINE_BYTES,
         ),
         LaunchFailureClass::OutOfMemory => trusted_line(
@@ -3665,6 +3693,7 @@ fn startup_failure_reason(
         | LaunchFailureClass::JvmExperimentalUnlock
         | LaunchFailureClass::JvmOptionOrdering => "Minecraft exited before startup completed with a detected JVM option compatibility failure.",
         LaunchFailureClass::JavaRuntimeMismatch => "Minecraft exited before startup completed with a detected Java runtime mismatch.",
+        LaunchFailureClass::RosettaRequired => "Minecraft exited before startup completed because Rosetta 2 is required.",
         LaunchFailureClass::ClasspathModuleConflict => "Minecraft exited before startup completed with a detected classpath or module conflict.",
         LaunchFailureClass::LauncherManagedArtifactSignature => "Minecraft exited before startup completed with detected launcher-managed jar signature corruption.",
         LaunchFailureClass::AuthModeIncompatible => "Minecraft exited before startup completed because the selected auth mode was not launch-ready.",
@@ -3928,6 +3957,7 @@ fn preflight_startup_history(fact: &GuardianFact) -> Option<PreflightHistory> {
             | LaunchFailureClass::JvmExperimentalUnlock
             | LaunchFailureClass::JvmOptionOrdering
             | LaunchFailureClass::JavaRuntimeMismatch
+            | LaunchFailureClass::RosettaRequired
             | LaunchFailureClass::ClasspathModuleConflict
             | LaunchFailureClass::LauncherManagedArtifactSignature
             | LaunchFailureClass::AuthModeIncompatible

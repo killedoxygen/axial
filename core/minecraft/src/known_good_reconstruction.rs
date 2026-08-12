@@ -286,6 +286,8 @@ pub enum ManagedVersionBundleRebuildError {
     Authority,
     LocalPreparation,
     Preparation,
+    Interrupted,
+    Unsettled,
     Indeterminate(Box<ManagedVersionBundleRebuildRecovery>),
     RolledBack(ManagedVersionBundleRollbackReceipt),
 }
@@ -356,6 +358,8 @@ impl std::fmt::Debug for ManagedVersionBundleRebuildError {
             Self::Authority => "ManagedVersionBundleRebuildError::Authority",
             Self::LocalPreparation => "ManagedVersionBundleRebuildError::LocalPreparation",
             Self::Preparation => "ManagedVersionBundleRebuildError::Preparation",
+            Self::Interrupted => "ManagedVersionBundleRebuildError::Interrupted",
+            Self::Unsettled => "ManagedVersionBundleRebuildError::Unsettled",
             Self::Indeterminate(_) => "ManagedVersionBundleRebuildError::Indeterminate(..)",
             Self::RolledBack(_) => "ManagedVersionBundleRebuildError::RolledBack(..)",
         })
@@ -396,6 +400,8 @@ impl std::fmt::Display for ManagedVersionBundleRebuildError {
             Self::Authority => "managed VersionBundle authority was rejected",
             Self::LocalPreparation => "managed VersionBundle local preparation failed",
             Self::Preparation => "managed VersionBundle rebuild failed before its canonical effect",
+            Self::Interrupted => "managed VersionBundle rebuild was interrupted",
+            Self::Unsettled => "managed VersionBundle rebuild could not settle its effect",
             Self::Indeterminate(_) => "managed VersionBundle rebuild outcome is indeterminate",
             Self::RolledBack(_) => "managed VersionBundle rebuild rolled back",
         })
@@ -1243,7 +1249,7 @@ async fn run_managed_version_bundle_rebuild_seed(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
-                .ok_or(ManagedVersionBundleRebuildError::Preparation)?;
+                .ok_or(ManagedVersionBundleRebuildError::Interrupted)?;
             Err(ManagedVersionBundleRebuildError::Indeterminate(Box::new(
                 ManagedVersionBundleRebuildRecovery {
                     state: ManagedVersionBundleRebuildRecoveryState::Restart(seed),
@@ -1292,7 +1298,7 @@ async fn publish_managed_version_bundle_rebuild_seed_owned(
                 },
             )));
         }
-        Err(_) => return Err(ManagedVersionBundleRebuildError::Preparation),
+        Err(error) => return Err(classify_version_bundle_settlement_error(error)),
     };
     let projection = seed.take_projection();
     settled_version_bundle_rebuild(projection, settled)
@@ -1351,9 +1357,30 @@ impl ManagedVersionBundleRebuildRecovery {
                         },
                     })),
                 ),
-                Err(_) => Err(ManagedVersionBundleRebuildError::Preparation),
+                Err(error) => Err(classify_version_bundle_settlement_error(error)),
             },
         }
+    }
+}
+
+fn classify_version_bundle_settlement_error(
+    error: VersionBundleTransactionError,
+) -> ManagedVersionBundleRebuildError {
+    match error {
+        VersionBundleTransactionError::TaskStopped => ManagedVersionBundleRebuildError::Interrupted,
+        VersionBundleTransactionError::UnacknowledgedSettlement
+        | VersionBundleTransactionError::RecoveryAmbiguous
+        | VersionBundleTransactionError::RecoveryUnsettled => {
+            ManagedVersionBundleRebuildError::Unsettled
+        }
+        VersionBundleTransactionError::Indeterminate(_) => {
+            unreachable!("indeterminate publication retains its recovery before classification")
+        }
+        VersionBundleTransactionError::ProjectionMismatch
+        | VersionBundleTransactionError::PortablePathAlias
+        | VersionBundleTransactionError::LaneOccupied
+        | VersionBundleTransactionError::Preparation
+        | VersionBundleTransactionError::Effect(_) => ManagedVersionBundleRebuildError::Preparation,
     }
 }
 
@@ -3342,6 +3369,8 @@ mod tests {
             super::ManagedVersionBundleRebuildError::Authority,
             super::ManagedVersionBundleRebuildError::LocalPreparation,
             super::ManagedVersionBundleRebuildError::Preparation,
+            super::ManagedVersionBundleRebuildError::Interrupted,
+            super::ManagedVersionBundleRebuildError::Unsettled,
             super::ManagedVersionBundleRebuildError::Reconstruction(
                 KnownGoodReconstructionError::Loader,
             ),

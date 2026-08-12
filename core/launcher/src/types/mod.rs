@@ -75,6 +75,7 @@ launch_failure_classes! {
     JvmExperimentalUnlock => "jvm_experimental_unlock",
     JvmOptionOrdering => "jvm_option_ordering",
     JavaRuntimeMismatch => "java_runtime_mismatch",
+    RosettaRequired => "rosetta_required",
     OutOfMemory => "out_of_memory",
     GraphicsDriverCrash => "graphics_driver_crash",
     MissingDependency => "missing_dependency",

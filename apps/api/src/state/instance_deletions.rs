@@ -872,6 +872,7 @@ fn spawn_instance_deletion_orphan_shutdown(state: AppState) {
 
 fn instance_deletion_error_class(error: &InstanceStoreError) -> &'static str {
     match error {
+        InstanceStoreError::Domain(_) => "domain",
         InstanceStoreError::Root(_) => "root",
         InstanceStoreError::Read(_) => "read",
         InstanceStoreError::Parse(_) => "parse",

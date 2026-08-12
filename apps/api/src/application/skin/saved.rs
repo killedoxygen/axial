@@ -1,6 +1,6 @@
 use crate::execution::physical_work;
 use crate::state::AppState;
-use crate::state::skins::{SavedSkinDeleteResult, SavedSkinRecord};
+use crate::state::skins::{SavedSkinDeleteResult, SavedSkinRecord, SavedSkinStoreFailureClass};
 use axial_resource::PhysicalIoClass;
 use axum::http::StatusCode;
 use serde::{Deserialize, Deserializer};
@@ -321,18 +321,26 @@ pub(super) async fn clear_saved_skin_applied(state: &AppState) -> Result<(), Api
         .map_err(skin_write_error)
 }
 
-async fn run_saved_skin_store<T, Work>(io: PhysicalIoClass, work: Work) -> std::io::Result<T>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SavedSkinStoreFailure {
+    TaskStopped,
+    Storage(SavedSkinStoreFailureClass),
+}
+
+async fn run_saved_skin_store<T, Work>(
+    io: PhysicalIoClass,
+    work: Work,
+) -> Result<T, SavedSkinStoreFailure>
 where
     T: Send + 'static,
     Work: FnOnce() -> std::io::Result<T> + Send + 'static,
 {
     physical_work::run(io, SAVED_SKIN_STORE_SCRATCH_BYTES, work)
         .await
-        .map_err(|_| saved_skin_store_task_error())?
-}
-
-fn saved_skin_store_task_error() -> std::io::Error {
-    std::io::Error::other("saved skin store task failed")
+        .map_err(|_| SavedSkinStoreFailure::TaskStopped)?
+        .map_err(|error| {
+            SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::from_error(&error))
+        })
 }
 
 pub(super) fn validate_saved_skin_name(value: &str) -> Result<String, ApiError> {
@@ -467,16 +475,114 @@ pub(super) fn validate_texture_key(value: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_string())
 }
 
-fn skin_read_error(_error: std::io::Error) -> ApiError {
-    json_error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Could not read saved skins. Check app data permissions and try again.",
-    )
+fn skin_read_error(error: SavedSkinStoreFailure) -> ApiError {
+    skin_store_error(error, "read")
 }
 
-fn skin_write_error(_error: std::io::Error) -> ApiError {
-    json_error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Could not update saved skins. Check app data permissions and try again.",
-    )
+fn skin_write_error(error: SavedSkinStoreFailure) -> ApiError {
+    skin_store_error(error, "update")
+}
+
+fn skin_store_error(error: SavedSkinStoreFailure, operation: &'static str) -> ApiError {
+    let (status, message) = match error {
+        SavedSkinStoreFailure::TaskStopped => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Saved skin storage stopped before the operation completed. Try again.",
+        ),
+        SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::PermissionDenied) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Saved skin storage access was denied. Check app data permissions and try again.",
+        ),
+        SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::StorageFull) => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Saved skin storage is full. Free disk space and try again.",
+        ),
+        SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::NotFound) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Saved skin storage is incomplete. Restart Axial and try again.",
+        ),
+        SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::Conflict) => (
+            StatusCode::CONFLICT,
+            "Another saved skin update conflicts with this operation. Try again.",
+        ),
+        SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::Interrupted) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The saved skin operation was interrupted. Try again.",
+        ),
+        SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::Unsettled) => (
+            StatusCode::CONFLICT,
+            "Another saved skin update is still settling. Try again.",
+        ),
+        SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::InvalidData) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Saved skin data is invalid and could not be loaded safely.",
+        ),
+        SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::Other) => {
+            let message = if operation == "read" {
+                "Could not read saved skins. Try again."
+            } else {
+                "Could not update saved skins. Try again."
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, message)
+        }
+    };
+    json_error(status, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Json;
+
+    #[test]
+    fn p02_b05_contract_cross_owner_saved_skin_failures_have_distinct_public_classes() {
+        let cases = [
+            (
+                SavedSkinStoreFailure::TaskStopped,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Saved skin storage stopped before the operation completed. Try again.",
+            ),
+            (
+                SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::PermissionDenied),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Saved skin storage access was denied. Check app data permissions and try again.",
+            ),
+            (
+                SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::StorageFull),
+                StatusCode::INSUFFICIENT_STORAGE,
+                "Saved skin storage is full. Free disk space and try again.",
+            ),
+            (
+                SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::NotFound),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Saved skin storage is incomplete. Restart Axial and try again.",
+            ),
+            (
+                SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::Conflict),
+                StatusCode::CONFLICT,
+                "Another saved skin update conflicts with this operation. Try again.",
+            ),
+            (
+                SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::Interrupted),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The saved skin operation was interrupted. Try again.",
+            ),
+            (
+                SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::Unsettled),
+                StatusCode::CONFLICT,
+                "Another saved skin update is still settling. Try again.",
+            ),
+            (
+                SavedSkinStoreFailure::Storage(SavedSkinStoreFailureClass::Other),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not update saved skins. Try again.",
+            ),
+        ];
+
+        for (error, expected_status, expected_message) in cases {
+            let (status, Json(body)) = skin_write_error(error);
+            assert_eq!(status, expected_status);
+            assert_eq!(body["error"], expected_message);
+        }
+    }
 }

@@ -53,6 +53,7 @@ pub fn format_failure_class(class: LaunchFailureClass) -> &'static str {
         LaunchFailureClass::JvmExperimentalUnlock => "experimental JVM option requires unlock",
         LaunchFailureClass::JvmOptionOrdering => "JVM option ordering conflict",
         LaunchFailureClass::JavaRuntimeMismatch => "Java runtime mismatch",
+        LaunchFailureClass::RosettaRequired => "Rosetta 2 required",
         LaunchFailureClass::OutOfMemory => "out of memory",
         LaunchFailureClass::GraphicsDriverCrash => "graphics driver crash",
         LaunchFailureClass::MissingDependency => "missing dependency",

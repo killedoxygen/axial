@@ -36,7 +36,7 @@ use std::fmt::Write as _;
 const SCHEMA: &str = "axial.guardian.invariant_coverage.v4";
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE";
 const EXPECTED_DECISION_COUNTS: [(GuardianActionKind, usize); 5] = [
-    (GuardianActionKind::Block, 160),
+    (GuardianActionKind::Block, 196),
     (GuardianActionKind::Fallback, 20),
     (GuardianActionKind::Strip, 30),
     (GuardianActionKind::AskUser, 30),
@@ -429,7 +429,7 @@ fn kernel_cells() -> Vec<KernelCell> {
             }
         }
     }
-    assert_eq!(cells.len(), 540);
+    assert_eq!(cells.len(), 576);
     cells
 }
 
@@ -441,7 +441,7 @@ fn assert_decision_counts(cells: &[KernelCell]) {
     for (decision, expected) in EXPECTED_DECISION_COUNTS {
         assert_eq!(counts.get(debug_name(&decision).as_str()), Some(&expected));
     }
-    assert_eq!(counts.values().sum::<usize>(), 540);
+    assert_eq!(counts.values().sum::<usize>(), 576);
 }
 
 fn persisted_state_startup_cells() -> Vec<PersistedStateStartupCell> {

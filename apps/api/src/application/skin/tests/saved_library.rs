@@ -840,7 +840,7 @@ async fn skin_saved_read_error_is_bounded_json() {
     assert_eq!(
         error.1.0,
         serde_json::json!({
-            "error": "Could not read saved skins. Check app data permissions and try again."
+            "error": "Saved skin data is invalid and could not be loaded safely."
         })
     );
 }
@@ -862,7 +862,7 @@ async fn skin_saved_write_error_is_bounded_json() {
     assert_eq!(
         error.1.0,
         serde_json::json!({
-            "error": "Could not update saved skins. Check app data permissions and try again."
+            "error": "Saved skin data is invalid and could not be loaded safely."
         })
     );
 }

@@ -57,11 +57,11 @@ pub use asset_index::{AssetIndexFlagsError, asset_index_requires_virtual_repair}
 #[cfg(feature = "test-support")]
 pub use download::publish_managed_install_fixture_for_test;
 pub use download::{
-    DownloadError, DownloadProgress, Downloader, KnownGoodActivationRejected,
-    ManagedInstallAcknowledgementOutcome, ManagedInstallAcknowledgementRecovery,
-    ManagedInstallActivationContractId, ManagedInstallActivationContractIdError,
-    ManagedInstallCheckpointVerificationFailure, ManagedInstallCommittedEvidence,
-    ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
+    DownloadError, DownloadFileFailureClass, DownloadProgress, Downloader,
+    KnownGoodActivationRejected, ManagedInstallAcknowledgementOutcome,
+    ManagedInstallAcknowledgementRecovery, ManagedInstallActivationContractId,
+    ManagedInstallActivationContractIdError, ManagedInstallCheckpointVerificationFailure,
+    ManagedInstallCommittedEvidence, ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
     ManagedInstallPostActivationAcknowledgement, ManagedInstallPublicationCandidates,
     ManagedInstallPublicationCandidatesError, ManagedInstallPublicationEvidenceId,
     ManagedInstallPublicationEvidenceIdError, ManagedInstallReceiptVerificationFailure,

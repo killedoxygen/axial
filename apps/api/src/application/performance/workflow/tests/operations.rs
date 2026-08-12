@@ -321,7 +321,9 @@ async fn queued_rollback_without_snapshot_emits_terminal_error() {
     assert!(terminal.done);
     assert_eq!(
         terminal.error.as_deref(),
-        Some("no performance rollback snapshot available")
+        Some(
+            "Guardian blocked the performance rollback because no verified snapshot is available."
+        )
     );
     let status = fixture
         .state
@@ -333,7 +335,9 @@ async fn queued_rollback_without_snapshot_emits_terminal_error() {
     assert_eq!(status.state, "failed");
     assert_eq!(
         status.error.as_deref(),
-        Some("no performance rollback snapshot available")
+        Some(
+            "Guardian blocked the performance rollback because no verified snapshot is available."
+        )
     );
     let journal = fixture
         .state
@@ -369,7 +373,7 @@ async fn queued_rollback_without_snapshot_emits_terminal_error() {
             "state_label": "Failed",
             "tone": "err",
             "title": "Bundle update failed",
-            "detail": "no performance rollback snapshot available",
+            "detail": "Guardian blocked the performance rollback because no verified snapshot is available.",
             "progress": {
                 "phase": "error",
                 "current": 4,

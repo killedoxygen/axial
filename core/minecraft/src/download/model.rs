@@ -951,6 +951,34 @@ pub enum DownloadError {
     LibraryPlan(#[from] LibraryPlanError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadFileFailureClass {
+    NotFound,
+    Conflict,
+    PermissionDenied,
+    StorageFull,
+    Interrupted,
+    Unsettled,
+    Other,
+}
+
+impl DownloadError {
+    pub fn file_failure_class(&self) -> Option<DownloadFileFailureClass> {
+        let Self::FileOperation(error) = self else {
+            return None;
+        };
+        Some(match error.kind() {
+            io::ErrorKind::NotFound => DownloadFileFailureClass::NotFound,
+            io::ErrorKind::AlreadyExists => DownloadFileFailureClass::Conflict,
+            io::ErrorKind::PermissionDenied => DownloadFileFailureClass::PermissionDenied,
+            io::ErrorKind::StorageFull => DownloadFileFailureClass::StorageFull,
+            io::ErrorKind::Interrupted => DownloadFileFailureClass::Interrupted,
+            io::ErrorKind::WouldBlock => DownloadFileFailureClass::Unsettled,
+            _ => DownloadFileFailureClass::Other,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum LibraryPlanError {
     #[error("library metadata contains an unsafe artifact path")]

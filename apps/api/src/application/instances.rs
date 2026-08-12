@@ -71,7 +71,10 @@ use crate::state::{
     AppState, InstalledVersionsLookup, InstanceUpdate, IntegrityForegroundLease,
     KnownGoodRebuildError, ProducerLease, RequestProducerHandoff,
 };
-use axial_config::{EnrichedInstance, InstanceStoreError, LaunchActionState};
+use axial_config::{
+    EnrichedInstance, InstanceStoreDomainError, InstanceStoreError, InstanceStoreFailureClass,
+    LaunchActionState,
+};
 use axial_launcher::{
     GuardianMode, LaunchReadiness, LaunchReadinessReasonId, LaunchReadinessRequest,
     LaunchReadinessSeverity, inspect_launch_readiness_summary,
@@ -82,7 +85,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     future::Future,
-    io::ErrorKind,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -116,18 +118,10 @@ enum InstanceWriteOperation {
 impl InstanceWriteOperation {
     fn internal_error_message(self) -> &'static str {
         match self {
-            Self::Create => {
-                "Could not create the instance. Check app data permissions and try again."
-            }
-            Self::Duplicate => {
-                "Could not duplicate the instance. Check app data permissions and try again."
-            }
-            Self::Update => {
-                "Could not save the instance. Check app data permissions and try again."
-            }
-            Self::Delete => {
-                "Could not delete the instance. Check app data permissions and try again."
-            }
+            Self::Create => "Could not create the instance. Try again.",
+            Self::Duplicate => "Could not duplicate the instance. Try again.",
+            Self::Update => "Could not save the instance. Try again.",
+            Self::Delete => "Could not delete the instance. Try again.",
         }
     }
 }
@@ -136,28 +130,66 @@ fn instance_write_error_response(
     operation: InstanceWriteOperation,
     error: InstanceStoreError,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let (status, message) = match error {
-        InstanceStoreError::Read(error) | InstanceStoreError::Persistence(error) => {
-            match error.kind() {
-                ErrorKind::NotFound => (StatusCode::NOT_FOUND, "instance not found".to_string()),
-                ErrorKind::AlreadyExists => (
+    match &error {
+        InstanceStoreError::Domain(domain) => {
+            let (status, message) = match domain {
+                InstanceStoreDomainError::NotFound => (StatusCode::NOT_FOUND, "instance not found"),
+                InstanceStoreDomainError::NameConflict => (
                     StatusCode::CONFLICT,
-                    "an instance with this name already exists".to_string(),
+                    "an instance with this name already exists",
                 ),
-                ErrorKind::InvalidInput => (StatusCode::BAD_REQUEST, error.to_string()),
-                ErrorKind::WouldBlock => (StatusCode::CONFLICT, error.to_string()),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    operation.internal_error_message().to_string(),
+                InstanceStoreDomainError::RunningInstance => (
+                    StatusCode::CONFLICT,
+                    "cannot delete a running instance; stop the game first",
                 ),
-            }
+                InstanceStoreDomainError::DirectVersionChangeUnsupported => (
+                    StatusCode::BAD_REQUEST,
+                    "direct version changes are not supported",
+                ),
+            };
+            return (status, Json(serde_json::json!({ "error": message })));
         }
-        InstanceStoreError::Validation(message) => (StatusCode::BAD_REQUEST, message.to_string()),
-        InstanceStoreError::Root(_)
-        | InstanceStoreError::Parse(_)
-        | InstanceStoreError::TooLarge { .. } => (
+        InstanceStoreError::Validation(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            );
+        }
+        _ => {}
+    }
+    let class = error.failure_class();
+    let (status, message) = match class {
+        InstanceStoreFailureClass::DomainNotFound => (StatusCode::NOT_FOUND, "instance not found"),
+        InstanceStoreFailureClass::Conflict => (
+            StatusCode::CONFLICT,
+            "an instance with this name already exists",
+        ),
+        InstanceStoreFailureClass::InvalidInput => {
+            (StatusCode::BAD_REQUEST, "instance data is invalid")
+        }
+        InstanceStoreFailureClass::PermissionDenied => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            operation.internal_error_message().to_string(),
+            "Instance storage access was denied. Check app data permissions and try again.",
+        ),
+        InstanceStoreFailureClass::StorageFull => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Instance storage is full. Free disk space and try again.",
+        ),
+        InstanceStoreFailureClass::PersistenceNotFound => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Instance storage is unavailable. Restart Axial and try again.",
+        ),
+        InstanceStoreFailureClass::Interrupted => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The instance update was interrupted. Try again.",
+        ),
+        InstanceStoreFailureClass::Unsettled => (
+            StatusCode::CONFLICT,
+            "Another instance update is still settling. Try again.",
+        ),
+        InstanceStoreFailureClass::InvalidData | InstanceStoreFailureClass::Other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            operation.internal_error_message(),
         ),
     };
 
@@ -236,6 +268,7 @@ async fn rollback_new_instance(
 
 fn instance_store_error_class(error: &InstanceStoreError) -> &'static str {
     match error {
+        InstanceStoreError::Domain(_) => "domain",
         InstanceStoreError::Root(_) => "root",
         InstanceStoreError::Read(_) => "read",
         InstanceStoreError::Parse(_) => "parse",

@@ -49,6 +49,7 @@
       "jvm_experimental_unlock",
       "jvm_option_ordering",
       "java_runtime_mismatch",
+      "rosetta_required",
       "out_of_memory",
       "graphics_driver_crash",
       "missing_dependency",
@@ -1518,6 +1519,294 @@
       "phase": "Failed",
       "mode": "Disabled",
       "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "managed_runtime_rosetta_required",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "rosetta_required",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "managed_runtime_rosetta_required",
       "decision": "Block",
       "public_surface": false
     },
