@@ -3148,6 +3148,11 @@ async fn refused_managed_runtime_admission_has_no_install_effects() {
     let manifest = persisted_java_manifest(&root, "http://127.0.0.1:9/java", java_bytes);
     write_persisted_runtime_source(&root, &manifest);
     let original_proof = component_manifest_proof_bytes(&manifest).expect("manifest proof");
+    let mut original_cache_entries = fs::read_dir(cache.root())
+        .expect("runtime cache entries before refusal")
+        .map(|entry| entry.expect("runtime cache entry").file_name())
+        .collect::<Vec<_>>();
+    original_cache_entries.sort();
     let admissions = AtomicUsize::new(0);
     let mut events = Vec::new();
 
@@ -3186,10 +3191,7 @@ async fn refused_managed_runtime_admission_has_no_install_effects() {
         .map(|entry| entry.expect("runtime cache entry").file_name())
         .collect::<Vec<_>>();
     cache_entries.sort();
-    assert_eq!(
-        cache_entries,
-        vec![std::ffi::OsString::from(component.as_str())]
-    );
+    assert_eq!(cache_entries, original_cache_entries);
 }
 
 #[test]
