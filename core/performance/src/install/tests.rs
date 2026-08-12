@@ -346,6 +346,7 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
     let _ = fs::remove_dir_all(fresh_instance);
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn managed_graph_transfers_two_candidates_before_publication() {
     let root_bytes = b"downloaded-root";
@@ -391,6 +392,7 @@ async fn managed_graph_transfers_two_candidates_before_publication() {
     let _ = fs::remove_dir_all(instance);
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn rejected_target_checkpoint_cleans_every_verified_candidate() {
     let root_bytes = b"downloaded-root";
@@ -444,6 +446,53 @@ async fn rejected_target_checkpoint_cleans_every_verified_candidate() {
     drop(mods);
     drop(instance_anchor);
     let _ = fs::remove_dir_all(instance);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn managed_graph_refuses_unsupported_native_transients_without_publication() {
+    let root_bytes = b"downloaded-root";
+    let dependency_bytes = b"downloaded-dependency";
+    let (base_url, server) = start_artifact_server(root_bytes, dependency_bytes).await;
+    let instance = test_root("unsupported-native-transient");
+    let manager = super::PerformanceManager::new().expect("manager");
+    let instance_anchor = anchor(&instance);
+    let plan = graph_plan_at(root_bytes, dependency_bytes, &base_url);
+
+    let error = manager
+        .ensure_installed(
+            &plan,
+            test_transfer_resolver(),
+            instance_anchor.directory(),
+            || async { Ok::<(), ()>(()) },
+        )
+        .await
+        .expect_err("unsupported native transient must reject the graph before publication");
+    assert!(matches!(
+        error,
+        super::ManagedInstallExecutionError::Mutation {
+            source: super::ManagedMutationError::Definite(InstallError::Transfer),
+            rollback_ready: false,
+        }
+    ));
+    server.abort();
+
+    let mods = instance_anchor
+        .directory()
+        .open_child("mods")
+        .expect("inspect rejected managed root")
+        .expect("candidate intent creates the managed root");
+    assert_eq!(
+        crate::state::load_state(&mods).expect("load rejected state"),
+        None
+    );
+    crate::state::prove_managed_storage_recovered(&mods, None)
+        .expect("unsupported transient leaves no candidate authority");
+    assert!(!instance.join("mods/root.jar").exists());
+    assert!(!instance.join("mods/dependency.jar").exists());
+    drop(mods);
+    drop(instance_anchor);
+    fs::remove_dir_all(instance).expect("remove unsupported transient fixture");
 }
 
 #[tokio::test]
