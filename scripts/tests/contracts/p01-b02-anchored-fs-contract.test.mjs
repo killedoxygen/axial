@@ -3702,6 +3702,30 @@ test("P01-B02 proves the retained directory object is unlinked before removal su
       }
     }
   }
+
+  const retainedDirectoryProof = functionBlock(
+    unix,
+    "retained_directory_is_removed",
+  );
+  assert.match(
+    retainedDirectoryProof,
+    /#\[cfg\(target_os = "linux"\)\][\s\S]*?st_nlink == 0/,
+  );
+  assert.match(
+    retainedDirectoryProof,
+    /#\[cfg\(target_os = "macos"\)\][\s\S]*?retained_directory_path_identity\(child\)\? != Some\(expected\)/,
+  );
+  const macosPathProof = functionBlock(
+    unix,
+    "retained_directory_path_identity",
+  );
+  assertOrdered(
+    macosPathProof,
+    "libc::F_GETPATH",
+    "rfs::stat",
+    "macOS resolves the retained vnode path before classifying it as unlinked",
+  );
+  assert.match(macosPathProof, /identity_from_stat\(stat\)/);
 });
 
 test("P01-B02 streams through positional handles and proves completion", async () => {

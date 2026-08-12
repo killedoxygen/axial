@@ -1752,7 +1752,42 @@ mod native {
         {
             return Err(binding_changed("retained directory changed identity"));
         }
-        Ok(stat.st_nlink == 0)
+        #[cfg(target_os = "linux")]
+        return Ok(stat.st_nlink == 0);
+        // Darwin retains link count two and a stale F_GETPATH after rmdir.
+        #[cfg(target_os = "macos")]
+        return Ok(retained_directory_path_identity(child)? != Some(expected));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn retained_directory_path_identity(child: &DirectoryHandle) -> io::Result<Option<Identity>> {
+        let mut path = [0_u8; libc::PATH_MAX as usize];
+        loop {
+            let result = unsafe {
+                libc::fcntl(
+                    child.as_raw_fd(),
+                    libc::F_GETPATH,
+                    path.as_mut_ptr().cast::<libc::c_char>(),
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        let path = CStr::from_bytes_until_nul(&path)
+            .map_err(|_| binding_changed("retained directory path was not terminated"))?;
+        match rfs::stat(OsStr::from_bytes(path.to_bytes())) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Directory => {
+                Ok(Some(identity_from_stat(stat)))
+            }
+            Ok(_) => Ok(None),
+            Err(error) if io::Error::from(error).kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub(crate) fn clone_root(root: &RootGuard) -> io::Result<DirectoryHandle> {
@@ -8385,49 +8420,3 @@ mod native {
 }
 
 pub(crate) use native::*;
-
-#[cfg(all(test, target_os = "macos"))]
-mod macos_native_probe {
-    use std::ffi::CStr;
-    use std::fs::File;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
-
-    #[test]
-    fn reports_retained_directory_removal_primitives() {
-        let temporary = tempfile::tempdir().expect("create native probe root");
-        let parent = File::open(temporary.path()).expect("open native probe root");
-        let child_path = temporary.path().join("child");
-        std::fs::create_dir(&child_path).expect("create native probe child");
-        let child = File::open(&child_path).expect("open native probe child");
-        std::fs::remove_dir(&child_path).expect("remove native probe child");
-
-        let fsync = unsafe { libc::fsync(parent.as_raw_fd()) };
-        let fsync_error = std::io::Error::last_os_error();
-        let barrier = unsafe { libc::fcntl(parent.as_raw_fd(), libc::F_BARRIERFSYNC) };
-        let barrier_error = std::io::Error::last_os_error();
-        let full = unsafe { libc::fcntl(parent.as_raw_fd(), libc::F_FULLFSYNC) };
-        let full_error = std::io::Error::last_os_error();
-        let mut path = [0_u8; libc::PATH_MAX as usize];
-        let get_path = unsafe {
-            libc::fcntl(
-                child.as_raw_fd(),
-                libc::F_GETPATH,
-                path.as_mut_ptr().cast::<libc::c_char>(),
-            )
-        };
-        let get_path_error = std::io::Error::last_os_error();
-        let retained_path = CStr::from_bytes_until_nul(&path)
-            .expect("decode retained native probe path")
-            .to_string_lossy();
-        let retained_path_metadata = std::fs::symlink_metadata(retained_path.as_ref())
-            .map(|metadata| (metadata.dev(), metadata.ino()));
-        eprintln!(
-            "macOS retained-directory probe: nlink={}, fsync={fsync}/{fsync_error:?}, barrier={barrier}/{barrier_error:?}, full={full}/{full_error:?}, get_path={get_path}/{get_path_error:?}, path={retained_path:?}, path_metadata={retained_path_metadata:?}",
-            child
-                .metadata()
-                .expect("stat retained native probe child")
-                .nlink(),
-        );
-    }
-}
