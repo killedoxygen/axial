@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::io;
+use std::sync::atomic::{AtomicUsize as SyncAtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -566,6 +567,7 @@ impl PersistenceOwnerLease {
             progress,
             changed: Notify::new(),
             idle: Notify::new(),
+            worker_tasks: Arc::new(LaneWorkerTasks::default()),
         });
         owner_state.lanes.insert(lane.clone())?;
         Ok(AtomicSnapshotWriter {
@@ -715,6 +717,32 @@ struct PathLane {
     progress: watch::Sender<CommitProgress>,
     changed: Notify,
     idle: Notify,
+    worker_tasks: Arc<LaneWorkerTasks>,
+}
+
+#[derive(Default)]
+struct LaneWorkerTasks {
+    active: SyncAtomicUsize,
+    released: Notify,
+}
+
+struct LaneWorkerTask {
+    tasks: Arc<LaneWorkerTasks>,
+}
+
+impl LaneWorkerTask {
+    fn new(tasks: Arc<LaneWorkerTasks>) -> Self {
+        tasks.active.fetch_add(1, AtomicOrdering::AcqRel);
+        Self { tasks }
+    }
+}
+
+impl Drop for LaneWorkerTask {
+    fn drop(&mut self) {
+        if self.tasks.active.fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
+            self.tasks.released.notify_waiters();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -932,6 +960,9 @@ impl AtomicSnapshotWriter {
                     .lanes
                     .remove(&lane);
             }
+            drop(transition);
+            drop(owner);
+            drop(lane);
             let _ = completed.send(result);
         });
         completion
@@ -1188,7 +1219,11 @@ impl AtomicSnapshotWriter {
 
 fn spawn_lane_worker(lane: Arc<PathLane>, owner: Arc<OwnerInner>) {
     let executor = owner.coordinator.executor.clone();
-    executor.spawn(run_lane(lane, owner));
+    let worker = LaneWorkerTask::new(lane.worker_tasks.clone());
+    executor.spawn(async move {
+        let _worker = worker;
+        run_lane(lane, owner).await;
+    });
 }
 
 fn restart_lane_worker_if_needed(lane: Arc<PathLane>, owner: Arc<OwnerInner>) {
@@ -1474,16 +1509,18 @@ async fn await_all_lanes(
 async fn await_all_lanes_idle(lanes: &[Arc<PathLane>]) {
     for lane in lanes {
         loop {
-            let idle = lane.idle.notified();
-            if !lane
+            let released = lane.worker_tasks.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            let worker_running = lane
                 .state
                 .lock()
                 .expect("persistence lane lock poisoned")
-                .worker_running
-            {
+                .worker_running;
+            if !worker_running && lane.worker_tasks.active.load(AtomicOrdering::Acquire) == 0 {
                 break;
             }
-            idle.await;
+            released.as_mut().await;
         }
     }
 }
@@ -1586,6 +1623,7 @@ async fn settle_owner_capabilities(
             Err(error) => Err(physical_work_io_error("settlement admission", error)),
         }
         .map_err(write_error);
+        drop(owner);
         let _ = completed.send(result);
     });
     completion
@@ -2229,6 +2267,15 @@ mod tests {
                 .await
                 .expect("persist before close");
             owner.close().await.expect("close current owner");
+            assert_eq!(
+                writer
+                    .lane
+                    .worker_tasks
+                    .active
+                    .load(AtomicOrdering::Acquire),
+                0,
+                "close must await release of every worker-owned capability"
+            );
 
             let replacement = coordinator
                 .claim_directory(directory.clone())
