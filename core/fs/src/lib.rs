@@ -20053,7 +20053,11 @@ mod tests {
             RootSessionAcquireOutcome::NoEffect(_)
         ));
         assert!(alias.is_file());
-        assert!(!temporary.path().join(ROOT_LEASE_NAME).exists());
+        assert!(
+            std::fs::read_dir(temporary.path())
+                .expect("list root after lease alias refusal")
+                .all(|entry| entry.expect("read root entry").file_name() != ROOT_LEASE_NAME)
+        );
     }
 
     #[test]
