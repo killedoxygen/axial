@@ -102,7 +102,7 @@ test("file cutover removes producerless Guardian vocabulary exactly", async () =
     readJson(
       "apps/api/tests/fixtures/guardian/guardian-decision-snapshot-v1.json",
     ),
-    readJson("apps/api/tests/fixtures/guardian/operation-journals-v8.json"),
+    readJson("apps/api/tests/fixtures/guardian/operation-journals-v9.json"),
     read("docs/GUARDIAN-INVARIANT-COVERAGE.md"),
   ]);
   const removedSymbols = [
@@ -307,7 +307,10 @@ test("performance production persistence has one capability-owned journal", asyn
     read("apps/api/src/state/mod.rs"),
     readdir(new URL("apps/api/src/state/", repository)),
   ]);
-  const persistence = braceBlock(journals, "struct OperationJournalPersistence");
+  const persistence = braceBlock(
+    journals,
+    "struct OperationJournalPersistence",
+  );
   const store = braceBlock(journals, "pub struct OperationJournalStore");
 
   assert.deepEqual(stateEntries.includes("performance_operations.rs"), false);
@@ -316,8 +319,14 @@ test("performance production persistence has one capability-owned journal", asyn
   assert.match(store, /persistence: Option<OperationJournalPersistence>/);
   assert.match(
     state,
-    /OperationJournalStore::try_load_from_directory\([\s\S]*operation_journal_parent\(\)/,
+    /OperationJournalStore::try_load_from_directory_with_temporal\([\s\S]*operation_journal_parent\(\)/,
   );
-  assert.doesNotMatch(state, /PerformanceOperationStore|performance_operation_directory/);
-  assert.match(journals, /pub const OPERATION_JOURNAL_SCHEMA: &str = "axial\.state\.operation_journals\.v8"/);
+  assert.doesNotMatch(
+    state,
+    /PerformanceOperationStore|performance_operation_directory/,
+  );
+  assert.match(
+    journals,
+    /pub const OPERATION_JOURNAL_SCHEMA: &str = "axial\.state\.operation_journals\.v9"/,
+  );
 });

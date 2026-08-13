@@ -359,22 +359,31 @@ impl PersistedStateRejectedRecordStoreScan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PersistedStateLoadEvidence {
     issue_count: usize,
+    temporal_load_issues: super::temporal::BoundedTemporalLoadIssueCounts,
     rejected_records: Vec<PersistedStateRejectedRecordEvidence>,
 }
 
 impl PersistedStateLoadEvidence {
     pub(super) fn from_store_parts(
-        issue_counts: [usize; 5],
+        issue_counts: [usize; 6],
+        temporal_load_issues: super::temporal::BoundedTemporalLoadIssueCounts,
         rejected_records: impl IntoIterator<Item = PersistedStateRejectedRecordEvidence>,
     ) -> Self {
         Self {
             issue_count: issue_counts.into_iter().fold(0usize, usize::saturating_add),
+            temporal_load_issues,
             rejected_records: rejected_records.into_iter().collect(),
         }
     }
 
     pub(crate) fn issue_count(&self) -> usize {
         self.issue_count
+    }
+
+    pub(crate) const fn temporal_load_issues(
+        &self,
+    ) -> super::temporal::BoundedTemporalLoadIssueCounts {
+        self.temporal_load_issues
     }
 
     #[cfg(test)]
@@ -384,7 +393,11 @@ impl PersistedStateLoadEvidence {
 
     #[cfg(test)]
     pub(crate) fn for_test(issue_count: usize) -> Self {
-        Self::from_store_parts([issue_count, 0, 0, 0, 0], [])
+        Self::from_store_parts(
+            [issue_count, 0, 0, 0, 0, 0],
+            super::temporal::BoundedTemporalLoadIssueCounts::default(),
+            [],
+        )
     }
 }
 
@@ -425,14 +438,29 @@ mod tests {
     );
 
     #[test]
-    fn five_store_issue_count_saturates() {
+    fn six_store_issue_count_saturates() {
         let evidence = PersistedStateLoadEvidence::from_store_parts(
-            [usize::MAX - 1, 1, 1, usize::MAX, usize::MAX],
+            [usize::MAX - 1, 1, 1, usize::MAX, usize::MAX, usize::MAX],
+            super::super::temporal::BoundedTemporalLoadIssueCounts::default(),
             [],
         );
 
         assert_eq!(evidence.issue_count(), usize::MAX);
         assert!(evidence.rejected_records().is_empty());
+    }
+
+    #[test]
+    fn temporal_load_issue_reasons_survive_evidence_aggregation() {
+        let temporal = super::super::temporal::BoundedTemporalLoadIssueCounts::new(2, 3);
+        let evidence = PersistedStateLoadEvidence::from_store_parts(
+            [0, 0, 0, 0, 0, temporal.total()],
+            temporal,
+            [],
+        );
+
+        assert_eq!(evidence.issue_count(), 5);
+        assert_eq!(evidence.temporal_load_issues.future_observation(), 2);
+        assert_eq!(evidence.temporal_load_issues.out_of_bounds_window(), 3);
     }
 
     #[cfg(unix)]

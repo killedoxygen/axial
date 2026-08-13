@@ -13,6 +13,10 @@ use super::contracts::{
     ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
 };
 use super::successors::FAILURE_MEMORY_SNAPSHOT_SUCCESSOR;
+use super::temporal::{
+    BoundedTemporalDisposition, BoundedTemporalLoadIssueCounts, BoundedTemporalPolicy,
+    BoundedTemporalRecord, BoundedTemporalViolation,
+};
 use crate::execution::anchored_record::AnchoredRecordDirectory;
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
@@ -28,12 +32,13 @@ use std::collections::BTreeSet;
 use std::io;
 #[cfg(test)]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
-pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v6";
+pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v7";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
-// The outer read bound follows the v6 record budget and fixed 128-entry capacity.
+// The outer read bound follows the v7 record budget and fixed 128-entry capacity.
 const MAX_FAILURE_MEMORY_ENTRY_BYTES: u64 = 16 * 1024;
 const FAILURE_MEMORY_SNAPSHOT_FIXED_BYTES: u64 =
     (r#"{"schema":"","entries":[]}"#.len() + FAILURE_MEMORY_SCHEMA.len()) as u64;
@@ -237,6 +242,12 @@ impl GuardianFailureMemoryEntry {
 
     pub(crate) fn persisted_state_repair_terminal(&self) -> Option<&PersistedStateRepairTerminal> {
         self.persisted_state_repair_terminal.as_ref()
+    }
+
+    fn has_pending_publication(&self) -> bool {
+        self.reconciliation_terminal()
+            .and_then(ReconciliationTerminal::version_bundle_publication)
+            .is_some_and(|publication| publication.is_pending())
     }
 
     pub(super) fn with_reconciliation_terminal(mut self, terminal: ReconciliationTerminal) -> Self {
@@ -515,6 +526,8 @@ pub enum FailureMemoryValidationError {
     ZeroOccurrences,
     InvalidObservedTimestamp,
     InvalidSuppressionTimestamp,
+    ObservedTimestampTooFarInFuture,
+    SuppressionWindowOutOfBounds,
     InvalidReconciliationTerminal,
     ReconciliationTerminalMismatch,
     InvalidPersistedStateRepairTerminal,
@@ -532,6 +545,8 @@ pub enum FailureMemoryStoreError {
     Persistence(#[source] io::Error),
     #[error("Guardian failure-memory capacity is exhausted by active reconciliation evidence")]
     CapacityExhausted,
+    #[error("Guardian failure-memory entry is outside the retained temporal window")]
+    Expired,
 }
 
 impl FailureMemoryStoreError {
@@ -541,6 +556,7 @@ impl FailureMemoryStoreError {
             Self::Snapshot(_) => "snapshot",
             Self::Persistence(_) => "persistence",
             Self::CapacityExhausted => "capacity_exhausted",
+            Self::Expired => "expired",
         }
     }
 }
@@ -589,6 +605,9 @@ pub struct GuardianFailureMemoryStore {
     attempts: Arc<Mutex<BTreeSet<String>>>,
     install_guardian_settlement: AsyncMutex<()>,
     max_entries: usize,
+    temporal: Arc<BoundedTemporalPolicy>,
+    temporal_future_observation_count: AtomicUsize,
+    temporal_out_of_bounds_window_count: AtomicUsize,
     persistence: Option<FailureMemoryPersistence>,
 }
 
@@ -656,19 +675,58 @@ impl GuardianFailureMemoryStore {
     }
 
     pub fn with_max_entries(max_entries: usize) -> Self {
+        Self::with_max_entries_and_clock(
+            max_entries,
+            Arc::new(BoundedTemporalPolicy::system()),
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn at_for_test(wall: DateTime<Utc>) -> Self {
+        Self::with_max_entries_and_clock(
+            DEFAULT_FAILURE_MEMORY_LIMIT,
+            Arc::new(BoundedTemporalPolicy::fixed(wall)),
+            None,
+        )
+    }
+
+    fn with_max_entries_and_clock(
+        max_entries: usize,
+        temporal: Arc<BoundedTemporalPolicy>,
+        persistence: Option<FailureMemoryPersistence>,
+    ) -> Self {
         Self {
             records: Arc::new(RwLock::new(FailureMemoryRecords::default())),
             attempts: Arc::new(Mutex::new(BTreeSet::new())),
             install_guardian_settlement: AsyncMutex::new(()),
             max_entries: max_entries.clamp(1, DEFAULT_FAILURE_MEMORY_LIMIT),
-            persistence: None,
+            temporal,
+            temporal_future_observation_count: AtomicUsize::new(0),
+            temporal_out_of_bounds_window_count: AtomicUsize::new(0),
+            persistence,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn try_load_from_directory(
         directory: AnchoredRecordDirectory,
     ) -> Result<Self, FailureMemoryStoreError> {
-        Self::try_load_with_coordinator_and_directory(PersistenceCoordinator::current(), directory)
+        Self::try_load_from_directory_with_temporal(
+            directory,
+            Arc::new(BoundedTemporalPolicy::system()),
+        )
+    }
+
+    pub(crate) fn try_load_from_directory_with_temporal(
+        directory: AnchoredRecordDirectory,
+        temporal: Arc<BoundedTemporalPolicy>,
+    ) -> Result<Self, FailureMemoryStoreError> {
+        Self::try_load_with_coordinator_directory_and_temporal(
+            PersistenceCoordinator::current(),
+            directory,
+            temporal,
+        )
     }
 
     #[cfg(test)]
@@ -682,15 +740,21 @@ impl GuardianFailureMemoryStore {
         directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, FailureMemoryStoreError> {
-        Self::try_load_with_coordinator_and_directory(coordinator, directory)
+        Self::try_load_with_coordinator_directory_and_temporal(
+            coordinator,
+            directory,
+            Arc::new(BoundedTemporalPolicy::system()),
+        )
     }
 
-    fn try_load_with_coordinator_and_directory(
+    fn try_load_with_coordinator_directory_and_temporal(
         coordinator: PersistenceCoordinator,
         directory: AnchoredRecordDirectory,
+        temporal: Arc<BoundedTemporalPolicy>,
     ) -> Result<Self, FailureMemoryStoreError> {
-        let store = Self::with_max_entries_and_persistence(
+        let store = Self::with_max_entries_and_clock(
             DEFAULT_FAILURE_MEMORY_LIMIT,
+            temporal,
             Some(FailureMemoryPersistence::claim(
                 directory.clone(),
                 coordinator,
@@ -727,21 +791,18 @@ impl GuardianFailureMemoryStore {
         Ok(())
     }
 
-    fn with_max_entries_and_persistence(
-        max_entries: usize,
-        persistence: Option<FailureMemoryPersistence>,
-    ) -> Self {
-        Self {
-            records: Arc::new(RwLock::new(FailureMemoryRecords::default())),
-            attempts: Arc::new(Mutex::new(BTreeSet::new())),
-            install_guardian_settlement: AsyncMutex::new(()),
-            max_entries: max_entries.clamp(1, DEFAULT_FAILURE_MEMORY_LIMIT),
-            persistence,
-        }
-    }
-
     pub(crate) async fn lock_install_guardian_settlement(&self) -> AsyncMutexGuard<'_, ()> {
         self.install_guardian_settlement.lock().await
+    }
+
+    pub(crate) fn construct_entry(
+        &self,
+        entry: GuardianFailureMemoryEntry,
+    ) -> Result<GuardianFailureMemoryEntry, FailureMemoryStoreError> {
+        match assess_temporal(&self.temporal, &entry)? {
+            BoundedTemporalDisposition::Current => Ok(entry),
+            BoundedTemporalDisposition::Expired => Err(FailureMemoryStoreError::Expired),
+        }
     }
 
     pub(crate) async fn settle_install_guardian_pending(
@@ -790,7 +851,12 @@ impl GuardianFailureMemoryStore {
     ) -> Result<Option<PendingFailureMemoryCommit>, FailureMemoryStoreError> {
         let mut protected_keys = BTreeSet::new();
         for entry in &entries {
-            entry.validate()?;
+            match assess_temporal(&self.temporal, entry)? {
+                BoundedTemporalDisposition::Current => {}
+                BoundedTemporalDisposition::Expired => {
+                    return Err(FailureMemoryStoreError::Expired);
+                }
+            }
             install_guardian_retry_observation(entry)?;
             if !protected_keys.insert(entry.key.as_str().to_string()) {
                 return Err(FailureMemoryValidationError::InstallGuardianRetryMismatch.into());
@@ -804,6 +870,7 @@ impl GuardianFailureMemoryStore {
             )));
         }
         let mut candidate = records.visible.clone();
+        prune_expired_records(&mut candidate, &self.temporal);
         let mut changed = false;
         for entry in entries {
             changed |= apply_install_guardian_startup_retry(&mut candidate, entry)?;
@@ -811,7 +878,12 @@ impl GuardianFailureMemoryStore {
         if !changed {
             return Ok(None);
         }
-        if !prune_records_protecting(&mut candidate, self.max_entries, &protected_keys) {
+        if !prune_records_protecting(
+            &mut candidate,
+            self.max_entries,
+            &protected_keys,
+            &self.temporal,
+        ) {
             return Err(FailureMemoryStoreError::CapacityExhausted);
         }
         let snapshot = FailureMemorySnapshot::new(candidate.values().cloned().collect())?;
@@ -860,7 +932,7 @@ impl GuardianFailureMemoryStore {
         ),
         urgency: WriteUrgency,
     ) -> Result<Option<PendingFailureMemoryCommit>, FailureMemoryStoreError> {
-        self.record_with_checked(entry, urgency, false, |records, entry| {
+        self.record_with_checked(entry, urgency, false, false, |records, entry| {
             apply(records, entry);
             Ok(true)
         })
@@ -871,6 +943,7 @@ impl GuardianFailureMemoryStore {
         entry: GuardianFailureMemoryEntry,
         urgency: WriteUrgency,
         protect_entry: bool,
+        allow_expired_transition: bool,
         apply: impl FnOnce(
             &mut BTreeMap<String, GuardianFailureMemoryEntry>,
             GuardianFailureMemoryEntry,
@@ -883,16 +956,28 @@ impl GuardianFailureMemoryStore {
                 "Guardian failure-memory persistence requires retry",
             )));
         }
-        entry.validate()?;
+        match assess_temporal(&self.temporal, &entry)? {
+            BoundedTemporalDisposition::Current => {}
+            BoundedTemporalDisposition::Expired if !allow_expired_transition => {
+                return Err(FailureMemoryStoreError::Expired);
+            }
+            BoundedTemporalDisposition::Expired => {}
+        }
         let protected_key = (protect_entry
             || entry.reconciliation_terminal().is_some()
             || entry.persisted_state_repair_terminal().is_some())
         .then(|| entry.key.as_str().to_string());
         let mut candidate = records.visible.clone();
+        prune_expired_records(&mut candidate, &self.temporal);
         if !apply(&mut candidate, entry)? {
             return Ok(None);
         }
-        if !prune_records(&mut candidate, self.max_entries, protected_key.as_deref()) {
+        if !prune_records(
+            &mut candidate,
+            self.max_entries,
+            protected_key.as_deref(),
+            &self.temporal,
+        ) {
             return Err(FailureMemoryStoreError::CapacityExhausted);
         }
         let snapshot = FailureMemorySnapshot::new(candidate.values().cloned().collect())?;
@@ -956,8 +1041,16 @@ impl GuardianFailureMemoryStore {
                 return Ok(());
             }
         }
-        let pending =
-            self.record_with(entry, apply_reconciliation_record, WriteUrgency::Immediate)?;
+        let pending = self.record_with_checked(
+            entry,
+            WriteUrgency::Immediate,
+            false,
+            true,
+            |records, entry| {
+                apply_reconciliation_record(records, entry);
+                Ok(true)
+            },
+        )?;
         self.await_commit(pending).await
     }
 
@@ -989,6 +1082,7 @@ impl GuardianFailureMemoryStore {
             acknowledged.clone(),
             WriteUrgency::Immediate,
             false,
+            true,
             |records, replacement| match records.get(expected.key.as_str()) {
                 Some(current) if current == &replacement => Ok(false),
                 Some(current) if current == expected => {
@@ -1024,8 +1118,16 @@ impl GuardianFailureMemoryStore {
                 return Ok(());
             }
         }
-        let pending =
-            self.record_with(entry, apply_reconciliation_record, WriteUrgency::Immediate)?;
+        let pending = self.record_with_checked(
+            entry,
+            WriteUrgency::Immediate,
+            false,
+            true,
+            |records, entry| {
+                apply_reconciliation_record(records, entry);
+                Ok(true)
+            },
+        )?;
         self.await_commit(pending).await
     }
 
@@ -1037,7 +1139,9 @@ impl GuardianFailureMemoryStore {
         if entry.persisted_state_repair_terminal().is_none() {
             return Err(FailureMemoryValidationError::InvalidPersistedStateRepairTerminal.into());
         }
-        entry.validate()?;
+        match assess_temporal(&self.temporal, entry)? {
+            BoundedTemporalDisposition::Current | BoundedTemporalDisposition::Expired => {}
+        }
         if reservation.key != entry.key || !Arc::ptr_eq(&reservation.attempts, &self.attempts) {
             return Err(FailureMemoryValidationError::MemoryKeyMismatch.into());
         }
@@ -1053,14 +1157,25 @@ impl GuardianFailureMemoryStore {
             .visible
             .get(entry.key.as_str())
             .is_some_and(|stored| {
-                stored != entry && !persisted_state_repair_entry_can_be_superseded(stored, entry)
+                stored != entry
+                    && !persisted_state_repair_entry_can_be_superseded(
+                        stored,
+                        entry,
+                        &self.temporal,
+                    )
             })
         {
             return Err(FailureMemoryValidationError::PersistedStateRepairTerminalMismatch.into());
         }
         let mut candidate = records.visible.clone();
         apply_reconciliation_record(&mut candidate, entry.clone());
-        if !prune_records(&mut candidate, self.max_entries, Some(entry.key.as_str())) {
+        prune_expired_records(&mut candidate, &self.temporal);
+        if !prune_records(
+            &mut candidate,
+            self.max_entries,
+            Some(entry.key.as_str()),
+            &self.temporal,
+        ) {
             return Err(FailureMemoryStoreError::CapacityExhausted);
         }
         Ok(())
@@ -1074,7 +1189,9 @@ impl GuardianFailureMemoryStore {
         if entry.reconciliation_terminal().is_none() {
             return Err(FailureMemoryValidationError::InvalidReconciliationTerminal.into());
         }
-        entry.validate()?;
+        match assess_temporal(&self.temporal, entry)? {
+            BoundedTemporalDisposition::Current | BoundedTemporalDisposition::Expired => {}
+        }
         if reservation.key != entry.key || !Arc::ptr_eq(&reservation.attempts, &self.attempts) {
             return Err(FailureMemoryValidationError::MemoryKeyMismatch.into());
         }
@@ -1089,14 +1206,20 @@ impl GuardianFailureMemoryStore {
         }
         if let Some(stored) = records.visible.get(entry.key.as_str())
             && stored != entry
-            && !reconciliation_entry_can_be_superseded(stored, entry)
+            && !reconciliation_entry_can_be_superseded(stored, entry, &self.temporal)
         {
             return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch.into());
         }
 
         let mut candidate = records.visible.clone();
         apply_reconciliation_record(&mut candidate, entry.clone());
-        if !prune_records(&mut candidate, self.max_entries, Some(entry.key.as_str())) {
+        prune_expired_records(&mut candidate, &self.temporal);
+        if !prune_records(
+            &mut candidate,
+            self.max_entries,
+            Some(entry.key.as_str()),
+            &self.temporal,
+        ) {
             return Err(FailureMemoryStoreError::CapacityExhausted);
         }
         Ok(())
@@ -1122,7 +1245,7 @@ impl GuardianFailureMemoryStore {
             records
                 .visible
                 .values()
-                .filter(|entry| active_durable_terminal(entry))
+                .filter(|entry| active_durable_terminal(entry, &self.temporal))
                 .map(|entry| entry.key.as_str().to_string()),
         );
         if !occupied_keys.contains(key.as_str()) && occupied_keys.len() >= self.max_entries {
@@ -1140,8 +1263,20 @@ impl GuardianFailureMemoryStore {
         &self,
         attempt: &PersistedStateRepairAttempt,
     ) -> Result<PersistedStateRepairReservation, PersistedStateRepairReserveError> {
-        let observed_at = DateTime::parse_from_rfc3339(attempt.observed_at())
+        attempt
+            .validate()
             .map_err(|_| PersistedStateRepairReserveError::InvalidAttempt)?;
+        match self.temporal.assess(BoundedTemporalRecord {
+            first_observed_at: attempt.observed_at(),
+            last_observed_at: attempt.observed_at(),
+            suppression_until: Some(attempt.suppression_until()),
+            pending: false,
+        }) {
+            Ok(BoundedTemporalDisposition::Current) => {}
+            Ok(BoundedTemporalDisposition::Expired) | Err(_) => {
+                return Err(PersistedStateRepairReserveError::InvalidAttempt);
+            }
+        }
         let key = FailureMemoryKey::for_persisted_state_repair(attempt);
         let records = self.records.read().expect(FAILURE_MEMORY_LOCK_INVARIANT);
         if records.critical_pending || records.retry_candidate.is_some() {
@@ -1157,9 +1292,7 @@ impl GuardianFailureMemoryStore {
         if records
             .visible
             .get(key.as_str())
-            .and_then(GuardianFailureMemoryEntry::persisted_state_repair_terminal)
-            .and_then(|terminal| DateTime::parse_from_rfc3339(terminal.suppression_until()).ok())
-            .is_some_and(|until| until > observed_at)
+            .is_some_and(|entry| self.temporal.suppression_active(temporal_record(entry)))
         {
             return Err(PersistedStateRepairReserveError::Suppressed);
         }
@@ -1168,7 +1301,7 @@ impl GuardianFailureMemoryStore {
             records
                 .visible
                 .values()
-                .filter(|entry| active_durable_terminal(entry))
+                .filter(|entry| active_durable_terminal(entry, &self.temporal))
                 .map(|entry| entry.key.as_str().to_string()),
         );
         if !occupied_keys.contains(key.as_str()) && occupied_keys.len() >= self.max_entries {
@@ -1216,6 +1349,41 @@ impl GuardianFailureMemoryStore {
             .collect()
     }
 
+    pub fn list_current(&self) -> Vec<GuardianFailureMemoryEntry> {
+        self.records
+            .read()
+            .expect(FAILURE_MEMORY_LOCK_INVARIANT)
+            .visible
+            .values()
+            .filter(|entry| {
+                assess_temporal(&self.temporal, entry)
+                    .is_ok_and(|disposition| disposition == BoundedTemporalDisposition::Current)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn suppression_active(&self, entry: &GuardianFailureMemoryEntry) -> bool {
+        entry.validate().is_ok() && self.temporal.suppression_active(temporal_record(entry))
+    }
+
+    pub(crate) fn now_timestamp(&self) -> String {
+        self.temporal.now_timestamp()
+    }
+
+    pub fn temporal_quarantine_count(&self) -> usize {
+        self.temporal_load_issues().total()
+    }
+
+    pub(crate) fn temporal_load_issues(&self) -> BoundedTemporalLoadIssueCounts {
+        BoundedTemporalLoadIssueCounts::new(
+            self.temporal_future_observation_count
+                .load(Ordering::Acquire),
+            self.temporal_out_of_bounds_window_count
+                .load(Ordering::Acquire),
+        )
+    }
+
     pub fn snapshot(&self) -> Result<FailureMemorySnapshot, FailureMemoryLoadError> {
         FailureMemorySnapshot::new(self.list())
     }
@@ -1226,10 +1394,40 @@ impl GuardianFailureMemoryStore {
     ) -> Result<(), FailureMemoryLoadError> {
         snapshot.validate()?;
         let mut candidate = BTreeMap::new();
+        let mut expired_publication_carriers = BTreeSet::new();
+        let mut temporal_load_issues = BoundedTemporalLoadIssueCounts::default();
         for entry in snapshot.entries {
+            match assess_temporal(&self.temporal, &entry) {
+                Ok(BoundedTemporalDisposition::Current) => {}
+                Ok(BoundedTemporalDisposition::Expired)
+                    if entry
+                        .reconciliation_terminal()
+                        .and_then(ReconciliationTerminal::version_bundle_publication)
+                        .is_some() =>
+                {
+                    expired_publication_carriers.insert(entry.key.as_str().to_string());
+                }
+                Ok(BoundedTemporalDisposition::Expired) => continue,
+                Err(FailureMemoryValidationError::ObservedTimestampTooFarInFuture) => {
+                    temporal_load_issues
+                        .record(BoundedTemporalViolation::ObservationTooFarInFuture);
+                    continue;
+                }
+                Err(FailureMemoryValidationError::SuppressionWindowOutOfBounds) => {
+                    temporal_load_issues
+                        .record(BoundedTemporalViolation::SuppressionWindowOutOfBounds);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
             candidate.insert(entry.key.as_str().to_string(), entry);
         }
-        if !prune_records(&mut candidate, self.max_entries, None) {
+        if !prune_records_protecting(
+            &mut candidate,
+            self.max_entries,
+            &expired_publication_carriers,
+            &self.temporal,
+        ) {
             return Err(FailureMemoryLoadError::TooManyEntries);
         }
         let mut records = self.records.write().expect(FAILURE_MEMORY_LOCK_INVARIANT);
@@ -1237,6 +1435,12 @@ impl GuardianFailureMemoryStore {
         records.visible_revision = 0;
         records.retry_candidate = None;
         records.critical_pending = false;
+        self.temporal_future_observation_count
+            .store(temporal_load_issues.future_observation(), Ordering::Release);
+        self.temporal_out_of_bounds_window_count.store(
+            temporal_load_issues.out_of_bounds_window(),
+            Ordering::Release,
+        );
         Ok(())
     }
 
@@ -1366,19 +1570,26 @@ fn prune_records(
     records: &mut BTreeMap<String, GuardianFailureMemoryEntry>,
     max_entries: usize,
     protected_key: Option<&str>,
+    temporal: &BoundedTemporalPolicy,
 ) -> bool {
     let protected_keys = protected_key
         .map(str::to_string)
         .into_iter()
         .collect::<BTreeSet<_>>();
-    prune_records_protecting(records, max_entries, &protected_keys)
+    prune_records_protecting(records, max_entries, &protected_keys, temporal)
 }
 
 fn prune_records_protecting(
     records: &mut BTreeMap<String, GuardianFailureMemoryEntry>,
     max_entries: usize,
     protected_keys: &BTreeSet<String>,
+    temporal: &BoundedTemporalPolicy,
 ) -> bool {
+    records.retain(|key, entry| {
+        protected_keys.contains(key)
+            || assess_temporal(temporal, entry)
+                .is_ok_and(|disposition| disposition == BoundedTemporalDisposition::Current)
+    });
     if records.len() <= max_entries {
         return true;
     }
@@ -1386,7 +1597,8 @@ fn prune_records_protecting(
     let mut ordered = records
         .values()
         .filter(|entry| {
-            !protected_keys.contains(entry.key.as_str()) && !active_durable_terminal(entry)
+            !protected_keys.contains(entry.key.as_str())
+                && !active_durable_terminal(entry, temporal)
         })
         .map(|entry| {
             (
@@ -1405,17 +1617,53 @@ fn prune_records_protecting(
     records.len() <= max_entries
 }
 
-fn active_durable_terminal(entry: &GuardianFailureMemoryEntry) -> bool {
-    entry.reconciliation_terminal().is_some_and(|terminal| {
-        terminal
-            .version_bundle_publication()
-            .is_some_and(|publication| publication.is_pending())
-            || DateTime::parse_from_rfc3339(terminal.suppression_until())
-                .is_ok_and(|until| until > chrono::Utc::now())
-    }) || entry
-        .persisted_state_repair_terminal()
-        .and_then(|terminal| DateTime::parse_from_rfc3339(terminal.suppression_until()).ok())
-        .is_some_and(|until| until > chrono::Utc::now())
+fn prune_expired_records(
+    records: &mut BTreeMap<String, GuardianFailureMemoryEntry>,
+    temporal: &BoundedTemporalPolicy,
+) {
+    records.retain(|_, entry| {
+        assess_temporal(temporal, entry)
+            .is_ok_and(|disposition| disposition == BoundedTemporalDisposition::Current)
+    });
+}
+
+fn active_durable_terminal(
+    entry: &GuardianFailureMemoryEntry,
+    temporal: &BoundedTemporalPolicy,
+) -> bool {
+    entry.has_pending_publication()
+        || (entry.reconciliation_terminal().is_some()
+            || entry.persisted_state_repair_terminal().is_some())
+            && temporal.suppression_active(temporal_record(entry))
+}
+
+fn temporal_record(entry: &GuardianFailureMemoryEntry) -> BoundedTemporalRecord<'_> {
+    BoundedTemporalRecord {
+        first_observed_at: &entry.first_observed_at,
+        last_observed_at: &entry.last_observed_at,
+        suppression_until: entry.suppression_until.as_deref(),
+        pending: entry.has_pending_publication(),
+    }
+}
+
+fn assess_temporal(
+    temporal: &BoundedTemporalPolicy,
+    entry: &GuardianFailureMemoryEntry,
+) -> Result<BoundedTemporalDisposition, FailureMemoryValidationError> {
+    entry.validate()?;
+    temporal
+        .assess(temporal_record(entry))
+        .map_err(|violation| match violation {
+            BoundedTemporalViolation::MalformedTimestamp => {
+                FailureMemoryValidationError::InvalidObservedTimestamp
+            }
+            BoundedTemporalViolation::ObservationTooFarInFuture => {
+                FailureMemoryValidationError::ObservedTimestampTooFarInFuture
+            }
+            BoundedTemporalViolation::SuppressionWindowOutOfBounds => {
+                FailureMemoryValidationError::SuppressionWindowOutOfBounds
+            }
+        })
 }
 
 fn apply_record(
@@ -1564,6 +1812,7 @@ fn apply_reconciliation_record(
 fn reconciliation_entry_can_be_superseded(
     existing: &GuardianFailureMemoryEntry,
     replacement: &GuardianFailureMemoryEntry,
+    temporal: &BoundedTemporalPolicy,
 ) -> bool {
     let (Some(existing_terminal), Some(replacement_terminal)) = (
         existing.reconciliation_terminal(),
@@ -1574,20 +1823,13 @@ fn reconciliation_entry_can_be_superseded(
     if existing_terminal == replacement_terminal {
         return false;
     }
-    let Ok(existing_until) = DateTime::parse_from_rfc3339(existing_terminal.suppression_until())
-    else {
-        return false;
-    };
-    let Ok(replacement_observed) = DateTime::parse_from_rfc3339(replacement_terminal.observed_at())
-    else {
-        return false;
-    };
-    existing_until <= replacement_observed
+    !temporal.suppression_active(temporal_record(existing))
 }
 
 fn persisted_state_repair_entry_can_be_superseded(
     existing: &GuardianFailureMemoryEntry,
     replacement: &GuardianFailureMemoryEntry,
+    temporal: &BoundedTemporalPolicy,
 ) -> bool {
     let (Some(existing_terminal), Some(replacement_terminal)) = (
         existing.persisted_state_repair_terminal(),
@@ -1598,16 +1840,7 @@ fn persisted_state_repair_entry_can_be_superseded(
     if existing.key != replacement.key || existing_terminal == replacement_terminal {
         return false;
     }
-    let Ok(existing_until) = DateTime::parse_from_rfc3339(existing_terminal.suppression_until())
-    else {
-        return false;
-    };
-    let Ok(replacement_observed) =
-        DateTime::parse_from_rfc3339(replacement_terminal.attempt().observed_at())
-    else {
-        return false;
-    };
-    existing_until <= replacement_observed
+    !temporal.suppression_active(temporal_record(existing))
 }
 
 fn safe_optional_fragment(value: &str, fallback: &str) -> Option<String> {
@@ -1661,11 +1894,13 @@ mod tests {
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
     use crate::state::contracts::{
-        OperationId, OwnershipClass, ReconciliationAttempt, ReconciliationComponent,
-        ReconciliationIncarnationFingerprint, ReconciliationInventoryFingerprint,
-        ReconciliationLineage, ReconciliationQuarantineCheckpoint, ReconciliationRung,
-        ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
-        StabilizationSystem, TargetDescriptor, TargetKind,
+        OperationId, OwnershipClass, PersistedStateRecordStore, PersistedStateRepairAttempt,
+        PersistedStateRepairTerminal, PersistedStateRepairTerminalOutcome, ReconciliationAttempt,
+        ReconciliationComponent, ReconciliationIncarnationFingerprint,
+        ReconciliationInventoryFingerprint, ReconciliationLineage,
+        ReconciliationQuarantineCheckpoint, ReconciliationRung, ReconciliationScope,
+        ReconciliationTerminal, ReconciliationTerminalOutcome, ReconciliationVersionBundleOutcome,
+        RestartStableRecordIdentity, StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use crate::state::journals::DEFAULT_OPERATION_JOURNAL_LIMIT;
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
@@ -1674,19 +1909,52 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::time::Duration;
 
-    const FAILURE_MEMORY_V6_FIXTURE: &str = include_str!(concat!(
+    const FAILURE_MEMORY_V7_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/failure-memory-v6.json"
+        "/tests/fixtures/guardian/failure-memory-v7.json"
     ));
 
     struct CountingFileBackend {
         attempts: AtomicUsize,
         failures: AtomicUsize,
+    }
+
+    struct TestFailureMemoryClock {
+        reading: Mutex<crate::state::temporal::TemporalClockReading>,
+    }
+
+    impl TestFailureMemoryClock {
+        fn new(wall: chrono::DateTime<chrono::Utc>) -> Self {
+            Self {
+                reading: Mutex::new(crate::state::temporal::TemporalClockReading {
+                    wall,
+                    monotonic: Duration::ZERO,
+                }),
+            }
+        }
+
+        fn set_wall(&self, wall: chrono::DateTime<chrono::Utc>) {
+            self.reading.lock().expect("test clock lock").wall = wall;
+        }
+
+        fn set_monotonic(&self, monotonic: Duration) {
+            self.reading.lock().expect("test clock lock").monotonic = monotonic;
+        }
+
+        fn advance_monotonic(&self, elapsed: Duration) {
+            let mut reading = self.reading.lock().expect("test clock lock");
+            reading.monotonic = reading.monotonic.saturating_add(elapsed);
+        }
+    }
+
+    impl crate::state::temporal::TemporalClock for TestFailureMemoryClock {
+        fn read(&self) -> crate::state::temporal::TemporalClockReading {
+            *self.reading.lock().expect("test clock lock")
+        }
     }
 
     impl CountingFileBackend {
@@ -1743,9 +2011,13 @@ mod tests {
         );
         let directory = test_failure_memory_record_directory(&paths)
             .expect("open failure-memory record directory");
-        let store = GuardianFailureMemoryStore::try_load_from_directory_with_coordinator(
-            directory.clone(),
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T10:00:00Z")
+            .expect("fixture time")
+            .with_timezone(&chrono::Utc);
+        let store = GuardianFailureMemoryStore::try_load_with_coordinator_directory_and_temporal(
             coordinator.clone(),
+            directory.clone(),
+            Arc::new(crate::state::temporal::BoundedTemporalPolicy::fixed(now)),
         )
         .expect("claim failure-memory persistence");
         (root, paths, backend, coordinator, directory, store)
@@ -1763,6 +2035,334 @@ mod tests {
         assert_eq!(decoded.entries, vec![entry]);
     }
 
+    #[test]
+    fn p03_b02_contract_exact_cooldown_and_future_skew_bound_all_admission_paths() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("test now")
+            .with_timezone(&chrono::Utc);
+        let store = test_store_at(now, super::DEFAULT_FAILURE_MEMORY_LIMIT).0;
+        let exact_observed = (now + chrono::Duration::minutes(5)).to_rfc3339();
+        let exact_until = (now + chrono::Duration::hours(24)).to_rfc3339();
+        let exact_skew = temporal_entry("exact-skew", &exact_observed, None);
+        store
+            .construct_entry(exact_skew.clone())
+            .expect("exact future skew constructs");
+        store.record(exact_skew).expect("exact future skew admits");
+        let exact_cooldown =
+            temporal_entry("exact-cooldown", &now.to_rfc3339(), Some(&exact_until));
+        store
+            .construct_entry(exact_cooldown.clone())
+            .expect("exact cooldown constructs");
+        store
+            .record(exact_cooldown.clone())
+            .expect("exact cooldown admits");
+
+        let encoded = FailureMemorySnapshot::new(vec![exact_cooldown.clone()])
+            .expect("exact cooldown snapshot")
+            .to_json()
+            .expect("serialize exact cooldown");
+        let decoded = FailureMemorySnapshot::from_json(&encoded).expect("decode exact cooldown");
+        let round_trip = test_store_at(now, super::DEFAULT_FAILURE_MEMORY_LIMIT).0;
+        round_trip
+            .load_snapshot(decoded)
+            .expect("max-valid cooldown loads after round trip");
+        assert_eq!(round_trip.get(&exact_cooldown.key), Some(exact_cooldown));
+
+        let offset_exact = temporal_entry(
+            "offset-exact-cooldown",
+            "2026-08-13T12:00:00+02:00",
+            Some("2026-08-14T12:00:00+02:00"),
+        );
+        store
+            .construct_entry(offset_exact)
+            .expect("equivalent offset exact cooldown constructs");
+        let offset_overlong = temporal_entry(
+            "offset-overlong-cooldown",
+            "2026-08-13T12:00:00+02:00",
+            Some("2026-08-14T12:00:01+02:00"),
+        );
+        assert!(matches!(
+            store.construct_entry(offset_overlong),
+            Err(FailureMemoryStoreError::Validation(
+                super::FailureMemoryValidationError::SuppressionWindowOutOfBounds
+            ))
+        ));
+
+        let future_plus_one =
+            (now + chrono::Duration::minutes(5) + chrono::Duration::seconds(1)).to_rfc3339();
+        let future = temporal_entry("future-plus-one", &future_plus_one, None);
+        assert!(matches!(
+            store.construct_entry(future.clone()),
+            Err(FailureMemoryStoreError::Validation(
+                super::FailureMemoryValidationError::ObservedTimestampTooFarInFuture
+            ))
+        ));
+        assert!(matches!(
+            store.record(future),
+            Err(FailureMemoryStoreError::Validation(
+                super::FailureMemoryValidationError::ObservedTimestampTooFarInFuture
+            ))
+        ));
+
+        let cooldown_observed = now.to_rfc3339();
+        let cooldown_plus_one =
+            (now + chrono::Duration::hours(24) + chrono::Duration::seconds(1)).to_rfc3339();
+        let overlong = temporal_entry(
+            "cooldown-plus-one",
+            &cooldown_observed,
+            Some(&cooldown_plus_one),
+        );
+        assert!(matches!(
+            store.construct_entry(overlong.clone()),
+            Err(FailureMemoryStoreError::Validation(
+                super::FailureMemoryValidationError::SuppressionWindowOutOfBounds
+            ))
+        ));
+        assert!(matches!(
+            store.record(overlong),
+            Err(FailureMemoryStoreError::Validation(
+                super::FailureMemoryValidationError::SuppressionWindowOutOfBounds
+            ))
+        ));
+    }
+
+    #[test]
+    fn p03_b02_contract_far_future_capacity_is_quarantined_before_valid_admission() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("test now")
+            .with_timezone(&chrono::Utc);
+        let (store, _) = test_store_at(now, super::DEFAULT_FAILURE_MEMORY_LIMIT);
+        let far_future = (now + chrono::Duration::days(365)).to_rfc3339();
+        let snapshot = FailureMemorySnapshot::new(
+            (0..super::DEFAULT_FAILURE_MEMORY_LIMIT)
+                .map(|index| temporal_entry(&format!("future-{index}"), &far_future, None))
+                .collect(),
+        )
+        .expect("structurally valid current-schema snapshot");
+
+        store
+            .load_snapshot(snapshot)
+            .expect("temporal-invalid rows are quarantined");
+        assert!(store.list().is_empty());
+        assert_eq!(
+            store.temporal_quarantine_count(),
+            super::DEFAULT_FAILURE_MEMORY_LIMIT
+        );
+
+        let current = temporal_entry("current", &now.to_rfc3339(), None);
+        store.record(current).expect("valid work retains capacity");
+        assert_eq!(store.list().len(), 1);
+    }
+
+    #[test]
+    fn p03_b02_contract_overlong_terminal_is_quarantined_but_malformed_is_fatal() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("test now")
+            .with_timezone(&chrono::Utc);
+        let valid = temporal_entry("valid-after-overlong", &now.to_rfc3339(), None);
+        let overlong = reconciliation_entry_at(
+            "overlong-load",
+            now,
+            now + chrono::Duration::hours(24) + chrono::Duration::seconds(1),
+        );
+        let encoded = FailureMemorySnapshot::new(vec![overlong, valid.clone()])
+            .expect("overlong terminal remains structurally valid")
+            .to_json()
+            .expect("serialize mixed snapshot");
+        let snapshot = FailureMemorySnapshot::from_json(&encoded)
+            .expect("decode structurally valid mixed snapshot");
+        let store = test_store_at(now, super::DEFAULT_FAILURE_MEMORY_LIMIT).0;
+        store
+            .load_snapshot(snapshot)
+            .expect("overlong terminal is quarantined per row");
+        assert_eq!(store.list(), vec![valid]);
+        assert_eq!(store.temporal_quarantine_count(), 1);
+
+        let mut malformed =
+            reconciliation_entry_at("malformed-load", now, now + chrono::Duration::minutes(1));
+        malformed.last_observed_at = "not-a-timestamp".to_string();
+        assert!(matches!(
+            FailureMemorySnapshot::new(vec![malformed]),
+            Err(FailureMemoryLoadError::InvalidEntry(_))
+        ));
+    }
+
+    #[test]
+    fn p03_b02_contract_monotonic_time_ignores_wall_jumps_and_never_resurrects_expiry() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("test now")
+            .with_timezone(&chrono::Utc);
+        let (store, clock) = test_store_at(now, super::DEFAULT_FAILURE_MEMORY_LIMIT);
+        let until = (now + chrono::Duration::minutes(30)).to_rfc3339();
+        let entry = temporal_entry("clock-jump", &now.to_rfc3339(), Some(&until));
+        store
+            .record(entry.clone())
+            .expect("record current cooldown");
+
+        clock.set_wall(now - chrono::Duration::days(30));
+        assert!(store.suppression_active(&entry));
+        clock.set_wall(now + chrono::Duration::days(30));
+        assert!(store.suppression_active(&entry));
+
+        clock.advance_monotonic(Duration::from_secs(30 * 60));
+        assert!(!store.suppression_active(&entry));
+        clock.set_monotonic(Duration::ZERO);
+        assert!(!store.suppression_active(&entry));
+    }
+
+    #[test]
+    fn p03_b02_contract_temporal_policy_preserves_exact_intent_keys() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("test now")
+            .with_timezone(&chrono::Utc);
+        let (store, _) = test_store_at(now, super::DEFAULT_FAILURE_MEMORY_LIMIT);
+        let until = (now + chrono::Duration::minutes(30)).to_rfc3339();
+        let first = temporal_intent_entry("intent-a", &now.to_rfc3339(), &until);
+        let second = temporal_intent_entry("intent-b", &now.to_rfc3339(), &until);
+        store
+            .record(
+                store
+                    .construct_entry(first.clone())
+                    .expect("construct first"),
+            )
+            .expect("admit first");
+        store
+            .load_snapshot(
+                FailureMemorySnapshot::new(vec![first.clone(), second.clone()])
+                    .expect("same temporal rules load"),
+            )
+            .expect("load exact intent entries");
+
+        assert_ne!(first.key, second.key);
+        assert_eq!(store.get(&first.key), Some(first));
+        assert_eq!(store.get(&second.key), Some(second));
+    }
+
+    #[test]
+    fn p03_b02_contract_repair_reservation_uses_policy_now_not_caller_time() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("test now")
+            .with_timezone(&chrono::Utc);
+        let (store, _) = test_store_at(now, super::DEFAULT_FAILURE_MEMORY_LIMIT);
+        let prior = persisted_repair_attempt_at(now);
+        let prior_entry = GuardianFailureMemoryEntry::for_persisted_state_repair_terminal(
+            PersistedStateRepairTerminal::from_attempt(
+                prior,
+                PersistedStateRepairTerminalOutcome::Refused,
+            ),
+        );
+        store
+            .record(prior_entry)
+            .expect("seed active repair memory");
+
+        let caller_shifted = persisted_repair_attempt_at(now + chrono::Duration::minutes(5));
+        assert_eq!(
+            store.reserve_persisted_state_repair(&caller_shifted).err(),
+            Some(super::PersistedStateRepairReserveError::Suppressed)
+        );
+    }
+
+    #[tokio::test]
+    async fn p03_b02_contract_future_replacement_cannot_end_live_suppression_early() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("test now")
+            .with_timezone(&chrono::Utc);
+        let (store, _) = test_store_at(now, super::DEFAULT_FAILURE_MEMORY_LIMIT);
+        let existing = reconciliation_entry_at("existing", now, now + chrono::Duration::minutes(3));
+        let key = existing.key.clone();
+        let reservation = store
+            .reserve_reconciliation_attempt(key.clone())
+            .expect("reserve initial reconciliation");
+        store
+            .record_reconciliation_terminal(existing, &reservation)
+            .await
+            .expect("record active reconciliation");
+        drop(reservation);
+
+        let replacement = reconciliation_entry_at(
+            "replacement",
+            now + chrono::Duration::minutes(5),
+            now + chrono::Duration::minutes(35),
+        );
+        let replacement_reservation = store
+            .reserve_reconciliation_attempt(key)
+            .expect("same key can reserve its capacity slot");
+        assert!(matches!(
+            store.validate_reconciliation_terminal(&replacement, &replacement_reservation),
+            Err(FailureMemoryStoreError::Validation(
+                super::FailureMemoryValidationError::ReconciliationTerminalMismatch
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn p03_b02_contract_expired_pending_publication_can_be_acknowledged_and_pruned() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("test now")
+            .with_timezone(&chrono::Utc);
+        let (store, clock) = test_store_at(now, 1);
+        let pending = pending_reconciliation_entry_at(now, now + chrono::Duration::minutes(1));
+        let key = pending.key.clone();
+        let reservation = store
+            .reserve_reconciliation_attempt(key)
+            .expect("reserve pending publication");
+        store
+            .record_reconciliation_terminal(pending.clone(), &reservation)
+            .await
+            .expect("persist pending publication");
+        drop(reservation);
+
+        clock.advance_monotonic(Duration::from_secs(2 * 60));
+        assert_eq!(store.list_current(), vec![pending.clone()]);
+        let terminal = pending.reconciliation_terminal().expect("pending terminal");
+        let evidence = terminal
+            .version_bundle_publication()
+            .expect("pending publication")
+            .evidence();
+        let acknowledged_terminal = terminal
+            .clone()
+            .with_acknowledged_version_bundle_publication(evidence)
+            .expect("acknowledge exact evidence");
+        let mut acknowledged = pending.clone();
+        acknowledged.reconciliation_terminal = Some(acknowledged_terminal);
+
+        store
+            .acknowledge_reconciliation_version_bundle_publication(&pending, acknowledged.clone())
+            .await
+            .expect("expired pending publication remains acknowledgeable");
+        let mut snapshot_entries = store
+            .snapshot()
+            .expect("snapshot acknowledged carrier")
+            .entries;
+        snapshot_entries.push(temporal_entry(
+            "ordinary-expired",
+            &now.to_rfc3339(),
+            Some(&(now + chrono::Duration::minutes(1)).to_rfc3339()),
+        ));
+        let snapshot = FailureMemorySnapshot::new(snapshot_entries)
+            .expect("snapshot acknowledged and ordinary expired entries");
+        let (reloaded, reloaded_clock) = test_store_at(now, 1);
+        reloaded_clock.advance_monotonic(Duration::from_secs(2 * 60));
+        reloaded
+            .load_snapshot(snapshot)
+            .expect("reload acknowledged carrier");
+        assert_eq!(reloaded.list(), vec![acknowledged]);
+        assert!(reloaded.list_current().is_empty());
+        let replacement = reconciliation_entry_at(
+            "capacity-reused",
+            now + chrono::Duration::minutes(2),
+            now + chrono::Duration::minutes(5),
+        );
+        let replacement_reservation = reloaded
+            .reserve_reconciliation_attempt(replacement.key.clone())
+            .expect("acknowledged expiry releases capacity");
+        reloaded
+            .record_reconciliation_terminal(replacement.clone(), &replacement_reservation)
+            .await
+            .expect("replacement prunes acknowledged expired carrier");
+        assert_eq!(reloaded.list(), vec![replacement]);
+    }
+
     #[tokio::test]
     async fn failure_memory_store_loads_a_valid_bounded_snapshot() {
         let root = test_root("bounded-valid-load");
@@ -1776,8 +2376,17 @@ mod tests {
         fs::write(&path, snapshot.to_json().expect("encode valid snapshot"))
             .expect("write valid snapshot");
 
-        let store = GuardianFailureMemoryStore::try_load_from_paths(&paths)
-            .expect("load valid bounded snapshot");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T10:00:00Z")
+            .expect("test time")
+            .with_timezone(&chrono::Utc);
+        let directory = test_failure_memory_record_directory(&paths)
+            .expect("open failure-memory record directory");
+        let store = GuardianFailureMemoryStore::try_load_with_coordinator_directory_and_temporal(
+            PersistenceCoordinator::current(),
+            directory,
+            Arc::new(crate::state::temporal::BoundedTemporalPolicy::fixed(now)),
+        )
+        .expect("load valid bounded snapshot");
         assert_eq!(store.get(&entry.key), Some(entry));
 
         store.close().await.expect("close valid loaded store");
@@ -1786,10 +2395,10 @@ mod tests {
 
     #[test]
     fn retired_failure_memory_schemas_are_strict_invalid_and_preserved_byte_exact() {
-        for retired_version in ["v4", "v5"] {
+        for retired_version in ["v4", "v5", "v6"] {
             let retired_schema = format!("axial.guardian.failure_memory.{retired_version}");
-            let legacy = FAILURE_MEMORY_V6_FIXTURE.replacen(
-                "axial.guardian.failure_memory.v6",
+            let legacy = FAILURE_MEMORY_V7_FIXTURE.replacen(
+                "axial.guardian.failure_memory.v7",
                 &retired_schema,
                 1,
             );
@@ -1887,7 +2496,7 @@ mod tests {
         let outside_path = outside.join("outside-failure-memory.json");
         fs::create_dir_all(path.parent().expect("failure-memory parent"))
             .expect("create failure-memory parent");
-        fs::write(&outside_path, FAILURE_MEMORY_V6_FIXTURE).expect("write outside snapshot");
+        fs::write(&outside_path, FAILURE_MEMORY_V7_FIXTURE).expect("write outside snapshot");
         symlink(&outside_path, &path).expect("link failure-memory snapshot");
 
         assert!(matches!(
@@ -1896,7 +2505,7 @@ mod tests {
         ));
         assert_eq!(
             fs::read_to_string(&outside_path).expect("outside snapshot remains readable"),
-            FAILURE_MEMORY_V6_FIXTURE
+            FAILURE_MEMORY_V7_FIXTURE
         );
         assert!(
             fs::symlink_metadata(&path)
@@ -1990,14 +2599,23 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_failure_memory_v6_fixture_is_byte_stable() {
+    fn p03_b02_contract_v7_fixture_is_byte_stable_and_v6_is_retired() {
         let snapshot =
-            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V6_FIXTURE).expect("strict fixture");
+            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V7_FIXTURE).expect("strict fixture");
         assert_eq!(
             super::FAILURE_MEMORY_SCHEMA,
-            "axial.guardian.failure_memory.v6"
+            "axial.guardian.failure_memory.v7"
         );
-        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v6");
+        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v7");
+        let retired_v6 = FAILURE_MEMORY_V7_FIXTURE.replacen(
+            "axial.guardian.failure_memory.v7",
+            "axial.guardian.failure_memory.v6",
+            1,
+        );
+        assert!(matches!(
+            FailureMemorySnapshot::from_json(&retired_v6),
+            Err(FailureMemoryLoadError::InvalidSchema)
+        ));
         let action_kinds = snapshot
             .entries
             .iter()
@@ -2098,7 +2716,7 @@ mod tests {
         );
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V6_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V7_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded = FailureMemorySnapshot::from_json(&compact).expect("decode compact fixture");
@@ -2211,7 +2829,10 @@ mod tests {
 
     #[test]
     fn retry_and_repair_suppression_shape_records_attempts_without_policy() {
-        let store = GuardianFailureMemoryStore::new();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T10:00:00Z")
+            .expect("test time")
+            .with_timezone(&chrono::Utc);
+        let store = GuardianFailureMemoryStore::at_for_test(now);
         let retry =
             retry_entry("2026-06-15T10:00:00Z").with_suppression_until("2026-06-15T10:30:00Z");
         let retry_key = retry.key.clone();
@@ -2269,7 +2890,10 @@ mod tests {
 
     #[tokio::test]
     async fn startup_install_retry_reconciliation_is_atomic_and_idempotent() {
-        let store = GuardianFailureMemoryStore::new();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T10:00:00Z")
+            .expect("test time")
+            .with_timezone(&chrono::Utc);
+        let (store, clock) = test_store_at(now, super::DEFAULT_FAILURE_MEMORY_LIMIT);
         let initial = retry_entry("2026-06-15T10:00:00+00:00")
             .with_suppression_until("2026-06-15T10:05:00+00:00");
         let key = initial.key.clone();
@@ -2286,14 +2910,15 @@ mod tests {
             .expect("exact startup Retry is a no-op");
         assert_eq!(store.get(&key).expect("initial Retry").occurrence_count, 1);
 
+        clock.advance_monotonic(Duration::from_secs(10 * 60));
         store
             .reconcile_install_guardian_retry(replacement.clone())
             .await
-            .expect("merge later non-overlapping Retry");
-        let merged = store.get(&key).expect("merged Retry");
-        assert_eq!(merged.first_observed_at, "2026-06-15T10:00:00+00:00");
+            .expect("replace expired Retry with the new window");
+        let merged = store.get(&key).expect("replacement Retry");
+        assert_eq!(merged.first_observed_at, "2026-06-15T10:10:00+00:00");
         assert_eq!(merged.last_observed_at, "2026-06-15T10:10:00+00:00");
-        assert_eq!(merged.occurrence_count, 2);
+        assert_eq!(merged.occurrence_count, 1);
         assert_eq!(
             merged.suppression_until.as_deref(),
             Some("2026-06-15T10:15:00+00:00")
@@ -2333,7 +2958,10 @@ mod tests {
             retry("loader_fabric_build"),
         ];
 
-        let undersized = GuardianFailureMemoryStore::with_max_entries(1);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T10:00:00Z")
+            .expect("test time")
+            .with_timezone(&chrono::Utc);
+        let undersized = test_store_at(now, 1).0;
         assert!(matches!(
             undersized
                 .reconcile_install_guardian_retry_batch(entries.clone())
@@ -2342,7 +2970,7 @@ mod tests {
         ));
         assert!(undersized.list().is_empty());
 
-        let store = GuardianFailureMemoryStore::with_max_entries(2);
+        let store = test_store_at(now, 2).0;
         store
             .reconcile_install_guardian_retry_batch(entries.clone())
             .await
@@ -2358,7 +2986,10 @@ mod tests {
 
     #[tokio::test]
     async fn startup_install_retry_reconciliation_rejects_drift_and_ambiguous_time() {
-        let store = GuardianFailureMemoryStore::new();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T10:00:00Z")
+            .expect("test time")
+            .with_timezone(&chrono::Utc);
+        let (store, clock) = test_store_at(now, super::DEFAULT_FAILURE_MEMORY_LIMIT);
         let initial = retry_entry("2026-06-15T10:00:00+00:00")
             .with_suppression_until("2026-06-15T10:05:00+00:00");
         let key = initial.key.clone();
@@ -2366,6 +2997,7 @@ mod tests {
             .reconcile_install_guardian_retry(initial.clone())
             .await
             .expect("insert initial startup Retry");
+        let _ = clock;
 
         let replacement = || {
             retry_entry("2026-06-15T10:10:00+00:00")
@@ -2419,10 +3051,15 @@ mod tests {
             noncanonical_utc,
             offset_time,
         ] {
-            assert!(matches!(
-                store.reconcile_install_guardian_retry(rejected).await,
-                Err(FailureMemoryStoreError::Validation(_))
-            ));
+            let result = store.reconcile_install_guardian_retry(rejected).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(FailureMemoryStoreError::Validation(_))
+                        | Err(FailureMemoryStoreError::Expired)
+                ),
+                "unexpected retry reconciliation result: {result:?}"
+            );
             assert_eq!(store.get(&key), Some(initial.clone()));
         }
     }
@@ -2879,8 +3516,17 @@ mod tests {
     async fn failure_memory_store_persists_snapshot_for_restart_reasoning() {
         let root = test_root("persisted-snapshot");
         let paths = test_paths(&root);
-        let store = GuardianFailureMemoryStore::try_load_from_paths(&paths)
-            .expect("load Guardian failure-memory persistence");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-15T10:00:00Z")
+            .expect("test time")
+            .with_timezone(&chrono::Utc);
+        let directory = test_failure_memory_record_directory(&paths)
+            .expect("open failure-memory record directory");
+        let store = GuardianFailureMemoryStore::try_load_with_coordinator_directory_and_temporal(
+            PersistenceCoordinator::current(),
+            directory,
+            Arc::new(crate::state::temporal::BoundedTemporalPolicy::fixed(now)),
+        )
+        .expect("load Guardian failure-memory persistence");
         let entry =
             retry_entry("2026-06-15T10:00:00Z").with_suppression_until("2026-06-15T10:30:00Z");
         let key = entry.key.clone();
@@ -2894,7 +3540,7 @@ mod tests {
         drop(store);
         let encoded = fs::read_to_string(&path).expect("read persisted failure memory");
         let snapshot = FailureMemorySnapshot::from_json(&encoded).expect("decode persisted memory");
-        let reloaded = GuardianFailureMemoryStore::new();
+        let reloaded = GuardianFailureMemoryStore::at_for_test(now);
         reloaded
             .load_snapshot(snapshot)
             .expect("reload persisted memory");
@@ -2924,6 +3570,174 @@ mod tests {
 
     fn assert_lock_invariant_panic(panic: Box<dyn std::any::Any + Send>) {
         assert!(panic_message(panic).contains(super::FAILURE_MEMORY_LOCK_INVARIANT));
+    }
+
+    fn test_store_at(
+        now: chrono::DateTime<chrono::Utc>,
+        max_entries: usize,
+    ) -> (GuardianFailureMemoryStore, Arc<TestFailureMemoryClock>) {
+        let clock = Arc::new(TestFailureMemoryClock::new(now));
+        let temporal = Arc::new(crate::state::temporal::BoundedTemporalPolicy::new(
+            clock.clone(),
+        ));
+        (
+            GuardianFailureMemoryStore::with_max_entries_and_clock(max_entries, temporal, None),
+            clock,
+        )
+    }
+
+    fn temporal_entry(
+        target_id: &str,
+        observed_at: &str,
+        suppression_until: Option<&str>,
+    ) -> GuardianFailureMemoryEntry {
+        let mut entry = GuardianFailureMemoryEntry::observed(
+            DiagnosisId::StartupFailedUnknown,
+            GuardianDomain::Launch,
+            TargetDescriptor::new(
+                StabilizationSystem::Guardian,
+                TargetKind::Instance,
+                target_id,
+                OwnershipClass::LauncherManaged,
+            ),
+            GuardianMode::Managed,
+            Some("intent-a"),
+            observed_at,
+        );
+        if let Some(suppression_until) = suppression_until {
+            entry = entry.with_suppression_until(suppression_until);
+        }
+        entry
+    }
+
+    fn temporal_intent_entry(
+        intent: &str,
+        observed_at: &str,
+        suppression_until: &str,
+    ) -> GuardianFailureMemoryEntry {
+        GuardianFailureMemoryEntry::observed(
+            DiagnosisId::StartupFailedUnknown,
+            GuardianDomain::Launch,
+            TargetDescriptor::new(
+                StabilizationSystem::Guardian,
+                TargetKind::Instance,
+                "same-target",
+                OwnershipClass::LauncherManaged,
+            ),
+            GuardianMode::Managed,
+            Some(intent),
+            observed_at,
+        )
+        .with_suppression_until(suppression_until)
+    }
+
+    fn persisted_repair_attempt_at(
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> PersistedStateRepairAttempt {
+        PersistedStateRepairAttempt::new(
+            PersistedStateRecordStore::BenchmarkSuiteDriver,
+            "benchmark-suite-driver-0000000000000001",
+            RestartStableRecordIdentity::from_digest([1; 32]),
+            GuardianMode::Managed,
+            observed_at.to_rfc3339(),
+        )
+    }
+
+    fn reconciliation_entry_at(
+        operation: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+        suppression_until: chrono::DateTime<chrono::Utc>,
+    ) -> GuardianFailureMemoryEntry {
+        let target = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            "same-reconciliation-target",
+            OwnershipClass::LauncherManaged,
+        );
+        let attempt = ReconciliationAttempt::new(
+            OperationId::deterministic_test(format!("temporal-{operation}")),
+            DiagnosisId::LauncherManagedArtifactCorrupt,
+            GuardianDomain::Library,
+            ReconciliationRung::RepairArtifact,
+            ReconciliationScope::RegisteredInstance {
+                instance_id: "0123456789abcdef".to_string(),
+                fingerprint: ReconciliationIncarnationFingerprint::from_digest(
+                    "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
+                ),
+                inventory_fingerprint: ReconciliationInventoryFingerprint::from_digest(
+                    "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+                ),
+                activation_contract_id: axial_minecraft::ManagedInstallActivationContractId::parse(
+                    "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+                )
+                .expect("canonical activation contract"),
+            },
+            ReconciliationComponent::Libraries,
+            target,
+            GuardianMode::Managed,
+            OwnershipClass::LauncherManaged,
+            observed_at.to_rfc3339(),
+            suppression_until.to_rfc3339(),
+            ReconciliationLineage::Initial,
+        );
+        crate::state::reconciliation_memory_entry(ReconciliationTerminal::from_attempt(
+            attempt,
+            ReconciliationTerminalOutcome::Failed,
+            ReconciliationQuarantineCheckpoint::default(),
+        ))
+        .expect("valid temporal reconciliation entry")
+    }
+
+    fn pending_reconciliation_entry_at(
+        observed_at: chrono::DateTime<chrono::Utc>,
+        suppression_until: chrono::DateTime<chrono::Utc>,
+    ) -> GuardianFailureMemoryEntry {
+        let target = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            "version-bundle",
+            OwnershipClass::LauncherManaged,
+        );
+        let attempt = ReconciliationAttempt::new(
+            OperationId::deterministic_test("temporal-pending-publication"),
+            DiagnosisId::LauncherManagedArtifactCorrupt,
+            GuardianDomain::Library,
+            ReconciliationRung::RebuildComponent,
+            ReconciliationScope::RegisteredInstance {
+                instance_id: "0123456789abcdef".to_string(),
+                fingerprint: ReconciliationIncarnationFingerprint::from_digest(
+                    "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
+                ),
+                inventory_fingerprint: ReconciliationInventoryFingerprint::from_digest(
+                    "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+                ),
+                activation_contract_id: axial_minecraft::ManagedInstallActivationContractId::parse(
+                    "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+                )
+                .expect("canonical activation contract"),
+            },
+            ReconciliationComponent::VersionBundle,
+            target,
+            GuardianMode::Managed,
+            OwnershipClass::LauncherManaged,
+            observed_at.to_rfc3339(),
+            suppression_until.to_rfc3339(),
+            ReconciliationLineage::Predecessor {
+                operation_id: OperationId::deterministic_test("temporal-pending-predecessor"),
+            },
+        );
+        let evidence = axial_minecraft::ManagedInstallPublicationEvidenceId::parse(
+            "managed-install-v1.T7ghN0PBffcxr4Rg08bVvTPOl9fRcUh9qyNnWZtd93c.Xsu8KmJnT7So_J1WS8rcqA.X-fR4EpDTc2mbfPpfNOFiA.JGoynsQN9LfT8e7hWyX1fknDskeaM7xQCAbFGATbD-I._FMcn_pUsOarv_sNtTJousevn4S1SMqttV6yiYdONOY",
+        )
+        .expect("canonical publication evidence");
+        let terminal = ReconciliationTerminal::from_attempt(
+            attempt,
+            ReconciliationTerminalOutcome::Failed,
+            ReconciliationQuarantineCheckpoint::default(),
+        )
+        .with_version_bundle_publication(evidence, ReconciliationVersionBundleOutcome::RolledBack);
+        crate::state::reconciliation_memory_entry(terminal)
+            .expect("valid pending publication memory")
     }
 
     fn retry_entry(observed_at: &str) -> GuardianFailureMemoryEntry {

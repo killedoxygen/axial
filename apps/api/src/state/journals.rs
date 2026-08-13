@@ -10,6 +10,10 @@ use super::contracts::{
     StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use super::successors::OPERATION_JOURNAL_SUCCESSOR;
+use super::temporal::{
+    BoundedTemporalDisposition, BoundedTemporalLoadIssueCounts, BoundedTemporalPolicy,
+    BoundedTemporalRecord, BoundedTemporalViolation,
+};
 use crate::execution::anchored_record::AnchoredRecordDirectory;
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
@@ -22,17 +26,20 @@ use crate::observability::{
 };
 #[cfg(test)]
 use axial_config::AppPaths;
+use im::OrdMap;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io;
+use std::ops::Deref;
 #[cfg(test)]
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
-pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v8";
+pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v9";
 pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
 pub(crate) const PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX: &str = "performance_plan_graph_sha512_";
@@ -43,6 +50,10 @@ const INSTALL_ACTIVATION_CONTRACT_FACT_PREFIX: &str = "install_activation_contra
 const INSTALL_VERSION_ID_FACT_PREFIX: &str = "install_version_id:";
 const LOADER_BUILD_ID_FACT_PREFIX: &str = "loader_build_id:";
 const OPERATION_JOURNAL_SNAPSHOT_NAME: &str = "operation-journals.json";
+const OPERATION_JOURNAL_SNAPSHOT_PREFIX: &[u8] =
+    b"{\"schema\":\"axial.state.operation_journals.v9\",\"next_sequence\":";
+const OPERATION_JOURNAL_SNAPSHOT_ENTRIES_PREFIX: &[u8] = b",\"entries\":[";
+const OPERATION_JOURNAL_SNAPSHOT_SUFFIX: &[u8] = b"]}";
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
 const MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const OPERATION_JOURNAL_LOCK_INVARIANT: &str =
@@ -256,7 +267,64 @@ pub struct OperationJournalStore {
     records: Arc<RwLock<OperationJournalRecords>>,
     mutation_gate: Arc<AsyncMutex<()>>,
     max_entries: usize,
+    temporal: Arc<BoundedTemporalPolicy>,
+    temporal_future_observation_count: AtomicUsize,
+    temporal_out_of_bounds_window_count: AtomicUsize,
     persistence: Option<OperationJournalPersistence>,
+    #[cfg(test)]
+    encoding_test_hook: Arc<JournalEncodingTestHook>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct JournalEncodingTestHook {
+    next: std::sync::Mutex<Option<Arc<JournalEncodingGate>>>,
+}
+
+#[cfg(test)]
+struct JournalEncodingGate {
+    entered: tokio::sync::Notify,
+    entered_flag: std::sync::atomic::AtomicBool,
+    released: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl JournalEncodingGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: tokio::sync::Notify::new(),
+            entered_flag: std::sync::atomic::AtomicBool::new(false),
+            released: std::sync::Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+        })
+    }
+
+    async fn wait_until_entered(&self) {
+        loop {
+            let entered = self.entered.notified();
+            if self.entered_flag.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            entered.await;
+        }
+    }
+
+    fn block(&self) {
+        self.entered_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.entered.notify_waiters();
+        let mut released = self.released.lock().expect("encoding gate lock");
+        while !*released {
+            released = self.changed.wait(released).expect("encoding gate wait");
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().expect("encoding gate lock") = true;
+        self.changed.notify_all();
+        self.entered.notify_waiters();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,19 +366,164 @@ pub(crate) struct PerformanceRestartPlan {
     pub applied_unverified: Vec<PerformanceOperationProjection>,
 }
 
-struct OperationJournalRecords {
-    visible: BTreeMap<OperationId, OperationJournalEntry>,
-    visible_revision: u64,
+struct AcceptedJournalEntry {
+    entry: OperationJournalEntry,
+    canonical: Arc<[u8]>,
+}
+
+impl AcceptedJournalEntry {
+    fn accept(entry: OperationJournalEntry) -> Result<Arc<Self>, OperationJournalStoreError> {
+        validate_entry(&entry)?;
+        Self::from_validated(entry).map_err(OperationJournalStoreError::Persistence)
+    }
+
+    fn from_validated(entry: OperationJournalEntry) -> io::Result<Arc<Self>> {
+        let canonical = serde_json::to_vec(&entry)
+            .map(Arc::<[u8]>::from)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(Arc::new(Self { entry, canonical }))
+    }
+}
+
+impl Deref for AcceptedJournalEntry {
+    type Target = OperationJournalEntry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entry
+    }
+}
+
+struct AcceptedJournalRevision {
+    entries: OrdMap<OperationId, Arc<AcceptedJournalEntry>>,
+    entries_bytes: usize,
     next_sequence: u64,
-    retry_candidate: Option<(u64, BTreeMap<OperationId, OperationJournalEntry>, u64)>,
+    next_sequence_bytes: Arc<[u8]>,
+    encoded_len: usize,
+}
+
+impl AcceptedJournalRevision {
+    fn empty() -> Arc<Self> {
+        Self::accept_loaded(OrdMap::new(), 1).expect("empty operation journal revision is bounded")
+    }
+
+    fn accept_loaded(
+        entries: OrdMap<OperationId, Arc<AcceptedJournalEntry>>,
+        next_sequence: u64,
+    ) -> Result<Arc<Self>, OperationJournalStoreError> {
+        let entries_bytes = entries.values().try_fold(0usize, |total, entry| {
+            total.checked_add(entry.canonical.len())
+        });
+        Self::accept_changed(
+            entries,
+            next_sequence,
+            entries_bytes
+                .ok_or_else(|| OperationJournalStoreError::Persistence(snapshot_too_large()))?,
+        )
+    }
+
+    fn accept_changed(
+        entries: OrdMap<OperationId, Arc<AcceptedJournalEntry>>,
+        next_sequence: u64,
+        entries_bytes: usize,
+    ) -> Result<Arc<Self>, OperationJournalStoreError> {
+        let next_sequence_bytes = Arc::<[u8]>::from(next_sequence.to_string().into_bytes());
+        let commas = entries.len().saturating_sub(1);
+        let encoded_len = OPERATION_JOURNAL_SNAPSHOT_PREFIX
+            .len()
+            .checked_add(next_sequence_bytes.len())
+            .and_then(|total| total.checked_add(OPERATION_JOURNAL_SNAPSHOT_ENTRIES_PREFIX.len()))
+            .and_then(|total| total.checked_add(commas))
+            .and_then(|total| total.checked_add(entries_bytes))
+            .and_then(|total| total.checked_add(OPERATION_JOURNAL_SNAPSHOT_SUFFIX.len()))
+            .ok_or_else(|| OperationJournalStoreError::Persistence(snapshot_too_large()))?;
+        if encoded_len as u64 > MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES {
+            return Err(OperationJournalStoreError::Persistence(snapshot_too_large()));
+        }
+        Ok(Arc::new(Self {
+            entries,
+            entries_bytes,
+            next_sequence,
+            next_sequence_bytes,
+            encoded_len,
+        }))
+    }
+
+    fn encoding(
+        self: &Arc<Self>,
+        #[cfg(test)] gate: Option<Arc<JournalEncodingGate>>,
+    ) -> io::Result<AcceptedJournalEncoding> {
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(self.encoded_len)
+            .map_err(|error| {
+                io::Error::other(format!("operation journal allocation failed: {error}"))
+            })?;
+        Ok(AcceptedJournalEncoding {
+            revision: self.clone(),
+            encoded_len: self.encoded_len,
+            buffer,
+            #[cfg(test)]
+            gate,
+        })
+    }
+
+    fn snapshot(&self) -> OperationJournalSnapshot {
+        OperationJournalSnapshot {
+            schema: OPERATION_JOURNAL_SCHEMA.to_string(),
+            next_sequence: self.next_sequence,
+            entries: self
+                .entries
+                .values()
+                .map(|entry| entry.entry.clone())
+                .collect(),
+        }
+    }
+}
+
+struct AcceptedJournalEncoding {
+    revision: Arc<AcceptedJournalRevision>,
+    encoded_len: usize,
+    buffer: Vec<u8>,
+    #[cfg(test)]
+    gate: Option<Arc<JournalEncodingGate>>,
+}
+
+impl AcceptedJournalEncoding {
+    fn assemble(mut self) -> io::Result<Vec<u8>> {
+        #[cfg(test)]
+        if let Some(gate) = &self.gate {
+            gate.block();
+        }
+        self.buffer
+            .extend_from_slice(OPERATION_JOURNAL_SNAPSHOT_PREFIX);
+        self.buffer
+            .extend_from_slice(&self.revision.next_sequence_bytes);
+        self.buffer
+            .extend_from_slice(OPERATION_JOURNAL_SNAPSHOT_ENTRIES_PREFIX);
+        for (index, entry) in self.revision.entries.values().enumerate() {
+            if index > 0 {
+                self.buffer.push(b',');
+            }
+            self.buffer.extend_from_slice(&entry.canonical);
+        }
+        self.buffer
+            .extend_from_slice(OPERATION_JOURNAL_SNAPSHOT_SUFFIX);
+        debug_assert_eq!(self.buffer.len(), self.encoded_len);
+        Ok(self.buffer)
+    }
+}
+
+struct OperationJournalRecords {
+    visible: Arc<AcceptedJournalRevision>,
+    visible_revision: u64,
+    retry_candidate: Option<(u64, Arc<AcceptedJournalRevision>)>,
 }
 
 impl Default for OperationJournalRecords {
     fn default() -> Self {
         Self {
-            visible: BTreeMap::new(),
+            visible: AcceptedJournalRevision::empty(),
             visible_revision: 0,
-            next_sequence: 1,
             retry_candidate: None,
         }
     }
@@ -319,8 +532,7 @@ impl Default for OperationJournalRecords {
 struct PendingJournalCommit {
     ticket: AcceptedWrite,
     revision: u64,
-    candidate: BTreeMap<OperationId, OperationJournalEntry>,
-    next_sequence: u64,
+    candidate: Arc<AcceptedJournalRevision>,
 }
 
 impl OperationJournalStore {
@@ -329,20 +541,44 @@ impl OperationJournalStore {
     }
 
     pub fn with_max_entries(max_entries: usize) -> Self {
+        Self::with_max_entries_and_temporal(max_entries, Arc::new(BoundedTemporalPolicy::system()))
+    }
+
+    fn with_max_entries_and_temporal(
+        max_entries: usize,
+        temporal: Arc<BoundedTemporalPolicy>,
+    ) -> Self {
         Self {
             records: Arc::new(RwLock::new(OperationJournalRecords::default())),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             max_entries: max_entries.clamp(1, DEFAULT_OPERATION_JOURNAL_LIMIT),
+            temporal,
+            temporal_future_observation_count: AtomicUsize::new(0),
+            temporal_out_of_bounds_window_count: AtomicUsize::new(0),
             persistence: None,
+            #[cfg(test)]
+            encoding_test_hook: Arc::new(JournalEncodingTestHook::default()),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn try_load_from_directory(
         directory: AnchoredRecordDirectory,
+    ) -> Result<Self, OperationJournalStoreError> {
+        Self::try_load_from_directory_with_temporal(
+            directory,
+            Arc::new(BoundedTemporalPolicy::system()),
+        )
+    }
+
+    pub(crate) fn try_load_from_directory_with_temporal(
+        directory: AnchoredRecordDirectory,
+        temporal: Arc<BoundedTemporalPolicy>,
     ) -> Result<Self, OperationJournalStoreError> {
         let mut store = Self::with_max_entries_and_persistence(
             DEFAULT_OPERATION_JOURNAL_LIMIT,
             Some(OperationJournalPersistence::claim(directory.clone())?),
+            temporal,
         );
 
         store.load_from_directory(&directory)?;
@@ -365,9 +601,38 @@ impl OperationJournalStore {
     }
 
     #[cfg(test)]
+    fn try_load_from_paths_with_max_entries_and_temporal(
+        paths: &AppPaths,
+        max_entries: usize,
+        temporal: Arc<BoundedTemporalPolicy>,
+    ) -> Result<Self, OperationJournalStoreError> {
+        let directory = test_journal_record_directory(paths)?;
+        let mut store = Self::with_max_entries_and_persistence(
+            max_entries,
+            Some(OperationJournalPersistence::claim(directory.clone())?),
+            temporal,
+        );
+        store.load_from_directory(&directory)?;
+        Ok(store)
+    }
+
+    #[cfg(test)]
     pub(crate) fn try_load_from_directory_with_coordinator(
         directory: AnchoredRecordDirectory,
         coordinator: PersistenceCoordinator,
+    ) -> Result<Self, OperationJournalStoreError> {
+        Self::try_load_from_directory_with_coordinator_and_temporal(
+            directory,
+            coordinator,
+            Arc::new(BoundedTemporalPolicy::system()),
+        )
+    }
+
+    #[cfg(test)]
+    fn try_load_from_directory_with_coordinator_and_temporal(
+        directory: AnchoredRecordDirectory,
+        coordinator: PersistenceCoordinator,
+        temporal: Arc<BoundedTemporalPolicy>,
     ) -> Result<Self, OperationJournalStoreError> {
         let mut store = Self::with_max_entries_and_persistence(
             DEFAULT_OPERATION_JOURNAL_LIMIT,
@@ -375,6 +640,7 @@ impl OperationJournalStore {
                 directory.clone(),
                 coordinator,
             )?),
+            temporal,
         );
         store.load_from_directory(&directory)?;
         Ok(store)
@@ -411,17 +677,47 @@ impl OperationJournalStore {
     fn with_max_entries_and_persistence(
         max_entries: usize,
         persistence: Option<OperationJournalPersistence>,
+        temporal: Arc<BoundedTemporalPolicy>,
     ) -> Self {
         Self {
             records: Arc::new(RwLock::new(OperationJournalRecords::default())),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             max_entries: max_entries.clamp(1, DEFAULT_OPERATION_JOURNAL_LIMIT),
+            temporal,
+            temporal_future_observation_count: AtomicUsize::new(0),
+            temporal_out_of_bounds_window_count: AtomicUsize::new(0),
             persistence,
+            #[cfg(test)]
+            encoding_test_hook: Arc::new(JournalEncodingTestHook::default()),
         }
     }
 
-    pub(crate) const fn load_issue_count(&self) -> usize {
-        0
+    pub(crate) fn load_issue_count(&self) -> usize {
+        self.temporal_load_issues().total()
+    }
+
+    pub(crate) fn temporal_load_issues(&self) -> BoundedTemporalLoadIssueCounts {
+        BoundedTemporalLoadIssueCounts::new(
+            self.temporal_future_observation_count
+                .load(Ordering::Acquire),
+            self.temporal_out_of_bounds_window_count
+                .load(Ordering::Acquire),
+        )
+    }
+
+    pub(crate) fn now_timestamp(&self) -> String {
+        self.temporal.now_timestamp()
+    }
+
+    #[cfg(test)]
+    fn gate_next_encoding(&self) -> Arc<JournalEncodingGate> {
+        let gate = JournalEncodingGate::new();
+        *self
+            .encoding_test_hook
+            .next
+            .lock()
+            .expect("encoding test hook lock") = Some(gate.clone());
+        gate
     }
 
     pub async fn create(
@@ -452,6 +748,7 @@ impl OperationJournalStore {
                     .read()
                     .expect(OPERATION_JOURNAL_LOCK_INVARIANT)
                     .visible
+                    .entries
                     .contains_key(candidate)
             })
             .ok_or(OperationJournalStoreError::SequenceExhausted)?;
@@ -486,14 +783,14 @@ impl OperationJournalStore {
         });
         validate_entry(&entry)?;
         let ticket = {
-            let mut records = self
+            let records = self
                 .records
                 .write()
                 .expect(OPERATION_JOURNAL_LOCK_INVARIANT);
             if records.retry_candidate.is_some() {
                 return Err(OperationJournalStoreError::RetryRequired.into());
             }
-            if records.visible.values().any(|candidate| {
+            if records.visible.entries.values().any(|candidate| {
                 !operation_journal_status_is_terminal(candidate.status)
                     && candidate
                         .performance_lifecycle()
@@ -501,23 +798,37 @@ impl OperationJournalStore {
             }) {
                 return Err(OperationJournalStoreError::Conflict.into());
             }
-            if records.visible.contains_key(&operation_id) {
+            if records.visible.entries.contains_key(&operation_id) {
                 return Err(OperationJournalStoreError::AlreadyExists.into());
             }
             let next_sequence = records
+                .visible
                 .next_sequence
                 .checked_add(1)
                 .ok_or(OperationJournalStoreError::SequenceExhausted)?;
-            entry.sequence = records.next_sequence;
-            let mut candidate = records.visible.clone();
-            candidate.insert(operation_id.clone(), entry);
-            if !prune_records(&mut candidate, self.max_entries, Some(&operation_id)) {
-                return Err(OperationJournalStoreError::CapacityExhausted.into());
-            }
+            entry.sequence = records.visible.next_sequence;
+            let accepted = AcceptedJournalEntry::from_validated(entry)
+                .map_err(OperationJournalStoreError::Persistence)?;
+            let mut entries_bytes = records
+                .visible
+                .entries_bytes
+                .checked_add(accepted.canonical.len())
+                .ok_or_else(|| OperationJournalStoreError::Persistence(snapshot_too_large()))?;
+            let mut candidate = clone_revision_entries(&records.visible.entries);
+            candidate.insert(operation_id.clone(), accepted);
+            let removed_bytes = prune_records(
+                &mut candidate,
+                self.max_entries,
+                Some(&operation_id),
+                &self.temporal,
+            )
+            .ok_or(OperationJournalStoreError::CapacityExhausted)?;
+            entries_bytes -= removed_bytes;
             self.accept_candidate(
-                &mut records,
+                records,
                 candidate,
                 next_sequence,
+                entries_bytes,
                 WriteUrgency::Immediate,
             )?
         };
@@ -562,35 +873,50 @@ impl OperationJournalStore {
     ) -> Result<(), OperationJournalStoreError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
         validate_entry(&entry)?;
+        validate_journal_temporal_admission(&self.temporal, &entry, false)?;
         let ticket = {
-            let mut records = self
+            let records = self
                 .records
                 .write()
                 .expect(OPERATION_JOURNAL_LOCK_INVARIANT);
             if records.retry_candidate.is_some() {
                 return Err(OperationJournalStoreError::RetryRequired);
             }
-            if let Some(existing) = records.visible.get(&entry.operation_id) {
+            if let Some(existing) = records.visible.entries.get(&entry.operation_id) {
                 if allow_matching_existing && existing.matches_store_entry(&entry) {
                     return Ok(());
                 }
                 return Err(OperationJournalStoreError::AlreadyExists);
             }
             let next_sequence = records
+                .visible
                 .next_sequence
                 .checked_add(1)
                 .ok_or(OperationJournalStoreError::SequenceExhausted)?;
-            entry.sequence = records.next_sequence;
+            entry.sequence = records.visible.next_sequence;
             let operation_key = entry.operation_id.clone();
-            let mut candidate = records.visible.clone();
-            candidate.insert(operation_key.clone(), entry);
-            if !prune_records(&mut candidate, self.max_entries, Some(&operation_key)) {
-                return Err(OperationJournalStoreError::CapacityExhausted);
-            }
+            let accepted = AcceptedJournalEntry::from_validated(entry)
+                .map_err(OperationJournalStoreError::Persistence)?;
+            let mut entries_bytes = records
+                .visible
+                .entries_bytes
+                .checked_add(accepted.canonical.len())
+                .ok_or_else(|| OperationJournalStoreError::Persistence(snapshot_too_large()))?;
+            let mut candidate = clone_revision_entries(&records.visible.entries);
+            candidate.insert(operation_key.clone(), accepted);
+            let removed_bytes = prune_records(
+                &mut candidate,
+                self.max_entries,
+                Some(&operation_key),
+                &self.temporal,
+            )
+            .ok_or(OperationJournalStoreError::CapacityExhausted)?;
+            entries_bytes -= removed_bytes;
             self.accept_candidate(
-                &mut records,
+                records,
                 candidate,
                 next_sequence,
+                entries_bytes,
                 WriteUrgency::Immediate,
             )?
         };
@@ -619,33 +945,48 @@ impl OperationJournalStore {
             .push(DiagnosisId::PersistedStateSchemaInvalid);
         entry.persisted_state_repair_attempt = Some(attempt);
         validate_entry(&entry)?;
+        validate_journal_temporal_admission(&self.temporal, &entry, false)?;
         let mutation = self.mutation_gate.clone().lock_owned().await;
         let ticket = {
-            let mut records = self
+            let records = self
                 .records
                 .write()
                 .expect(OPERATION_JOURNAL_LOCK_INVARIANT);
             if records.retry_candidate.is_some() {
                 return Err(OperationJournalStoreError::RetryRequired);
             }
-            if records.visible.contains_key(&entry.operation_id) {
+            if records.visible.entries.contains_key(&entry.operation_id) {
                 return Err(OperationJournalStoreError::AlreadyExists);
             }
             let next_sequence = records
+                .visible
                 .next_sequence
                 .checked_add(1)
                 .ok_or(OperationJournalStoreError::SequenceExhausted)?;
-            entry.sequence = records.next_sequence;
+            entry.sequence = records.visible.next_sequence;
             let operation_key = entry.operation_id.clone();
-            let mut candidate = records.visible.clone();
-            candidate.insert(operation_key.clone(), entry);
-            if !prune_records(&mut candidate, self.max_entries, Some(&operation_key)) {
-                return Err(OperationJournalStoreError::CapacityExhausted);
-            }
+            let accepted = AcceptedJournalEntry::from_validated(entry)
+                .map_err(OperationJournalStoreError::Persistence)?;
+            let mut entries_bytes = records
+                .visible
+                .entries_bytes
+                .checked_add(accepted.canonical.len())
+                .ok_or_else(|| OperationJournalStoreError::Persistence(snapshot_too_large()))?;
+            let mut candidate = clone_revision_entries(&records.visible.entries);
+            candidate.insert(operation_key.clone(), accepted);
+            let removed_bytes = prune_records(
+                &mut candidate,
+                self.max_entries,
+                Some(&operation_key),
+                &self.temporal,
+            )
+            .ok_or(OperationJournalStoreError::CapacityExhausted)?;
+            entries_bytes -= removed_bytes;
             self.accept_candidate(
-                &mut records,
+                records,
                 candidate,
                 next_sequence,
+                entries_bytes,
                 WriteUrgency::Immediate,
             )?
         };
@@ -657,8 +998,9 @@ impl OperationJournalStore {
             .read()
             .expect(OPERATION_JOURNAL_LOCK_INVARIANT)
             .visible
+            .entries
             .get(operation_id)
-            .cloned()
+            .map(|entry| entry.entry.clone())
     }
 
     pub fn latest_for_command(&self, command: CommandKind) -> Option<OperationJournalEntry> {
@@ -666,10 +1008,11 @@ impl OperationJournalStore {
             .read()
             .expect(OPERATION_JOURNAL_LOCK_INVARIANT)
             .visible
+            .entries
             .values()
             .filter(|entry| entry.command == command)
             .max_by_key(|entry| entry.sequence)
-            .cloned()
+            .map(|entry| entry.entry.clone())
     }
 
     pub(crate) fn performance_operation(
@@ -688,8 +1031,9 @@ impl OperationJournalStore {
             .read()
             .expect(OPERATION_JOURNAL_LOCK_INVARIANT)
             .visible
+            .entries
             .values()
-            .filter_map(performance_operation_projection)
+            .filter_map(|entry| performance_operation_projection(entry))
             .filter(|projection| projection.intent.instance_id == instance_id)
             .max_by_key(|projection| (!projection.terminal, projection.sequence))
     }
@@ -778,26 +1122,36 @@ impl OperationJournalStore {
                 continue;
             }
             let ticket = {
-                let mut records = self
+                let records = self
                     .records
                     .write()
                     .expect(OPERATION_JOURNAL_LOCK_INVARIANT);
-                let mut candidate = records.visible.clone();
+                let mut candidate = clone_revision_entries(&records.visible.entries);
+                let mut entries_bytes = records.visible.entries_bytes;
                 let now = timestamp_utc();
-                let mut changed = false;
-                for entry in candidate.values_mut() {
-                    let Some(phase) = entry
+                let mut changed = 0usize;
+                for (operation_id, accepted) in &records.visible.entries {
+                    let Some(phase) = accepted
                         .performance_lifecycle()
                         .map(|lifecycle| lifecycle.phase.clone())
                     else {
                         continue;
                     };
-                    let terminal = match phase {
+                    let mut entry = match phase {
                         PerformanceOperationPhase::Accepted {}
                         | PerformanceOperationPhase::Planning {} => {
-                            Some(PerformanceOperationTerminal::AbandonedBeforeEffect {})
+                            let mut entry = accepted.entry.clone();
+                            let OperationIntent::Performance(lifecycle) = &mut entry.intent else {
+                                unreachable!("performance lifecycle disappeared")
+                            };
+                            lifecycle.phase = PerformanceOperationPhase::Terminal {
+                                terminal: PerformanceOperationTerminal::AbandonedBeforeEffect {},
+                            };
+                            lifecycle.updated_at = now.clone();
+                            entry
                         }
                         PerformanceOperationPhase::EffectStarted { prepared } => {
+                            let mut entry = accepted.entry.clone();
                             let OperationIntent::Performance(lifecycle) = &mut entry.intent else {
                                 unreachable!("performance lifecycle disappeared")
                             };
@@ -806,34 +1160,38 @@ impl OperationJournalStore {
                                 error: APPLIED_UNVERIFIED_ERROR.to_string(),
                             };
                             lifecycle.updated_at = now.clone();
-                            apply_performance_phase_shape(entry);
-                            validate_entry(entry)?;
-                            changed = true;
-                            None
+                            entry
                         }
-                        PerformanceOperationPhase::TerminalIntent { terminal } => Some(terminal),
+                        PerformanceOperationPhase::TerminalIntent { terminal } => {
+                            let mut entry = accepted.entry.clone();
+                            let OperationIntent::Performance(lifecycle) = &mut entry.intent else {
+                                unreachable!("performance lifecycle disappeared")
+                            };
+                            lifecycle.phase = PerformanceOperationPhase::Terminal { terminal };
+                            lifecycle.updated_at = now.clone();
+                            entry
+                        }
                         PerformanceOperationPhase::Prepared { .. }
                         | PerformanceOperationPhase::AppliedUnverified { .. }
-                        | PerformanceOperationPhase::Terminal { .. } => None,
+                        | PerformanceOperationPhase::Terminal { .. } => continue,
                     };
-                    let Some(terminal) = terminal else {
-                        continue;
-                    };
-                    let OperationIntent::Performance(lifecycle) = &mut entry.intent else {
-                        unreachable!("performance lifecycle disappeared")
-                    };
-                    lifecycle.phase = PerformanceOperationPhase::Terminal { terminal };
-                    lifecycle.updated_at = now.clone();
-                    apply_performance_phase_shape(entry);
-                    validate_entry(entry)?;
-                    changed = true;
+                    apply_performance_phase_shape(&mut entry);
+                    let replacement = AcceptedJournalEntry::accept(entry)?;
+                    entries_bytes = checked_replaced_entries_bytes(
+                        entries_bytes,
+                        accepted.canonical.len(),
+                        replacement.canonical.len(),
+                    )?;
+                    candidate.insert(operation_id.clone(), replacement);
+                    changed += 1;
                 }
-                if changed {
-                    let next_sequence = records.next_sequence;
+                if changed > 0 {
+                    let next_sequence = records.visible.next_sequence;
                     self.accept_candidate(
-                        &mut records,
+                        records,
                         candidate,
                         next_sequence,
+                        entries_bytes,
                         WriteUrgency::Immediate,
                     )?
                 } else {
@@ -858,8 +1216,9 @@ impl OperationJournalStore {
             .read()
             .expect(OPERATION_JOURNAL_LOCK_INVARIANT)
             .visible
+            .entries
             .values()
-            .filter_map(performance_operation_projection)
+            .filter_map(|entry| performance_operation_projection(entry))
         {
             match projection.restart {
                 OperationRestartDisposition::Resumable => plan.resumable.push(projection),
@@ -949,21 +1308,28 @@ impl OperationJournalStore {
         if terminal.outcome() != ReconciliationTerminalOutcome::Succeeded {
             return Err(OperationJournalValidationError::ReconciliationTerminalMismatch.into());
         }
+        self.validate_temporal_terminal_admission(&terminal)?;
         let mutation = self.mutation_gate.clone().lock_owned().await;
-        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
-            if operation_journal_status_is_terminal(entry.status) {
-                return Err(OperationJournalStoreError::AlreadyTerminal);
-            }
-            if entry.reconciliation_attempt.as_ref() != Some(terminal.attempt()) {
-                return Err(OperationJournalValidationError::ReconciliationTerminalMismatch.into());
-            }
-            entry.status = OperationStatus::Succeeded;
-            entry.completed_steps.push(completed_step);
-            entry.failure_point = None;
-            entry.outcome = Some(OperationOutcome::Succeeded);
-            entry.reconciliation_terminal = Some(terminal);
-            Ok(())
-        })?;
+        let ticket = self.update_expired_terminal_settlement(
+            operation_id,
+            WriteUrgency::Immediate,
+            |entry| {
+                if operation_journal_status_is_terminal(entry.status) {
+                    return Err(OperationJournalStoreError::AlreadyTerminal);
+                }
+                if entry.reconciliation_attempt.as_ref() != Some(terminal.attempt()) {
+                    return Err(
+                        OperationJournalValidationError::ReconciliationTerminalMismatch.into(),
+                    );
+                }
+                entry.status = OperationStatus::Succeeded;
+                entry.completed_steps.push(completed_step);
+                entry.failure_point = None;
+                entry.outcome = Some(OperationOutcome::Succeeded);
+                entry.reconciliation_terminal = Some(terminal);
+                Ok(())
+            },
+        )?;
         self.await_commit(ticket, mutation).await
     }
 
@@ -977,21 +1343,28 @@ impl OperationJournalStore {
         if terminal.outcome() != ReconciliationTerminalOutcome::Failed {
             return Err(OperationJournalValidationError::ReconciliationTerminalMismatch.into());
         }
+        self.validate_temporal_terminal_admission(&terminal)?;
         let mutation = self.mutation_gate.clone().lock_owned().await;
-        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
-            if operation_journal_status_is_terminal(entry.status) {
-                return Err(OperationJournalStoreError::AlreadyTerminal);
-            }
-            if entry.reconciliation_attempt.as_ref() != Some(terminal.attempt()) {
-                return Err(OperationJournalValidationError::ReconciliationTerminalMismatch.into());
-            }
-            entry.status = OperationStatus::Failed;
-            entry.completed_steps.push(failure_step);
-            entry.failure_point = Some(failure_point.into());
-            entry.outcome = Some(OperationOutcome::Failed);
-            entry.reconciliation_terminal = Some(terminal);
-            Ok(())
-        })?;
+        let ticket = self.update_expired_terminal_settlement(
+            operation_id,
+            WriteUrgency::Immediate,
+            |entry| {
+                if operation_journal_status_is_terminal(entry.status) {
+                    return Err(OperationJournalStoreError::AlreadyTerminal);
+                }
+                if entry.reconciliation_attempt.as_ref() != Some(terminal.attempt()) {
+                    return Err(
+                        OperationJournalValidationError::ReconciliationTerminalMismatch.into(),
+                    );
+                }
+                entry.status = OperationStatus::Failed;
+                entry.completed_steps.push(failure_step);
+                entry.failure_point = Some(failure_point.into());
+                entry.outcome = Some(OperationOutcome::Failed);
+                entry.reconciliation_terminal = Some(terminal);
+                Ok(())
+            },
+        )?;
         self.await_commit(ticket, mutation).await
     }
 
@@ -1023,7 +1396,7 @@ impl OperationJournalStore {
         {
             return Ok(acknowledged);
         }
-        let ticket = self.update_post_terminal_obligation(
+        let ticket = self.update_expired_terminal_ack(
             expected.operation_id(),
             WriteUrgency::Immediate,
             |entry| {
@@ -1048,29 +1421,36 @@ impl OperationJournalStore {
         operation_id: &OperationId,
         terminal: PersistedStateRepairTerminal,
     ) -> Result<(), OperationJournalStoreError> {
+        self.validate_temporal_persisted_state_repair_admission(&terminal)?;
         let mutation = self.mutation_gate.clone().lock_owned().await;
-        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
-            if operation_journal_status_is_terminal(entry.status) {
-                return Err(OperationJournalStoreError::AlreadyTerminal);
-            }
-            if entry.persisted_state_repair_attempt.as_ref() != Some(terminal.attempt()) {
-                return Err(OperationJournalValidationError::PersistedStateRepairMismatch.into());
-            }
-            let shape = persisted_state_repair_terminal_shape(terminal.outcome());
-            let mut completed_step = OperationJournalStep::new(
-                "quarantine_rejected_restart_record",
-                OperationPhase::Repairing,
-            );
-            completed_step.result = shape.step_result;
-            completed_step.changed_target = Some(terminal.attempt().target().clone());
-            completed_step.generated_facts = vec![shape.fact.to_string()];
-            entry.status = shape.status;
-            entry.completed_steps.push(completed_step);
-            entry.failure_point = shape.failure_point.map(str::to_string);
-            entry.outcome = Some(shape.outcome);
-            entry.persisted_state_repair_terminal = Some(terminal);
-            Ok(())
-        })?;
+        let ticket = self.update_expired_terminal_settlement(
+            operation_id,
+            WriteUrgency::Immediate,
+            |entry| {
+                if operation_journal_status_is_terminal(entry.status) {
+                    return Err(OperationJournalStoreError::AlreadyTerminal);
+                }
+                if entry.persisted_state_repair_attempt.as_ref() != Some(terminal.attempt()) {
+                    return Err(
+                        OperationJournalValidationError::PersistedStateRepairMismatch.into(),
+                    );
+                }
+                let shape = persisted_state_repair_terminal_shape(terminal.outcome());
+                let mut completed_step = OperationJournalStep::new(
+                    "quarantine_rejected_restart_record",
+                    OperationPhase::Repairing,
+                );
+                completed_step.result = shape.step_result;
+                completed_step.changed_target = Some(terminal.attempt().target().clone());
+                completed_step.generated_facts = vec![shape.fact.to_string()];
+                entry.status = shape.status;
+                entry.completed_steps.push(completed_step);
+                entry.failure_point = shape.failure_point.map(str::to_string);
+                entry.outcome = Some(shape.outcome);
+                entry.persisted_state_repair_terminal = Some(terminal);
+                Ok(())
+            },
+        )?;
         self.await_commit(ticket, mutation).await
     }
 
@@ -1193,6 +1573,7 @@ impl OperationJournalStore {
             }
             let entry = records
                 .visible
+                .entries
                 .get(operation_id)
                 .ok_or(OperationJournalStoreError::MissingOperation)?;
             if operation_journal_status_is_terminal(entry.status) {
@@ -1250,6 +1631,7 @@ impl OperationJournalStore {
                 let records = self.records.read().expect(OPERATION_JOURNAL_LOCK_INVARIANT);
                 let entry = records
                     .visible
+                    .entries
                     .get(operation_id)
                     .ok_or(OperationJournalStoreError::MissingOperation)?;
                 let Some(lifecycle) = entry.performance_lifecycle() else {
@@ -1352,7 +1734,7 @@ impl OperationJournalStore {
         urgency: WriteUrgency,
         update: impl FnOnce(&mut OperationJournalEntry) -> Result<(), OperationJournalStoreError>,
     ) -> Result<Option<PendingJournalCommit>, OperationJournalStoreError> {
-        self.update_with_policy(operation_id, urgency, false, false, update)
+        self.update_with_policy(operation_id, urgency, false, false, false, update)
     }
 
     fn update_performance(
@@ -1361,7 +1743,7 @@ impl OperationJournalStore {
         urgency: WriteUrgency,
         update: impl FnOnce(&mut OperationJournalEntry) -> Result<(), OperationJournalStoreError>,
     ) -> Result<Option<PendingJournalCommit>, OperationJournalStoreError> {
-        self.update_with_policy(operation_id, urgency, false, true, update)
+        self.update_with_policy(operation_id, urgency, false, true, false, update)
     }
 
     fn update_post_terminal_obligation(
@@ -1370,7 +1752,25 @@ impl OperationJournalStore {
         urgency: WriteUrgency,
         update: impl FnOnce(&mut OperationJournalEntry) -> Result<(), OperationJournalStoreError>,
     ) -> Result<Option<PendingJournalCommit>, OperationJournalStoreError> {
-        self.update_with_policy(operation_id, urgency, true, false, update)
+        self.update_with_policy(operation_id, urgency, true, false, false, update)
+    }
+
+    fn update_expired_terminal_ack(
+        &self,
+        operation_id: &OperationId,
+        urgency: WriteUrgency,
+        update: impl FnOnce(&mut OperationJournalEntry) -> Result<(), OperationJournalStoreError>,
+    ) -> Result<Option<PendingJournalCommit>, OperationJournalStoreError> {
+        self.update_with_policy(operation_id, urgency, true, false, true, update)
+    }
+
+    fn update_expired_terminal_settlement(
+        &self,
+        operation_id: &OperationId,
+        urgency: WriteUrgency,
+        update: impl FnOnce(&mut OperationJournalEntry) -> Result<(), OperationJournalStoreError>,
+    ) -> Result<Option<PendingJournalCommit>, OperationJournalStoreError> {
+        self.update_with_policy(operation_id, urgency, false, false, true, update)
     }
 
     fn update_with_policy(
@@ -1379,78 +1779,97 @@ impl OperationJournalStore {
         urgency: WriteUrgency,
         post_terminal_obligation: bool,
         performance_transition: bool,
+        allow_expired_terminal: bool,
         update: impl FnOnce(&mut OperationJournalEntry) -> Result<(), OperationJournalStoreError>,
     ) -> Result<Option<PendingJournalCommit>, OperationJournalStoreError> {
-        let mut records = self
+        let records = self
             .records
             .write()
             .expect(OPERATION_JOURNAL_LOCK_INVARIANT);
         if records.retry_candidate.is_some() {
             return Err(OperationJournalStoreError::RetryRequired);
         }
-        let mut candidate = records.visible.clone();
-        let entry = candidate
-            .get_mut(operation_id)
+        let mut candidate = clone_revision_entries(&records.visible.entries);
+        let accepted = candidate
+            .get(operation_id)
             .ok_or(OperationJournalStoreError::MissingOperation)?;
-        if entry.performance_lifecycle().is_some() && !performance_transition {
-            return Err(if operation_journal_status_is_terminal(entry.status) {
+        if accepted.performance_lifecycle().is_some() && !performance_transition {
+            return Err(if operation_journal_status_is_terminal(accepted.status) {
                 OperationJournalStoreError::AlreadyTerminal
             } else {
                 OperationJournalStoreError::AlreadyExists
             });
         }
-        if operation_journal_status_is_terminal(entry.status) && !post_terminal_obligation {
+        if operation_journal_status_is_terminal(accepted.status) && !post_terminal_obligation {
             return Err(OperationJournalStoreError::AlreadyTerminal);
         }
-        update(entry)?;
-        validate_entry(entry)?;
-        if !prune_records(&mut candidate, self.max_entries, None) {
-            return Err(OperationJournalStoreError::CapacityExhausted);
-        }
-        let next_sequence = records.next_sequence;
-        self.accept_candidate(&mut records, candidate, next_sequence, urgency)
+        let mut entry = accepted.entry.clone();
+        update(&mut entry)?;
+        validate_journal_temporal_admission(&self.temporal, &entry, allow_expired_terminal)?;
+        let replacement = AcceptedJournalEntry::accept(entry)?;
+        let mut entries_bytes = checked_replaced_entries_bytes(
+            records.visible.entries_bytes,
+            accepted.canonical.len(),
+            replacement.canonical.len(),
+        )?;
+        candidate.insert(operation_id.clone(), replacement);
+        let removed_bytes = prune_records(&mut candidate, self.max_entries, None, &self.temporal)
+            .ok_or(OperationJournalStoreError::CapacityExhausted)?;
+        entries_bytes -= removed_bytes;
+        let next_sequence = records.visible.next_sequence;
+        self.accept_candidate(records, candidate, next_sequence, entries_bytes, urgency)
     }
 
     fn accept_candidate(
         &self,
-        records: &mut OperationJournalRecords,
-        candidate: BTreeMap<OperationId, OperationJournalEntry>,
+        records: RwLockWriteGuard<'_, OperationJournalRecords>,
+        candidate: OrdMap<OperationId, Arc<AcceptedJournalEntry>>,
         next_sequence: u64,
+        entries_bytes: usize,
         urgency: WriteUrgency,
     ) -> Result<Option<PendingJournalCommit>, OperationJournalStoreError> {
-        let snapshot = OperationJournalSnapshot::with_next_sequence(
-            candidate.values().cloned().collect(),
-            next_sequence,
-        )?;
-        let encoded = encode_snapshot(snapshot).map_err(OperationJournalStoreError::Persistence)?;
-        let ticket = self
-            .persistence
-            .as_ref()
-            .map(|persistence| {
+        drop(records);
+        let candidate =
+            AcceptedJournalRevision::accept_changed(candidate, next_sequence, entries_bytes)?;
+        let ticket = if let Some(persistence) = &self.persistence {
+            let encoding = candidate
+                .encoding(
+                    #[cfg(test)]
+                    self.encoding_test_hook
+                        .next
+                        .lock()
+                        .expect("encoding test hook lock")
+                        .take(),
+                )
+                .map_err(OperationJournalStoreError::Persistence)?;
+            Some(
                 persistence
                     .writer
-                    .accept_encoded(encoded, urgency)
-                    .map_err(|error| OperationJournalStoreError::Persistence(error.into()))
-            })
-            .transpose()?;
+                    .accept(encoding, urgency, AcceptedJournalEncoding::assemble)
+                    .map_err(|error| OperationJournalStoreError::Persistence(error.into()))?,
+            )
+        } else {
+            None
+        };
+        let mut records = self
+            .records
+            .write()
+            .expect(OPERATION_JOURNAL_LOCK_INVARIANT);
         records.retry_candidate = None;
         let Some(ticket) = ticket else {
             records.visible = candidate;
-            records.next_sequence = next_sequence;
             return Ok(None);
         };
         let revision = ticket.revision().get();
         if urgency == WriteUrgency::Debounced {
             records.visible = candidate;
             records.visible_revision = revision;
-            records.next_sequence = next_sequence;
             return Ok(None);
         }
         Ok(Some(PendingJournalCommit {
             ticket,
             revision,
             candidate,
-            next_sequence,
         }))
     }
 
@@ -1459,8 +1878,36 @@ impl OperationJournalStore {
             .read()
             .expect(OPERATION_JOURNAL_LOCK_INVARIANT)
             .visible
+            .entries
             .values()
-            .cloned()
+            .map(|entry| entry.entry.clone())
+            .collect()
+    }
+
+    pub(crate) fn any_matching(
+        &self,
+        mut matches: impl FnMut(&OperationJournalEntry) -> bool,
+    ) -> bool {
+        self.records
+            .read()
+            .expect(OPERATION_JOURNAL_LOCK_INVARIANT)
+            .visible
+            .entries
+            .values()
+            .any(|entry| matches(entry))
+    }
+
+    pub(crate) fn matching_entries(
+        &self,
+        mut matches: impl FnMut(&OperationJournalEntry) -> bool,
+    ) -> Vec<OperationJournalEntry> {
+        let records = self.records.read().expect(OPERATION_JOURNAL_LOCK_INVARIANT);
+        records
+            .visible
+            .entries
+            .values()
+            .filter(|entry| matches(entry))
+            .map(|entry| entry.entry.clone())
             .collect()
     }
 
@@ -1474,10 +1921,7 @@ impl OperationJournalStore {
 
     pub fn snapshot(&self) -> Result<OperationJournalSnapshot, OperationJournalLoadError> {
         let records = self.records.read().expect(OPERATION_JOURNAL_LOCK_INVARIANT);
-        OperationJournalSnapshot::with_next_sequence(
-            records.visible.values().cloned().collect(),
-            records.next_sequence,
-        )
+        Ok(records.visible.snapshot())
     }
 
     pub fn load_snapshot(
@@ -1486,22 +1930,86 @@ impl OperationJournalStore {
     ) -> Result<(), OperationJournalLoadError> {
         snapshot.validate()?;
         let next_sequence = snapshot.next_sequence;
-        let mut candidate = BTreeMap::new();
+        let mut candidate = OrdMap::new();
+        let mut current_entries = Vec::new();
+        let mut expired_entries = Vec::new();
+        let mut temporal_load_issues = BoundedTemporalLoadIssueCounts::default();
         for entry in snapshot.entries {
-            candidate.insert(entry.operation_id.clone(), entry);
+            match assess_journal_temporal(&self.temporal, &entry) {
+                Ok(BoundedTemporalDisposition::Current) => current_entries.push(entry),
+                Ok(BoundedTemporalDisposition::Expired) => expired_entries.push(entry),
+                Err(BoundedTemporalViolation::ObservationTooFarInFuture) => {
+                    temporal_load_issues
+                        .record(BoundedTemporalViolation::ObservationTooFarInFuture);
+                    continue;
+                }
+                Err(BoundedTemporalViolation::SuppressionWindowOutOfBounds) => {
+                    temporal_load_issues
+                        .record(BoundedTemporalViolation::SuppressionWindowOutOfBounds);
+                    continue;
+                }
+                Err(BoundedTemporalViolation::MalformedTimestamp) => {
+                    return Err(temporal_journal_validation_error(&entry).into());
+                }
+            }
         }
-        if !prune_records(&mut candidate, self.max_entries, None) {
-            return Err(OperationJournalLoadError::TooManyEntries);
+        let referenced_predecessors = live_journal_predecessor_obligations(&current_entries);
+        current_entries.extend(expired_entries.into_iter().filter(|entry| {
+            operation_journal_status_is_terminal(entry.status)
+                && referenced_predecessors.contains(&entry.operation_id)
+        }));
+        for entry in current_entries {
+            let canonical = serde_json::to_vec(&entry)
+                .map(Arc::<[u8]>::from)
+                .map_err(OperationJournalLoadError::Json)?;
+            candidate.insert(
+                entry.operation_id.clone(),
+                Arc::new(AcceptedJournalEntry { entry, canonical }),
+            );
         }
+        prune_records(&mut candidate, self.max_entries, None, &self.temporal)
+            .ok_or(OperationJournalLoadError::TooManyEntries)?;
         let mut records = self
             .records
             .write()
             .expect(OPERATION_JOURNAL_LOCK_INVARIANT);
-        records.visible = candidate;
+        records.visible = AcceptedJournalRevision::accept_loaded(candidate, next_sequence)
+            .map_err(|_| OperationJournalLoadError::TooLarge)?;
         records.visible_revision = 0;
-        records.next_sequence = next_sequence;
         records.retry_candidate = None;
+        self.temporal_future_observation_count
+            .store(temporal_load_issues.future_observation(), Ordering::Release);
+        self.temporal_out_of_bounds_window_count.store(
+            temporal_load_issues.out_of_bounds_window(),
+            Ordering::Release,
+        );
         Ok(())
+    }
+
+    fn validate_temporal_terminal_admission(
+        &self,
+        terminal: &ReconciliationTerminal,
+    ) -> Result<(), OperationJournalStoreError> {
+        match self
+            .temporal
+            .assess(reconciliation_temporal_record(terminal))
+        {
+            Ok(BoundedTemporalDisposition::Current | BoundedTemporalDisposition::Expired) => Ok(()),
+            Err(_) => Err(OperationJournalValidationError::InvalidReconciliationTerminal.into()),
+        }
+    }
+
+    fn validate_temporal_persisted_state_repair_admission(
+        &self,
+        terminal: &PersistedStateRepairTerminal,
+    ) -> Result<(), OperationJournalStoreError> {
+        match self
+            .temporal
+            .assess(persisted_state_repair_temporal_record(terminal))
+        {
+            Ok(BoundedTemporalDisposition::Current | BoundedTemporalDisposition::Expired) => Ok(()),
+            Err(_) => Err(OperationJournalValidationError::InvalidPersistedStateRepair.into()),
+        }
     }
 
     pub async fn flush(&self) -> Result<(), OperationJournalStoreError> {
@@ -1614,17 +2122,15 @@ impl OperationJournalStore {
             records
                 .retry_candidate
                 .as_ref()
-                .filter(|(candidate_revision, _, _)| *candidate_revision == revision)
-                .map(|(_, candidate, next_sequence)| (candidate.clone(), *next_sequence))
-                .unwrap_or_else(|| (records.visible.clone(), records.next_sequence))
+                .filter(|(candidate_revision, _)| *candidate_revision == revision)
+                .map(|(_, candidate)| candidate.clone())
+                .unwrap_or_else(|| records.visible.clone())
         };
-        let (candidate, next_sequence) = candidate;
         self.await_commit_holding_gate(
             Some(PendingJournalCommit {
                 ticket,
                 revision,
                 candidate,
-                next_sequence,
             }),
             mutation,
         )
@@ -1658,7 +2164,6 @@ impl OperationJournalStore {
                     if records.visible_revision < commit.revision {
                         records.visible = commit.candidate;
                         records.visible_revision = commit.revision;
-                        records.next_sequence = commit.next_sequence;
                     }
                     records.retry_candidate = None;
                     Ok(())
@@ -1667,8 +2172,7 @@ impl OperationJournalStore {
                     records
                         .write()
                         .expect(OPERATION_JOURNAL_LOCK_INVARIANT)
-                        .retry_candidate =
-                        Some((commit.revision, commit.candidate, commit.next_sequence));
+                        .retry_candidate = Some((commit.revision, commit.candidate));
                     Err(error)
                 }
             };
@@ -1760,6 +2264,14 @@ impl Default for OperationJournalStore {
     }
 }
 
+#[cfg(test)]
+fn clone_matching<'a, T: Clone + 'a>(
+    values: impl Iterator<Item = &'a T>,
+    mut matches: impl FnMut(&T) -> bool,
+) -> Vec<T> {
+    values.filter(|value| matches(*value)).cloned().collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationJournalSnapshot {
@@ -1770,19 +2282,6 @@ pub struct OperationJournalSnapshot {
 
 impl OperationJournalSnapshot {
     pub fn new(
-        entries: Vec<OperationJournalEntry>,
-        next_sequence: u64,
-    ) -> Result<Self, OperationJournalLoadError> {
-        let snapshot = Self {
-            schema: OPERATION_JOURNAL_SCHEMA.to_string(),
-            next_sequence,
-            entries,
-        };
-        snapshot.validate()?;
-        Ok(snapshot)
-    }
-
-    fn with_next_sequence(
         entries: Vec<OperationJournalEntry>,
         next_sequence: u64,
     ) -> Result<Self, OperationJournalLoadError> {
@@ -1811,9 +2310,6 @@ impl OperationJournalSnapshot {
     fn validate(&self) -> Result<(), OperationJournalLoadError> {
         if self.schema != OPERATION_JOURNAL_SCHEMA {
             return Err(OperationJournalLoadError::InvalidSchema);
-        }
-        if self.entries.len() > DEFAULT_OPERATION_JOURNAL_LIMIT {
-            return Err(OperationJournalLoadError::TooManyEntries);
         }
         let mut operation_ids = BTreeSet::new();
         let mut sequences = BTreeSet::new();
@@ -3100,57 +3596,178 @@ fn has_long_secret_like_segment(value: &str) -> bool {
         })
 }
 
+fn checked_replaced_entries_bytes(
+    entries_bytes: usize,
+    previous_bytes: usize,
+    replacement_bytes: usize,
+) -> Result<usize, OperationJournalStoreError> {
+    entries_bytes
+        .checked_sub(previous_bytes)
+        .and_then(|total| total.checked_add(replacement_bytes))
+        .ok_or_else(|| OperationJournalStoreError::Persistence(snapshot_too_large()))
+}
+
+fn clone_revision_entries(
+    entries: &OrdMap<OperationId, Arc<AcceptedJournalEntry>>,
+) -> OrdMap<OperationId, Arc<AcceptedJournalEntry>> {
+    entries.clone()
+}
+
 fn prune_records(
-    records: &mut BTreeMap<OperationId, OperationJournalEntry>,
+    records: &mut OrdMap<OperationId, Arc<AcceptedJournalEntry>>,
     max_entries: usize,
     protected_key: Option<&OperationId>,
-) -> bool {
-    let referenced_predecessors = records
-        .values()
-        .filter(|entry| {
-            matches!(
-                entry.status,
-                OperationStatus::Planned | OperationStatus::Running
-            ) && entry.reconciliation_terminal().is_none()
-        })
-        .filter_map(OperationJournalEntry::reconciliation_attempt)
-        .filter_map(|attempt| match attempt.lineage() {
-            ReconciliationLineage::Predecessor { operation_id } => Some(operation_id.clone()),
-            ReconciliationLineage::Initial => None,
-        })
-        .collect::<BTreeSet<_>>();
+    temporal: &BoundedTemporalPolicy,
+) -> Option<usize> {
+    if records.len() <= max_entries {
+        return Some(0);
+    }
+    let referenced_predecessors =
+        live_journal_predecessor_obligations(records.values().map(|entry| &entry.entry));
+    let mut removed_bytes = 0usize;
     while records.len() > max_entries {
-        let Some(key) = records
+        let key = records
             .iter()
             .filter(|(key, entry)| {
                 protected_key != Some(*key)
                     && !referenced_predecessors.contains(*key)
                     && operation_journal_status_is_terminal(entry.status)
-                    && !active_reconciliation_terminal(entry)
+                    && !active_reconciliation_terminal(entry, temporal)
             })
             .min_by_key(|(_, entry)| entry.sequence)
-            .map(|(key, _)| key.clone())
-        else {
-            return false;
-        };
-        records.remove(&key);
+            .map(|(key, _)| key.clone())?;
+        let removed = records
+            .remove(&key)
+            .expect("selected operation journal record exists");
+        removed_bytes = removed_bytes.checked_add(removed.canonical.len())?;
     }
-    true
+    Some(removed_bytes)
 }
 
-fn active_reconciliation_terminal(entry: &OperationJournalEntry) -> bool {
+fn live_journal_predecessor_obligations<'a>(
+    entries: impl IntoIterator<Item = &'a OperationJournalEntry>,
+) -> BTreeSet<OperationId> {
+    let mut referenced = BTreeSet::new();
+    for entry in entries.into_iter().filter(|entry| {
+        matches!(
+            entry.status,
+            OperationStatus::Planned | OperationStatus::Running
+        ) && entry.reconciliation_terminal().is_none()
+            && entry.persisted_state_repair_terminal().is_none()
+    }) {
+        if let Some(operation_id) = &entry.parent_operation_id {
+            referenced.insert(operation_id.clone());
+        }
+        if let Some(ReconciliationLineage::Predecessor { operation_id }) = entry
+            .reconciliation_attempt()
+            .map(ReconciliationAttempt::lineage)
+        {
+            referenced.insert(operation_id.clone());
+        }
+    }
+    referenced
+}
+
+fn active_reconciliation_terminal(
+    entry: &OperationJournalEntry,
+    temporal: &BoundedTemporalPolicy,
+) -> bool {
     entry.reconciliation_terminal().is_some_and(|terminal| {
-        terminal
-            .version_bundle_publication()
-            .is_some_and(|publication| publication.is_pending())
-            || chrono::DateTime::parse_from_rfc3339(terminal.suppression_until())
-                .is_ok_and(|until| until > chrono::Utc::now())
+        temporal
+            .assess(reconciliation_temporal_record(terminal))
+            .is_ok_and(|disposition| disposition == BoundedTemporalDisposition::Current)
     }) || entry
         .persisted_state_repair_terminal()
-        .and_then(|terminal| {
-            chrono::DateTime::parse_from_rfc3339(terminal.suppression_until()).ok()
+        .is_some_and(|terminal| {
+            temporal
+                .assess(persisted_state_repair_temporal_record(terminal))
+                .is_ok_and(|disposition| disposition == BoundedTemporalDisposition::Current)
         })
-        .is_some_and(|until| until > chrono::Utc::now())
+}
+
+fn reconciliation_temporal_record(terminal: &ReconciliationTerminal) -> BoundedTemporalRecord<'_> {
+    BoundedTemporalRecord {
+        first_observed_at: terminal.observed_at(),
+        last_observed_at: terminal.observed_at(),
+        suppression_until: Some(terminal.suppression_until()),
+        pending: terminal
+            .version_bundle_publication()
+            .is_some_and(|publication| publication.is_pending()),
+    }
+}
+
+fn reconciliation_attempt_temporal_record(
+    attempt: &ReconciliationAttempt,
+) -> BoundedTemporalRecord<'_> {
+    BoundedTemporalRecord {
+        first_observed_at: attempt.observed_at(),
+        last_observed_at: attempt.observed_at(),
+        suppression_until: Some(attempt.suppression_until()),
+        pending: true,
+    }
+}
+
+fn persisted_state_repair_temporal_record(
+    terminal: &PersistedStateRepairTerminal,
+) -> BoundedTemporalRecord<'_> {
+    BoundedTemporalRecord {
+        first_observed_at: terminal.attempt().observed_at(),
+        last_observed_at: terminal.attempt().observed_at(),
+        suppression_until: Some(terminal.suppression_until()),
+        pending: false,
+    }
+}
+
+fn persisted_state_repair_attempt_temporal_record(
+    attempt: &PersistedStateRepairAttempt,
+) -> BoundedTemporalRecord<'_> {
+    BoundedTemporalRecord {
+        first_observed_at: attempt.observed_at(),
+        last_observed_at: attempt.observed_at(),
+        suppression_until: Some(attempt.suppression_until()),
+        pending: true,
+    }
+}
+
+fn assess_journal_temporal(
+    temporal: &BoundedTemporalPolicy,
+    entry: &OperationJournalEntry,
+) -> Result<BoundedTemporalDisposition, BoundedTemporalViolation> {
+    if let Some(terminal) = entry.reconciliation_terminal() {
+        temporal.assess(reconciliation_temporal_record(terminal))
+    } else if let Some(terminal) = entry.persisted_state_repair_terminal() {
+        temporal.assess(persisted_state_repair_temporal_record(terminal))
+    } else if let Some(attempt) = entry.reconciliation_attempt() {
+        temporal.assess(reconciliation_attempt_temporal_record(attempt))
+    } else if let Some(attempt) = entry.persisted_state_repair_attempt() {
+        temporal.assess(persisted_state_repair_attempt_temporal_record(attempt))
+    } else {
+        Ok(BoundedTemporalDisposition::Current)
+    }
+}
+
+fn temporal_journal_validation_error(
+    entry: &OperationJournalEntry,
+) -> OperationJournalValidationError {
+    if entry.persisted_state_repair_attempt().is_some() {
+        OperationJournalValidationError::InvalidPersistedStateRepair
+    } else {
+        OperationJournalValidationError::InvalidReconciliationTerminal
+    }
+}
+
+fn validate_journal_temporal_admission(
+    temporal: &BoundedTemporalPolicy,
+    entry: &OperationJournalEntry,
+    allow_expired_terminal: bool,
+) -> Result<(), OperationJournalStoreError> {
+    match assess_journal_temporal(temporal, entry) {
+        Ok(BoundedTemporalDisposition::Current) => Ok(()),
+        Ok(BoundedTemporalDisposition::Expired) if allow_expired_terminal => Ok(()),
+        Ok(BoundedTemporalDisposition::Expired) | Err(_) => {
+            Err(temporal_journal_validation_error(entry).into())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3158,32 +3775,39 @@ pub(crate) fn operation_journal_path(paths: &AppPaths) -> PathBuf {
     paths.operation_journal_file().to_path_buf()
 }
 
+#[cfg(test)]
 fn encode_snapshot(snapshot: OperationJournalSnapshot) -> io::Result<Vec<u8>> {
     let encoded = snapshot
         .to_json()
         .map(String::into_bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if encoded.len() as u64 > MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "operation journal snapshot exceeds its persistence bound",
-        ));
+        return Err(snapshot_too_large());
     }
     Ok(encoded)
+}
+
+fn snapshot_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "operation journal snapshot exceeds its persistence bound",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        OPERATION_JOURNAL_LOCK_INVARIANT, OPERATION_JOURNAL_SCHEMA, OperationJournalReconciliation,
-        OperationJournalSnapshot, OperationJournalStore, OperationJournalStoreError,
-        OperationRestartDisposition, PerformanceOperationCreateError,
-        PerformanceOperationTransition, apply_performance_transition, operation_journal_path,
+        AcceptedJournalEntry, AcceptedJournalRevision, OPERATION_JOURNAL_LOCK_INVARIANT,
+        OPERATION_JOURNAL_SCHEMA, OperationJournalReconciliation, OperationJournalSnapshot,
+        OperationJournalStore, OperationJournalStoreError, OperationRestartDisposition,
+        PerformanceOperationCreateError, PerformanceOperationTransition,
+        apply_performance_transition, clone_matching, operation_journal_path,
         operation_journal_plan_is_visible, performance_guardian_evidence_matches,
         safe_generated_fact,
     };
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator, WriteUrgency};
     use crate::guardian::DiagnosisId;
+    use crate::guardian::{GuardianDomain, GuardianMode};
     use crate::state::contracts::{
         CommandKind, JournalId, OperationId, OperationIntent, OperationJournalEntry,
         OperationJournalStep, OperationOutcome, OperationPhase, OperationStatus,
@@ -3191,10 +3815,11 @@ mod tests {
         PerformanceOperationIntent, PerformanceOperationPhase, PerformanceOperationPrepared,
         PerformanceOperationTerminal, PerformancePreparedProof, PerformanceRollbackTarget,
         ReconciliationComponent, ReconciliationRung, ReconciliationScope,
-        ReconciliationTerminalOutcome, RollbackState, StabilizationSystem, TargetDescriptor,
-        TargetKind,
+        ReconciliationTerminalOutcome, ReconciliationVersionBundleOutcome, RollbackState,
+        StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use axial_config::AppPaths;
+    use im::OrdMap;
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -3204,10 +3829,96 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
 
-    const OPERATION_JOURNALS_V8_FIXTURE: &str = include_str!(concat!(
+    struct TestJournalClock {
+        reading: Mutex<crate::state::temporal::TemporalClockReading>,
+    }
+
+    impl TestJournalClock {
+        fn new(wall: chrono::DateTime<chrono::Utc>) -> Self {
+            Self {
+                reading: Mutex::new(crate::state::temporal::TemporalClockReading {
+                    wall,
+                    monotonic: Duration::ZERO,
+                }),
+            }
+        }
+
+        fn advance(&self, elapsed: Duration) {
+            let mut reading = self.reading.lock().expect("test journal clock lock");
+            reading.monotonic = reading.monotonic.saturating_add(elapsed);
+        }
+    }
+
+    impl crate::state::temporal::TemporalClock for TestJournalClock {
+        fn read(&self) -> crate::state::temporal::TemporalClockReading {
+            *self.reading.lock().expect("test journal clock lock")
+        }
+    }
+
+    const OPERATION_JOURNALS_V9_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/operation-journals-v8.json"
+        "/tests/fixtures/guardian/operation-journals-v9.json"
     ));
+
+    #[test]
+    fn p03_b02_narrow_queries_clone_only_matches_and_preserve_exact_order() {
+        struct CloneProbe {
+            id: usize,
+            clones: Arc<AtomicUsize>,
+        }
+
+        impl Clone for CloneProbe {
+            fn clone(&self) -> Self {
+                self.clones.fetch_add(1, Ordering::SeqCst);
+                Self {
+                    id: self.id,
+                    clones: self.clones.clone(),
+                }
+            }
+        }
+
+        let clones = Arc::new(AtomicUsize::new(0));
+        let probes = (0..5)
+            .map(|id| CloneProbe {
+                id,
+                clones: clones.clone(),
+            })
+            .collect::<Vec<_>>();
+        let selected = clone_matching(probes.iter(), |probe| probe.id == 1 || probe.id == 4);
+        assert_eq!(
+            selected.iter().map(|probe| probe.id).collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        assert_eq!(clones.load(Ordering::SeqCst), selected.len());
+
+        let store = OperationJournalStore::new();
+        let mut entries = ["narrow-c", "narrow-a", "narrow-b"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut entry = test_entry(id);
+                entry.sequence = (index + 1) as u64;
+                entry
+            })
+            .collect::<Vec<_>>();
+        let snapshot = OperationJournalSnapshot::new(std::mem::take(&mut entries), 4)
+            .expect("valid narrow-query snapshot");
+        store
+            .load_snapshot(snapshot)
+            .expect("load narrow-query snapshot");
+
+        let expected = store
+            .list()
+            .into_iter()
+            .filter(|entry| entry.sequence != 2)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            store.matching_entries(|entry| entry.sequence != 2),
+            expected
+        );
+        assert!(store.any_matching(|entry| entry.sequence == 3));
+        assert!(!store.any_matching(|entry| entry.sequence == 9));
+    }
 
     #[test]
     fn guardian_memory_binding_generated_fact_has_exact_safe_shape() {
@@ -5045,14 +5756,14 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_operation_journals_v8_fixture_is_strict() {
-        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V8_FIXTURE)
+    fn checked_in_operation_journals_v9_fixture_is_strict() {
+        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V9_FIXTURE)
             .expect("strict fixture");
         assert_eq!(
             super::OPERATION_JOURNAL_SCHEMA,
-            "axial.state.operation_journals.v8"
+            "axial.state.operation_journals.v9"
         );
-        assert_eq!(snapshot.schema, "axial.state.operation_journals.v8");
+        assert_eq!(snapshot.schema, "axial.state.operation_journals.v9");
         assert_eq!(snapshot.next_sequence, 8);
         assert_eq!(
             snapshot
@@ -5165,7 +5876,7 @@ mod tests {
         ));
 
         let mut unknown_snapshot =
-            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V8_FIXTURE)
+            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V9_FIXTURE)
                 .expect("fixture value");
         unknown_snapshot["entries"][0]["guardian_diagnosis_ids"][0] =
             serde_json::Value::String("future_diagnosis".to_string());
@@ -5175,7 +5886,7 @@ mod tests {
         assert!(!error.contains("future_diagnosis"));
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V8_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V9_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded =
@@ -5289,7 +6000,7 @@ mod tests {
         let path = operation_journal_path(&paths);
         fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
         let future =
-            r#"{"schema":"axial.state.operation_journals.v9","next_sequence":1,"entries":[]}"#;
+            r#"{"schema":"axial.state.operation_journals.v10","next_sequence":1,"entries":[]}"#;
         fs::write(&path, future).expect("write future journal snapshot");
 
         let result = OperationJournalStore::try_load_from_paths(&paths);
@@ -5308,10 +6019,10 @@ mod tests {
 
     #[test]
     fn previous_operation_journal_schema_is_strict_invalid_and_preserved_byte_exact() {
-        let legacy = OPERATION_JOURNALS_V8_FIXTURE
+        let legacy = OPERATION_JOURNALS_V9_FIXTURE
             .replacen(
+                "axial.state.operation_journals.v9",
                 "axial.state.operation_journals.v8",
-                "axial.state.operation_journals.v7",
                 1,
             )
             .replacen("artifact_ownership_unsafe", "launch_command_prepared", 1);
@@ -5320,11 +6031,11 @@ mod tests {
             Err(super::OperationJournalLoadError::InvalidSchema)
         ));
 
-        let root = test_root("preserve-v7-schema");
+        let root = test_root("preserve-v8-schema");
         let paths = test_paths(&root);
         let path = operation_journal_path(&paths);
         fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
-        fs::write(&path, legacy.as_bytes()).expect("write v7 journal snapshot");
+        fs::write(&path, legacy.as_bytes()).expect("write v8 journal snapshot");
 
         assert!(matches!(
             OperationJournalStore::try_load_from_paths(&paths),
@@ -5333,7 +6044,7 @@ mod tests {
             ))
         ));
         assert_eq!(
-            fs::read(&path).expect("v6 journal remains"),
+            fs::read(&path).expect("v8 journal remains"),
             legacy.as_bytes()
         );
         cleanup(&root);
@@ -5402,7 +6113,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_snapshot_encoder_accepts_the_exact_size_bound_and_rejects_one_more_byte() {
+    fn p03_b02_contract_journal_snapshot_encoder_accepts_exact_bound_and_rejects_one_more_byte() {
         let mut snapshot = OperationJournalSnapshot {
             schema: String::new(),
             next_sequence: 1,
@@ -5430,8 +6141,135 @@ mod tests {
         );
     }
 
+    #[test]
+    fn p03_b02_contract_revision_reuses_unchanged_entries_and_encodes_canonically() {
+        let mut entries = OrdMap::new();
+        for index in 0..super::DEFAULT_OPERATION_JOURNAL_LIMIT {
+            let mut entry = test_entry(&format!("operation-p03-b02-cached-{index:03}"));
+            entry.sequence = index as u64 + 1;
+            entries.insert(
+                entry.operation_id.clone(),
+                AcceptedJournalEntry::accept(entry).expect("accept valid cached entry"),
+            );
+        }
+        let original = AcceptedJournalRevision::accept_loaded(
+            entries,
+            super::DEFAULT_OPERATION_JOURNAL_LIMIT as u64 + 1,
+        )
+        .expect("accept maximum-cardinality revision");
+        let encoded = original
+            .encoding(None)
+            .expect("preallocate exact encoding")
+            .assemble()
+            .expect("assemble infallible canonical encoding");
+        assert_eq!(
+            encoded,
+            serde_json::to_vec(&original.snapshot()).expect("reference snapshot encoding")
+        );
+        assert_eq!(encoded.len(), original.encoded_len);
+
+        let changed_id = original
+            .entries
+            .keys()
+            .next()
+            .expect("cached entry")
+            .clone();
+        let mut changed = original
+            .entries
+            .get(&changed_id)
+            .expect("changed cached entry")
+            .entry
+            .clone();
+        changed
+            .completed_steps
+            .push(completed_step("cached_entry_changed"));
+        let mut changed_entries = original.entries.clone();
+        changed_entries.insert(
+            changed_id.clone(),
+            AcceptedJournalEntry::accept(changed).expect("accept changed entry"),
+        );
+        let replacement = changed_entries
+            .get(&changed_id)
+            .expect("changed accepted entry");
+        let changed_entries_bytes = super::checked_replaced_entries_bytes(
+            original.entries_bytes,
+            original
+                .entries
+                .get(&changed_id)
+                .expect("original accepted entry")
+                .canonical
+                .len(),
+            replacement.canonical.len(),
+        )
+        .expect("account changed entry bytes");
+        let changed = AcceptedJournalRevision::accept_changed(
+            changed_entries,
+            super::DEFAULT_OPERATION_JOURNAL_LIMIT as u64 + 1,
+            changed_entries_bytes,
+        )
+        .expect("accept changed revision");
+
+        assert_eq!(
+            original
+                .entries
+                .iter()
+                .filter(|(operation_id, entry)| {
+                    *operation_id != &changed_id
+                        && Arc::ptr_eq(
+                            entry,
+                            changed.entries.get(*operation_id).expect("retained entry"),
+                        )
+                })
+                .count(),
+            super::DEFAULT_OPERATION_JOURNAL_LIMIT - 1
+        );
+        assert!(!Arc::ptr_eq(
+            original.entries.get(&changed_id).expect("original entry"),
+            changed.entries.get(&changed_id).expect("changed entry")
+        ));
+    }
+
+    #[test]
+    fn p03_b02_contract_revision_accounts_exact_eight_mib_before_encoding() {
+        let mut entry = test_entry("operation-p03-b02-exact-size");
+        entry.sequence = 1;
+        let operation_id = entry.operation_id.clone();
+        let accepted = AcceptedJournalEntry::accept(entry).expect("accept size test entry");
+        let fixed = super::OPERATION_JOURNAL_SNAPSHOT_PREFIX.len()
+            + 1
+            + super::OPERATION_JOURNAL_SNAPSHOT_ENTRIES_PREFIX.len()
+            + super::OPERATION_JOURNAL_SNAPSHOT_SUFFIX.len();
+        let exact_entry_bytes = super::MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES as usize - fixed;
+        let exact = Arc::new(AcceptedJournalEntry {
+            entry: accepted.entry.clone(),
+            canonical: Arc::from(vec![b'x'; exact_entry_bytes]),
+        });
+        let exact = AcceptedJournalRevision::accept_loaded(
+            OrdMap::from(vec![(operation_id.clone(), exact)]),
+            2,
+        )
+        .expect("accept exact 8 MiB aggregate");
+        assert_eq!(
+            exact.encoded_len as u64,
+            super::MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES
+        );
+
+        let oversized = Arc::new(AcceptedJournalEntry {
+            entry: accepted.entry.clone(),
+            canonical: Arc::from(vec![b'x'; exact_entry_bytes + 1]),
+        });
+        assert!(matches!(
+            AcceptedJournalRevision::accept_loaded(
+                OrdMap::from(vec![(operation_id, oversized)]),
+                2,
+            ),
+            Err(OperationJournalStoreError::Persistence(error))
+                if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
     #[tokio::test]
-    async fn oversized_valid_candidate_is_rejected_before_acceptance_without_latching_retry() {
+    async fn p03_b02_contract_oversized_candidate_is_rejected_before_visibility() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("oversized-candidate-preflight");
         let mut oversized = test_entry("operation-oversized-candidate");
@@ -5635,6 +6473,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn p03_b02_contract_blocked_encoder_keeps_queries_responsive_and_candidate_hidden() {
+        let (root, _paths, _backend, _coordinator, store) =
+            persistence_fixture("p03-b02-blocked-encoder-query");
+        let store = Arc::new(store);
+        let operation_id = OperationId::deterministic_test("operation-p03-b02-blocked-encoder");
+        store
+            .create(planned_entry(&operation_id))
+            .await
+            .expect("create journal before blocked encoding");
+        let gate = store.gate_next_encoding();
+        let update_store = store.clone();
+        let update_id = operation_id.clone();
+        let update = tokio::spawn(async move {
+            update_store
+                .record_checkpoint(&update_id, completed_step("encoded_off_lock"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_entered())
+            .await
+            .expect("encoder reaches blocking worker");
+
+        let query_started = std::time::Instant::now();
+        let visible = store.get(&operation_id).expect("last committed journal");
+        let listed = store.list();
+        let snapshot = store.snapshot().expect("query immutable revision");
+        assert!(query_started.elapsed() < Duration::from_millis(100));
+        assert!(visible.completed_steps.is_empty());
+        assert_eq!(listed.len(), 1);
+        assert!(snapshot.entries[0].completed_steps.is_empty());
+
+        gate.release();
+        update
+            .await
+            .expect("update task")
+            .expect("commit off-lock encoding");
+        assert_eq!(
+            store
+                .get(&operation_id)
+                .expect("committed checkpoint")
+                .completed_steps
+                .len(),
+            1
+        );
+        store.close().await.expect("close journal store");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
     async fn initial_journal_is_hidden_until_the_physical_commit_finishes() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("gated-initial-visibility");
@@ -5782,7 +6668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn progress_burst_coalesces_and_reloads_the_latest_snapshot() {
+    async fn p03_b02_contract_cross_owner_coalesced_revision_reloads_exactly() {
         let (root, paths, backend, coordinator, store) =
             persistence_fixture("progress-burst-reload");
         let operation_id = OperationId::deterministic_test("operation-progress-burst");
@@ -5817,7 +6703,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_retries_latest_failed_debounced_progress_and_reloads_it() {
+    async fn p03_b02_contract_failed_debounced_commit_retries_latest_snapshot() {
         let (root, paths, backend, coordinator, store) =
             persistence_fixture("close-retries-debounced-progress");
         let operation_id = OperationId::deterministic_test("operation-close-progress-retry");
@@ -5858,7 +6744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn physical_failure_stays_hidden_and_retry_publishes_latest_candidate() {
+    async fn p03_b02_contract_failed_immediate_commit_retries_exact_hidden_candidate() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("failure-retry-latest");
         let store = Arc::new(store);
@@ -6234,6 +7120,461 @@ mod tests {
                 aggregate_bytes: 4096,
             },
         }
+    }
+
+    fn temporal_reconciliation_entry(
+        operation: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+        suppression_until: chrono::DateTime<chrono::Utc>,
+        terminal: bool,
+        pending_publication: bool,
+    ) -> OperationJournalEntry {
+        temporal_reconciliation_entry_with_predecessor(
+            operation,
+            observed_at,
+            suppression_until,
+            terminal,
+            pending_publication,
+            None,
+        )
+    }
+
+    fn temporal_reconciliation_entry_with_predecessor(
+        operation: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+        suppression_until: chrono::DateTime<chrono::Utc>,
+        terminal: bool,
+        pending_publication: bool,
+        predecessor: Option<OperationId>,
+    ) -> OperationJournalEntry {
+        let operation_id = OperationId::deterministic_test(operation);
+        let target = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            if pending_publication {
+                "version-bundle"
+            } else {
+                "same-reconciliation-target"
+            },
+            OwnershipClass::LauncherManaged,
+        );
+        let component = if pending_publication {
+            ReconciliationComponent::VersionBundle
+        } else {
+            ReconciliationComponent::Libraries
+        };
+        let rung = if pending_publication {
+            ReconciliationRung::RebuildComponent
+        } else {
+            ReconciliationRung::RepairArtifact
+        };
+        let lineage = if let Some(operation_id) = &predecessor {
+            crate::state::contracts::ReconciliationLineage::Predecessor {
+                operation_id: operation_id.clone(),
+            }
+        } else if pending_publication {
+            crate::state::contracts::ReconciliationLineage::Predecessor {
+                operation_id: OperationId::deterministic_test("temporal-pending-predecessor"),
+            }
+        } else {
+            crate::state::contracts::ReconciliationLineage::Initial
+        };
+        let attempt = crate::state::contracts::ReconciliationAttempt::new(
+            operation_id.clone(),
+            DiagnosisId::LauncherManagedArtifactCorrupt,
+            GuardianDomain::Library,
+            rung,
+            ReconciliationScope::RegisteredInstance {
+                instance_id: "0123456789abcdef".to_string(),
+                fingerprint:
+                    crate::state::contracts::ReconciliationIncarnationFingerprint::from_digest(
+                        "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
+                    ),
+                inventory_fingerprint:
+                    crate::state::contracts::ReconciliationInventoryFingerprint::from_digest(
+                        "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+                    ),
+                activation_contract_id: axial_minecraft::ManagedInstallActivationContractId::parse(
+                    "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+                )
+                .expect("canonical activation contract"),
+            },
+            component,
+            target.clone(),
+            GuardianMode::Managed,
+            OwnershipClass::LauncherManaged,
+            observed_at.to_rfc3339(),
+            suppression_until.to_rfc3339(),
+            lineage,
+        );
+        let mut entry = OperationJournalEntry::new(
+            JournalId::new(format!("journal-{operation_id}")),
+            operation_id,
+            CommandKind::RepairInstance,
+            StabilizationSystem::Guardian,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        );
+        entry.targets = vec![
+            TargetDescriptor::new(
+                StabilizationSystem::State,
+                TargetKind::Instance,
+                "0123456789abcdef",
+                OwnershipClass::LauncherManaged,
+            ),
+            target.clone(),
+        ];
+        entry
+            .guardian_diagnosis_ids
+            .push(DiagnosisId::LauncherManagedArtifactCorrupt);
+        entry.reconciliation_attempt = Some(attempt.clone());
+        if terminal {
+            let mut terminal = crate::state::contracts::ReconciliationTerminal::from_attempt(
+                attempt,
+                ReconciliationTerminalOutcome::Failed,
+                crate::state::contracts::ReconciliationQuarantineCheckpoint::default(),
+            );
+            if pending_publication {
+                terminal = terminal.with_version_bundle_publication(
+                    axial_minecraft::ManagedInstallPublicationEvidenceId::parse(
+                        "managed-install-v1.T7ghN0PBffcxr4Rg08bVvTPOl9fRcUh9qyNnWZtd93c.Xsu8KmJnT7So_J1WS8rcqA.X-fR4EpDTc2mbfPpfNOFiA.JGoynsQN9LfT8e7hWyX1fknDskeaM7xQCAbFGATbD-I._FMcn_pUsOarv_sNtTJousevn4S1SMqttV6yiYdONOY",
+                    )
+                    .expect("canonical publication evidence"),
+                    ReconciliationVersionBundleOutcome::RolledBack,
+                );
+            }
+            let mut failed = OperationJournalStep::new(
+                "repair_launcher_managed_artifact",
+                OperationPhase::Repairing,
+            );
+            failed.result = OperationStepResult::Failed;
+            failed.changed_target = Some(target);
+            entry.status = OperationStatus::Failed;
+            entry.completed_steps.push(failed);
+            entry.failure_point = Some("artifact_repair_failed".to_string());
+            entry.outcome = Some(OperationOutcome::Failed);
+            entry.reconciliation_terminal = Some(terminal);
+        }
+        entry
+    }
+
+    #[tokio::test]
+    async fn p03_b02_contract_restart_retains_only_live_child_predecessor() {
+        let root = test_root("p03-b02-relational-temporal-reload");
+        let paths = test_paths(&root);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("fixed timestamp")
+            .with_timezone(&chrono::Utc);
+        let temporal = Arc::new(crate::state::temporal::BoundedTemporalPolicy::fixed(now));
+
+        let mut predecessor = temporal_reconciliation_entry(
+            "restart-expired-predecessor",
+            now - chrono::Duration::hours(2),
+            now - chrono::Duration::hours(1),
+            true,
+            false,
+        );
+        predecessor.sequence = 1;
+        let predecessor_id = predecessor.operation_id.clone();
+        let mut unrelated = temporal_reconciliation_entry(
+            "restart-unrelated-expired",
+            now - chrono::Duration::hours(2),
+            now - chrono::Duration::hours(1),
+            true,
+            false,
+        );
+        unrelated.sequence = 2;
+        let unrelated_id = unrelated.operation_id.clone();
+        let mut child = temporal_reconciliation_entry_with_predecessor(
+            "restart-live-version-bundle-child",
+            now,
+            now + chrono::Duration::hours(1),
+            false,
+            true,
+            Some(predecessor_id.clone()),
+        );
+        child.sequence = 3;
+        let child_id = child.operation_id.clone();
+        assert!(
+            child.parent_operation_id.is_none(),
+            "VersionBundle lineage is typed and does not use the generic journal parent"
+        );
+
+        let persisted =
+            OperationJournalSnapshot::new(vec![predecessor, unrelated, child.clone()], 4)
+                .expect("valid relational restart snapshot");
+        let path = operation_journal_path(&paths);
+        fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
+        fs::write(&path, persisted.to_json().expect("encode restart snapshot"))
+            .expect("persist restart snapshot");
+
+        let store = OperationJournalStore::try_load_from_paths_with_max_entries_and_temporal(
+            &paths, 2, temporal,
+        )
+        .expect("reload relational snapshot from the journal directory");
+        assert!(
+            store.get(&predecessor_id).is_some(),
+            "the exact expired predecessor remains available to startup reconstruction"
+        );
+        assert!(store.get(&child_id).is_some());
+        assert!(
+            store.get(&unrelated_id).is_none(),
+            "unrelated expired terminal history is not retained"
+        );
+
+        let attempt = child
+            .reconciliation_attempt()
+            .expect("VersionBundle child attempt")
+            .clone();
+        let mut failed =
+            OperationJournalStep::new("rebuild_version_bundle", OperationPhase::Repairing);
+        failed.result = OperationStepResult::Failed;
+        failed.changed_target = Some(attempt.target().clone());
+        let terminal = crate::state::contracts::ReconciliationTerminal::from_attempt(
+            attempt,
+            ReconciliationTerminalOutcome::Failed,
+            crate::state::contracts::ReconciliationQuarantineCheckpoint::default(),
+        );
+        store
+            .record_reconciliation_failure(
+                &child_id,
+                failed,
+                "version_bundle_rebuild_failed",
+                terminal,
+            )
+            .await
+            .expect("resolve the live child obligation");
+
+        let replacement = test_entry("after-restart-child-resolution");
+        let replacement_id = replacement.operation_id.clone();
+        store
+            .create(replacement)
+            .await
+            .expect("resolved predecessor is capacity eligible");
+        assert!(store.get(&predecessor_id).is_none());
+        assert!(store.get(&child_id).is_some());
+        assert!(store.get(&replacement_id).is_some());
+
+        store.close().await.expect("close reloaded journal store");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn p03_b02_contract_temporal_load_filters_before_capacity_and_counts_reasons() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("fixed timestamp")
+            .with_timezone(&chrono::Utc);
+        let temporal = Arc::new(crate::state::temporal::BoundedTemporalPolicy::fixed(now));
+        let store = OperationJournalStore::with_max_entries_and_temporal(2, temporal);
+        let future = now + chrono::Duration::minutes(6);
+        let overlong = now + chrono::Duration::hours(25);
+        let mut entries = (0..128)
+            .map(|index| {
+                let observed = if index % 2 == 0 { future } else { now };
+                let until = if index % 2 == 0 {
+                    future + chrono::Duration::hours(1)
+                } else {
+                    overlong
+                };
+                let mut entry = temporal_reconciliation_entry(
+                    &format!("temporal-invalid-{index}"),
+                    observed,
+                    until,
+                    true,
+                    false,
+                );
+                entry.sequence = index + 1;
+                entry
+            })
+            .collect::<Vec<_>>();
+        let mut current = test_entry("temporal-current");
+        current.sequence = 129;
+        entries.push(current.clone());
+        let snapshot = OperationJournalSnapshot {
+            schema: OPERATION_JOURNAL_SCHEMA.to_string(),
+            next_sequence: 130,
+            entries,
+        };
+
+        store
+            .load_snapshot(snapshot)
+            .expect("invalid temporal rows are excluded before capacity");
+        assert_eq!(store.list(), vec![current]);
+        assert_eq!(store.load_issue_count(), 128);
+        assert_eq!(store.temporal_load_issues().future_observation(), 64);
+        assert_eq!(store.temporal_load_issues().out_of_bounds_window(), 64);
+    }
+
+    #[tokio::test]
+    async fn p03_b02_contract_temporal_admission_rejects_future_and_overlong_attempts() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("fixed timestamp")
+            .with_timezone(&chrono::Utc);
+        let store = OperationJournalStore::with_max_entries_and_temporal(
+            128,
+            Arc::new(crate::state::temporal::BoundedTemporalPolicy::fixed(now)),
+        );
+        for (name, observed, until) in [
+            (
+                "future-attempt",
+                now + chrono::Duration::seconds(301),
+                now + chrono::Duration::hours(1),
+            ),
+            (
+                "overlong-attempt",
+                now,
+                now + chrono::Duration::seconds(86_401),
+            ),
+        ] {
+            for terminal in [false, true] {
+                let entry = temporal_reconciliation_entry(
+                    &format!("{name}-{terminal}"),
+                    observed,
+                    until,
+                    terminal,
+                    false,
+                );
+                assert!(matches!(
+                    store.create(entry).await,
+                    Err(OperationJournalStoreError::Validation(
+                        super::OperationJournalValidationError::InvalidReconciliationTerminal
+                    ))
+                ));
+            }
+        }
+        for (name, observed, until) in [
+            (
+                "exact-future-bound",
+                now + chrono::Duration::seconds(300),
+                now + chrono::Duration::hours(1),
+            ),
+            (
+                "exact-window-bound",
+                now,
+                now + chrono::Duration::seconds(86_400),
+            ),
+        ] {
+            store
+                .create(temporal_reconciliation_entry(
+                    name, observed, until, false, false,
+                ))
+                .await
+                .expect("exact temporal boundary is admitted");
+        }
+        assert_eq!(store.list().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn p03_b02_contract_expired_pending_publication_ack_becomes_evictable() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("fixed timestamp")
+            .with_timezone(&chrono::Utc);
+        let clock = Arc::new(TestJournalClock::new(now));
+        let temporal = Arc::new(crate::state::temporal::BoundedTemporalPolicy::new(
+            clock.clone(),
+        ));
+        let store = OperationJournalStore::with_max_entries_and_temporal(1, temporal);
+        let mut pending = temporal_reconciliation_entry(
+            "expired-pending-publication",
+            now - chrono::Duration::hours(2),
+            now - chrono::Duration::hours(1),
+            true,
+            true,
+        );
+        pending.sequence = 1;
+        let expected = pending
+            .reconciliation_terminal()
+            .expect("pending terminal")
+            .clone();
+        store
+            .load_snapshot(OperationJournalSnapshot {
+                schema: OPERATION_JOURNAL_SCHEMA.to_string(),
+                next_sequence: 2,
+                entries: vec![pending],
+            })
+            .expect("expired pending publication stays current");
+
+        clock.advance(Duration::from_secs(1));
+        let acknowledged = store
+            .acknowledge_reconciliation_version_bundle_publication(&expected)
+            .await
+            .expect("exact acknowledgement bypasses terminal expiry");
+        assert!(
+            !acknowledged
+                .version_bundle_publication()
+                .expect("publication")
+                .is_pending()
+        );
+
+        let replacement = test_entry("after-expired-publication-ack");
+        let replacement_id = replacement.operation_id.clone();
+        store
+            .create(replacement)
+            .await
+            .expect("acknowledged expired record is capacity eligible");
+        assert!(store.get(expected.operation_id()).is_none());
+        assert!(store.get(&replacement_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn p03_b02_contract_expired_reconciliation_settlement_commits_then_is_evictable() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("fixed timestamp")
+            .with_timezone(&chrono::Utc);
+        let clock = Arc::new(TestJournalClock::new(now));
+        let store = OperationJournalStore::with_max_entries_and_temporal(
+            1,
+            Arc::new(crate::state::temporal::BoundedTemporalPolicy::new(
+                clock.clone(),
+            )),
+        );
+        let observed_at = now;
+        let suppression_until = now + chrono::Duration::hours(1);
+        let plan = temporal_reconciliation_entry(
+            "expired-terminal-settlement",
+            observed_at,
+            suppression_until,
+            false,
+            false,
+        );
+        let operation_id = plan.operation_id.clone();
+        store.create(plan).await.expect("admit current plan");
+
+        clock.advance(Duration::from_secs(2 * 60 * 60));
+        let mut terminal_entry = temporal_reconciliation_entry(
+            "expired-terminal-settlement",
+            observed_at,
+            suppression_until,
+            true,
+            false,
+        );
+        let failure_step = terminal_entry.completed_steps.remove(0);
+        let terminal = terminal_entry
+            .reconciliation_terminal
+            .take()
+            .expect("failed terminal");
+        store
+            .record_reconciliation_failure(
+                &operation_id,
+                failure_step,
+                "artifact_repair_failed",
+                terminal,
+            )
+            .await
+            .expect("expiry does not strand an admitted terminal settlement");
+        assert_eq!(
+            store.get(&operation_id).expect("settled journal").status,
+            OperationStatus::Failed
+        );
+
+        let replacement = test_entry("after-expired-terminal-settlement");
+        let replacement_id = replacement.operation_id.clone();
+        store
+            .create(replacement)
+            .await
+            .expect("expired settled terminal is capacity eligible");
+        assert!(store.get(&operation_id).is_none());
+        assert!(store.get(&replacement_id).is_some());
     }
 
     fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {

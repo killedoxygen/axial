@@ -19,6 +19,7 @@ flate2.workspace = true
 futures-util.workspace = true
 include_dir = { workspace = true, optional = true }
 http-body-util.workspace = true
+im.workspace = true
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 mime_guess = { workspace = true, optional = true }
 p256.workspace = true

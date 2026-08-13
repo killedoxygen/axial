@@ -11,7 +11,6 @@ use crate::guardian::{
     plan_launch_recovery_directive, record_launch_recovery_attempt, record_launch_recovery_failure,
     record_launch_recovery_success, resume_launch_recovery_attempt,
 };
-use crate::logging::timestamp_utc;
 use crate::state::{AppState, OperationJournalReconciliation, OperationJournalStoreError};
 use axial_launcher::LaunchFailureClass;
 use std::time::Duration;
@@ -146,7 +145,7 @@ async fn record_guardian_launch_recovery_attempt(
     )?;
     let mut resume = false;
     let outcome = loop {
-        let observed_at = timestamp_utc();
+        let observed_at = state.failure_memory().now_timestamp();
         let request = GuardianLaunchRecoveryRecordRequest {
             plan,
             observed_at: observed_at.as_str(),
@@ -200,7 +199,7 @@ pub(super) async fn record_successful_self_healing_if_any(
         GuardianLaunchRecoveryJournalTransition::Success,
     )?;
     loop {
-        let observed_at = timestamp_utc();
+        let observed_at = state.failure_memory().now_timestamp();
         match record_launch_recovery_success(GuardianLaunchRecoveryRecordRequest {
             plan,
             observed_at: observed_at.as_str(),
@@ -250,7 +249,7 @@ pub(super) async fn record_failed_self_healing_if_any(
         GuardianLaunchRecoveryJournalTransition::Failure,
     )?;
     loop {
-        let observed_at = timestamp_utc();
+        let observed_at = state.failure_memory().now_timestamp();
         match record_launch_recovery_failure(GuardianLaunchRecoveryRecordRequest {
             plan,
             observed_at: observed_at.as_str(),

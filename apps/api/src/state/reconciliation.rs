@@ -1626,6 +1626,9 @@ impl RegisteredReconciliationAuthority {
         } {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&state.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
         let (evidence, expected_attempt) =
             if let Some(predecessor_operation_id) = predecessor_operation_id {
                 if attempt.rung() != ReconciliationRung::RebuildComponent {
@@ -1635,7 +1638,7 @@ impl RegisteredReconciliationAuthority {
                     &lifecycle,
                     predecessor_operation_id,
                     ReconciliationRung::RepairArtifact,
-                    chrono::Utc::now().fixed_offset(),
+                    observed_at,
                     Some(&verification),
                     false,
                 )?;
@@ -1649,7 +1652,7 @@ impl RegisteredReconciliationAuthority {
                     &lifecycle,
                     attempt.operation_id(),
                     ReconciliationRung::RepairArtifact,
-                    chrono::Utc::now().fixed_offset(),
+                    observed_at,
                     Some(&verification),
                 )?;
                 (evidence, attempt.clone())
@@ -1696,7 +1699,9 @@ impl RegisteredReconciliationAuthority {
         target: TargetDescriptor,
         suppression_for: chrono::Duration,
     ) -> Result<ReconciliationAttempt, ReconciliationEvidenceRejection> {
-        let observed_at = chrono::Utc::now().fixed_offset();
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.state.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
         let suppression_until = observed_at
             .checked_add_signed(suppression_for)
             .filter(|until| *until > observed_at)
@@ -1993,7 +1998,7 @@ pub(crate) fn reserve_reconciliation_attempt(
     journals: &OperationJournalStore,
     key: FailureMemoryKey,
 ) -> Result<ReconciliationAttemptReservation, ReconciliationAttemptRejection> {
-    if journals.list().iter().any(|journal| {
+    if journals.any_matching(|journal| {
         matches!(
             journal.status,
             OperationStatus::Planned | OperationStatus::Running
@@ -2014,13 +2019,14 @@ pub(crate) fn reserve_reconciliation_attempt_resume(
 ) -> Result<ReconciliationAttemptReservation, ReconciliationAttemptRejection> {
     let key = reconciliation_attempt_key(attempt);
     let mut exact = 0usize;
-    for journal in journals.list() {
-        let Some(candidate) = journal.reconciliation_attempt() else {
-            continue;
-        };
-        if reconciliation_attempt_key(candidate) != key {
-            continue;
-        }
+    for journal in journals.matching_entries(|journal| {
+        journal
+            .reconciliation_attempt()
+            .is_some_and(|candidate| reconciliation_attempt_key(candidate) == key)
+    }) {
+        let candidate = journal
+            .reconciliation_attempt()
+            .expect("reconciliation attempt was filtered");
         if source_component_rebuild_journal_is_resumable(&journal, attempt) && candidate == attempt
         {
             exact = exact.saturating_add(1);
@@ -2072,7 +2078,14 @@ impl AppState {
     fn startup_version_bundle_orphan_requirements(
         &self,
     ) -> io::Result<Vec<StartupVersionBundleOrphanRequirement>> {
-        let journals = self.journals.list();
+        let journals = self.journals.matching_entries(|journal| {
+            journal.reconciliation_attempt().is_some_and(|attempt| {
+                (attempt.rung() == ReconciliationRung::RebuildComponent
+                    && attempt.component() == ReconciliationComponent::VersionBundle
+                    && journal.reconciliation_terminal().is_none())
+                    || journal.reconciliation_terminal().is_some()
+            })
+        });
         let memories = self.failure_memory.list();
         let mut requirements = Vec::new();
         for journal in &journals {
@@ -2167,27 +2180,12 @@ impl AppState {
                 .iter()
                 .find(|memory| memory.key == reconciliation_attempt_key(attempt))
             {
-                let observed_at = chrono::DateTime::parse_from_rfc3339(attempt.observed_at())
-                    .map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "planned VersionBundle recovery observation is invalid",
-                        )
-                    })?;
                 let Some(prior_terminal) = prior.reconciliation_terminal() else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "planned VersionBundle recovery prior memory is untyped",
                     ));
                 };
-                let prior_until =
-                    chrono::DateTime::parse_from_rfc3339(prior_terminal.suppression_until())
-                        .map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "planned VersionBundle recovery prior window is invalid",
-                            )
-                        })?;
                 if prior
                     != &reconciliation_memory_entry(prior_terminal.clone()).map_err(|_| {
                         io::Error::new(
@@ -2198,7 +2196,7 @@ impl AppState {
                     || prior_terminal
                         .version_bundle_publication()
                         .is_some_and(|publication| publication.is_pending())
-                    || prior_until > observed_at
+                    || self.failure_memory.suppression_active(prior)
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -2222,7 +2220,11 @@ impl AppState {
     fn startup_version_bundle_publication_requirements(
         &self,
     ) -> io::Result<Vec<StartupVersionBundlePublicationRequirement>> {
-        let journals = self.journals.list();
+        let journals = self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_terminal()
+                .is_some_and(|terminal| terminal.version_bundle_publication().is_some())
+        });
         let memories = self.failure_memory.list();
         let mut evidence_owners = std::collections::BTreeMap::new();
         let mut requirements = Vec::new();
@@ -2336,7 +2338,11 @@ impl AppState {
     async fn converge_existing_version_bundle_publication_acknowledgements(
         &self,
     ) -> io::Result<()> {
-        let journals = self.journals.list();
+        let journals = self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_terminal()
+                .is_some_and(|terminal| terminal.version_bundle_publication().is_some())
+        });
         let memories = self.failure_memory.list();
         for journal in journals {
             let Some(journal_terminal) = journal
@@ -2970,9 +2976,10 @@ impl AppState {
             })?;
         self.converge_existing_version_bundle_publication_acknowledgements()
             .await?;
-        let now = chrono::Utc::now();
         let mut newest = std::collections::BTreeMap::new();
-        let journals = self.journals.list();
+        let journals = self
+            .journals
+            .matching_entries(|journal| journal.reconciliation_attempt().is_some());
         let referenced_predecessors = journals
             .iter()
             .filter(|journal| {
@@ -2994,10 +3001,15 @@ impl AppState {
             let publication_pending = terminal
                 .version_bundle_publication()
                 .is_some_and(|publication| publication.is_pending());
+            let memory = reconciliation_memory_entry(terminal.clone()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active reconciliation journal cannot derive failure memory",
+                )
+            })?;
             if !publication_pending
                 && !referenced_predecessors.contains(terminal.operation_id())
-                && !chrono::DateTime::parse_from_rfc3339(terminal.suppression_until())
-                    .is_ok_and(|until| until > now)
+                && !self.failure_memory.suppression_active(&memory)
             {
                 continue;
             }
@@ -3021,8 +3033,7 @@ impl AppState {
                 .is_some_and(|publication| publication.is_pending());
             if !publication_pending
                 && !referenced_predecessors.contains(terminal.operation_id())
-                && !chrono::DateTime::parse_from_rfc3339(terminal.suppression_until())
-                    .is_ok_and(|until| until > now)
+                && !self.failure_memory.suppression_active(&memory)
             {
                 continue;
             }
@@ -3050,24 +3061,13 @@ impl AppState {
             if self.failure_memory.get(&memory.key).as_ref() == Some(&memory) {
                 continue;
             }
-            if let Some(existing) = self.failure_memory.get(&memory.key) {
-                let prior_until = existing
-                    .suppression_until
-                    .as_deref()
-                    .and_then(|until| chrono::DateTime::parse_from_rfc3339(until).ok());
-                let next_observed = chrono::DateTime::parse_from_rfc3339(&memory.last_observed_at)
-                    .map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "typed reconciliation observation timestamp is invalid",
-                        )
-                    })?;
-                if prior_until.is_none_or(|until| until > next_observed) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "overlapping reconciliation memory cannot be superseded",
-                    ));
-                }
+            if let Some(existing) = self.failure_memory.get(&memory.key)
+                && self.failure_memory.suppression_active(&existing)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "overlapping reconciliation memory cannot be superseded",
+                ));
             }
             let reservation = reserve_reconciliation_attempt(
                 self.failure_memory.as_ref(),
@@ -3174,11 +3174,14 @@ impl AppState {
         lifecycle: &InstanceLifecycleLease,
         operation_id: &OperationId,
     ) -> Result<RecordedRuntimeArtifactRepairFailure, ReconciliationEvidenceRejection> {
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
         let evidence = self.recorded_reconciliation_failure_at(
             lifecycle,
             operation_id,
             ReconciliationRung::RepairArtifact,
-            chrono::Utc::now().fixed_offset(),
+            observed_at,
             None,
         )?;
         let attempt = evidence.terminal.attempt();
@@ -3267,7 +3270,6 @@ impl AppState {
             }
             return Ok(Some(continuation));
         }
-        let observed_at = chrono::Utc::now().fixed_offset();
         let matches_exact_candidate = |attempt: &ReconciliationAttempt| {
             attempt.rung() == ReconciliationRung::RepairArtifact
                 && attempt.target() == &expected_target
@@ -3285,7 +3287,11 @@ impl AppState {
                 )
         };
 
-        let journals = self.journals.list();
+        let journals = self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_attempt()
+                .is_some_and(&matches_exact_candidate)
+        });
         let mut active_journals = Vec::new();
         for journal in &journals {
             let Some(attempt) = journal.reconciliation_attempt() else {
@@ -3297,7 +3303,7 @@ impl AppState {
             let Some(terminal) = journal.reconciliation_terminal() else {
                 return Err(ReconciliationEvidenceRejection::JournalMismatch);
             };
-            if !active_reconciliation_terminal_at(terminal, observed_at)? {
+            if !active_reconciliation_terminal_at(self.failure_memory.as_ref(), terminal)? {
                 continue;
             }
             if terminal.outcome() != ReconciliationTerminalOutcome::Failed {
@@ -3313,12 +3319,12 @@ impl AppState {
         }
 
         let mut active_memories = Vec::new();
-        for memory in self.failure_memory.list() {
+        for memory in self.failure_memory.list_current() {
             let Some(terminal) = memory.reconciliation_terminal().cloned() else {
                 continue;
             };
             if !matches_exact_candidate(terminal.attempt())
-                || !active_reconciliation_terminal_at(&terminal, observed_at)?
+                || !active_reconciliation_terminal_at(self.failure_memory.as_ref(), &terminal)?
             {
                 continue;
             }
@@ -3357,6 +3363,9 @@ impl AppState {
         {
             return Err(ReconciliationEvidenceRejection::ScopeMismatch);
         }
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
         let evidence = self.recorded_reconciliation_failure_at(
             &verification._lifecycle,
             terminal.operation_id(),
@@ -3415,13 +3424,14 @@ impl AppState {
                 )
         };
         let mut matched = None;
-        for journal in self.journals.list() {
-            let Some(attempt) = journal.reconciliation_attempt() else {
-                continue;
-            };
-            if !matches_attempt(attempt) {
-                continue;
-            }
+        for journal in self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_attempt()
+                .is_some_and(&matches_attempt)
+        }) {
+            let attempt = journal
+                .reconciliation_attempt()
+                .expect("reconciliation attempt was filtered");
             attempt
                 .validate()
                 .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
@@ -3431,7 +3441,7 @@ impl AppState {
                 return Err(ReconciliationEvidenceRejection::JournalMismatch);
             }
         }
-        if self.failure_memory.list().iter().any(|memory| {
+        if self.failure_memory.list_current().iter().any(|memory| {
             memory
                 .reconciliation_terminal()
                 .is_some_and(|terminal| matches_attempt(terminal.attempt()))
@@ -3449,7 +3459,6 @@ impl AppState {
             return Err(ReconciliationEvidenceRejection::ScopeMismatch);
         }
         let current = self.current_reconciliation_incarnation(&lifecycle.instance_id)?;
-        let observed_at = chrono::Utc::now().fixed_offset();
         let matches_current_runtime = |attempt: &ReconciliationAttempt| {
             attempt.rung() == ReconciliationRung::RepairArtifact
                 && attempt.component() == ReconciliationComponent::Runtime
@@ -3474,7 +3483,11 @@ impl AppState {
                 )
         };
 
-        let journals = self.journals.list();
+        let journals = self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_attempt()
+                .is_some_and(&matches_current_runtime)
+        });
         for journal in &journals {
             let Some(attempt) = journal.reconciliation_attempt() else {
                 continue;
@@ -3497,7 +3510,7 @@ impl AppState {
                     && matches_current_runtime(terminal.attempt())
             })
             .map(|terminal| {
-                active_reconciliation_terminal_at(terminal, observed_at)
+                active_reconciliation_terminal_at(self.failure_memory.as_ref(), terminal)
                     .map(|active| active.then_some(terminal.clone()))
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -3505,13 +3518,13 @@ impl AppState {
             .flatten()
             .collect::<Vec<_>>();
         let mut active_memories = Vec::new();
-        for memory in self.failure_memory.list() {
+        for memory in self.failure_memory.list_current() {
             let Some(terminal) = memory.reconciliation_terminal().cloned() else {
                 continue;
             };
             if terminal.outcome() != ReconciliationTerminalOutcome::Failed
                 || !matches_current_runtime(terminal.attempt())
-                || !active_reconciliation_terminal_at(&terminal, observed_at)?
+                || !active_reconciliation_terminal_at(self.failure_memory.as_ref(), &terminal)?
             {
                 continue;
             }
@@ -3529,6 +3542,9 @@ impl AppState {
         {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
         let evidence = self.recorded_reconciliation_failure_at(
             lifecycle,
             active_journals[0].operation_id(),
@@ -3620,11 +3636,14 @@ impl AppState {
             evidence.evidence.artifact_provenance,
             &evidence.evidence.terminal,
         )?;
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
         let predecessor_before_wait = self.recorded_reconciliation_failure_at_with_window(
             &evidence.evidence.lifecycle,
             evidence.evidence.terminal.operation_id(),
             ReconciliationRung::RepairArtifact,
-            chrono::Utc::now().fixed_offset(),
+            observed_at,
             verification.as_ref(),
             resume_attempt.is_none(),
         )?;
@@ -3665,11 +3684,14 @@ impl AppState {
             None => self.sessions.acquire_shared_component_mutation().await,
         }
         .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
         let predecessor = self.recorded_reconciliation_failure_at_with_window(
             &predecessor_before_wait.lifecycle,
             predecessor_before_wait.terminal.operation_id(),
             ReconciliationRung::RepairArtifact,
-            chrono::Utc::now().fixed_offset(),
+            observed_at,
             verification.as_ref(),
             resume_attempt.is_none(),
         )?;
@@ -3741,7 +3763,9 @@ impl AppState {
                 }
             }
         };
-        let observed_at = chrono::Utc::now().fixed_offset();
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
         let resumable = self.resumable_source_component_attempt(&prior)?;
         if resume_attempt.is_some_and(|expected| resumable.as_ref() != Some(expected)) {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
@@ -3767,7 +3791,7 @@ impl AppState {
                         operation_id: prior.operation_id().clone(),
                     },
                 )?;
-                self.refuse_active_component_rebuild_window(&attempt, observed_at)?;
+                self.refuse_active_component_rebuild_window(&attempt)?;
                 (attempt, false)
             }
         };
@@ -3812,20 +3836,21 @@ impl AppState {
                     }
         };
         let mut matched = None;
-        for journal in self.journals.list() {
-            let Some(attempt) = journal.reconciliation_attempt() else {
-                continue;
-            };
-            if !matches_attempt(attempt) {
-                continue;
-            }
+        for journal in self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_attempt()
+                .is_some_and(&matches_attempt)
+        }) {
+            let attempt = journal
+                .reconciliation_attempt()
+                .expect("reconciliation attempt was filtered");
             if !source_component_rebuild_journal_is_resumable(&journal, attempt)
                 || matched.replace(attempt.clone()).is_some()
             {
                 return Err(ReconciliationEvidenceRejection::JournalMismatch);
             }
         }
-        if self.failure_memory.list().iter().any(|memory| {
+        if self.failure_memory.list_current().iter().any(|memory| {
             memory
                 .reconciliation_terminal()
                 .is_some_and(|terminal| matches_attempt(terminal.attempt()))
@@ -3838,7 +3863,6 @@ impl AppState {
     fn refuse_active_component_rebuild_window(
         &self,
         attempt: &ReconciliationAttempt,
-        observed_at: chrono::DateTime<chrono::FixedOffset>,
     ) -> Result<(), ReconciliationEvidenceRejection> {
         let matches_suppression = |candidate: &ReconciliationAttempt| {
             if attempt.component() == ReconciliationComponent::Runtime {
@@ -3850,7 +3874,6 @@ impl AppState {
         };
         self.refuse_active_reconciliation_window(
             ReconciliationRung::RebuildComponent,
-            observed_at,
             matches_suppression,
         )
     }
@@ -3862,7 +3885,6 @@ impl AppState {
         let key = reconciliation_attempt_key(attempt);
         self.refuse_active_reconciliation_window(
             ReconciliationRung::RepairArtifact,
-            chrono::Utc::now().fixed_offset(),
             move |candidate| reconciliation_attempt_key(candidate) == key,
         )
     }
@@ -3870,7 +3892,6 @@ impl AppState {
     fn refuse_active_reconciliation_window<Matches>(
         &self,
         rung: ReconciliationRung,
-        observed_at: chrono::DateTime<chrono::FixedOffset>,
         matches_suppression: Matches,
     ) -> Result<(), ReconciliationEvidenceRejection>
     where
@@ -3879,7 +3900,11 @@ impl AppState {
         let matches_window = |attempt: &ReconciliationAttempt| {
             attempt.rung() == rung && matches_suppression(attempt)
         };
-        let journals = self.journals.list();
+        let journals = self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_attempt()
+                .is_some_and(&matches_window)
+        });
         if journals.iter().any(|journal| {
             matches!(
                 journal.status,
@@ -3897,7 +3922,7 @@ impl AppState {
                 continue;
             };
             if !matches_window(terminal.attempt())
-                || !active_reconciliation_terminal_at(&terminal, observed_at)?
+                || !active_reconciliation_terminal_at(self.failure_memory.as_ref(), &terminal)?
             {
                 continue;
             }
@@ -3905,12 +3930,12 @@ impl AppState {
         }
 
         let mut active_memories = Vec::new();
-        for memory in self.failure_memory.list() {
+        for memory in self.failure_memory.list_current() {
             let Some(terminal) = memory.reconciliation_terminal().cloned() else {
                 continue;
             };
             if !matches_window(terminal.attempt())
-                || !active_reconciliation_terminal_at(&terminal, observed_at)?
+                || !active_reconciliation_terminal_at(self.failure_memory.as_ref(), &terminal)?
             {
                 continue;
             }
@@ -4020,15 +4045,8 @@ impl AppState {
         }
         let last_observed_at = chrono::DateTime::parse_from_rfc3339(&memory.last_observed_at)
             .map_err(|_| ReconciliationEvidenceRejection::MemoryWindowInactive)?;
-        let suppression_until = chrono::DateTime::parse_from_rfc3339(
-            memory
-                .suppression_until
-                .as_deref()
-                .ok_or(ReconciliationEvidenceRejection::MemoryWindowInactive)?,
-        )
-        .map_err(|_| ReconciliationEvidenceRejection::MemoryWindowInactive)?;
         if observed_at < last_observed_at
-            || (require_active_window && observed_at >= suppression_until)
+            || (require_active_window && !self.failure_memory.suppression_active(&memory))
         {
             return Err(ReconciliationEvidenceRejection::MemoryWindowInactive);
         }
@@ -4382,19 +4400,11 @@ fn component_rebuild_terminal_matches(
 }
 
 fn active_reconciliation_terminal_at(
+    failure_memory: &GuardianFailureMemoryStore,
     terminal: &ReconciliationTerminal,
-    observed_at: chrono::DateTime<chrono::FixedOffset>,
 ) -> Result<bool, ReconciliationEvidenceRejection> {
-    active_reconciliation_attempt_at(terminal.attempt(), observed_at)
-}
-
-fn active_reconciliation_attempt_at(
-    attempt: &ReconciliationAttempt,
-    observed_at: chrono::DateTime<chrono::FixedOffset>,
-) -> Result<bool, ReconciliationEvidenceRejection> {
-    let suppression_until = chrono::DateTime::parse_from_rfc3339(attempt.suppression_until())
-        .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
-    Ok(observed_at < suppression_until)
+    let memory = reconciliation_memory_entry(terminal.clone())?;
+    Ok(failure_memory.suppression_active(&memory))
 }
 
 pub(crate) fn reconciliation_instance_target(instance_id: &str) -> TargetDescriptor {
@@ -6934,7 +6944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orphan_plan_accepts_supersedable_same_key_prior_memory() {
+    async fn orphan_plan_accepts_pruned_same_key_prior_memory() {
         let fixture = fixture("orphan-plan-same-key-prior");
         let (prior_attempt, _) = version_bundle_publication_attempt_at_window(
             &fixture,
@@ -7007,11 +7017,12 @@ mod tests {
             .await
             .expect("persist newer orphan child plan");
 
-        assert_eq!(
+        assert!(
             fixture
                 .failure_memory
-                .get(&reconciliation_attempt_key(&child_attempt)),
-            Some(prior_memory)
+                .get(&reconciliation_attempt_key(&child_attempt))
+                .is_none(),
+            "a later admission prunes the expired prior memory"
         );
         assert_eq!(
             fixture
@@ -7870,11 +7881,7 @@ mod tests {
         assert_eq!(
             fixture
                 .state
-                .refuse_active_reconciliation_window(
-                    rung,
-                    chrono::Utc::now().fixed_offset(),
-                    |_| true,
-                )
+                .refuse_active_reconciliation_window(rung, |_| true,)
                 .err(),
             Some(ReconciliationEvidenceRejection::JournalMismatch)
         );

@@ -3,6 +3,7 @@ use super::{
     GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianUserOutcome,
     author_guardian_copy, build_safety_case, decide_guardian_policy,
 };
+use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::OperationPhase;
 use crate::state::{PersistedStateLoadEvidence, persisted_state_load_target};
 
@@ -20,7 +21,22 @@ pub(crate) fn persisted_state_load_guardian_outcome(
         return None;
     }
 
-    let fact = persisted_state_schema_invalid_fact();
+    let mut fact = persisted_state_schema_invalid_fact();
+    let temporal = evidence.temporal_load_issues();
+    if temporal.future_observation() != 0 {
+        fact.fields.push(EvidenceField::new(
+            "temporal_future_observation_count",
+            temporal.future_observation().to_string(),
+            EvidenceSensitivity::Public,
+        ));
+    }
+    if temporal.out_of_bounds_window() != 0 {
+        fact.fields.push(EvidenceField::new(
+            "temporal_out_of_bounds_window_count",
+            temporal.out_of_bounds_window().to_string(),
+            EvidenceSensitivity::Public,
+        ));
+    }
     let safety_case = build_safety_case(
         None,
         GuardianMode::Managed,

@@ -5,7 +5,10 @@ use crate::guardian::{
     launch_recovery_user_intent_fingerprint,
 };
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
-use crate::state::failure_memory::{FailureMemoryActionOutcome, GuardianFailureMemoryEntry};
+use crate::state::failure_memory::{
+    FailureMemoryActionOutcome, FailureMemorySnapshot, FailureMemoryStoreError,
+    GuardianFailureMemoryEntry,
+};
 use axial_launcher::{LaunchFailureClass, LaunchStatusEvent};
 use chrono::{Duration, SecondsFormat, Utc};
 use sha1::{Digest, Sha1};
@@ -192,32 +195,44 @@ async fn launch_preflight_surfaces_only_active_suppression_for_the_exact_current
             &GuardianDirective::startup_preset_downgrade("performance"),
         )
         .expect("valid stored recovery intent");
-        fixture
-            .state
-            .failure_memory()
-            .record(
-                GuardianFailureMemoryEntry::observed(
-                    DiagnosisId::JvmPresetRecovery,
-                    GuardianDomain::Launch,
-                    instance_target(&instance_id, OwnershipClass::LauncherManaged),
-                    ApiGuardianMode::Managed,
-                    Some(&intent_hash),
-                    relative_timestamp(Duration::minutes(-5)),
-                )
-                .with_action(
-                    GuardianActionKind::Downgrade,
-                    FailureMemoryActionOutcome::Failed,
-                )
-                .with_repair_attempt()
-                .with_suppression_until(relative_timestamp(suppression_offset)),
-            )
-            .expect("record launch repair suppression");
-        fixture
-            .state
-            .failure_memory()
-            .flush()
-            .await
-            .expect("flush launch repair suppression");
+        let memory = GuardianFailureMemoryEntry::observed(
+            DiagnosisId::JvmPresetRecovery,
+            GuardianDomain::Launch,
+            instance_target(&instance_id, OwnershipClass::LauncherManaged),
+            ApiGuardianMode::Managed,
+            Some(&intent_hash),
+            relative_timestamp(Duration::minutes(-5)),
+        )
+        .with_action(
+            GuardianActionKind::Downgrade,
+            FailureMemoryActionOutcome::Failed,
+        )
+        .with_repair_attempt()
+        .with_suppression_until(relative_timestamp(suppression_offset));
+        if name == "expired" {
+            assert!(matches!(
+                fixture.state.failure_memory().record(memory.clone()),
+                Err(FailureMemoryStoreError::Expired)
+            ));
+            fixture
+                .state
+                .failure_memory()
+                .load_snapshot(FailureMemorySnapshot::new(vec![memory]).expect("valid snapshot"))
+                .expect("filter expired launch repair suppression");
+            assert!(fixture.state.failure_memory().list().is_empty());
+        } else {
+            fixture
+                .state
+                .failure_memory()
+                .record(memory)
+                .expect("record launch repair suppression");
+            fixture
+                .state
+                .failure_memory()
+                .flush()
+                .await
+                .expect("flush launch repair suppression");
+        }
 
         let preflight = prepare_launch_preflight(&fixture.state, instance_id.clone())
             .await

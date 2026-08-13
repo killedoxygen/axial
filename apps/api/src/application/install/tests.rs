@@ -8931,6 +8931,38 @@ fn persisted_download_outcome_entry() -> OperationJournalEntry {
     entry
 }
 
+fn persisted_install_guardian_memory_window(entry: &OperationJournalEntry) -> (String, String) {
+    let marker = |prefix: &str| {
+        entry
+            .completed_steps
+            .iter()
+            .flat_map(|step| step.generated_facts.iter())
+            .find_map(|fact| fact.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("missing persisted Guardian marker: {prefix}"))
+            .to_string()
+    };
+    let observed_at = marker("guardian_outcome_memory_observed_at:");
+    let suppression_until = marker("guardian_outcome_memory_suppression_until:");
+    let observed = chrono::DateTime::parse_from_rfc3339(&observed_at)
+        .expect("canonical persisted Guardian observation");
+    let suppression = chrono::DateTime::parse_from_rfc3339(&suppression_until)
+        .expect("canonical persisted Guardian suppression boundary");
+    assert_eq!(
+        observed.checked_add_signed(chrono::Duration::minutes(5)),
+        Some(suppression),
+        "persisted provider window remains exactly five minutes"
+    );
+    (observed_at, suppression_until)
+}
+
+fn fixed_failure_memory(observed_at: &str) -> Arc<GuardianFailureMemoryStore> {
+    Arc::new(GuardianFailureMemoryStore::at_for_test(
+        chrono::DateTime::parse_from_rfc3339(observed_at)
+            .expect("test time")
+            .with_timezone(&chrono::Utc),
+    ))
+}
+
 #[test]
 fn install_journal_outcome_replay_does_not_borrow_facts_from_an_older_step() {
     let mut entry = persisted_download_outcome_entry();
@@ -9451,6 +9483,7 @@ async fn provider_retry_memory_failure_blocks_followers_until_durable() {
     let first_entry = journals
         .get(&first_operation)
         .expect("first install journal");
+    let (_, expected_suppression_until) = persisted_install_guardian_memory_window(&first_entry);
     assert_eq!(
         install_guardian_outcome_summary_from_journal(&first_entry)
             .expect("journal-first Guardian outcome")
@@ -9522,7 +9555,7 @@ async fn provider_retry_memory_failure_blocks_followers_until_durable() {
     assert_eq!(expected_memory[0].occurrence_count, 1);
     assert_eq!(
         expected_memory[0].suppression_until.as_deref(),
-        Some("2026-06-16T10:05:00+00:00")
+        Some(expected_suppression_until.as_str())
     );
 
     failure_memory
@@ -9590,6 +9623,11 @@ async fn permanent_memory_failure_returns_once_and_recovers_before_follower_asse
             .decision(),
         "retry"
     );
+    let first_entry = journals
+        .get(&first_operation)
+        .expect("journal-first Guardian outcome");
+    let (expected_observed_at, expected_suppression_until) =
+        persisted_install_guardian_memory_window(&first_entry);
 
     backend.fail_next_with_kind(io::ErrorKind::PermissionDenied);
     let follower_attempt = backend.attempts.load(Ordering::SeqCst);
@@ -9649,10 +9687,10 @@ async fn permanent_memory_failure_returns_once_and_recovers_before_follower_asse
     let memory = failure_memory.list();
     assert_eq!(memory.len(), 1);
     assert_eq!(memory[0].occurrence_count, 1);
-    assert_eq!(memory[0].first_observed_at, "2026-06-16T10:00:00+00:00");
+    assert_eq!(memory[0].first_observed_at, expected_observed_at);
     assert_eq!(
         memory[0].suppression_until.as_deref(),
-        Some("2026-06-16T10:05:00+00:00")
+        Some(expected_suppression_until.as_str())
     );
 
     failure_memory.close().await.expect("close failure memory");
@@ -9704,6 +9742,11 @@ async fn transient_memory_failure_exhausts_fixed_budget_and_recovers_later() {
             .decision(),
         "retry"
     );
+    let entry = journals
+        .get(&operation_id)
+        .expect("journal-first Guardian outcome");
+    let (expected_observed_at, expected_suppression_until) =
+        persisted_install_guardian_memory_window(&entry);
 
     backend.allow_writes();
     let (recovered, policy_evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
@@ -9722,10 +9765,10 @@ async fn transient_memory_failure_exhausts_fixed_budget_and_recovers_later() {
     assert_eq!(policy_evaluations, 0);
     let memory = failure_memory.list();
     assert_eq!(memory.len(), 1);
-    assert_eq!(memory[0].first_observed_at, "2026-06-16T10:00:00+00:00");
+    assert_eq!(memory[0].first_observed_at, expected_observed_at);
     assert_eq!(
         memory[0].suppression_until.as_deref(),
-        Some("2026-06-16T10:05:00+00:00")
+        Some(expected_suppression_until.as_str())
     );
 
     failure_memory.close().await.expect("close failure memory");
@@ -9735,8 +9778,8 @@ async fn transient_memory_failure_exhausts_fixed_budget_and_recovers_later() {
 #[tokio::test]
 async fn provider_terminal_replay_backfills_missing_memory_only_once() {
     let journals = Arc::new(OperationJournalStore::new());
-    let initial_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let replay_memory = Arc::new(GuardianFailureMemoryStore::new());
+    let initial_memory = fixed_failure_memory("2026-06-16T10:00:00+00:00");
+    let replay_memory = fixed_failure_memory("2026-06-16T10:00:00+00:00");
     let operation_id = test_operation_id("provider-terminal-memory-backfill");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
@@ -9812,8 +9855,16 @@ async fn provider_terminal_replay_backfills_missing_memory_only_once() {
 #[tokio::test]
 async fn expired_provider_terminal_replay_does_not_resurrect_retry_memory() {
     let journals = Arc::new(OperationJournalStore::new());
-    let initial_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let replay_memory = Arc::new(GuardianFailureMemoryStore::new());
+    let initial_memory = Arc::new(GuardianFailureMemoryStore::at_for_test(
+        chrono::DateTime::parse_from_rfc3339("2026-06-16T10:00:00+00:00")
+            .expect("test time")
+            .with_timezone(&chrono::Utc),
+    ));
+    let replay_memory = Arc::new(GuardianFailureMemoryStore::at_for_test(
+        chrono::DateTime::parse_from_rfc3339("2026-06-16T10:05:00+00:00")
+            .expect("test time")
+            .with_timezone(&chrono::Utc),
+    ));
     let operation_id = test_operation_id("expired-provider-terminal-memory");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
@@ -9896,6 +9947,9 @@ async fn startup_reloads_journal_only_retry_and_blocks_the_next_matching_failure
     );
     assert!(failure_memory.list().is_empty());
     assert!(!crate::state::failure_memory::failure_memory_path(&test_app_paths(&root)).exists());
+    let entry = journals.get(&operation_id).expect("durable journal Retry");
+    let (expected_observed_at, expected_suppression_until) =
+        persisted_install_guardian_memory_window(&entry);
 
     journals.close().await.expect("close durable journals");
     drop(journals);
@@ -9921,10 +9975,10 @@ async fn startup_reloads_journal_only_retry_and_blocks_the_next_matching_failure
     let restored = failure_memory.list();
     assert_eq!(restored.len(), 1);
     assert_eq!(restored[0].occurrence_count, 1);
-    assert_eq!(restored[0].last_observed_at, "2026-07-17T10:00:00+00:00");
+    assert_eq!(restored[0].last_observed_at, expected_observed_at);
     assert_eq!(
         restored[0].suppression_until.as_deref(),
-        Some("2026-07-17T10:05:00+00:00")
+        Some(expected_suppression_until.as_str())
     );
 
     let next_operation_id = test_operation_id("startup-provider-retry-blocked");
@@ -10193,23 +10247,25 @@ async fn startup_retry_scan_skips_boundary_expiry_and_rejects_duplicate_active_k
         ExecutionDownloadFactKind::ProviderFailure,
         "minecraft_client_1.21.5",
     )];
-    for suffix in ["first", "second"] {
-        let operation_id = test_operation_id(format!("startup-duplicate-{suffix}"));
-        begin_install_operation_journal(&journals, &operation_id, "1.21.5")
-            .await
-            .expect("record install journal");
-        record_install_failure_outcome(
-            &test_producer(),
-            journals.clone(),
-            Arc::new(GuardianFailureMemoryStore::new()),
-            &operation_id,
-            &facts,
-            "2026-07-17T10:00:00+00:00",
-        )
-        .await;
-    }
+    let first_operation = test_operation_id("startup-duplicate-first");
+    begin_install_operation_journal(&journals, &first_operation, "1.21.5")
+        .await
+        .expect("record first install journal");
+    record_install_failure_outcome(
+        &test_producer(),
+        journals.clone(),
+        fixed_failure_memory("2026-07-17T10:00:00+00:00"),
+        &first_operation,
+        &facts,
+        "2026-07-17T10:00:00+00:00",
+    )
+    .await;
 
-    let boundary_memory = GuardianFailureMemoryStore::new();
+    let boundary_memory = GuardianFailureMemoryStore::at_for_test(
+        chrono::DateTime::parse_from_rfc3339("2026-07-17T10:05:00+00:00")
+            .expect("test time")
+            .with_timezone(&chrono::Utc),
+    );
     super::operation::settle_startup_install_guardian_failure_memory(
         &journals,
         &boundary_memory,
@@ -10219,7 +10275,25 @@ async fn startup_retry_scan_skips_boundary_expiry_and_rejects_duplicate_active_k
     .expect("expiry boundary is inactive");
     assert!(boundary_memory.list().is_empty());
 
-    let active_memory = GuardianFailureMemoryStore::new();
+    let second_operation = test_operation_id("startup-duplicate-second");
+    begin_install_operation_journal(&journals, &second_operation, "1.21.5")
+        .await
+        .expect("record second install journal");
+    record_install_failure_outcome(
+        &test_producer(),
+        journals.clone(),
+        fixed_failure_memory("2026-07-17T10:00:00+00:00"),
+        &second_operation,
+        &facts,
+        "2026-07-17T10:00:00+00:00",
+    )
+    .await;
+
+    let active_memory = GuardianFailureMemoryStore::at_for_test(
+        chrono::DateTime::parse_from_rfc3339("2026-07-17T10:01:00+00:00")
+            .expect("test time")
+            .with_timezone(&chrono::Utc),
+    );
     let (result, policy_evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
         super::operation::settle_startup_install_guardian_failure_memory(
             &journals,
@@ -10305,13 +10379,13 @@ async fn startup_retry_scan_rejects_forged_target_and_binding_without_policy() {
 }
 
 #[tokio::test]
-async fn startup_retry_scan_merges_newer_window_once_and_is_idempotent() {
+async fn startup_retry_scan_replaces_expired_window_once_and_is_idempotent() {
     let facts = [download_fact(
         ExecutionDownloadFactKind::ProviderFailure,
         "minecraft_client_1.21.5",
     )];
     let old_journals = Arc::new(OperationJournalStore::new());
-    let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
+    let old_memory = fixed_failure_memory("2026-07-17T10:00:00+00:00");
     let old_operation = test_operation_id("startup-stale-memory-old");
     begin_install_operation_journal(&old_journals, &old_operation, "1.21.5")
         .await
@@ -10319,12 +10393,18 @@ async fn startup_retry_scan_merges_newer_window_once_and_is_idempotent() {
     record_install_failure_outcome(
         &test_producer(),
         old_journals,
-        failure_memory.clone(),
+        old_memory.clone(),
         &old_operation,
         &facts,
         "2026-07-17T10:00:00+00:00",
     )
     .await;
+    let old_snapshot = old_memory.snapshot().expect("snapshot old Retry window");
+    let failure_memory = fixed_failure_memory("2026-07-17T10:10:00+00:00");
+    failure_memory
+        .load_snapshot(old_snapshot)
+        .expect("load expired Retry window");
+    assert!(failure_memory.list().is_empty());
 
     let journals = Arc::new(OperationJournalStore::new());
     let newer_operation = test_operation_id("startup-stale-memory-newer");
@@ -10334,7 +10414,7 @@ async fn startup_retry_scan_merges_newer_window_once_and_is_idempotent() {
     record_install_failure_outcome(
         &test_producer(),
         journals.clone(),
-        Arc::new(GuardianFailureMemoryStore::new()),
+        fixed_failure_memory("2026-07-17T10:10:00+00:00"),
         &newer_operation,
         &facts,
         "2026-07-17T10:10:00+00:00",
@@ -10350,13 +10430,13 @@ async fn startup_retry_scan_merges_newer_window_once_and_is_idempotent() {
             ),
         )
         .await;
-        result.expect("merge newer startup Retry window");
+        result.expect("replace expired startup Retry window");
         assert_eq!(policy_evaluations, 0);
     }
     let merged = failure_memory.list();
     assert_eq!(merged.len(), 1);
-    assert_eq!(merged[0].occurrence_count, 2);
-    assert_eq!(merged[0].first_observed_at, "2026-07-17T10:00:00+00:00");
+    assert_eq!(merged[0].occurrence_count, 1);
+    assert_eq!(merged[0].first_observed_at, "2026-07-17T10:10:00+00:00");
     assert_eq!(merged[0].last_observed_at, "2026-07-17T10:10:00+00:00");
     assert_eq!(
         merged[0].suppression_until.as_deref(),
@@ -10478,7 +10558,7 @@ async fn startup_retry_scan_restores_vanilla_and_external_provider_ownership() {
 #[tokio::test]
 async fn concurrent_provider_failures_open_one_fixed_retry_window() {
     let journals = Arc::new(OperationJournalStore::new());
-    let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
+    let failure_memory = fixed_failure_memory("2026-06-16T10:00:00+00:00");
     let first_operation = test_operation_id("concurrent-provider-first");
     let second_operation = test_operation_id("concurrent-provider-second");
     begin_install_operation_journal(&journals, &first_operation, "1.21.5")
@@ -10662,7 +10742,7 @@ async fn cancelling_provider_settlement_waiter_releases_coordination() {
 #[tokio::test]
 async fn vanilla_provider_failure_records_guardian_retry_then_suppression_without_raw_details() {
     let journals = Arc::new(OperationJournalStore::new());
-    let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
+    let failure_memory = fixed_failure_memory("2026-06-16T10:00:00+00:00");
     let operation_id = test_operation_id("vanilla-provider-failure");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
@@ -10758,6 +10838,16 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed_entry).expect("journal json"));
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed).expect("summary json"));
 
+    let boundary_failure_memory = fixed_failure_memory("2026-06-16T10:05:00+00:00");
+    boundary_failure_memory
+        .load_snapshot(
+            failure_memory
+                .snapshot()
+                .expect("snapshot initial Retry window"),
+        )
+        .expect("load Retry window at expiry boundary");
+    assert!(boundary_failure_memory.list().is_empty());
+
     let boundary_operation_id = test_operation_id("vanilla-provider-failure-at-boundary");
     begin_install_operation_journal(&journals, &boundary_operation_id, "1.21.5")
         .await
@@ -10765,7 +10855,7 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     record_install_failure_outcome(
         &test_producer(),
         journals.clone(),
-        failure_memory.clone(),
+        boundary_failure_memory.clone(),
         &boundary_operation_id,
         &facts,
         "2026-06-16T10:05:00+00:00",
@@ -10778,12 +10868,12 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     let boundary = install_guardian_outcome_summary_from_journal(&boundary_entry)
         .expect("boundary Guardian outcome");
     assert_eq!(boundary.decision(), "retry");
-    let renewed_memory = failure_memory.list();
+    let renewed_memory = boundary_failure_memory.list();
     assert_eq!(renewed_memory.len(), 1);
-    assert_eq!(renewed_memory[0].occurrence_count, 2);
+    assert_eq!(renewed_memory[0].occurrence_count, 1);
     assert_eq!(
         renewed_memory[0].first_observed_at,
-        "2026-06-16T10:00:00+00:00"
+        "2026-06-16T10:05:00+00:00"
     );
     assert_eq!(
         renewed_memory[0].last_observed_at,

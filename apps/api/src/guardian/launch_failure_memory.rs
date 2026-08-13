@@ -305,12 +305,11 @@ pub fn record_launch_failure_observation(
     instance_id: &str,
     mode: GuardianMode,
     failure_class: LaunchFailureClass,
-    observed_at: &str,
 ) -> Result<(), FailureMemoryStoreError> {
     if !is_guardian_launch_crash_class(failure_class) {
         return Ok(());
     }
-    failure_memory.record(GuardianFailureMemoryEntry::observed(
+    let entry = failure_memory.construct_entry(GuardianFailureMemoryEntry::observed(
         launch_failure_diagnosis_id(failure_class),
         GuardianDomain::Startup,
         TargetDescriptor::new(
@@ -321,8 +320,9 @@ pub fn record_launch_failure_observation(
         ),
         mode,
         None,
-        observed_at,
-    ))
+        failure_memory.now_timestamp(),
+    ))?;
+    failure_memory.record(entry)
 }
 
 pub(super) fn launch_failure_diagnosis_id(failure_class: LaunchFailureClass) -> DiagnosisId {
@@ -391,7 +391,6 @@ mod tests {
             "instance-a",
             GuardianMode::Managed,
             LaunchFailureClass::ModAttributedCrash,
-            "2026-01-01T00:00:00Z",
         )
         .expect("record first mod-attributed crash");
         record_launch_failure_observation(
@@ -399,7 +398,6 @@ mod tests {
             "instance-a",
             GuardianMode::Managed,
             LaunchFailureClass::ModAttributedCrash,
-            "2026-01-01T00:05:00Z",
         )
         .expect("record repeated mod-attributed crash");
 
@@ -409,8 +407,9 @@ mod tests {
         assert_eq!(entries[0].target.kind, TargetKind::Instance);
         assert_eq!(entries[0].target.id, "instance-a");
         assert_eq!(entries[0].occurrence_count, 2);
-        assert_eq!(entries[0].first_observed_at, "2026-01-01T00:00:00Z");
-        assert_eq!(entries[0].last_observed_at, "2026-01-01T00:05:00Z");
+        let first = parsed_timestamp(&entries[0].first_observed_at).expect("canonical first time");
+        let last = parsed_timestamp(&entries[0].last_observed_at).expect("canonical last time");
+        assert!(last >= first);
         assert_eq!(entries[0].last_action_kind, None);
         assert_eq!(entries[0].last_action_outcome, None);
     }
@@ -431,7 +430,6 @@ mod tests {
                 "instance-a",
                 GuardianMode::Managed,
                 failure_class,
-                "2026-01-01T00:00:00Z",
             )
             .expect("record accepted launch failure");
         }
@@ -440,7 +438,6 @@ mod tests {
             "instance-a",
             GuardianMode::Managed,
             LaunchFailureClass::Unknown,
-            "2026-01-01T00:00:00Z",
         )
         .expect("ignore generic launch failure");
 

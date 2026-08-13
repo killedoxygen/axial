@@ -204,7 +204,7 @@ pub(super) fn recovering_install_journals(
     let mut identities = HashSet::new();
     let mut recovering = Vec::new();
 
-    for entry in journals.list().into_iter().filter(|entry| {
+    for entry in journals.matching_entries(|entry| {
         entry.command == CommandKind::InstallVersion && !install_journal_is_terminal(entry.status)
     }) {
         let journal = parse_recovering_install_journal(&entry)?;
@@ -897,14 +897,13 @@ pub(crate) fn install_operation_journal_for_session(
 ) -> Option<OperationJournalEntry> {
     let session_target = install_session_target(install_id);
     journals
-        .list()
-        .into_iter()
-        .filter(|entry| {
+        .matching_entries(|entry| {
             matches!(
                 entry.command,
                 CommandKind::InstallVersion | CommandKind::ModifyInstanceContent
             ) && entry.targets.contains(&session_target)
         })
+        .into_iter()
         .max_by_key(|entry| entry.sequence)
 }
 
@@ -1173,26 +1172,21 @@ async fn record_operation_interrupted(
     evidence: &[GuardianInstallArtifactFailureEvidence],
 ) -> Result<(), OperationJournalStoreError> {
     let memory_window =
-        ProviderFailureObservationWindow::from_observed_at(&chrono::Utc::now().to_rfc3339())
+        ProviderFailureObservationWindow::from_observed_at(&journals.now_timestamp())
             .ok_or(OperationJournalStoreError::InvalidGuardianOutcome)?;
-    let (fact_ids, diagnosis_ids) = assess_install_guardian_failure(
-        None,
-        operation_id,
-        evidence,
-        OperationPhase::Downloading,
-        &memory_window.observed_at,
-    )
-    .as_ref()
-    .and_then(|assessment| {
-        install_guardian_terminal_update(
-            assessment,
-            operation_id,
-            evidence,
-            OperationPhase::Downloading,
-            &memory_window,
-        )
-    })
-    .unwrap_or_default();
+    let (fact_ids, diagnosis_ids) =
+        assess_install_guardian_failure(None, operation_id, evidence, OperationPhase::Downloading)
+            .as_ref()
+            .and_then(|assessment| {
+                install_guardian_terminal_update(
+                    assessment,
+                    operation_id,
+                    evidence,
+                    OperationPhase::Downloading,
+                    &memory_window,
+                )
+            })
+            .unwrap_or_default();
     let mut step = install_progress_step(
         step_namespace,
         &safe_progress_phase(&progress.phase),
@@ -1359,14 +1353,13 @@ pub(super) async fn record_install_operation_initialization_cancelled(
     )
     .with_field("phase", "initializing");
     let memory_window =
-        ProviderFailureObservationWindow::from_observed_at(&chrono::Utc::now().to_rfc3339())
+        ProviderFailureObservationWindow::from_observed_at(&journals.now_timestamp())
             .ok_or(OperationJournalStoreError::InvalidGuardianOutcome)?;
     let (fact_ids, diagnosis_ids) = assess_install_guardian_failure(
         None,
         operation_id,
         std::slice::from_ref(&evidence),
         OperationPhase::Downloading,
-        &memory_window.observed_at,
     )
     .as_ref()
     .and_then(|assessment| {
@@ -1542,13 +1535,12 @@ pub(super) async fn settle_startup_install_guardian_failure_memory(
 
     let mut active_keys = BTreeSet::new();
     let mut candidates = Vec::new();
-    for entry in journals.list() {
-        if !matches!(
+    for entry in journals.matching_entries(|entry| {
+        matches!(
             entry.command,
             CommandKind::InstallVersion | CommandKind::ModifyInstanceContent
-        ) {
-            continue;
-        }
+        )
+    }) {
         let (summary, memory) = match persisted_install_guardian_outcome(&entry) {
             PersistedInstallGuardianOutcome::Absent => continue,
             PersistedInstallGuardianOutcome::Invalid => {
@@ -1568,9 +1560,6 @@ pub(super) async fn settle_startup_install_guardian_failure_memory(
         let Some(memory) = memory else {
             return Err(OperationJournalStoreError::InvalidGuardianOutcome);
         };
-        if !suppression_deadline_active(memory.suppression_until(), observed_at) {
-            continue;
-        }
         if !install_provider_retry_target_is_valid(memory.target()) {
             return Err(OperationJournalStoreError::InvalidGuardianOutcome);
         }
@@ -1592,6 +1581,11 @@ pub(super) async fn settle_startup_install_guardian_failure_memory(
         {
             return Err(OperationJournalStoreError::InvalidGuardianOutcome);
         }
+        let candidate = match failure_memory.construct_entry(candidate) {
+            Ok(candidate) => candidate,
+            Err(FailureMemoryStoreError::Expired) => continue,
+            Err(_) => return Err(OperationJournalStoreError::InvalidGuardianOutcome),
+        };
         candidates.push(candidate);
     }
 
@@ -2278,6 +2272,7 @@ pub(crate) async fn record_content_failure_outcome(
         phase,
         observed_at,
     } = request;
+    let _ = observed_at;
     let mut evidence = install_failure_evidence_from_download_facts(operation_id, download_facts);
     if let Some(additional_evidence) = additional_evidence {
         evidence.push(additional_evidence);
@@ -2294,7 +2289,6 @@ pub(crate) async fn record_content_failure_outcome(
             command: CommandKind::ModifyInstanceContent,
             evidence: &evidence,
             phase,
-            observed_at,
         },
     )
     .await
@@ -2522,7 +2516,7 @@ async fn record_install_guardian_failure_outcome_without_memory(
     )
     .await?;
     let memory_window =
-        ProviderFailureObservationWindow::from_observed_at(&chrono::Utc::now().to_rfc3339())
+        ProviderFailureObservationWindow::from_observed_at(&journals.now_timestamp())
             .ok_or(OperationJournalStoreError::InvalidGuardianOutcome)?;
     settle_operation_guardian_failure(
         journals,
@@ -2549,7 +2543,7 @@ pub(super) async fn record_install_guardian_failure_outcome(
     operation_id: &OperationId,
     evidence: &[GuardianInstallArtifactFailureEvidence],
     phase: OperationPhase,
-    observed_at: &str,
+    _observed_at: &str,
 ) -> Result<(), OperationJournalStoreError> {
     record_operation_guardian_failure_outcome(
         producer,
@@ -2560,7 +2554,6 @@ pub(super) async fn record_install_guardian_failure_outcome(
             command: CommandKind::InstallVersion,
             evidence,
             phase,
-            observed_at,
         },
     )
     .await
@@ -2571,7 +2564,6 @@ struct OperationGuardianFailureRequest<'a> {
     command: CommandKind,
     evidence: &'a [GuardianInstallArtifactFailureEvidence],
     phase: OperationPhase,
-    observed_at: &'a str,
 }
 
 fn assess_install_guardian_failure(
@@ -2579,7 +2571,6 @@ fn assess_install_guardian_failure(
     operation_id: &OperationId,
     evidence: &[GuardianInstallArtifactFailureEvidence],
     phase: OperationPhase,
-    observed_at: &str,
 ) -> Option<GuardianInstallAssessment> {
     let mode = GuardianMode::Managed;
     let context = failure_memory_suppression_context(
@@ -2588,7 +2579,6 @@ fn assess_install_guardian_failure(
         mode,
         phase,
         evidence,
-        observed_at,
     );
     assess_install_artifact_failure_with_context(
         Some(operation_id.clone()),
@@ -2616,8 +2606,9 @@ async fn record_operation_guardian_failure_outcome(
     let operation_id = request.operation_id.clone();
     let logged_operation_id = operation_id.clone();
     let evidence = request.evidence.to_vec();
-    let memory_window = ProviderFailureObservationWindow::from_observed_at(request.observed_at)
-        .ok_or(OperationJournalStoreError::InvalidGuardianOutcome)?;
+    let memory_window =
+        ProviderFailureObservationWindow::from_observed_at(&failure_memory.now_timestamp())
+            .ok_or(OperationJournalStoreError::InvalidGuardianOutcome)?;
     let command = request.command;
     let phase = request.phase;
     #[cfg(test)]
@@ -2809,7 +2800,6 @@ async fn settle_operation_guardian_failure(
                         evidence,
                         diagnosis_id: summary.diagnosis_id(),
                         retry: summary.decision_is(GuardianActionKind::Retry),
-                        observed_at: &memory_window.observed_at,
                         publication: ProviderMemoryPublication::Replay(
                             memory.map(|memory| *memory),
                         ),
@@ -2821,13 +2811,9 @@ async fn settle_operation_guardian_failure(
         }
     }
 
-    let Some(assessment) = assess_install_guardian_failure(
-        failure_memory,
-        operation_id,
-        evidence,
-        phase,
-        &memory_window.observed_at,
-    ) else {
+    let Some(assessment) =
+        assess_install_guardian_failure(failure_memory, operation_id, evidence, phase)
+    else {
         return Ok(());
     };
     let Some(outcome) = assessment.terminal_outcome() else {
@@ -2868,7 +2854,6 @@ async fn settle_operation_guardian_failure(
                 evidence,
                 diagnosis_id: outcome.diagnosis_id,
                 retry: true,
-                observed_at: &memory_window.observed_at,
                 publication: ProviderMemoryPublication::Assessed(memory),
             },
         )
@@ -3080,18 +3065,9 @@ fn failure_memory_suppression_context(
     mode: GuardianMode,
     phase: OperationPhase,
     evidence: &[GuardianInstallArtifactFailureEvidence],
-    observed_at: &str,
 ) -> GuardianPolicyContext {
     let mut context = GuardianPolicyContext::current_operation();
-    if provider_failure_memory_entry(
-        failure_memory,
-        operation_id,
-        mode,
-        phase,
-        evidence,
-        observed_at,
-    )
-    .is_some()
+    if provider_failure_memory_entry(failure_memory, operation_id, mode, phase, evidence).is_some()
     {
         context = context.with_suppression();
     }
@@ -3104,7 +3080,6 @@ fn provider_failure_memory_entry(
     mode: GuardianMode,
     phase: OperationPhase,
     evidence: &[GuardianInstallArtifactFailureEvidence],
-    observed_at: &str,
 ) -> Option<crate::state::failure_memory::GuardianFailureMemoryEntry> {
     let memory = failure_memory?;
     let key = install_failure_memory_key(
@@ -3115,7 +3090,7 @@ fn provider_failure_memory_entry(
         DiagnosisId::DownloadUnavailable,
     )?;
     let entry = memory.get(&key)?;
-    if !suppression_active(&entry, observed_at) {
+    if !memory.suppression_active(&entry) {
         return None;
     }
     Some(entry)
@@ -3134,7 +3109,6 @@ struct ProviderFailureMemoryPublicationRequest<'a> {
     evidence: &'a [GuardianInstallArtifactFailureEvidence],
     diagnosis_id: DiagnosisId,
     retry: bool,
-    observed_at: &'a str,
     publication: ProviderMemoryPublication,
 }
 
@@ -3149,7 +3123,6 @@ async fn publish_provider_failure_memory_if_needed(
         evidence,
         diagnosis_id,
         retry,
-        observed_at,
         publication,
     } = request;
     if diagnosis_id != DiagnosisId::DownloadUnavailable || !retry {
@@ -3172,12 +3145,7 @@ async fn publish_provider_failure_memory_if_needed(
     let replay = matches!(&publication, ProviderMemoryPublication::Replay(_));
     let memory_persistence = match publication {
         ProviderMemoryPublication::Assessed(memory) => memory,
-        ProviderMemoryPublication::Replay(Some(memory)) => {
-            if !suppression_deadline_active(memory.suppression_until(), observed_at) {
-                return Ok(());
-            }
-            memory
-        }
+        ProviderMemoryPublication::Replay(Some(memory)) => memory,
         ProviderMemoryPublication::Replay(None) => return Ok(()),
     };
     let entry = GuardianFailureMemoryEntry::observed(
@@ -3196,6 +3164,11 @@ async fn publish_provider_failure_memory_if_needed(
     if !memory_persistence.matches_failure_memory_key(&entry.key, &entry.target) {
         return Ok(());
     }
+    let entry = match memory.construct_entry(entry) {
+        Ok(entry) => entry,
+        Err(FailureMemoryStoreError::Expired) if replay => return Ok(()),
+        Err(error) => return Err(error),
+    };
     if replay {
         return memory.reconcile_install_guardian_retry(entry).await;
     }
@@ -3251,23 +3224,6 @@ fn install_failure_memory_key(
         mode,
         Some(PROVIDER_FAILURE_MEMORY_SOURCE),
     ))
-}
-
-fn suppression_active(entry: &GuardianFailureMemoryEntry, observed_at: &str) -> bool {
-    let Some(suppression_until) = &entry.suppression_until else {
-        return false;
-    };
-    suppression_deadline_active(suppression_until, observed_at)
-}
-
-fn suppression_deadline_active(suppression_until: &str, observed_at: &str) -> bool {
-    let Ok(suppression_until) = chrono::DateTime::parse_from_rfc3339(suppression_until) else {
-        return false;
-    };
-    let Ok(observed_at) = chrono::DateTime::parse_from_rfc3339(observed_at) else {
-        return false;
-    };
-    suppression_until > observed_at
 }
 
 pub(super) fn public_install_id(id: &str) -> String {

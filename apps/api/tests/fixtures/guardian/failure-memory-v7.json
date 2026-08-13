@@ -1,5 +1,5 @@
 {
-  "schema": "axial.guardian.failure_memory.v6",
+  "schema": "axial.guardian.failure_memory.v7",
   "entries": [
     {
       "key": "Launch:launch_prepare_failed:Guardian.Config.fixture_target_01:Managed:intent_01",

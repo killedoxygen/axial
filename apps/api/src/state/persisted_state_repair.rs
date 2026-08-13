@@ -24,7 +24,6 @@ use crate::state::contracts::{
     persisted_state_repair_quarantine_suffix,
 };
 use axial_resource::PhysicalIoClass;
-use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 use std::io;
 use std::time::Duration;
@@ -241,13 +240,13 @@ impl AppState {
                     error.class()
                 ))
             })?;
-        for journal in self.journals.list() {
-            let Some(attempt) = journal.persisted_state_repair_attempt() else {
-                continue;
-            };
-            if journal.persisted_state_repair_terminal().is_some() {
-                continue;
-            }
+        for journal in self.journals.matching_entries(|journal| {
+            journal.persisted_state_repair_attempt().is_some()
+                && journal.persisted_state_repair_terminal().is_none()
+        }) {
+            let attempt = journal
+                .persisted_state_repair_attempt()
+                .expect("persisted-state repair attempt was filtered");
             let directory = self
                 .persisted_state_repair_directories
                 .for_store(attempt.store());
@@ -356,8 +355,9 @@ impl AppState {
                 return Err(io::Error::other(error));
             }
         }
-        let now = Utc::now();
-        let journals = self.journals.list();
+        let journals = self
+            .journals
+            .matching_entries(|journal| journal.persisted_state_repair_attempt().is_some());
         let mut active = BTreeMap::new();
         for journal in &journals {
             let Some(attempt) = journal.persisted_state_repair_attempt() else {
@@ -369,9 +369,9 @@ impl AppState {
                     "nonterminal persisted-state repair remained unsettled after recovery",
                 ));
             };
-            if !DateTime::parse_from_rfc3339(terminal.suppression_until())
-                .is_ok_and(|until| until > now)
-            {
+            let memory =
+                GuardianFailureMemoryEntry::for_persisted_state_repair_terminal(terminal.clone());
+            if !self.failure_memory.suppression_active(&memory) {
                 continue;
             }
             let key = FailureMemoryKey::for_persisted_state_repair(attempt);
@@ -385,13 +385,11 @@ impl AppState {
                 ));
             }
         }
-        for memory in self.failure_memory.list() {
+        for memory in self.failure_memory.list_current() {
             let Some(terminal) = memory.persisted_state_repair_terminal() else {
                 continue;
             };
-            if !DateTime::parse_from_rfc3339(terminal.suppression_until())
-                .is_ok_and(|until| until > now)
-            {
+            if !self.failure_memory.suppression_active(&memory) {
                 continue;
             }
             let canonical =
@@ -477,45 +475,43 @@ impl AppState {
         {
             return Err(PersistedStateRepairAdmissionRejection::RecordIdentityChanged);
         }
-        let observed_at = Utc::now().fixed_offset();
+        let observed_at = self.failure_memory.now_timestamp();
         let attempt = PersistedStateRepairAttempt::new(
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
             GuardianMode::Managed,
-            observed_at.to_rfc3339(),
+            observed_at,
         );
         attempt
             .validate()
             .map_err(|_| PersistedStateRepairAdmissionRejection::RecordIdentityChanged)?;
         let key = FailureMemoryKey::for_persisted_state_repair(&attempt);
-        if self.failure_memory.get(&key).is_some_and(|entry| {
-            entry
-                .persisted_state_repair_terminal()
-                .and_then(|terminal| {
-                    DateTime::parse_from_rfc3339(terminal.suppression_until()).ok()
-                })
-                .is_some_and(|until| until > observed_at)
-        }) {
+        if self
+            .failure_memory
+            .get(&key)
+            .is_some_and(|entry| self.failure_memory.suppression_active(&entry))
+        {
             return Err(PersistedStateRepairAdmissionRejection::Suppressed);
         }
         let mut active_terminals = 0usize;
-        for journal in self.journals.list() {
-            let Some(prior) = journal.persisted_state_repair_attempt() else {
-                continue;
-            };
-            if FailureMemoryKey::for_persisted_state_repair(prior) != key {
-                continue;
-            }
+        for journal in self.journals.matching_entries(|journal| {
+            journal
+                .persisted_state_repair_attempt()
+                .is_some_and(|prior| FailureMemoryKey::for_persisted_state_repair(prior) == key)
+        }) {
             match journal.persisted_state_repair_terminal() {
                 None => {
                     return Err(PersistedStateRepairAdmissionRejection::AmbiguousPriorAttempt);
                 }
                 Some(terminal)
-                    if DateTime::parse_from_rfc3339(terminal.suppression_until())
-                        .is_ok_and(|until| until > observed_at) =>
+                    if self.failure_memory.suppression_active(
+                        &GuardianFailureMemoryEntry::for_persisted_state_repair_terminal(
+                            terminal.clone(),
+                        ),
+                    ) =>
                 {
-                    active_terminals += 1;
+                    active_terminals += 1
                 }
                 Some(_) => {}
             }
@@ -817,6 +813,7 @@ mod tests {
         persisted_state_rejected_record_eligibility_in_directory_for_test,
     };
     use axial_config::{AppConfig, AppPaths, InstanceRegistrySnapshot};
+    use chrono::{DateTime, Utc};
     use static_assertions::assert_not_impl_any;
     use std::ffi::OsStr;
     use std::fs;
@@ -1269,50 +1266,52 @@ mod tests {
     async fn expired_same_key_retry_mints_a_new_attempt_and_supersedes_memory() {
         let fixture = fixture("expired-retry");
         let (_, eligibility) = owned_eligibility(&fixture.state, &fixture.root, 7);
-        let expired_attempt = PersistedStateRepairAttempt::new(
+        let expiring_attempt = PersistedStateRepairAttempt::new(
             eligibility.store(),
             eligibility.record_id(),
             eligibility.physical_identity().clone(),
             GuardianMode::Managed,
-            (Utc::now() - chrono::Duration::hours(49))
+            (Utc::now() - chrono::Duration::hours(24) + chrono::Duration::seconds(2))
                 .fixed_offset()
                 .to_rfc3339(),
         );
-        let expired_terminal = PersistedStateRepairTerminal::from_attempt(
-            expired_attempt.clone(),
+        let expiring_terminal = PersistedStateRepairTerminal::from_attempt(
+            expiring_attempt.clone(),
             PersistedStateRepairTerminalOutcome::Refused,
         );
         fixture
             .state
             .journals()
-            .create_persisted_state_repair_plan(expired_attempt.clone())
+            .create_persisted_state_repair_plan(expiring_attempt.clone())
             .await
-            .expect("expired plan");
+            .expect("current plan near expiry");
         fixture
             .state
             .journals()
             .record_persisted_state_repair_terminal(
-                expired_attempt.operation_id(),
-                expired_terminal.clone(),
+                expiring_attempt.operation_id(),
+                expiring_terminal.clone(),
             )
             .await
-            .expect("expired terminal");
-        let key = FailureMemoryKey::for_persisted_state_repair(&expired_attempt);
+            .expect("current terminal near expiry");
+        let key = FailureMemoryKey::for_persisted_state_repair(&expiring_attempt);
         let reservation = fixture
             .state
             .failure_memory()
-            .reserve_persisted_state_repair(&expired_attempt)
-            .expect("expired memory reservation");
+            .reserve_persisted_state_repair(&expiring_attempt)
+            .expect("current memory reservation near expiry");
         fixture
             .state
             .failure_memory()
             .record_persisted_state_repair_terminal(
-                GuardianFailureMemoryEntry::for_persisted_state_repair_terminal(expired_terminal),
+                GuardianFailureMemoryEntry::for_persisted_state_repair_terminal(expiring_terminal),
                 &reservation,
             )
             .await
-            .expect("expired memory");
+            .expect("current memory near expiry");
         drop(reservation);
+
+        tokio::time::sleep(Duration::from_millis(2_250)).await;
 
         let admission = fixture
             .state
@@ -1321,7 +1320,7 @@ mod tests {
             .expect("expired suppression permits retry");
         assert_ne!(
             admission.attempt.operation_id(),
-            expired_attempt.operation_id()
+            expiring_attempt.operation_id()
         );
         let new_operation_id = admission.attempt.operation_id().clone();
         assert_eq!(
@@ -1367,7 +1366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reservation_uses_the_exact_attempt_timestamp_at_the_suppression_boundary() {
+    async fn reservation_uses_policy_now_at_the_suppression_boundary() {
         let fixture = fixture("suppression-boundary");
         let (_, eligibility) = owned_eligibility(&fixture.state, &fixture.root, 9);
         let replacement_observed_at = Utc::now().fixed_offset();
@@ -1413,10 +1412,7 @@ mod tests {
             .failure_memory()
             .reserve_persisted_state_repair(&replacement)
             .err();
-        assert_eq!(
-            rejection,
-            Some(PersistedStateRepairReserveError::Suppressed)
-        );
+        assert_eq!(rejection, None);
 
         drop((eligibility, fixture.state));
         let _ = fs::remove_dir_all(fixture.root);
@@ -1678,11 +1674,11 @@ mod tests {
         assert_eq!(coverage.suppression_hours, 24);
         assert_eq!(
             coverage.operation_journal_schema,
-            "axial.state.operation_journals.v8"
+            "axial.state.operation_journals.v9"
         );
         assert_eq!(
             coverage.failure_memory_schema,
-            "axial.guardian.failure_memory.v6"
+            "axial.guardian.failure_memory.v7"
         );
         assert_eq!(
             coverage.terminal_outcomes,

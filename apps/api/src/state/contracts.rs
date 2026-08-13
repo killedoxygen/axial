@@ -428,10 +428,7 @@ impl PersistedStateRepairAttempt {
             .map_err(|_| PersistedStateRepairValidationError::InvalidWindow)?;
         let suppression_until = chrono::DateTime::parse_from_rfc3339(&self.suppression_until)
             .map_err(|_| PersistedStateRepairValidationError::InvalidWindow)?;
-        if observed_at.checked_add_signed(chrono::Duration::hours(
-            PERSISTED_STATE_REPAIR_SUPPRESSION_HOURS,
-        )) != Some(suppression_until)
-        {
+        if suppression_until <= observed_at {
             return Err(PersistedStateRepairValidationError::InvalidWindow);
         }
         Ok(())

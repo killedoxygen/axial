@@ -607,10 +607,7 @@ pub(super) async fn reconcile_interrupted_tier2_integrity_sweeps(
     let _producer = producer;
     let interrupted = state
         .journals()
-        .list()
-        .into_iter()
-        .filter(tier2_restart_journal_is_exact)
-        .collect::<Vec<_>>();
+        .matching_entries(tier2_restart_journal_is_exact);
     for journal in interrupted {
         record_terminal_reconciled(
             state.journals(),

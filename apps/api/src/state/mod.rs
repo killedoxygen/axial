@@ -36,6 +36,7 @@ mod setup_plans;
 mod shutdown;
 pub mod skins;
 mod successors;
+pub(crate) mod temporal;
 mod update_admission;
 pub mod updater;
 mod user_mod_witness;
@@ -1256,16 +1257,40 @@ impl AppState {
                 })?
                 .into_parts();
         let rejected_record_scans = vec![benchmark_suite_driver_rejection_scan];
+        let durable_temporal_policy = Arc::new(temporal::BoundedTemporalPolicy::system());
         let journals = Arc::new(
-            OperationJournalStore::try_load_from_directory(
+            OperationJournalStore::try_load_from_directory_with_temporal(
                 crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
                     Arc::clone(&root_session),
                     persisted_state_directories.operation_journal_parent(),
                 ),
+                Arc::clone(&durable_temporal_policy),
             )
             .map_err(|error| {
                 std::io::Error::other(format!("failed to load operation journals: {error}"))
             })?,
+        );
+        let failure_memory = Arc::new(
+            GuardianFailureMemoryStore::try_load_from_directory_with_temporal(
+                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
+                    Arc::clone(&root_session),
+                    persisted_state_directories.guardian_failure_memory_parent(),
+                ),
+                Arc::clone(&durable_temporal_policy),
+            )
+            .map_err(|error| {
+                std::io::Error::other(format!("failed to load Guardian failure memory: {error}"))
+            })?,
+        );
+        let journal_temporal_load_issues = journals.temporal_load_issues();
+        let failure_memory_temporal_load_issues = failure_memory.temporal_load_issues();
+        let temporal_load_issues = temporal::BoundedTemporalLoadIssueCounts::new(
+            journal_temporal_load_issues
+                .future_observation()
+                .saturating_add(failure_memory_temporal_load_issues.future_observation()),
+            journal_temporal_load_issues
+                .out_of_bounds_window()
+                .saturating_add(failure_memory_temporal_load_issues.out_of_bounds_window()),
         );
         let persisted_state_load = Arc::new(PersistedStateLoadEvidence::from_store_parts(
             [
@@ -1274,7 +1299,9 @@ impl AppState {
                 benchmark_suite_drivers.load_issue_count(),
                 launch_reports.load_issue_count(),
                 journals.load_issue_count(),
+                failure_memory.temporal_quarantine_count(),
             ],
+            temporal_load_issues,
             rejected_record_scans
                 .iter()
                 .flat_map(persisted_state_load::PersistedStateRejectedRecordStoreScan::evidence),
@@ -1304,17 +1331,6 @@ impl AppState {
                 persisted_state_directories.application_root(),
             ),
         )?);
-        let failure_memory = Arc::new(
-            GuardianFailureMemoryStore::try_load_from_directory(
-                crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
-                    Arc::clone(&root_session),
-                    persisted_state_directories.guardian_failure_memory_parent(),
-                ),
-            )
-            .map_err(|error| {
-                std::io::Error::other(format!("failed to load Guardian failure memory: {error}"))
-            })?,
-        );
         let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(
             crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
                 Arc::clone(&root_session),

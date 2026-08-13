@@ -24,7 +24,6 @@ use crate::guardian::{
     guardian_summary_with_blocked_outcome, guardian_summary_with_observed_outcome,
     is_guardian_launch_crash_class, record_launch_failure_observation, user_mod_set_drift_fact,
 };
-use crate::logging::timestamp_utc;
 use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
     TelemetryLaunchOutcome,
@@ -448,15 +447,9 @@ async fn settle_observed_process_exit(
             event.guardian = serialize_guardian(Some(guardian));
         }
 
-        let observed_at = timestamp_utc();
-        if let Err(error) = persist_launch_failure_observation(
-            state,
-            instance_id,
-            guardian_mode,
-            failure_class,
-            &observed_at,
-        )
-        .await
+        if let Err(error) =
+            persist_launch_failure_observation(state, instance_id, guardian_mode, failure_class)
+                .await
         {
             tracing::warn!(
                 error_kind = error.class(),
@@ -477,14 +470,12 @@ async fn persist_launch_failure_observation(
     instance_id: &str,
     guardian_mode: crate::guardian::GuardianMode,
     failure_class: LaunchFailureClass,
-    observed_at: &str,
 ) -> Result<(), crate::state::failure_memory::FailureMemoryStoreError> {
     record_launch_failure_observation(
         state.failure_memory(),
         instance_id,
         guardian_mode,
         failure_class,
-        observed_at,
     )?;
     state.failure_memory().flush().await
 }
@@ -1362,23 +1353,20 @@ async fn launch_session_inner_with_control(
                     })
                 };
                 let failure_class = startup_outcome.failure_class;
-                if is_guardian_launch_crash_class(failure_class) {
-                    let observed_at = timestamp_utc();
-                    if let Err(error) = persist_launch_failure_observation(
+                if is_guardian_launch_crash_class(failure_class)
+                    && let Err(error) = persist_launch_failure_observation(
                         &state,
                         &instance_id,
                         guardian_mode,
                         failure_class,
-                        &observed_at,
                     )
                     .await
-                    {
-                        tracing::warn!(
-                            error_kind = error.class(),
-                            failure_class = failure_class.as_str(),
-                            "failed to record startup launch failure observation"
-                        );
-                    }
+                {
+                    tracing::warn!(
+                        error_kind = error.class(),
+                        failure_class = failure_class.as_str(),
+                        "failed to record startup launch failure observation"
+                    );
                 }
                 if let Some(recovery_plan) = last_recovery_plan.take() {
                     record_failed_self_healing_if_any(&state, &session_id, Some(&recovery_plan))

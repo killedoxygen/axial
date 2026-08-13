@@ -1,5 +1,5 @@
 {
-  "schema": "axial.state.operation_journals.v8",
+  "schema": "axial.state.operation_journals.v9",
   "next_sequence": 8,
   "entries": [
     {

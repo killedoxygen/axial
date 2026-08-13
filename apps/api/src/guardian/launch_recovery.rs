@@ -14,10 +14,9 @@ use crate::state::failure_memory::{
 };
 use crate::state::{OperationJournalStore, OperationJournalStoreError};
 use axial_launcher::LaunchFailureClass;
-use chrono::{DateTime, Duration, FixedOffset};
+use chrono::{DateTime, Duration};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::warn;
 
 const DEFAULT_LAUNCH_RECOVERY_SUPPRESSION_MINUTES: i64 = 30;
 const LAUNCH_RECOVERY_INTENT_DOMAIN: &[u8] = b"axial.guardian.launch-recovery-intent.v1";
@@ -265,7 +264,7 @@ async fn record_launch_recovery_attempt_with_existing_policy(
     );
 
     if let Some(entry) = request.failure_memory.get(&memory_key)
-        && suppression_active(&entry, request.observed_at)
+        && request.failure_memory.suppression_active(&entry)
     {
         match request.journals.get(&operation_id) {
             Some(entry)
@@ -306,6 +305,7 @@ pub async fn record_launch_recovery_success(
 ) -> Result<GuardianLaunchRecoveryOutcome, OperationJournalStoreError> {
     let plan = request.plan;
     let diagnosis_id = plan.diagnosis_id;
+    let observed_at = request.failure_memory.now_timestamp();
     let operation_id = plan.operation_id.clone();
     let action = plan.directive.action_kind();
     match request.journals.get(&operation_id) {
@@ -335,11 +335,11 @@ pub async fn record_launch_recovery_success(
         &plan.target,
         action,
         FailureMemoryActionOutcome::Retried,
-        request.observed_at,
+        &observed_at,
         Some(plan.user_intent_hash.as_str()),
         None,
         true,
-    );
+    )?;
     Ok(launch_recovery_outcome(
         operation_id,
         GuardianLaunchRecoveryStatus::Succeeded,
@@ -351,9 +351,10 @@ pub async fn record_launch_recovery_failure(
 ) -> Result<GuardianLaunchRecoveryOutcome, OperationJournalStoreError> {
     let plan = request.plan;
     let diagnosis_id = plan.diagnosis_id;
+    let observed_at = request.failure_memory.now_timestamp();
     let operation_id = plan.operation_id.clone();
     let action = plan.directive.action_kind();
-    let suppression_until = default_suppression_until(request.observed_at);
+    let suppression_until = default_suppression_until(&observed_at);
     match request.journals.get(&operation_id) {
         Some(entry)
             if launch_recovery_journal_transition_matches(
@@ -384,11 +385,11 @@ pub async fn record_launch_recovery_failure(
         &plan.target,
         action,
         FailureMemoryActionOutcome::Failed,
-        request.observed_at,
+        &observed_at,
         Some(plan.user_intent_hash.as_str()),
         suppression_until.as_deref(),
         true,
-    );
+    )?;
     Ok(launch_recovery_outcome(
         operation_id,
         GuardianLaunchRecoveryStatus::Failed,
@@ -596,7 +597,7 @@ fn record_launch_recovery_memory(
     user_intent_hash: Option<&str>,
     suppression_until: Option<&str>,
     repair_attempt: bool,
-) {
+) -> Result<(), OperationJournalStoreError> {
     let mut entry = GuardianFailureMemoryEntry::observed(
         *diagnosis_id,
         GuardianDomain::Launch,
@@ -612,25 +613,12 @@ fn record_launch_recovery_memory(
     if let Some(suppression_until) = suppression_until {
         entry = entry.with_suppression_until(suppression_until);
     }
-    if let Err(error) = failure_memory.record(entry) {
-        warn!(
-            error_kind = error.class(),
-            "failed to record Guardian launch-recovery failure memory"
-        );
-    }
-}
-
-fn suppression_active(entry: &GuardianFailureMemoryEntry, now: &str) -> bool {
-    let Some(suppression_until) = entry.suppression_until.as_deref() else {
-        return false;
-    };
-    let Ok(suppression_until) = DateTime::parse_from_rfc3339(suppression_until) else {
-        return false;
-    };
-    let Ok(now) = DateTime::<FixedOffset>::parse_from_rfc3339(now) else {
-        return false;
-    };
-    suppression_until > now
+    let entry = failure_memory
+        .construct_entry(entry)
+        .map_err(|_| OperationJournalStoreError::GuardianFailureMemoryUnavailable)?;
+    failure_memory
+        .record(entry)
+        .map_err(|_| OperationJournalStoreError::GuardianFailureMemoryUnavailable)
 }
 
 fn default_suppression_until(observed_at: &str) -> Option<String> {
@@ -1194,7 +1182,8 @@ mod tests {
     #[tokio::test]
     async fn launch_recovery_failure_sets_suppression_window() {
         let journals = OperationJournalStore::new();
-        let failure_memory = GuardianFailureMemoryStore::new();
+        let failure_memory =
+            GuardianFailureMemoryStore::at_for_test(test_time("2026-06-15T10:00:00Z"));
         let plan = plan("session-2", RecoveryCase::SwitchManagedRuntime);
 
         record_launch_recovery_attempt(request(
@@ -1232,7 +1221,8 @@ mod tests {
     #[tokio::test]
     async fn later_session_suppression_preserves_failed_memory() {
         let journals = OperationJournalStore::new();
-        let failure_memory = GuardianFailureMemoryStore::new();
+        let failure_memory =
+            GuardianFailureMemoryStore::at_for_test(test_time("2026-06-15T10:00:00Z"));
         let initial_plan = plan("instance-3", RecoveryCase::DowngradePreset);
 
         record_launch_recovery_attempt(request(
@@ -1410,11 +1400,22 @@ mod tests {
         ))
         .await
         .expect("persist launch recovery failure");
+        let suppression_until = first_memory
+            .list()
+            .first()
+            .and_then(|entry| entry.suppression_until.as_deref())
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .expect("recorded suppression deadline")
+            .with_timezone(&chrono::Utc);
 
         first_memory.flush().await.expect("flush failure memory");
         first_memory.close().await.expect("close failure memory");
         drop(first_memory);
-        let reloaded_memory = reload_failure_memory(&paths);
+        let reloaded_memory = reload_failure_memory_at(
+            &paths,
+            suppression_until + chrono::Duration::milliseconds(1),
+        );
+        assert!(reloaded_memory.list().is_empty());
         let retry_plan = plan("session-expired", RecoveryCase::SwitchManagedRuntime);
         let attempt = record_launch_recovery_attempt(request(
             &retry_plan,
@@ -1426,10 +1427,7 @@ mod tests {
         .expect("persist launch recovery attempt");
 
         assert_eq!(attempt.status, GuardianLaunchRecoveryStatus::Recorded);
-        assert_eq!(
-            reloaded_memory.list()[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Failed)
-        );
+        assert!(reloaded_memory.list().is_empty());
         record_launch_recovery_success(request(
             &retry_plan,
             "2026-06-15T10:32:00Z",
@@ -1444,7 +1442,7 @@ mod tests {
             memory[0].last_action_outcome,
             Some(FailureMemoryActionOutcome::Retried)
         );
-        assert_eq!(memory[0].repair_attempt_count, 2);
+        assert_eq!(memory[0].repair_attempt_count, 1);
         assert!(memory[0].suppression_until.is_none());
 
         let next_plan = plan("session-expired", RecoveryCase::SwitchManagedRuntime);
@@ -1609,6 +1607,27 @@ mod tests {
             .load_snapshot(snapshot)
             .expect("reload persisted failure memory");
         store
+    }
+
+    fn reload_failure_memory_at(
+        paths: &AppPaths,
+        wall: chrono::DateTime<chrono::Utc>,
+    ) -> GuardianFailureMemoryStore {
+        let encoded =
+            fs::read_to_string(failure_memory_path(paths)).expect("read persisted failure memory");
+        let snapshot =
+            FailureMemorySnapshot::from_json(&encoded).expect("decode persisted failure memory");
+        let store = GuardianFailureMemoryStore::at_for_test(wall);
+        store
+            .load_snapshot(snapshot)
+            .expect("reload persisted failure memory at policy time");
+        store
+    }
+
+    fn test_time(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .expect("valid test time")
+            .with_timezone(&chrono::Utc)
     }
 
     fn test_root(name: &str) -> PathBuf {

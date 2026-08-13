@@ -28,7 +28,7 @@ use crate::state::{
     record_guardian_repair_refusal, reserve_reconciliation_attempt, settle_reconciliation_memory,
 };
 use axial_resource::PhysicalIoClass;
-use chrono::{DateTime, Duration};
+use chrono::Duration;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -292,17 +292,13 @@ async fn recover_runtime_evidence(
     key: &crate::state::failure_memory::FailureMemoryKey,
     action: GuardianActionKind,
 ) -> Result<Option<GuardianRepairOutcome>, OperationJournalStoreError> {
-    let now = chrono::Utc::now();
     let mut active_prior_terminal = None;
-    for journal in context.journals.list() {
-        let Some(attempt) = journal.reconciliation_attempt() else {
-            continue;
-        };
-        if &reconciliation_attempt_key(attempt) != key
-            || attempt.diagnosis_id() != *context.diagnosis_id
-        {
-            continue;
-        }
+    for journal in context.journals.matching_entries(|journal| {
+        journal.reconciliation_attempt().is_some_and(|attempt| {
+            &reconciliation_attempt_key(attempt) == key
+                && attempt.diagnosis_id() == *context.diagnosis_id
+        })
+    }) {
         if let Some(terminal) = journal.reconciliation_terminal().cloned() {
             if &journal.operation_id == context.attempt.operation_id() {
                 return reconcile_same_operation_runtime_terminal(
@@ -311,8 +307,8 @@ async fn recover_runtime_evidence(
                 .await
                 .map(Some);
             }
-            let active = DateTime::parse_from_rfc3339(terminal.suppression_until())
-                .is_ok_and(|until| until > now);
+            let active = reconciliation_memory_entry(terminal.clone())
+                .is_ok_and(|memory| context.failure_memory.suppression_active(&memory));
             if active
                 && active_prior_terminal
                     .as_ref()

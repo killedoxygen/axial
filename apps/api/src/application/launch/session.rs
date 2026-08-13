@@ -850,8 +850,9 @@ async fn build_launch_preflight_facts_with_memory_capture(
         max_memory_mb,
     );
     let resources_elapsed = resources_started_at.elapsed();
-    let failure_memory = state.failure_memory().list();
-    let current_at = timestamp_utc();
+    let failure_memory_store = state.failure_memory();
+    let failure_memory = failure_memory_store.list_current();
+    let current_at = failure_memory_store.now_timestamp();
     let suggested_memory_mb = policy::suggested_max_memory_after_recent_oom(
         max_memory_mb,
         resource_budget.host_total_memory_mb,

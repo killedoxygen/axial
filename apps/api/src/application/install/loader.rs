@@ -1414,7 +1414,7 @@ pub(super) async fn start_loader_install_with_foreground(
 
             let exact_terminal = match result {
                 Err(error) => {
-                    let observed_at = chrono::Utc::now().to_rfc3339();
+                    let observed_at = worker_journals.now_timestamp();
                     let progress = loader_install_error_progress(&error);
                     dispatch_loader_install_failure(
                         &guardian_owner,
@@ -2030,7 +2030,7 @@ pub(super) fn spawn_recovering_loader_install<Reconstruct, Reconstruction>(
             let exact_terminal = match result {
                 Ok(progress) => progress,
                 Err(error) => {
-                    let observed_at = chrono::Utc::now().to_rfc3339();
+                    let observed_at = worker_journals.now_timestamp();
                     let progress = loader_install_error_progress(&error);
                     let loader_target_id =
                         format!("loader_{}_{}", component_id.short_key(), build_id);
