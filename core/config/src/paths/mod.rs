@@ -22,7 +22,6 @@ pub struct AppPaths {
     known_good_dir: PathBuf,
     persisted_state_rejection_streaks_file: PathBuf,
     performance_dir: PathBuf,
-    performance_operations_dir: PathBuf,
     benchmark_suites_dir: PathBuf,
     benchmark_suite_drivers_dir: PathBuf,
     launch_reports_dir: PathBuf,
@@ -51,7 +50,6 @@ impl AppPaths {
                 .join("state")
                 .join("persisted-state-rejection-streaks.json"),
             performance_dir: root.join("performance"),
-            performance_operations_dir: root.join("performance").join("operations"),
             benchmark_suites_dir: root.join("benchmarks").join("suites"),
             benchmark_suite_drivers_dir: root.join("benchmarks").join("suite-drivers"),
             launch_reports_dir: root.join("benchmarks").join("launch"),
@@ -107,10 +105,6 @@ impl AppPaths {
 
     pub fn performance_dir(&self) -> &Path {
         &self.performance_dir
-    }
-
-    pub fn performance_operations_dir(&self) -> &Path {
-        &self.performance_operations_dir
     }
 
     pub fn benchmark_suites_dir(&self) -> &Path {
@@ -295,10 +289,6 @@ mod tests {
                 .join("persisted-state-rejection-streaks.json")
         );
         assert_eq!(paths.performance_dir(), root.join("performance"));
-        assert_eq!(
-            paths.performance_operations_dir(),
-            root.join("performance").join("operations")
-        );
         assert_eq!(
             paths.benchmark_suites_dir(),
             root.join("benchmarks").join("suites")

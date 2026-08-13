@@ -1102,7 +1102,7 @@ test("Performance state saves use one retained State successor", async () => {
 });
 
 test("State successors are domain-admitted before pre-session replay", async () => {
-  const [library, recovery, runtime, config, successors, accounts, journals, stateConfig, failureMemory, instances, performanceRules, performanceOperations, launchReports, benchmarkSuites, benchmarkSuiteDrivers, rejectionStreaks, witnesses, skins, bootstrap, anchored] =
+  const [library, recovery, runtime, config, successors, accounts, journals, stateConfig, failureMemory, instances, performanceRules, launchReports, benchmarkSuites, benchmarkSuiteDrivers, rejectionStreaks, witnesses, skins, bootstrap, anchored] =
     await Promise.all([
       read("core/fs/src/lib.rs"),
       read("core/fs/src/recovery.rs"),
@@ -1115,7 +1115,6 @@ test("State successors are domain-admitted before pre-session replay", async () 
       read("apps/api/src/state/failure_memory.rs"),
       read("apps/api/src/state/instance_registry.rs"),
       read("apps/api/src/state/performance_rules.rs"),
-      read("apps/api/src/state/performance_operations.rs"),
       read("apps/api/src/state/launch_reports.rs"),
       read("apps/api/src/state/benchmark_suites.rs"),
       read("apps/api/src/state/benchmark_suite_drivers.rs"),
@@ -1271,7 +1270,6 @@ test("State successors are domain-admitted before pre-session replay", async () 
   for (const marker of [
     "admits_performance_composition_state",
     "admits_saved_skin_index",
-    "admits_performance_operation_batch",
     "admits_launch_report_batch",
     "admits_benchmark_suite_batch",
     "admits_benchmark_suite_driver_batch",
@@ -1313,14 +1311,7 @@ test("State successors are domain-admitted before pre-session replay", async () 
     assert.match(registry, new RegExp(spec));
   }
   assert.doesNotMatch(registry, /PERFORMANCE_OPERATION/);
-  assert.match(
-    successors,
-    /const PERFORMANCE_OPERATION_SUCCESSOR_OWNER:\s*&\[u8\]\s*=\s*b"performance-operation"/,
-  );
-  assert.match(
-    successors,
-    /const PERFORMANCE_OPERATION_SUCCESSOR_PARENT:\s*&\[&str\]\s*=\s*&\["performance", "operations"\]/,
-  );
+  assert.doesNotMatch(successors, /PERFORMANCE_OPERATION|performance-operation/);
   assert.match(
     successors,
     /const LAUNCH_REPORT_SUCCESSOR_OWNER:\s*&\[u8\]\s*=\s*b"launch-report"/,
@@ -1353,13 +1344,6 @@ test("State successors are domain-admitted before pre-session replay", async () 
     "spec.parent == parent",
     "spec.leaf == leaf",
     "matches.next().is_none()",
-  ]);
-  const dynamicPerformance = block(successors, "fn admits_performance_operation_batch");
-  ordered(dynamicPerformance, [
-    "admits_dynamic_batch",
-    "PERFORMANCE_OPERATION_SUCCESSOR_OWNER",
-    "PERFORMANCE_OPERATION_SUCCESSOR_PARENT",
-    "performance_operation_from_leaf",
   ]);
   const dynamicLaunchReports = block(successors, "fn admits_launch_report_batch");
   ordered(dynamicLaunchReports, [
@@ -1423,17 +1407,6 @@ test("State successors are domain-admitted before pre-session replay", async () 
     block(performanceRules, "fn claim_with_coordinator"),
     /PERFORMANCE_RULES_SNAPSHOT_SUCCESSOR\.bind\(record\)/,
   );
-  const performanceRecord = block(performanceOperations, "fn record");
-  ordered(performanceRecord, [
-    "safe_operation_filename(operation_id)",
-    ".target(OsStr::new(&name), MAX_RESTART_RECORD_BYTES)",
-    ".and_then(bind_performance_operation_successor)",
-  ]);
-  assert.match(block(performanceOperations, "fn writer"), /self\.record\(operation_id\)\?/);
-  assert.match(
-    block(performanceOperations, "fn cleanup_writer"),
-    /self\.record\(operation_id\)\?/,
-  );
   const launchReportRecord = block(launchReports, "fn record");
   ordered(launchReportRecord, [
     "!canonical_session_id(session_id)",
@@ -1474,8 +1447,6 @@ test("State successors are domain-admitted before pre-session replay", async () 
   );
   assert.match(successors, /fn startup_successor_registry_is_exact_and_closed/);
   assert.match(successors, /fn performance_composition_state_successor_is_exact_and_singleton/);
-  assert.match(successors, /fn performance_operation_successor_is_strict_and_dynamic/);
-  assert.match(successors, /fn performance_operation_batch_admission_is_exact_and_complete/);
   assert.match(successors, /fn launch_report_batch_admission_is_exact_and_complete/);
   assert.match(successors, /fn benchmark_suite_batch_admission_is_exact_and_complete/);
   assert.match(successors, /fn benchmark_suite_driver_batch_admission_is_exact_and_complete/);

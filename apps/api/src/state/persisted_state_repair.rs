@@ -36,17 +36,12 @@ const PERSISTED_STATE_REPAIR_MEMORY_SETTLEMENT_ATTEMPTS: usize = 4;
 
 #[derive(Clone)]
 pub(super) struct PersistedStateRepairDirectories {
-    performance_operations: AnchoredRecordDirectory,
     benchmark_suite_drivers: AnchoredRecordDirectory,
 }
 
 impl PersistedStateRepairDirectories {
-    pub(super) fn new(
-        performance_operations: AnchoredRecordDirectory,
-        benchmark_suite_drivers: AnchoredRecordDirectory,
-    ) -> Self {
+    pub(super) fn new(benchmark_suite_drivers: AnchoredRecordDirectory) -> Self {
         Self {
-            performance_operations,
             benchmark_suite_drivers,
         }
     }
@@ -56,9 +51,6 @@ impl PersistedStateRepairDirectories {
         store: super::contracts::PersistedStateRecordStore,
     ) -> AnchoredRecordDirectory {
         match store {
-            super::contracts::PersistedStateRecordStore::PerformanceOperation => {
-                self.performance_operations.clone()
-            }
             super::contracts::PersistedStateRecordStore::BenchmarkSuiteDriver => {
                 self.benchmark_suite_drivers.clone()
             }
@@ -912,8 +904,7 @@ mod tests {
     }
 
     fn record_id(index: u128) -> String {
-        crate::state::contracts::OperationId::deterministic_test(format!("record-{index}"))
-            .to_string()
+        format!("benchmark-suite-driver-{index:016x}")
     }
 
     fn owned_eligibility(
@@ -1025,7 +1016,7 @@ mod tests {
         let id = record_id(18);
         let source = super::super::persisted_state_load::persisted_state_record_path(
             fixture.state.config().paths(),
-            super::super::contracts::PersistedStateRecordStore::PerformanceOperation,
+            super::super::contracts::PersistedStateRecordStore::BenchmarkSuiteDriver,
             &id,
         );
         let parent = source.parent().expect("canonical record parent");
@@ -1204,7 +1195,7 @@ mod tests {
         let id = record_id(8);
         let source = super::super::persisted_state_load::persisted_state_record_path(
             fixture.state.config().paths(),
-            super::super::contracts::PersistedStateRecordStore::PerformanceOperation,
+            super::super::contracts::PersistedStateRecordStore::BenchmarkSuiteDriver,
             &id,
         );
         let parent = source.parent().expect("canonical record parent");
@@ -1575,8 +1566,11 @@ mod tests {
         let conflict_journals = Arc::new(OperationJournalStore::new());
         conflict_journals
             .load_snapshot(
-                OperationJournalSnapshot::new(vec![journal_snapshot.entries[0].clone()])
-                    .expect("conflict journal snapshot"),
+                OperationJournalSnapshot::new(
+                    vec![journal_snapshot.entries[0].clone()],
+                    journal_snapshot.next_sequence,
+                )
+                .expect("conflict journal snapshot"),
             )
             .expect("conflict journals");
         let conflict_state = fixture
@@ -1684,7 +1678,7 @@ mod tests {
         assert_eq!(coverage.suppression_hours, 24);
         assert_eq!(
             coverage.operation_journal_schema,
-            "axial.state.operation_journals.v7"
+            "axial.state.operation_journals.v8"
         );
         assert_eq!(
             coverage.failure_memory_schema,

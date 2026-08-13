@@ -194,11 +194,7 @@ async fn rules_refresh_journal_failure_prevents_refresh() {
     let root = test_root("rules-refresh-journal-failure");
     let journal_backend = Arc::new(ScriptedOperationBackend::default());
     journal_backend.set_fail_all(true);
-    let state = build_test_state_with_operation_backends(
-        &root,
-        journal_backend.clone(),
-        Arc::new(ScriptedOperationBackend::default()),
-    );
+    let state = build_test_state_with_operation_backends(&root, journal_backend.clone());
     let fixture = TestFixture {
         state,
         root,
@@ -384,10 +380,9 @@ async fn terminal_journal_failure_returns_bounded_then_reconciles_without_refres
     )
     .await;
     let journal_backend = Arc::new(ScriptedOperationBackend::default());
-    let status_backend = Arc::new(ScriptedOperationBackend::default());
     journal_backend.gate_attempt(1);
     let base = build_test_state(&root, Some(remote_url), Some(signed.public_key));
-    let state = replace_operation_backends(base, journal_backend.clone(), status_backend);
+    let state = replace_operation_backend(base, journal_backend.clone());
     let request_state = state.clone();
     let request = tokio::spawn(async move {
         router()

@@ -209,7 +209,6 @@ impl AnchoredRecordRetirement {
 
 #[derive(Clone, Copy)]
 pub(crate) enum AnchoredRecordRestartContext {
-    PerformanceOperation,
     BenchmarkSuiteDriver,
 }
 
@@ -524,7 +523,6 @@ impl AnchoredRecordObservation {
         let mut hasher = Sha256::new();
         hasher.update(RESTART_IDENTITY_DOMAIN);
         let store_domain: &[u8] = match context {
-            AnchoredRecordRestartContext::PerformanceOperation => b"performance-operation\0",
             AnchoredRecordRestartContext::BenchmarkSuiteDriver => b"benchmark-suite-driver\0",
         };
         hasher.update(store_domain);

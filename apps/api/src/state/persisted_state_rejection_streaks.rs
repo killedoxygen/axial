@@ -25,7 +25,7 @@ use tracing::warn;
 
 const REJECTION_STREAK_SCHEMA: &str = "axial.state.persisted_state_rejection_streaks.v1";
 const REJECTION_STREAK_THRESHOLD: u8 = 3;
-const MAX_REJECTION_STREAK_ENTRIES: usize = MAX_REJECTED_RESTART_RECORDS_PER_STORE * 2;
+const MAX_REJECTION_STREAK_ENTRIES: usize = MAX_REJECTED_RESTART_RECORDS_PER_STORE;
 const MAX_REJECTION_STREAK_SNAPSHOT_BYTES: u64 = 32 * 1024;
 const REJECTION_STREAK_LOCK_INVARIANT: &str = "persisted-state rejection streak lock poisoned";
 const REJECTION_STREAK_SNAPSHOT_NAME: &str = "persisted-state-rejection-streaks.json";
@@ -324,14 +324,10 @@ fn validate_snapshot(
         return Err(HistoryReadError::Invalid);
     }
     let mut previous_record = None;
-    let mut performance_entries = 0usize;
     let mut driver_entries = 0usize;
     for entry in &snapshot.entries {
         let record = (entry.store, entry.record_id.as_str());
         match entry.store {
-            PersistedStateRecordStore::PerformanceOperation => {
-                performance_entries = performance_entries.saturating_add(1)
-            }
             PersistedStateRecordStore::BenchmarkSuiteDriver => {
                 driver_entries = driver_entries.saturating_add(1)
             }
@@ -339,7 +335,6 @@ fn validate_snapshot(
         if !(1..=REJECTION_STREAK_THRESHOLD).contains(&entry.consecutive_startups)
             || !record_id_is_valid(entry.store, &entry.record_id)
             || previous_record.is_some_and(|previous| previous >= record)
-            || performance_entries > MAX_REJECTED_RESTART_RECORDS_PER_STORE
             || driver_entries > MAX_REJECTED_RESTART_RECORDS_PER_STORE
         {
             return Err(HistoryReadError::Invalid);
@@ -413,9 +408,6 @@ fn advance_snapshot(
 
 fn record_id_is_valid(store: PersistedStateRecordStore, record_id: &str) -> bool {
     match store {
-        PersistedStateRecordStore::PerformanceOperation => {
-            super::contracts::OperationId::try_from(record_id).is_ok()
-        }
         PersistedStateRecordStore::BenchmarkSuiteDriver => {
             super::benchmark_suite_drivers::is_safe_driver_id(record_id)
         }
@@ -546,12 +538,7 @@ mod tests {
         AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
     }
 
-    fn performance_id(index: u128) -> String {
-        super::super::contracts::OperationId::deterministic_test(format!("record-{index}"))
-            .to_string()
-    }
-
-    fn driver_id(index: u64) -> String {
+    fn driver_id(index: u128) -> String {
         format!("benchmark-suite-driver-{index:016x}")
     }
 
@@ -591,9 +578,6 @@ mod tests {
                     )
                     .expect("derive rejected record identity");
                 let artifact = match store {
-                    PersistedStateRecordStore::PerformanceOperation => {
-                        CurrentArtifact::PerformanceOperationStatus
-                    }
                     PersistedStateRecordStore::BenchmarkSuiteDriver => {
                         CurrentArtifact::BenchmarkSuiteDriverStatus
                     }
@@ -714,32 +698,18 @@ mod tests {
         let root = test_root("strict-round-trip");
         let paths = test_paths(&root);
         let path = rejection_streak_path(&paths);
-        let expected = snapshot(vec![
-            snapshot_entry(
-                PersistedStateRecordStore::PerformanceOperation,
-                performance_id(1),
-                RestartStableRecordIdentity::from_digest([1; 32]),
-                1,
-            ),
-            snapshot_entry(
-                PersistedStateRecordStore::BenchmarkSuiteDriver,
-                driver_id(1),
-                RestartStableRecordIdentity::from_digest([2; 32]),
-                3,
-            ),
-        ]);
+        let expected = snapshot(vec![snapshot_entry(
+            PersistedStateRecordStore::BenchmarkSuiteDriver,
+            driver_id(1),
+            RestartStableRecordIdentity::from_digest([2; 32]),
+            3,
+        )]);
         let encoded = write_snapshot(&path, &expected);
         let exact = format!(
             concat!(
                 "{{\n",
                 "  \"schema\": \"{}\",\n",
                 "  \"entries\": [\n",
-                "    {{\n",
-                "      \"store\": \"performance_operation\",\n",
-                "      \"record_id\": \"{}\",\n",
-                "      \"physical_identity\": \"{}\",\n",
-                "      \"consecutive_startups\": 1\n",
-                "    }},\n",
                 "    {{\n",
                 "      \"store\": \"benchmark_suite_driver\",\n",
                 "      \"record_id\": \"{}\",\n",
@@ -750,8 +720,6 @@ mod tests {
                 "}}"
             ),
             REJECTION_STREAK_SCHEMA,
-            performance_id(1),
-            "sha256.01010101.01010101.01010101.01010101.01010101.01010101.01010101.01010101",
             driver_id(1),
             "sha256.02020202.02020202.02020202.02020202.02020202.02020202.02020202.02020202",
         );
@@ -772,43 +740,43 @@ mod tests {
         let identity = serde_json::to_value(RestartStableRecordIdentity::from_digest([3; 32]))
             .expect("serialize identity");
         let valid_entry = serde_json::json!({
-            "store": "performance_operation",
-            "record_id": performance_id(1),
+            "store": "benchmark_suite_driver",
+            "record_id": driver_id(1),
             "physical_identity": identity,
             "consecutive_startups": 1
         });
-        let mut reversed_performance_ids = [performance_id(1), performance_id(2)];
-        reversed_performance_ids.sort();
-        reversed_performance_ids.reverse();
+        let mut reversed_driver_ids = [driver_id(1), driver_id(2)];
+        reversed_driver_ids.sort();
+        reversed_driver_ids.reverse();
         let cases = vec![
             serde_json::json!({"schema": "axial.state.persisted_state_rejection_streaks.v2", "entries": [valid_entry.clone()]}),
             serde_json::json!({"schema_version": 1, "entries": [valid_entry.clone()]}),
             serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [valid_entry.clone()], "legacy": true}),
             serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "records": []}),
-            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "performance_operation", "record_id": "../unsafe", "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1}]}),
-            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "performance_operation", "record_id": performance_id(1), "physical_identity": "sha256.AAAAAAAA.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa", "consecutive_startups": 1}]}),
-            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "performance_operation", "record_id": performance_id(1), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1, "legacy": true}]}),
-            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "retired_store", "record_id": performance_id(1), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1}]}),
-            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "performance_operation", "record_id": performance_id(1), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 0}]}),
-            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "performance_operation", "record_id": performance_id(1), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 4}]}),
+            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "benchmark_suite_driver", "record_id": "../unsafe", "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1}]}),
+            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "benchmark_suite_driver", "record_id": driver_id(1), "physical_identity": "sha256.AAAAAAAA.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa", "consecutive_startups": 1}]}),
+            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "benchmark_suite_driver", "record_id": driver_id(1), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1, "legacy": true}]}),
+            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "retired_store", "record_id": driver_id(1), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1}]}),
+            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "benchmark_suite_driver", "record_id": driver_id(1), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 0}]}),
+            serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [{"store": "benchmark_suite_driver", "record_id": driver_id(1), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 4}]}),
             serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [valid_entry.clone(), valid_entry.clone()]}),
             serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [
-                {"store": "performance_operation", "record_id": reversed_performance_ids[0].clone(), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1},
-                {"store": "performance_operation", "record_id": reversed_performance_ids[1].clone(), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1}
+                {"store": "benchmark_suite_driver", "record_id": reversed_driver_ids[0].clone(), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1},
+                {"store": "benchmark_suite_driver", "record_id": reversed_driver_ids[1].clone(), "physical_identity": RestartStableRecordIdentity::from_digest([3; 32]), "consecutive_startups": 1}
             ]}),
             serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": [
                 {"store": "benchmark_suite_driver", "record_id": driver_id(1), "physical_identity": RestartStableRecordIdentity::from_digest([4; 32]), "consecutive_startups": 1},
                 valid_entry.clone()
             ]}),
             serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": (1_u128..=9).map(|index| serde_json::json!({
-                "store": "performance_operation",
-                "record_id": performance_id(index),
+                "store": "benchmark_suite_driver",
+                "record_id": driver_id(index),
                 "physical_identity": RestartStableRecordIdentity::from_digest([5; 32]),
                 "consecutive_startups": 1
             })).collect::<Vec<_>>() }),
             serde_json::json!({"schema": REJECTION_STREAK_SCHEMA, "entries": (1_u128..=17).map(|index| serde_json::json!({
-                "store": "performance_operation",
-                "record_id": performance_id(index),
+                "store": "benchmark_suite_driver",
+                "record_id": driver_id(index),
                 "physical_identity": RestartStableRecordIdentity::from_digest([6; 32]),
                 "consecutive_startups": 1
             })).collect::<Vec<_>>() }),
@@ -843,19 +811,19 @@ mod tests {
     async fn exact_identity_progresses_one_two_three_and_saturates_after_commit() {
         let root = test_root("progression");
         let paths = test_paths(&root);
-        let id = performance_id(1);
+        let id = driver_id(1);
 
         for expected_count in [1, 2, 3, 3] {
             let record = test_record(
                 &root,
-                "performance.json",
-                PersistedStateRecordStore::PerformanceOperation,
+                "driver.json",
+                PersistedStateRecordStore::BenchmarkSuiteDriver,
                 &id,
             );
             let streaks = Arc::new(test_streaks(
                 &paths,
                 vec![scan(
-                    PersistedStateRecordStore::PerformanceOperation,
+                    PersistedStateRecordStore::BenchmarkSuiteDriver,
                     true,
                     vec![record],
                 )],
@@ -874,7 +842,7 @@ mod tests {
                 assert_eq!(eligibilities.len(), 1);
                 assert_eq!(
                     eligibilities[0].store(),
-                    PersistedStateRecordStore::PerformanceOperation
+                    PersistedStateRecordStore::BenchmarkSuiteDriver
                 );
                 assert_eq!(eligibilities[0].record_id(), id);
                 assert_eq!(
@@ -896,18 +864,18 @@ mod tests {
         let root = test_root("commit-barrier");
         let paths = test_paths(&root);
         let snapshot_path = rejection_streak_path(&paths);
-        let id = performance_id(1);
+        let id = driver_id(1);
         let record = test_record(
             &root,
-            "performance.json",
-            PersistedStateRecordStore::PerformanceOperation,
+            "driver.json",
+            PersistedStateRecordStore::BenchmarkSuiteDriver,
             &id,
         );
         let prior_identity = record.restart_identity().clone();
         write_snapshot(
             &snapshot_path,
             &snapshot(vec![snapshot_entry(
-                PersistedStateRecordStore::PerformanceOperation,
+                PersistedStateRecordStore::BenchmarkSuiteDriver,
                 id.clone(),
                 prior_identity,
                 2,
@@ -916,7 +884,7 @@ mod tests {
         let streaks = Arc::new(test_streaks(
             &paths,
             vec![scan(
-                PersistedStateRecordStore::PerformanceOperation,
+                PersistedStateRecordStore::BenchmarkSuiteDriver,
                 true,
                 vec![record],
             )],
@@ -946,87 +914,17 @@ mod tests {
     }
 
     #[test]
-    fn blind_store_resets_only_itself_while_other_store_reaches_threshold() {
-        let root = test_root("blind-store");
-        let performance_id = performance_id(1);
-        let driver_id = driver_id(1);
-        let mut records = test_records(
-            &root,
-            [
-                (
-                    "performance.json".to_string(),
-                    PersistedStateRecordStore::PerformanceOperation,
-                    performance_id.clone(),
-                ),
-                (
-                    "driver.json".to_string(),
-                    PersistedStateRecordStore::BenchmarkSuiteDriver,
-                    driver_id.clone(),
-                ),
-            ],
-        )
-        .into_iter();
-        let performance = records.next().expect("performance rejected record");
-        let driver = records.next().expect("driver rejected record");
-        let history = snapshot(vec![
-            snapshot_entry(
-                PersistedStateRecordStore::PerformanceOperation,
-                performance_id.clone(),
-                performance.restart_identity().clone(),
-                2,
-            ),
-            snapshot_entry(
-                PersistedStateRecordStore::BenchmarkSuiteDriver,
-                driver_id.clone(),
-                driver.restart_identity().clone(),
-                2,
-            ),
-        ]);
-
-        let (advanced, eligibilities) = advance_snapshot(
-            history,
-            vec![
-                scan(
-                    PersistedStateRecordStore::PerformanceOperation,
-                    false,
-                    vec![performance],
-                ),
-                scan(
-                    PersistedStateRecordStore::BenchmarkSuiteDriver,
-                    true,
-                    vec![driver],
-                ),
-            ],
-            &Arc::new(()),
-        );
-
-        assert_eq!(advanced.entries.len(), 1);
-        assert_eq!(
-            advanced.entries[0].store,
-            PersistedStateRecordStore::BenchmarkSuiteDriver
-        );
-        assert_eq!(advanced.entries[0].consecutive_startups, 3);
-        assert_eq!(eligibilities.len(), 1);
-        assert_eq!(
-            eligibilities[0].store(),
-            PersistedStateRecordStore::BenchmarkSuiteDriver
-        );
-        drop(eligibilities);
-        fs::remove_dir_all(root).expect("remove blind store root");
-    }
-
-    #[test]
     fn absence_and_physical_identity_replacement_restart_the_exact_streak() {
         let root = test_root("replacement-reset");
-        let id = performance_id(1);
+        let id = driver_id(1);
         let record = test_record(
             &root,
-            "performance.json",
-            PersistedStateRecordStore::PerformanceOperation,
+            "driver.json",
+            PersistedStateRecordStore::BenchmarkSuiteDriver,
             &id,
         );
         let replacement_history = snapshot(vec![snapshot_entry(
-            PersistedStateRecordStore::PerformanceOperation,
+            PersistedStateRecordStore::BenchmarkSuiteDriver,
             id.clone(),
             RestartStableRecordIdentity::from_digest([0xff; 32]),
             2,
@@ -1035,7 +933,7 @@ mod tests {
         let (replacement, eligibilities) = advance_snapshot(
             replacement_history,
             vec![scan(
-                PersistedStateRecordStore::PerformanceOperation,
+                PersistedStateRecordStore::BenchmarkSuiteDriver,
                 true,
                 vec![record],
             )],
@@ -1048,7 +946,7 @@ mod tests {
         let (absent, eligibilities) = advance_snapshot(
             replacement,
             vec![scan(
-                PersistedStateRecordStore::PerformanceOperation,
+                PersistedStateRecordStore::BenchmarkSuiteDriver,
                 true,
                 Vec::new(),
             )],
@@ -1060,65 +958,32 @@ mod tests {
     }
 
     #[test]
-    fn both_store_scans_retain_exactly_eight_entries_each() {
-        let root = test_root("both-store-bound");
-        let mut records = test_records(
+    fn store_scan_retains_exactly_eight_entries() {
+        let root = test_root("store-bound");
+        let records = test_records(
             &root,
-            (1_u128..=8)
-                .map(|index| {
-                    (
-                        format!("performance-{index}.json"),
-                        PersistedStateRecordStore::PerformanceOperation,
-                        performance_id(index),
-                    )
-                })
-                .chain((1_u64..=8).map(|index| {
-                    (
-                        format!("driver-{index}.json"),
-                        PersistedStateRecordStore::BenchmarkSuiteDriver,
-                        driver_id(index),
-                    )
-                })),
+            (1_u128..=8).map(|index| {
+                (
+                    format!("driver-{index}.json"),
+                    PersistedStateRecordStore::BenchmarkSuiteDriver,
+                    driver_id(index),
+                )
+            }),
         );
-        let drivers = records.split_off(8);
-        let performance = records;
 
         let (advanced, eligibilities) = advance_snapshot(
             snapshot(Vec::new()),
-            vec![
-                scan(
-                    PersistedStateRecordStore::PerformanceOperation,
-                    true,
-                    performance,
-                ),
-                scan(
-                    PersistedStateRecordStore::BenchmarkSuiteDriver,
-                    true,
-                    drivers,
-                ),
-            ],
+            vec![scan(
+                PersistedStateRecordStore::BenchmarkSuiteDriver,
+                true,
+                records,
+            )],
             &Arc::new(()),
         );
 
-        assert_eq!(advanced.entries.len(), 16);
-        assert_eq!(
-            advanced
-                .entries
-                .iter()
-                .filter(|entry| entry.store == PersistedStateRecordStore::PerformanceOperation)
-                .count(),
-            8
-        );
-        assert_eq!(
-            advanced
-                .entries
-                .iter()
-                .filter(|entry| entry.store == PersistedStateRecordStore::BenchmarkSuiteDriver)
-                .count(),
-            8
-        );
+        assert_eq!(advanced.entries.len(), 8);
         assert!(eligibilities.is_empty());
-        fs::remove_dir_all(root).expect("remove both-store root");
+        fs::remove_dir_all(root).expect("remove store-bound root");
     }
 
     #[tokio::test]
@@ -1127,11 +992,11 @@ mod tests {
             let root = test_root(failure);
             let paths = test_paths(&root);
             let snapshot_path = rejection_streak_path(&paths);
-            let id = performance_id(1);
+            let id = driver_id(1);
             let record = test_record(
                 &root,
-                "performance.json",
-                PersistedStateRecordStore::PerformanceOperation,
+                "driver.json",
+                PersistedStateRecordStore::BenchmarkSuiteDriver,
                 &id,
             );
             let original = if matches!(failure, "corrupt" | "oversized") {
@@ -1148,7 +1013,7 @@ mod tests {
                 write_snapshot(
                     &snapshot_path,
                     &snapshot(vec![snapshot_entry(
-                        PersistedStateRecordStore::PerformanceOperation,
+                        PersistedStateRecordStore::BenchmarkSuiteDriver,
                         id.clone(),
                         record.restart_identity().clone(),
                         2,
@@ -1160,7 +1025,7 @@ mod tests {
             let streaks = PersistedStateRejectionStreaks::new(
                 directory,
                 vec![scan(
-                    PersistedStateRecordStore::PerformanceOperation,
+                    PersistedStateRecordStore::BenchmarkSuiteDriver,
                     true,
                     vec![record],
                 )],
@@ -1240,22 +1105,22 @@ mod tests {
     async fn discarded_synchronous_bootstrap_releases_candidates_without_progression() {
         let root = test_root("discarded-bootstrap");
         let paths = test_paths(&root);
-        let id = performance_id(1);
+        let id = driver_id(1);
         let record = test_record(
             &root,
-            "performance.json",
-            PersistedStateRecordStore::PerformanceOperation,
+            "driver.json",
+            PersistedStateRecordStore::BenchmarkSuiteDriver,
             &id,
         );
         let streaks = PersistedStateRejectionStreaks::discarded(vec![scan(
-            PersistedStateRecordStore::PerformanceOperation,
+            PersistedStateRecordStore::BenchmarkSuiteDriver,
             true,
             vec![record],
         )]);
 
         assert!(!streaks.has_pending_startup());
         fs::rename(
-            root.join("records").join("performance.json"),
+            root.join("records").join("driver.json"),
             root.join("records").join("released.json"),
         )
         .expect("discard released anchored candidate");

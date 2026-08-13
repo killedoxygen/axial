@@ -21452,13 +21452,13 @@ mod tests {
         let first = acquire_test_root(temporary.path());
         let first_payload = b"first cold State payload";
         let second_payload = b"second cold State payload";
-        let parent = ["performance", "operations"]
+        let parent = ["state", "batch-members"]
             .map(|component| RecoveryName::new_exact(component).expect("recovery parent"))
             .to_vec();
         let first_leaf = "11111111-1111-4111-8111-111111111111.json";
         let second_leaf = "22222222-2222-4222-8222-222222222222.json";
-        std::fs::create_dir_all(temporary.path().join("performance/operations"))
-            .expect("performance operation directory");
+        std::fs::create_dir_all(temporary.path().join("state/batch-members"))
+            .expect("State batch member directory");
         let mut first_operation = [0x11; 16];
         first_operation[6] = 0x41;
         first_operation[8] = 0x81;
@@ -21488,17 +21488,17 @@ mod tests {
         std::fs::rename(
             temporary
                 .path()
-                .join("performance/operations")
+                .join("state/batch-members")
                 .join(first_stage.as_str()),
             temporary
                 .path()
-                .join("performance/operations")
+                .join("state/batch-members")
                 .join(first_leaf),
         )
         .expect("publish first member before its physical clear");
         persist_test_state_successor_batch_with_owner(
             &first,
-            b"performance-operation",
+            b"test-state-batch",
             &[
                 (first_registration, first_payload.as_slice()),
                 (second_registration, second_payload.as_slice()),
@@ -21518,11 +21518,11 @@ mod tests {
         assert_eq!(successor.recovery_count(), 2);
         assert_eq!(
             successor.recovery_destination(0),
-            Some((vec!["performance", "operations"], first_leaf))
+            Some((vec!["state", "batch-members"], first_leaf))
         );
         assert_eq!(
             successor.recovery_destination(1),
-            Some((vec!["performance", "operations"], second_leaf))
+            Some((vec!["state", "batch-members"], second_leaf))
         );
         let replayed = match obligation.reconcile_state_successor(successor) {
             RootSessionAcquireOutcome::Acquired(session) => session,
@@ -21532,7 +21532,7 @@ mod tests {
             std::fs::read(
                 temporary
                     .path()
-                    .join("performance/operations")
+                    .join("state/batch-members")
                     .join(first_leaf)
             )
             .expect("first target"),
@@ -21542,7 +21542,7 @@ mod tests {
             std::fs::read(
                 temporary
                     .path()
-                    .join("performance/operations")
+                    .join("state/batch-members")
                     .join(second_leaf)
             )
             .expect("second target"),
@@ -21551,14 +21551,14 @@ mod tests {
         assert!(
             !temporary
                 .path()
-                .join("performance/operations")
+                .join("state/batch-members")
                 .join(first_stage.as_str())
                 .exists()
         );
         assert!(
             !temporary
                 .path()
-                .join("performance/operations")
+                .join("state/batch-members")
                 .join(second_stage.as_str())
                 .exists()
         );

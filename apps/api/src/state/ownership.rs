@@ -66,7 +66,6 @@ pub enum CurrentArtifact {
     GuardianFailureMemorySnapshot,
     OperationJournalSnapshot,
     PerformanceRulesCache,
-    PerformanceOperationStatus,
     PersistedStateRejectionStreakSnapshot,
     UserModWitnessSnapshot,
     UserJavaOverride,
@@ -78,9 +77,9 @@ pub enum CurrentArtifact {
 impl CurrentArtifact {
     fn target_system(self) -> StabilizationSystem {
         match self {
-            Self::PerformanceRulesCache
-            | Self::PerformanceOperationStatus
-            | Self::ExternalPerformanceRules => StabilizationSystem::Performance,
+            Self::PerformanceRulesCache | Self::ExternalPerformanceRules => {
+                StabilizationSystem::Performance
+            }
             Self::ManagedRuntimeCache => StabilizationSystem::Execution,
             _ => StabilizationSystem::State,
         }
@@ -92,8 +91,7 @@ impl CurrentArtifact {
             | Self::GuardianFailureMemorySnapshot
             | Self::OperationJournalSnapshot
             | Self::BenchmarkSuiteManifest
-            | Self::BenchmarkSuiteDriverStatus
-            | Self::PerformanceOperationStatus => TargetKind::Config,
+            | Self::BenchmarkSuiteDriverStatus => TargetKind::Config,
             Self::PersistedStateRejectionStreakSnapshot => TargetKind::Config,
             Self::UserModWitnessSnapshot => TargetKind::Config,
             Self::UserJavaOverride | Self::UserJvmArguments | Self::UnknownFilesystemPath => {
@@ -111,8 +109,7 @@ impl CurrentArtifact {
             | Self::BenchmarkSuiteDriverStatus
             | Self::GuardianFailureMemorySnapshot
             | Self::OperationJournalSnapshot
-            | Self::PerformanceRulesCache
-            | Self::PerformanceOperationStatus => OwnershipClass::LauncherManaged,
+            | Self::PerformanceRulesCache => OwnershipClass::LauncherManaged,
             Self::PersistedStateRejectionStreakSnapshot => OwnershipClass::LauncherManaged,
             Self::UserModWitnessSnapshot => OwnershipClass::LauncherManaged,
             Self::UserJavaOverride | Self::UserJvmArguments => OwnershipClass::UserOwned,
@@ -129,7 +126,6 @@ impl CurrentArtifact {
             Self::GuardianFailureMemorySnapshot => "guardian_failure_memory",
             Self::OperationJournalSnapshot => "operation_journal",
             Self::PerformanceRulesCache => "performance_rules_cache",
-            Self::PerformanceOperationStatus => "performance_operation_status",
             Self::PersistedStateRejectionStreakSnapshot => "persisted_state_rejection_streaks",
             Self::UserModWitnessSnapshot => "user_mod_witnesses",
             Self::UserJavaOverride => "custom_java_path",

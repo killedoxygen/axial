@@ -1661,12 +1661,11 @@ mod tests {
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
     use crate::state::contracts::{
-        OperationId, OwnershipClass, PersistedStateRepairTerminalOutcome, ReconciliationAttempt,
-        ReconciliationComponent, ReconciliationIncarnationFingerprint,
-        ReconciliationInventoryFingerprint, ReconciliationLineage,
-        ReconciliationQuarantineCheckpoint, ReconciliationRung, ReconciliationScope,
-        ReconciliationTerminal, ReconciliationTerminalOutcome, StabilizationSystem,
-        TargetDescriptor, TargetKind,
+        OperationId, OwnershipClass, ReconciliationAttempt, ReconciliationComponent,
+        ReconciliationIncarnationFingerprint, ReconciliationInventoryFingerprint,
+        ReconciliationLineage, ReconciliationQuarantineCheckpoint, ReconciliationRung,
+        ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
+        StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use crate::state::journals::DEFAULT_OPERATION_JOURNAL_LIMIT;
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
@@ -2012,7 +2011,6 @@ mod tests {
             GuardianActionKind::Fallback,
             GuardianActionKind::Repair,
             GuardianActionKind::Block,
-            GuardianActionKind::Quarantine,
         ];
         assert_eq!(action_kinds, expected_action_kinds);
         let action_outcomes = snapshot
@@ -2092,15 +2090,11 @@ mod tests {
         );
         assert!(terminals[1].quarantine_checkpoint().is_empty());
 
-        let persisted_state_terminals = snapshot
-            .entries
-            .iter()
-            .filter_map(GuardianFailureMemoryEntry::persisted_state_repair_terminal)
-            .collect::<Vec<_>>();
-        assert_eq!(persisted_state_terminals.len(), 1);
-        assert_eq!(
-            persisted_state_terminals[0].outcome(),
-            PersistedStateRepairTerminalOutcome::Refused
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| entry.persisted_state_repair_terminal().is_none())
         );
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");

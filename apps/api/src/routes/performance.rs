@@ -178,10 +178,11 @@ async fn handle_instance_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{
-        AppStateInit, InstallStore, SessionStore,
-        performance_operations::PerformanceOperationPayload,
+    use crate::state::contracts::{
+        PerformanceOperationAction, PerformanceOperationIntent, PerformanceOperationTerminal,
+        RollbackState,
     };
+    use crate::state::{AppStateInit, InstallStore, PerformanceOperationTransition, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use axum::{
@@ -193,46 +194,53 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
-    async fn operation_status_route_redacts_payload_through_production_router() {
+    async fn operation_status_route_projects_only_state_sanitized_values() {
         let fixture = RoutePerformanceFixture::new("operation-status-production-route");
         let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
         let operation = fixture
             .state
-            .performance_operations()
-            .start(
-                instance_id.clone(),
-                "install/provider_payload=secret-token".to_string(),
-                PerformanceOperationPayload {
-                    game_version: Some("/Users/alice/.minecraft/private-version".to_string()),
-                    loader: Some("fabric".to_string()),
-                    mode: Some("managed --accessToken secret-token".to_string()),
-                    rollback_id: Some("rb-old\\secret".to_string()),
-                },
-            )
+            .journals()
+            .create_performance(PerformanceOperationIntent {
+                instance_id: instance_id.clone(),
+                requested_action: PerformanceOperationAction::Install,
+                action: PerformanceOperationAction::Install,
+                base_target_id: "managed-state-absent".to_string(),
+                rollback: RollbackState::Unavailable,
+                game_version: Some("1.20.4".to_string()),
+                loader: Some("fabric".to_string()),
+                mode: Some("managed".to_string()),
+                rollback_id: None,
+            })
             .await
             .expect("operation starts");
-        fixture
-            .state
-            .performance_operations()
-            .record_failed(
-                &operation.id,
-                "provider_payload={\"url\":\"https://cdn.example.test/private/sodium-secret.jar?token=secret-token\"}; java_path=C:\\Users\\Alice\\Java\\bin\\java.exe; -Xmx8192M",
-            )
-            .await
-            .expect("failure accepted");
+        let operation_id = operation.operation_id;
+        let terminal = PerformanceOperationTerminal::FailedBeforeEffect {
+            error: "provider_payload={secret-token}; java_path=C:\\private\\java.exe".to_string(),
+        };
+        for transition in [
+            PerformanceOperationTransition::RequestTerminal(terminal.clone()),
+            PerformanceOperationTransition::CommitTerminal(terminal),
+        ] {
+            fixture
+                .state
+                .journals()
+                .transition_performance(&operation_id, transition)
+                .await
+                .expect("failure accepted");
+        }
 
         let (status, payload) = fixture
             .request_json(
                 Method::GET,
-                &format!("/api/v1/performance/operations/{}", operation.id),
+                &format!("/api/v1/performance/operations/{operation_id}"),
             )
             .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["id"], operation.id.to_string());
+        assert_eq!(payload["id"], operation_id.to_string());
         assert_eq!(payload["instance_id"], instance_id);
         assert_eq!(payload["state"], "failed");
-        assert_eq!(payload["action"], "unknown");
+        assert_eq!(payload["action"], "install");
         assert_eq!(payload["error"], "performance operation failed");
         assert_eq!(payload["view_model"]["tone"], "err");
         assert_eq!(
@@ -240,10 +248,10 @@ mod tests {
             "performance operation failed"
         );
         assert_eq!(payload["view_model"]["progress"]["phase"], "error");
-        assert_eq!(payload["payload"]["game_version"], "redacted");
+        assert_eq!(payload["payload"]["game_version"], "1.20.4");
         assert_eq!(payload["payload"]["loader"], "fabric");
-        assert_eq!(payload["payload"]["mode"], "redacted");
-        assert_eq!(payload["payload"]["rollback_id"], "redacted");
+        assert_eq!(payload["payload"]["mode"], "managed");
+        assert!(payload["payload"]["rollback_id"].is_null());
         assert_no_performance_route_sensitive_fragments(&payload);
 
         let (status, payload) = fixture
@@ -254,17 +262,17 @@ mod tests {
             .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["operation"]["id"], operation.id.to_string());
-        assert_eq!(payload["operation"]["action"], "unknown");
+        assert_eq!(payload["operation"]["id"], operation_id.to_string());
+        assert_eq!(payload["operation"]["action"], "install");
         assert_eq!(
             payload["operation"]["error"],
             "performance operation failed"
         );
         assert_eq!(payload["operation"]["view_model"]["tone"], "err");
-        assert_eq!(payload["operation"]["payload"]["game_version"], "redacted");
+        assert_eq!(payload["operation"]["payload"]["game_version"], "1.20.4");
         assert_eq!(payload["operation"]["payload"]["loader"], "fabric");
-        assert_eq!(payload["operation"]["payload"]["mode"], "redacted");
-        assert_eq!(payload["operation"]["payload"]["rollback_id"], "redacted");
+        assert_eq!(payload["operation"]["payload"]["mode"], "managed");
+        assert!(payload["operation"]["payload"]["rollback_id"].is_null());
         assert_no_performance_route_sensitive_fragments(&payload);
     }
 

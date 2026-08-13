@@ -1524,14 +1524,10 @@ mod tests {
 
     fn test_app_state_with_journal_backend(root: &Path) -> (AppState, Arc<JournalFailureBackend>) {
         let state = test_app_state(root);
-        let (journal_directory, _) = state
+        let journal_directory = state
             .operation_store_directories_for_test()
             .expect("operation store directories");
-        let performance_operations = Arc::clone(state.performance_operations());
-        let state = state.with_operation_stores(
-            Arc::new(OperationJournalStore::new()),
-            Arc::clone(&performance_operations),
-        );
+        let state = state.with_journals(Arc::new(OperationJournalStore::new()));
         let backend = Arc::new(JournalFailureBackend::default());
         let coordinator =
             PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
@@ -1542,10 +1538,7 @@ mod tests {
             )
             .expect("claim injected operation journal persistence"),
         );
-        (
-            state.with_operation_stores(journals, performance_operations),
-            backend,
-        )
+        (state.with_journals(journals), backend)
     }
 
     fn test_paths(root: &Path) -> AppPaths {

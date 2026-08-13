@@ -1,8 +1,5 @@
 use super::*;
-use crate::state::performance_operations::{
-    PERFORMANCE_COMMITTING_COMPLETE_STATE, PerformanceOperationPayload,
-};
-use crate::state::{AppStateInit, DownloadProgress, IdleSweepTerminal, InstallStore, SessionStore};
+use crate::state::{AppStateInit, DownloadProgress, InstallStore, SessionStore};
 use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
 use axial_performance::{CompositionState, InstalledMod, PerformanceManager};
@@ -27,8 +24,6 @@ use tower::ServiceExt;
 
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
 use crate::state::OperationJournalStore;
-use crate::state::contracts::TargetDescriptor;
-use crate::state::performance_operations::PerformanceOperationStore;
 
 type PlanQuery = PerformancePlanRequest;
 type HealthQuery = PerformanceHealthRequest;
@@ -282,22 +277,6 @@ async fn collect_install_events(
     }
 }
 
-async fn wait_for_integrity_idle(state: &AppState, expected: bool) {
-    let mut idle = state.subscribe_integrity_idle();
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if idle.borrow_and_update().is_stably_idle() == expected {
-                return;
-            }
-            idle.changed()
-                .await
-                .expect("integrity idle state remains open");
-        }
-    })
-    .await
-    .expect("integrity idle state settles");
-}
-
 fn json_error_message(error: &(StatusCode, Json<serde_json::Value>)) -> String {
     error
         .1
@@ -341,15 +320,16 @@ impl ScriptedOperationBackend {
         )
     }
 
-    fn fail_attempt(&self, attempt: usize) {
+    fn set_fail_all(&self, fail: bool) {
+        self.fail_all.store(fail, Ordering::SeqCst);
+    }
+
+    fn fail_next_attempts(&self, count: usize) {
+        let first = self.attempts.load(Ordering::SeqCst) + 1;
         self.fail_attempts
             .lock()
             .expect("scripted failures lock")
-            .insert(attempt);
-    }
-
-    fn set_fail_all(&self, fail: bool) {
-        self.fail_all.store(fail, Ordering::SeqCst);
+            .extend(first..first + count);
     }
 
     fn gate_attempt(&self, attempt: usize) {
@@ -686,20 +666,18 @@ async fn load_test_state(root: &FsPath) -> AppState {
 fn build_test_state_with_operation_backends(
     root: &FsPath,
     journal_backend: Arc<ScriptedOperationBackend>,
-    status_backend: Arc<ScriptedOperationBackend>,
 ) -> AppState {
     let state = build_test_state(root, None, None);
-    replace_operation_backends(state, journal_backend, status_backend)
+    replace_operation_backend(state, journal_backend)
 }
 
-fn replace_operation_backends(
+fn replace_operation_backend(
     state: AppState,
     journal_backend: Arc<ScriptedOperationBackend>,
-    status_backend: Arc<ScriptedOperationBackend>,
 ) -> AppState {
-    let (journal_directory, performance_operation_directory) = state
+    let journal_directory = state
         .operation_store_directories_for_test()
-        .expect("derive scripted operation-store directories");
+        .expect("derive scripted operation-journal directory");
     let journals = Arc::new(
         OperationJournalStore::try_load_from_directory_with_coordinator(
             journal_directory,
@@ -707,23 +685,7 @@ fn replace_operation_backends(
         )
         .expect("scripted journal store"),
     );
-    let performance_operations = Arc::new(
-        PerformanceOperationStore::try_load_from_directory_with_coordinator(
-            performance_operation_directory,
-            status_backend.coordinator(),
-        )
-        .expect("scripted performance status store"),
-    );
-    state.with_operation_stores(journals, performance_operations)
-}
-
-fn test_operation_payload() -> PerformanceOperationPayload {
-    PerformanceOperationPayload {
-        game_version: None,
-        loader: None,
-        mode: None,
-        rollback_id: None,
-    }
+    state.with_journals(journals)
 }
 
 struct SignedRulesResponse {

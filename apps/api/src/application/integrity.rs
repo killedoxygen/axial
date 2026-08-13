@@ -1210,8 +1210,7 @@ mod tests {
             )
             .expect("claim gated journal store"),
         );
-        let performance_operations = state.performance_operations().clone();
-        let state = state.with_operation_stores(journals, performance_operations);
+        let state = state.with_journals(journals);
         (state, root, paths, backend)
     }
 
@@ -2170,8 +2169,7 @@ exec sleep 30
             ))
             .await
             .expect("fill active journal capacity");
-        let performance_operations = state.performance_operations().clone();
-        let state = state.with_operation_stores(journals, performance_operations);
+        let state = state.with_journals(journals);
         let idle_before = *state.subscribe_integrity_idle().borrow();
 
         let result = plan_tier2_integrity_sweep_with_id(
@@ -2834,8 +2832,7 @@ exec sleep 30
             )
             .await
             .expect("terminalize completed fixture");
-        let performance_operations = state.performance_operations().clone();
-        let state = state.with_operation_stores(journals, performance_operations);
+        let state = state.with_journals(journals);
 
         for _ in 0..2 {
             reconcile_interrupted_tier2_integrity_sweeps(

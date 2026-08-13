@@ -102,7 +102,7 @@ test("file cutover removes producerless Guardian vocabulary exactly", async () =
     readJson(
       "apps/api/tests/fixtures/guardian/guardian-decision-snapshot-v1.json",
     ),
-    readJson("apps/api/tests/fixtures/guardian/operation-journals-v7.json"),
+    readJson("apps/api/tests/fixtures/guardian/operation-journals-v8.json"),
     read("docs/GUARDIAN-INVARIANT-COVERAGE.md"),
   ]);
   const removedSymbols = [
@@ -258,6 +258,17 @@ test("file cutover removes producerless Guardian vocabulary exactly", async () =
     .flatMap((entry) => entry.guardian_diagnosis_ids);
   assert.equal(diagnosisIds.length, 76);
   assert.equal(new Set(diagnosisIds).size, 76);
+  assert.equal(journals.next_sequence, 8);
+  assert.deepEqual(
+    journals.entries.map((entry) => entry.sequence),
+    [1, 2, 3, 4, 5, 7],
+  );
+  assert.deepEqual(
+    journals.entries
+      .filter((entry) => entry.intent.kind === "performance")
+      .map((entry) => [entry.command, entry.intent.phase.phase]),
+    [["ApplyPerformancePlan", "accepted"]],
+  );
   assert.match(coverageDoc, /\| Diagnosis rules \| 56 \|/);
   assert.match(coverageDoc, /\| Registered facts \| 116 \|/);
   assert.match(coverageDoc, /\| Adapter sources \| 93 \|/);
@@ -290,76 +301,23 @@ test("execution file module is fact-only and crate-private", async () => {
   );
 });
 
-test("performance production persistence remains capability-owned", async () => {
-  const source = await read("apps/api/src/state/performance_operations.rs");
-  const persistence = braceBlock(
-    source,
-    "struct PerformanceOperationPersistence",
-  );
-  const progress = braceBlock(source, "fn accept_progress");
-  const critical = braceBlock(source, "async fn commit_transition");
-  const fixture = braceBlock(source, "fn write_operation_status_fixture");
-
-  assert.match(persistence, /owner: PersistenceOwnerLease/);
-  assert.match(persistence, /directory: AnchoredRecordDirectory/);
-  assert.match(
-    persistence,
-    /writers: SyncMutex<HashMap<OperationId, AtomicSnapshotWriter>>/,
-  );
-  assert.match(
-    source,
-    /coordinator\s*\.claim_directory\(directory\.clone\(\)\)/,
-  );
-  assert.match(source, /self\s*\.directory\s*\.target\(/);
-  assert.match(source, /self\s*\.owner\s*\.writer\(record\)/);
-  assert.match(
-    progress,
-    /persistence\s*\.writer\(&status\.id\)\?[\s\S]*\.accept\(/,
-  );
-  assert.match(
-    critical,
-    /persistence\s*\.writer\(&status\.id\)\?[\s\S]*\.accept\(/,
-  );
-
-  const fixtureStart = source.indexOf("fn write_operation_status_fixture");
-  assert.notEqual(fixtureStart, -1);
-  assert.match(
-    source.slice(Math.max(0, fixtureStart - 32), fixtureStart),
-    /#\[cfg\(test\)\]\s*$/,
-  );
-  assert.match(fixture, /fs::create_dir_all\(storage_dir\)/);
-  assert.match(fixture, /fs::write\(path, data\)/);
-});
-
-test("performance startup carries only capability authority", async () => {
-  const [source, state] = await Promise.all([
-    read("apps/api/src/state/performance_operations.rs"),
+test("performance production persistence has one capability-owned journal", async () => {
+  const [journals, state, stateEntries] = await Promise.all([
+    read("apps/api/src/state/journals.rs"),
     read("apps/api/src/state/mod.rs"),
+    readdir(new URL("apps/api/src/state/", repository)),
   ]);
-  const retention = braceBlock(
-    source,
-    "pub enum PerformanceOperationRetentionIssueKind",
-  );
-  const startup = braceBlock(
-    source,
-    "pub(super) fn load_from_paths_for_startup",
-  );
-  const inner = braceBlock(
-    source,
-    "fn try_load_from_paths_with_coordinator_for_startup",
-  );
+  const persistence = braceBlock(journals, "struct OperationJournalPersistence");
+  const store = braceBlock(journals, "pub struct OperationJournalStore");
 
-  assert.doesNotMatch(retention, /\bBlockingTask\b/);
-  assert.doesNotMatch(
-    source,
-    /PerformanceOperationRetentionIssueKind::BlockingTask/,
-  );
-  assert.doesNotMatch(startup, /\bAppPaths\b|\bpaths\b/);
-  assert.doesNotMatch(inner, /\bAppPaths\b|\bpaths\b/);
-  assert.match(startup, /directory: AnchoredRecordDirectory/);
-  assert.match(inner, /directory: AnchoredRecordDirectory/);
+  assert.deepEqual(stateEntries.includes("performance_operations.rs"), false);
+  assert.match(persistence, /owner: PersistenceOwnerLease/);
+  assert.match(persistence, /writer: AtomicSnapshotWriter/);
+  assert.match(store, /persistence: Option<OperationJournalPersistence>/);
   assert.match(
     state,
-    /PerformanceOperationStore::load_from_paths_for_startup\(\s*performance_operation_directory,\s*\)/,
+    /OperationJournalStore::try_load_from_directory\([\s\S]*operation_journal_parent\(\)/,
   );
+  assert.doesNotMatch(state, /PerformanceOperationStore|performance_operation_directory/);
+  assert.match(journals, /pub const OPERATION_JOURNAL_SCHEMA: &str = "axial\.state\.operation_journals\.v8"/);
 });

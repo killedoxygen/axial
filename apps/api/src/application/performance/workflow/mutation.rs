@@ -1,10 +1,10 @@
 use super::managed_plan::{ManagedPlanResolutionError, resolve_managed_install_plan};
 use super::operations::{
-    PerformanceApplicationError, PerformanceInstallAction, PerformanceJournalTransition,
-    PerformanceOperationExecutionError, PerformanceOperationResultRequest,
-    begin_performance_operation_journal, record_performance_effect_started,
-    record_performance_effect_started_status, record_performance_guardian_supervision,
-    record_performance_operation_result, record_performance_plan_resolved,
+    PerformanceApplicationError, PerformanceInstallAction, PerformanceOperationExecutionError,
+    PerformanceOperationResultRequest, begin_performance_operation_journal,
+    record_performance_applied_unverified, record_performance_effect_started,
+    record_performance_guardian_supervision, record_performance_operation_result,
+    record_performance_plan_resolved, record_performance_prepared,
 };
 use super::plan_health::{
     PerformanceManagedArtifactSummary, managed_artifact_summary, performance_composition_target,
@@ -22,13 +22,16 @@ use crate::guardian::{
     performance_plan_guardian_facts, plan_performance_supervision,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
-use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
+use crate::state::contracts::{
+    OperationId, OperationPhase, PerformanceOperationPhase, PerformanceOperationPrepared,
+    PerformancePreparedProof, PerformanceRollbackTarget, RollbackState,
+};
 use crate::state::{AppManagedCompositionAdmission, AppState, IntegrityForegroundLease};
 use axial_minecraft::download::{TransferClient, TransferOrigin};
 use axial_performance::{
     BundleHealth, CompositionPlan, CompositionState, InstallError, ManagedArtifactTransferResolver,
     ManagedCompositionInspection, ManagedCompositionInstallPlan, ManagedInstallExecutionError,
-    ManagedRollbackOutcome, PerformanceMode, ResolutionRequest,
+    ManagedMutationError, ManagedRollbackOutcome, PerformanceMode, ResolutionRequest,
     RollbackSnapshotSummary as CoreRollbackSnapshotSummary, RollbackSnapshotTarget, StateError,
 };
 use axum::{Json, http::StatusCode};
@@ -56,6 +59,13 @@ struct PerformanceInstallExecutionRequest<'a> {
     mode: PerformanceMode,
     game_version: String,
     loader: String,
+}
+
+#[derive(Clone, Debug)]
+struct PerformanceRollbackPreflight {
+    target_id: String,
+    rollback_state: RollbackState,
+    prepared: Option<PerformanceOperationPrepared>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,45 +235,31 @@ pub(super) async fn performance_operation_journal_identity(
             )
         })?;
     let admitted = state
-        .admit_managed_instance_with_foreground(foreground, &instance.id, false)
+        .admit_managed_instance_with_foreground(foreground, &instance.id, true)
         .await
         .map_err(managed_admission_error)?;
 
     if matches!(operation.action, PerformanceInstallAction::Rollback) {
-        return Ok(
-            match rollback_preflight(&admitted, operation.rollback_id.as_deref()).await {
-                Ok((target_id, rollback)) => PerformanceJournalIdentity {
-                    action: PerformanceInstallAction::Rollback,
-                    target_id,
-                    rollback,
-                },
-                Err(_) => PerformanceJournalIdentity {
-                    action: PerformanceInstallAction::Rollback,
-                    target_id: "performance_rollback_snapshot".to_string(),
-                    rollback: RollbackState::Unavailable,
-                },
-            },
-        );
+        let preflight = rollback_preflight(&admitted, operation.rollback_id.as_deref()).await?;
+        return Ok(PerformanceJournalIdentity {
+            action: PerformanceInstallAction::Rollback,
+            target_id: preflight.target_id,
+            rollback: preflight.rollback_state,
+        });
     }
 
     let mode = resolve_instance_mode(state, &instance, operation.mode.as_deref())?;
     if matches!(operation.action, PerformanceInstallAction::Remove)
         || !matches!(mode, PerformanceMode::Managed)
     {
-        return Ok(match preflight_current_performance_state(&admitted).await {
-            Ok(current) => PerformanceJournalIdentity {
-                action: PerformanceInstallAction::Remove,
-                target_id: current
-                    .as_ref()
-                    .map(|state| state.composition_id.clone())
-                    .unwrap_or_else(|| "performance_composition_lock".to_string()),
-                rollback: rollback_state_for_current_state(current.as_ref()),
-            },
-            Err(_) => PerformanceJournalIdentity {
-                action: PerformanceInstallAction::Remove,
-                target_id: "performance_composition_lock".to_string(),
-                rollback: RollbackState::Unavailable,
-            },
+        let current = preflight_current_performance_state(&admitted).await?;
+        return Ok(PerformanceJournalIdentity {
+            action: PerformanceInstallAction::Remove,
+            target_id: current
+                .as_ref()
+                .map(|state| state.composition_id.clone())
+                .unwrap_or_else(|| "performance_composition_lock".to_string()),
+            rollback: rollback_state_for_current_state(current.as_ref()),
         });
     }
 
@@ -273,21 +269,18 @@ pub(super) async fn performance_operation_journal_identity(
         operation.game_version.as_deref(),
         operation.loader.as_deref(),
     )?;
-    let inspection = admitted.inspect(None).await;
+    let inspection = admitted
+        .inspect(None)
+        .await
+        .map_err(managed_mutation_error)?;
     let plan = state.performance().get_plan(ResolutionRequest {
         game_version,
         loader,
         mode,
         hardware: state.performance().hardware(),
-        installed_mods: inspection
-            .as_ref()
-            .map(|inspection| inspection.installed_mod_evidence.clone())
-            .unwrap_or_default(),
+        installed_mods: inspection.installed_mod_evidence.clone(),
     });
-    let rollback = inspection
-        .as_ref()
-        .map(install_rollback_state_for_inspection)
-        .unwrap_or(RollbackState::Unavailable);
+    let rollback = install_rollback_state_for_inspection(&inspection);
     Ok(PerformanceJournalIdentity {
         action: PerformanceInstallAction::Install,
         target_id: plan.composition_id,
@@ -307,7 +300,7 @@ where
 {
     let preflight = rollback_preflight(admitted, operation.rollback_id.as_deref()).await;
     let (target_id, rollback_state) = match &preflight {
-        Ok((target_id, rollback_state)) => (target_id.clone(), *rollback_state),
+        Ok(preflight) => (preflight.target_id.clone(), preflight.rollback_state),
         Err(_) => (
             "performance_rollback_snapshot".to_string(),
             RollbackState::Unavailable,
@@ -326,26 +319,26 @@ where
         PerformanceOperationExecutionError::journal_transition(
             operation.status_operation_id.clone(),
             error,
-            PerformanceJournalTransition::created(operation.action, &target_id, rollback_state),
         )
     })?;
-    if let Err(error) = preflight {
-        let result = Err(error);
-        record_performance_operation_result(
-            state,
-            PerformanceOperationResultRequest {
-                operation_id: &operation_id,
-                action: operation.action,
-                fallback_target_id: &target_id,
-                terminal_rollback: rollback_state,
-                changed_target: false,
-                result: &result,
-                failure_signal: operation.persistence_failure.as_ref(),
-            },
-        )
-        .await?;
-        return result.map_err(Into::into);
-    }
+    let preflight = match preflight {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            let result = Err(error);
+            record_performance_operation_result(
+                state,
+                PerformanceOperationResultRequest {
+                    operation_id: &operation_id,
+                    terminal_rollback: rollback_state,
+                    changed_target: false,
+                    result: &result,
+                    failure_signal: operation.persistence_failure.as_ref(),
+                },
+            )
+            .await?;
+            return result.map_err(Into::into);
+        }
+    };
     let supervision = match supervise_performance_operation(
         state,
         &operation_id,
@@ -365,8 +358,6 @@ where
                 state,
                 PerformanceOperationResultRequest {
                     operation_id: &operation_id,
-                    action: operation.action,
-                    fallback_target_id: &target_id,
                     terminal_rollback: rollback_state,
                     changed_target: false,
                     result: &result,
@@ -383,12 +374,29 @@ where
             PerformanceOperationExecutionError::journal_transition(
                 Some(operation_id.clone()),
                 error,
-                PerformanceJournalTransition::guardian(
-                    operation.action,
-                    &target_id,
-                    rollback_state,
-                    &supervision,
-                ),
+            )
+        })?;
+    let Some(prepared) = preflight.prepared else {
+        let result = Err(performance_install_error(InstallError::NoRollbackSnapshot));
+        record_performance_operation_result(
+            state,
+            PerformanceOperationResultRequest {
+                operation_id: &operation_id,
+                terminal_rollback: rollback_state,
+                changed_target: false,
+                result: &result,
+                failure_signal: operation.persistence_failure.as_ref(),
+            },
+        )
+        .await?;
+        return result.map_err(Into::into);
+    };
+    record_performance_prepared(state, &operation_id, prepared)
+        .await
+        .map_err(|error| {
+            PerformanceOperationExecutionError::journal_transition(
+                Some(operation_id.clone()),
+                error,
             )
         })?;
     record_performance_effect_started(
@@ -400,76 +408,69 @@ where
     )
     .await
     .map_err(|error| {
-        PerformanceOperationExecutionError::journal_transition(
-            Some(operation_id.clone()),
-            error,
-            PerformanceJournalTransition::effect_started(
-                operation.action,
-                &target_id,
-                rollback_state,
-            ),
-        )
+        PerformanceOperationExecutionError::journal_transition(Some(operation_id.clone()), error)
     })?;
-    record_performance_effect_started_status(
-        state,
-        &operation_id,
-        operation.persistence_failure.as_ref(),
-    )
-    .await?;
     progress(operation.action).await;
 
-    let result = async {
-        let rollback_id = optional_value(operation.rollback_id.as_deref());
-        let restored = admitted
-            .rollback_managed(rollback_id.as_deref())
-            .await
-            .map_err(managed_mutation_error)?;
-        let inspection = admitted
-            .inspect(None)
-            .await
-            .map_err(managed_mutation_error)?;
-        let health = inspection.health;
-        let warnings = inspection.warnings;
-
-        Ok(match restored {
-            ManagedRollbackOutcome::ManagedStateAbsent => PerformanceInstallResponse {
-                active: false,
-                status: "rolled_back".to_string(),
-                install_id: None,
-                health,
-                composition_id: String::new(),
-                tier: String::new(),
-                installed_count: 0,
-                managed_artifacts: Vec::new(),
-                warnings,
-            },
-            ManagedRollbackOutcome::ManagedComposition(restored_state) => {
-                PerformanceInstallResponse {
-                    active: true,
-                    status: "rolled_back".to_string(),
-                    install_id: None,
-                    health,
-                    composition_id: super::super::public_performance_descriptor(
-                        &restored_state.composition_id,
-                        "composition",
-                    ),
-                    tier: tier_name(restored_state.tier).to_string(),
-                    installed_count: restored_state.installed_mods.len(),
-                    managed_artifacts: managed_artifact_summary(Some(&restored_state)),
-                    warnings,
+    let rollback_id = optional_value(operation.rollback_id.as_deref());
+    let mutation = admitted.rollback_managed(rollback_id.as_deref()).await;
+    let (result, terminal_rollback, changed_target) = match mutation {
+        Ok(restored) => {
+            let inspection = admitted.inspect(None).await;
+            let result = match inspection {
+                Ok(inspection) => Ok({
+                    let health = inspection.health;
+                    let warnings = inspection.warnings;
+                    match restored {
+                        ManagedRollbackOutcome::ManagedStateAbsent => PerformanceInstallResponse {
+                            active: false,
+                            status: "rolled_back".to_string(),
+                            install_id: None,
+                            health,
+                            composition_id: String::new(),
+                            tier: String::new(),
+                            installed_count: 0,
+                            managed_artifacts: Vec::new(),
+                            warnings,
+                        },
+                        ManagedRollbackOutcome::ManagedComposition(restored_state) => {
+                            PerformanceInstallResponse {
+                                active: true,
+                                status: "rolled_back".to_string(),
+                                install_id: None,
+                                health,
+                                composition_id: super::super::public_performance_descriptor(
+                                    &restored_state.composition_id,
+                                    "composition",
+                                ),
+                                tier: tier_name(restored_state.tier).to_string(),
+                                installed_count: restored_state.installed_mods.len(),
+                                managed_artifacts: managed_artifact_summary(Some(&restored_state)),
+                                warnings,
+                            }
+                        }
+                    }
+                }),
+                Err(error) if managed_mutation_is_indeterminate(&error) => {
+                    record_indeterminate_performance_effect(state, &operation_id).await?;
+                    return Err(managed_mutation_error(error).into());
                 }
-            }
-        })
-    }
-    .await;
+                Err(error) => Err(managed_mutation_error(error)),
+            };
+            (result, RollbackState::Applied, true)
+        }
+        Err(error) if managed_mutation_is_indeterminate(&error) => {
+            record_indeterminate_performance_effect(state, &operation_id).await?;
+            return Err(managed_mutation_error(error).into());
+        }
+        Err(error) => (Err(managed_mutation_error(error)), rollback_state, false),
+    };
     record_performance_operation_result(
         state,
         PerformanceOperationResultRequest {
             operation_id: &operation_id,
-            action: operation.action,
-            fallback_target_id: &target_id,
-            terminal_rollback: rollback_state,
-            changed_target: result.is_ok(),
+            terminal_rollback,
+            changed_target,
             result: &result,
             failure_signal: operation.persistence_failure.as_ref(),
         },
@@ -518,7 +519,6 @@ where
         PerformanceOperationExecutionError::journal_transition(
             operation.status_operation_id.clone(),
             error,
-            PerformanceJournalTransition::created(journal_action, &target_id, rollback_state),
         )
     })?;
     let supervision = match supervise_performance_operation(
@@ -540,8 +540,6 @@ where
                 state,
                 PerformanceOperationResultRequest {
                     operation_id: &operation_id,
-                    action: journal_action,
-                    fallback_target_id: &target_id,
                     terminal_rollback: rollback_state,
                     changed_target: false,
                     result: &result,
@@ -558,22 +556,60 @@ where
             PerformanceOperationExecutionError::journal_transition(
                 Some(operation_id.clone()),
                 error,
-                PerformanceJournalTransition::guardian(
-                    journal_action,
-                    &target_id,
-                    rollback_state,
-                    &supervision,
-                ),
             )
         })?;
-    if let Err(error) = current_state {
-        let result = Err(error);
+    let current_state = match current_state {
+        Ok(current_state) => current_state,
+        Err(error) => {
+            let result = Err(error);
+            record_performance_operation_result(
+                state,
+                PerformanceOperationResultRequest {
+                    operation_id: &operation_id,
+                    terminal_rollback: rollback_state,
+                    changed_target: false,
+                    result: &result,
+                    failure_signal: operation.persistence_failure.as_ref(),
+                },
+            )
+            .await?;
+            return result.map_err(Into::into);
+        }
+    };
+    let artifact_count = current_state
+        .as_ref()
+        .map(|state| u64::try_from(state.installed_mods.len()))
+        .transpose()
+        .map_err(|_| {
+            PerformanceOperationExecutionError::journal_transition(
+                Some(operation_id.clone()),
+                crate::state::OperationJournalStoreError::CapacityExhausted,
+            )
+        })?;
+    let prepared = PerformanceOperationPrepared {
+        result_target_id: target_id.clone(),
+        proof: match &current_state {
+            Some(current) => PerformancePreparedProof::RemoveCurrent {
+                graph_sha512: current.graph_sha512.clone(),
+                artifact_count: artifact_count.expect("present state has an artifact count"),
+            },
+            None => PerformancePreparedProof::ManagedStateAbsent {},
+        },
+    };
+    record_performance_prepared(state, &operation_id, prepared)
+        .await
+        .map_err(|error| {
+            PerformanceOperationExecutionError::journal_transition(
+                Some(operation_id.clone()),
+                error,
+            )
+        })?;
+    if current_state.is_none() {
+        let result = Ok(removed_install_response());
         record_performance_operation_result(
             state,
             PerformanceOperationResultRequest {
                 operation_id: &operation_id,
-                action: journal_action,
-                fallback_target_id: &target_id,
                 terminal_rollback: rollback_state,
                 changed_target: false,
                 result: &result,
@@ -592,35 +628,22 @@ where
     )
     .await
     .map_err(|error| {
-        PerformanceOperationExecutionError::journal_transition(
-            Some(operation_id.clone()),
-            error,
-            PerformanceJournalTransition::effect_started(
-                journal_action,
-                &target_id,
-                rollback_state,
-            ),
-        )
+        PerformanceOperationExecutionError::journal_transition(Some(operation_id.clone()), error)
     })?;
-    record_performance_effect_started_status(
-        state,
-        &operation_id,
-        operation.persistence_failure.as_ref(),
-    )
-    .await?;
     progress(journal_action).await;
 
-    let result = admitted
-        .remove_managed()
-        .await
-        .map(|_| removed_install_response())
-        .map_err(managed_mutation_error);
+    let result = match admitted.remove_managed().await {
+        Ok(()) => Ok(removed_install_response()),
+        Err(error) if managed_mutation_is_indeterminate(&error) => {
+            record_indeterminate_performance_effect(state, &operation_id).await?;
+            return Err(managed_mutation_error(error).into());
+        }
+        Err(error) => Err(managed_mutation_error(error)),
+    };
     record_performance_operation_result(
         state,
         PerformanceOperationResultRequest {
             operation_id: &operation_id,
-            action: journal_action,
-            fallback_target_id: &target_id,
             terminal_rollback: rollback_state,
             changed_target: remove_target_present && result.is_ok(),
             result: &result,
@@ -682,11 +705,6 @@ where
         PerformanceOperationExecutionError::journal_transition(
             operation.status_operation_id.clone(),
             error,
-            PerformanceJournalTransition::created(
-                operation.action,
-                &plan.composition_id,
-                rollback_state,
-            ),
         )
     })?;
     let guardian_facts = performance_plan_guardian_facts(&plan, OperationPhase::Installing);
@@ -709,8 +727,6 @@ where
                 state,
                 PerformanceOperationResultRequest {
                     operation_id: &operation_id,
-                    action: operation.action,
-                    fallback_target_id: &plan.composition_id,
                     terminal_rollback: pre_effect_rollback_state,
                     changed_target: false,
                     result: &result,
@@ -727,12 +743,6 @@ where
             PerformanceOperationExecutionError::journal_transition(
                 Some(operation_id.clone()),
                 error,
-                PerformanceJournalTransition::guardian(
-                    operation.action,
-                    &plan.composition_id,
-                    rollback_state,
-                    &supervision,
-                ),
             )
         })?;
     if let Err(error) = current_inspection {
@@ -741,8 +751,6 @@ where
             state,
             PerformanceOperationResultRequest {
                 operation_id: &operation_id,
-                action: operation.action,
-                fallback_target_id: &plan.composition_id,
                 terminal_rollback: pre_effect_rollback_state,
                 changed_target: false,
                 result: &result,
@@ -760,8 +768,6 @@ where
                 state,
                 PerformanceOperationResultRequest {
                     operation_id: &operation_id,
-                    action: operation.action,
-                    fallback_target_id: &plan.composition_id,
                     terminal_rollback: pre_effect_rollback_state,
                     changed_target: false,
                     result: &result,
@@ -782,22 +788,12 @@ where
     )
     .await
     .map_err(|error| {
-        PerformanceOperationExecutionError::journal_transition(
-            Some(operation_id.clone()),
-            error,
-            PerformanceJournalTransition::plan_resolved(
-                operation.action,
-                &plan.composition_id,
-                rollback_state,
-                &install_plan,
-            ),
-        )
+        PerformanceOperationExecutionError::journal_transition(Some(operation_id.clone()), error)
     })?;
     let effect_state = state.clone();
     let effect_operation_id = operation_id.clone();
     let effect_action = operation.action;
     let effect_target_id = plan.composition_id.clone();
-    let effect_persistence_failure = operation.persistence_failure.clone();
     let execution = admitted
         .ensure_installed(
             &install_plan,
@@ -816,19 +812,8 @@ where
                     PerformanceOperationExecutionError::journal_transition(
                         Some(effect_operation_id.clone()),
                         error,
-                        PerformanceJournalTransition::effect_started(
-                            effect_action,
-                            &effect_target_id,
-                            rollback_ready,
-                        ),
                     )
                 })?;
-                record_performance_effect_started_status(
-                    &effect_state,
-                    &effect_operation_id,
-                    effect_persistence_failure.as_ref(),
-                )
-                .await?;
                 progress(effect_action).await;
                 Ok(())
             },
@@ -859,9 +844,19 @@ where
                         warnings,
                     })
                 }
+                Err(error) if managed_mutation_is_indeterminate(&error) => {
+                    record_indeterminate_performance_effect(state, &operation_id).await?;
+                    return Err(managed_mutation_error(error).into());
+                }
                 Err(error) => Err(managed_mutation_error(error)),
             };
             (result, terminal_rollback, changed_target)
+        }
+        Err(ManagedInstallExecutionError::Mutation { source, .. })
+            if managed_mutation_is_indeterminate(&source) =>
+        {
+            record_indeterminate_performance_effect(state, &operation_id).await?;
+            return Err(managed_mutation_error(source).into());
         }
         Err(ManagedInstallExecutionError::Mutation {
             source,
@@ -877,8 +872,6 @@ where
         state,
         PerformanceOperationResultRequest {
             operation_id: &operation_id,
-            action: operation.action,
-            fallback_target_id: &plan.composition_id,
             terminal_rollback,
             changed_target,
             result: &result,
@@ -975,8 +968,19 @@ async fn preflight_current_performance_state(
 async fn rollback_preflight(
     admitted: &AppManagedCompositionAdmission,
     rollback_id: Option<&str>,
-) -> Result<(String, RollbackState), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<PerformanceRollbackPreflight, (StatusCode, Json<serde_json::Value>)> {
     let rollback_id = optional_value(rollback_id);
+    if rollback_id.as_deref().is_some_and(|snapshot_id| {
+        snapshot_id.len() > 96
+            || !snapshot_id
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || value == b'-' || value == b'_')
+    }) {
+        return Err(performance_supervision_error(
+            GuardianPerformanceSupervisionRejection::RollbackUnavailable,
+            OperationPhase::RollingBack,
+        ));
+    }
     let inspection = admitted
         .inspect(None)
         .await
@@ -997,17 +1001,40 @@ async fn rollback_preflight(
     );
 
     Ok(match snapshot {
-        Some(snapshot) => (
-            snapshot
+        Some(snapshot) => {
+            let artifact_count = u64::try_from(snapshot.artifact_count).map_err(|_| {
+                internal_install_error("performance rollback snapshot is too large")
+            })?;
+            let target = match snapshot.target {
+                RollbackSnapshotTarget::ManagedStateAbsent => {
+                    PerformanceRollbackTarget::ManagedStateAbsent
+                }
+                RollbackSnapshotTarget::ManagedComposition => {
+                    PerformanceRollbackTarget::ManagedComposition
+                }
+            };
+            let target_id = snapshot
                 .composition_id
                 .clone()
-                .unwrap_or_else(|| "performance_managed_state_absent".to_string()),
-            RollbackState::Available,
-        ),
-        None => (
-            "performance_rollback_snapshot".to_string(),
-            RollbackState::Unavailable,
-        ),
+                .unwrap_or_else(|| "performance_managed_state_absent".to_string());
+            PerformanceRollbackPreflight {
+                target_id: target_id.clone(),
+                rollback_state: RollbackState::Available,
+                prepared: Some(PerformanceOperationPrepared {
+                    result_target_id: target_id,
+                    proof: PerformancePreparedProof::RollbackSnapshot {
+                        snapshot_id: snapshot.id.clone(),
+                        target,
+                        artifact_count,
+                    },
+                }),
+            }
+        }
+        None => PerformanceRollbackPreflight {
+            target_id: "performance_rollback_snapshot".to_string(),
+            rollback_state: RollbackState::Unavailable,
+            prepared: None,
+        },
     })
 }
 
@@ -1213,18 +1240,61 @@ fn managed_mutation_error(
     }
 }
 
+fn managed_mutation_is_indeterminate(error: &ManagedMutationError) -> bool {
+    matches!(error, ManagedMutationError::Indeterminate(_))
+}
+
+async fn record_indeterminate_performance_effect(
+    state: &AppState,
+    operation_id: &OperationId,
+) -> Result<(), PerformanceOperationExecutionError> {
+    let Some(projection) = state.journals().performance_operation(operation_id) else {
+        return Err(PerformanceOperationExecutionError::journal_transition(
+            Some(operation_id.clone()),
+            crate::state::OperationJournalStoreError::MissingOperation,
+        ));
+    };
+    if matches!(projection.phase, PerformanceOperationPhase::Prepared { .. }) {
+        return Ok(());
+    }
+    record_performance_applied_unverified(
+        state,
+        operation_id,
+        "managed performance effect requires reconciliation",
+    )
+    .await
+    .map_err(|error| {
+        PerformanceOperationExecutionError::journal_transition(Some(operation_id.clone()), error)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ManagedPlanResolutionError, PERFORMANCE_INSTALL_INTERNAL_ERROR,
-        managed_plan_resolution_error, performance_supervision_error,
-        plan_performance_operation_supervision,
+        managed_mutation_is_indeterminate, managed_plan_resolution_error,
+        performance_supervision_error, plan_performance_operation_supervision,
     };
     use crate::guardian::{
         GuardianMode, GuardianPerformanceOperationKind, GuardianPerformanceSupervisionRejection,
     };
     use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
     use axum::http::StatusCode;
+
+    #[test]
+    fn indeterminate_managed_mutations_require_applied_unverified_reconciliation() {
+        assert!(managed_mutation_is_indeterminate(
+            &axial_performance::ManagedMutationError::reconciliation_required("install")
+        ));
+        assert!(managed_mutation_is_indeterminate(
+            &axial_performance::ManagedMutationError::owner_stopped("remove")
+        ));
+        assert!(!managed_mutation_is_indeterminate(
+            &axial_performance::ManagedMutationError::Definite(
+                axial_performance::InstallError::NoRollbackSnapshot
+            )
+        ));
+    }
 
     #[test]
     fn p02_b05_contract_cross_owner_performance_rejections_use_exact_distinct_copy() {

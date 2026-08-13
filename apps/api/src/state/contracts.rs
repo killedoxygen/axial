@@ -21,7 +21,6 @@ pub(super) const PERSISTED_STATE_REPAIR_MAX_ATTEMPTS_PER_STABLE_KEY_PER_SUPPRESS
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PersistedStateRecordStore {
-    PerformanceOperation,
     BenchmarkSuiteDriver,
 }
 
@@ -415,14 +414,7 @@ impl PersistedStateRepairAttempt {
 
     pub(super) fn validate(&self) -> Result<(), PersistedStateRepairValidationError> {
         if !safe_reconciliation_token(&self.record_id, 128)
-            || !match self.store {
-                PersistedStateRecordStore::PerformanceOperation => {
-                    OperationId::try_from(self.record_id.as_str()).is_ok()
-                }
-                PersistedStateRecordStore::BenchmarkSuiteDriver => {
-                    super::benchmark_suite_drivers::is_safe_driver_id(&self.record_id)
-                }
-            }
+            || !super::benchmark_suite_drivers::is_safe_driver_id(&self.record_id)
         {
             return Err(PersistedStateRepairValidationError::UnsafeRecordId);
         }
@@ -1085,6 +1077,125 @@ pub enum OperationStatus {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceOperationAction {
+    Install,
+    Remove,
+    Rollback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceOperationIntent {
+    pub instance_id: String,
+    pub requested_action: PerformanceOperationAction,
+    pub action: PerformanceOperationAction,
+    pub base_target_id: String,
+    pub rollback: RollbackState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loader: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "proof", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PerformancePreparedProof {
+    InstallPlan {
+        graph_sha512: String,
+        artifact_count: u64,
+        aggregate_bytes: u64,
+    },
+    RemoveCurrent {
+        graph_sha512: String,
+        artifact_count: u64,
+    },
+    ManagedStateAbsent {},
+    RollbackSnapshot {
+        snapshot_id: String,
+        target: PerformanceRollbackTarget,
+        artifact_count: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceRollbackTarget {
+    ManagedStateAbsent,
+    ManagedComposition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceOperationPrepared {
+    pub result_target_id: String,
+    pub proof: PerformancePreparedProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PerformanceOperationTerminal {
+    Succeeded {
+        prepared: PerformanceOperationPrepared,
+        changed_target: bool,
+        rollback: RollbackState,
+    },
+    FailedBeforeEffect {
+        error: String,
+    },
+    FailedAfterEffect {
+        prepared: PerformanceOperationPrepared,
+        changed_target: bool,
+        rollback: RollbackState,
+        error: String,
+    },
+    AbandonedBeforeEffect {},
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PerformanceOperationPhase {
+    Accepted {},
+    Planning {},
+    Prepared {
+        prepared: PerformanceOperationPrepared,
+    },
+    EffectStarted {
+        prepared: PerformanceOperationPrepared,
+    },
+    AppliedUnverified {
+        prepared: PerformanceOperationPrepared,
+        error: String,
+    },
+    TerminalIntent {
+        terminal: PerformanceOperationTerminal,
+    },
+    Terminal {
+        terminal: PerformanceOperationTerminal,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceOperationLifecycle {
+    pub intent: PerformanceOperationIntent,
+    pub phase: PerformanceOperationPhase,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperationIntent {
+    Generic {},
+    Performance(PerformanceOperationLifecycle),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationJournalEntry {
@@ -1094,6 +1205,7 @@ pub struct OperationJournalEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_operation_id: Option<OperationId>,
     pub command: CommandKind,
+    pub intent: OperationIntent,
     pub status: OperationStatus,
     pub owner: StabilizationSystem,
     pub ownership: OwnershipClass,
@@ -1125,6 +1237,7 @@ impl OperationJournalEntry {
             sequence: 0,
             parent_operation_id: None,
             command,
+            intent: OperationIntent::Generic {},
             status: OperationStatus::Planned,
             owner,
             ownership,
@@ -1144,6 +1257,13 @@ impl OperationJournalEntry {
 
     pub(crate) fn reconciliation_terminal(&self) -> Option<&ReconciliationTerminal> {
         self.reconciliation_terminal.as_ref()
+    }
+
+    pub(crate) fn performance_lifecycle(&self) -> Option<&PerformanceOperationLifecycle> {
+        match &self.intent {
+            OperationIntent::Performance(lifecycle) => Some(lifecycle),
+            OperationIntent::Generic {} => None,
+        }
     }
 
     pub(crate) fn reconciliation_attempt(&self) -> Option<&ReconciliationAttempt> {
@@ -1320,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_record_identity_and_store_have_strict_durable_shapes() {
+    fn restart_record_identity_and_benchmark_store_have_strict_durable_shapes() {
         let identity = RestartStableRecordIdentity::from_digest([0xab; 32]);
         let encoded = serde_json::to_string(&identity).expect("serialize restart identity");
         assert_eq!(
@@ -1343,11 +1463,6 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            serde_json::to_string(&PersistedStateRecordStore::PerformanceOperation)
-                .expect("serialize performance store"),
-            "\"performance_operation\""
-        );
         assert_eq!(
             serde_json::to_string(&PersistedStateRecordStore::BenchmarkSuiteDriver)
                 .expect("serialize driver store"),

@@ -38,7 +38,6 @@ pub struct PersistedStateDirectories {
     known_good: Directory,
     guardian_failure_memory_parent: Directory,
     performance_parent: Directory,
-    performance_operations: Directory,
     benchmark_suites: Directory,
     benchmark_suite_drivers: Directory,
     launch_reports: Directory,
@@ -63,10 +62,6 @@ impl PersistedStateDirectories {
 
     pub fn performance_parent(&self) -> Directory {
         self.performance_parent.clone()
-    }
-
-    pub fn performance_operations(&self) -> Directory {
-        self.performance_operations.clone()
     }
 
     pub fn benchmark_suite_drivers(&self) -> Directory {
@@ -266,8 +261,6 @@ impl AppRootSession {
             guardian_failure_memory_parent: self
                 .open_or_create_fixed_relative_directory(&["guardian"])?,
             performance_parent: self.open_or_create_fixed_relative_directory(&["performance"])?,
-            performance_operations: self
-                .open_or_create_fixed_relative_directory(&["performance", "operations"])?,
             benchmark_suites: self
                 .open_or_create_fixed_relative_directory(&["benchmarks", "suites"])?,
             benchmark_suite_drivers: self

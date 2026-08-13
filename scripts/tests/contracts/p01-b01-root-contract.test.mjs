@@ -30,7 +30,6 @@ test("P01-B01 keeps one explicit application-root authority", async () => {
     journals,
     knownGood,
     rejectionStreaks,
-    performanceOperations,
     benchmarkSuites,
     benchmarkSuiteDrivers,
     launchReports,
@@ -63,7 +62,6 @@ test("P01-B01 keeps one explicit application-root authority", async () => {
     read("apps/api/src/state/journals.rs"),
     read("apps/api/src/state/known_good.rs"),
     read("apps/api/src/state/persisted_state_rejection_streaks.rs"),
-    read("apps/api/src/state/performance_operations.rs"),
     read("apps/api/src/state/benchmark_suites.rs"),
     read("apps/api/src/state/benchmark_suite_drivers.rs"),
     read("apps/api/src/state/launch_reports.rs"),
@@ -131,7 +129,6 @@ test("P01-B01 keeps one explicit application-root authority", async () => {
     "known_good_dir",
     "persisted_state_rejection_streaks_file",
     "performance_dir",
-    "performance_operations_dir",
     "benchmark_suites_dir",
     "benchmark_suite_drivers_dir",
     "launch_reports_dir",
@@ -192,7 +189,6 @@ test("P01-B01 keeps one explicit application-root authority", async () => {
     [journals, /paths\.operation_journal_file\(\)/],
     [knownGood, /paths\.known_good_dir\(\)/],
     [rejectionStreaks, /paths\s*\.persisted_state_rejection_streaks_file\(\)/],
-    [performanceOperations, /paths\.performance_operations_dir\(\)/],
     [benchmarkSuites, /paths\.benchmark_suites_dir\(\)/],
     [benchmarkSuiteDrivers, /paths\.benchmark_suite_drivers_dir\(\)/],
     [launchReports, /paths\.launch_reports_dir\(\)/],
@@ -209,6 +205,11 @@ test("P01-B01 keeps one explicit application-root authority", async () => {
     /\.join\("(?:accounts\.json|skins|state|guardian|performance|benchmarks|updates)"\)/,
   );
   assert.doesNotMatch(paths, /pub fn (?:state|benchmarks?)_dir\s*\(/);
+  assert.doesNotMatch(paths, /performance_operations_dir/);
+  assert.doesNotMatch(
+    state,
+    /PerformanceOperationStore|performance_operations:/,
+  );
 
   assert.match(updater, /pub fn new\(staging_dir: impl Into<PathBuf>\)/);
   assert.doesNotMatch(updater, /UPDATE_STAGING_DIR_NAME|\.join\("updates"\)/);

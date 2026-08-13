@@ -240,10 +240,7 @@ mod tests {
             let candidates = indices
                 .iter()
                 .map(|index| {
-                    let record_id = crate::state::contracts::OperationId::deterministic_test(
-                        format!("record-{index}"),
-                    )
-                    .to_string();
+                    let record_id = format!("benchmark-suite-driver-{index:016x}");
                     let file_name = format!("{record_id}.json");
                     let source = self.records.join(&file_name);
                     fs::write(&source, br#"{"schema":"invalid"}"#)

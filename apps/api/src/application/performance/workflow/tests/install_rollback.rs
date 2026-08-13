@@ -195,42 +195,24 @@ async fn install_custom_mode_removes_only_managed_artifacts() {
         target.id == "core"
             && target.ownership == crate::state::contracts::OwnershipClass::CompositionManaged
     }));
-    let completed = journal
-        .completed_steps
-        .iter()
-        .find(|step| step.step_id == "remove_performance_plan")
-        .expect("completed remove step");
-    assert_eq!(
-        completed
-            .changed_target
-            .as_ref()
-            .map(|target| (target.id.as_str(), target.ownership)),
-        Some((
-            "core",
-            crate::state::contracts::OwnershipClass::CompositionManaged
-        ))
-    );
-    assert!(
-        completed
-            .generated_facts
-            .contains(&"performance_rollback_evidence".to_string())
-    );
-    assert_eq!(
-        journal
-            .completed_steps
-            .iter()
-            .filter(|step| step.step_id == "performance_effect_started")
-            .count(),
-        1
-    );
-    assert_eq!(
-        journal
-            .completed_steps
-            .iter()
-            .filter(|step| step.step_id == "performance_terminal_intent")
-            .count(),
-        1
-    );
+    let projection = fixture
+        .state
+        .journals()
+        .performance_operation(&journal.operation_id)
+        .expect("typed remove projection");
+    assert!(matches!(
+        projection.phase,
+        crate::state::contracts::PerformanceOperationPhase::Terminal {
+            terminal: crate::state::contracts::PerformanceOperationTerminal::Succeeded {
+                prepared: crate::state::contracts::PerformanceOperationPrepared {
+                    result_target_id,
+                    proof: crate::state::contracts::PerformancePreparedProof::RemoveCurrent { .. },
+                },
+                changed_target: true,
+                rollback: RollbackState::Available,
+            }
+        } if result_target_id == "core"
+    ));
     fixture.close().await;
 }
 
@@ -549,38 +531,27 @@ async fn queued_first_install_and_exact_reapply_report_factual_effect_proof() {
     let events = collect_install_events(&fixture.state, &operation_id).await;
     assert_eq!(events.last().expect("terminal progress").phase, "complete");
 
-    let status = fixture
-        .state
-        .performance_operations()
-        .get(
-            &crate::state::contracts::OperationId::try_from(operation_id.as_str())
-                .expect("strict operation id"),
-        )
-        .await
-        .expect("durable first-install status");
-    assert_eq!(status.state, "complete");
-    assert_eq!(
-        status
-            .journal_identity
-            .as_ref()
-            .expect("journal identity")
-            .rollback,
-        RollbackState::Unavailable
-    );
-    let journal = fixture
+    let projection = fixture
         .state
         .journals()
-        .get(
+        .performance_operation(
             &crate::state::contracts::OperationId::try_from(operation_id.as_str())
                 .expect("strict operation id"),
         )
-        .expect("first-install journal");
-    assert_eq!(journal.rollback, RollbackState::Unavailable);
+        .expect("first-install projection");
+    assert_eq!(projection.intent.rollback, RollbackState::Unavailable);
     assert!(
-        journal
-            .planned_steps
-            .iter()
-            .all(|step| step.rollback == RollbackState::Unavailable)
+        matches!(
+            projection.phase,
+            crate::state::contracts::PerformanceOperationPhase::Terminal {
+                terminal: crate::state::contracts::PerformanceOperationTerminal::Succeeded {
+                    changed_target: true,
+                    rollback: RollbackState::Available,
+                    ..
+                }
+            }
+        ),
+        "first install records the changed target in the typed terminal"
     );
 
     let public = performance_operation_status(&fixture.state, &operation_id)
@@ -630,21 +601,21 @@ async fn queued_first_install_and_exact_reapply_report_factual_effect_proof() {
 
     let operation_id = crate::state::contracts::OperationId::try_from(reapply_id.as_str())
         .expect("strict operation id");
-    let journal = fixture
+    let projection = fixture
         .state
         .journals()
-        .get(&operation_id)
-        .expect("exact reapply journal");
-    assert!(!journal.completed_steps.iter().any(|step| {
-        step.step_id == "performance_effect_started" || step.changed_target.is_some()
-    }));
-    assert!(journal.completed_steps.iter().any(|step| {
-        step.step_id == "performance_terminal_intent"
-            && step
-                .generated_facts
-                .iter()
-                .any(|fact| fact == "performance_terminal_target_unchanged_v1")
-    }));
+        .performance_operation(&operation_id)
+        .expect("exact reapply projection");
+    assert!(matches!(
+        projection.phase,
+        crate::state::contracts::PerformanceOperationPhase::Terminal {
+            terminal: crate::state::contracts::PerformanceOperationTerminal::Succeeded {
+                changed_target: false,
+                rollback: crate::state::contracts::RollbackState::Available,
+                ..
+            }
+        }
+    ));
     let public = performance_operation_status(&fixture.state, &reapply_id)
         .await
         .expect("exact reapply public status");
@@ -965,47 +936,29 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
     );
     assert_eq!(
         journal.rollback,
-        crate::state::contracts::RollbackState::Available
-    );
-    let completed = journal
-        .completed_steps
-        .iter()
-        .find(|step| step.step_id == "rollback_performance_plan")
-        .expect("completed rollback step");
-    assert_eq!(
-        completed.rollback,
         crate::state::contracts::RollbackState::Applied
     );
+    let projection = fixture
+        .state
+        .journals()
+        .performance_operation(&journal.operation_id)
+        .expect("typed rollback projection");
+    assert!(matches!(
+        projection.phase,
+        crate::state::contracts::PerformanceOperationPhase::Terminal {
+            terminal: crate::state::contracts::PerformanceOperationTerminal::Succeeded {
+                changed_target: true,
+                rollback: RollbackState::Applied,
+                ..
+            }
+        }
+    ));
+    let public = performance_operation_status(&fixture.state, &journal.operation_id.to_string())
+        .await
+        .expect("public rollback status");
     assert_eq!(
-        completed
-            .changed_target
-            .as_ref()
-            .map(|target| (target.id.as_str(), target.ownership)),
-        Some((
-            "core-a",
-            crate::state::contracts::OwnershipClass::CompositionManaged
-        ))
-    );
-    assert!(
-        completed
-            .generated_facts
-            .contains(&"performance_rollback_evidence".to_string())
-    );
-    assert_eq!(
-        journal
-            .completed_steps
-            .iter()
-            .filter(|step| step.step_id == "performance_effect_started")
-            .count(),
-        1
-    );
-    assert_eq!(
-        journal
-            .completed_steps
-            .iter()
-            .filter(|step| step.step_id == "performance_terminal_intent")
-            .count(),
-        1
+        public.proof.expect("terminal rollback proof").rollback,
+        RollbackState::Applied
     );
     fixture.close().await;
 }

@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 const SHUTDOWN_LOCK_INVARIANT: &str =
     "application shutdown lock poisoned; completion state may be inconsistent";
-const SHUTDOWN_STEP_COUNT: usize = 21;
+const SHUTDOWN_STEP_COUNT: usize = 20;
 type ShutdownAttemptChannel = Arc<watch::Sender<Option<Result<(), AppShutdownError>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,7 +20,6 @@ pub enum AppShutdownStep {
     DriverStore,
     LaunchReports,
     BenchmarkSuites,
-    PerformanceOperations,
     Journals,
     FailureMemory,
     Accounts,
@@ -46,16 +45,15 @@ impl AppShutdownStep {
             Self::DriverStore => 8,
             Self::LaunchReports => 9,
             Self::BenchmarkSuites => 10,
-            Self::PerformanceOperations => 11,
-            Self::Journals => 12,
-            Self::FailureMemory => 13,
-            Self::Accounts => 14,
-            Self::SecureAuth => 15,
-            Self::KnownGoodInventories => 16,
-            Self::UserModWitnesses => 17,
-            Self::InstanceRegistry => 18,
-            Self::Config => 19,
-            Self::ManagedLibrary => 20,
+            Self::Journals => 11,
+            Self::FailureMemory => 12,
+            Self::Accounts => 13,
+            Self::SecureAuth => 14,
+            Self::KnownGoodInventories => 15,
+            Self::UserModWitnesses => 16,
+            Self::InstanceRegistry => 17,
+            Self::Config => 18,
+            Self::ManagedLibrary => 19,
         }
     }
 
@@ -72,7 +70,6 @@ impl AppShutdownStep {
             Self::DriverStore => "driver_store",
             Self::LaunchReports => "launch_reports",
             Self::BenchmarkSuites => "benchmark_suites",
-            Self::PerformanceOperations => "performance_operations",
             Self::Journals => "journals",
             Self::FailureMemory => "failure_memory",
             Self::Accounts => "accounts",
@@ -403,16 +400,6 @@ impl AppShutdownCoordinator {
     }
 
     async fn close_performance_chain(&self, state: &AppState) -> Result<(), AppShutdownError> {
-        let operations = async {
-            if self.completed(AppShutdownStep::PerformanceOperations) {
-                return Ok(());
-            }
-            state
-                .performance_operations
-                .close()
-                .await
-                .map_err(|_| AppShutdownError::at(AppShutdownStep::PerformanceOperations))
-        };
         let journals = async {
             if self.completed(AppShutdownStep::Journals) {
                 return Ok(());
@@ -433,20 +420,15 @@ impl AppShutdownCoordinator {
                 .await
                 .map_err(|_| AppShutdownError::at(AppShutdownStep::FailureMemory))
         };
-        let (operations, journals, failure_memory) =
-            tokio::join!(operations, journals, failure_memory);
-        self.finish_performance_closes(operations, journals, failure_memory)
+        let (journals, failure_memory) = tokio::join!(journals, failure_memory);
+        self.finish_performance_closes(journals, failure_memory)
     }
 
     fn finish_performance_closes(
         &self,
-        operations: Result<(), AppShutdownError>,
         journals: Result<(), AppShutdownError>,
         failure_memory: Result<(), AppShutdownError>,
     ) -> Result<(), AppShutdownError> {
-        if operations.is_ok() {
-            self.mark_completed(AppShutdownStep::PerformanceOperations);
-        }
         if journals.is_ok() {
             self.mark_completed(AppShutdownStep::Journals);
         }
@@ -455,7 +437,6 @@ impl AppShutdownCoordinator {
         }
 
         let mut first_error = None;
-        retain_first_error(&mut first_error, operations);
         retain_first_error(&mut first_error, journals);
         retain_first_error(&mut first_error, failure_memory);
         first_error.map_or(Ok(()), Err)
@@ -1161,26 +1142,23 @@ mod tests {
     }
 
     #[test]
-    fn performance_failures_retain_independent_success_for_retry() {
+    fn performance_chain_failures_retain_independent_success_for_retry() {
         let coordinator = AppShutdownCoordinator::new();
         let first = coordinator.finish_performance_closes(
-            Err(AppShutdownError::at(AppShutdownStep::PerformanceOperations)),
             Ok(()),
             Err(AppShutdownError::at(AppShutdownStep::FailureMemory)),
         );
 
         assert_eq!(
             first,
-            Err(AppShutdownError::at(AppShutdownStep::PerformanceOperations))
+            Err(AppShutdownError::at(AppShutdownStep::FailureMemory))
         );
-        assert!(!coordinator.completed(AppShutdownStep::PerformanceOperations));
         assert!(coordinator.completed(AppShutdownStep::Journals));
         assert!(!coordinator.completed(AppShutdownStep::FailureMemory));
 
         coordinator
-            .finish_performance_closes(Ok(()), Ok(()), Ok(()))
+            .finish_performance_closes(Ok(()), Ok(()))
             .expect("retry completes failed independent closes");
-        assert!(coordinator.completed(AppShutdownStep::PerformanceOperations));
         assert!(coordinator.completed(AppShutdownStep::Journals));
         assert!(coordinator.completed(AppShutdownStep::FailureMemory));
     }

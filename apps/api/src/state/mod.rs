@@ -24,7 +24,6 @@ mod managed_library;
 mod music_cache;
 pub mod ownership;
 mod performance_managed;
-pub mod performance_operations;
 mod performance_rules;
 mod persisted_state_load;
 mod persisted_state_rejection_streaks;
@@ -167,7 +166,8 @@ pub(crate) use java_probe_failures::{
 };
 pub(crate) use journals::{
     MAX_OPERATION_JOURNAL_DIAGNOSES, MAX_OPERATION_JOURNAL_STEP_FACTS,
-    OperationJournalReconciliation, PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX,
+    OperationJournalReconciliation, PerformanceOperationCreateError,
+    PerformanceOperationProjection, PerformanceOperationTransition, PerformanceRestartPlan,
     operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
     operation_journal_terminal_is_visible,
 };
@@ -282,7 +282,6 @@ pub struct AppState {
     skins: Arc<skins::SavedSkinStore>,
     benchmark_suites: Arc<benchmark_suites::BenchmarkSuiteStore>,
     benchmark_suite_drivers: Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore>,
-    performance_operations: Arc<performance_operations::PerformanceOperationStore>,
     performance: Arc<AppPerformanceStore>,
     telemetry: Arc<TelemetryHub>,
     updater: Arc<UpdaterStore>,
@@ -1048,34 +1047,16 @@ impl AppState {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_operation_stores(
-        mut self,
-        journals: Arc<OperationJournalStore>,
-        performance_operations: Arc<performance_operations::PerformanceOperationStore>,
-    ) -> Self {
-        self.journals = journals;
-        self.performance_operations = performance_operations;
-        self
-    }
-
-    #[cfg(test)]
     pub(crate) fn operation_store_directories_for_test(
         &self,
-    ) -> io::Result<(
-        crate::execution::anchored_record::AnchoredRecordDirectory,
-        crate::execution::anchored_record::AnchoredRecordDirectory,
-    )> {
+    ) -> io::Result<crate::execution::anchored_record::AnchoredRecordDirectory> {
         let directories = self.root_session.prepare_persisted_state_directories()?;
-        Ok((
+        Ok(
             crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
                 Arc::clone(&self.root_session),
                 directories.operation_journal_parent(),
             ),
-            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
-                Arc::clone(&self.root_session),
-                directories.performance_operations(),
-            ),
-        ))
+        )
     }
 
     #[cfg(test)]
@@ -1089,6 +1070,12 @@ impl AppState {
                 self.root_session.admit_absolute_directory(path)?,
             ),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_journals(mut self, journals: Arc<OperationJournalStore>) -> Self {
+        self.journals = journals;
+        self
     }
 
     #[cfg(test)]
@@ -1217,14 +1204,8 @@ impl AppState {
                 Arc::clone(&root_session),
                 persisted_state_directories.benchmark_suite_drivers(),
             );
-        let performance_operation_directory =
-            crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
-                Arc::clone(&root_session),
-                persisted_state_directories.performance_operations(),
-            );
         let persisted_state_repair_directories =
             persisted_state_repair::PersistedStateRepairDirectories::new(
-                performance_operation_directory.clone(),
                 benchmark_suite_driver_directory.clone(),
             );
         let benchmark_suite_drivers =
@@ -1274,20 +1255,7 @@ impl AppState {
                     ))
                 })?
                 .into_parts();
-        let (performance_operations, performance_operation_rejection_scan) =
-            performance_operations::PerformanceOperationStore::load_from_paths_for_startup(
-                performance_operation_directory,
-            )
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "failed to initialize performance operation persistence: {error}"
-                ))
-            })?
-            .into_parts();
-        let rejected_record_scans = vec![
-            performance_operation_rejection_scan,
-            benchmark_suite_driver_rejection_scan,
-        ];
+        let rejected_record_scans = vec![benchmark_suite_driver_rejection_scan];
         let journals = Arc::new(
             OperationJournalStore::try_load_from_directory(
                 crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
@@ -1302,7 +1270,6 @@ impl AppState {
         let persisted_state_load = Arc::new(PersistedStateLoadEvidence::from_store_parts(
             [
                 auth_logins.load_issue_count(),
-                performance_operations.load_issue_count(),
                 benchmark_suites.load_issue_count(),
                 benchmark_suite_drivers.load_issue_count(),
                 launch_reports.load_issue_count(),
@@ -1330,7 +1297,6 @@ impl AppState {
             }
         });
         let benchmark_suite_drivers = Arc::new(benchmark_suite_drivers);
-        let performance_operations = Arc::new(performance_operations);
         let skins = Arc::new(skins::SavedSkinStore::claim(Arc::clone(&root_session))?);
         let accounts = Arc::new(LauncherAccountStore::try_load_from_directory(
             crate::execution::anchored_record::AnchoredRecordDirectory::from_directory(
@@ -1396,7 +1362,6 @@ impl AppState {
             skins,
             benchmark_suites,
             benchmark_suite_drivers,
-            performance_operations,
             performance,
             telemetry,
             updater,
@@ -1567,12 +1532,6 @@ impl AppState {
 
     pub fn benchmark_suites(&self) -> &Arc<benchmark_suites::BenchmarkSuiteStore> {
         &self.benchmark_suites
-    }
-
-    pub fn performance_operations(
-        &self,
-    ) -> &Arc<performance_operations::PerformanceOperationStore> {
-        &self.performance_operations
     }
 
     pub(crate) fn persisted_state_load_evidence(&self) -> &PersistedStateLoadEvidence {

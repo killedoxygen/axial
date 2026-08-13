@@ -1,7 +1,6 @@
 use crate::execution::anchored_record::AnchoredRecordTarget;
 use crate::state::benchmark_suite_drivers::is_safe_driver_id;
 use crate::state::benchmark_suites::is_canonical_suite_id;
-use crate::state::contracts::OperationId;
 use crate::state::launch_reports::canonical_session_id;
 use axial_config::is_canonical_instance_id;
 use axial_fs::RootStateSuccessor;
@@ -10,8 +9,6 @@ use std::collections::BTreeSet;
 use std::io;
 
 const SNAPSHOT_SUCCESSOR_SCHEMA: u16 = 1;
-const PERFORMANCE_OPERATION_SUCCESSOR_OWNER: &[u8] = b"performance-operation";
-const PERFORMANCE_OPERATION_SUCCESSOR_PARENT: &[&str] = &["performance", "operations"];
 const PERFORMANCE_COMPOSITION_STATE_LEAF: &str = ".axial-lock.json";
 const SAVED_SKIN_INDEX_SUCCESSOR_OWNER: &[u8] = b"saved-skin-index";
 const SAVED_SKIN_INDEX_SUCCESSOR_PARENT: &[&str] = &["skins"];
@@ -34,15 +31,6 @@ impl StateSnapshotSuccessorSpec {
     pub(super) fn bind(self, target: AnchoredRecordTarget) -> io::Result<AnchoredRecordTarget> {
         target.with_state_successor(SNAPSHOT_SUCCESSOR_SCHEMA, self.owner_id)
     }
-}
-
-pub(super) fn bind_performance_operation_successor(
-    target: AnchoredRecordTarget,
-) -> io::Result<AnchoredRecordTarget> {
-    target.with_state_successor(
-        SNAPSHOT_SUCCESSOR_SCHEMA,
-        PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-    )
 }
 
 pub(super) fn bind_launch_report_successor(
@@ -139,11 +127,6 @@ pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> i
         successor.recovery_count(),
         |index| successor.recovery_destination(index),
     ) || admits_saved_skin_index(
-        successor.owner_schema(),
-        successor.owner_id(),
-        successor.recovery_count(),
-        |index| successor.recovery_destination(index),
-    ) || admits_performance_operation_batch(
         successor.owner_schema(),
         successor.owner_id(),
         successor.recovery_count(),
@@ -283,23 +266,6 @@ fn benchmark_suite_driver_from_leaf(leaf: &str) -> Option<&str> {
     is_safe_driver_id(driver_id).then_some(driver_id)
 }
 
-fn admits_performance_operation_batch<'a>(
-    owner_schema: u16,
-    owner_id: &[u8],
-    count: usize,
-    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
-) -> bool {
-    admits_dynamic_batch(
-        owner_schema,
-        owner_id,
-        count,
-        &mut destination,
-        PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-        PERFORMANCE_OPERATION_SUCCESSOR_PARENT,
-        performance_operation_from_leaf,
-    )
-}
-
 fn admits_dynamic_batch<'a, T: Ord>(
     owner_schema: u16,
     owner_id: &[u8],
@@ -325,13 +291,6 @@ fn admits_dynamic_batch<'a, T: Ord>(
     })
 }
 
-fn performance_operation_from_leaf(leaf: &str) -> Option<OperationId> {
-    let encoded = leaf.strip_suffix(".json")?;
-    OperationId::try_from(encoded)
-        .ok()
-        .filter(|operation| operation.to_string() == encoded)
-}
-
 fn matching_spec(
     owner_schema: u16,
     owner_id: &[u8],
@@ -355,14 +314,12 @@ mod tests {
     use super::{
         BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER, BENCHMARK_SUITE_SUCCESSOR_OWNER,
         LAUNCH_REPORT_SUCCESSOR_OWNER, PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
-        PERFORMANCE_OPERATION_SUCCESSOR_OWNER, SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
-        admits_benchmark_suite_batch, admits_benchmark_suite_driver_batch,
-        admits_launch_report_batch, admits_performance_composition_state,
-        admits_performance_operation_batch, admits_saved_skin_index,
+        SAVED_SKIN_INDEX_SUCCESSOR_OWNER, admits_benchmark_suite_batch,
+        admits_benchmark_suite_driver_batch, admits_launch_report_batch,
+        admits_performance_composition_state, admits_saved_skin_index,
         benchmark_suite_driver_from_leaf, benchmark_suite_from_leaf,
-        launch_report_session_from_leaf, matching_spec, performance_operation_from_leaf,
+        launch_report_session_from_leaf, matching_spec,
     };
-    use crate::state::contracts::OperationId;
 
     #[test]
     fn startup_successor_registry_is_exact_and_closed() {
@@ -403,16 +360,6 @@ mod tests {
         }
         assert!(matching_spec(1, b"config", 1, &["state"], "config.json").is_none());
         assert!(matching_spec(1, b"unknown", 1, &[], "config.json").is_none());
-        assert!(
-            matching_spec(
-                1,
-                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-                1,
-                &["performance", "operations"],
-                "operation.json",
-            )
-            .is_none()
-        );
     }
 
     #[test]
@@ -518,90 +465,6 @@ mod tests {
             ),
         ] {
             assert!(!admitted(schema, owner, count, parent, leaf));
-        }
-    }
-
-    #[test]
-    fn performance_operation_successor_is_strict_and_dynamic() {
-        let operation_id = OperationId::deterministic_test("performance-successor");
-        let leaf = format!("{operation_id}.json");
-        assert_eq!(performance_operation_from_leaf(&leaf), Some(operation_id));
-        for candidate in [
-            "operation.json".to_string(),
-            "op-00000000-0000-1000-8000-000000000000.json".to_string(),
-            leaf.to_uppercase(),
-            format!("{leaf}.json"),
-        ] {
-            assert!(performance_operation_from_leaf(&candidate).is_none());
-        }
-    }
-
-    #[test]
-    fn performance_operation_batch_admission_is_exact_and_complete() {
-        let first = OperationId::deterministic_test("performance-batch-first").to_string();
-        let second = OperationId::deterministic_test("performance-batch-second").to_string();
-        let leaves = [format!("{first}.json"), format!("{second}.json")];
-        let admitted = |schema, owner: &[u8], count, leaves: &[String], parent: &[&str]| {
-            admits_performance_operation_batch(schema, owner, count, |index| {
-                leaves
-                    .get(index)
-                    .map(|leaf| (parent.to_vec(), leaf.as_str()))
-            })
-        };
-        let parent = ["performance", "operations"];
-        assert!(admitted(
-            1,
-            PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-            2,
-            &leaves,
-            &parent,
-        ));
-        assert!(!admitted(
-            1,
-            PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-            2,
-            &[leaves[0].clone(), leaves[0].clone()],
-            &parent,
-        ));
-        for (schema, owner, count, candidates, parent) in [
-            (
-                2,
-                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-                2,
-                &leaves[..],
-                &parent[..],
-            ),
-            (1, b"other".as_slice(), 2, &leaves[..], &parent[..]),
-            (
-                1,
-                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-                0,
-                &[][..],
-                &parent[..],
-            ),
-            (
-                1,
-                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-                33,
-                &leaves[..],
-                &parent[..],
-            ),
-            (
-                1,
-                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-                2,
-                &leaves[..1],
-                &parent[..],
-            ),
-            (
-                1,
-                PERFORMANCE_OPERATION_SUCCESSOR_OWNER,
-                2,
-                &leaves[..],
-                &["other"][..],
-            ),
-        ] {
-            assert!(!admitted(schema, owner, count, candidates, parent));
         }
     }
 

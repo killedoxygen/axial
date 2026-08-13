@@ -1713,8 +1713,7 @@ mod tests {
             ))
             .await
             .expect("fill journal capacity with an active operation");
-        let performance_operations = state.performance_operations().clone();
-        let state = state.with_operation_stores(journals.clone(), performance_operations);
+        let state = state.with_journals(journals.clone());
         let mut instance_ids = [
             register_healthy_instance(&state, "Second after capacity"),
             register_healthy_instance(&state, "First after capacity"),

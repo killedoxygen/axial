@@ -7228,7 +7228,6 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
     state,
     anchoredRecord,
     benchmarkDrivers,
-    performanceOperations,
     journals,
     failureMemory,
     persistedLoad,
@@ -7246,7 +7245,6 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
     read("apps/api/src/state/mod.rs"),
     read("apps/api/src/execution/anchored_record.rs"),
     read("apps/api/src/state/benchmark_suite_drivers.rs"),
-    read("apps/api/src/state/performance_operations.rs"),
     read("apps/api/src/state/journals.rs"),
     read("apps/api/src/state/failure_memory.rs"),
     read("apps/api/src/state/persisted_state_load.rs"),
@@ -7272,7 +7270,6 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
     "known_good",
     "guardian_failure_memory_parent",
     "performance_parent",
-    "performance_operations",
     "benchmark_suites",
     "benchmark_suite_drivers",
     "launch_reports",
@@ -7285,8 +7282,8 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
   }
   assert.equal(
     directories.match(/:\s*Directory\b/g)?.length ?? 0,
-    9,
-    "persisted-state directory bundle must expose exactly its nine R1 capabilities",
+    8,
+    "persisted-state directory bundle must expose exactly its eight retained capabilities",
   );
   assert.doesNotMatch(directories, /\b(?:Path|PathBuf|OsString|String)\b/);
 
@@ -7307,7 +7304,6 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
     /\[\s*"state"\s*,\s*"known-good"\s*\]/,
     /\[\s*"guardian"\s*\]/,
     /\[\s*"performance"\s*\]/,
-    /\[\s*"performance"\s*,\s*"operations"\s*\]/,
     /\[\s*"benchmarks"\s*,\s*"suites"\s*\]/,
     /\[\s*"benchmarks"\s*,\s*"suite-drivers"\s*\]/,
     /\[\s*"benchmarks"\s*,\s*"launch"\s*\]/,
@@ -7342,7 +7338,6 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
     "known_good",
     "guardian_failure_memory_parent",
     "performance_parent",
-    "performance_operations",
     "benchmark_suites",
     "benchmark_suite_drivers",
     "launch_reports",
@@ -7366,7 +7361,6 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
   const productionSources = [
     ["anchored adapter", anchoredRecord],
     ["benchmark driver loader", benchmarkDrivers],
-    ["performance operation loader", performanceOperations],
     ["journal loader", journals],
     ["failure-memory loader", failureMemory],
     ["persisted-state recovery", persistedLoad],
@@ -7406,12 +7400,10 @@ test("P01-B02 derives complete bounded v3 restart observations from axial-fs", a
   const [
     anchoredRecord,
     benchmarkDrivers,
-    performanceOperations,
     userOwnedState,
   ] = await Promise.all([
     read("apps/api/src/execution/anchored_record.rs"),
     read("apps/api/src/state/benchmark_suite_drivers.rs"),
-    read("apps/api/src/state/performance_operations.rs"),
     read("apps/api/src/execution/user_owned_state.rs"),
   ]);
   const productionAdapter = anchoredRecord.split(
@@ -7476,11 +7468,6 @@ test("P01-B02 derives complete bounded v3 restart observations from axial-fs", a
 
   for (const [label, source, loaderName] of [
     ["benchmark driver", benchmarkDrivers, "load_persisted_driver_inner"],
-    [
-      "performance operation",
-      performanceOperations,
-      "load_persisted_operation_inner",
-    ],
   ]) {
     const loader = uniqueReachableFunctions(
       source,
@@ -7676,7 +7663,7 @@ test("P01-B02 derives complete bounded v3 restart observations from axial-fs", a
     "enum",
     "AnchoredRecordRestartContext",
   );
-  assert.match(restartContext, /\bPerformanceOperation\b/);
+  assert.doesNotMatch(restartContext, /\bPerformanceOperation\b/);
   assert.match(restartContext, /\bBenchmarkSuiteDriver\b/);
   const restart = uniqueReachableFunctions(productionAdapter, restartMethod);
   assert.match(restart, /\bbytes\b/);
@@ -7693,17 +7680,12 @@ test("P01-B02 derives complete bounded v3 restart observations from axial-fs", a
     ),
     "v3 identity must hash the matched store context",
   );
-  const performanceDomain = /PerformanceOperation\s*=>\s*b"([^"]+)"/.exec(
-    restartMethod,
-  )?.[1];
   const benchmarkDomain = /BenchmarkSuiteDriver\s*=>\s*b"([^"]+)"/.exec(
     restartMethod,
   )?.[1];
   assert.ok(
-    performanceDomain &&
-      benchmarkDomain &&
-      performanceDomain !== benchmarkDomain,
-    "each persisted-state store needs distinct hashed context bytes",
+    benchmarkDomain,
+    "the retained persisted-state store needs fixed hashed context bytes",
   );
   assert.match(
     restartMethod,
@@ -7829,7 +7811,6 @@ test("P01-B02 derives complete bounded v3 restart observations from axial-fs", a
 
   for (const [source, functionName] of [
     [benchmarkDrivers, "retain_driver_rejected_records"],
-    [performanceOperations, "retain_performance_rejected_records"],
   ]) {
     const retention = functionBlock(source, functionName);
     assert.match(

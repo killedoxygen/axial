@@ -13,27 +13,18 @@ use crate::state::contracts::RollbackState;
 #[cfg(test)]
 use axial_performance::{CompositionTier, InstallError, PerformanceMode};
 #[cfg(test)]
-use managed_plan::ManagedPlanResolutionError;
-#[cfg(test)]
 use mutation::{
     PERFORMANCE_INSTALL_INTERNAL_ERROR, execute_performance_operation, performance_install_error,
-    performance_operation_journal_identity, plan_performance_operation_supervision,
+    performance_operation_journal_identity,
 };
 pub use mutation::{PerformanceRollbackListResponse, performance_rollback_list};
 
 pub(crate) use operations::spawn_pending_performance_operations;
 #[cfg(test)]
 use operations::{
-    PERFORMANCE_JOURNAL_ERROR, PerformanceInstallAction, PerformanceJournalTransition,
-    PerformanceOperationExecutionError, PerformanceWorkerIdentity,
-    begin_performance_operation_journal, commit_mismatched_performance_reconciliation_with_mint,
-    mismatched_reconciliation_entry, performance_journal_is_terminal,
-    performance_restart_is_pre_effect_replayable, record_performance_effect_started,
-    record_performance_guardian_supervision, record_performance_plan_resolved,
-    record_performance_terminal_intent, retry_performance_status_correction,
-    retry_performance_status_transition, run_queued_performance_operation,
-    run_queued_performance_operation_with_resolver, stage_performance_installed_versions,
-    supervise_performance_worker, terminalize_mismatched_performance_operation,
+    PerformanceInstallAction, PerformanceWorkerIdentity, operation_from_projection,
+    performance_operation_intent, stage_performance_installed_versions,
+    supervise_performance_worker,
 };
 pub use operations::{
     PerformanceInstanceOperationResponse, PerformanceOperationStatusResponse,
@@ -44,15 +35,6 @@ use operations::{
     queue_performance_operation,
 };
 
-#[cfg(test)]
-async fn resume_pending_performance_operations(state: AppState) -> usize {
-    let producer = state
-        .try_claim_producer()
-        .expect("claim test performance resume producer");
-    let child_owner = producer.claim_child();
-    let shutdown = state.subscribe_shutdown();
-    operations::resume_pending_performance_operations_owned(state, &child_owner, shutdown).await
-}
 pub(crate) use plan_health::performance_health;
 #[cfg(test)]
 use plan_health::{

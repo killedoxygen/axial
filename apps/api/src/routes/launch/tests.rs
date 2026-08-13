@@ -4045,11 +4045,6 @@ impl RouteTestFixture {
             .await
             .expect("close launch report store before reload");
         self.state
-            .performance_operations()
-            .close()
-            .await
-            .expect("close performance operation store before reload");
-        self.state
             .journals()
             .close()
             .await

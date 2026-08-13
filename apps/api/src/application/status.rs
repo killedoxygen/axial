@@ -36,7 +36,6 @@ pub fn launcher_status(state: &AppState) -> StatusResponse {
 #[cfg(test)]
 mod tests {
     use super::launcher_status;
-    use crate::state::performance_operations::{operation_dir, operation_path};
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
@@ -97,30 +96,9 @@ mod tests {
     }
 
     #[test]
-    fn status_aggregates_six_stores_and_owns_two_store_rejection_evidence() {
+    fn status_aggregates_retained_stores_and_owns_driver_rejection_evidence() {
         let root = test_root("status-operation-state-warning");
         let paths = test_paths(&root);
-        let operation_dir = operation_dir(&paths);
-        fs::create_dir_all(&operation_dir).expect("create operation dir");
-        let operation_id =
-            crate::state::contracts::OperationId::deterministic_test("status-rejected-operation");
-        fs::write(
-            operation_path(&operation_dir, &operation_id),
-            serde_json::to_vec(&serde_json::json!({
-                "id": operation_id,
-                "instance_id": "instance-a",
-                "action": "install",
-                "payload": {
-                    "unexpected_mode": true
-                },
-                "state": "applying",
-                "error": null,
-                "created_at": "2026-01-01T00:00:00.000Z",
-                "updated_at": "2026-01-01T00:01:00.000Z"
-            }))
-            .expect("serialize status"),
-        )
-        .expect("write status");
         let driver_id = "benchmark-suite-driver-0000000000000001";
         let driver_dir = paths.benchmark_suite_drivers_dir();
         fs::create_dir_all(driver_dir).expect("create driver dir");
@@ -158,21 +136,12 @@ mod tests {
             "Guardian kept Axial running after persisted operation state could not be trusted."
         );
         assert!(!response.warnings[0].contains(&root.to_string_lossy().to_string()));
-        assert!(!response.warnings[0].contains("unexpected_mode"));
         assert!(!response.warnings[0].contains("line"));
-        assert_eq!(load_evidence.issue_count(), 3);
-        assert_eq!(load_evidence.rejected_records().len(), 2);
-        assert_eq!(
-            load_evidence.rejected_records()[0].target().id,
-            operation_id.to_string()
-        );
-        assert_eq!(load_evidence.rejected_records()[1].target().id, driver_id);
+        assert_eq!(load_evidence.issue_count(), 2);
+        assert_eq!(load_evidence.rejected_records().len(), 1);
+        assert_eq!(load_evidence.rejected_records()[0].target().id, driver_id);
         assert_eq!(
             format!("{:?}", load_evidence.rejected_records()[0].store()),
-            "PerformanceOperation"
-        );
-        assert_eq!(
-            format!("{:?}", load_evidence.rejected_records()[1].store()),
             "BenchmarkSuiteDriver"
         );
 

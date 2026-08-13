@@ -317,21 +317,6 @@ pub(super) fn performance_composition_target(composition_id: &str) -> TargetDesc
     )
 }
 
-pub(super) fn performance_artifacts_target(composition_id: &str) -> TargetDescriptor {
-    let id = super::super::public_performance_descriptor(composition_id, "performance_composition");
-    let target_id = if id == "performance_composition" {
-        "managed_performance_artifacts".to_string()
-    } else {
-        format!("{id}_managed_artifacts")
-    };
-    TargetDescriptor::new(
-        StabilizationSystem::Performance,
-        TargetKind::Artifact,
-        target_id,
-        StateOwnershipClass::CompositionManaged,
-    )
-}
-
 fn performance_instance_display(
     state: &AppState,
     instance: &axial_config::Instance,

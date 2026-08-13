@@ -4,8 +4,8 @@ use crate::execution::anchored_record::{
     AnchoredRecordRestartContext, AnchoredRecordRestartDigest, anchored_record_quarantine_name,
 };
 use crate::state::contracts::{
-    OperationId, OwnershipClass, PersistedStateRecordStore, RestartStableRecordIdentity,
-    StabilizationSystem, TargetDescriptor, TargetKind,
+    OwnershipClass, PersistedStateRecordStore, RestartStableRecordIdentity, StabilizationSystem,
+    TargetDescriptor, TargetKind,
 };
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 use axial_fs::LeafName;
@@ -31,9 +31,6 @@ pub(super) fn persisted_state_record_target(
     record_id: &str,
 ) -> TargetDescriptor {
     let artifact = match store {
-        PersistedStateRecordStore::PerformanceOperation => {
-            CurrentArtifact::PerformanceOperationStatus
-        }
         PersistedStateRecordStore::BenchmarkSuiteDriver => {
             CurrentArtifact::BenchmarkSuiteDriverStatus
         }
@@ -50,14 +47,6 @@ pub(super) fn persisted_state_record_path(
     record_id: &str,
 ) -> PathBuf {
     match store {
-        PersistedStateRecordStore::PerformanceOperation => {
-            let operation_id = super::contracts::OperationId::try_from(record_id)
-                .expect("persisted performance operation record id is canonical");
-            super::performance_operations::operation_path(
-                &super::performance_operations::operation_dir(paths),
-                &operation_id,
-            )
-        }
         PersistedStateRecordStore::BenchmarkSuiteDriver => {
             super::benchmark_suite_drivers::driver_path(
                 &super::benchmark_suite_drivers::driver_dir(paths),
@@ -72,15 +61,6 @@ pub(super) fn persisted_state_record_name(
     record_id: &str,
 ) -> io::Result<LeafName> {
     let name = match store {
-        PersistedStateRecordStore::PerformanceOperation => {
-            let operation_id = OperationId::try_from(record_id).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "persisted performance operation id is not canonical",
-                )
-            })?;
-            format!("{operation_id}.json")
-        }
         PersistedStateRecordStore::BenchmarkSuiteDriver => {
             if !super::benchmark_suite_drivers::is_safe_driver_id(record_id) {
                 return Err(io::Error::new(
@@ -133,9 +113,6 @@ pub(super) fn admit_exact_applied_persisted_state_quarantine(
 
 pub(super) fn restart_context(store: PersistedStateRecordStore) -> AnchoredRecordRestartContext {
     match store {
-        PersistedStateRecordStore::PerformanceOperation => {
-            AnchoredRecordRestartContext::PerformanceOperation
-        }
         PersistedStateRecordStore::BenchmarkSuiteDriver => {
             AnchoredRecordRestartContext::BenchmarkSuiteDriver
         }
@@ -305,13 +282,13 @@ pub(crate) fn persisted_state_rejected_record_eligibility_in_directory_for_test(
         )
     })?;
     let (identity, restart_digest) = observation.into_restart_identity(
-        AnchoredRecordRestartContext::PerformanceOperation,
+        AnchoredRecordRestartContext::BenchmarkSuiteDriver,
         &canonical_leaf,
     )?;
     Ok(PersistedStateRejectedRecord::new(
-        PersistedStateRecordStore::PerformanceOperation,
+        PersistedStateRecordStore::BenchmarkSuiteDriver,
         PersistedStateRecordRejection::InvalidSchema,
-        persisted_state_record_target(PersistedStateRecordStore::PerformanceOperation, record_id),
+        persisted_state_record_target(PersistedStateRecordStore::BenchmarkSuiteDriver, record_id),
         identity,
         restart_digest,
     )
@@ -387,7 +364,7 @@ pub(crate) struct PersistedStateLoadEvidence {
 
 impl PersistedStateLoadEvidence {
     pub(super) fn from_store_parts(
-        issue_counts: [usize; 6],
+        issue_counts: [usize; 5],
         rejected_records: impl IntoIterator<Item = PersistedStateRejectedRecordEvidence>,
     ) -> Self {
         Self {
@@ -407,7 +384,7 @@ impl PersistedStateLoadEvidence {
 
     #[cfg(test)]
     pub(crate) fn for_test(issue_count: usize) -> Self {
-        Self::from_store_parts([issue_count, 0, 0, 0, 0, 0], [])
+        Self::from_store_parts([issue_count, 0, 0, 0, 0], [])
     }
 }
 
@@ -448,9 +425,9 @@ mod tests {
     );
 
     #[test]
-    fn six_store_issue_count_saturates() {
+    fn five_store_issue_count_saturates() {
         let evidence = PersistedStateLoadEvidence::from_store_parts(
-            [usize::MAX - 1, 1, 1, usize::MAX, usize::MAX, usize::MAX],
+            [usize::MAX - 1, 1, 1, usize::MAX, usize::MAX],
             [],
         );
 
@@ -488,15 +465,15 @@ mod tests {
             .expect("read rejected record");
         let (identity, restart_digest) = observation
             .into_restart_identity(
-                super::AnchoredRecordRestartContext::PerformanceOperation,
+                super::AnchoredRecordRestartContext::BenchmarkSuiteDriver,
                 &axial_fs::LeafName::new("record.json").expect("test record leaf"),
             )
             .expect("seal rejected record identity");
         let eligibility = PersistedStateRejectedRecord::new(
-            PersistedStateRecordStore::PerformanceOperation,
+            PersistedStateRecordStore::BenchmarkSuiteDriver,
             PersistedStateRecordRejection::InvalidSchema,
             persisted_state_record_target(
-                PersistedStateRecordStore::PerformanceOperation,
+                PersistedStateRecordStore::BenchmarkSuiteDriver,
                 "persisted-record-id",
             ),
             identity,
