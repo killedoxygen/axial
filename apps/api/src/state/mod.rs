@@ -3392,6 +3392,11 @@ impl AppState {
         let installed_versions = self.installed_versions.clone();
         let integrity_activity = self.integrity_activity.clone();
         Arc::new(move |previous: AppConfig, current: AppConfig| {
+            if previous.telemetry_enabled != current.telemetry_enabled
+                || previous.telemetry_install_id != current.telemetry_install_id
+            {
+                telemetry.refresh_panic_capture(&current);
+            }
             if previous.telemetry_enabled && !current.telemetry_enabled {
                 telemetry.clear_queue();
             }

@@ -12,7 +12,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
-use url::Url;
+use url::{Host, Url};
 
 pub const POSTHOG_API_KEY_ENV: &str = "AXIAL_POSTHOG_API_KEY";
 pub const POSTHOG_HOST_ENV: &str = "AXIAL_POSTHOG_HOST";
@@ -25,6 +25,9 @@ const TELEMETRY_BATCH_CAP: usize = 20;
 const TELEMETRY_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEMETRY_SYNC_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const TELEMETRY_SYNC_SCRATCH_BYTES: u64 = 1 << 20;
+const TELEMETRY_PANIC_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
+const TELEMETRY_PANIC_CHANNEL_CAP: usize = 1;
+const TELEMETRY_PANIC_SUMMARY: &str = "Process panicked.";
 const TELEMETRY_USER_AGENT: &str = concat!("axial/", env!("CARGO_PKG_VERSION"), " telemetry");
 const MAX_PROPERTY_TEXT_CHARS: usize = 128;
 const MAX_PROPERTY_TOKEN_CHARS: usize = 64;
@@ -70,11 +73,9 @@ fn configured_posthog_key() -> Option<String> {
 }
 
 fn configured_posthog_host() -> String {
-    let raw = std::env::var(POSTHOG_HOST_ENV)
+    std::env::var(POSTHOG_HOST_ENV)
         .ok()
-        .or_else(|| option_env!("AXIAL_POSTHOG_HOST").map(str::to_string));
-    raw.as_deref()
-        .and_then(sanitize_posthog_host)
+        .or_else(|| option_env!("AXIAL_POSTHOG_HOST").map(str::to_string))
         .unwrap_or_else(|| DEFAULT_POSTHOG_HOST.to_string())
 }
 
@@ -422,6 +423,31 @@ pub struct TelemetryHub {
     queue: Mutex<VecDeque<QueuedTelemetryEvent>>,
     error_storm: Mutex<TelemetryErrorStormState>,
     failed_batches: AtomicU64,
+    panic_capture: PanicCapture,
+}
+
+struct PanicCapture {
+    published_generation: AtomicU64,
+    state: Mutex<PanicCaptureState>,
+    sender: tokio::sync::mpsc::Sender<PanicSignal>,
+    receiver: Mutex<Option<tokio::sync::mpsc::Receiver<PanicSignal>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PanicSignal {
+    generation: u64,
+}
+
+#[derive(Default)]
+struct PanicCaptureState {
+    generation: u64,
+    distinct_id: Option<String>,
+}
+
+struct PanicExport {
+    key: String,
+    host: String,
+    event: QueuedTelemetryEvent,
 }
 
 pub trait TelemetryConfigSource: Send + Sync {
@@ -447,14 +473,25 @@ impl TelemetryHub {
     where
         Source: TelemetryConfigSource + 'static,
     {
+        let (panic_sender, panic_receiver) =
+            tokio::sync::mpsc::channel(TELEMETRY_PANIC_CHANNEL_CAP);
+        let host = sanitize_posthog_host(&host);
         Self {
             config: Mutex::new(config),
-            key: key.and_then(|value| sanitize_posthog_key(&value).ok()),
-            host: sanitize_posthog_host(&host).unwrap_or_else(|| DEFAULT_POSTHOG_HOST.to_string()),
+            key: host
+                .as_ref()
+                .and_then(|_| key.and_then(|value| sanitize_posthog_key(&value).ok())),
+            host: host.unwrap_or_else(|| DEFAULT_POSTHOG_HOST.to_string()),
             consent_admission: Mutex::new(()),
             queue: Mutex::new(VecDeque::new()),
             error_storm: Mutex::new(TelemetryErrorStormState::default()),
             failed_batches: AtomicU64::new(0),
+            panic_capture: PanicCapture {
+                published_generation: AtomicU64::new(0),
+                state: Mutex::new(PanicCaptureState::default()),
+                sender: panic_sender,
+                receiver: Mutex::new(Some(panic_receiver)),
+            },
         }
     }
 
@@ -521,6 +558,32 @@ impl TelemetryHub {
         self.key.is_some()
     }
 
+    pub(crate) fn refresh_panic_capture(&self, config: &AppConfig) {
+        let distinct_id = self
+            .key
+            .as_ref()
+            .filter(|_| config.telemetry_enabled)
+            .and_then(|_| self.telemetry_install_id(config.clone()));
+        let mut state = self
+            .panic_capture
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.generation = state.generation.saturating_add(1);
+        state.distinct_id = distinct_id;
+        self.panic_capture
+            .published_generation
+            .store(state.generation, Ordering::Release);
+    }
+
+    pub(crate) fn take_panic_receiver(&self) -> Option<tokio::sync::mpsc::Receiver<PanicSignal>> {
+        self.panic_capture
+            .receiver
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_config_source<Source>(&self, config: Arc<Source>)
     where
@@ -558,7 +621,11 @@ impl TelemetryHub {
         });
         let url = format!("{}/batch/", self.host);
 
-        match telemetry_client().post(url).json(&body).send().await {
+        let Some(client) = telemetry_client() else {
+            self.record_failed_batch(event_count);
+            return 0;
+        };
+        match client.post(url).json(&body).send().await {
             Ok(response) if response.status().is_success() => event_count,
             Ok(_) | Err(_) => {
                 self.record_failed_batch(event_count);
@@ -664,6 +731,52 @@ impl TelemetryHub {
             .unwrap_or(false)
     }
 
+    fn try_capture_panic(&self) {
+        let generation = self
+            .panic_capture
+            .published_generation
+            .load(Ordering::Acquire);
+        if generation == 0 {
+            return;
+        }
+        let _ = self
+            .panic_capture
+            .sender
+            .try_send(PanicSignal { generation });
+    }
+
+    fn panic_export(&self, signal: &PanicSignal) -> Option<PanicExport> {
+        let distinct_id = {
+            let state = self
+                .panic_capture
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.generation != signal.generation {
+                return None;
+            }
+            state.distinct_id.clone()?
+        };
+        if !self.export_is_admitted(&distinct_id) {
+            return None;
+        }
+        let event = TelemetryEvent::error_captured(
+            TelemetryErrorKind::Panic,
+            TelemetryErrorArea::Panic,
+            TelemetryErrorLevel::Fatal,
+            TELEMETRY_PANIC_SUMMARY,
+        );
+        if !self.allow_event_for_export(&event) {
+            return None;
+        }
+        let event = QueuedTelemetryEvent::from_event(event, &distinct_id)?;
+        Some(PanicExport {
+            key: self.key.clone()?,
+            host: self.host.clone(),
+            event,
+        })
+    }
+
     fn record_failed_batch(&self, event_count: usize) {
         let failures = self
             .failed_batches
@@ -715,6 +828,36 @@ pub async fn run_telemetry_flush_loop(
     .await;
 }
 
+pub(crate) async fn run_panic_capture_loop(
+    hub: Arc<TelemetryHub>,
+    mut receiver: tokio::sync::mpsc::Receiver<PanicSignal>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        let signal = tokio::select! {
+            signal = receiver.recv() => {
+                let Some(signal) = signal else {
+                    return;
+                };
+                signal
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow_and_update() {
+                    return;
+                }
+                continue;
+            }
+        };
+        let Some(export) = hub.panic_export(&signal) else {
+            continue;
+        };
+        let _ = send_panic_batch(export).await;
+    }
+}
+
 async fn run_telemetry_flush_loop_with<F, Fut>(
     mut flush: F,
     interval: Duration,
@@ -747,6 +890,7 @@ async fn wait_for_telemetry_shutdown(
 }
 
 pub fn install_panic_capture(hub: Arc<TelemetryHub>) {
+    hub.refresh_panic_capture(&hub.current_config());
     let hub_slot = PANIC_CAPTURE_HUB.get_or_init(|| Mutex::new(None));
     if let Ok(mut guard) = hub_slot.lock() {
         *guard = Some(Arc::downgrade(&hub));
@@ -758,25 +902,20 @@ pub fn install_panic_capture(hub: Arc<TelemetryHub>) {
 
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if PANIC_HOOK_ACTIVE.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let _guard = PanicHookGuard;
+        let capture_is_active = !PANIC_HOOK_ACTIVE.swap(true, Ordering::AcqRel);
+        let _guard = capture_is_active.then_some(PanicHookGuard);
 
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            if let Some(hub) = PANIC_CAPTURE_HUB.get().and_then(|slot| {
-                slot.lock()
-                    .ok()
-                    .and_then(|guard| guard.as_ref().and_then(Weak::upgrade))
-            }) {
-                hub.emit_sync_best_effort(TelemetryEvent::error_captured(
-                    TelemetryErrorKind::Panic,
-                    TelemetryErrorArea::Panic,
-                    TelemetryErrorLevel::Fatal,
-                    panic_summary(info),
-                ));
-            }
-        }));
+        if capture_is_active {
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                if let Some(hub) = PANIC_CAPTURE_HUB.get().and_then(|slot| {
+                    slot.try_lock()
+                        .ok()
+                        .and_then(|guard| guard.as_ref().and_then(Weak::upgrade))
+                }) {
+                    hub.try_capture_panic();
+                }
+            }));
+        }
 
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| previous_hook(info)));
     }));
@@ -877,7 +1016,9 @@ fn sanitize_posthog_host(raw: &str) -> Option<String> {
         return None;
     }
     let url = Url::parse(value).ok()?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+    if url.host_str().is_none()
+        || !(url.scheme() == "https" || url.scheme() == "http" && posthog_host_is_loopback(&url))
+    {
         return None;
     }
     if !url.username().is_empty()
@@ -889,6 +1030,15 @@ fn sanitize_posthog_host(raw: &str) -> Option<String> {
     }
 
     Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn posthog_host_is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(host)) => host.is_loopback(),
+        Some(Host::Ipv6(host)) => host.is_loopback(),
+        None => false,
+    }
 }
 
 fn sanitize_posthog_environment(raw: &str) -> Option<String> {
@@ -905,15 +1055,16 @@ fn sanitize_posthog_environment(raw: &str) -> Option<String> {
     Some(value)
 }
 
-fn telemetry_client() -> reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+fn telemetry_client() -> Option<reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
                 .user_agent(TELEMETRY_USER_AGENT)
                 .timeout(TELEMETRY_HTTP_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new())
+                .ok()
         })
         .clone()
 }
@@ -927,6 +1078,7 @@ fn send_blocking_batch(key: String, host: String, event: QueuedTelemetryEvent) -
     let Ok(client) = reqwest::blocking::Client::builder()
         .user_agent(TELEMETRY_USER_AGENT)
         .timeout(TELEMETRY_SYNC_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     else {
         return false;
@@ -940,32 +1092,23 @@ fn send_blocking_batch(key: String, host: String, event: QueuedTelemetryEvent) -
         .unwrap_or(false)
 }
 
-fn panic_summary(info: &std::panic::PanicHookInfo<'_>) -> String {
-    let payload = info
-        .payload()
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("panic payload unavailable");
-    let Some(location) = info.location() else {
-        return payload.to_string();
+async fn send_panic_batch(export: PanicExport) -> bool {
+    let body = json!({
+        "api_key": export.key,
+        "batch": [export.event.to_batch_item()],
+    });
+    let url = format!("{}/batch/", export.host);
+    let Some(client) = telemetry_client() else {
+        return false;
     };
-    format!("{payload} at {}", panic_location_summary(location))
-}
-
-fn panic_location_summary(location: &std::panic::Location<'_>) -> String {
-    let file = location
-        .file()
-        .chars()
-        .map(|value| {
-            if matches!(value, '/' | '\\') {
-                ':'
-            } else {
-                value
-            }
-        })
-        .collect::<String>();
-    format!("{file}:{}", location.line())
+    client
+        .post(url)
+        .timeout(TELEMETRY_PANIC_HTTP_TIMEOUT)
+        .json(&body)
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -974,13 +1117,22 @@ mod tests {
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppPaths, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
-    use axum::{Json, Router, extract::State, http::StatusCode, http::Uri, routing::post};
+    use axum::{
+        Json, Router, extract::State, http::StatusCode, http::Uri, response::Redirect,
+        routing::post,
+    };
     use std::fs;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::Instant;
     use tokio::sync::mpsc;
 
     const TEST_KEY: &str = "phc_test";
     const TEST_INSTALL_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const PANIC_PROBE_ENV: &str = "AXIAL_TELEMETRY_PANIC_PROBE";
+    const PANIC_PROBE_TEST: &str = "observability::telemetry::tests::telemetry_panic_probe_helper";
 
     struct TestConfig {
         root: PathBuf,
@@ -1015,6 +1167,16 @@ mod tests {
     impl Drop for TestConfig {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct MutableConfig {
+        current: Mutex<AppConfig>,
+    }
+
+    impl TelemetryConfigSource for MutableConfig {
+        fn current(&self) -> AppConfig {
+            self.current.lock().expect("mutable config lock").clone()
         }
     }
 
@@ -1061,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn posthog_host_sanitizer_accepts_http_urls_and_strips_trailing_slash() {
+    fn p02_b09_contract_posthog_host_requires_https_except_exact_loopback() {
         assert_eq!(
             sanitize_posthog_host(" https://eu.i.posthog.com/ "),
             Some("https://eu.i.posthog.com".to_string())
@@ -1070,11 +1232,43 @@ mod tests {
             sanitize_posthog_host("http://127.0.0.1:43123/custom/"),
             Some("http://127.0.0.1:43123/custom".to_string())
         );
+        assert_eq!(
+            sanitize_posthog_host("http://localhost:43123"),
+            Some("http://localhost:43123".to_string())
+        );
+        assert_eq!(
+            sanitize_posthog_host("http://[::1]:43123"),
+            Some("http://[::1]:43123".to_string())
+        );
+        for rejected in [
+            "http://example.test",
+            "http://localhost.example.test",
+            "http://localhost.:43123",
+            "http://10.0.0.1:43123",
+            "http://169.254.1.1:43123",
+            "http://192.168.1.1:43123",
+            "http://0.0.0.0:43123",
+            "http://[::]:43123",
+        ] {
+            assert_eq!(sanitize_posthog_host(rejected), None, "{rejected}");
+        }
         assert_eq!(sanitize_posthog_host("ftp://example.test"), None);
         assert_eq!(
             sanitize_posthog_host("https://example.test/path?token=x"),
             None
         );
+        assert_eq!(
+            sanitize_posthog_host("https://user@example.test/path"),
+            None
+        );
+
+        let fixture = TestConfig::new("invalid-host", enabled_config_with_install_id());
+        let hub = TelemetryHub::new(
+            fixture.store.clone(),
+            Some(TEST_KEY.to_string()),
+            "http://collector.example.test".to_string(),
+        );
+        assert!(!hub.export_configured());
     }
 
     #[test]
@@ -1332,6 +1526,349 @@ mod tests {
     }
 
     #[test]
+    fn p02_b09_contract_panic_hook_is_nonblocking_and_always_chains_previous_hook() {
+        for mode in [
+            "hub-slot",
+            "config",
+            "consent",
+            "queue",
+            "error-storm",
+            "panic-state",
+            "panic-receiver",
+            "concurrent",
+            "reentrant",
+        ] {
+            run_panic_probe(mode);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn telemetry_panic_probe_helper() {
+        let mode = std::env::var(PANIC_PROBE_ENV).expect("panic probe mode");
+        let previous_calls = Arc::new(AtomicUsize::new(0));
+        let reentered = Arc::new(AtomicBool::new(false));
+        let concurrent_barrier = Arc::new(Barrier::new(2));
+        let hook_calls = previous_calls.clone();
+        let hook_reentered = reentered.clone();
+        let hook_barrier = concurrent_barrier.clone();
+        let hook_mode = mode.clone();
+        std::panic::set_hook(Box::new(move |_| {
+            hook_calls.fetch_add(1, AtomicOrdering::AcqRel);
+            if hook_mode == "reentrant" && !hook_reentered.swap(true, Ordering::AcqRel) {
+                let nested = std::thread::spawn(|| {
+                    let _ = std::panic::catch_unwind(|| {
+                        panic!("nested panic canary /private/token=not-exported");
+                    });
+                });
+                let _ = nested.join();
+            }
+            if hook_mode == "concurrent" {
+                hook_barrier.wait();
+            }
+        }));
+
+        let fixture = TestConfig::new("panic-probe", enabled_config_with_install_id());
+        let hub = Arc::new(test_hub(fixture.store.clone()));
+        install_panic_capture(hub.clone());
+        let panic_once = || {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    panic!("panic canary /private/token=not-exported");
+                })
+                .is_err()
+            );
+        };
+
+        match mode.as_str() {
+            "hub-slot" => {
+                let _held = PANIC_CAPTURE_HUB
+                    .get()
+                    .expect("panic hub slot")
+                    .lock()
+                    .expect("hold panic hub slot");
+                panic_once();
+            }
+            "config" => {
+                let _held = hub.config.lock().expect("hold config source");
+                panic_once();
+            }
+            "consent" => {
+                let _held = hub
+                    .consent_admission
+                    .lock()
+                    .expect("hold consent admission");
+                panic_once();
+            }
+            "queue" => {
+                let _held = hub.queue.lock().expect("hold telemetry queue");
+                panic_once();
+            }
+            "error-storm" => {
+                let _held = hub.error_storm.lock().expect("hold error storm");
+                panic_once();
+            }
+            "panic-state" => {
+                let _held = hub.panic_capture.state.lock().expect("hold panic state");
+                panic_once();
+            }
+            "panic-receiver" => {
+                let _held = hub
+                    .panic_capture
+                    .receiver
+                    .lock()
+                    .expect("hold panic receiver");
+                panic_once();
+            }
+            "concurrent" => {
+                let first = std::thread::spawn(panic_once);
+                let second = std::thread::spawn(panic_once);
+                first.join().expect("first panic probe completes");
+                second.join().expect("second panic probe completes");
+            }
+            "reentrant" => panic_once(),
+            other => panic!("unknown panic probe mode: {other}"),
+        }
+
+        let expected_calls = if matches!(mode.as_str(), "concurrent" | "reentrant") {
+            2
+        } else {
+            1
+        };
+        assert_eq!(previous_calls.load(AtomicOrdering::Acquire), expected_calls);
+    }
+
+    #[tokio::test]
+    async fn p02_b09_contract_panic_sink_exports_only_precomputed_redacted_evidence() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping socket panic telemetry test: bind denied");
+                return;
+            }
+            Err(error) => panic!("bind panic telemetry test server: {error}"),
+        };
+        let addr = listener.local_addr().expect("panic test listener addr");
+        let (tx, mut rx) = mpsc::unbounded_channel::<(String, Value)>();
+        let app = Router::new()
+            .route("/batch/", post(capture_batch))
+            .with_state(tx);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let fixture = TestConfig::new("panic-export", enabled_config_with_install_id());
+        let hub = Arc::new(TelemetryHub::new(
+            fixture.store.clone(),
+            Some(TEST_KEY.to_string()),
+            format!("http://{addr}"),
+        ));
+        hub.refresh_panic_capture(&fixture.store.current());
+        let receiver = hub.take_panic_receiver().expect("panic receiver");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(run_panic_capture_loop(hub.clone(), receiver, shutdown_rx));
+
+        hub.try_capture_panic();
+        let (_, body) = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("panic export deadline")
+            .expect("captured panic export");
+        shutdown_tx.send_replace(true);
+        worker.await.expect("panic worker stops");
+        server.abort();
+
+        assert_eq!(body["batch"][0]["event"], EVENT_EXCEPTION);
+        assert_eq!(
+            body["batch"][0]["properties"][PROP_EXCEPTION_FINGERPRINT],
+            "panic"
+        );
+        assert_eq!(
+            body["batch"][0]["properties"][PROP_EXCEPTION_LIST][0]["value"],
+            TELEMETRY_PANIC_SUMMARY
+        );
+        let encoded = serde_json::to_string(&body).expect("serialize panic body");
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("token"));
+        assert!(!encoded.contains("stacktrace"));
+    }
+
+    #[tokio::test]
+    async fn p02_b09_contract_cross_owner_revocation_drops_stale_panic_and_sink_quiesces() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping socket panic revocation test: bind denied");
+                return;
+            }
+            Err(error) => panic!("bind panic revocation listener: {error}"),
+        };
+        let addr = listener.local_addr().expect("revocation listener addr");
+        let fixture = TestConfig::new("panic-revocation", enabled_config_with_install_id());
+        let telemetry = Arc::new(TelemetryHub::new(
+            fixture.store.clone(),
+            Some(TEST_KEY.to_string()),
+            format!("http://{addr}"),
+        ));
+        let state = test_state(&fixture, telemetry.clone());
+        telemetry.refresh_panic_capture(&state.config().current());
+        telemetry.try_capture_panic();
+
+        state
+            .mutate_config(|config| {
+                config.telemetry_enabled = false;
+                Ok(())
+            })
+            .await
+            .expect("revoke telemetry consent");
+
+        let receiver = telemetry.take_panic_receiver().expect("panic receiver");
+        let producer = state
+            .try_claim_producer()
+            .expect("claim panic sink producer");
+        producer.spawn(run_panic_capture_loop(
+            telemetry,
+            receiver,
+            state.subscribe_shutdown(),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "revoked panic signal must not reach the collector"
+        );
+
+        state.quiesce().await.expect("panic sink quiesces");
+        state.shutdown().await.expect("state shuts down");
+    }
+
+    #[test]
+    fn p02_b09_contract_cross_owner_authoritative_consent_rejects_stale_generation() {
+        let config = Arc::new(MutableConfig {
+            current: Mutex::new(enabled_config_with_install_id()),
+        });
+        let hub = TelemetryHub::new(
+            config.clone(),
+            Some(TEST_KEY.to_string()),
+            DEFAULT_POSTHOG_HOST.to_string(),
+        );
+        hub.refresh_panic_capture(&config.current());
+        let signal = PanicSignal {
+            generation: hub
+                .panic_capture
+                .published_generation
+                .load(Ordering::Acquire),
+        };
+
+        config
+            .current
+            .lock()
+            .expect("mutable config lock")
+            .telemetry_enabled = false;
+
+        assert!(hub.panic_export(&signal).is_none());
+    }
+
+    #[test]
+    fn p02_b09_contract_panic_sink_preserves_error_storm_bounds() {
+        let fixture = TestConfig::new("panic-storm", enabled_config_with_install_id());
+        let hub = test_hub(fixture.store.clone());
+        hub.refresh_panic_capture(&fixture.store.current());
+        let signal = PanicSignal {
+            generation: hub
+                .panic_capture
+                .published_generation
+                .load(Ordering::Acquire),
+        };
+
+        for _ in 0..MAX_ERROR_EVENTS_PER_FINGERPRINT {
+            assert!(hub.panic_export(&signal).is_some());
+        }
+        assert!(hub.panic_export(&signal).is_none());
+    }
+
+    #[tokio::test]
+    async fn p02_b09_contract_telemetry_requests_do_not_follow_redirects() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect target");
+        let target_url = format!(
+            "http://{}/batch/",
+            target.local_addr().expect("redirect target address")
+        );
+        let redirect = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect origin");
+        let redirect_addr = redirect.local_addr().expect("redirect origin address");
+        let app = Router::new().route(
+            "/batch/",
+            post(move || {
+                let target_url = target_url.clone();
+                async move { Redirect::temporary(&target_url) }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(redirect, app).await;
+        });
+        let fixture = TestConfig::new("redirect-refusal", enabled_config_with_install_id());
+        let hub = TelemetryHub::new(
+            fixture.store.clone(),
+            Some(TEST_KEY.to_string()),
+            format!("http://{redirect_addr}"),
+        );
+        hub.emit(TelemetryEvent::launch_completed(
+            TelemetryLaunchOutcome::Success,
+        ));
+
+        assert_eq!(hub.flush_once().await, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "telemetry client followed a redirect"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p02_b09_contract_unresponsive_collector_has_a_bounded_sink_lifetime() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unresponsive collector");
+        let addr = listener
+            .local_addr()
+            .expect("unresponsive collector address");
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let collector = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept panic export");
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let fixture = TestConfig::new("unresponsive-collector", enabled_config_with_install_id());
+        let hub = Arc::new(TelemetryHub::new(
+            fixture.store.clone(),
+            Some(TEST_KEY.to_string()),
+            format!("http://{addr}"),
+        ));
+        hub.refresh_panic_capture(&fixture.store.current());
+        let receiver = hub.take_panic_receiver().expect("panic receiver");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(run_panic_capture_loop(hub.clone(), receiver, shutdown_rx));
+
+        hub.try_capture_panic();
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .expect("panic request reaches collector")
+            .expect("collector observes panic request");
+        let shutdown_started = Instant::now();
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("panic sink stops after request timeout")
+            .expect("panic sink task");
+        assert!(shutdown_started.elapsed() < Duration::from_secs(5));
+        collector.abort();
+    }
+
+    #[test]
     fn queue_is_bounded_and_drops_oldest_events() {
         let fixture = TestConfig::new("bounded", enabled_config_with_install_id());
         let hub = test_hub(fixture.store.clone());
@@ -1566,5 +2103,41 @@ mod tests {
 
     fn test_paths(root: &std::path::Path) -> AppPaths {
         AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
+    }
+
+    fn run_panic_probe(mode: &str) {
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg(PANIC_PROBE_TEST)
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(PANIC_PROBE_ENV, mode)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn panic probe");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().expect("poll panic probe").is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().expect("collect timed-out probe");
+                panic!(
+                    "panic probe timed out in {mode} mode\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().expect("collect panic probe");
+        assert!(
+            output.status.success(),
+            "panic probe failed in {mode} mode\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

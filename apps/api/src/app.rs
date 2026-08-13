@@ -1,5 +1,5 @@
 use crate::observability::telemetry::{
-    TelemetryEvent, install_panic_capture, run_telemetry_flush_loop,
+    TelemetryEvent, install_panic_capture, run_panic_capture_loop, run_telemetry_flush_loop,
 };
 use crate::routes;
 use crate::state::AppState;
@@ -158,6 +158,13 @@ fn spawn_telemetry_export(state: &AppState) -> OptionalWorkflowState {
 
     let telemetry = state.telemetry().clone();
     let shutdown = state.subscribe_shutdown();
+    if let Some(receiver) = telemetry.take_panic_receiver() {
+        producer.spawn_child(run_panic_capture_loop(
+            telemetry.clone(),
+            receiver,
+            shutdown.clone(),
+        ));
+    }
     producer.spawn(run_telemetry_flush_loop(telemetry, shutdown));
     OptionalWorkflowState::Started
 }

@@ -51,7 +51,7 @@ Telemetry uses PostHog. The default host is the PostHog EU ingest endpoint, `htt
 
 Uploads only happen when a valid `AXIAL_POSTHOG_API_KEY` is available at runtime or compiled into the build. The key must be a public PostHog project key with the `phc_` prefix. Keyless runs never upload.
 
-`AXIAL_POSTHOG_HOST` can redirect the endpoint, including to a local or self-auditing PostHog-compatible endpoint. The host must be an `http` or `https` URL without credentials, query parameters, or fragments.
+`AXIAL_POSTHOG_HOST` can select the endpoint, including a local or self-auditing PostHog-compatible endpoint. Remote endpoints must use HTTPS. Plain HTTP is accepted only for the exact `localhost` name or a loopback IPv4/IPv6 address. The URL cannot contain credentials, query parameters, or fragments, and telemetry requests do not follow redirects.
 
 `AXIAL_POSTHOG_ENVIRONMENT` can override the deployment label attached to events. Values are lowercased and must contain only ASCII letters, numbers, hyphens, or underscores, up to 32 characters. Invalid values fall back to `dev` for debug builds and `production` otherwise.
 
@@ -59,6 +59,6 @@ Uploads only happen when a valid `AXIAL_POSTHOG_API_KEY` is available at runtime
 Backend error events are capped per process before they enter the telemetry queue. At most 30 `$exception` events are exported per process, and at most 5 events are exported for the same `$exception_fingerprint`. The counters reset only when the process restarts. Non-error telemetry events are unaffected.
 
 ## Panic capture
-The backend installs a panic hook at startup. The hook records a single fatal `$exception` with kind `panic`, then chains the previous hook so normal stderr output remains.
+The backend installs a panic hook at startup. The hook attempts to enqueue one precomputed, redacted fatal `$exception` with kind `panic`, then always chains the previous hook so normal stderr output remains. Panic payloads, source locations, and backtraces are not captured.
 
-Because the process may be exiting, panic capture does not rely on the async flush loop. It performs a best-effort single-event PostHog batch send on a fresh blocking thread with a short timeout. If telemetry consent or the PostHog key is absent, the hook is a no-op.
+The hook performs only nonblocking access to a capacity-one signal channel. A lifecycle-owned telemetry task performs the best-effort network request with a short timeout and stops during application quiescence. Capture is dropped if the channel is busy, telemetry consent or the PostHog key is absent, or the admitted telemetry identity changes before the task accepts the signal. Losing panic telemetry is preferable to delaying termination or suppressing the previous hook.
