@@ -18,8 +18,9 @@ use crate::application::transfer::{managed_transfer_retry_policy, pinned_public_
 use crate::guardian::{
     GuardianCopyRequest, GuardianFact, GuardianMode, GuardianPerformanceOperationKind,
     GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection,
-    GuardianPerformanceSupervisionRequest, GuardianPolicyContext, author_guardian_copy,
-    performance_plan_guardian_facts, plan_performance_supervision,
+    GuardianPerformanceSupervisionRequest, GuardianPolicyContext, MAX_OPERATION_EVIDENCE_FACTS,
+    OperationEvidenceBatch, author_guardian_copy, performance_plan_guardian_facts,
+    plan_performance_supervision,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
@@ -368,7 +369,7 @@ where
             return result.map_err(Into::into);
         }
     };
-    record_performance_guardian_supervision(state, &operation_id, &supervision)
+    record_performance_guardian_supervision(state, &supervision)
         .await
         .map_err(|error| {
             PerformanceOperationExecutionError::journal_transition(
@@ -550,7 +551,7 @@ where
             return result.map_err(Into::into);
         }
     };
-    record_performance_guardian_supervision(state, &operation_id, &supervision)
+    record_performance_guardian_supervision(state, &supervision)
         .await
         .map_err(|error| {
             PerformanceOperationExecutionError::journal_transition(
@@ -737,7 +738,7 @@ where
             return result.map_err(Into::into);
         }
     };
-    record_performance_guardian_supervision(state, &operation_id, &supervision)
+    record_performance_guardian_supervision(state, &supervision)
         .await
         .map_err(|error| {
             PerformanceOperationExecutionError::journal_transition(
@@ -943,13 +944,27 @@ pub(super) fn plan_performance_operation_supervision(
     rollback_state: RollbackState,
     facts: &[GuardianFact],
 ) -> Result<GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection> {
+    if facts.len() > MAX_OPERATION_EVIDENCE_FACTS {
+        return Err(GuardianPerformanceSupervisionRejection::GuardianBlocked);
+    }
+    let mut bound_facts = facts.to_vec();
+    for fact in &mut bound_facts {
+        match fact.operation_id.as_ref() {
+            Some(actual) if actual != operation_id => {
+                return Err(GuardianPerformanceSupervisionRejection::GuardianBlocked);
+            }
+            Some(_) => {}
+            None => fact.operation_id = Some(operation_id.clone()),
+        }
+    }
+    let evidence = OperationEvidenceBatch::try_from_guardian_operation(operation_id, &bound_facts)
+        .map_err(|_| GuardianPerformanceSupervisionRejection::GuardianBlocked)?;
     plan_performance_supervision(GuardianPerformanceSupervisionRequest {
-        operation_id: Some(operation_id.clone()),
         mode,
         phase,
         operation,
         target: performance_composition_target(target_id),
-        facts,
+        evidence: &evidence,
         rollback_state,
         context: GuardianPolicyContext::current_operation(),
     })
@@ -1297,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn p02_b05_contract_cross_owner_performance_rejections_use_exact_distinct_copy() {
+    fn behavior_contract_cross_owner_performance_rejections_use_exact_distinct_copy() {
         let cases = [
             (
                 GuardianPerformanceSupervisionRejection::UnsafeOwnership,

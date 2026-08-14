@@ -43,9 +43,9 @@ import { acquireExclusiveLoopbackPort } from "../../loopback-lease.mjs";
 const repositoryRoot = path.resolve(".");
 const cargoRunner = "node scripts/cargo-target.mjs run -- cargo";
 const windowsCargoRunner = "node scripts/cargo-windows-target.mjs run -- cargo";
-const focusedContract = "scripts/tests/contracts/p00-b13-contract.test.mjs";
+const focusedContract = "scripts/tests/contracts/process-containment-contract.test.mjs";
 const crossOwnerContract =
-  "scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs";
+  "scripts/tests/contracts/process-containment-cross-owner-contract.test.mjs";
 const temporaryRoots = [];
 
 after(async () => {
@@ -1443,7 +1443,7 @@ test("normal profiles retain line tables and full debug inherits dev overrides",
   assert.doesNotMatch(manifest, /^\[profile\.dev-full\.package\./m);
 });
 
-test("canonical and native verification inventories execute B13 once", () => {
+test("canonical and native verification inventories execute process containment once", () => {
   for (const [label, inventory] of [
     ["canonical", runTask(["--dry", "capability:self-test"])],
     ["Windows", runTask(["--summary", "verify:native:windows"])],
@@ -1452,12 +1452,12 @@ test("canonical and native verification inventories execute B13 once", () => {
     assert.equal(
       occurrences(inventory, focusedContract),
       1,
-      `${label} must execute the B13 focused contract exactly once`,
+      `${label} must execute the focused process containment contract exactly once`,
     );
     assert.equal(
       occurrences(inventory, crossOwnerContract),
       1,
-      `${label} must execute the B13 cross-owner contract exactly once`,
+      `${label} must execute the cross-owner process containment contract exactly once`,
     );
   }
 

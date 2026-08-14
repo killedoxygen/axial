@@ -5,9 +5,9 @@ import process from "node:process";
 import { promisify, TextDecoder } from "node:util";
 
 export const scenario = Object.freeze({
-  scenario_id: "CP-P01-B02-ANCHORED-FS",
-  proof_id: "CAP-P01-B02-ANCHORED-FS",
-  capability_id: "p01-b02-anchored-fs",
+  scenario_id: "CP-ANCHORED-FILESYSTEM",
+  proof_id: "CAP-ANCHORED-FILESYSTEM",
+  capability_id: "anchored-filesystem",
 });
 
 export const anchoredFsChecks = Object.freeze([
@@ -20,7 +20,7 @@ export const anchoredFsChecks = Object.freeze([
       "axial-api",
       "--lib",
       "--no-default-features",
-      "state::managed_library::tests::p01_b02_contract",
+      "state::managed_library::tests::anchored_filesystem_contract",
       "--",
       "--exact",
     ]),
@@ -35,7 +35,7 @@ export const anchoredFsChecks = Object.freeze([
       "axial-api",
       "--lib",
       "--no-default-features",
-      "state::managed_library::tests::p01_b02_contract_cross_owner",
+      "state::managed_library::tests::anchored_filesystem_contract_cross_owner",
       "--",
       "--exact",
     ]),

@@ -37,6 +37,12 @@ function braceBlock(source, marker) {
   assert.fail(`unterminated ${marker}`);
 }
 
+function registryWireIds(source, marker) {
+  return [...braceBlock(source, marker).matchAll(/=>\s*"([^"]+)"/g)].map(
+    (match) => match[1],
+  );
+}
+
 test("file cutover deletes the raw mutation surface", async () => {
   const sources = await readRustTree("apps", "core");
   const removed = [
@@ -80,10 +86,10 @@ test("file cutover removes producerless Guardian vocabulary exactly", async () =
     guardianTests,
     copy,
     decisionSource,
-    factIds,
     invariant,
     decisionFixture,
     journals,
+    fixtureNames,
     coverageDoc,
   ] = await Promise.all([
     readRustTree("apps", "core"),
@@ -95,14 +101,14 @@ test("file cutover removes producerless Guardian vocabulary exactly", async () =
     read("apps/api/src/guardian/tests.rs"),
     read("apps/api/src/guardian/copy.rs"),
     read("apps/api/src/guardian/decision_snapshot.rs"),
-    readJson("apps/api/tests/fixtures/guardian/guardian-fact-ids.json"),
     readJson(
-      "apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v4.json",
+      "apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v5.json",
     ),
     readJson(
       "apps/api/tests/fixtures/guardian/guardian-decision-snapshot-v1.json",
     ),
-    readJson("apps/api/tests/fixtures/guardian/operation-journals-v9.json"),
+    readJson("apps/api/tests/fixtures/guardian/operation-journals-v10.json"),
+    readdir(new URL("apps/api/tests/fixtures/guardian/", repository)),
     read("docs/GUARDIAN-INVARIANT-COVERAGE.md"),
   ]);
   const removedSymbols = [
@@ -136,7 +142,6 @@ test("file cutover removes producerless Guardian vocabulary exactly", async () =
     }
   }
   const fixtureText = JSON.stringify({
-    factIds,
     invariant,
     decisionFixture,
     journals,
@@ -157,8 +162,23 @@ test("file cutover removes producerless Guardian vocabulary exactly", async () =
     facts,
     /ExecutionFactKind::DownloadTempWriteFailed\s*=>\s*\(\s*GuardianFactId::TempFileWriteFailed/,
   );
-  assert.match(model, /pub const ALL: \[Self; 116\] = \[/);
-  assert.match(model, /pub const ALL: \[Self; 76\] = \[/);
+  assert.match(
+    execution,
+    /DownloadTempDiscarded => \("download_temp_discarded", NonFailure\)/,
+  );
+  assert.match(
+    facts,
+    /ExecutionFactKind::DownloadTempDiscarded\s*=>\s*\(\s*GuardianFactId::DownloadTempDiscarded/,
+  );
+  assert.match(model, /macro_rules! stable_phase_id_registry/);
+  assert.match(
+    model,
+    /stable_phase_id_registry!\s*\{\s*"unknown Guardian fact id";\s*117;\s*pub enum GuardianFactId/,
+  );
+  assert.match(
+    model,
+    /stable_phase_id_registry!\s*\{\s*"unknown Guardian diagnosis id";\s*76;\s*pub enum DiagnosisId/,
+  );
   assert.match(
     rules,
     /TempFileWriteFailed,[\s\S]*?evidence: \[TempFileWriteFailed\]/,
@@ -183,21 +203,18 @@ test("file cutover removes producerless Guardian vocabulary exactly", async () =
   assert.match(decisionSource, /RAW_POLICY_EVALUATION_COUNT, 61_056/);
   assert.match(decisionSource, /COMPRESSED_POLICY_CELL_COUNT, 16_176/);
 
-  assert.equal(factIds.length, 116);
-  assert.equal(new Set(factIds).size, 116);
+  const factIds = registryWireIds(model, "pub enum GuardianFactId");
+  const diagnosisIds = registryWireIds(model, "pub enum DiagnosisId");
+  assert.equal(factIds.length, 117);
+  assert.equal(new Set(factIds).size, 117);
   assert.ok(factIds.includes("atomic_promotion_completed"));
+  assert.ok(factIds.includes("download_temp_discarded"));
   assert.ok(factIds.includes("primitive_refused"));
   assert.ok(factIds.includes("temp_file_write_failed"));
+  assert.equal(diagnosisIds.length, 76);
+  assert.equal(new Set(diagnosisIds).size, 76);
   assert.equal(invariant.rules.length, 56);
-  assert.equal(invariant.facts.length, 116);
-  assert.equal(invariant.adapters.execution.length, 47);
-  assert.equal(
-    Object.values(invariant.adapters).reduce(
-      (count, rows) => count + rows.length,
-      0,
-    ),
-    93,
-  );
+  assert.equal(invariant.facts.length, 117);
   assert.deepEqual(
     invariant.rules.find((row) => row.diagnosis === "artifact_ownership_unsafe")
       ?.triggers,
@@ -213,6 +230,13 @@ test("file cutover removes producerless Guardian vocabulary exactly", async () =
       (row) =>
         row.source === "download_promoted" &&
         row.fact === "atomic_promotion_completed",
+    ),
+  );
+  assert.ok(
+    invariant.adapters.execution.some(
+      (row) =>
+        row.source === "download_temp_discarded" &&
+        row.fact === "download_temp_discarded",
     ),
   );
   assert.equal(decisionFixture.contexts.length, 16);
@@ -253,25 +277,55 @@ test("file cutover removes producerless Guardian vocabulary exactly", async () =
     referencedProfiles,
     new Set(decisionFixture.policy_profiles.map((profile) => profile.id)),
   );
-  const diagnosisIds = journals.entries
-    .slice(0, 3)
-    .flatMap((entry) => entry.guardian_diagnosis_ids);
-  assert.equal(diagnosisIds.length, 76);
-  assert.equal(new Set(diagnosisIds).size, 76);
+  assert.equal(journals.schema, "axial.state.operation_journals.v10");
   assert.equal(journals.next_sequence, 8);
   assert.deepEqual(
     journals.entries.map((entry) => entry.sequence),
-    [1, 2, 3, 4, 5, 7],
+    [1, 2, 4, 5, 7],
   );
+  const tier2Step = journals.entries
+    .flatMap((entry) => entry.completed_steps)
+    .find((step) => step.step_id === "tier2_integrity_sweep");
+  assert.equal(tier2Step?.metrics?.kind, "tier2_integrity");
+  assert.deepEqual(tier2Step?.guardian_fact_ids, [
+    "artifact_checksum_mismatch",
+  ]);
+  const install = journals.entries.find(
+    (entry) => entry.command === "InstallVersion",
+  );
+  assert.equal(install?.completed_steps[0]?.metrics?.kind, "content_download");
+  assert.deepEqual(install?.completed_steps[0]?.guardian_fact_ids, [
+    "download_provider_unavailable",
+  ]);
+  assert.equal(
+    install?.guardian_install_terminal?.diagnosis_id,
+    "download_unavailable",
+  );
+  assert.equal(install?.guardian_install_terminal?.action, "Retry");
+  assert.ok(install?.guardian_install_terminal?.memory);
   assert.deepEqual(
     journals.entries
       .filter((entry) => entry.intent.kind === "performance")
       .map((entry) => [entry.command, entry.intent.phase.phase]),
     [["ApplyPerformancePlan", "accepted"]],
   );
+  assert.deepEqual(
+    fixtureNames
+      .filter((name) => name.startsWith("operation-journals-v"))
+      .toSorted(),
+    ["operation-journals-v10.json"],
+  );
+  assert.ok(!fixtureNames.includes("guardian-fact-ids.json"));
+  for (const prefix of [
+    "integrity_counter:",
+    "execution_download_fact:",
+    "guardian_fact:",
+    "guardian_outcome_",
+  ]) {
+    assert.ok(!JSON.stringify(journals).includes(prefix));
+  }
   assert.match(coverageDoc, /\| Diagnosis rules \| 56 \|/);
-  assert.match(coverageDoc, /\| Registered facts \| 116 \|/);
-  assert.match(coverageDoc, /\| Adapter sources \| 93 \|/);
+  assert.match(coverageDoc, /\| Registered facts \| 117 \|/);
 });
 
 test("execution file module is fact-only and crate-private", async () => {
@@ -301,6 +355,43 @@ test("execution file module is fact-only and crate-private", async () => {
   );
 });
 
+test("Guardian evidence is operation-bound, typed, and string-free", async () => {
+  const [sources, model, facts, contracts] = await Promise.all([
+    readRustTree("apps", "core"),
+    read("apps/api/src/guardian/model.rs"),
+    read("apps/api/src/guardian/facts.rs"),
+    read("apps/api/src/state/contracts.rs"),
+  ]);
+
+  assert.match(model, /pub enum EvidenceScope\s*\{/);
+  assert.match(facts, /pub struct OperationEvidenceBatch\s*\{/);
+  assert.match(model, /pub const MAX_OPERATION_EVIDENCE_FACTS: usize = 64;/);
+  assert.match(
+    model,
+    /pub const MAX_OPERATION_EVIDENCE_SERIALIZED_BYTES: usize = 131_072;/,
+  );
+  assert.match(facts, /pub fn try_from_execution_operation\s*\(/);
+  assert.match(facts, /pub fn try_from_guardian_operation\s*\(/);
+  assert.match(facts, /OperationEvidenceBatchRejection::ForeignOperation/);
+  assert.match(contracts, /guardian_fact_ids:\s*Vec<GuardianFactId>/);
+  assert.match(contracts, /metrics:\s*Option<OperationStepMetrics>/);
+  assert.match(
+    contracts,
+    /guardian_install_terminal:\s*Option<GuardianInstallTerminalEvidence>/,
+  );
+
+  const reservedJournalString =
+    /"(?:integrity_counter:|execution_download_fact:|guardian_fact:|guardian_outcome_)/;
+  for (const [path, source] of sources) {
+    const production = source.split("#[cfg(test)]")[0];
+    assert.doesNotMatch(
+      production,
+      reservedJournalString,
+      `${path} retains a reserved journal string carrier`,
+    );
+  }
+});
+
 test("performance production persistence has one capability-owned journal", async () => {
   const [journals, state, stateEntries] = await Promise.all([
     read("apps/api/src/state/journals.rs"),
@@ -327,6 +418,10 @@ test("performance production persistence has one capability-owned journal", asyn
   );
   assert.match(
     journals,
-    /pub const OPERATION_JOURNAL_SCHEMA: &str = "axial\.state\.operation_journals\.v9"/,
+    /pub const OPERATION_JOURNAL_SCHEMA: &str = "axial\.state\.operation_journals\.v10"/,
+  );
+  assert.match(
+    journals,
+    /previous_operation_journal_schema_is_strict_invalid_and_preserved_byte_exact[\s\S]*?"axial\.state\.operation_journals\.v10"[\s\S]*?"axial\.state\.operation_journals\.v9"/,
   );
 });

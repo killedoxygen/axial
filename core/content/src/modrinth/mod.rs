@@ -770,7 +770,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[tokio::test]
-    async fn p00_b11_contract_injected_service_maps_provider_neutral_wire_records() {
+    async fn behavior_contract_injected_service_maps_provider_neutral_wire_records() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind content service fixture");
@@ -834,7 +834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p00_b11_contract_foreign_namespaces_fail_before_any_request() {
+    async fn behavior_contract_foreign_namespaces_fail_before_any_request() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind no-request fixture");

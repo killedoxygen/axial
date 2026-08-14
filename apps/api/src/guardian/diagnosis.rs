@@ -1,10 +1,12 @@
 use super::rules::{DIAGNOSIS_RULES, DecisionPriorityBand, DiagnosisRule};
 use super::{
-    ActionPlanPrerequisite, DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDomain,
-    GuardianFact, GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase,
+    ActionPlanPrerequisite, DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDecision,
+    GuardianDomain, GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext,
+    GuardianSeverity, OperationEvidenceBatch, SafetyCase, decide_guardian_policy,
 };
+use crate::state::contracts::{DurableGuardianEvidence, GuardianInstallTerminalEvidence};
 use crate::state::contracts::{
-    OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+    OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use serde::Serialize;
 use std::cmp::Ordering;
@@ -82,7 +84,8 @@ impl Diagnosis {
     }
 }
 
-pub fn diagnose(facts: &[GuardianFact], phase: OperationPhase) -> Vec<Diagnosis> {
+pub fn diagnose(evidence: &OperationEvidenceBatch, phase: OperationPhase) -> Vec<Diagnosis> {
+    let facts = evidence.facts();
     let mut diagnoses = DIAGNOSIS_RULES
         .iter()
         .enumerate()
@@ -102,16 +105,108 @@ pub fn diagnose(facts: &[GuardianFact], phase: OperationPhase) -> Vec<Diagnosis>
 }
 
 pub fn build_safety_case(
-    operation_id: Option<OperationId>,
     mode: GuardianMode,
     phase: OperationPhase,
-    facts: &[GuardianFact],
+    evidence: &OperationEvidenceBatch,
 ) -> SafetyCase {
     SafetyCase {
-        operation_id,
+        operation_id: evidence.operation_id().cloned(),
         mode,
         phase,
-        diagnoses: diagnose(facts, phase),
+        diagnoses: diagnose(evidence, phase),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GuardianEvidenceAssessment {
+    safety_case: SafetyCase,
+    decision: GuardianDecision,
+    #[serde(skip)]
+    fact_ids: Vec<GuardianFactId>,
+    #[serde(skip)]
+    evidence: OperationEvidenceBatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuardianEvidenceProjectionError {
+    Unscoped,
+    OperationMismatch,
+    InvalidDurableEvidence,
+}
+
+impl GuardianEvidenceAssessment {
+    pub const fn safety_case(&self) -> &SafetyCase {
+        &self.safety_case
+    }
+
+    pub const fn decision(&self) -> &GuardianDecision {
+        &self.decision
+    }
+
+    pub(crate) fn durable_evidence(
+        &self,
+        evidence: &OperationEvidenceBatch,
+        install_terminal: Option<GuardianInstallTerminalEvidence>,
+    ) -> Result<DurableGuardianEvidence, GuardianEvidenceProjectionError> {
+        let operation_id = evidence
+            .operation_id()
+            .ok_or(GuardianEvidenceProjectionError::Unscoped)?
+            .clone();
+        if self.safety_case.operation_id.as_ref() != Some(&operation_id) {
+            return Err(GuardianEvidenceProjectionError::OperationMismatch);
+        }
+        let mut fact_ids = Vec::new();
+        for fact in evidence.facts() {
+            if !fact_ids.contains(&fact.id) {
+                fact_ids.push(fact.id);
+            }
+        }
+        if fact_ids != self.fact_ids || evidence != &self.evidence {
+            return Err(GuardianEvidenceProjectionError::OperationMismatch);
+        }
+        let mut diagnosis_ids = Vec::new();
+        for diagnosis in &self.safety_case.diagnoses {
+            if !diagnosis_ids.contains(&diagnosis.id()) {
+                diagnosis_ids.push(diagnosis.id());
+            }
+        }
+        if let Some(terminal) = &install_terminal {
+            let expected_terminal_action = match self.decision.kind() {
+                GuardianActionKind::Repair | GuardianActionKind::Quarantine => {
+                    GuardianActionKind::Block
+                }
+                action => action,
+            };
+            if !diagnosis_ids.contains(&terminal.diagnosis_id())
+                || terminal.action() != expected_terminal_action
+            {
+                return Err(GuardianEvidenceProjectionError::InvalidDurableEvidence);
+            }
+        }
+        DurableGuardianEvidence::new(operation_id, fact_ids, diagnosis_ids, install_terminal)
+            .map_err(|_| GuardianEvidenceProjectionError::InvalidDurableEvidence)
+    }
+}
+
+pub fn assess_operation_evidence(
+    mode: GuardianMode,
+    phase: OperationPhase,
+    evidence: &OperationEvidenceBatch,
+    context: GuardianPolicyContext,
+) -> GuardianEvidenceAssessment {
+    let safety_case = build_safety_case(mode, phase, evidence);
+    let decision = decide_guardian_policy(&safety_case, context);
+    let mut fact_ids = Vec::new();
+    for fact in evidence.facts() {
+        if !fact_ids.contains(&fact.id) {
+            fact_ids.push(fact.id);
+        }
+    }
+    GuardianEvidenceAssessment {
+        safety_case,
+        decision,
+        fact_ids,
+        evidence: evidence.clone(),
     }
 }
 

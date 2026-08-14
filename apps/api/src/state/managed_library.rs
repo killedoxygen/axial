@@ -1075,8 +1075,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
-    const ROOT_LEASE_HELPER_MODE: &str = "AXIAL_P01_B02_ROOT_LEASE_HELPER_MODE";
-    const ROOT_LEASE_HELPER_PATH: &str = "AXIAL_P01_B02_ROOT_LEASE_HELPER_PATH";
+    const ROOT_LEASE_HELPER_MODE: &str = "AXIAL_MANAGED_LIBRARY_ROOT_LEASE_HELPER_MODE";
+    const ROOT_LEASE_HELPER_PATH: &str = "AXIAL_MANAGED_LIBRARY_ROOT_LEASE_HELPER_PATH";
 
     fn paths(name: &str) -> AppPaths {
         let root = std::env::temp_dir()
@@ -1195,7 +1195,7 @@ mod tests {
     fn run_root_helper(executable: &Path, mode: &str, app_root: &Path) {
         let mut child = Command::new(executable)
             .arg("--exact")
-            .arg("state::managed_library::tests::p01_b02_contract_cross_owner")
+            .arg("state::managed_library::tests::anchored_filesystem_contract_cross_owner")
             .arg("--nocapture")
             .env(ROOT_LEASE_HELPER_MODE, mode)
             .env(ROOT_LEASE_HELPER_PATH, app_root)
@@ -1306,8 +1306,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p01_b02_contract() {
-        let paths = paths("p01-b02-contract");
+    async fn native_filesystem_contract_managed_library() {
+        let paths = paths("anchored-filesystem-contract");
         let app_root = paths
             .library_dir()
             .parent()
@@ -1430,12 +1430,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p01_b02_contract_cross_owner() {
+    async fn native_filesystem_contract_managed_library_cross_owner() {
         if complete_root_lease_helper_if_requested() {
             return;
         }
 
-        let lease_paths = paths("p01-b02-cross-process-lease");
+        let lease_paths = paths("anchored-filesystem-cross-process-lease");
         let lease_root = lease_paths
             .library_dir()
             .parent()
@@ -1458,7 +1458,7 @@ mod tests {
         std::fs::remove_dir_all(lease_root.parent().expect("temporary parent"))
             .expect("remove lease root");
 
-        let process_paths = paths("p01-b02-process-image-reset");
+        let process_paths = paths("anchored-filesystem-process-image-reset");
         let process_root = process_paths
             .library_dir()
             .parent()
@@ -1471,7 +1471,7 @@ mod tests {
             .expect("remove process-image test root");
 
         let (app_root, paths, root_session, owner) =
-            configured_owner("p01-b02-cross-owner-generation");
+            configured_owner("anchored-filesystem-cross-owner-generation");
         let old_operation = owner.try_acquire().expect("old generation operation");
         owner
             .validate_current(&old_operation)

@@ -15,9 +15,8 @@ mod stream;
 pub(crate) use operation::loader_install_guardian_evidence_kind;
 
 use crate::application::instances::instance_version_is_installed_and_launchable;
-use crate::guardian::{
-    DiagnosisId, GuardianInstallArtifactFailureEvidence, GuardianInstallOutcomeSummary,
-};
+use crate::execution::{ExecutionFact, ExecutionFactKind};
+use crate::guardian::{DiagnosisId, GuardianInstallOutcomeSummary};
 use crate::observability::{
     operation_journal_proof_record,
     telemetry::{
@@ -416,15 +415,10 @@ pub(crate) async fn settle_startup_install_guardian_failure_memory(state: &AppSt
     };
     let journals = state.journals().clone();
     let failure_memory = state.failure_memory().clone();
-    let observed_at = chrono::Utc::now().to_rfc3339();
     match producer
         .spawn_joinable(async move {
-            operation::settle_startup_install_guardian_failure_memory(
-                &journals,
-                &failure_memory,
-                &observed_at,
-            )
-            .await
+            operation::settle_startup_install_guardian_failure_memory(&journals, &failure_memory)
+                .await
         })
         .await
     {
@@ -1491,7 +1485,6 @@ async fn start_install_version_with_foreground(
                                 &worker_operation_id,
                                 &error,
                                 &install_facts,
-                                &chrono::Utc::now().to_rfc3339(),
                             )
                             .await;
                             (
@@ -1530,7 +1523,6 @@ async fn start_install_version_with_foreground(
                         &worker_operation_id,
                         &install_error,
                         &install_facts,
-                        &chrono::Utc::now().to_rfc3339(),
                     )
                     .await;
                     (
@@ -2515,7 +2507,6 @@ fn spawn_recovering_vanilla_install_with_checkpoint_reconstruction<Reconstruct, 
                                         &journal.operation_id,
                                         &error,
                                         &install_facts,
-                                        &chrono::Utc::now().to_rfc3339(),
                                     )
                                     .await;
                                     install_progress_with_terminal_error(
@@ -2543,7 +2534,6 @@ fn spawn_recovering_vanilla_install_with_checkpoint_reconstruction<Reconstruct, 
                                 &journal.operation_id,
                                 &error,
                                 &install_facts,
-                                &chrono::Utc::now().to_rfc3339(),
                             )
                             .await;
                             install_progress_with_terminal_error(
@@ -2672,7 +2662,6 @@ fn spawn_recovering_vanilla_install_with_checkpoint_reconstruction<Reconstruct, 
                         &journal.operation_id,
                         &error,
                         &[],
-                        &chrono::Utc::now().to_rfc3339(),
                     )
                     .await;
                     install_progress_with_terminal_error(
@@ -2690,7 +2679,6 @@ fn spawn_recovering_vanilla_install_with_checkpoint_reconstruction<Reconstruct, 
                         &journal.operation_id,
                         &error,
                         &[],
-                        &chrono::Utc::now().to_rfc3339(),
                     )
                     .await;
                     install_progress_with_terminal_error(
@@ -2752,18 +2740,10 @@ pub(super) async fn record_install_failure_outcome(
     failure_memory: Arc<crate::state::GuardianFailureMemoryStore>,
     operation_id: &crate::state::contracts::OperationId,
     install_facts: &[ExecutionDownloadFact],
-    observed_at: &str,
 ) {
     let evidence = install_failure_evidence_from_download_facts(operation_id, install_facts);
-    record_install_failure_evidence(
-        producer,
-        journals,
-        failure_memory,
-        operation_id,
-        &evidence,
-        observed_at,
-    )
-    .await;
+    record_install_failure_evidence(producer, journals, failure_memory, operation_id, &evidence)
+        .await;
 }
 
 pub(super) async fn record_install_failure_outcome_for_error(
@@ -2773,19 +2753,11 @@ pub(super) async fn record_install_failure_outcome_for_error(
     operation_id: &crate::state::contracts::OperationId,
     error: &DownloadError,
     install_facts: &[ExecutionDownloadFact],
-    observed_at: &str,
 ) {
     let evidence =
         install_failure_evidence_from_download_error_or_facts(operation_id, error, install_facts);
-    record_install_failure_evidence(
-        producer,
-        journals,
-        failure_memory,
-        operation_id,
-        &evidence,
-        observed_at,
-    )
-    .await;
+    record_install_failure_evidence(producer, journals, failure_memory, operation_id, &evidence)
+        .await;
 }
 
 fn install_error_log_kind(error: &DownloadError) -> &'static str {
@@ -2820,8 +2792,7 @@ async fn record_install_failure_evidence(
     journals: Arc<crate::state::OperationJournalStore>,
     failure_memory: Arc<crate::state::GuardianFailureMemoryStore>,
     operation_id: &crate::state::contracts::OperationId,
-    evidence: &[GuardianInstallArtifactFailureEvidence],
-    observed_at: &str,
+    evidence: &[ExecutionFact],
 ) {
     if record_install_guardian_failure_outcome(
         producer,
@@ -2830,7 +2801,6 @@ async fn record_install_failure_evidence(
         operation_id,
         evidence,
         crate::state::contracts::OperationPhase::Downloading,
-        observed_at,
     )
     .await
     .is_err()
@@ -4311,7 +4281,7 @@ where
                             &progress_journals,
                             &progress_operation_id,
                             &progress,
-                            &[],
+                            None,
                             &mut progress_journal,
                         )
                         .await
@@ -4495,11 +4465,18 @@ where
                     )
                 }
             };
-            let (facts, journal_facts) = {
+            let (facts, metrics) = {
                 let download_facts = download_facts
                     .lock()
                     .expect("content download fact accumulator lock poisoned");
-                (download_facts.facts(), download_facts.journal_facts())
+                (download_facts.facts(), download_facts.metrics())
+            };
+            let metrics = match metrics {
+                Ok(metrics) => metrics,
+                Err(_) => {
+                    tracing::warn!("content download metrics could not be projected");
+                    return;
+                }
             };
             *attempted_terminal
                 .lock()
@@ -4515,7 +4492,7 @@ where
                     install_id: &worker_install_id,
                     progress: terminal,
                     execution_facts: &facts,
-                    journal_facts: &journal_facts,
+                    metrics: &metrics,
                     failure_kind,
                 },
             )
@@ -4535,11 +4512,15 @@ where
                 interrupted_setup_cleanup.as_ref(),
             )
             .await;
-            let (facts, journal_facts) = {
+            let (facts, metrics) = {
                 let download_facts = interrupted_download_facts
                     .lock()
                     .expect("content download fact accumulator lock poisoned");
-                (download_facts.facts(), download_facts.journal_facts())
+                (download_facts.facts(), download_facts.metrics())
+            };
+            let Ok(metrics) = metrics else {
+                tracing::warn!("content download metrics could not be projected");
+                return None;
             };
             let attempted_terminal = interrupted_attempted_terminal
                 .lock()
@@ -4552,7 +4533,7 @@ where
                 ContentWorkerInterruptionRequest {
                     operation_id: &interrupted_operation_id,
                     fallback: progress,
-                    journal_facts: &journal_facts,
+                    metrics: &metrics,
                     execution_facts: &facts,
                     attempted_terminal,
                 },
@@ -4580,7 +4561,7 @@ struct ContentTerminalProgress<'a> {
     install_id: &'a str,
     progress: DownloadProgress,
     execution_facts: &'a [axial_minecraft::download::ExecutionDownloadFact],
-    journal_facts: &'a [String],
+    metrics: &'a crate::state::contracts::ContentDownloadMetrics,
     failure_kind: Option<crate::application::content::ContentExecutionFailureKind>,
 }
 
@@ -4607,20 +4588,22 @@ async fn commit_and_emit_content_terminal_progress(
                 download_facts: terminal.execution_facts,
                 additional_evidence: evidence,
                 phase,
-                observed_at: &chrono::Utc::now().to_rfc3339(),
+                terminal_progress: &terminal.progress,
+                metrics: terminal.metrics,
             },
         )
         .await?;
+    } else {
+        let mut progress_journal = InstallProgressJournalTracker::default();
+        record_content_operation_progress(
+            &journals,
+            terminal.operation_id,
+            &terminal.progress,
+            Some(terminal.metrics),
+            &mut progress_journal,
+        )
+        .await?;
     }
-    let mut progress_journal = InstallProgressJournalTracker::default();
-    record_content_operation_progress(
-        &journals,
-        terminal.operation_id,
-        &terminal.progress,
-        terminal.journal_facts,
-        &mut progress_journal,
-    )
-    .await?;
     store
         .emit(
             terminal.install_id,
@@ -4633,7 +4616,7 @@ async fn commit_and_emit_content_terminal_progress(
 struct ContentWorkerInterruptionRequest<'a> {
     operation_id: &'a OperationId,
     fallback: DownloadProgress,
-    journal_facts: &'a [String],
+    metrics: &'a crate::state::contracts::ContentDownloadMetrics,
     execution_facts: &'a [axial_minecraft::download::ExecutionDownloadFact],
     attempted_terminal: Option<(
         DownloadProgress,
@@ -4650,7 +4633,7 @@ async fn settle_content_worker_interruption(
     let ContentWorkerInterruptionRequest {
         operation_id,
         fallback,
-        journal_facts,
+        metrics,
         execution_facts,
         attempted_terminal,
     } = request;
@@ -4672,7 +4655,8 @@ async fn settle_content_worker_interruption(
                     download_facts: execution_facts,
                     additional_evidence: evidence,
                     phase,
-                    observed_at: &chrono::Utc::now().to_rfc3339(),
+                    terminal_progress: attempted_progress,
+                    metrics,
                 },
             )
             .await
@@ -4688,12 +4672,13 @@ async fn settle_content_worker_interruption(
                 tracing::warn!("failed to settle interrupted content Guardian outcome");
                 return None;
             }
+            return Some(sanitize_install_progress(attempted_progress.clone()));
         }
         match record_content_operation_interrupted(
             &journals,
             operation_id,
             &fallback,
-            journal_facts,
+            metrics,
             execution_facts,
         )
         .await
@@ -4706,7 +4691,7 @@ async fn settle_content_worker_interruption(
                             entry,
                             operation_id,
                             attempted_progress,
-                            journal_facts,
+                            metrics,
                         )
                     })
                 {
@@ -4730,40 +4715,42 @@ async fn settle_content_worker_interruption(
 fn content_execution_failure_evidence(
     operation_id: &OperationId,
     kind: crate::application::content::ContentExecutionFailureKind,
-) -> (GuardianInstallArtifactFailureEvidence, OperationPhase) {
+) -> (ExecutionFact, OperationPhase) {
     use crate::application::content::ContentExecutionFailureKind;
     let (target, failure_kind, phase) = match kind {
         ContentExecutionFailureKind::FileOperation => (
             "content_filesystem",
-            crate::guardian::GuardianInstallArtifactFailureKind::TempWriteFailed,
+            ExecutionFactKind::DownloadTempWriteFailed,
             OperationPhase::Installing,
         ),
         ContentExecutionFailureKind::MetadataInvalid => (
             "content_metadata",
-            crate::guardian::GuardianInstallArtifactFailureKind::MetadataInvalid,
+            ExecutionFactKind::ProviderDataInvalid,
             OperationPhase::Downloading,
         ),
         ContentExecutionFailureKind::NetworkFailure => (
             "content_download",
-            crate::guardian::GuardianInstallArtifactFailureKind::NetworkFailure,
+            ExecutionFactKind::DownloadNetworkFailure,
             OperationPhase::Downloading,
         ),
         ContentExecutionFailureKind::PermissionDenied => (
             "content_filesystem",
-            crate::guardian::GuardianInstallArtifactFailureKind::PermissionDenied,
+            ExecutionFactKind::FilePermissionDenied,
             OperationPhase::Installing,
         ),
         ContentExecutionFailureKind::ProviderFailure => (
             "content_provider",
-            crate::guardian::GuardianInstallArtifactFailureKind::ProviderFailure,
+            ExecutionFactKind::DownloadProviderFailure,
             OperationPhase::Downloading,
         ),
     };
     (
-        GuardianInstallArtifactFailureEvidence::launcher_managed(
-            Some(operation_id.clone()),
+        operation::install_execution_fact(
+            operation_id,
             target,
+            crate::state::contracts::OwnershipClass::LauncherManaged,
             failure_kind,
+            [],
         ),
         phase,
     )

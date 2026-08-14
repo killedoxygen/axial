@@ -166,9 +166,9 @@ pub(crate) use java_probe_failures::{
     JavaProbeFailureOwner,
 };
 pub(crate) use journals::{
-    MAX_OPERATION_JOURNAL_DIAGNOSES, MAX_OPERATION_JOURNAL_STEP_FACTS,
-    OperationJournalReconciliation, PerformanceOperationCreateError,
-    PerformanceOperationProjection, PerformanceOperationTransition, PerformanceRestartPlan,
+    MAX_OPERATION_JOURNAL_STEP_FACTS, OperationJournalReconciliation,
+    PerformanceOperationCreateError, PerformanceOperationProjection,
+    PerformanceOperationTransition, PerformanceRestartPlan,
     operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
     operation_journal_terminal_is_visible,
 };
@@ -3958,7 +3958,7 @@ mod known_good_identity_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn p01_b06_contract_native_folder_projection_rejects_binding_replacement() {
+    async fn native_filesystem_contract_native_folder_projection_rejects_binding_replacement() {
         let root = std::env::temp_dir().join(format!(
             "axial-native-folder-projection-{}-{}",
             std::process::id(),

@@ -1835,7 +1835,7 @@ async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
 }
 
 #[tokio::test]
-async fn p00_b09_contract_runtime_failure_receipt_retains_exact_inventory_proof() {
+async fn behavior_contract_runtime_failure_receipt_retains_exact_inventory_proof() {
     let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
     let component = RuntimeId::from("jre-legacy");
     let root = cache

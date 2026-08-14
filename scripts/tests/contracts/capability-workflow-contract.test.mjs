@@ -145,7 +145,7 @@ test("Task exposes the closed verification and capability entry points", async (
     "capability:self-test",
     "capability:audit",
     "capability:run",
-    "capability:phase:p00",
+    "capability:offline-assets",
     "capability:platform",
   ]) {
     assert.ok(names.has(name), `missing Task entry point ${name}`);
@@ -176,13 +176,13 @@ test("Task exposes the closed verification and capability entry points", async (
   await assert.rejects(access("frontend/tsconfig.test.json"), { code: "ENOENT" });
 });
 
-test("the P00 capability phase has one exact Task and native workflow owner", async () => {
+test("the offline asset capability task has one exact owner and native workflow handoff", async () => {
   const taskfile = await readFile("Taskfile.yml", "utf8");
-  const phase = taskBlock(taskfile, "capability:phase:p00");
+  const phase = taskBlock(taskfile, "capability:offline-assets");
   assert.equal(
     phase.match(/^\s{6}- task: capability:run$/gm)?.length,
     5,
-    "each P00 scenario must use the closed dispatcher task exactly once",
+    "each offline asset scenario must use the closed dispatcher task exactly once",
   );
   assert.deepEqual(
     [...phase.matchAll(/^\s{10}SCENARIO: (CP-OA-[A-Z-]+)$/gm)].map((match) => match[1]),
@@ -207,25 +207,25 @@ test("the P00 capability phase has one exact Task and native workflow owner", as
     ["verify:native:macos", "macos"],
   ]) {
     const native = taskBlock(taskfile, task);
-    assert.equal(native.match(/^\s{6}- task: capability:phase:p00$/gm)?.length, 1);
+    assert.equal(native.match(/^\s{6}- task: capability:offline-assets$/gm)?.length, 1);
     assert.match(
       native,
-      new RegExp(`- task: capability:phase:p00\\n {8}vars:\\n {10}PLATFORM: ${platform}\\s*$`),
-      `${task} must finish with its concrete P00 capability phase`,
+      new RegExp(`- task: capability:offline-assets\\n {8}vars:\\n {10}PLATFORM: ${platform}\\s*$`),
+      `${task} must finish with its concrete offline asset capability`,
     );
   }
 });
 
-test("native CI transports only exact-commit bounded P00 evidence", async () => {
+test("native CI transports only exact-commit bounded capability evidence", async () => {
   const ciSource = await readFile(".github/workflows/ci.yml", "utf8");
   assert.match(ciSource, /^  workflow_dispatch:\s*$/m);
   assert.match(
     ciSource,
-    /^  push:\s*\n    branches:\s*\n      - main\s*\n    tags:\s*\n      - p00-phase-gate-\*\s*$/m,
+    /^  push:\s*\n    branches:\s*\n      - main\s*\n    tags:\s*\n      - release-gate-\*\s*$/m,
   );
   assert.match(
     ciSource,
-    /^  verify-linux:\s*\n    if: \$\{\{ !startsWith\(github\.ref, 'refs\/tags\/p00-phase-gate-'\) \}\}$/m,
+    /^  verify-linux:\s*\n    if: \$\{\{ !startsWith\(github\.ref, 'refs\/tags\/release-gate-'\) \}\}$/m,
   );
   const exactSource = "${{ github.sha }}";
   const proofIds = [
@@ -247,17 +247,17 @@ test("native CI transports only exact-commit bounded P00 evidence", async () => 
     assert.equal(checkout[0].inputs.get("persist-credentials"), "false");
     assert.equal(checkout[0].inputs.get("ref"), exactSource);
     const identityStep = job.steps.find(
-      (step) => step.name === "Verify P00 phase-gate source identity",
+      (step) => step.name === "Verify release gate source identity",
     );
-    assert.ok(identityStep, `${jobId}: missing phase-gate identity assertion`);
+    assert.ok(identityStep, `${jobId}: missing release gate identity assertion`);
     assert.equal(
       identityStep.run,
-      'test \"$PHASE_GATE_TAG\" = \"p00-phase-gate-$EXPECTED_SHA\"\n' +
+      'test \"$RELEASE_GATE_TAG\" = \"release-gate-$EXPECTED_SHA\"\n' +
         'test \"$(git rev-parse HEAD)\" = \"$EXPECTED_SHA\"',
     );
     assert.match(
       job.source,
-      /- name: Verify P00 phase-gate source identity\n {8}if: startsWith\(github\.ref, 'refs\/tags\/p00-phase-gate-'\)\n {8}shell: bash\n {8}env:\n {10}EXPECTED_SHA: \$\{\{ github\.sha \}\}\n {10}PHASE_GATE_TAG: \$\{\{ github\.ref_name \}\}\n {8}run: \|\n {10}test "\$PHASE_GATE_TAG" = "p00-phase-gate-\$EXPECTED_SHA"\n {10}test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SHA"/,
+      /- name: Verify release gate source identity\n {8}if: startsWith\(github\.ref, 'refs\/tags\/release-gate-'\)\n {8}shell: bash\n {8}env:\n {10}EXPECTED_SHA: \$\{\{ github\.sha \}\}\n {10}RELEASE_GATE_TAG: \$\{\{ github\.ref_name \}\}\n {8}run: \|\n {10}test "\$RELEASE_GATE_TAG" = "release-gate-\$EXPECTED_SHA"\n {10}test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SHA"/,
     );
 
     const pnpm = job.steps.filter((step) => step.actionRepository === "pnpm/action-setup");
@@ -284,7 +284,7 @@ test("native CI transports only exact-commit bounded P00 evidence", async () => 
       "path",
       "retention-days",
     ]);
-    assert.equal(upload.inputs.get("name"), `p00-capabilities-${platform}-${exactSource}`);
+    assert.equal(upload.inputs.get("name"), `capabilities-${platform}-${exactSource}`);
     assert.deepEqual(
       upload.inputs.get("path").split("\n"),
       proofIds.map((proofId) => `evidence/capabilities/${proofId}/${platform}.json`),

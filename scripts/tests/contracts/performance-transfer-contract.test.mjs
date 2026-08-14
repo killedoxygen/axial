@@ -61,7 +61,7 @@ test("Performance transfers use the neutral retained-authority primitive", async
   ]);
   assert.match(
     taskfile,
-    /verify:contracts:[\s\S]*p01-b02-performance-transfer-contract\.test\.mjs/,
+    /verify:contracts:[\s\S]*scripts\/tests\/contracts\/performance-transfer-contract\.test\.mjs/,
   );
 });
 

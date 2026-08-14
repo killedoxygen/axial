@@ -748,8 +748,9 @@ mod tests {
     use crate::execution::integrity::Tier2CleanSealRequest;
     use crate::state::contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
-        OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
-        RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
+        OperationOutcome, OperationPhase, OperationStatus, OperationStepMetrics,
+        OperationStepResult, OwnershipClass, RollbackState, StabilizationSystem, TargetDescriptor,
+        TargetKind, Tier2IntegrityMetrics,
     };
     use crate::state::{
         AppStateInit, IdleSweepCancellation, IdleSweepReservation, IdleSweepTerminal, InstallStore,
@@ -970,13 +971,13 @@ mod tests {
             if !planned.persist_journal {
                 return Ok(());
             }
-            let mut step =
-                OperationJournalStep::new("tier2_integrity_sweep", OperationPhase::Validating);
-            step.result = OperationStepResult::Skipped;
             planned
                 .state
                 .journals()
-                .record_cancellation(&planned.operation_id, step)
+                .record_cancellation_with_metrics(
+                    &planned.operation_id,
+                    scripted_terminal_step(OperationStepResult::Skipped),
+                )
                 .await
                 .map_err(|error| error.class())
         }
@@ -1169,27 +1170,23 @@ mod tests {
                 let cancelled = settled_rx.await.map_err(|_| "worker_stopped")?;
                 transactions.inner.terminal_gate.pass().await;
                 if planned.persist_journal {
-                    let mut step = OperationJournalStep::new(
-                        "tier2_integrity_sweep",
-                        OperationPhase::Validating,
-                    );
                     if cancelled {
-                        step.result = OperationStepResult::Skipped;
                         planned
                             .state
                             .journals()
-                            .record_cancellation(&planned.operation_id, step)
+                            .record_cancellation_with_metrics(
+                                &planned.operation_id,
+                                scripted_terminal_step(OperationStepResult::Skipped),
+                            )
                             .await
                             .map_err(|error| error.class())?;
                     } else {
-                        step.result = OperationStepResult::Completed;
                         planned
                             .state
                             .journals()
-                            .record_success(
+                            .record_success_with_metrics(
                                 &planned.operation_id,
-                                step,
-                                OperationOutcome::Succeeded,
+                                scripted_terminal_step(OperationStepResult::Completed),
                             )
                             .await
                             .map_err(|error| error.class())?;
@@ -1205,6 +1202,17 @@ mod tests {
                 Ok(SchedulerExecution::nonclean())
             })
         }
+    }
+
+    fn scripted_terminal_step(result: OperationStepResult) -> OperationJournalStep {
+        let mut step =
+            OperationJournalStep::new("tier2_integrity_sweep", OperationPhase::Validating);
+        step.result = result;
+        step.set_metrics(OperationStepMetrics::Tier2Integrity(
+            Tier2IntegrityMetrics::new(0, 0, 0, 0, 0, 0, 0, 0, 0)
+                .expect("zero-value Tier 2 metrics"),
+        ));
+        step
     }
 
     fn state_fixture(label: &str) -> (AppState, PathBuf) {

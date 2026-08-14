@@ -5,10 +5,11 @@
 
 pub mod telemetry;
 
-use crate::guardian::DiagnosisId;
+use crate::guardian::{DiagnosisId, GuardianFactId};
 use crate::state::contracts::{
-    CommandKind, OperationId, OperationJournalEntry, OperationOutcome, OperationStatus,
-    RollbackState, StabilizationSystem, TargetDescriptor,
+    CommandKind, GuardianInstallTerminalEvidence, OperationId, OperationJournalEntry,
+    OperationOutcome, OperationStatus, OperationStepMetrics, RollbackState, StabilizationSystem,
+    TargetDescriptor,
 };
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +112,9 @@ pub struct OperationProofRecord {
     pub targets: Vec<TargetDescriptor>,
     pub failure_point: Option<String>,
     pub guardian_diagnosis_ids: Vec<DiagnosisId>,
+    pub guardian_fact_ids: Vec<GuardianFactId>,
+    pub latest_step_metrics: Option<OperationStepMetrics>,
+    pub guardian_install_terminal: Option<GuardianInstallTerminalEvidence>,
     pub rollback: RollbackState,
     pub fields: Vec<EvidenceField>,
     pub retention: RetentionClass,
@@ -202,10 +206,30 @@ pub fn operation_journal_proof_record(entry: &OperationJournalEntry) -> Operatio
             .copied()
             .take(16)
             .collect(),
+        guardian_fact_ids: operation_journal_guardian_fact_ids(entry),
+        latest_step_metrics: entry
+            .completed_steps
+            .last()
+            .and_then(|step| step.metrics().cloned()),
+        guardian_install_terminal: entry.guardian_install_terminal().cloned(),
         rollback: entry.rollback,
         fields: operation_journal_proof_fields(entry),
         retention: RetentionClass::Proof,
     }
+}
+
+fn operation_journal_guardian_fact_ids(entry: &OperationJournalEntry) -> Vec<GuardianFactId> {
+    let mut fact_ids = Vec::new();
+    for fact_id in entry
+        .completed_steps
+        .iter()
+        .flat_map(|step| step.guardian_fact_ids().iter().copied())
+    {
+        if !fact_ids.contains(&fact_id) {
+            fact_ids.push(fact_id);
+        }
+    }
+    fact_ids
 }
 
 fn sanitized_target_descriptor(target: &TargetDescriptor) -> TargetDescriptor {
@@ -756,11 +780,12 @@ mod tests {
         sanitize_evidence_text, sanitize_evidence_token, sanitize_public_diagnostic_text,
         sanitize_public_json_value, sanitize_public_log_line,
     };
-    use crate::guardian::DiagnosisId;
+    use crate::guardian::{DiagnosisId, GuardianFactId};
     use crate::state::contracts::{
-        CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
-        OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
-        RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
+        CommandKind, ContentDownloadMetrics, JournalId, OperationId, OperationJournalEntry,
+        OperationJournalStep, OperationOutcome, OperationPhase, OperationStatus,
+        OperationStepMetrics, OperationStepResult, OwnershipClass, RollbackState,
+        StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 
@@ -989,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_journal_proof_connects_redacted_facts_and_guardian_outcome() {
+    fn operation_journal_proof_connects_typed_guardian_evidence_and_redacted_facts() {
         let mut entry = OperationJournalEntry::new(
             JournalId::new("journal-install-operation-1"),
             OperationId::deterministic_test("install-operation-1"),
@@ -1012,12 +1037,10 @@ mod tests {
             .push(DiagnosisId::DownloadUnavailable);
         let mut step = OperationJournalStep::new("install_progress_error", OperationPhase::Failed);
         step.result = OperationStepResult::Failed;
-        step.generated_facts
-            .push("guardian_outcome_decision:retry".to_string());
-        step.generated_facts.push(
-            "guardian_outcome_summary:Guardian treated install download failure as retryable."
-                .to_string(),
-        );
+        step.set_guardian_fact_ids_for_test(vec![GuardianFactId::DownloadInterrupted]);
+        step.set_metrics(OperationStepMetrics::ContentDownload(
+            ContentDownloadMetrics::new(0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        ));
         step.generated_facts
             .push(r"C:\Users\Alice\.minecraft --accessToken secret -Xmx8192M".to_string());
         entry.completed_steps.push(step);
@@ -1040,12 +1063,16 @@ mod tests {
             vec![DiagnosisId::DownloadUnavailable]
         );
         assert!(encoded.contains(r#""guardian_diagnosis_ids":["download_unavailable"]"#));
-        assert!(proof.fields.iter().any(|field| {
-            field.key == "generated_fact" && field.value == "guardian_outcome_decision:retry"
-        }));
-        assert!(proof.fields.iter().any(|field| {
-            field.key == "generated_fact" && field.value.contains("Guardian treated install")
-        }));
+        assert_eq!(
+            proof.guardian_fact_ids,
+            [GuardianFactId::DownloadInterrupted]
+        );
+        assert!(matches!(
+            proof.latest_step_metrics,
+            Some(OperationStepMetrics::ContentDownload(ref metrics))
+                if metrics.interrupted() == 1
+        ));
+        assert!(proof.guardian_install_terminal.is_none());
         assert!(
             proof
                 .fields

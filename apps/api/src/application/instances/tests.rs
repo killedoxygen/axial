@@ -60,7 +60,7 @@ fn instance_write_error_mapper_preserves_safe_status_messages() {
 }
 
 #[test]
-fn p02_b05_contract_instance_failures_preserve_domain_and_persistence_classes() {
+fn behavior_contract_instance_failures_preserve_domain_and_persistence_classes() {
     let cases = [
         (
             InstanceStoreError::from(InstanceStoreDomainError::NotFound),
@@ -442,7 +442,7 @@ async fn instance_log_tail_rejects_unsafe_log_name() {
 }
 
 #[tokio::test]
-async fn p01_b05_contract_log_tail_returns_bounded_truncated_held_file_tail() {
+async fn native_filesystem_contract_log_tail_returns_bounded_truncated_held_file_tail() {
     let fixture = TestFixture::new("log-tail-truncated");
     let instance = fixture
         .state
@@ -570,7 +570,7 @@ fn instance_screenshot_content_type_maps_supported_extensions() {
 }
 
 #[tokio::test]
-async fn p01_b05_contract_screenshot_file_serves_bounded_held_file_with_nosniff() {
+async fn native_filesystem_contract_screenshot_file_serves_bounded_held_file_with_nosniff() {
     let fixture = TestFixture::new("screenshot-file");
     let instance = fixture
         .state
@@ -613,7 +613,7 @@ async fn p01_b05_contract_screenshot_file_serves_bounded_held_file_with_nosniff(
 
 #[cfg(unix)]
 #[tokio::test]
-async fn p01_b05_contract_resource_reads_refuse_symlinked_screenshot_and_log_files() {
+async fn native_filesystem_contract_resource_reads_refuse_symlinked_screenshot_and_log_files() {
     use std::os::unix::fs::symlink;
 
     let fixture = TestFixture::new("resource-held-file-symlinks");
@@ -1503,7 +1503,7 @@ async fn instance_world_delete_removes_only_named_world_directory() {
 }
 
 #[tokio::test]
-async fn p01_b06_contract_world_backup_copies_directory_to_instance_local_label() {
+async fn native_filesystem_contract_world_backup_copies_directory_to_instance_local_label() {
     let fixture = TestFixture::new("world-backup");
     let instance = fixture
         .state
@@ -1550,14 +1550,14 @@ async fn p01_b06_contract_world_backup_copies_directory_to_instance_local_label(
 }
 
 #[test]
-fn p01_b06_contract_world_backup_preserves_established_capacity_envelope() {
+fn native_filesystem_contract_world_backup_preserves_established_capacity_envelope() {
     assert_eq!(WORLD_BACKUP_MAX_DEPTH, 64);
     assert_eq!(WORLD_BACKUP_MAX_ENTRIES, 100_000);
     assert_eq!(WORLD_BACKUP_MAX_BYTES, 50 * 1024 * 1024 * 1024);
 }
 
 #[tokio::test]
-async fn p01_b06_contract_world_backup_cleans_admitted_temp_after_copy_failure() {
+async fn native_filesystem_contract_world_backup_cleans_admitted_temp_after_copy_failure() {
     const COPY_FAILURE_DEPTH_LIMIT: usize = 2;
 
     let fixture = TestFixture::new("world-backup-copy-failure");
@@ -1667,7 +1667,7 @@ async fn bounded_filesystem_world_scan_rejects_symlink_cycle_without_following_i
 
 #[cfg(unix)]
 #[tokio::test]
-async fn p01_b06_contract_world_backup_rejects_links_and_cleans_staging() {
+async fn native_filesystem_contract_world_backup_rejects_links_and_cleans_staging() {
     use std::os::unix::fs::symlink;
 
     let fixture = TestFixture::new("world-backup-link");
@@ -1733,7 +1733,7 @@ async fn p01_b06_contract_world_backup_rejects_links_and_cleans_staging() {
 }
 
 #[tokio::test]
-async fn p01_b06_contract_world_backup_rejects_source_mutation_without_publication() {
+async fn native_filesystem_contract_world_backup_rejects_source_mutation_without_publication() {
     let fixture = TestFixture::new("world-backup-source-mutation");
     let instance = fixture
         .state
@@ -1778,7 +1778,7 @@ async fn p01_b06_contract_world_backup_rejects_source_mutation_without_publicati
 }
 
 #[tokio::test]
-async fn p01_b06_contract_world_backup_cleans_stage_after_storage_exhaustion() {
+async fn native_filesystem_contract_world_backup_cleans_stage_after_storage_exhaustion() {
     let fixture = TestFixture::new("world-backup-storage-full");
     let instance = fixture
         .state
@@ -1820,7 +1820,7 @@ async fn p01_b06_contract_world_backup_cleans_stage_after_storage_exhaustion() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn p01_b06_contract_world_backup_refuses_source_binding_replacement() {
+async fn native_filesystem_contract_world_backup_refuses_source_binding_replacement() {
     let fixture = TestFixture::new("world-backup-source-replacement");
     let instance = fixture
         .state
@@ -1865,7 +1865,7 @@ async fn p01_b06_contract_world_backup_refuses_source_binding_replacement() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn p01_b06_contract_world_backup_refuses_destination_binding_replacement() {
+async fn native_filesystem_contract_world_backup_refuses_destination_binding_replacement() {
     let fixture = TestFixture::new("world-backup-destination-replacement");
     let instance = fixture
         .state
@@ -1909,7 +1909,7 @@ async fn p01_b06_contract_world_backup_refuses_destination_binding_replacement()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn p01_b06_contract_cross_owner_world_backup_survives_request_cancellation() {
+async fn native_filesystem_contract_cross_owner_world_backup_survives_request_cancellation() {
     let fixture = TestFixture::new("world-backup-request-cancellation");
     let instance = fixture
         .state
@@ -3279,7 +3279,7 @@ async fn normal_setup_transaction_creates_and_queues_once() {
 }
 
 #[tokio::test]
-async fn p00_b07_contract_cross_owner_setup_uses_exact_create_prerequisite() {
+async fn behavior_contract_cross_owner_setup_uses_exact_create_prerequisite() {
     let fixture = TestFixture::new("setup-exact-create-prerequisite");
     fixture.configure_create_manifest(&["1.21.2"]);
     seed_committed_busy_install(&fixture.state, "busy-setup-prerequisite").await;
@@ -4423,7 +4423,7 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
 }
 
 #[tokio::test]
-async fn p00_b07_contract_cross_owner_create_response_uses_one_exact_queue_projection() {
+async fn behavior_contract_cross_owner_create_response_uses_one_exact_queue_projection() {
     let fixture = TestFixture::new("create-vanilla-queue");
     write_version_manifest_cache(&fixture.state, &["1.21.2"]);
     seed_committed_busy_install(&fixture.state, "busy-queue").await;

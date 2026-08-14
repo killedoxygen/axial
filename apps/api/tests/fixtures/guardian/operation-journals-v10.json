@@ -1,181 +1,142 @@
 {
-  "schema": "axial.state.operation_journals.v9",
+  "schema": "axial.state.operation_journals.v10",
   "next_sequence": 8,
   "entries": [
     {
-      "journal_id": "guardian-vocabulary-journal-01",
-      "operation_id": "op-7a88fb8e-c72c-47f7-a1af-86d513bc4004",
+      "journal_id": "journal-op-11111111-1111-4111-8111-111111111111",
+      "operation_id": "op-11111111-1111-4111-8111-111111111111",
       "sequence": 1,
       "command": "ValidateInstance",
       "intent": {
         "kind": "generic"
       },
-      "status": "Planned",
-      "owner": "Guardian",
+      "status": "Succeeded",
+      "owner": "Application",
       "ownership": "LauncherManaged",
-      "targets": [],
-      "planned_steps": [
+      "targets": [
         {
-          "step_id": "pin_guardian_diagnoses_01",
-          "phase": "Planning",
-          "result": "Planned",
-          "changed_target": null,
-          "generated_facts": [],
-          "rollback": "NotApplicable"
+          "system": "State",
+          "kind": "Instance",
+          "id": "0123456789abcdef",
+          "ownership": "LauncherManaged"
         }
       ],
-      "completed_steps": [],
+      "planned_steps": [],
+      "completed_steps": [
+        {
+          "step_id": "tier2_integrity_sweep",
+          "phase": "Validating",
+          "result": "Completed",
+          "changed_target": null,
+          "generated_facts": [],
+          "rollback": "NotApplicable",
+          "guardian_fact_ids": [
+            "artifact_checksum_mismatch"
+          ],
+          "metrics": {
+            "kind": "tier2_integrity",
+            "values": {
+              "selected_entry_count": 3,
+              "verified_entry_count": 1,
+              "processed_entry_count": 2,
+              "hashed_entry_count": 1,
+              "expected_content_byte_count": 4096,
+              "content_read_byte_count": 2048,
+              "metadata_lookup_count": 1,
+              "link_lookup_count": 1,
+              "suppressed_fact_count": 1
+            }
+          }
+        }
+      ],
       "failure_point": null,
       "rollback": "NotApplicable",
       "guardian_diagnosis_ids": [
-        "artifact_ownership_unsafe",
-        "atomic_promotion_failed",
-        "download_unavailable",
-        "filesystem_permission_denied",
-        "install_artifact_metadata_invalid",
-        "install_dependency_failed",
-        "install_execution_failed",
-        "install_processor_failed",
-        "java_override_unavailable",
-        "java_probe_failed",
-        "java_runtime_major_mismatch",
-        "java_runtime_update_too_old",
-        "jvm_arg_unsafe_override",
-        "jvm_arg_unsupported",
-        "jvm_args_empty",
-        "jvm_args_malformed",
-        "launcher_managed_artifact_corrupt",
-        "launcher_managed_artifact_signature_corrupt",
-        "managed_runtime_corrupt",
-        "managed_runtime_missing",
-        "managed_runtime_rosetta_required",
-        "managed_runtime_unavailable_for_platform",
-        "performance_fallback_selected",
-        "performance_rules_invalid",
-        "performance_user_owned_conflict"
+        "launcher_managed_artifact_corrupt"
       ],
-      "outcome": null,
+      "outcome": "Succeeded",
       "reconciliation_attempt": null,
       "reconciliation_terminal": null,
       "persisted_state_repair_attempt": null,
-      "persisted_state_repair_terminal": null
+      "persisted_state_repair_terminal": null,
+      "guardian_install_terminal": null
     },
     {
-      "journal_id": "guardian-vocabulary-journal-02",
-      "operation_id": "op-da45a5bb-a53e-4ab1-af3d-3db5ad6d732f",
+      "journal_id": "journal-op-22222222-2222-4222-8222-222222222222",
+      "operation_id": "op-22222222-2222-4222-8222-222222222222",
       "sequence": 2,
-      "command": "ValidateInstance",
+      "command": "InstallVersion",
       "intent": {
         "kind": "generic"
       },
-      "status": "Planned",
-      "owner": "Guardian",
+      "status": "Failed",
+      "owner": "Application",
       "ownership": "LauncherManaged",
-      "targets": [],
-      "planned_steps": [
+      "targets": [
         {
-          "step_id": "pin_guardian_diagnoses_02",
-          "phase": "Planning",
-          "result": "Planned",
-          "changed_target": null,
-          "generated_facts": [],
-          "rollback": "NotApplicable"
+          "system": "Execution",
+          "kind": "Artifact",
+          "id": "minecraft_client_1.21.5",
+          "ownership": "LauncherManaged"
         }
       ],
-      "completed_steps": [],
-      "failure_point": null,
+      "planned_steps": [],
+      "completed_steps": [
+        {
+          "step_id": "content_progress_download",
+          "phase": "Downloading",
+          "result": "Failed",
+          "changed_target": null,
+          "generated_facts": [],
+          "rollback": "NotApplicable",
+          "guardian_fact_ids": [
+            "download_provider_unavailable"
+          ],
+          "metrics": {
+            "kind": "content_download",
+            "values": {
+              "checksum_mismatch": 0,
+              "metadata_invalid": 0,
+              "metadata_missing": 0,
+              "interrupted": 1,
+              "network_failure": 1,
+              "permission_failure": 0,
+              "promote_failed": 0,
+              "provider_failure": 1,
+              "size_mismatch": 0,
+              "temp_discarded": 1,
+              "temp_write_failed": 0,
+              "written_to_temp": 0,
+              "promoted": 0
+            }
+          }
+        }
+      ],
+      "failure_point": "content_progress_download",
       "rollback": "NotApplicable",
       "guardian_diagnosis_ids": [
-        "persisted_state_schema_invalid",
-        "process_lifecycle_observed",
-        "temp_file_write_failed",
-        "installed_version_metadata_missing",
-        "parent_version_metadata_missing",
-        "install_incomplete",
-        "client_jar_missing",
-        "libraries_missing",
-        "asset_index_missing",
-        "launch_memory_min_clamped",
-        "launch_memory_allocation_low",
-        "launch_resource_memory_pressure",
-        "launch_resource_cpu_pressure",
-        "launch_resource_install_pressure",
-        "launch_resource_disk_pressure",
-        "custom_java_override_present",
-        "custom_jvm_preset_present",
-        "custom_jvm_args_present",
-        "performance_health_invalid",
-        "jvm_preset_adjusted",
-        "launch_prepare_failed",
-        "startup_stalled",
-        "out_of_memory",
-        "graphics_driver_crash",
-        "missing_dependency"
+        "download_unavailable"
       ],
-      "outcome": null,
+      "outcome": "Failed",
       "reconciliation_attempt": null,
       "reconciliation_terminal": null,
       "persisted_state_repair_attempt": null,
-      "persisted_state_repair_terminal": null
-    },
-    {
-      "journal_id": "guardian-vocabulary-journal-03",
-      "operation_id": "op-9235210f-28ba-4c5f-9a1b-ce00f52f79bb",
-      "sequence": 3,
-      "command": "ValidateInstance",
-      "intent": {
-        "kind": "generic"
-      },
-      "status": "Planned",
-      "owner": "Guardian",
-      "ownership": "LauncherManaged",
-      "targets": [],
-      "planned_steps": [
-        {
-          "step_id": "pin_guardian_diagnoses_03",
-          "phase": "Planning",
-          "result": "Planned",
-          "changed_target": null,
-          "generated_facts": [],
-          "rollback": "NotApplicable"
+      "persisted_state_repair_terminal": null,
+      "guardian_install_terminal": {
+        "diagnosis_id": "download_unavailable",
+        "action": "Retry",
+        "memory": {
+          "binding": "e5305877140668490671d224ad398d02a0013ba04bab32a748109abe79aeff25",
+          "target": {
+            "system": "Execution",
+            "kind": "Artifact",
+            "id": "minecraft_client_1.21.5",
+            "ownership": "LauncherManaged"
+          },
+          "observed_at": "2026-08-13T10:00:00.000Z",
+          "suppression_until": "2026-08-13T10:05:00.000Z"
         }
-      ],
-      "completed_steps": [],
-      "failure_point": null,
-      "rollback": "NotApplicable",
-      "guardian_diagnosis_ids": [
-        "mod_transformation_failure",
-        "mod_attributed_crash",
-        "classpath_module_conflict",
-        "auth_mode_incompatible",
-        "loader_bootstrap_failure",
-        "startup_failed_unknown",
-        "java_runtime_recovery",
-        "jvm_preset_recovery",
-        "unknown",
-        "jvm_unsupported_option",
-        "jvm_experimental_unlock",
-        "jvm_option_ordering",
-        "java_runtime_mismatch",
-        "launcher_managed_artifact_signature",
-        "unknown_failure_startup",
-        "unknown_failure_planning",
-        "unknown_failure_validating",
-        "unknown_failure_downloading",
-        "unknown_failure_installing",
-        "unknown_failure_preparing",
-        "unknown_failure_launching",
-        "unknown_failure_running",
-        "unknown_failure_repairing",
-        "unknown_failure_rolling_back",
-        "unknown_failure_completed",
-        "unknown_failure_failed"
-      ],
-      "outcome": null,
-      "reconciliation_attempt": null,
-      "reconciliation_terminal": null,
-      "persisted_state_repair_attempt": null,
-      "persisted_state_repair_terminal": null
+      }
     },
     {
       "journal_id": "guardian-reconciliation-journal-artifact",
@@ -209,7 +170,9 @@
           "result": "Planned",
           "changed_target": null,
           "generated_facts": [],
-          "rollback": "NotApplicable"
+          "rollback": "NotApplicable",
+          "guardian_fact_ids": [],
+          "metrics": null
         }
       ],
       "completed_steps": [
@@ -224,7 +187,11 @@
             "ownership": "LauncherManaged"
           },
           "generated_facts": [],
-          "rollback": "NotApplicable"
+          "rollback": "NotApplicable",
+          "guardian_fact_ids": [
+            "artifact_hash_mismatch"
+          ],
+          "metrics": null
         }
       ],
       "failure_point": "artifact_repair_failed",
@@ -293,7 +260,8 @@
         "version_bundle_publication": null
       },
       "persisted_state_repair_attempt": null,
-      "persisted_state_repair_terminal": null
+      "persisted_state_repair_terminal": null,
+      "guardian_install_terminal": null
     },
     {
       "journal_id": "guardian-reconciliation-journal-component",
@@ -327,7 +295,9 @@
           "result": "Planned",
           "changed_target": null,
           "generated_facts": [],
-          "rollback": "NotApplicable"
+          "rollback": "NotApplicable",
+          "guardian_fact_ids": [],
+          "metrics": null
         }
       ],
       "completed_steps": [
@@ -342,7 +312,11 @@
             "ownership": "LauncherManaged"
           },
           "generated_facts": [],
-          "rollback": "NotApplicable"
+          "rollback": "NotApplicable",
+          "guardian_fact_ids": [
+            "managed_runtime_corrupt"
+          ],
+          "metrics": null
         }
       ],
       "failure_point": null,
@@ -425,7 +399,8 @@
         "version_bundle_publication": null
       },
       "persisted_state_repair_attempt": null,
-      "persisted_state_repair_terminal": null
+      "persisted_state_repair_terminal": null,
+      "guardian_install_terminal": null
     },
     {
       "journal_id": "journal-op-4df6e859-e903-44bf-86e9-d1a4e30e4518",
@@ -476,7 +451,8 @@
       "reconciliation_attempt": null,
       "reconciliation_terminal": null,
       "persisted_state_repair_attempt": null,
-      "persisted_state_repair_terminal": null
+      "persisted_state_repair_terminal": null,
+      "guardian_install_terminal": null
     }
   ]
 }

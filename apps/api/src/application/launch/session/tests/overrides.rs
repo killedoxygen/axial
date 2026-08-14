@@ -329,7 +329,8 @@ async fn runtime_repreflight_shape_reuses_the_flow_receipt() {
         },
         None,
     )
-    .await;
+    .await
+    .expect("valid initial launch preflight evidence");
     let receipt = initial.java_probe_receipt.take().expect("initial receipt");
     let rebuilt = build_launch_preflight_facts(
         &fixture.state,
@@ -346,7 +347,8 @@ async fn runtime_repreflight_shape_reuses_the_flow_receipt() {
         },
         Some(receipt),
     )
-    .await;
+    .await
+    .expect("valid rebuilt launch preflight evidence");
 
     assert!(rebuilt.java_probe_receipt.is_some());
     assert_eq!(read_probe_count(&count_file), 1);

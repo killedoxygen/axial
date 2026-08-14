@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b03_contract_json_rejections_are_bounded_before_handler_execution() {
+    async fn behavior_contract_json_rejections_are_bounded_before_handler_execution() {
         let effects = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route("/json", post(json_handler))
@@ -221,7 +221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b03_contract_cross_owner_query_and_optional_json_use_the_same_boundary() {
+    async fn behavior_contract_cross_owner_query_and_optional_json_use_the_same_boundary() {
         let effects = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route("/query", get(query_handler))

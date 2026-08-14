@@ -21,7 +21,7 @@ import test from 'node:test';
  */
 
 const repositoryRoot = basename(process.cwd()) === 'frontend' ? resolve(process.cwd(), '..') : process.cwd();
-const manifestPath = 'apps/api/src/routes/P02_B08_ROUTES.tsv';
+const manifestPath = 'apps/api/src/routes/route-manifest.tsv';
 const manifestHeader = [
   'method',
   'template',
@@ -183,7 +183,7 @@ function expectedAuth(route) {
   return 'capability';
 }
 
-test('P02-B08 manifest exactly freezes every non-fallback production API method and template', async () => {
+test('route-manifest manifest exactly freezes every non-fallback production API method and template', async () => {
   const [manifestSource, rustPaths] = await Promise.all([read(manifestPath), rustSourcesBelow('apps/api/src/routes')]);
   const manifest = parseManifest(manifestSource);
   /** @type {RegisteredRoute[]} */
@@ -194,7 +194,11 @@ test('P02-B08 manifest exactly freezes every non-fallback production API method 
   }
   registered.sort(compareRoutes);
 
-  assert.equal(manifest.length, 122, 'the frozen P02-B08 production surface must contain 122 method/template pairs');
+  assert.equal(
+    manifest.length,
+    122,
+    'the frozen route-manifest production surface must contain 122 method/template pairs',
+  );
   assert.deepEqual(
     manifest.map(({ method, registration_source, template }) => ({ method, registration_source, template })),
     registered,
@@ -231,7 +235,7 @@ test('P02-B08 manifest exactly freezes every non-fallback production API method 
   }
 });
 
-test('P02-B08 manifest binds every route to an exact caller fragment or explicit internal designation', async () => {
+test('route-manifest manifest binds every route to an exact caller fragment or explicit internal designation', async () => {
   const manifest = parseManifest(await read(manifestPath));
   /** @type {Map<string, string>} */
   const cachedSources = new Map();

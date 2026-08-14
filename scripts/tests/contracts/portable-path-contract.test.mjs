@@ -25,7 +25,7 @@ const occurrences = (source, needle) => {
   return positions;
 };
 
-test("P01-B01 has one typed portable path and identity owner", async () => {
+test("portable-identity has one typed portable path and identity owner", async () => {
   const [
     workspace,
     minecraftManifest,

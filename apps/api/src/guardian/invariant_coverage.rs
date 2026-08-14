@@ -1,4 +1,3 @@
-use super::assess_install_artifact_failure;
 use super::launch_decision::failure_class_matrix_decision;
 use super::persisted_state_repair::{
     PERSISTED_STATE_REPAIR_CANDIDATES, persisted_state_startup_policy_cells,
@@ -6,11 +5,10 @@ use super::persisted_state_repair::{
 use super::repair_authorization::repair_hand_coverage;
 use super::rules::DIAGNOSIS_RULES;
 use super::{
-    DiagnosisId, GuardianActionKind, GuardianFactId, GuardianInstallArtifactFailureEvidence,
-    GuardianInstallArtifactFailureKind, GuardianMode, GuardianPrepareFailureRequest,
-    GuardianStartupFailureObservation, GuardianStartupFailureRequest, guardian_fact_from_execution,
+    DiagnosisId, GuardianActionKind, GuardianFact, GuardianFactId, GuardianMode,
+    GuardianPrepareFailureRequest, GuardianStartupFailureObservation,
+    GuardianStartupFailureRequest, OperationEvidenceBatch, assess_install_failure,
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
-    install_artifact_failure_guardian_fact,
 };
 use crate::application::install::loader_install_guardian_evidence_kind;
 use crate::application::launch::readiness_guardian_facts_for_coverage;
@@ -18,7 +16,7 @@ use crate::application::timing::{
     INTEGRITY_TIER0_CEILING_MS, LAUNCH_PREFLIGHT_SENSE_TIMING_SIGNAL, LaunchPreflightSenseId,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind, ExecutionFactSemantics};
-use crate::observability::evidence_text_looks_sensitive;
+use crate::observability::{EvidenceField, EvidenceSensitivity, evidence_text_looks_sensitive};
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, ReconciliationRung, StabilizationSystem, TargetDescriptor,
     TargetKind,
@@ -33,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
-const SCHEMA: &str = "axial.guardian.invariant_coverage.v4";
+const SCHEMA: &str = "axial.guardian.invariant_coverage.v5";
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE";
 const EXPECTED_DECISION_COUNTS: [(GuardianActionKind, usize); 5] = [
     (GuardianActionKind::Block, 196),
@@ -159,7 +157,6 @@ struct PreflightSenseCoverage {
 #[serde(deny_unknown_fields)]
 struct AdapterCoverage {
     execution: Vec<ExecutionAdapterCell>,
-    install: Vec<AdapterCell>,
     loader_active_install: Vec<LoaderActiveInstallAdapterCell>,
     loader_pre_operation: Vec<LoaderBoundaryAdapterCell>,
     readiness: Vec<AdapterCell>,
@@ -186,7 +183,7 @@ struct ExecutionAdapterCell {
 struct LoaderActiveInstallAdapterCell {
     source: String,
     phase: String,
-    evidence_kind: String,
+    execution_fact_kind: String,
     fact: String,
     diagnosis: String,
     target_kind: String,
@@ -219,12 +216,12 @@ struct ReconciliationHandCoverage {
 #[serde(deny_unknown_fields)]
 struct DeferredDemonstration {
     invariant: String,
-    phase: String,
+    capability: String,
     status: String,
 }
 
 #[test]
-fn p00_b09_contract_guardian_invariant_coverage_artifacts_match_v4() {
+fn guardian_invariant_coverage_artifacts_match_typed_evidence_schema() {
     let generated = generate_coverage();
     let expected_json =
         std::fs::read(json_fixture_path()).expect("read Guardian invariant fixture");
@@ -269,29 +266,44 @@ fn generate_coverage() -> InvariantCoverage {
     InvariantCoverage {
         schema: SCHEMA.to_string(),
         invariants: vec![
-            invariant("I1", "launch_failure_matrix_and_rules_registered"),
             invariant(
-                "I2",
+                "launch-failure-matrix",
+                "launch_failure_matrix_and_rules_registered",
+            ),
+            invariant(
+                "guardian-reconciliation",
                 "current_guardian_reconciliation_and_persisted_state_repair_typed_hands_registered",
             ),
-            invariant("I3", "public_launch_failure_guidance_complete"),
             invariant(
-                "I4",
+                "launch-failure-guidance",
+                "public_launch_failure_guidance_complete",
+            ),
+            invariant(
+                "repair-attempt-bounds",
                 "current_guardian_reconciliation_and_persisted_state_repair_hand_attempt_bounds_registered",
             ),
-            invariant("I5", "launch_failure_surfaces_bounded_and_redacted"),
-            invariant("I6", "implemented_memory_trigger_rules_registered"),
             invariant(
-                "I7",
+                "bounded-failure-surfaces",
+                "launch_failure_surfaces_bounded_and_redacted",
+            ),
+            invariant(
+                "memory-trigger-rules",
+                "implemented_memory_trigger_rules_registered",
+            ),
+            invariant(
+                "loader-worker-dispatch",
                 "typed_loader_worker_delegated_dispatch_and_named_boundary_single_assessment_complete",
             ),
             invariant(
-                "I8",
+                "warm-cache-integrity",
                 "preflight_costs_declared_reviewed_warm_cache_tier0_rotational_measurement",
             ),
-            invariant("I9", "reserved_facts_unused_agent_demo_pending_phase_5"),
             invariant(
-                "I10",
+                "agent-fallback-reservation",
+                "reserved_facts_unused_agent_fallback_demonstration_pending",
+            ),
+            invariant(
+                "persisted-repair-durability",
                 "persisted_state_repair_durability_and_fail_closed_restart_contract_registered",
             ),
         ],
@@ -311,7 +323,6 @@ fn generate_coverage() -> InvariantCoverage {
         preflight_senses: preflight_sense_coverage(),
         adapters: AdapterCoverage {
             execution: execution_adapter_coverage(),
-            install: install_adapter_coverage(),
             loader_active_install: loader_active_install_adapter_coverage(),
             loader_pre_operation: loader_pre_operation_adapter_coverage(),
             readiness: readiness_adapter_coverage(),
@@ -326,9 +337,9 @@ fn generate_coverage() -> InvariantCoverage {
             .collect(),
         reconciliation_hands,
         deferred_demonstrations: vec![DeferredDemonstration {
-            invariant: "I9".to_string(),
-            phase: "phase_5".to_string(),
-            status: "agent_fallback_execution_pending".to_string(),
+            invariant: "agent-fallback-reservation".to_string(),
+            capability: "agent_fallback_execution".to_string(),
+            status: "pending".to_string(),
         }],
     }
 }
@@ -679,7 +690,7 @@ fn fact_coverage() -> Vec<FactCoverage> {
         .map(|fact| FactCoverage {
             fact: fact_name(fact),
             availability: if RESERVED_AGENT_FACTS.contains(fact) {
-                "reserved_phase_5".to_string()
+                "reserved_for_agent_fallback".to_string()
             } else {
                 "registered_current".to_string()
             },
@@ -700,7 +711,7 @@ fn preflight_sense_coverage() -> Vec<PreflightSenseCoverage> {
             measurement_status: if *sense == LaunchPreflightSenseId::IntegrityTier0 {
                 "reviewed_warm_metadata_cache_rotational_measurement"
             } else {
-                "pending_phase_4"
+                "measurement_pending"
             }
             .to_string(),
             ceiling_ms: (*sense == LaunchPreflightSenseId::IntegrityTier0)
@@ -732,20 +743,18 @@ fn execution_adapter_coverage() -> Vec<ExecutionAdapterCell> {
     ExecutionFactKind::ALL
         .iter()
         .map(|kind| {
-            let fact = guardian_fact_from_execution(
-                &ExecutionFact {
-                    operation_id: None,
-                    kind: *kind,
-                    target: Some(TargetDescriptor::new(
-                        StabilizationSystem::Execution,
-                        TargetKind::Artifact,
-                        "coverage_target",
-                        OwnershipClass::LauncherManaged,
-                    )),
-                    fields: Vec::new(),
-                },
-                OperationPhase::Validating,
+            let execution_fact = execution_fact_for_coverage(
+                *kind,
+                OwnershipClass::LauncherManaged,
+                TargetKind::Artifact,
+                Vec::new(),
             );
+            let batch = OperationEvidenceBatch::try_from_execution_unscoped(
+                OperationPhase::Validating,
+                std::slice::from_ref(&execution_fact),
+            )
+            .expect("registered execution fact reaches a bounded Guardian batch");
+            let fact = only_guardian_fact(&batch);
             assert!(guardian_fact_is_registered(&fact.id));
             let diagnoses = DIAGNOSIS_RULES
                 .iter()
@@ -786,43 +795,35 @@ fn execution_adapter_coverage() -> Vec<ExecutionAdapterCell> {
         .collect()
 }
 
-fn install_adapter_coverage() -> Vec<AdapterCell> {
-    GuardianInstallArtifactFailureKind::ALL
-        .iter()
-        .map(|kind| {
-            let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-                None,
-                "coverage_artifact",
-                *kind,
-            );
-            let fact =
-                install_artifact_failure_guardian_fact(&evidence, OperationPhase::Installing);
-            assert!(guardian_fact_is_registered(&fact.id));
-            AdapterCell {
-                source: debug_name(kind),
-                fact: fact_name(&fact.id),
-            }
-        })
-        .collect()
-}
-
 fn loader_active_install_adapter_coverage() -> Vec<LoaderActiveInstallAdapterCell> {
     LoaderInstallFailureKind::ALL
         .iter()
         .map(|failure_kind| {
             let source = debug_name(failure_kind);
             let (kind, ownership, phase) = loader_install_guardian_evidence_kind(*failure_kind);
-            let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-                None,
-                "coverage_loader_version",
+            let execution_fact = execution_fact_for_coverage(
                 kind,
+                ownership,
+                execution_target_kind(kind),
+                vec![EvidenceField::new(
+                    "failure_kind",
+                    failure_kind.as_str(),
+                    EvidenceSensitivity::Public,
+                )],
+            );
+            let evidence = OperationEvidenceBatch::try_from_execution_unscoped(
+                phase,
+                std::slice::from_ref(&execution_fact),
             )
-            .with_ownership(ownership)
-            .with_field("failure_kind", failure_kind.as_str());
-            let fact = install_artifact_failure_guardian_fact(&evidence, phase);
-            let assessment =
-                assess_install_artifact_failure(None, GuardianMode::Managed, phase, &[evidence])
-                    .expect("active loader evidence reaches a Guardian assessment");
+            .expect("active loader execution fact reaches a bounded Guardian batch");
+            let fact = only_guardian_fact(&evidence);
+            let assessment = assess_install_failure(
+                GuardianMode::Managed,
+                phase,
+                &evidence,
+                super::GuardianPolicyContext::current_operation(),
+            )
+            .expect("active loader evidence reaches a Guardian assessment");
             let outcome = assessment
                 .terminal_outcome()
                 .expect("active loader assessment has a terminal outcome");
@@ -837,7 +838,7 @@ fn loader_active_install_adapter_coverage() -> Vec<LoaderActiveInstallAdapterCel
             LoaderActiveInstallAdapterCell {
                 source,
                 phase: debug_name(&phase),
-                evidence_kind: debug_name(&kind),
+                execution_fact_kind: kind.as_str().to_string(),
                 fact: fact_name(&fact.id),
                 diagnosis: outcome.diagnosis_id.as_str().to_string(),
                 target_kind: debug_name(
@@ -850,6 +851,43 @@ fn loader_active_install_adapter_coverage() -> Vec<LoaderActiveInstallAdapterCel
             }
         })
         .collect()
+}
+
+fn execution_fact_for_coverage(
+    kind: ExecutionFactKind,
+    ownership: OwnershipClass,
+    target_kind: TargetKind,
+    fields: Vec<EvidenceField>,
+) -> ExecutionFact {
+    ExecutionFact {
+        operation_id: None,
+        kind,
+        target: Some(TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            target_kind,
+            "coverage_target",
+            ownership,
+        )),
+        fields,
+    }
+}
+
+fn execution_target_kind(kind: ExecutionFactKind) -> TargetKind {
+    match kind {
+        ExecutionFactKind::RuntimeRosettaRequired
+        | ExecutionFactKind::RuntimeUnavailableForPlatform => TargetKind::Runtime,
+        ExecutionFactKind::InstallExecutionFailed | ExecutionFactKind::InstallProcessorFailed => {
+            TargetKind::Version
+        }
+        _ => TargetKind::Artifact,
+    }
+}
+
+fn only_guardian_fact(evidence: &OperationEvidenceBatch) -> &GuardianFact {
+    let [fact] = evidence.facts() else {
+        panic!("single execution fact must map to one Guardian fact")
+    };
+    fact
 }
 
 fn loader_pre_operation_adapter_coverage() -> Vec<LoaderBoundaryAdapterCell> {
@@ -907,7 +945,7 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
          # Guardian Invariant Coverage\n\n\
          This document is a deterministic human-readable projection of Guardian's strict invariant coverage artifact. The JSON artifact remains the complete machine-readable inventory, including all kernel cells.\n\n\
          - Schema: `{}`\n\
-         - Machine-readable artifact: [guardian-invariant-coverage-v4.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v4.json)\n\
+         - Machine-readable artifact: [guardian-invariant-coverage-v5.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v5.json)\n\
          - Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test --locked -p axial-api --no-default-features regenerate_guardian_invariant_coverage_artifacts -- --ignored`\n\n\
          ## Invariant Status\n",
         snapshot.schema
@@ -927,7 +965,6 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
         .filter(|cell| cell.public_surface)
         .count();
     let adapter_sources = snapshot.adapters.execution.len()
-        + snapshot.adapters.install.len()
         + snapshot.adapters.loader_active_install.len()
         + snapshot.adapters.loader_pre_operation.len()
         + snapshot.adapters.readiness.len();
@@ -1118,11 +1155,11 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
     document.push_str("\n## Deferred Demonstrations\n");
     markdown_table(
         &mut document,
-        &["Invariant", "Phase", "Status"],
+        &["Invariant", "Capability", "Status"],
         snapshot.deferred_demonstrations.iter().map(|item| {
             vec![
                 item.invariant.clone(),
-                item.phase.clone(),
+                item.capability.clone(),
                 item.status.clone(),
             ]
         }),
@@ -1162,7 +1199,7 @@ fn markdown_cell(value: &str) -> String {
 
 fn json_fixture_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/guardian/guardian-invariant-coverage-v4.json")
+        .join("tests/fixtures/guardian/guardian-invariant-coverage-v5.json")
 }
 
 fn markdown_document_path() -> std::path::PathBuf {

@@ -1,23 +1,15 @@
 use super::{
-    DiagnosisId, FactReliability, GuardianDecision, GuardianFact, GuardianFactId, GuardianMode,
-    GuardianPolicyContext, build_safety_case, decide_guardian_policy, diagnose,
-    guardian_fact_from_execution,
+    FactReliability, GuardianDecision, GuardianFact, GuardianFactId, GuardianMode,
+    GuardianPolicyContext, OperationEvidenceBatch, OperationEvidenceBatchRejection,
+    assess_operation_evidence,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
+use crate::state::RegisteredArtifactRepairCandidate;
+use crate::state::contracts::DurableGuardianEvidence;
 use crate::state::contracts::{OperationId, OperationPhase, OwnershipClass};
-use crate::state::{
-    MAX_OPERATION_JOURNAL_DIAGNOSES, MAX_OPERATION_JOURNAL_STEP_FACTS,
-    RegisteredArtifactRepairCandidate,
-};
-use std::collections::HashSet;
-
-pub(crate) const TIER2_INTEGRITY_COUNTER_TOKEN_COUNT: usize = 9;
-const MAX_TIER2_INTEGRITY_FACT_IDS: usize =
-    MAX_OPERATION_JOURNAL_STEP_FACTS - TIER2_INTEGRITY_COUNTER_TOKEN_COUNT;
 
 pub(crate) struct Tier2IntegrityGuardianEvidence {
-    fact_ids: Vec<String>,
-    diagnosis_ids: Vec<DiagnosisId>,
+    durable: Option<DurableGuardianEvidence>,
 }
 
 pub(crate) struct Tier2RegisteredArtifactAssessment {
@@ -32,53 +24,47 @@ impl Tier2RegisteredArtifactAssessment {
 
 impl Tier2IntegrityGuardianEvidence {
     pub(crate) fn empty() -> Self {
-        Self {
-            fact_ids: Vec::new(),
-            diagnosis_ids: Vec::new(),
-        }
+        Self { durable: None }
     }
 
-    pub(crate) fn fact_ids(&self) -> &[String] {
-        &self.fact_ids
-    }
-
-    pub(crate) fn diagnosis_ids(&self) -> &[DiagnosisId] {
-        &self.diagnosis_ids
+    pub(crate) fn durable(&self) -> Option<&DurableGuardianEvidence> {
+        self.durable.as_ref()
     }
 }
 
+pub(crate) fn try_tier2_integrity_guardian_evidence(
+    operation_id: &OperationId,
+    execution_facts: &[ExecutionFact],
+) -> Result<Tier2IntegrityGuardianEvidence, OperationEvidenceBatchRejection> {
+    let evidence = OperationEvidenceBatch::try_from_execution_operation(
+        operation_id,
+        OperationPhase::Validating,
+        execution_facts,
+    )?;
+    if evidence.facts().is_empty() {
+        return Ok(Tier2IntegrityGuardianEvidence::empty());
+    }
+    let assessment = assess_operation_evidence(
+        GuardianMode::Managed,
+        OperationPhase::Validating,
+        &evidence,
+        GuardianPolicyContext::current_operation(),
+    );
+    let durable = assessment
+        .durable_evidence(&evidence, None)
+        .map_err(|_| OperationEvidenceBatchRejection::SerializationFailed)?;
+    Ok(Tier2IntegrityGuardianEvidence {
+        durable: Some(durable),
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn tier2_integrity_guardian_evidence(
     operation_id: &OperationId,
     execution_facts: &[ExecutionFact],
 ) -> Tier2IntegrityGuardianEvidence {
-    let mut seen_fact_ids = HashSet::new();
-    let facts = execution_facts
-        .iter()
-        .filter_map(|fact| {
-            let fact = tier2_guardian_fact(operation_id, fact);
-            seen_fact_ids.insert(fact.id).then_some(fact)
-        })
-        .take(MAX_TIER2_INTEGRITY_FACT_IDS)
-        .collect::<Vec<_>>();
-    let fact_ids = facts
-        .iter()
-        .map(|fact| format!("guardian_fact:{}", fact.id.as_str()))
-        .collect();
-    let diagnosis_ids = if facts.is_empty() {
-        Vec::new()
-    } else {
-        let mut seen_diagnosis_ids = HashSet::new();
-        diagnose(&facts, OperationPhase::Validating)
-            .into_iter()
-            .map(|diagnosis| diagnosis.id())
-            .filter(|diagnosis_id| seen_diagnosis_ids.insert(*diagnosis_id))
-            .take(MAX_OPERATION_JOURNAL_DIAGNOSES)
-            .collect()
-    };
-    Tier2IntegrityGuardianEvidence {
-        fact_ids,
-        diagnosis_ids,
-    }
+    try_tier2_integrity_guardian_evidence(operation_id, execution_facts)
+        .expect("valid Tier 2 operation evidence")
 }
 
 pub(crate) fn assess_tier2_registered_artifact_repair(
@@ -99,10 +85,16 @@ pub(crate) fn assess_tier2_registered_artifact_repair(
     }
 
     let phase = OperationPhase::Validating;
-    let mut finding = tier2_guardian_fact(&operation_id, execution_fact);
+    let mapped = OperationEvidenceBatch::try_from_execution_operation(
+        &operation_id,
+        phase,
+        std::slice::from_ref(execution_fact),
+    )
+    .ok()?;
+    let mut finding = mapped.facts().first()?.clone();
     finding.domain = candidate.domain();
     let available = GuardianFact {
-        operation_id: Some(operation_id.clone()),
+        operation_id: None,
         id: GuardianFactId::RegisteredArtifactRepairAvailable,
         domain: candidate.domain(),
         phase,
@@ -113,31 +105,35 @@ pub(crate) fn assess_tier2_registered_artifact_repair(
         target: Some(candidate.target().clone()),
         fields: Vec::new(),
     };
-    let safety_case = build_safety_case(Some(operation_id), mode, phase, &[finding, available]);
+    let evidence = OperationEvidenceBatch::try_from_trusted_guardian_operation(
+        operation_id,
+        vec![finding, available],
+    )
+    .ok()?;
+    let assessment = assess_operation_evidence(
+        mode,
+        phase,
+        &evidence,
+        GuardianPolicyContext::current_operation(),
+    );
     Some(Tier2RegisteredArtifactAssessment {
-        decision: decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation()),
+        decision: assessment.decision().clone(),
     })
-}
-
-fn tier2_guardian_fact(operation_id: &OperationId, fact: &ExecutionFact) -> GuardianFact {
-    let mut fact = fact.clone();
-    fact.operation_id = Some(operation_id.clone());
-    guardian_fact_from_execution(&fact, OperationPhase::Validating)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::{ExecutionFactKind, ExecutionFactSemantics};
+    use crate::execution::ExecutionFactKind;
     use crate::guardian::{GuardianActionKind, GuardianDomain};
     use crate::observability::{EvidenceField, EvidenceSensitivity};
     use crate::state::contracts::{
         OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
 
-    fn execution_fact(kind: ExecutionFactKind) -> ExecutionFact {
+    fn execution_fact(operation_id: &OperationId, kind: ExecutionFactKind) -> ExecutionFact {
         ExecutionFact {
-            operation_id: Some(OperationId::deterministic_test("foreign-operation")),
+            operation_id: Some(operation_id.clone()),
             kind,
             target: Some(TargetDescriptor::new(
                 StabilizationSystem::Execution,
@@ -157,12 +153,17 @@ mod tests {
     fn tier_two_evidence_attaches_exact_operation_and_redacts_fields() {
         let operation_id = OperationId::deterministic_test("integrity-sweep-exact");
 
-        let fact = tier2_guardian_fact(
+        let execution_fact = execution_fact(&operation_id, ExecutionFactKind::ArtifactHashMismatch);
+        let batch = OperationEvidenceBatch::try_from_execution_operation(
             &operation_id,
-            &execution_fact(ExecutionFactKind::ArtifactHashMismatch),
-        );
+            OperationPhase::Validating,
+            std::slice::from_ref(&execution_fact),
+        )
+        .expect("exact operation batch");
+        let fact = batch.facts().first().expect("mapped fact");
 
-        assert_eq!(fact.operation_id, Some(operation_id));
+        assert_eq!(batch.operation_id(), Some(&operation_id));
+        assert_eq!(fact.operation_id, None);
         assert_eq!(fact.phase, OperationPhase::Validating);
         assert!(fact.fields.is_empty());
     }
@@ -171,26 +172,24 @@ mod tests {
     fn tier_two_evidence_deduplicates_before_diagnosis() {
         let operation_id = OperationId::deterministic_test("integrity-sweep-dedup");
         let facts = [
-            execution_fact(ExecutionFactKind::ArtifactHashMismatch),
-            execution_fact(ExecutionFactKind::ArtifactHashMismatch),
-            execution_fact(ExecutionFactKind::ArtifactMissing),
+            execution_fact(&operation_id, ExecutionFactKind::ArtifactHashMismatch),
+            execution_fact(&operation_id, ExecutionFactKind::ArtifactHashMismatch),
+            execution_fact(&operation_id, ExecutionFactKind::ArtifactMissing),
         ];
 
         let evidence = tier2_integrity_guardian_evidence(&operation_id, &facts);
+        let durable = evidence.durable().expect("typed durable evidence");
 
         assert_eq!(
-            evidence.fact_ids(),
+            durable.fact_ids(),
             &[
-                format!(
-                    "guardian_fact:{}",
-                    GuardianFactId::ArtifactHashMismatch.as_str()
-                ),
-                format!("guardian_fact:{}", GuardianFactId::ArtifactMissing.as_str()),
+                GuardianFactId::ArtifactHashMismatch,
+                GuardianFactId::ArtifactMissing,
             ]
         );
         assert_eq!(
-            evidence.diagnosis_ids(),
-            &[DiagnosisId::LauncherManagedArtifactCorrupt]
+            durable.diagnosis_ids(),
+            &[crate::guardian::DiagnosisId::LauncherManagedArtifactCorrupt]
         );
     }
 
@@ -201,32 +200,32 @@ mod tests {
             &[],
         );
 
-        assert!(evidence.fact_ids().is_empty());
-        assert!(evidence.diagnosis_ids().is_empty());
+        assert!(evidence.durable().is_none());
     }
 
     #[test]
-    fn tier_two_evidence_stays_within_journal_caps() {
-        let facts = ExecutionFactKind::ALL
-            .iter()
-            .copied()
-            .filter(|kind| kind.semantics() == ExecutionFactSemantics::Diagnostic)
-            .cycle()
-            .take(MAX_OPERATION_JOURNAL_STEP_FACTS * 3)
-            .map(execution_fact)
+    fn tier_two_evidence_rejects_foreign_operation_provenance() {
+        let operation_id = OperationId::deterministic_test("integrity-sweep-current");
+        let foreign = OperationId::deterministic_test("integrity-sweep-foreign");
+        let fact = execution_fact(&foreign, ExecutionFactKind::ArtifactMissing);
+
+        assert!(matches!(
+            try_tier2_integrity_guardian_evidence(&operation_id, &[fact]),
+            Err(OperationEvidenceBatchRejection::ForeignOperation { fact_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn tier_two_evidence_rejects_over_cap_corpus() {
+        let operation_id = OperationId::deterministic_test("integrity-sweep-capped");
+        let facts = (0..=crate::guardian::MAX_OPERATION_EVIDENCE_FACTS)
+            .map(|_| execution_fact(&operation_id, ExecutionFactKind::ArtifactMissing))
             .collect::<Vec<_>>();
 
-        let evidence = tier2_integrity_guardian_evidence(
-            &OperationId::deterministic_test("integrity-sweep-capped"),
-            &facts,
-        );
-
-        assert!(evidence.fact_ids().len() <= MAX_TIER2_INTEGRITY_FACT_IDS);
-        assert!(evidence.diagnosis_ids().len() <= MAX_OPERATION_JOURNAL_DIAGNOSES);
-        assert_eq!(
-            evidence.fact_ids().iter().collect::<HashSet<_>>().len(),
-            evidence.fact_ids().len()
-        );
+        assert!(matches!(
+            try_tier2_integrity_guardian_evidence(&operation_id, &facts),
+            Err(OperationEvidenceBatchRejection::TooManyFacts)
+        ));
     }
 
     #[test]
@@ -256,10 +255,14 @@ mod tests {
         ];
 
         for (kind, expected) in kinds {
-            assert_eq!(
-                tier2_guardian_fact(&operation_id, &execution_fact(kind)).id,
-                expected
-            );
+            let fact = execution_fact(&operation_id, kind);
+            let batch = OperationEvidenceBatch::try_from_execution_operation(
+                &operation_id,
+                OperationPhase::Validating,
+                std::slice::from_ref(&fact),
+            )
+            .expect("mapped Tier 2 batch");
+            assert_eq!(batch.facts().first().expect("mapped fact").id, expected);
         }
     }
 
@@ -271,8 +274,9 @@ mod tests {
             "leaf-v2.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef",
             OwnershipClass::LauncherManaged,
         );
+        let operation_id = OperationId::deterministic_test("tier-two-registered-artifact");
         let fact = ExecutionFact {
-            operation_id: None,
+            operation_id: Some(operation_id.clone()),
             kind: ExecutionFactKind::ArtifactHashMismatch,
             target: Some(target.clone()),
             fields: Vec::new(),
@@ -284,7 +288,7 @@ mod tests {
             (GuardianMode::Disabled, GuardianActionKind::RecordOnly),
         ] {
             let assessment = assess_tier2_registered_artifact_repair(
-                OperationId::deterministic_test("tier-two-registered-artifact"),
+                operation_id.clone(),
                 mode,
                 &fact,
                 RegisteredArtifactRepairCandidate::for_test(&target, GuardianDomain::Download),
@@ -324,8 +328,9 @@ mod tests {
             "leaf-v2.00000000.00000000.00000000.00000000.00000000.00000000.00000000.00000000",
             OwnershipClass::LauncherManaged,
         );
+        let operation_id = OperationId::deterministic_test("tier-two-fabricated-artifact");
         let fact = ExecutionFact {
-            operation_id: None,
+            operation_id: Some(operation_id.clone()),
             kind: ExecutionFactKind::ArtifactMissing,
             target: Some(fabricated),
             fields: Vec::new(),
@@ -333,7 +338,7 @@ mod tests {
 
         assert!(
             assess_tier2_registered_artifact_repair(
-                OperationId::deterministic_test("tier-two-fabricated-artifact"),
+                operation_id,
                 GuardianMode::Managed,
                 &fact,
                 RegisteredArtifactRepairCandidate::for_test(&target, GuardianDomain::Download),

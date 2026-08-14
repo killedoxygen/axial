@@ -26,14 +26,14 @@ const toolchainProfiles = Object.freeze(["frontend", "rust", "desktop"]);
 const scenarioPattern = /^(?:CP|PM)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/;
 const proofPattern = /^(?:CAP|PM)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/;
 const capabilityPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const phasePattern = /^P(?:0[0-9]|1[0-4])$/;
+const domainPattern = /^[a-z][a-z0-9-]{1,31}$/;
 const commitPattern = /^[0-9a-f]{40}$/;
 const hashPattern = /^[0-9a-f]{64}$/;
 const recordKeys = Object.freeze([
   "scenario_id",
   "proof_id",
   "capability_id",
-  "owner_phase",
+  "owner_domain",
   "toolchain_profile",
   "allowed_platforms",
   "timeout_ms",
@@ -129,7 +129,7 @@ async function validateRegistryStructure(registry, options) {
     validateBoundedId(source.scenario_id, scenarioPattern, "invalid_scenario_id");
     validateBoundedId(source.proof_id, proofPattern, "invalid_proof_id");
     validateBoundedId(source.capability_id, capabilityPattern, "invalid_capability_id");
-    if (!phasePattern.test(source.owner_phase)) fail("invalid_owner_phase");
+    if (!domainPattern.test(source.owner_domain)) fail("invalid_owner_domain");
     if (!toolchainProfiles.includes(source.toolchain_profile)) fail("invalid_toolchain_profile");
     if (!Number.isSafeInteger(source.timeout_ms) || source.timeout_ms < 25 || source.timeout_ms > 300_000) {
       fail("invalid_timeout");
@@ -177,7 +177,7 @@ async function validateRegistryStructure(registry, options) {
         scenario_id: source.scenario_id,
         proof_id: source.proof_id,
         capability_id: source.capability_id,
-        owner_phase: source.owner_phase,
+        owner_domain: source.owner_domain,
         toolchain_profile: source.toolchain_profile,
         allowed_platforms: Object.freeze([...source.allowed_platforms].sort()),
         timeout_ms: source.timeout_ms,
@@ -462,7 +462,7 @@ async function readCurrentReceipts(record, documents, root) {
         scenario_id: record.scenario_id,
         proof_id: record.proof_id,
         capability_id: record.capability_id,
-        owner_phase: record.owner_phase,
+        owner_domain: record.owner_domain,
         platform: document.platform.os,
         repository_root: root,
         observations: observationIds,
@@ -843,7 +843,7 @@ export async function runCapability(request, overrides = {}) {
     scenario_id: record.scenario_id,
     proof_id: record.proof_id,
     capability_id: record.capability_id,
-    owner_phase: record.owner_phase,
+    owner_domain: record.owner_domain,
     platform: actualPlatform.os,
     repository_root: root,
   };
@@ -865,7 +865,7 @@ export async function runCapability(request, overrides = {}) {
     proof_id: record.proof_id,
     scenario_id: record.scenario_id,
     capability_id: record.capability_id,
-    owner_phase: record.owner_phase,
+    owner_domain: record.owner_domain,
     source,
     platform: actualPlatform,
     toolchain,

@@ -2123,7 +2123,7 @@ mod tests {
     }
 
     #[test]
-    fn p01_b03_contract_state_successor_delegates_for_vacant_and_existing_records() {
+    fn native_filesystem_contract_state_successor_delegates_for_vacant_and_existing_records() {
         let temporary = tempfile::tempdir().expect("temporary anchored-record root");
         let directory = AnchoredRecordDirectory::for_test_directory(temporary.path())
             .expect("anchored-record directory");
@@ -2167,7 +2167,7 @@ mod tests {
     }
 
     #[test]
-    fn p01_b03_contract_cross_owner_restores_vacant_and_existing_mutations() {
+    fn native_filesystem_contract_cross_owner_restores_vacant_and_existing_mutations() {
         let temporary = tempfile::tempdir().expect("temporary anchored-record root");
         let directory = AnchoredRecordDirectory::for_test_directory(temporary.path())
             .expect("anchored-record directory");

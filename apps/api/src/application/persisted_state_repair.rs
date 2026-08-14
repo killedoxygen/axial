@@ -75,7 +75,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
-    async fn p00_b09_contract_custom_and_disabled_have_no_effect_or_durable_records() {
+    async fn behavior_contract_custom_and_disabled_have_no_effect_or_durable_records() {
         for mode in ["custom", "disabled"] {
             let fixture = Fixture::new(&format!("{mode}-record-only"));
             let source = fixture.publish_candidate(1);

@@ -18,7 +18,7 @@ function ordered(source, markers) {
   }
 }
 
-test('P02-B07 frontend bootstrap gates Ready and retains an explicit retry terminal', async () => {
+test('bootstrap-lifecycle frontend bootstrap gates Ready and retains an explicit retry terminal', async () => {
   const [bootstrap, main, splash] = await Promise.all([
     read('frontend/src/bootstrap.ts'),
     read('frontend/src/main.tsx'),

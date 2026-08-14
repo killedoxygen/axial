@@ -1,18 +1,20 @@
 use super::jvm_preset::{GuardianJvmPresetId, GuardianJvmPresetResolution};
 use super::{
     DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianDirective, GuardianFact,
-    GuardianFactId, GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianManagedJavaReason, GuardianMode, GuardianObservedLaunchFailurePhase,
-    GuardianPerformanceSupervisionRejection, GuardianPreflightOutcome,
+    GuardianFactId, GuardianManagedJavaReason, GuardianMode, GuardianObservedLaunchFailurePhase,
+    GuardianPerformanceSupervisionRejection, GuardianPolicyContext, GuardianPreflightOutcome,
     GuardianPresetDowngradeReason, GuardianPresetValue, GuardianRepairStatus,
     GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianStripJvmArgsReason,
+    OperationEvidenceBatch, assess_operation_evidence,
 };
 use crate::observability::{
     RedactionAudience, sanitize_evidence_text, sanitize_evidence_token,
     sanitize_public_diagnostic_text,
 };
 use crate::state::contracts::{
-    OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+    DurableGuardianEvidence, GuardianInstallMemoryEvidence, GuardianInstallTerminalEvidence,
+    GuardianMemoryBindingDigest, OperationPhase, OwnershipClass, StabilizationSystem,
+    TargetDescriptor, TargetKind,
 };
 use crate::state::failure_memory::FailureMemoryKey;
 use axial_launcher::{
@@ -179,18 +181,6 @@ const MAX_NOTICE_MESSAGE_BYTES: usize = 180;
 const MAX_NOTICE_DETAIL_BYTES: usize = 240;
 const MAX_NOTICE_DETAILS: usize = 8;
 const PRIVATE_NOTICE_FALLBACK: &str = "Launch status details were hidden for privacy.";
-const GUARDIAN_OUTCOME_DECISION_PREFIX: &str = "guardian_outcome_decision:";
-const GUARDIAN_OUTCOME_SUMMARY_PREFIX: &str = "guardian_outcome_summary:";
-const GUARDIAN_OUTCOME_DETAIL_PREFIX: &str = "guardian_outcome_detail:";
-const GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX: &str = "guardian_outcome_memory_binding:";
-const GUARDIAN_OUTCOME_MEMORY_OBSERVED_AT_PREFIX: &str = "guardian_outcome_memory_observed_at:";
-const GUARDIAN_OUTCOME_MEMORY_SUPPRESSION_UNTIL_PREFIX: &str =
-    "guardian_outcome_memory_suppression_until:";
-const GUARDIAN_OUTCOME_MEMORY_TARGET_SYSTEM_PREFIX: &str = "guardian_outcome_memory_target_system:";
-const GUARDIAN_OUTCOME_MEMORY_TARGET_KIND_PREFIX: &str = "guardian_outcome_memory_target_kind:";
-const GUARDIAN_OUTCOME_MEMORY_TARGET_OWNERSHIP_PREFIX: &str =
-    "guardian_outcome_memory_target_ownership:";
-const GUARDIAN_OUTCOME_MEMORY_TARGET_ID_PREFIX: &str = "guardian_outcome_memory_target_id:";
 const GUARDIAN_OUTCOME_MEMORY_BINDING_DOMAIN: &[u8] =
     b"axial.guardian.install_failure_memory_binding.v3\0";
 
@@ -855,6 +845,143 @@ pub struct GuardianInstallOutcomeSummary {
     guidance: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GuardianInstallFailureOutcome {
+    pub diagnosis_id: DiagnosisId,
+    pub decision: GuardianActionKind,
+    pub user_outcome: GuardianUserOutcome,
+}
+
+pub(crate) struct GuardianInstallAssessment {
+    assessment: crate::guardian::GuardianEvidenceAssessment,
+    terminal_outcome: Option<GuardianInstallFailureOutcome>,
+}
+
+impl GuardianInstallAssessment {
+    pub(crate) fn terminal_outcome(&self) -> Option<&GuardianInstallFailureOutcome> {
+        self.terminal_outcome.as_ref()
+    }
+
+    pub(crate) fn durable_terminal_evidence(
+        &self,
+        evidence: &OperationEvidenceBatch,
+        mode: GuardianMode,
+        failure_memory_source: &str,
+        observed_at: &str,
+        suppression_until: &str,
+    ) -> Option<(
+        DurableGuardianEvidence,
+        Option<GuardianInstallOutcomeMemoryPersistence>,
+    )> {
+        let Some(outcome) = self.terminal_outcome() else {
+            let durable = self.assessment.durable_evidence(evidence, None).ok()?;
+            let durable = if install_evidence_is_non_failure_only(evidence) {
+                DurableGuardianEvidence::new(
+                    durable.operation_id().clone(),
+                    durable.fact_ids().to_vec(),
+                    Vec::new(),
+                    None,
+                )
+                .ok()?
+            } else {
+                durable
+            };
+            return Some((durable, None));
+        };
+        let memory = if outcome.decision == GuardianActionKind::Retry {
+            let diagnosis = self
+                .assessment
+                .safety_case()
+                .diagnoses
+                .iter()
+                .find(|diagnosis| diagnosis.id() == outcome.diagnosis_id)?;
+            let target = diagnosis.affected_targets().first()?.clone();
+            let key = FailureMemoryKey::for_observation(
+                diagnosis.domain(),
+                &diagnosis.id(),
+                &target,
+                mode,
+                Some(failure_memory_source),
+            );
+            Some(
+                GuardianInstallOutcomeMemoryPersistence::for_failure_memory_key(
+                    &key,
+                    target,
+                    observed_at.to_string(),
+                    suppression_until.to_string(),
+                )?,
+            )
+        } else {
+            None
+        };
+        let terminal = GuardianInstallTerminalEvidence::new(
+            outcome.diagnosis_id,
+            outcome.decision,
+            memory.as_ref().and_then(|memory| memory.durable()),
+        )
+        .ok()?;
+        let durable = self
+            .assessment
+            .durable_evidence(evidence, Some(terminal))
+            .ok()?;
+        Some((durable, memory))
+    }
+}
+
+fn install_evidence_is_non_failure_only(evidence: &OperationEvidenceBatch) -> bool {
+    !evidence.facts().is_empty()
+        && evidence.facts().iter().all(|fact| {
+            matches!(
+                fact.id,
+                GuardianFactId::AtomicPromotionCompleted
+                    | GuardianFactId::DownloadTempDiscarded
+                    | GuardianFactId::DownloadWrittenToTemp
+            )
+        })
+}
+
+pub(crate) fn assess_install_failure(
+    mode: GuardianMode,
+    phase: OperationPhase,
+    evidence: &OperationEvidenceBatch,
+    context: GuardianPolicyContext,
+) -> Option<GuardianInstallAssessment> {
+    if evidence.facts().is_empty() {
+        return None;
+    }
+    let assessment = assess_operation_evidence(mode, phase, evidence, context);
+    let terminal_decision = match assessment.decision().kind() {
+        GuardianActionKind::Allow | GuardianActionKind::RecordOnly => None,
+        GuardianActionKind::Repair | GuardianActionKind::Quarantine => {
+            Some(GuardianActionKind::Block)
+        }
+        decision => Some(decision),
+    };
+    let terminal_outcome = if let Some(terminal_decision) = terminal_decision {
+        let diagnosis_id = assessment
+            .decision()
+            .action_plan()
+            .map(|plan| plan.prerequisite.diagnosis_id)
+            .or_else(|| assessment.decision().diagnoses().first().copied())?;
+        let user_outcome = author_guardian_copy(GuardianCopyRequest::install_failure(
+            diagnosis_id,
+            terminal_decision,
+            evidence,
+        ))?;
+        Some(GuardianInstallFailureOutcome {
+            diagnosis_id,
+            decision: terminal_decision,
+            user_outcome,
+        })
+    } else {
+        None
+    };
+    Some(GuardianInstallAssessment {
+        assessment,
+        terminal_outcome,
+    })
+}
+
 impl GuardianInstallOutcomeSummary {
     pub fn diagnosis_id(&self) -> DiagnosisId {
         self.diagnosis_id
@@ -862,10 +989,6 @@ impl GuardianInstallOutcomeSummary {
 
     pub fn decision(&self) -> &str {
         &self.decision
-    }
-
-    pub(crate) fn decision_is(&self, decision: GuardianActionKind) -> bool {
-        self.decision == guardian_action_persisted_id(decision)
     }
 
     pub fn label(&self) -> &str {
@@ -915,32 +1038,6 @@ impl GuardianInstallOutcomeMemoryBinding {
         }
         Self(digest.finalize().into())
     }
-
-    fn from_persisted(value: &str) -> Option<Self> {
-        if value.len() != 64
-            || !value
-                .bytes()
-                .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
-        {
-            return None;
-        }
-        let mut binding = [0_u8; 32];
-        for (output, pair) in binding.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
-            *output = (lower_hex_nibble(pair[0])? << 4) | lower_hex_nibble(pair[1])?;
-        }
-        Some(Self(binding))
-    }
-
-    fn persisted(self) -> String {
-        const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
-
-        let mut persisted = String::with_capacity(64);
-        for byte in self.0 {
-            persisted.push(LOWER_HEX[usize::from(byte >> 4)] as char);
-            persisted.push(LOWER_HEX[usize::from(byte & 0x0f)] as char);
-        }
-        persisted
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -952,7 +1049,24 @@ pub(crate) struct GuardianInstallOutcomeMemoryPersistence {
 }
 
 impl GuardianInstallOutcomeMemoryPersistence {
-    pub(crate) fn for_failure_memory_key(
+    pub(crate) fn from_durable(memory: &GuardianInstallMemoryEvidence) -> Self {
+        Self {
+            binding: GuardianInstallOutcomeMemoryBinding(*memory.binding().as_bytes()),
+            target: memory.target().clone(),
+            observed_at: memory.observed_at().to_string(),
+            suppression_until: memory.suppression_until().to_string(),
+        }
+    }
+    fn durable(&self) -> Option<GuardianInstallMemoryEvidence> {
+        GuardianInstallMemoryEvidence::new(
+            GuardianMemoryBindingDigest::from_sha256(self.binding.0),
+            self.target.clone(),
+            self.observed_at.clone(),
+            self.suppression_until.clone(),
+        )
+        .ok()
+    }
+    fn for_failure_memory_key(
         key: &FailureMemoryKey,
         target: TargetDescriptor,
         observed_at: String,
@@ -977,37 +1091,6 @@ impl GuardianInstallOutcomeMemoryPersistence {
             target,
             observed_at,
             suppression_until,
-        })
-    }
-
-    fn from_persisted(
-        binding: &str,
-        target_system: &str,
-        target_kind: &str,
-        target_ownership: &str,
-        target_id: &str,
-        observed_at: &str,
-        suppression_until: &str,
-    ) -> Option<Self> {
-        let observed = canonical_failure_memory_timestamp(observed_at)?;
-        let suppression = canonical_failure_memory_timestamp(suppression_until)?;
-        if observed.checked_add_signed(chrono::Duration::minutes(5))? != suppression {
-            return None;
-        }
-        let target = TargetDescriptor::new(
-            target_system_from_persisted_id(target_system)?,
-            target_kind_from_persisted_id(target_kind)?,
-            target_id,
-            target_ownership_from_persisted_id(target_ownership)?,
-        );
-        if target.id != target_id {
-            return None;
-        }
-        Some(Self {
-            binding: GuardianInstallOutcomeMemoryBinding::from_persisted(binding)?,
-            target,
-            observed_at: observed_at.to_string(),
-            suppression_until: suppression_until.to_string(),
         })
     }
 
@@ -1056,7 +1139,9 @@ fn canonical_failure_memory_timestamp(value: &str) -> Option<DateTime<Utc>> {
     let parsed = DateTime::parse_from_rfc3339(value)
         .ok()?
         .with_timezone(&Utc);
-    (parsed.to_rfc3339() == value).then_some(parsed)
+    (parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) == value
+        || parsed.to_rfc3339() == value)
+        .then_some(parsed)
 }
 
 const fn target_system_persisted_id(system: StabilizationSystem) -> &'static str {
@@ -1068,19 +1153,6 @@ const fn target_system_persisted_id(system: StabilizationSystem) -> &'static str
         StabilizationSystem::Observability => "observability",
         StabilizationSystem::State => "state",
         StabilizationSystem::Interface => "interface",
-    }
-}
-
-fn target_system_from_persisted_id(value: &str) -> Option<StabilizationSystem> {
-    match value {
-        "application" => Some(StabilizationSystem::Application),
-        "execution" => Some(StabilizationSystem::Execution),
-        "guardian" => Some(StabilizationSystem::Guardian),
-        "performance" => Some(StabilizationSystem::Performance),
-        "observability" => Some(StabilizationSystem::Observability),
-        "state" => Some(StabilizationSystem::State),
-        "interface" => Some(StabilizationSystem::Interface),
-        _ => None,
     }
 }
 
@@ -1099,22 +1171,6 @@ const fn target_kind_persisted_id(kind: TargetKind) -> &'static str {
     }
 }
 
-fn target_kind_from_persisted_id(value: &str) -> Option<TargetKind> {
-    match value {
-        "instance" => Some(TargetKind::Instance),
-        "version" => Some(TargetKind::Version),
-        "artifact" => Some(TargetKind::Artifact),
-        "runtime" => Some(TargetKind::Runtime),
-        "session" => Some(TargetKind::Session),
-        "account" => Some(TargetKind::Account),
-        "config" => Some(TargetKind::Config),
-        "performance_composition" => Some(TargetKind::PerformanceComposition),
-        "filesystem_path" => Some(TargetKind::FilesystemPath),
-        "network_resource" => Some(TargetKind::NetworkResource),
-        _ => None,
-    }
-}
-
 const fn target_ownership_persisted_id(ownership: OwnershipClass) -> &'static str {
     match ownership {
         OwnershipClass::LauncherManaged => "launcher_managed",
@@ -1125,289 +1181,21 @@ const fn target_ownership_persisted_id(ownership: OwnershipClass) -> &'static st
     }
 }
 
-fn target_ownership_from_persisted_id(value: &str) -> Option<OwnershipClass> {
-    match value {
-        "launcher_managed" => Some(OwnershipClass::LauncherManaged),
-        "composition_managed" => Some(OwnershipClass::CompositionManaged),
-        "user_owned" => Some(OwnershipClass::UserOwned),
-        "external_provider_derived" => Some(OwnershipClass::ExternalProviderDerived),
-        "unknown" => Some(OwnershipClass::Unknown),
-        _ => None,
-    }
-}
-
-fn lower_hex_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        _ => None,
-    }
-}
-
-pub(crate) fn guardian_install_outcome_persistence_facts(
-    outcome: &GuardianUserOutcome,
-    memory: Option<&GuardianInstallOutcomeMemoryPersistence>,
-) -> Option<Vec<String>> {
-    let mut facts = vec![
-        format!(
-            "{GUARDIAN_OUTCOME_DECISION_PREFIX}{}",
-            guardian_action_persisted_id(outcome.decision)
-        ),
-        format!("{GUARDIAN_OUTCOME_SUMMARY_PREFIX}{}", outcome.summary),
-    ];
-    if let Some(detail) = outcome.details.first() {
-        facts.push(format!("{GUARDIAN_OUTCOME_DETAIL_PREFIX}{detail}"));
-    }
-    match (outcome.decision, memory) {
-        (GuardianActionKind::Retry, Some(memory)) => {
-            facts.push(format!(
-                "{GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX}{}",
-                memory.binding.persisted()
-            ));
-            facts.push(format!(
-                "{GUARDIAN_OUTCOME_MEMORY_OBSERVED_AT_PREFIX}{}",
-                memory.observed_at
-            ));
-            facts.push(format!(
-                "{GUARDIAN_OUTCOME_MEMORY_SUPPRESSION_UNTIL_PREFIX}{}",
-                memory.suppression_until
-            ));
-            facts.push(format!(
-                "{GUARDIAN_OUTCOME_MEMORY_TARGET_SYSTEM_PREFIX}{}",
-                target_system_persisted_id(memory.target.system)
-            ));
-            facts.push(format!(
-                "{GUARDIAN_OUTCOME_MEMORY_TARGET_KIND_PREFIX}{}",
-                target_kind_persisted_id(memory.target.kind)
-            ));
-            facts.push(format!(
-                "{GUARDIAN_OUTCOME_MEMORY_TARGET_OWNERSHIP_PREFIX}{}",
-                target_ownership_persisted_id(memory.target.ownership)
-            ));
-            facts.push(format!(
-                "{GUARDIAN_OUTCOME_MEMORY_TARGET_ID_PREFIX}{}",
-                memory.target.id
-            ));
-        }
-        (GuardianActionKind::Retry, None) | (_, Some(_)) => return None,
-        (_, None) => {}
-    }
-    Some(facts)
-}
-
-pub(crate) struct GuardianInstallOutcomeFactGroup<'a> {
-    decision: GuardianActionKind,
-    summary: &'a str,
-    detail: Option<&'a str>,
-    memory: Option<GuardianInstallOutcomeMemoryPersistence>,
-}
-
-impl GuardianInstallOutcomeFactGroup<'_> {
-    pub(crate) fn memory(&self) -> Option<GuardianInstallOutcomeMemoryPersistence> {
-        self.memory.clone()
-    }
-}
-
-pub(crate) enum GuardianInstallOutcomeFactGroupParse<'a> {
-    Absent,
-    Valid(GuardianInstallOutcomeFactGroup<'a>),
-    Invalid,
-}
-
-pub(crate) fn guardian_install_outcome_fact_group<'a>(
-    facts: impl IntoIterator<Item = &'a str>,
-) -> GuardianInstallOutcomeFactGroupParse<'a> {
-    let mut decision = None;
-    let mut summary = None;
-    let mut detail = None;
-    let mut memory_binding = None;
-    let mut memory_observed_at = None;
-    let mut memory_suppression_until = None;
-    let mut memory_target_system = None;
-    let mut memory_target_kind = None;
-    let mut memory_target_ownership = None;
-    let mut memory_target_id = None;
-    let mut has_marker = false;
-    let mut invalid = false;
-    for fact in facts {
-        let marker = if let Some(value) = fact.strip_prefix(GUARDIAN_OUTCOME_DECISION_PREFIX) {
-            Some((&mut decision, value))
-        } else if let Some(value) = fact.strip_prefix(GUARDIAN_OUTCOME_SUMMARY_PREFIX) {
-            Some((&mut summary, value))
-        } else if let Some(value) = fact.strip_prefix(GUARDIAN_OUTCOME_DETAIL_PREFIX) {
-            Some((&mut detail, value))
-        } else {
-            fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX)
-                .map(|value| (&mut memory_binding, value))
-                .or_else(|| {
-                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_OBSERVED_AT_PREFIX)
-                        .map(|value| (&mut memory_observed_at, value))
-                })
-                .or_else(|| {
-                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_SUPPRESSION_UNTIL_PREFIX)
-                        .map(|value| (&mut memory_suppression_until, value))
-                })
-                .or_else(|| {
-                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_TARGET_SYSTEM_PREFIX)
-                        .map(|value| (&mut memory_target_system, value))
-                })
-                .or_else(|| {
-                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_TARGET_KIND_PREFIX)
-                        .map(|value| (&mut memory_target_kind, value))
-                })
-                .or_else(|| {
-                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_TARGET_OWNERSHIP_PREFIX)
-                        .map(|value| (&mut memory_target_ownership, value))
-                })
-                .or_else(|| {
-                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_TARGET_ID_PREFIX)
-                        .map(|value| (&mut memory_target_id, value))
-                })
-        };
-        if let Some((slot, value)) = marker {
-            has_marker = true;
-            if slot.replace(value).is_some() {
-                invalid = true;
-            }
-        }
-    }
-    if !has_marker {
-        return GuardianInstallOutcomeFactGroupParse::Absent;
-    }
-    let Some(decision) = decision.and_then(guardian_action_from_persisted_id) else {
-        return GuardianInstallOutcomeFactGroupParse::Invalid;
-    };
-    let Some(summary) = summary else {
-        return GuardianInstallOutcomeFactGroupParse::Invalid;
-    };
-    let persisted_memory = (
-        memory_binding,
-        memory_observed_at,
-        memory_suppression_until,
-        memory_target_system,
-        memory_target_kind,
-        memory_target_ownership,
-        memory_target_id,
-    );
-    let memory = match persisted_memory {
-        (
-            Some(binding),
-            Some(observed_at),
-            Some(suppression_until),
-            Some(target_system),
-            Some(target_kind),
-            Some(target_ownership),
-            Some(target_id),
-        ) => {
-            match GuardianInstallOutcomeMemoryPersistence::from_persisted(
-                binding,
-                target_system,
-                target_kind,
-                target_ownership,
-                target_id,
-                observed_at,
-                suppression_until,
-            ) {
-                Some(memory) => Some(memory),
-                None => return GuardianInstallOutcomeFactGroupParse::Invalid,
-            }
-        }
-        (None, None, None, None, None, None, None) => None,
-        _ => return GuardianInstallOutcomeFactGroupParse::Invalid,
-    };
-    let binding_shape_valid = match decision {
-        GuardianActionKind::Retry => memory.is_some(),
-        _ => persisted_memory == (None, None, None, None, None, None, None),
-    };
-    if invalid || !binding_shape_valid {
-        return GuardianInstallOutcomeFactGroupParse::Invalid;
-    }
-    GuardianInstallOutcomeFactGroupParse::Valid(GuardianInstallOutcomeFactGroup {
-        decision,
-        summary,
-        detail,
-        memory,
-    })
-}
-
-pub(crate) fn guardian_install_outcome_from_persisted_group(
+pub(crate) fn guardian_install_outcome_from_terminal(
     diagnosis_id: DiagnosisId,
-    group: GuardianInstallOutcomeFactGroup<'_>,
+    decision: GuardianActionKind,
 ) -> Option<GuardianInstallOutcomeSummary> {
-    let decision = group.decision;
-    let persisted_summary = group.summary;
-    let persisted_detail = group.detail;
     let canonical = author_guardian_copy(GuardianCopyRequest::install_failure_replay(
         diagnosis_id,
         decision,
     ))?;
-    if persisted_summary != canonical.summary {
-        return None;
-    }
-
-    let detail = match (persisted_detail, canonical.details.first()) {
-        (Some(detail), Some(canonical_detail)) => Some(validated_install_detail(
-            diagnosis_id,
-            detail,
-            canonical_detail,
-        )?),
-        (None, None) => None,
-        _ => return None,
-    };
     Some(GuardianInstallOutcomeSummary {
         diagnosis_id,
         decision: guardian_action_persisted_id(decision).to_string(),
         label: canonical.summary,
-        detail,
+        detail: canonical.details.first().cloned(),
         guidance: canonical.guidance,
     })
-}
-
-fn validated_persisted_copy_line(value: &str) -> Option<String> {
-    sanitize_evidence_text(value, RedactionAudience::UserVisible, MAX_LINE_BYTES)
-        .filter(|sanitized| sanitized == value && sanitized.len() <= MAX_LINE_BYTES)
-}
-
-fn validated_install_detail(
-    diagnosis_id: DiagnosisId,
-    value: &str,
-    canonical: &str,
-) -> Option<String> {
-    let value = validated_persisted_copy_line(value)?;
-    if value == canonical {
-        return Some(value);
-    }
-    match diagnosis_id {
-        DiagnosisId::ManagedRuntimeUnavailableForPlatform => {
-            let body = value
-                .strip_prefix("Java runtime component ")?
-                .strip_suffix('.')?;
-            let (component, platform) = body.split_once(" is not available for ")?;
-            validate_dynamic_install_token(component)?;
-            validate_dynamic_install_token(platform)?;
-        }
-        DiagnosisId::ManagedRuntimeRosettaRequired => {
-            let component = value
-                .strip_prefix("Java runtime component ")?
-                .strip_suffix(" needs Rosetta 2 on this Mac.")?;
-            validate_dynamic_install_token(component)?;
-        }
-        _ => return None,
-    }
-    Some(value)
-}
-
-fn validate_dynamic_install_token(value: &str) -> Option<()> {
-    if matches!(value, "the required runtime" | "this device") {
-        return Some(());
-    }
-    sanitize_evidence_token(
-        value,
-        RedactionAudience::UserVisible,
-        MAX_DYNAMIC_TOKEN_BYTES,
-    )
-    .filter(|sanitized| sanitized == value)
-    .map(|_| ())
 }
 
 const fn guardian_action_persisted_id(action: GuardianActionKind) -> &'static str {
@@ -1423,23 +1211,6 @@ const fn guardian_action_persisted_id(action: GuardianActionKind) -> &'static st
         GuardianActionKind::AskUser => "ask_user",
         GuardianActionKind::Block => "block",
         GuardianActionKind::RecordOnly => "record_only",
-    }
-}
-
-fn guardian_action_from_persisted_id(value: &str) -> Option<GuardianActionKind> {
-    match value {
-        "allow" => Some(GuardianActionKind::Allow),
-        "warn" => Some(GuardianActionKind::Warn),
-        "repair" => Some(GuardianActionKind::Repair),
-        "retry" => Some(GuardianActionKind::Retry),
-        "strip" => Some(GuardianActionKind::Strip),
-        "downgrade" => Some(GuardianActionKind::Downgrade),
-        "fallback" => Some(GuardianActionKind::Fallback),
-        "quarantine" => Some(GuardianActionKind::Quarantine),
-        "ask_user" => Some(GuardianActionKind::AskUser),
-        "block" => Some(GuardianActionKind::Block),
-        "record_only" => Some(GuardianActionKind::RecordOnly),
-        _ => None,
     }
 }
 
@@ -2064,7 +1835,7 @@ impl<'a> GuardianCopyRequest<'a> {
     pub(crate) fn install_failure(
         diagnosis_id: DiagnosisId,
         decision: GuardianActionKind,
-        evidence: &'a [GuardianInstallArtifactFailureEvidence],
+        evidence: &'a OperationEvidenceBatch,
     ) -> Self {
         Self {
             diagnosis_id: Some(diagnosis_id),
@@ -4155,13 +3926,10 @@ fn startup_failure_guidance(
 }
 
 fn copy_fact_field<'a>(fact: &'a GuardianFact, key: &str) -> Option<&'a str> {
-    let mut values = fact
-        .fields
+    fact.fields
         .iter()
         .filter(|field| field.key == key)
-        .filter_map(|field| field.value_for(RedactionAudience::UserVisible));
-    let value = values.next()?;
-    values.next().is_none().then_some(value)
+        .find_map(|field| field.value_for(RedactionAudience::UserVisible))
 }
 
 fn copy_fact_field_u32(fact: &GuardianFact, key: &str) -> Option<u32> {
@@ -4177,39 +3945,29 @@ fn install_dynamics<'a>(context: &'a GuardianCopyContext<'a>) -> InstallCopyDyna
 
 fn install_copy_dynamics<'a>(
     diagnosis_id: DiagnosisId,
-    evidence: &'a [GuardianInstallArtifactFailureEvidence],
+    evidence: &'a OperationEvidenceBatch,
 ) -> InstallCopyDynamics<'a> {
-    let kind = match diagnosis_id {
+    let fact_id = match diagnosis_id {
         DiagnosisId::ManagedRuntimeUnavailableForPlatform => {
-            GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform
+            GuardianFactId::ManagedRuntimeUnavailableForPlatform
         }
-        DiagnosisId::ManagedRuntimeRosettaRequired => {
-            GuardianInstallArtifactFailureKind::RuntimeRosettaRequired
-        }
+        DiagnosisId::ManagedRuntimeRosettaRequired => GuardianFactId::ManagedRuntimeRosettaRequired,
         _ => return InstallCopyDynamics::None,
     };
-    let Some(evidence) = evidence.iter().find(|evidence| evidence.kind == kind) else {
+    let Some(fact) = evidence.facts().iter().find(|fact| fact.id == fact_id) else {
         return InstallCopyDynamics::None;
     };
-    let field = |key| {
-        evidence
-            .fields
-            .iter()
-            .find(|(field_key, _)| field_key == key)
-            .map(|(_, value)| value.as_str())
-    };
-    match kind {
-        GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform => {
+    let field = |key| copy_fact_field(fact, key);
+    match fact_id {
+        GuardianFactId::ManagedRuntimeUnavailableForPlatform => {
             InstallCopyDynamics::RuntimeUnavailable {
                 component: field("component"),
                 platform: field("platform"),
             }
         }
-        GuardianInstallArtifactFailureKind::RuntimeRosettaRequired => {
-            InstallCopyDynamics::Rosetta {
-                component: field("component"),
-            }
-        }
+        GuardianFactId::ManagedRuntimeRosettaRequired => InstallCopyDynamics::Rosetta {
+            component: field("component"),
+        },
         _ => InstallCopyDynamics::None,
     }
 }
@@ -4281,17 +4039,17 @@ mod tests {
         GuardianInterventionKind, GuardianRuntimeRepairCopy, GuardianSummary,
         GuardianSummaryDecision, MAX_COLLECTION_LINES, MAX_LINE_BYTES, MAX_SUMMARY_BYTES,
         PREFLIGHT_DIAGNOSIS_RULES, PREFLIGHT_INVARIANT_DIAGNOSIS_RULES, PREFLIGHT_SUMMARY_RULES,
-        author_guardian_copy, finalize_lines, guardian_install_outcome_persistence_facts,
-        guardian_summary_for_test, guardian_summary_from_persisted_value,
+        author_guardian_copy, finalize_lines, guardian_summary_for_test,
+        guardian_summary_from_persisted_value,
     };
     use crate::guardian::{
-        DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus,
-        GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-        GuardianJvmPresetId, GuardianLaunchAdmission, GuardianManagedJavaReason,
-        GuardianPerformanceSupervisionRejection, GuardianRepairStatus, GuardianStripJvmArgsReason,
-        GuardianUserOutcome, SafetyOutcome,
+        DiagnosisId, FactReliability, GuardianActionKind, GuardianArtifactRepairStatus,
+        GuardianDomain, GuardianFact, GuardianFactId, GuardianJvmPresetId, GuardianLaunchAdmission,
+        GuardianManagedJavaReason, GuardianPerformanceSupervisionRejection, GuardianRepairStatus,
+        GuardianStripJvmArgsReason, GuardianUserOutcome, OperationEvidenceBatch, SafetyOutcome,
     };
-    use crate::state::contracts::OperationPhase;
+    use crate::observability::{EvidenceField, EvidenceSensitivity};
+    use crate::state::contracts::{OperationPhase, OwnershipClass};
     use axial_launcher::{
         GuardianMode, LaunchHealingSummary, LaunchNoticeTone, LaunchSessionExitReason,
         LaunchSessionOutcome,
@@ -4693,27 +4451,6 @@ mod tests {
     }
 
     #[test]
-    fn install_persistence_projects_only_sealed_decision_summary_and_detail() {
-        let outcome = author_guardian_copy(GuardianCopyRequest::install_failure_replay(
-            DiagnosisId::ManagedRuntimeRosettaRequired,
-            GuardianActionKind::Block,
-        ))
-        .expect("Rosetta install copy rule");
-
-        assert_eq!(
-            guardian_install_outcome_persistence_facts(&outcome, None)
-                .expect("blocking persistence facts"),
-            vec![
-                "guardian_outcome_decision:block".to_string(),
-                "guardian_outcome_summary:This Minecraft version needs Rosetta 2 on Apple Silicon Macs."
-                    .to_string(),
-                "guardian_outcome_detail:Java runtime component the required runtime needs Rosetta 2 on this Mac."
-                    .to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn copy_rule_table_is_unique_complete_and_bounded() {
         assert_eq!(GUARDIAN_COPY_RULES.len(), 25);
         for (index, rule) in GUARDIAN_COPY_RULES.iter().enumerate() {
@@ -4902,14 +4639,16 @@ mod tests {
 
     #[test]
     fn hostile_dynamic_install_fields_are_redacted_and_byte_bounded() {
-        let evidence = [GuardianInstallArtifactFailureEvidence::launcher_managed(
-            None,
-            "artifact",
-            GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
-        )
-        .with_field("component", "/home/alice/java --accessToken secret")
-        .with_field("component", "ignored-second-value")
-        .with_field("platform", "界".repeat(64))];
+        let facts = [runtime_unavailable_fact(vec![
+            EvidenceField::new(
+                "component",
+                "/home/alice/java --accessToken secret",
+                EvidenceSensitivity::Public,
+            ),
+            EvidenceField::new("platform", "界".repeat(32), EvidenceSensitivity::Public),
+        ])];
+        let evidence = OperationEvidenceBatch::try_from_guardian_unscoped(&facts)
+            .expect("bounded runtime evidence");
         let outcome = author_guardian_copy(GuardianCopyRequest::install_failure(
             DiagnosisId::ManagedRuntimeUnavailableForPlatform,
             GuardianActionKind::Block,
@@ -4930,7 +4669,7 @@ mod tests {
                 .chain(&outcome.guidance)
                 .all(|line| line.len() <= MAX_LINE_BYTES)
         );
-        for sensitive in ["/home", "alice", "accessToken", "secret", "ignored-second"] {
+        for sensitive in ["/home", "alice", "accessToken", "secret"] {
             assert!(
                 !encoded.contains(sensitive),
                 "leaked {sensitive}: {encoded}"
@@ -4940,23 +4679,19 @@ mod tests {
 
     #[test]
     fn install_dynamics_use_the_first_matching_evidence_and_field() {
-        let evidence = [
-            GuardianInstallArtifactFailureEvidence::launcher_managed(
-                None,
-                "first",
-                GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
-            )
-            .with_field("component", "jre-first")
-            .with_field("component", "ignored-field")
-            .with_field("platform", "platform-first"),
-            GuardianInstallArtifactFailureEvidence::launcher_managed(
-                None,
-                "second",
-                GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
-            )
-            .with_field("component", "jre-second")
-            .with_field("platform", "platform-second"),
+        let facts = [
+            runtime_unavailable_fact(vec![
+                EvidenceField::new("component", "jre-first", EvidenceSensitivity::Public),
+                EvidenceField::new("component", "ignored-field", EvidenceSensitivity::Public),
+                EvidenceField::new("platform", "platform-first", EvidenceSensitivity::Public),
+            ]),
+            runtime_unavailable_fact(vec![
+                EvidenceField::new("component", "jre-second", EvidenceSensitivity::Public),
+                EvidenceField::new("platform", "platform-second", EvidenceSensitivity::Public),
+            ]),
         ];
+        let evidence = OperationEvidenceBatch::try_from_guardian_unscoped(&facts)
+            .expect("bounded runtime evidence");
 
         let outcome = author_guardian_copy(GuardianCopyRequest::install_failure(
             DiagnosisId::ManagedRuntimeUnavailableForPlatform,
@@ -4969,6 +4704,21 @@ mod tests {
             outcome.details,
             ["Java runtime component jre-first is not available for platform-first."]
         );
+    }
+
+    fn runtime_unavailable_fact(fields: Vec<EvidenceField>) -> GuardianFact {
+        GuardianFact {
+            operation_id: None,
+            id: GuardianFactId::ManagedRuntimeUnavailableForPlatform,
+            domain: GuardianDomain::Runtime,
+            phase: OperationPhase::Downloading,
+            reliability: FactReliability::DirectStructured,
+            severity: None,
+            confidence: None,
+            ownership: OwnershipClass::LauncherManaged,
+            target: None,
+            fields,
+        }
     }
 
     #[test]

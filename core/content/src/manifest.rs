@@ -1883,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b11_contract_file_owners_require_canonical_sha512_and_positive_exact_size() {
+    fn behavior_contract_file_owners_require_canonical_sha512_and_positive_exact_size() {
         let dir = temp_game_dir("checksum-required");
         let path = manifest_path(&dir);
         let entry = managed_entry("AAA", "tracked.jar");
@@ -1935,7 +1935,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b11_contract_entry_presence_rejects_same_size_corruption() {
+    fn behavior_contract_entry_presence_rejects_same_size_corruption() {
         let dir = temp_game_dir("entry-presence");
         let mods_dir = dir.join("mods");
         fs::create_dir_all(&mods_dir).expect("mods dir");

@@ -5,8 +5,8 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const repository = fileURLToPath(new URL("../../../", import.meta.url));
-const contractPhase = process.env.P01_B02_CONTRACT_PHASE ?? "terminal";
-const terminalTest = contractPhase === "terminal" ? test : test.skip;
+const contractMode = process.env.ANCHORED_FILESYSTEM_CONTRACT_MODE ?? "terminal";
+const terminalTest = contractMode === "terminal" ? test : test.skip;
 
 const read = (path) => readFile(join(repository, path), "utf8");
 
@@ -1178,14 +1178,14 @@ const assertAbsent = (sources, expressions) => {
   }
 };
 
-test("P01-B02 contract mode is explicit and terminal by default", () => {
+test("anchored-filesystem contract mode is explicit and terminal by default", () => {
   assert.ok(
-    contractPhase === "migration" || contractPhase === "terminal",
-    "P01_B02_CONTRACT_PHASE must be migration or terminal",
+    contractMode === "migration" || contractMode === "terminal",
+    "ANCHORED_FILESYSTEM_CONTRACT_MODE must be migration or terminal",
   );
 });
 
-test("P01-B02 has one dependency-bottom physical capability owner", async () => {
+test("anchored-filesystem has one dependency-bottom physical capability owner", async () => {
   const [workspace, manifest, library] = await Promise.all([
     read("Cargo.toml"),
     read("core/fs/Cargo.toml"),
@@ -1251,7 +1251,7 @@ test("P01-B02 has one dependency-bottom physical capability owner", async () => 
   assert.doesNotMatch(library, /PathBuf/);
 });
 
-test("P01-B02 mutation outcomes retain distinct gated obligations", async () => {
+test("anchored-filesystem mutation outcomes retain distinct gated obligations", async () => {
   const library = await read("core/fs/src/lib.rs");
   const outcomes = [
     ["DirectoryCreateOutcome", "Created"],
@@ -1356,7 +1356,7 @@ test("P01-B02 mutation outcomes retain distinct gated obligations", async () => 
   }
 });
 
-test("P01-B02 reserves create effects before native namespace mutation", async () => {
+test("anchored-filesystem reserves create effects before native namespace mutation", async () => {
   const library = await read("core/fs/src/lib.rs");
   const authority = implementationBlock(library, "CapabilityAuthority");
 
@@ -1502,7 +1502,7 @@ test("P01-B02 reserves create effects before native namespace mutation", async (
   );
 });
 
-test("P01-B02 preserves Unix mkdir effects that never yielded retained identity", async () => {
+test("anchored-filesystem preserves Unix mkdir effects that never yielded retained identity", async () => {
   const [library, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -2249,7 +2249,7 @@ test("P01-B02 preserves Unix mkdir effects that never yielded retained identity"
   }
 });
 
-test("P01-B02 remains session-local and does not absorb B03 durability", async () => {
+test("anchored-filesystem remains session-local and does not absorb journal durability", async () => {
   const [manifest, library, platform, transient, recovery, recoveryRuntime] =
     await Promise.all([
     read("core/fs/Cargo.toml"),
@@ -2259,7 +2259,7 @@ test("P01-B02 remains session-local and does not absorb B03 durability", async (
     read("core/fs/src/recovery.rs"),
     read("core/fs/src/recovery_runtime.rs"),
   ]);
-  const b02Primitives = [
+  const filesystemPrimitives = [
     rustProductionSource(transient),
     ...[library, platform]
       .flatMap((source) => functionBlocks(rustProductionSource(source)))
@@ -2268,7 +2268,7 @@ test("P01-B02 remains session-local and does not absorb B03 durability", async (
   ].join("\n");
   assert.doesNotMatch(manifest, /^serde(?:_json)?\s*=/m);
   assert.doesNotMatch(
-    b02Primitives,
+    filesystemPrimitives,
     /\bSerialize\b|\bDeserialize\b|\bpersistent_(?:binding|identity)\b|\b(?:StageJournal|PersistedStage|DurableReceipt|StartupStageRecovery|PidStage|StagePid)\b|std::process::id\(|process::id\(/,
     "axial-fs must not persist native identity, stage state, PID sweep authority, or restart truth",
   );
@@ -2282,12 +2282,12 @@ test("P01-B02 remains session-local and does not absorb B03 durability", async (
   assert.deepEqual(
     parallelSweepers,
     [],
-    "generic B02 code must not grow a parallel startup sweeper",
+    "generic session code must not grow a parallel startup sweeper",
   );
   assert.doesNotMatch(
-    b02Primitives,
+    filesystemPrimitives,
     /RecoveryJournal|initialize_and_replay/,
-    "B02 transient and park primitives must remain session-local",
+    "transient and park primitives must remain session-local",
   );
   assert.match(recovery, /struct RecoveryJournal\b/);
   assert.match(
@@ -2297,7 +2297,7 @@ test("P01-B02 remains session-local and does not absorb B03 durability", async (
   assert.match(library, /recovery_runtime::initialize_and_replay\s*\(/);
 });
 
-test("P01-B02 never serializes native filesystem identity", async () => {
+test("anchored-filesystem never serializes native filesystem identity", async () => {
   const rustSources = await readRustTree("apps", "core");
   const byPath = new Map(rustSources);
   assertAbsent(rustSources, [
@@ -2349,7 +2349,7 @@ test("P01-B02 never serializes native filesystem identity", async () => {
   );
 });
 
-test("P01-B02 root acquisition retains exact partial-effect obligations", async () => {
+test("anchored-filesystem root acquisition retains exact partial-effect obligations", async () => {
   const [library, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -2906,7 +2906,7 @@ test("P01-B02 root acquisition retains exact partial-effect obligations", async 
   );
 });
 
-test("P01-B02 retains physical startup process-image ancestry for reset", async () => {
+test("anchored-filesystem retains physical startup process-image ancestry for reset", async () => {
   const [library, platform, bootstrap] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -3165,7 +3165,7 @@ test("P01-B02 retains physical startup process-image ancestry for reset", async 
   }
 });
 
-test("P01-B02 native operations stay relative to retained handles", async () => {
+test("anchored-filesystem native operations stay relative to retained handles", async () => {
   const [library, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -3579,7 +3579,7 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
   );
 });
 
-test("P01-B02 proves the retained directory object is unlinked before removal success", async () => {
+test("anchored-filesystem proves the retained directory object is unlinked before removal success", async () => {
   const platform = await read("core/fs/src/platform.rs");
   const unix = between(
     platform,
@@ -3728,7 +3728,7 @@ test("P01-B02 proves the retained directory object is unlinked before removal su
   assert.match(macosPathProof, /identity_from_stat\(stat\)/);
 });
 
-test("P01-B02 streams through positional handles and proves completion", async () => {
+test("anchored-filesystem streams through positional handles and proves completion", async () => {
   const [library, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -3803,7 +3803,7 @@ test("P01-B02 streams through positional handles and proves completion", async (
   assert.match(writerWrite, /position[\s\S]*?checked_add/);
 });
 
-test("P01-B02 enumeration retains opaque cleanup tokens and reports overflow", async () => {
+test("anchored-filesystem enumeration retains opaque cleanup tokens and reports overflow", async () => {
   const [library, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -3900,7 +3900,7 @@ test("P01-B02 enumeration retains opaque cleanup tokens and reports overflow", a
   }
 });
 
-test("P01-B02 owns capability-safe park restore and replacement primitives", async () => {
+test("anchored-filesystem owns capability-safe park restore and replacement primitives", async () => {
   const [library, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -3953,7 +3953,7 @@ test("P01-B02 owns capability-safe park restore and replacement primitives", asy
   assert.match(
     sealed,
     /pub fn replace_nondurable\s*\(/,
-    "B02 replacement must not claim B03 durability",
+    "replacement must not claim journal durability",
   );
 
   const publicFunctions = functionBlocks(library).filter(({ source }) =>
@@ -4007,7 +4007,7 @@ test("P01-B02 owns capability-safe park restore and replacement primitives", asy
   }
 });
 
-test("P01-B02 explicitly acknowledges preserved exact files", async () => {
+test("anchored-filesystem explicitly acknowledges preserved exact files", async () => {
   const library = await read("core/fs/src/lib.rs");
   assertMustUse(library, "struct", "FileParkPreservationError");
   assertLinear(library, "FileParkPreservationError");
@@ -4218,7 +4218,7 @@ test("P01-B02 explicitly acknowledges preserved exact files", async () => {
   assert.match(unixFailureTest, /token\.armed/);
 });
 
-test("P01-B02 bounds every outstanding native effect with one shared permit", async () => {
+test("anchored-filesystem bounds every outstanding native effect with one shared permit", async () => {
   const library = await read("core/fs/src/lib.rs");
   const operationState = itemBlock(library, "struct", "OperationState");
   const effectField = operationState.match(
@@ -4470,7 +4470,7 @@ test("P01-B02 bounds every outstanding native effect with one shared permit", as
   );
 });
 
-test("P01-B02 retries abandoned create cleanup from its applied-delete phase", async () => {
+test("anchored-filesystem retries abandoned create cleanup from its applied-delete phase", async () => {
   const library = await read("core/fs/src/lib.rs");
   const authority = implementationBlock(library, "CapabilityAuthority");
 
@@ -4586,7 +4586,7 @@ test("P01-B02 retries abandoned create cleanup from its applied-delete phase", a
   }
 });
 
-test("P01-B02 tracks user-origin parks with separate recoverable authorities", async () => {
+test("anchored-filesystem tracks user-origin parks with separate recoverable authorities", async () => {
   const library = await read("core/fs/src/lib.rs");
   const fileTokenName = library.match(
     /struct ([A-Za-z0-9_]*FilePark[A-Za-z0-9_]*Token[A-Za-z0-9_]*)\s*\{/,
@@ -5179,7 +5179,7 @@ test("P01-B02 tracks user-origin parks with separate recoverable authorities", a
   }
 });
 
-test("P01-B02 tracks stage ownership through drop promotion and reset", async () => {
+test("anchored-filesystem tracks stage ownership through drop promotion and reset", async () => {
   const library = await read("core/fs/src/lib.rs");
   const tokenName = library.match(
     /struct ([A-Za-z0-9_]*Stage[A-Za-z0-9_]*Token[A-Za-z0-9_]*)\s*\{/,
@@ -5431,7 +5431,7 @@ test("P01-B02 tracks stage ownership through drop promotion and reset", async ()
   );
 });
 
-test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () => {
+test("anchored-filesystem root lease is retained, identity-bound, and fail-fast", async () => {
   const [library, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -6210,7 +6210,7 @@ test("P01-B02 root lease is retained, identity-bound, and fail-fast", async () =
   }
 });
 
-test("P01-B02 admits external absolute roots into the one live session", async () => {
+test("anchored-filesystem admits external absolute roots into the one live session", async () => {
   const [library, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -6274,7 +6274,7 @@ test("P01-B02 admits external absolute roots into the one live session", async (
   assert.match(directoryValidation, /BindingState::Exact|validate_[a-z_]*root/);
 });
 
-test("P01-B02 fail-stops unresolved acquisition and root-clear authority", async () => {
+test("anchored-filesystem fail-stops unresolved acquisition and root-clear authority", async () => {
   const library = await read("core/fs/src/lib.rs");
   for (const carrier of ["RootSessionAcquireObligation", "RootClearFailure"]) {
     const drop = traitImplementationBlock(library, "Drop", carrier);
@@ -6290,7 +6290,7 @@ test("P01-B02 fail-stops unresolved acquisition and root-clear authority", async
   }
 });
 
-test("P01-B02 reset failures retain explicit cancellation exits", async () => {
+test("anchored-filesystem reset failures retain explicit cancellation exits", async () => {
   const library = await read("core/fs/src/lib.rs");
   for (const carrier of ["ResetStartFailure", "ResetDrainFailure"]) {
     const drop = traitImplementationBlock(library, "Drop", carrier);
@@ -6369,7 +6369,7 @@ test("P01-B02 reset failures retain explicit cancellation exits", async () => {
   );
 });
 
-test("P01-B02 keeps read completion advisory and drain recovery internal", async () => {
+test("anchored-filesystem keeps read completion advisory and drain recovery internal", async () => {
   const library = await read("core/fs/src/lib.rs");
   assertMustUse(library, "struct", "FileReader");
   const readerDropName = library.match(
@@ -6390,7 +6390,7 @@ test("P01-B02 keeps read completion advisory and drain recovery internal", async
   );
 });
 
-test("P01-B02 parks exact files at caller-named leaves without a second rename framework", async () => {
+test("anchored-filesystem parks exact files at caller-named leaves without a second rename framework", async () => {
   const [library, platform, workspaceManifest, fsManifest] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -6568,7 +6568,7 @@ test("P01-B02 parks exact files at caller-named leaves without a second rename f
   );
 });
 
-test("P01-B02 admits exact existing file parks without replaying mutation", async () => {
+test("anchored-filesystem admits exact existing file parks without replaying mutation", async () => {
   const library = await read("core/fs/src/lib.rs");
   const admission = uniqueMethodBlock(
     library,
@@ -6672,7 +6672,7 @@ test("P01-B02 admits exact existing file parks without replaying mutation", asyn
   );
 });
 
-test("P01-B02 admits exact existing directory parks without replaying mutation", async () => {
+test("anchored-filesystem admits exact existing directory parks without replaying mutation", async () => {
   const library = await read("core/fs/src/lib.rs");
   const admission = uniqueMethodBlock(
     library,
@@ -6785,7 +6785,7 @@ test("P01-B02 admits exact existing directory parks without replaying mutation",
   );
 });
 
-test("P01-B02 exposes exact bounded file revision evidence", async () => {
+test("anchored-filesystem exposes exact bounded file revision evidence", async () => {
   const [library, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -7075,7 +7075,7 @@ test("P01-B02 exposes exact bounded file revision evidence", async () => {
   );
 });
 
-test("P01-B02 keeps directory revisions opaque and identity process-local", async () => {
+test("anchored-filesystem keeps directory revisions opaque and identity process-local", async () => {
   const [library, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
     read("core/fs/src/platform.rs"),
@@ -7222,7 +7222,7 @@ test("P01-B02 keeps directory revisions opaque and identity process-local", asyn
   assert.doesNotMatch(manifest, /^serde(?:_json)?\s*=/m);
 });
 
-test("P01-B02 injects one fixed persisted-state directory bundle off runtime", async () => {
+test("anchored-filesystem injects one fixed persisted-state directory bundle off runtime", async () => {
   const [
     configRoot,
     state,
@@ -7396,7 +7396,7 @@ test("P01-B02 injects one fixed persisted-state directory bundle off runtime", a
   );
 });
 
-test("P01-B02 derives complete bounded v3 restart observations from axial-fs", async () => {
+test("anchored-filesystem derives complete bounded v3 restart observations from axial-fs", async () => {
   const [
     anchoredRecord,
     benchmarkDrivers,
@@ -7821,7 +7821,7 @@ test("P01-B02 derives complete bounded v3 restart observations from axial-fs", a
   }
 });
 
-test("P01-B02 resumes deterministic persisted-state parks as typed receipts off runtime", async () => {
+test("anchored-filesystem resumes deterministic persisted-state parks as typed receipts off runtime", async () => {
   const [persistedLoad, persistedRepair, anchoredRecord] = await Promise.all([
     read("apps/api/src/state/persisted_state_load.rs"),
     read("apps/api/src/state/persisted_state_repair.rs"),
@@ -8049,7 +8049,7 @@ test("P01-B02 resumes deterministic persisted-state parks as typed receipts off 
   );
 });
 
-test("P01-B02 settles live persisted-state parks after durable plan and off Tokio", async () => {
+test("anchored-filesystem settles live persisted-state parks after durable plan and off Tokio", async () => {
   const [persistedRepair, anchoredRecord] = await Promise.all([
     read("apps/api/src/state/persisted_state_repair.rs"),
     read("apps/api/src/execution/anchored_record.rs"),
@@ -8283,7 +8283,7 @@ test("P01-B02 settles live persisted-state parks after durable plan and off Toki
   );
 });
 
-test("P01-B02 wires registered artifact proofs and effects through Guardian settlement", async () => {
+test("anchored-filesystem wires registered artifact proofs and effects through Guardian settlement", async () => {
   const [executionModule, anchoredRecord, artifact, findings, reconciliation, guardian] =
     await Promise.all([
       read("apps/api/src/execution/mod.rs"),
@@ -8474,7 +8474,7 @@ test("P01-B02 wires registered artifact proofs and effects through Guardian sett
 });
 
 terminalTest(
-  "P01-B02 preserves B01 root selection and portable naming authority",
+  "anchored-filesystem preserves portable root selection and naming authority",
   async () => {
     const [
       bootstrap,
@@ -8524,7 +8524,7 @@ terminalTest(
 );
 
 terminalTest(
-  "P01-B02 acquires and retains the application root before every store",
+  "anchored-filesystem acquires and retains the application root before every store",
   async () => {
     const [
       configLibrary,
@@ -8665,7 +8665,7 @@ terminalTest(
 );
 
 terminalTest(
-  "P01-B02 retains typed move and cleared-root authority in axial-fs",
+  "anchored-filesystem retains typed move and cleared-root authority in axial-fs",
   async () => {
     const [library, platform] = await Promise.all([
       read("core/fs/src/lib.rs"),
@@ -8814,7 +8814,7 @@ terminalTest(
   },
 );
 
-terminalTest("P01-B02 leaves one shared physical adapter", async () => {
+terminalTest("anchored-filesystem leaves one shared physical adapter", async () => {
   const [anchoredRecord, managedFs, launchReports, performanceLibrary] =
     await Promise.all([
       read("apps/api/src/execution/anchored_record.rs"),
@@ -8887,7 +8887,7 @@ terminalTest("P01-B02 leaves one shared physical adapter", async () => {
 });
 
 terminalTest(
-  "P01-B02 performance managed storage has one capability authority",
+  "anchored-filesystem performance managed storage has one capability authority",
   async () => {
     const [
       storage,
@@ -9225,7 +9225,7 @@ terminalTest(
 );
 
 terminalTest(
-  "P01-B02 rollback retention is bounded and interruption recoverable",
+  "anchored-filesystem rollback retention is bounded and interruption recoverable",
   async () => {
     const [state, mutation] = await Promise.all([
       read("core/performance/src/state/mod.rs"),
@@ -9897,7 +9897,7 @@ terminalTest("architecture records native skin authority timing and remote-volum
   assert.match(architecture, /not a hard kernel I\/O[\s\S]*deadline/);
 });
 
-test("P01-B02 deletes the abandoned lower transfer stack", async () => {
+test("anchored-filesystem deletes the abandoned lower transfer stack", async () => {
   const [downloadModule, transfer, facts, minecraftManifest] = await Promise.all([
     read("core/minecraft/src/download/mod.rs"),
     read("core/minecraft/src/download/transfer.rs"),
@@ -9918,7 +9918,7 @@ test("P01-B02 deletes the abandoned lower transfer stack", async () => {
   assert.doesNotMatch(minecraftManifest, /^sysinfo\.workspace\s*=\s*true$/m);
 });
 
-terminalTest("P01-B02 deletes raw mutation and migration residue", async () => {
+terminalTest("anchored-filesystem deletes raw mutation and migration residue", async () => {
   const rustSources = await readRustTree("apps", "core");
   const byPath = new Map(rustSources);
   assertAbsent(rustSources, [
@@ -9955,7 +9955,7 @@ terminalTest("P01-B02 deletes raw mutation and migration residue", async () => {
   ];
   for (const path of migratedMutationOwners) {
     const source = byPath.get(path);
-    assert.ok(source, `missing migrated B02 owner ${path}`);
+    assert.ok(source, `missing migrated session owner ${path}`);
     const productionSource = rustProductionSource(source);
     assert.doesNotMatch(
       productionSource,
@@ -10001,7 +10001,7 @@ terminalTest("P01-B02 deletes raw mutation and migration residue", async () => {
 });
 
 terminalTest(
-  "P01-B02 reset retries are bounded and external data is identity-protected",
+  "anchored-filesystem reset retries are bounded and external data is identity-protected",
   async () => {
     const [configSources, desktopState, fsLibrary, fsPlatform] = await Promise.all([
       readRustTree("core/config/src"),
@@ -10148,7 +10148,7 @@ terminalTest(
 );
 
 terminalTest(
-  "P01-B02 reset and loader authority are capability-bound and pathless",
+  "anchored-filesystem reset and loader authority are capability-bound and pathless",
   async () => {
     const [
       desktopCommands,
@@ -10290,7 +10290,7 @@ terminalTest(
 );
 
 terminalTest(
-  "P01-B02 documents and retains only the one required park digest lifetime",
+  "anchored-filesystem documents and retains only the one required park digest lifetime",
   async () => {
     const [library, namespaceAdr, guardianArchitecture] = await Promise.all([
       read("core/fs/src/lib.rs"),
@@ -10325,7 +10325,7 @@ terminalTest(
 );
 
 terminalTest(
-  "P01-B02 removes dependencies owned only by displaced adapters",
+  "anchored-filesystem removes dependencies owned only by displaced adapters",
   async () => {
     const [performanceManifest, desktopManifest] = await Promise.all([
       read("core/performance/Cargo.toml"),

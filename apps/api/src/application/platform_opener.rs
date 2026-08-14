@@ -212,12 +212,12 @@ mod tests {
     const HELPER_ENV: &str = "AXIAL_NATIVE_OPENER_HELPER";
     const HELPER_MARKER_ENV: &str = "AXIAL_NATIVE_OPENER_MARKER";
     const HELPER_TEST: &str =
-        "application::platform_opener::tests::p01_b06_contract_native_opener_child";
+        "application::platform_opener::tests::native_filesystem_contract_native_opener_child";
     static NATIVE_OPENER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     #[ignore]
-    fn p01_b06_contract_native_opener_child() {
+    fn native_filesystem_contract_native_opener_child() {
         if std::env::var_os(HELPER_ENV).is_none() {
             return;
         }
@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn p01_b06_contract_native_openers_are_bounded_and_shutdown_owned() {
+    async fn native_filesystem_contract_native_openers_are_bounded_and_shutdown_owned() {
         let _serial = NATIVE_OPENER_TEST_LOCK.lock().await;
         let temporary = tempfile::tempdir().expect("native opener temporary directory");
         let lifecycle = AppLifecycle::new();
@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn p01_b06_contract_slow_opener_preparation_does_not_block_async_heartbeat() {
+    async fn native_filesystem_contract_slow_opener_preparation_does_not_block_async_heartbeat() {
         let _serial = NATIVE_OPENER_TEST_LOCK.lock().await;
         let temporary = tempfile::tempdir().expect("native opener temporary directory");
         let marker = temporary.path().join("slow.marker");
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn p01_b06_contract_cross_owner_cancelled_request_retains_opener_owner() {
+    async fn native_filesystem_contract_cross_owner_cancelled_request_retains_opener_owner() {
         let _serial = NATIVE_OPENER_TEST_LOCK.lock().await;
         let temporary = tempfile::tempdir().expect("native opener temporary directory");
         let marker = temporary.path().join("cancelled.marker");

@@ -1544,19 +1544,19 @@ test("focused publication regressions remain registered", async () => {
   assert.doesNotMatch(windowsReceiptMisuse, /std::fs::rename/);
   assert.match(
     taskfile,
-    /verify:native:windows:[\s\S]*task: verify:phase:p01:native/,
+    /verify:native:windows:[\s\S]*task: verify:native:filesystem/,
   );
   assert.match(
     taskfile,
-    /verify:native:macos:[\s\S]*task: verify:phase:p01:native/,
+    /verify:native:macos:[\s\S]*task: verify:native:filesystem/,
   );
   const phaseGate = taskfile.slice(
-    taskfile.indexOf("  verify:phase:p01:native:"),
+    taskfile.indexOf("  verify:native:filesystem:"),
     taskfile.indexOf("  capability:self-test:"),
   );
   for (const command of [
     "task: verify:contracts",
-    "cargo test --locked -p axial-api --lib --no-default-features p01_b0",
+    "cargo test --locked -p axial-api --lib --no-default-features native_filesystem_contract_ --",
     "cargo test --locked -p axial-fs --lib",
     "cargo test --locked -p axial-resource --lib",
     "cargo test --locked -p axial-minecraft download::transient_transfer::tests",
@@ -1570,6 +1570,6 @@ test("focused publication regressions remain registered", async () => {
   );
   assert.match(
     taskfile,
-    /verify:contracts:[\s\S]*scripts\/tests\/contracts\/p01-b03-named-publication-contract\.test\.mjs/,
+    /verify:contracts:[\s\S]*scripts\/tests\/contracts\/named-publication-contract\.test\.mjs/,
   );
 });

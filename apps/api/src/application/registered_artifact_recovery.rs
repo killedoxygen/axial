@@ -105,11 +105,20 @@ pub(super) fn prepare_tier2_registered_artifact_recovery(
         if matching_facts.next().is_some() {
             return Tier2RegisteredArtifactRecovery { execution: None };
         }
+        let mut fact = fact.clone();
+        if fact
+            .operation_id
+            .as_ref()
+            .is_some_and(|operation_id| operation_id != sweep_operation_id)
+        {
+            return Tier2RegisteredArtifactRecovery { execution: None };
+        }
+        fact.operation_id = Some(sweep_operation_id.clone());
         let mode = GuardianMode::from_config(&state.config().current().guardian_mode);
         let Some(assessment) = assess_tier2_registered_artifact_repair(
             sweep_operation_id.clone(),
             mode,
-            fact,
+            &fact,
             candidate,
         ) else {
             return Tier2RegisteredArtifactRecovery { execution: None };
@@ -371,7 +380,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn p02_b05_contract_cross_owner_known_good_interrupted_and_unsettled_remain_distinct() {
+    fn behavior_contract_cross_owner_known_good_interrupted_and_unsettled_remain_distinct() {
         let interrupted = axial_minecraft::ManagedVersionBundleRebuildError::Interrupted;
         let unsettled = axial_minecraft::ManagedVersionBundleRebuildError::Unsettled;
 

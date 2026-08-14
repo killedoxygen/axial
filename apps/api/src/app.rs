@@ -597,7 +597,7 @@ mod tests {
 
     #[cfg(feature = "embedded-frontend")]
     #[tokio::test]
-    async fn p02_b06_contract_cross_owner_embedded_static_routing_and_mime_are_exact() {
+    async fn behavior_contract_cross_owner_embedded_static_routing_and_mime_are_exact() {
         for (request_path, expected_type) in [
             ("/index.html", "text/html"),
             ("/app.js", "text/javascript"),
@@ -825,7 +825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b07_contract_optional_workflow_reports_admission_failure_during_request_drain() {
+    async fn behavior_contract_optional_workflow_reports_admission_failure_during_request_drain() {
         let root = axial_api_test_support::test_root("performance-resume-draining");
         let state = build_test_state(&root, None);
         let request = state.try_admit_request().expect("admit held request");

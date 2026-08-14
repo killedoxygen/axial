@@ -455,10 +455,10 @@ async fn prepared_application_error_terminalizes_and_preserves_public_error() {
 }
 
 #[tokio::test]
-async fn p03_b01_contract_cross_owner() {
-    let fixture = TestFixture::new("p03-b01-contract-cross-owner");
+async fn behavior_contract_cross_owner() {
+    let fixture = TestFixture::new("performance-journal-contract-cross-owner");
     let instance_id = fixture
-        .add_persisted_instance("P03 B01", "1.20.4-fabric")
+        .add_persisted_instance("performance-journal", "1.20.4-fabric")
         .await;
     let projection = fixture
         .state
@@ -573,7 +573,7 @@ fn test_intent(instance_id: &str) -> PerformanceOperationIntent {
         instance_id: instance_id.to_string(),
         requested_action: PerformanceOperationAction::Install,
         action: PerformanceOperationAction::Install,
-        base_target_id: "p03-b01-target".to_string(),
+        base_target_id: "performance-journal-target".to_string(),
         rollback: RollbackState::Unavailable,
         game_version: Some("1.20.4".to_string()),
         loader: Some("fabric".to_string()),
@@ -584,7 +584,7 @@ fn test_intent(instance_id: &str) -> PerformanceOperationIntent {
 
 fn test_prepared() -> PerformanceOperationPrepared {
     PerformanceOperationPrepared {
-        result_target_id: "p03-b01-target".to_string(),
+        result_target_id: "performance-journal-target".to_string(),
         proof: PerformancePreparedProof::InstallPlan {
             graph_sha512: "a".repeat(128),
             artifact_count: 0,

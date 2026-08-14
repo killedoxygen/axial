@@ -2802,7 +2802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p00_b09_contract_cross_owner_managed_version_bundle_commit_settles_exact_terminal_memory()
+    async fn behavior_contract_cross_owner_managed_version_bundle_commit_settles_exact_terminal_memory()
      {
         let fixture = fixture("version-bundle-commit");
         let admission = version_bundle_component_admission(&fixture, "version-bundle-commit").await;

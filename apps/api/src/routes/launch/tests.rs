@@ -58,7 +58,7 @@ fn benchmark_launch_request_missing_instance_id_returns_json_error() {
 }
 
 #[tokio::test]
-async fn p00_b11_contract_cross_owner_response_uses_application_task_identity() {
+async fn behavior_contract_cross_owner_response_uses_application_task_identity() {
     let fixture = RouteTestFixture::new("prepared-response-payload");
     let producer = fixture
         .state

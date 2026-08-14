@@ -18,11 +18,11 @@ use crate::guardian::{
     GuardianFact, GuardianLaunchRecoveryPlan, GuardianObservedLaunchFailurePhase,
     GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
     GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianSummary,
-    author_guardian_copy, guardian_fact_from_execution,
-    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-    guardian_startup_failure_outcome, guardian_summary_with_artifact_repair_outcome,
-    guardian_summary_with_blocked_outcome, guardian_summary_with_observed_outcome,
-    is_guardian_launch_crash_class, record_launch_failure_observation, user_mod_set_drift_fact,
+    OperationEvidenceBatch, author_guardian_copy, guardian_prelaunch_preset_adjustment_directive,
+    guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
+    guardian_summary_with_artifact_repair_outcome, guardian_summary_with_blocked_outcome,
+    guardian_summary_with_observed_outcome, is_guardian_launch_crash_class,
+    record_launch_failure_observation, user_mod_set_drift_fact,
 };
 use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
@@ -2265,18 +2265,14 @@ async fn sense_startup_failure_integrity(
         .await
         .map(|admitted| {
             let (report, findings) = admitted.into_parts();
-            let facts = report
-                .facts
-                .iter()
-                .map(|fact| {
-                    guardian_fact_from_execution(
-                        fact,
-                        crate::state::contracts::OperationPhase::Launching,
-                    )
-                })
-                .collect();
+            let Ok(evidence) = OperationEvidenceBatch::try_from_execution_unscoped(
+                crate::state::contracts::OperationPhase::Launching,
+                &report.facts,
+            ) else {
+                return StartupFailureIntegrity::default();
+            };
             StartupFailureIntegrity {
-                facts,
+                facts: evidence.facts().to_vec(),
                 findings: Some(findings),
             }
         })
@@ -2336,7 +2332,7 @@ mod tests {
     const CRASH_E2E_INSTANCE_ID: &str = "0123456789abcdef";
 
     #[test]
-    fn p00_b09_contract_registered_artifact_startup_disposition_is_managed_only() {
+    fn behavior_contract_registered_artifact_startup_disposition_is_managed_only() {
         let cases = [
             (
                 GuardianMode::Managed,
@@ -2874,7 +2870,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn p00_b09_contract_deleted_library_uses_r1_and_second_process_reaches_boot() {
+    async fn behavior_contract_deleted_library_uses_r1_and_second_process_reaches_boot() {
         let root = unique_test_dir("deleted-library-launch-continuation");
         let instance_id = "0000000000000001";
         let session_id = "deleted-library-launch-continuation";
@@ -2950,14 +2946,14 @@ mod tests {
         assert_eq!(reconciliation.len(), 1);
         let leaf = reconciliation
             .first()
-            .expect("deleted-Libraries R1 terminal");
+            .expect("deleted-Libraries RepairArtifact terminal");
         assert_eq!(leaf.1.rung(), ReconciliationRung::RepairArtifact);
         assert_eq!(leaf.0.status, OperationStatus::Succeeded);
         assert_eq!(leaf.1.component(), ReconciliationComponent::Libraries);
         let leaf_terminal = leaf
             .0
             .reconciliation_terminal()
-            .expect("deleted-Libraries R1 result");
+            .expect("deleted-Libraries RepairArtifact result");
         assert_eq!(
             leaf_terminal.outcome(),
             ReconciliationTerminalOutcome::Succeeded
@@ -3010,7 +3006,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn p00_b09_contract_cross_owner_wrong_client_uses_r1_r2_and_second_process_reaches_boot()
+    async fn behavior_contract_cross_owner_wrong_client_uses_r1_r2_and_second_process_reaches_boot()
     {
         let root = unique_test_dir("wrong-content-client-launch-continuation");
         let instance_id = "0000000000000001";
@@ -3176,11 +3172,11 @@ mod tests {
         let leaf = reconciliation
             .iter()
             .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RepairArtifact)
-            .expect("wrong-content VersionBundle R1 terminal");
+            .expect("wrong-content VersionBundle RepairArtifact terminal");
         let component = reconciliation
             .iter()
             .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RebuildComponent)
-            .expect("wrong-content VersionBundle R2 terminal");
+            .expect("wrong-content VersionBundle RebuildComponent terminal");
         assert_eq!(leaf.1.component(), ReconciliationComponent::VersionBundle);
         assert_eq!(
             component.1.component(),
@@ -3204,11 +3200,11 @@ mod tests {
         let leaf_terminal = leaf
             .0
             .reconciliation_terminal()
-            .expect("wrong-content VersionBundle R1 result");
+            .expect("wrong-content VersionBundle RepairArtifact result");
         let component_terminal = component
             .0
             .reconciliation_terminal()
-            .expect("wrong-content VersionBundle R2 result");
+            .expect("wrong-content VersionBundle RebuildComponent result");
         assert_eq!(
             leaf_terminal.outcome(),
             ReconciliationTerminalOutcome::Failed
@@ -5254,7 +5250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p00_b08_contract_runner_transitions_from_preparing_to_starting() {
+    async fn behavior_contract_runner_transitions_from_preparing_to_starting() {
         let root = unique_test_dir("runner-stage-evidence");
         let state = test_app_state(&root);
         let session_id = "runner-stage-evidence";
@@ -5345,7 +5341,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_registered_artifact_diagnostic_reasons_are_closed_tokens() {
+    fn behavior_contract_registered_artifact_diagnostic_reasons_are_closed_tokens() {
         let reasons = [
             RegisteredArtifactRepairFailureReason::EvidenceUnavailable,
             RegisteredArtifactRepairFailureReason::AuthorizationRejected,

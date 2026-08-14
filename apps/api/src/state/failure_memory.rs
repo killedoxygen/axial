@@ -25,7 +25,7 @@ use crate::execution::persistence::{
 use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
 #[cfg(test)]
 use axial_config::AppPaths;
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -66,8 +66,11 @@ impl FailureMemoryKey {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "no_intent".to_string());
         Self(format!(
-            "{domain:?}:{diagnosis}:{:?}.{:?}.{target_id}:{mode:?}:{intent}",
-            target.system, target.kind
+            "{}:{diagnosis}:{}.{}.{target_id}:{}:{intent}",
+            domain.failure_memory_id(),
+            target.system.failure_memory_id(),
+            target.kind.failure_memory_id(),
+            mode.failure_memory_id(),
         ))
     }
 
@@ -115,18 +118,18 @@ impl FailureMemoryKey {
         );
         let base = Self::for_observation(domain, diagnosis_id, target, mode, None);
         Self(format!(
-            "{}:rung.{:?}:component.{:?}:scope.{scope}",
+            "{}:rung.{}:component.{}:scope.{scope}",
             base.as_str(),
-            rung,
-            component,
+            rung.failure_memory_id(),
+            component.failure_memory_id(),
         ))
     }
 
     pub(super) fn for_persisted_state_repair(attempt: &PersistedStateRepairAttempt) -> Self {
         Self(format!(
-            "State:{}:Managed:{:?}:{}:{}",
+            "State:{}:Managed:{}:{}:{}",
             DiagnosisId::PersistedStateSchemaInvalid.as_str(),
-            attempt.store(),
+            attempt.store().failure_memory_id(),
             attempt.record_id(),
             attempt.physical_identity().as_str(),
         ))
@@ -1776,7 +1779,8 @@ fn canonical_install_guardian_retry_timestamp(
     let parsed = DateTime::parse_from_rfc3339(value)
         .map_err(|_| FailureMemoryValidationError::InstallGuardianRetryMismatch)?
         .with_timezone(&Utc);
-    if parsed.to_rfc3339() != value {
+    if parsed.to_rfc3339() != value && parsed.to_rfc3339_opts(SecondsFormat::Millis, true) != value
+    {
         return Err(FailureMemoryValidationError::InstallGuardianRetryMismatch);
     }
     Ok(parsed)
@@ -2036,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b02_contract_exact_cooldown_and_future_skew_bound_all_admission_paths() {
+    fn behavior_contract_exact_cooldown_and_future_skew_bound_all_admission_paths() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("test now")
             .with_timezone(&chrono::Utc);
@@ -2127,7 +2131,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b02_contract_far_future_capacity_is_quarantined_before_valid_admission() {
+    fn behavior_contract_far_future_capacity_is_quarantined_before_valid_admission() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("test now")
             .with_timezone(&chrono::Utc);
@@ -2155,7 +2159,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b02_contract_overlong_terminal_is_quarantined_but_malformed_is_fatal() {
+    fn behavior_contract_overlong_terminal_is_quarantined_but_malformed_is_fatal() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("test now")
             .with_timezone(&chrono::Utc);
@@ -2188,7 +2192,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b02_contract_monotonic_time_ignores_wall_jumps_and_never_resurrects_expiry() {
+    fn behavior_contract_monotonic_time_ignores_wall_jumps_and_never_resurrects_expiry() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("test now")
             .with_timezone(&chrono::Utc);
@@ -2211,7 +2215,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b02_contract_temporal_policy_preserves_exact_intent_keys() {
+    fn behavior_contract_temporal_policy_preserves_exact_intent_keys() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("test now")
             .with_timezone(&chrono::Utc);
@@ -2239,7 +2243,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b02_contract_repair_reservation_uses_policy_now_not_caller_time() {
+    fn behavior_contract_repair_reservation_uses_policy_now_not_caller_time() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("test now")
             .with_timezone(&chrono::Utc);
@@ -2263,7 +2267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b02_contract_future_replacement_cannot_end_live_suppression_early() {
+    async fn behavior_contract_future_replacement_cannot_end_live_suppression_early() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("test now")
             .with_timezone(&chrono::Utc);
@@ -2296,7 +2300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b02_contract_expired_pending_publication_can_be_acknowledged_and_pruned() {
+    async fn behavior_contract_expired_pending_publication_can_be_acknowledged_and_pruned() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("test now")
             .with_timezone(&chrono::Utc);
@@ -2599,7 +2603,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b02_contract_v7_fixture_is_byte_stable_and_v6_is_retired() {
+    fn behavior_contract_v7_fixture_is_byte_stable_and_v6_is_retired() {
         let snapshot =
             FailureMemorySnapshot::from_json(FAILURE_MEMORY_V7_FIXTURE).expect("strict fixture");
         assert_eq!(

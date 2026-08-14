@@ -413,7 +413,7 @@ async fn assert_required_lane_failure_cancels_blocked_sibling(
 }
 
 #[tokio::test]
-async fn p00_b09_contract_reconstruction_matches_install_without_touching_seeded_destinations() {
+async fn behavior_contract_reconstruction_matches_install_without_touching_seeded_destinations() {
     let root = temp_dir("reconstruction-parity");
     let (version_url, version_sha1, mut requests) =
         spawn_reconstruction_parity_server("reconstruction").await;
@@ -634,7 +634,7 @@ async fn p00_b09_contract_reconstruction_matches_install_without_touching_seeded
 }
 
 #[tokio::test]
-async fn p00_b09_contract_reconstruction_derives_runtime_inventory_without_runtime_effects() {
+async fn behavior_contract_reconstruction_derives_runtime_inventory_without_runtime_effects() {
     let root = temp_dir("reconstruction-runtime");
     let (version_url, version_sha1, runtime_source, mut requests) =
         spawn_runtime_reconstruction_server("runtime-reconstruction").await;
@@ -1420,7 +1420,7 @@ async fn loader_base_verification_retains_mismatch_and_releases_only_after_activ
 }
 
 #[tokio::test]
-async fn p00_b09_contract_nonempty_assets_publish_once_and_match_reconstruction() {
+async fn behavior_contract_nonempty_assets_publish_once_and_match_reconstruction() {
     let version_id = "normal-nonempty-assets";
     let root = temp_dir(version_id);
     let mut fixture = spawn_nonempty_asset_install_server(version_id).await;
@@ -1610,7 +1610,7 @@ async fn p00_b09_contract_nonempty_assets_publish_once_and_match_reconstruction(
 }
 
 #[tokio::test]
-async fn p00_b09_contract_normal_install_settles_assets_rollback() {
+async fn behavior_contract_normal_install_settles_assets_rollback() {
     let version_id = "normal-assets-first-row-rollback";
     let root = temp_dir(version_id);
     let fixture = spawn_nonempty_asset_install_server(version_id).await;
@@ -1653,7 +1653,7 @@ async fn p00_b09_contract_normal_install_settles_assets_rollback() {
 }
 
 #[tokio::test]
-async fn p00_b09_contract_normal_install_settles_libraries_rollback() {
+async fn behavior_contract_normal_install_settles_libraries_rollback() {
     let version_id = "normal-libraries-first-row-rollback";
     let root = temp_dir(version_id);
     let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;

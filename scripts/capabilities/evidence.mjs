@@ -237,14 +237,14 @@ function validatePlatform(platform) {
 export function validateEvidenceDocument(document) {
   requireExactKeys(
     document,
-    ["schema_version", "result", "proof_id", "scenario_id", "capability_id", "owner_phase", "source", "platform", "toolchain", "timing", "observations", "artifacts"],
+    ["schema_version", "result", "proof_id", "scenario_id", "capability_id", "owner_domain", "source", "platform", "toolchain", "timing", "observations", "artifacts"],
     "invalid_evidence",
   );
   if (document.schema_version !== 1 || document.result !== "verified") fail("invalid_evidence");
   if (!/^(?:CAP|PM)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/.test(document.proof_id)) fail("invalid_evidence_proof");
   if (!/^(?:CP|PM)-[A-Z0-9]+(?:-[A-Z0-9]+)*$/.test(document.scenario_id)) fail("invalid_evidence_scenario");
   requireClosedId(document.capability_id, "invalid_evidence_capability");
-  if (!/^P(?:0[0-9]|1[0-4])$/.test(document.owner_phase)) fail("invalid_evidence_phase");
+  requireClosedId(document.owner_domain, "invalid_evidence_domain");
 
   requireExactKeys(document.source, ["commit", "tree"], "invalid_evidence_source");
   requireHash(document.source.commit, HEX_40, "invalid_evidence_source");
@@ -364,7 +364,7 @@ export async function aggregateCapabilityEvidence(documents, expected) {
       document.scenario_id !== expected.record.scenario_id ||
       document.proof_id !== expected.record.proof_id ||
       document.capability_id !== expected.record.capability_id ||
-      document.owner_phase !== expected.record.owner_phase
+      document.owner_domain !== expected.record.owner_domain
     ) {
       fail("mixed_evidence_identity");
     }
@@ -395,7 +395,7 @@ export async function aggregateCapabilityEvidence(documents, expected) {
     scenario_id: expected.record.scenario_id,
     proof_id: expected.record.proof_id,
     capability_id: expected.record.capability_id,
-    owner_phase: expected.record.owner_phase,
+    owner_domain: expected.record.owner_domain,
     source: Object.freeze({ ...first.source }),
     toolchain: { manifest_sha256: manifestIdentity, identity: expected.manifest_identity },
     platforms: Object.freeze(required),

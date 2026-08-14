@@ -1,44 +1,44 @@
 {
-  "schema": "axial.guardian.invariant_coverage.v4",
+  "schema": "axial.guardian.invariant_coverage.v5",
   "invariants": [
     {
-      "id": "I1",
+      "id": "launch-failure-matrix",
       "status": "launch_failure_matrix_and_rules_registered"
     },
     {
-      "id": "I2",
+      "id": "guardian-reconciliation",
       "status": "current_guardian_reconciliation_and_persisted_state_repair_typed_hands_registered"
     },
     {
-      "id": "I3",
+      "id": "launch-failure-guidance",
       "status": "public_launch_failure_guidance_complete"
     },
     {
-      "id": "I4",
+      "id": "repair-attempt-bounds",
       "status": "current_guardian_reconciliation_and_persisted_state_repair_hand_attempt_bounds_registered"
     },
     {
-      "id": "I5",
+      "id": "bounded-failure-surfaces",
       "status": "launch_failure_surfaces_bounded_and_redacted"
     },
     {
-      "id": "I6",
+      "id": "memory-trigger-rules",
       "status": "implemented_memory_trigger_rules_registered"
     },
     {
-      "id": "I7",
+      "id": "loader-worker-dispatch",
       "status": "typed_loader_worker_delegated_dispatch_and_named_boundary_single_assessment_complete"
     },
     {
-      "id": "I8",
+      "id": "warm-cache-integrity",
       "status": "preflight_costs_declared_reviewed_warm_cache_tier0_rotational_measurement"
     },
     {
-      "id": "I9",
-      "status": "reserved_facts_unused_agent_demo_pending_phase_5"
+      "id": "agent-fallback-reservation",
+      "status": "reserved_facts_unused_agent_fallback_demonstration_pending"
     },
     {
-      "id": "I10",
+      "id": "persisted-repair-durability",
       "status": "persisted_state_repair_durability_and_fail_closed_restart_contract_registered"
     }
   ],
@@ -4742,7 +4742,7 @@
       ],
       "max_attempts_per_stable_key_per_suppression_window": 1,
       "suppression_window_hours": 24,
-      "operation_journal_schema": "axial.state.operation_journals.v9",
+      "operation_journal_schema": "axial.state.operation_journals.v10",
       "failure_memory_schema": "axial.guardian.failure_memory.v7",
       "terminal_outcomes": [
         "Quarantined",
@@ -5701,12 +5701,12 @@
   "facts": [
     {
       "fact": "agent_hook_failed",
-      "availability": "reserved_phase_5",
+      "availability": "reserved_for_agent_fallback",
       "referenced_by_rule": false
     },
     {
       "fact": "agent_unavailable",
-      "availability": "reserved_phase_5",
+      "availability": "reserved_for_agent_fallback",
       "referenced_by_rule": false
     },
     {
@@ -5766,12 +5766,12 @@
     },
     {
       "fact": "boot_milestone_overdue",
-      "availability": "reserved_phase_5",
+      "availability": "reserved_for_agent_fallback",
       "referenced_by_rule": false
     },
     {
       "fact": "boot_milestone_reached",
-      "availability": "reserved_phase_5",
+      "availability": "reserved_for_agent_fallback",
       "referenced_by_rule": false
     },
     {
@@ -5810,6 +5810,11 @@
       "referenced_by_rule": true
     },
     {
+      "fact": "download_temp_discarded",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
       "fact": "download_written_to_temp",
       "availability": "registered_current",
       "referenced_by_rule": false
@@ -5836,12 +5841,12 @@
     },
     {
       "fact": "frame_budget_exceeded",
-      "availability": "reserved_phase_5",
+      "availability": "reserved_for_agent_fallback",
       "referenced_by_rule": false
     },
     {
       "fact": "gc_pause_storm",
-      "availability": "reserved_phase_5",
+      "availability": "reserved_for_agent_fallback",
       "referenced_by_rule": false
     },
     {
@@ -5851,7 +5856,7 @@
     },
     {
       "fact": "heap_pressure_critical",
-      "availability": "reserved_phase_5",
+      "availability": "reserved_for_agent_fallback",
       "referenced_by_rule": false
     },
     {
@@ -6085,27 +6090,7 @@
       "referenced_by_rule": true
     },
     {
-      "fact": "no_structured_fact_completed",
-      "availability": "registered_current",
-      "referenced_by_rule": false
-    },
-    {
-      "fact": "no_structured_fact_downloading",
-      "availability": "registered_current",
-      "referenced_by_rule": false
-    },
-    {
-      "fact": "no_structured_fact_failed",
-      "availability": "registered_current",
-      "referenced_by_rule": false
-    },
-    {
-      "fact": "no_structured_fact_installing",
-      "availability": "registered_current",
-      "referenced_by_rule": false
-    },
-    {
-      "fact": "no_structured_fact_launching",
+      "fact": "no_structured_fact_startup",
       "availability": "registered_current",
       "referenced_by_rule": false
     },
@@ -6115,7 +6100,32 @@
       "referenced_by_rule": false
     },
     {
+      "fact": "no_structured_fact_validating",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_downloading",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_installing",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
       "fact": "no_structured_fact_preparing",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_launching",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_running",
       "availability": "registered_current",
       "referenced_by_rule": false
     },
@@ -6130,17 +6140,12 @@
       "referenced_by_rule": false
     },
     {
-      "fact": "no_structured_fact_running",
+      "fact": "no_structured_fact_completed",
       "availability": "registered_current",
       "referenced_by_rule": false
     },
     {
-      "fact": "no_structured_fact_startup",
-      "availability": "registered_current",
-      "referenced_by_rule": false
-    },
-    {
-      "fact": "no_structured_fact_validating",
+      "fact": "no_structured_fact_failed",
       "availability": "registered_current",
       "referenced_by_rule": false
     },
@@ -6285,7 +6290,7 @@
       "id": "memory",
       "declared_cost_class": "metadata_io",
       "timing_signal": "launch_preflight_sense_timing",
-      "measurement_status": "pending_phase_4",
+      "measurement_status": "measurement_pending",
       "ceiling_ms": null,
       "evidence": null
     },
@@ -6293,7 +6298,7 @@
       "id": "installed_versions",
       "declared_cost_class": "content_io",
       "timing_signal": "launch_preflight_sense_timing",
-      "measurement_status": "pending_phase_4",
+      "measurement_status": "measurement_pending",
       "ceiling_ms": null,
       "evidence": null
     },
@@ -6301,7 +6306,7 @@
       "id": "overrides",
       "declared_cost_class": "external_probe",
       "timing_signal": "launch_preflight_sense_timing",
-      "measurement_status": "pending_phase_4",
+      "measurement_status": "measurement_pending",
       "ceiling_ms": null,
       "evidence": null
     },
@@ -6309,7 +6314,7 @@
       "id": "resources",
       "declared_cost_class": "metadata_io",
       "timing_signal": "launch_preflight_sense_timing",
-      "measurement_status": "pending_phase_4",
+      "measurement_status": "measurement_pending",
       "ceiling_ms": null,
       "evidence": null
     },
@@ -6325,7 +6330,7 @@
       "id": "readiness",
       "declared_cost_class": "content_io",
       "timing_signal": "launch_preflight_sense_timing",
-      "measurement_status": "pending_phase_4",
+      "measurement_status": "measurement_pending",
       "ceiling_ms": null,
       "evidence": null
     },
@@ -6333,7 +6338,7 @@
       "id": "guardian_policy",
       "declared_cost_class": "in_process",
       "timing_signal": "launch_preflight_sense_timing",
-      "measurement_status": "pending_phase_4",
+      "measurement_status": "measurement_pending",
       "ceiling_ms": null,
       "evidence": null
     }
@@ -6417,6 +6422,12 @@
         "diagnoses": [
           "launcher_managed_artifact_corrupt"
         ]
+      },
+      {
+        "source": "download_temp_discarded",
+        "classification": "non_failure",
+        "fact": "download_temp_discarded",
+        "diagnoses": []
       },
       {
         "source": "download_temp_write_failed",
@@ -6709,65 +6720,11 @@
         ]
       }
     ],
-    "install": [
-      {
-        "source": "ChecksumMismatch",
-        "fact": "artifact_checksum_mismatch"
-      },
-      {
-        "source": "SizeMismatch",
-        "fact": "artifact_size_mismatch"
-      },
-      {
-        "source": "MetadataInvalid",
-        "fact": "provider_data_invalid"
-      },
-      {
-        "source": "ProviderFailure",
-        "fact": "download_provider_unavailable"
-      },
-      {
-        "source": "NetworkFailure",
-        "fact": "download_interrupted"
-      },
-      {
-        "source": "PermissionDenied",
-        "fact": "filesystem_permission_denied"
-      },
-      {
-        "source": "TempWriteFailed",
-        "fact": "temp_file_write_failed"
-      },
-      {
-        "source": "PromotionFailed",
-        "fact": "atomic_promotion_failed"
-      },
-      {
-        "source": "DependencyFailed",
-        "fact": "install_dependency_failed"
-      },
-      {
-        "source": "ExecutionFailed",
-        "fact": "install_execution_failed"
-      },
-      {
-        "source": "ProcessorFailed",
-        "fact": "install_processor_failed"
-      },
-      {
-        "source": "RuntimeRosettaRequired",
-        "fact": "managed_runtime_rosetta_required"
-      },
-      {
-        "source": "RuntimeUnavailableForPlatform",
-        "fact": "managed_runtime_unavailable_for_platform"
-      }
-    ],
     "loader_active_install": [
       {
         "source": "ArtifactMissing",
         "phase": "Downloading",
-        "evidence_kind": "ProviderFailure",
+        "execution_fact_kind": "download_provider_failure",
         "fact": "download_provider_unavailable",
         "diagnosis": "download_unavailable",
         "target_kind": "Artifact"
@@ -6775,7 +6732,7 @@
       {
         "source": "InvalidProfile",
         "phase": "Downloading",
-        "evidence_kind": "MetadataInvalid",
+        "execution_fact_kind": "provider_data_invalid",
         "fact": "provider_data_invalid",
         "diagnosis": "install_artifact_metadata_invalid",
         "target_kind": "Artifact"
@@ -6783,7 +6740,7 @@
       {
         "source": "ProviderHttpFailure",
         "phase": "Downloading",
-        "evidence_kind": "ProviderFailure",
+        "execution_fact_kind": "download_provider_failure",
         "fact": "download_provider_unavailable",
         "diagnosis": "download_unavailable",
         "target_kind": "Artifact"
@@ -6791,7 +6748,7 @@
       {
         "source": "ProviderNetworkFailure",
         "phase": "Downloading",
-        "evidence_kind": "NetworkFailure",
+        "execution_fact_kind": "download_network_failure",
         "fact": "download_interrupted",
         "diagnosis": "download_unavailable",
         "target_kind": "Artifact"
@@ -6799,7 +6756,7 @@
       {
         "source": "ProviderRateLimited",
         "phase": "Downloading",
-        "evidence_kind": "ProviderFailure",
+        "execution_fact_kind": "download_provider_failure",
         "fact": "download_provider_unavailable",
         "diagnosis": "download_unavailable",
         "target_kind": "Artifact"
@@ -6807,7 +6764,7 @@
       {
         "source": "ProviderResponseTooLarge",
         "phase": "Downloading",
-        "evidence_kind": "MetadataInvalid",
+        "execution_fact_kind": "provider_data_invalid",
         "fact": "provider_data_invalid",
         "diagnosis": "install_artifact_metadata_invalid",
         "target_kind": "Artifact"
@@ -6815,7 +6772,7 @@
       {
         "source": "ProviderSchemaInvalid",
         "phase": "Downloading",
-        "evidence_kind": "MetadataInvalid",
+        "execution_fact_kind": "provider_data_invalid",
         "fact": "provider_data_invalid",
         "diagnosis": "install_artifact_metadata_invalid",
         "target_kind": "Artifact"
@@ -6823,7 +6780,7 @@
       {
         "source": "ProcessorFailed",
         "phase": "Installing",
-        "evidence_kind": "ProcessorFailed",
+        "execution_fact_kind": "install_processor_failed",
         "fact": "install_processor_failed",
         "diagnosis": "install_processor_failed",
         "target_kind": "Version"
@@ -6831,7 +6788,7 @@
       {
         "source": "InstallExecutionFailed",
         "phase": "Installing",
-        "evidence_kind": "ExecutionFailed",
+        "execution_fact_kind": "install_execution_failed",
         "fact": "install_execution_failed",
         "diagnosis": "install_execution_failed",
         "target_kind": "Version"
@@ -6839,7 +6796,7 @@
       {
         "source": "VerifyFailed",
         "phase": "Installing",
-        "evidence_kind": "ExecutionFailed",
+        "execution_fact_kind": "install_execution_failed",
         "fact": "install_execution_failed",
         "diagnosis": "install_execution_failed",
         "target_kind": "Version"
@@ -6847,7 +6804,7 @@
       {
         "source": "ParseFailed",
         "phase": "Installing",
-        "evidence_kind": "ExecutionFailed",
+        "execution_fact_kind": "install_execution_failed",
         "fact": "install_execution_failed",
         "diagnosis": "install_execution_failed",
         "target_kind": "Version"
@@ -6972,9 +6929,9 @@
   ],
   "deferred_demonstrations": [
     {
-      "invariant": "I9",
-      "phase": "phase_5",
-      "status": "agent_fallback_execution_pending"
+      "invariant": "agent-fallback-reservation",
+      "capability": "agent_fallback_execution",
+      "status": "pending"
     }
   ]
 }

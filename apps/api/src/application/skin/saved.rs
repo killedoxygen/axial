@@ -535,7 +535,7 @@ mod tests {
     use axum::Json;
 
     #[test]
-    fn p02_b05_contract_cross_owner_saved_skin_failures_have_distinct_public_classes() {
+    fn behavior_contract_cross_owner_saved_skin_failures_have_distinct_public_classes() {
         let cases = [
             (
                 SavedSkinStoreFailure::TaskStopped,

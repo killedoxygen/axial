@@ -131,7 +131,7 @@ mod tests {
     };
 
     #[test]
-    fn p00_b10_contract_local_registry_uses_default_without_override() {
+    fn behavior_contract_local_registry_uses_default_without_override() {
         let fixture = TestFixture::new("list-default");
         let response = super::list_flags(&fixture.state);
         let flag = response
@@ -145,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b10_contract_release_projection_hides_dev_only_registry() {
+    fn behavior_contract_release_projection_hides_dev_only_registry() {
         let fixture = TestFixture::new("release-projection");
         let response = super::list_flags_for_build(&fixture.state, false);
 
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b10_contract_wire_source_vocabulary_is_exactly_local() {
+    fn behavior_contract_wire_source_vocabulary_is_exactly_local() {
         let sources = [FlagSource::Default, FlagSource::Override];
         let expected = sources.clone().map(|source| match source {
             FlagSource::Default => "default",
@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p00_b10_contract_local_override_is_persisted() {
+    async fn behavior_contract_local_override_is_persisted() {
         let fixture = TestFixture::new("set-override");
         let response = super::update_flag(
             &fixture.state,
@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p00_b10_contract_local_override_reset_restores_default() {
+    async fn behavior_contract_local_override_reset_restores_default() {
         let fixture = TestFixture::new("clear-override");
         super::update_flag(
             &fixture.state,
@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b02_contract_flag_failure_respects_committed_telemetry_consent() {
+    async fn behavior_contract_flag_failure_respects_committed_telemetry_consent() {
         for (telemetry_enabled, expected_events) in [(false, 0), (true, 1)] {
             let fixture = TestFixture::with_config(
                 if telemetry_enabled {

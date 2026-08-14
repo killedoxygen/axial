@@ -112,7 +112,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b02_contract_public_config_route_is_revisioned_and_omits_internal_fields() {
+    async fn behavior_contract_public_config_route_is_revisioned_and_omits_internal_fields() {
         let fixture = TestFixture::with_config(
             "public-view",
             AppConfig {
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b02_contract_cross_owner_rejects_invalid_wire_settings_before_persistence() {
+    async fn behavior_contract_cross_owner_rejects_invalid_wire_settings_before_persistence() {
         let fixture = TestFixture::new("invalid-wire-settings");
         let app = super::router().with_state(fixture.state.clone());
 

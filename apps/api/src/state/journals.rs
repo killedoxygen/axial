@@ -1,10 +1,11 @@
 use super::contracts::{
-    CommandKind, JournalId, OperationId, OperationIntent, OperationJournalEntry,
-    OperationJournalStep, OperationOutcome, OperationPhase, OperationStatus, OperationStepResult,
-    OwnershipClass, PerformanceOperationAction, PerformanceOperationIntent,
-    PerformanceOperationLifecycle, PerformanceOperationPhase, PerformanceOperationPrepared,
-    PerformanceOperationTerminal, PerformancePreparedProof, PersistedStateRepairAttempt,
-    PersistedStateRepairTerminal, PersistedStateRepairTerminalOutcome,
+    CommandKind, DurableGuardianEvidence, GuardianInstallTerminalEvidence, JournalId,
+    MAX_DURABLE_GUARDIAN_DIAGNOSES, MAX_DURABLE_GUARDIAN_FACT_IDS, OperationId, OperationIntent,
+    OperationJournalEntry, OperationJournalStep, OperationOutcome, OperationPhase, OperationStatus,
+    OperationStepMetrics, OperationStepResult, OwnershipClass, PerformanceOperationAction,
+    PerformanceOperationIntent, PerformanceOperationLifecycle, PerformanceOperationPhase,
+    PerformanceOperationPrepared, PerformanceOperationTerminal, PerformancePreparedProof,
+    PersistedStateRepairAttempt, PersistedStateRepairTerminal, PersistedStateRepairTerminalOutcome,
     RECONCILIATION_EVIDENCE_CAPACITY, ReconciliationAttempt, ReconciliationLineage,
     ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState,
     StabilizationSystem, TargetDescriptor, TargetKind,
@@ -39,11 +40,10 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
-pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v9";
+pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v10";
 pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
 pub(crate) const PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX: &str = "performance_plan_graph_sha512_";
-const GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX: &str = "guardian_outcome_memory_binding:";
 const INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX: &str = "install_publication_evidence:";
 const INSTALL_PUBLICATION_VERSION_ID_FACT_PREFIX: &str = "install_publication_version_id:";
 const INSTALL_ACTIVATION_CONTRACT_FACT_PREFIX: &str = "install_activation_contract:";
@@ -51,10 +51,10 @@ const INSTALL_VERSION_ID_FACT_PREFIX: &str = "install_version_id:";
 const LOADER_BUILD_ID_FACT_PREFIX: &str = "loader_build_id:";
 const OPERATION_JOURNAL_SNAPSHOT_NAME: &str = "operation-journals.json";
 const OPERATION_JOURNAL_SNAPSHOT_PREFIX: &[u8] =
-    b"{\"schema\":\"axial.state.operation_journals.v9\",\"next_sequence\":";
+    b"{\"schema\":\"axial.state.operation_journals.v10\",\"next_sequence\":";
 const OPERATION_JOURNAL_SNAPSHOT_ENTRIES_PREFIX: &[u8] = b",\"entries\":[";
 const OPERATION_JOURNAL_SNAPSHOT_SUFFIX: &[u8] = b"]}";
-pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
+pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = MAX_DURABLE_GUARDIAN_DIAGNOSES;
 const MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const OPERATION_JOURNAL_LOCK_INVARIANT: &str =
     "operation journal records lock poisoned; in-memory and persisted state may diverge";
@@ -83,6 +83,8 @@ pub enum OperationJournalStoreError {
     Conflict,
     #[error("operation journal contains an invalid Guardian install outcome")]
     InvalidGuardianOutcome,
+    #[error("operation journal contains invalid typed operation metrics")]
+    InvalidOperationMetrics,
     #[error("Guardian install failure memory could not be settled")]
     GuardianFailureMemoryUnavailable,
     #[error("operation journal persistence failed: {0}")]
@@ -102,6 +104,7 @@ impl OperationJournalStoreError {
             Self::SequenceExhausted => "sequence_exhausted",
             Self::Conflict => "conflict",
             Self::InvalidGuardianOutcome => "invalid_guardian_outcome",
+            Self::InvalidOperationMetrics => "invalid_operation_metrics",
             Self::GuardianFailureMemoryUnavailable => "guardian_failure_memory_unavailable",
             Self::Persistence(_) => "persistence",
         }
@@ -154,6 +157,7 @@ pub(crate) fn operation_journal_plan_is_visible(
         && entry.completed_steps == expected.completed_steps
         && entry.failure_point == expected.failure_point
         && entry.guardian_diagnosis_ids == expected.guardian_diagnosis_ids
+        && entry.guardian_install_terminal == expected.guardian_install_terminal
         && entry.outcome == expected.outcome
         && entry.reconciliation_attempt == expected.reconciliation_attempt
         && entry.reconciliation_terminal == expected.reconciliation_terminal
@@ -187,10 +191,15 @@ pub(crate) fn operation_journal_completed_step_is_visible(
             && step.result == expected.result
             && step.changed_target == expected.changed_target
             && step.rollback == expected.rollback
+            && step.metrics() == expected.metrics()
             && expected
                 .generated_facts
                 .iter()
                 .all(|fact| step.generated_facts.contains(fact))
+            && expected
+                .guardian_fact_ids()
+                .iter()
+                .all(|fact_id| step.guardian_fact_ids().contains(fact_id))
     })
 }
 
@@ -205,6 +214,7 @@ pub(crate) fn operation_journal_terminal_is_visible(
             .guardian_diagnosis_ids
             .iter()
             .all(|diagnosis_id| entry.guardian_diagnosis_ids.contains(diagnosis_id))
+        && entry.guardian_install_terminal == expected.guardian_install_terminal
         && entry.outcome == expected.outcome
         && entry.reconciliation_attempt == expected.reconciliation_attempt
         && entry.reconciliation_terminal == expected.reconciliation_terminal
@@ -1242,6 +1252,7 @@ impl OperationJournalStore {
         completed_step: OperationJournalStep,
         outcome: OperationOutcome,
     ) -> Result<(), OperationJournalStoreError> {
+        reject_unowned_typed_step_evidence(&completed_step)?;
         let mutation = self.mutation_gate.clone().lock_owned().await;
         let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
             if operation_journal_status_is_terminal(entry.status) {
@@ -1258,11 +1269,36 @@ impl OperationJournalStore {
 
     pub(crate) async fn record_success_with_guardian_evidence(
         &self,
+        completed_step: OperationJournalStep,
+        evidence: DurableGuardianEvidence,
+    ) -> Result<(), OperationJournalStoreError> {
+        if evidence.install_terminal().is_some()
+            || !completed_step.guardian_fact_ids().is_empty()
+            || completed_step.result != OperationStepResult::Completed
+        {
+            return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+        }
+        let operation_id = evidence.operation_id().clone();
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = self.update(&operation_id, WriteUrgency::Immediate, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return Err(OperationJournalStoreError::AlreadyTerminal);
+            }
+            entry.status = OperationStatus::Succeeded;
+            entry.completed_steps.push(completed_step);
+            entry.failure_point = None;
+            entry.outcome = Some(OperationOutcome::Succeeded);
+            apply_guardian_evidence(entry, &evidence)
+        })?;
+        self.await_commit(ticket, mutation).await
+    }
+
+    pub(crate) async fn record_success_with_metrics(
+        &self,
         operation_id: &OperationId,
         completed_step: OperationJournalStep,
-        fact_ids: Vec<String>,
-        diagnosis_ids: Vec<DiagnosisId>,
     ) -> Result<(), OperationJournalStoreError> {
+        require_metrics_only_step(&completed_step, OperationStepResult::Completed)?;
         let mutation = self.mutation_gate.clone().lock_owned().await;
         let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
             if operation_journal_status_is_terminal(entry.status) {
@@ -1272,7 +1308,6 @@ impl OperationJournalStore {
             entry.completed_steps.push(completed_step);
             entry.failure_point = None;
             entry.outcome = Some(OperationOutcome::Succeeded);
-            apply_guardian_evidence(entry, fact_ids, diagnosis_ids);
             Ok(())
         })?;
         self.await_commit(ticket, mutation).await
@@ -1285,6 +1320,7 @@ impl OperationJournalStore {
         failure_point: impl Into<String>,
         outcome: OperationOutcome,
     ) -> Result<(), OperationJournalStoreError> {
+        reject_unowned_typed_step_evidence(&failure_step)?;
         let mutation = self.mutation_gate.clone().lock_owned().await;
         let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
             if operation_journal_status_is_terminal(entry.status) {
@@ -1481,15 +1517,41 @@ impl OperationJournalStore {
         self.await_commit(ticket, mutation).await
     }
 
-    pub async fn record_failure_with_guardian_evidence(
+    pub(crate) async fn record_failure_with_guardian_evidence(
+        &self,
+        failure_step: OperationJournalStep,
+        failure_point: impl Into<String>,
+        outcome: OperationOutcome,
+        evidence: DurableGuardianEvidence,
+    ) -> Result<(), OperationJournalStoreError> {
+        if !failure_step.guardian_fact_ids().is_empty()
+            || failure_step.result != OperationStepResult::Failed
+            || outcome != OperationOutcome::Failed
+        {
+            return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+        }
+        let operation_id = evidence.operation_id().clone();
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = self.update(&operation_id, WriteUrgency::Immediate, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return Err(OperationJournalStoreError::AlreadyTerminal);
+            }
+            entry.status = OperationStatus::Failed;
+            entry.completed_steps.push(failure_step);
+            entry.failure_point = Some(failure_point.into());
+            entry.outcome = Some(outcome);
+            apply_guardian_evidence(entry, &evidence)
+        })?;
+        self.await_commit(ticket, mutation).await
+    }
+
+    pub(crate) async fn record_failure_with_metrics(
         &self,
         operation_id: &OperationId,
         failure_step: OperationJournalStep,
         failure_point: impl Into<String>,
-        outcome: OperationOutcome,
-        fact_ids: Vec<String>,
-        diagnosis_ids: Vec<DiagnosisId>,
     ) -> Result<(), OperationJournalStoreError> {
+        require_metrics_only_step(&failure_step, OperationStepResult::Failed)?;
         let mutation = self.mutation_gate.clone().lock_owned().await;
         let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
             if operation_journal_status_is_terminal(entry.status) {
@@ -1498,14 +1560,23 @@ impl OperationJournalStore {
             entry.status = OperationStatus::Failed;
             entry.completed_steps.push(failure_step);
             entry.failure_point = Some(failure_point.into());
-            entry.outcome = Some(outcome);
-            apply_guardian_evidence(entry, fact_ids, diagnosis_ids);
+            entry.outcome = Some(OperationOutcome::Failed);
             Ok(())
         })?;
         self.await_commit(ticket, mutation).await
     }
 
-    pub(crate) async fn record_cancellation(
+    pub(crate) async fn record_cancellation_with_metrics(
+        &self,
+        operation_id: &OperationId,
+        cancellation_step: OperationJournalStep,
+    ) -> Result<(), OperationJournalStoreError> {
+        require_metrics_only_step(&cancellation_step, OperationStepResult::Skipped)?;
+        self.record_cancellation_inner(operation_id, cancellation_step)
+            .await
+    }
+
+    async fn record_cancellation_inner(
         &self,
         operation_id: &OperationId,
         cancellation_step: OperationJournalStep,
@@ -1520,6 +1591,7 @@ impl OperationJournalStore {
             entry.completed_steps.push(cancellation_step);
             entry.failure_point = None;
             entry.guardian_diagnosis_ids.clear();
+            entry.guardian_install_terminal = None;
             entry.outcome = Some(OperationOutcome::Cancelled);
             Ok(())
         })?;
@@ -1531,6 +1603,7 @@ impl OperationJournalStore {
         operation_id: &OperationId,
         progress_step: OperationJournalStep,
     ) -> Result<(), OperationJournalStoreError> {
+        reject_unowned_typed_step_evidence(&progress_step)?;
         let _mutation = self.mutation_gate.lock().await;
         self.update(operation_id, WriteUrgency::Debounced, |entry| {
             if operation_journal_status_is_terminal(entry.status) {
@@ -1548,6 +1621,7 @@ impl OperationJournalStore {
         operation_id: &OperationId,
         checkpoint: OperationJournalStep,
     ) -> Result<(), OperationJournalStoreError> {
+        reject_unowned_typed_step_evidence(&checkpoint)?;
         let mutation = self.mutation_gate.clone().lock_owned().await;
         let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
             if operation_journal_status_is_terminal(entry.status) {
@@ -1565,6 +1639,7 @@ impl OperationJournalStore {
         operation_id: &OperationId,
         checkpoint: OperationJournalStep,
     ) -> Result<(), OperationJournalStoreError> {
+        reject_unowned_typed_step_evidence(&checkpoint)?;
         let mutation = self.mutation_gate.clone().lock_owned().await;
         {
             let records = self.records.read().expect(OPERATION_JOURNAL_LOCK_INVARIANT);
@@ -1598,32 +1673,28 @@ impl OperationJournalStore {
         self.await_commit(ticket, mutation).await
     }
 
-    pub async fn record_guardian_evidence(
+    pub(crate) async fn record_guardian_evidence(
         &self,
-        operation_id: &OperationId,
-        fact_ids: Vec<String>,
-        diagnosis_ids: Vec<DiagnosisId>,
+        evidence: DurableGuardianEvidence,
     ) -> Result<(), OperationJournalStoreError> {
+        let operation_id = evidence.operation_id().clone();
         let mutation = self.mutation_gate.clone().lock_owned().await;
-        let ticket =
-            self.update_post_terminal_obligation(operation_id, WriteUrgency::Immediate, |entry| {
-                apply_guardian_evidence(entry, fact_ids, diagnosis_ids);
-                Ok(())
-            })?;
+        let ticket = self.update_post_terminal_obligation(
+            &operation_id,
+            WriteUrgency::Immediate,
+            |entry| apply_guardian_evidence(entry, &evidence),
+        )?;
         self.await_commit(ticket, mutation).await
     }
 
     pub(crate) async fn record_performance_guardian_evidence(
         &self,
-        operation_id: &OperationId,
-        mut fact_ids: Vec<String>,
-        mut diagnosis_ids: Vec<DiagnosisId>,
+        evidence: DurableGuardianEvidence,
     ) -> Result<(), OperationJournalStoreError> {
-        dedup_preserving_order(&mut fact_ids);
-        dedup_preserving_order(&mut diagnosis_ids);
-        if fact_ids.is_empty() && diagnosis_ids.is_empty() {
-            return Ok(());
+        if evidence.install_terminal().is_some() {
+            return Err(OperationJournalStoreError::InvalidGuardianOutcome);
         }
+        let operation_id = evidence.operation_id().clone();
         let mut foreign_retries = 0;
         loop {
             let mutation = self.mutation_gate.clone().lock_owned().await;
@@ -1632,7 +1703,7 @@ impl OperationJournalStore {
                 let entry = records
                     .visible
                     .entries
-                    .get(operation_id)
+                    .get(&operation_id)
                     .ok_or(OperationJournalStoreError::MissingOperation)?;
                 let Some(lifecycle) = entry.performance_lifecycle() else {
                     return Err(OperationJournalStoreError::MissingOperation);
@@ -1647,22 +1718,14 @@ impl OperationJournalStore {
                             && entry.guardian_diagnosis_ids.is_empty()
                         {
                             // The first evidence set is accepted below.
-                        } else if performance_guardian_evidence_matches(
-                            entry,
-                            &fact_ids,
-                            &diagnosis_ids,
-                        ) {
+                        } else if performance_guardian_evidence_matches(entry, &evidence) {
                             return Ok(());
                         } else {
                             return Err(OperationJournalStoreError::AlreadyExists);
                         }
                     }
                     PerformanceOperationPhase::Prepared { .. }
-                        if performance_guardian_evidence_matches(
-                            entry,
-                            &fact_ids,
-                            &diagnosis_ids,
-                        ) =>
+                        if performance_guardian_evidence_matches(entry, &evidence) =>
                     {
                         return Ok(());
                     }
@@ -1675,13 +1738,12 @@ impl OperationJournalStore {
                     }
                 }
             }
-            let ticket = self.update_performance(operation_id, WriteUrgency::Immediate, |entry| {
+            let ticket = self.update_performance(&operation_id, WriteUrgency::Immediate, |entry| {
                 let OperationIntent::Performance(lifecycle) = &mut entry.intent else {
                     return Err(OperationJournalStoreError::MissingOperation);
                 };
                 lifecycle.updated_at = timestamp_utc();
-                apply_idempotent_guardian_evidence(entry, fact_ids.clone(), diagnosis_ids.clone());
-                Ok(())
+                apply_idempotent_guardian_evidence(entry, &evidence)
             });
             let error = match ticket {
                 Ok(ticket) => match self.await_commit(ticket, mutation).await {
@@ -1702,13 +1764,11 @@ impl OperationJournalStore {
             }
             match self
                 .reconcile_transition(
-                    operation_id,
+                    &operation_id,
                     error,
                     Duration::from_millis(20),
                     Duration::from_secs(1),
-                    |entry| {
-                        performance_guardian_evidence_is_visible(entry, &fact_ids, &diagnosis_ids)
-                    },
+                    |entry| performance_guardian_evidence_is_visible(entry, &evidence),
                 )
                 .await?
             {
@@ -1956,7 +2016,8 @@ impl OperationJournalStore {
         let referenced_predecessors = live_journal_predecessor_obligations(&current_entries);
         current_entries.extend(expired_entries.into_iter().filter(|entry| {
             operation_journal_status_is_terminal(entry.status)
-                && referenced_predecessors.contains(&entry.operation_id)
+                && (entry.guardian_install_terminal().is_some()
+                    || referenced_predecessors.contains(&entry.operation_id))
         }));
         for entry in current_entries {
             let canonical = serde_json::to_vec(&entry)
@@ -2205,34 +2266,35 @@ fn test_journal_record_directory(
 
 fn apply_guardian_evidence(
     entry: &mut OperationJournalEntry,
-    fact_ids: Vec<String>,
-    diagnosis_ids: Vec<DiagnosisId>,
-) {
-    if !fact_ids.is_empty() && entry.completed_steps.is_empty() {
+    evidence: &DurableGuardianEvidence,
+) -> Result<(), OperationJournalStoreError> {
+    if entry.operation_id != *evidence.operation_id() {
+        return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+    }
+    if !evidence.fact_ids().is_empty() && entry.completed_steps.is_empty() {
         let mut step = OperationJournalStep::new("guardian_evidence", OperationPhase::Running);
         step.result = OperationStepResult::Completed;
         entry.completed_steps.push(step);
     }
     if let Some(step) = entry.completed_steps.last_mut() {
-        for fact_id in fact_ids {
-            if !step.generated_facts.contains(&fact_id) {
-                step.generated_facts.push(fact_id);
-            }
+        step.merge_guardian_fact_ids(evidence.fact_ids());
+    }
+    for diagnosis_id in evidence.diagnosis_ids() {
+        if !entry.guardian_diagnosis_ids.contains(diagnosis_id) {
+            entry.guardian_diagnosis_ids.push(*diagnosis_id);
         }
     }
-    for diagnosis_id in diagnosis_ids {
-        if !entry.guardian_diagnosis_ids.contains(&diagnosis_id) {
-            entry.guardian_diagnosis_ids.push(diagnosis_id);
-        }
-    }
+    merge_install_terminal(entry, evidence.install_terminal())
 }
 
 fn apply_idempotent_guardian_evidence(
     entry: &mut OperationJournalEntry,
-    fact_ids: Vec<String>,
-    diagnosis_ids: Vec<DiagnosisId>,
-) {
-    if !fact_ids.is_empty() {
+    evidence: &DurableGuardianEvidence,
+) -> Result<(), OperationJournalStoreError> {
+    if entry.operation_id != *evidence.operation_id() {
+        return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+    }
+    if !evidence.fact_ids().is_empty() {
         let evidence_index = entry
             .completed_steps
             .iter()
@@ -2244,17 +2306,29 @@ fn apply_idempotent_guardian_evidence(
                 entry.completed_steps.push(step);
                 entry.completed_steps.len() - 1
             });
-        let evidence = &mut entry.completed_steps[evidence_index];
-        for fact_id in fact_ids {
-            if !evidence.generated_facts.contains(&fact_id) {
-                evidence.generated_facts.push(fact_id);
-            }
+        let step = &mut entry.completed_steps[evidence_index];
+        step.merge_guardian_fact_ids(evidence.fact_ids());
+    }
+    for diagnosis_id in evidence.diagnosis_ids() {
+        if !entry.guardian_diagnosis_ids.contains(diagnosis_id) {
+            entry.guardian_diagnosis_ids.push(*diagnosis_id);
         }
     }
-    for diagnosis_id in diagnosis_ids {
-        if !entry.guardian_diagnosis_ids.contains(&diagnosis_id) {
-            entry.guardian_diagnosis_ids.push(diagnosis_id);
+    merge_install_terminal(entry, evidence.install_terminal())
+}
+
+fn merge_install_terminal(
+    entry: &mut OperationJournalEntry,
+    terminal: Option<&GuardianInstallTerminalEvidence>,
+) -> Result<(), OperationJournalStoreError> {
+    match (&entry.guardian_install_terminal, terminal) {
+        (_, None) => Ok(()),
+        (None, Some(terminal)) => {
+            entry.guardian_install_terminal = Some(terminal.clone());
+            Ok(())
         }
+        (Some(current), Some(terminal)) if current == terminal => Ok(()),
+        (Some(_), Some(_)) => Err(OperationJournalStoreError::InvalidGuardianOutcome),
     }
 }
 
@@ -2376,7 +2450,12 @@ pub enum OperationJournalValidationError {
     TooManyPlannedSteps,
     TooManyCompletedSteps,
     TooManyFacts,
+    TooManyGuardianFacts,
+    DuplicateGuardianFact,
     TooManyDiagnoses,
+    DuplicateDiagnosis,
+    InvalidOperationMetrics,
+    InvalidGuardianInstallTerminal,
     InvalidReconciliationTerminal,
     ReconciliationTerminalMismatch,
     InvalidPersistedStateRepair,
@@ -2402,6 +2481,9 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
     }
     for step in &entry.planned_steps {
         validate_step(step)?;
+        if !step.guardian_fact_ids().is_empty() || step.metrics().is_some() {
+            return Err(OperationJournalValidationError::InvalidOperationMetrics);
+        }
     }
     if entry.completed_steps.len() > 256 {
         return Err(OperationJournalValidationError::TooManyCompletedSteps);
@@ -2416,6 +2498,30 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
     }
     if entry.guardian_diagnosis_ids.len() > MAX_OPERATION_JOURNAL_DIAGNOSES {
         return Err(OperationJournalValidationError::TooManyDiagnoses);
+    }
+    if contains_duplicate(&entry.guardian_diagnosis_ids) {
+        return Err(OperationJournalValidationError::DuplicateDiagnosis);
+    }
+    validate_entry_step_metrics(entry)?;
+    if let Some(terminal) = entry.guardian_install_terminal() {
+        terminal
+            .validate()
+            .map_err(|_| OperationJournalValidationError::InvalidGuardianInstallTerminal)?;
+        if entry.status != OperationStatus::Failed
+            || entry.outcome != Some(OperationOutcome::Failed)
+            || !matches!(
+                entry.command,
+                CommandKind::InstallVersion | CommandKind::ModifyInstanceContent
+            )
+            || !entry
+                .guardian_diagnosis_ids
+                .contains(&terminal.diagnosis_id())
+        {
+            return Err(OperationJournalValidationError::InvalidGuardianInstallTerminal);
+        }
+        if let Some(memory) = terminal.memory() {
+            validate_target(memory.target())?;
+        }
     }
     match &entry.intent {
         OperationIntent::Performance(lifecycle) => {
@@ -2514,6 +2620,8 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
             || entry.planned_steps[0].result != OperationStepResult::Planned
             || entry.planned_steps[0].changed_target.is_some()
             || !entry.planned_steps[0].generated_facts.is_empty()
+            || !entry.planned_steps[0].guardian_fact_ids().is_empty()
+            || entry.planned_steps[0].metrics().is_some()
             || entry.planned_steps[0].rollback != RollbackState::NotApplicable
         {
             return Err(OperationJournalValidationError::PersistedStateRepairMismatch);
@@ -2536,6 +2644,8 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
             || entry.completed_steps[0].step_id != "quarantine_rejected_restart_record"
             || entry.completed_steps[0].phase != OperationPhase::Repairing
             || entry.completed_steps[0].changed_target.as_ref() != Some(terminal.attempt().target())
+            || !entry.completed_steps[0].guardian_fact_ids().is_empty()
+            || entry.completed_steps[0].metrics().is_some()
             || entry.completed_steps[0].rollback != RollbackState::NotApplicable
         {
             return Err(OperationJournalValidationError::PersistedStateRepairMismatch);
@@ -2553,6 +2663,31 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
         && operation_journal_status_is_terminal(entry.status)
     {
         return Err(OperationJournalValidationError::PersistedStateRepairMismatch);
+    }
+    Ok(())
+}
+
+fn reject_unowned_typed_step_evidence(
+    step: &OperationJournalStep,
+) -> Result<(), OperationJournalStoreError> {
+    if !step.guardian_fact_ids().is_empty() {
+        return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+    }
+    if step.metrics().is_some() {
+        return Err(OperationJournalStoreError::InvalidOperationMetrics);
+    }
+    Ok(())
+}
+
+fn require_metrics_only_step(
+    step: &OperationJournalStep,
+    expected_result: OperationStepResult,
+) -> Result<(), OperationJournalStoreError> {
+    if !step.guardian_fact_ids().is_empty()
+        || step.metrics().is_none()
+        || step.result != expected_result
+    {
+        return Err(OperationJournalStoreError::InvalidOperationMetrics);
     }
     Ok(())
 }
@@ -3001,58 +3136,50 @@ fn performance_guardian_evidence_is_canonical(entry: &OperationJournalEntry) -> 
         .enumerate()
         .all(|(index, diagnosis)| !entry.guardian_diagnosis_ids[..index].contains(diagnosis));
     diagnoses_are_unique
+        && entry.guardian_install_terminal.is_none()
         && (entry.completed_steps.is_empty()
             || (entry.completed_steps.len() == 1
                 && entry.completed_steps[0].step_id == "guardian_evidence"
                 && entry.completed_steps[0].phase == OperationPhase::Running
                 && entry.completed_steps[0].result == OperationStepResult::Completed
                 && entry.completed_steps[0].changed_target.is_none()
+                && entry.completed_steps[0].generated_facts.is_empty()
+                && entry.completed_steps[0].metrics().is_none()
                 && entry.completed_steps[0].rollback == RollbackState::NotApplicable
-                && !entry.completed_steps[0].generated_facts.is_empty()
+                && !entry.completed_steps[0].guardian_fact_ids().is_empty()
                 && entry.completed_steps[0]
-                    .generated_facts
+                    .guardian_fact_ids()
                     .iter()
                     .enumerate()
                     .all(|(index, fact)| {
-                        !entry.completed_steps[0].generated_facts[..index].contains(fact)
+                        !entry.completed_steps[0].guardian_fact_ids()[..index].contains(fact)
                     })))
 }
 
 fn performance_guardian_evidence_matches(
     entry: &OperationJournalEntry,
-    fact_ids: &[String],
-    diagnosis_ids: &[DiagnosisId],
+    evidence: &DurableGuardianEvidence,
 ) -> bool {
     let existing_facts = entry
         .completed_steps
         .first()
-        .map(|step| step.generated_facts.as_slice())
+        .map(OperationJournalStep::guardian_fact_ids)
         .unwrap_or_default();
-    existing_facts == fact_ids && entry.guardian_diagnosis_ids == diagnosis_ids
+    existing_facts == evidence.fact_ids()
+        && entry.guardian_diagnosis_ids == evidence.diagnosis_ids()
+        && entry.guardian_install_terminal.as_ref() == evidence.install_terminal()
 }
 
 fn performance_guardian_evidence_is_visible(
     entry: &OperationJournalEntry,
-    fact_ids: &[String],
-    diagnosis_ids: &[DiagnosisId],
+    evidence: &DurableGuardianEvidence,
 ) -> bool {
     entry.performance_lifecycle().is_some_and(|lifecycle| {
         matches!(
             lifecycle.phase,
             PerformanceOperationPhase::Accepted {} | PerformanceOperationPhase::Planning {}
-        ) && performance_guardian_evidence_matches(entry, fact_ids, diagnosis_ids)
+        ) && performance_guardian_evidence_matches(entry, evidence)
     })
-}
-
-fn dedup_preserving_order<T: Eq>(values: &mut Vec<T>) {
-    let mut index = 0;
-    while index < values.len() {
-        if values[..index].contains(&values[index]) {
-            values.remove(index);
-        } else {
-            index += 1;
-        }
-    }
 }
 
 fn sanitize_performance_terminal(
@@ -3406,6 +3533,41 @@ fn validate_target(target: &TargetDescriptor) -> Result<(), OperationJournalVali
     Ok(())
 }
 
+fn validate_entry_step_metrics(
+    entry: &OperationJournalEntry,
+) -> Result<(), OperationJournalValidationError> {
+    for step in entry.planned_steps.iter().chain(&entry.completed_steps) {
+        match step.metrics() {
+            Some(OperationStepMetrics::Tier2Integrity(_))
+                if entry.command == CommandKind::ValidateInstance
+                    && step.step_id == "tier2_integrity_sweep"
+                    && step.phase == OperationPhase::Validating => {}
+            Some(OperationStepMetrics::ContentDownload(_))
+                if matches!(
+                    entry.command,
+                    CommandKind::InstallVersion | CommandKind::ModifyInstanceContent
+                ) && step.phase == OperationPhase::Downloading => {}
+            Some(_) => return Err(OperationJournalValidationError::InvalidOperationMetrics),
+            None => {}
+        }
+    }
+    if entry
+        .planned_steps
+        .iter()
+        .any(|step| step.step_id == "tier2_integrity_sweep" && step.metrics().is_some())
+        || entry.completed_steps.iter().any(|step| {
+            step.step_id == "tier2_integrity_sweep"
+                && !matches!(
+                    step.metrics(),
+                    Some(OperationStepMetrics::Tier2Integrity(_))
+                )
+        })
+    {
+        return Err(OperationJournalValidationError::InvalidOperationMetrics);
+    }
+    Ok(())
+}
+
 fn validate_step(step: &OperationJournalStep) -> Result<(), OperationJournalValidationError> {
     if !safe_token(&step.step_id, 96) {
         return Err(OperationJournalValidationError::UnsafeStepId);
@@ -3421,10 +3583,39 @@ fn validate_step(step: &OperationJournalStep) -> Result<(), OperationJournalVali
             return Err(OperationJournalValidationError::UnsafeGeneratedFact);
         }
     }
+    if step.guardian_fact_ids().len() > MAX_DURABLE_GUARDIAN_FACT_IDS {
+        return Err(OperationJournalValidationError::TooManyGuardianFacts);
+    }
+    if contains_duplicate(step.guardian_fact_ids()) {
+        return Err(OperationJournalValidationError::DuplicateGuardianFact);
+    }
+    if let Some(metrics) = step.metrics() {
+        metrics
+            .validate()
+            .map_err(|_| OperationJournalValidationError::InvalidOperationMetrics)?;
+    }
     Ok(())
 }
 
+fn contains_duplicate<T: Eq>(values: &[T]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| values[..index].contains(value))
+}
+
 fn safe_generated_fact(value: &str) -> bool {
+    if [
+        "guardian_fact:",
+        "guardian_outcome_",
+        "integrity_counter:",
+        "execution_download_fact:",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+    {
+        return false;
+    }
     if value.contains(INSTALL_PUBLICATION_EVIDENCE_FACT_PREFIX) {
         return safe_install_publication_evidence_fact(value);
     }
@@ -3442,9 +3633,6 @@ fn safe_generated_fact(value: &str) -> bool {
     }
     if value.contains(PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX) {
         return safe_performance_plan_graph_sha512_fact(value);
-    }
-    if value.contains(GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX) {
-        return safe_guardian_outcome_memory_binding(value);
     }
     safe_public_fragment(value, 320)
 }
@@ -3495,17 +3683,6 @@ fn safe_performance_plan_graph_sha512_fact(value: &str) -> bool {
         .is_some_and(|digest| {
             digest.len() == 128
                 && digest
-                    .bytes()
-                    .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
-        })
-}
-
-fn safe_guardian_outcome_memory_binding(value: &str) -> bool {
-    value
-        .strip_prefix(GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX)
-        .is_some_and(|binding| {
-            binding.len() == 64
-                && binding
                     .bytes()
                     .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
         })
@@ -3806,17 +3983,20 @@ mod tests {
         safe_generated_fact,
     };
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator, WriteUrgency};
-    use crate::guardian::DiagnosisId;
-    use crate::guardian::{GuardianDomain, GuardianMode};
+    use crate::guardian::{
+        DiagnosisId, GuardianActionKind, GuardianDomain, GuardianFactId, GuardianMode,
+    };
     use crate::state::contracts::{
-        CommandKind, JournalId, OperationId, OperationIntent, OperationJournalEntry,
-        OperationJournalStep, OperationOutcome, OperationPhase, OperationStatus,
-        OperationStepResult, OwnershipClass, PerformanceOperationAction,
-        PerformanceOperationIntent, PerformanceOperationPhase, PerformanceOperationPrepared,
-        PerformanceOperationTerminal, PerformancePreparedProof, PerformanceRollbackTarget,
-        ReconciliationComponent, ReconciliationRung, ReconciliationScope,
-        ReconciliationTerminalOutcome, ReconciliationVersionBundleOutcome, RollbackState,
-        StabilizationSystem, TargetDescriptor, TargetKind,
+        CommandKind, DurableGuardianEvidence, DurableGuardianEvidenceError,
+        GuardianInstallMemoryEvidence, GuardianInstallTerminalEvidence,
+        GuardianMemoryBindingDigest, JournalId, OperationId, OperationIntent,
+        OperationJournalEntry, OperationJournalStep, OperationOutcome, OperationPhase,
+        OperationStatus, OperationStepMetrics, OperationStepResult, OwnershipClass,
+        PerformanceOperationAction, PerformanceOperationIntent, PerformanceOperationPhase,
+        PerformanceOperationPrepared, PerformanceOperationTerminal, PerformancePreparedProof,
+        PerformanceRollbackTarget, ReconciliationComponent, ReconciliationRung,
+        ReconciliationScope, ReconciliationTerminalOutcome, ReconciliationVersionBundleOutcome,
+        RollbackState, StabilizationSystem, TargetDescriptor, TargetKind, Tier2IntegrityMetrics,
     };
     use axial_config::AppPaths;
     use im::OrdMap;
@@ -3855,13 +4035,22 @@ mod tests {
         }
     }
 
-    const OPERATION_JOURNALS_V9_FIXTURE: &str = include_str!(concat!(
+    const OPERATION_JOURNALS_V10_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/operation-journals-v9.json"
+        "/tests/fixtures/guardian/operation-journals-v10.json"
     ));
 
+    fn durable_evidence(
+        operation_id: &OperationId,
+        fact_ids: Vec<GuardianFactId>,
+        diagnosis_ids: Vec<DiagnosisId>,
+    ) -> DurableGuardianEvidence {
+        DurableGuardianEvidence::new(operation_id.clone(), fact_ids, diagnosis_ids, None)
+            .expect("valid durable Guardian evidence")
+    }
+
     #[test]
-    fn p03_b02_narrow_queries_clone_only_matches_and_preserve_exact_order() {
+    fn behavior_narrow_queries_clone_only_matches_and_preserve_exact_order() {
         struct CloneProbe {
             id: usize,
             clones: Arc<AtomicUsize>,
@@ -3921,28 +4110,17 @@ mod tests {
     }
 
     #[test]
-    fn guardian_memory_binding_generated_fact_has_exact_safe_shape() {
+    fn behavior_contract_reserved_typed_evidence_strings_are_rejected() {
         let binding = "0123456789abcdef".repeat(4);
         let fact = format!("guardian_outcome_memory_binding:{binding}");
-        assert!(safe_generated_fact(&fact));
-
-        assert!(!safe_generated_fact(&format!(
-            "guardian_outcome_memory_binding:{}",
-            binding.to_ascii_uppercase()
-        )));
-        assert!(!safe_generated_fact(&format!(
-            "guardian_outcome_memory_binding:{}",
-            &binding[..63]
-        )));
-        assert!(!safe_generated_fact(&format!(
-            "guardian_outcome_memory_binding:{binding}0"
-        )));
-        assert!(!safe_generated_fact(&format!(
-            "guardian_outcome_memory_binding:{}g",
-            &binding[..63]
-        )));
-        assert!(!safe_generated_fact(&format!("x{fact}")));
-        assert!(!safe_generated_fact(&format!("{fact}:suffix")));
+        for reserved in [
+            fact,
+            "guardian_fact:artifact_missing".to_string(),
+            "integrity_counter:processed_entry_count:1".to_string(),
+            "execution_download_fact:promoted:1".to_string(),
+        ] {
+            assert!(!safe_generated_fact(&reserved));
+        }
     }
 
     #[test]
@@ -4219,7 +4397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p01_b01_contract() {
+    async fn native_filesystem_contract_operation_identity() {
         let canonical = "op-123e4567-e89b-42d3-a456-426614174000";
         let operation_id = OperationId::try_from(canonical).expect("canonical operation id");
         assert_eq!(operation_id.to_string(), canonical);
@@ -4266,7 +4444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_contract() {
+    async fn performance_lifecycle_contract() {
         let store = OperationJournalStore::new();
         let status = store
             .create_performance(performance_intent("0123456789abcdef"))
@@ -4294,26 +4472,20 @@ mod tests {
             .await
             .expect("Accepted advances to Planning");
         store
-            .record_performance_guardian_evidence(
+            .record_performance_guardian_evidence(durable_evidence(
                 &status.operation_id,
-                vec![
-                    "guardian_fact:performance_plan_allowed".to_string(),
-                    "guardian_fact:performance_plan_allowed".to_string(),
-                ],
-                vec![
-                    DiagnosisId::PerformanceFallbackSelected,
-                    DiagnosisId::PerformanceFallbackSelected,
-                ],
-            )
+                vec![GuardianFactId::PerformanceFallbackSelected],
+                vec![DiagnosisId::PerformanceFallbackSelected],
+            ))
             .await
             .expect("supporting Guardian evidence is journal-owned after Planning");
         let evidence_snapshot = store.snapshot().expect("evidence snapshot");
         store
-            .record_performance_guardian_evidence(
+            .record_performance_guardian_evidence(durable_evidence(
                 &status.operation_id,
-                vec!["guardian_fact:performance_plan_allowed".to_string()],
+                vec![GuardianFactId::PerformanceFallbackSelected],
                 vec![DiagnosisId::PerformanceFallbackSelected],
-            )
+            ))
             .await
             .expect("deduplicated exact evidence retry is idempotent");
         assert_eq!(
@@ -4322,11 +4494,11 @@ mod tests {
         );
         assert!(matches!(
             store
-                .record_performance_guardian_evidence(
+                .record_performance_guardian_evidence(durable_evidence(
                     &status.operation_id,
-                    vec!["guardian_fact:late".to_string()],
+                    vec![GuardianFactId::PerformanceRulesInvalid],
                     vec![DiagnosisId::PerformanceFallbackSelected],
-                )
+                ),)
                 .await,
             Err(OperationJournalStoreError::AlreadyExists)
         ));
@@ -4339,20 +4511,20 @@ mod tests {
             .await
             .expect("Planning advances to typed Prepared");
         store
-            .record_performance_guardian_evidence(
+            .record_performance_guardian_evidence(durable_evidence(
                 &status.operation_id,
-                vec!["guardian_fact:performance_plan_allowed".to_string()],
+                vec![GuardianFactId::PerformanceFallbackSelected],
                 vec![DiagnosisId::PerformanceFallbackSelected],
-            )
+            ))
             .await
             .expect("Prepared restart may replay only the exact admitted Guardian evidence");
         assert!(matches!(
             store
-                .record_performance_guardian_evidence(
+                .record_performance_guardian_evidence(durable_evidence(
                     &status.operation_id,
-                    vec!["guardian_fact:different".to_string()],
+                    vec![GuardianFactId::PerformanceRulesInvalid],
                     vec![DiagnosisId::PerformanceFallbackSelected],
-                )
+                ),)
                 .await,
             Err(OperationJournalStoreError::AlreadyExists)
         ));
@@ -4431,11 +4603,11 @@ mod tests {
         assert_eq!(store.snapshot().expect("unchanged terminal"), stable);
         assert!(matches!(
             store
-                .record_guardian_evidence(
+                .record_guardian_evidence(durable_evidence(
                     &status.operation_id,
-                    vec!["guardian_fact:late".to_string()],
+                    vec![GuardianFactId::PerformanceRulesInvalid],
                     vec![],
-                )
+                ),)
                 .await,
             Err(OperationJournalStoreError::AlreadyTerminal)
         ));
@@ -4448,7 +4620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_strict_load_binds_performance_constructor_identity() {
+    async fn behavior_strict_load_binds_performance_constructor_identity() {
         let store = OperationJournalStore::new();
         let status = store
             .create_performance(performance_intent("abababababababab"))
@@ -4504,10 +4676,10 @@ mod tests {
         let mut duplicate_evidence = store.snapshot().expect("valid constructor snapshot");
         let mut evidence = OperationJournalStep::new("guardian_evidence", OperationPhase::Running);
         evidence.result = OperationStepResult::Completed;
-        evidence.generated_facts = vec![
-            "guardian_fact:performance_plan_allowed".to_string(),
-            "guardian_fact:performance_plan_allowed".to_string(),
-        ];
+        evidence.set_guardian_fact_ids_for_test(vec![
+            GuardianFactId::PerformanceFallbackSelected,
+            GuardianFactId::PerformanceFallbackSelected,
+        ]);
         duplicate_evidence.entries[0].completed_steps = vec![evidence];
         assert!(matches!(
             OperationJournalSnapshot::from_json(
@@ -4516,7 +4688,7 @@ mod tests {
                     .expect("encode duplicate Performance evidence")
             ),
             Err(super::OperationJournalLoadError::InvalidEntry(
-                super::OperationJournalValidationError::InvalidPerformanceLifecycle
+                super::OperationJournalValidationError::DuplicateGuardianFact
             ))
         ));
         assert_eq!(
@@ -4529,7 +4701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_restart_settlement_is_durable_and_second_restart_is_stable() {
+    async fn behavior_restart_settlement_is_durable_and_second_restart_is_stable() {
         let root = test_root("performance-restart-settlement");
         let paths = test_paths(&root);
         let store = OperationJournalStore::try_load_from_paths(&paths)
@@ -4664,7 +4836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_abandoned_capacity_and_sequence_high_water_survive_pruning() {
+    async fn behavior_abandoned_capacity_and_sequence_high_water_survive_pruning() {
         let store = OperationJournalStore::with_max_entries(128);
         let mut first = None;
         for index in 0_u64..128 {
@@ -4697,7 +4869,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_applied_unverified_capacity_is_protected() {
+    async fn behavior_applied_unverified_capacity_is_protected() {
         let store = OperationJournalStore::with_max_entries(128);
         for index in 0_u64..128 {
             let status = store
@@ -4733,7 +4905,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_snapshot_rejects_parallel_active_instance_lifecycles() {
+    async fn behavior_snapshot_rejects_parallel_active_instance_lifecycles() {
         let store = OperationJournalStore::new();
         let status = store
             .create_performance(performance_intent("aaaaaaaaaaaaaaaa"))
@@ -4758,7 +4930,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_rejects_inconsistent_action_target_and_rollback_identity() {
+    async fn behavior_rejects_inconsistent_action_target_and_rollback_identity() {
         let store = OperationJournalStore::new();
         let mut intent = performance_intent("bbbbbbbbbbbbbbbb");
         intent.action = PerformanceOperationAction::Remove;
@@ -4774,7 +4946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_prepared_proof_is_bound_to_intent_target() {
+    async fn behavior_prepared_proof_is_bound_to_intent_target() {
         let store = OperationJournalStore::new();
         let status = store
             .create_performance(performance_intent("bcbcbcbcbcbcbcbc"))
@@ -4823,7 +4995,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b01_rollback_proof_target_class_matches_exact_target() {
+    fn behavior_rollback_proof_target_class_matches_exact_target() {
         let proof = |target| PerformancePreparedProof::RollbackSnapshot {
             snapshot_id: "snapshot-safe".to_string(),
             target,
@@ -4855,7 +5027,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_remove_absent_commits_without_effect() {
+    async fn behavior_remove_absent_commits_without_effect() {
         let store = OperationJournalStore::new();
         let mut intent = performance_intent("dddddddddddddddd");
         intent.action = PerformanceOperationAction::Remove;
@@ -4949,7 +5121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_terminal_retains_effective_rollback_fact() {
+    async fn behavior_terminal_retains_effective_rollback_fact() {
         let store = OperationJournalStore::new();
         let mut intent = performance_intent("eeeeeeeeeeeeeeee");
         intent.rollback = RollbackState::Unavailable;
@@ -5001,7 +5173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_exact_install_reapply_commits_without_effect_started() {
+    async fn behavior_exact_install_reapply_commits_without_effect_started() {
         let store = OperationJournalStore::new();
         let mut intent = performance_intent("edededededededed");
         intent.rollback = RollbackState::Unavailable;
@@ -5043,7 +5215,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b01_strict_sequence_high_water_rejects_missing_reuse_and_overflow() {
+    fn behavior_strict_sequence_high_water_rejects_missing_reuse_and_overflow() {
         let mut entry = test_entry("strict-sequence");
         entry.sequence = 7;
         let snapshot = OperationJournalSnapshot::new(vec![entry], 8).expect("strict v8 snapshot");
@@ -5072,7 +5244,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b01_tagged_performance_enums_reject_unknown_fields() {
+    fn behavior_tagged_performance_enums_reject_unknown_fields() {
         assert!(
             serde_json::from_value::<crate::state::contracts::OperationIntent>(
                 serde_json::json!({"kind":"generic","future":true})
@@ -5126,7 +5298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_flush_retries_semantic_candidate_before_success() {
+    async fn behavior_flush_retries_semantic_candidate_before_success() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("performance-strict-flush");
         let operation_id = OperationId::deterministic_test("strict-flush-candidate");
@@ -5154,7 +5326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_create_failure_retains_minted_identity_and_same_candidate() {
+    async fn behavior_create_failure_retains_minted_identity_and_same_candidate() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("performance-create-identity");
         let intent = performance_intent("cccccccccccccccc");
@@ -5187,7 +5359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_create_reconciliation_accepts_an_exact_planning_descendant() {
+    async fn behavior_create_reconciliation_accepts_an_exact_planning_descendant() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("performance-create-descendant");
         let store = Arc::new(store);
@@ -5244,7 +5416,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_performance_evidence_converges_own_and_foreign_failed_commits() {
+    async fn behavior_performance_evidence_converges_own_and_foreign_failed_commits() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("performance-evidence-convergence");
         let status = store
@@ -5259,16 +5431,16 @@ mod tests {
             .await
             .expect("advance before Guardian evidence");
 
-        let fact = "guardian_fact:performance_plan_allowed".to_string();
+        let fact = GuardianFactId::PerformanceFallbackSelected;
         let diagnosis = DiagnosisId::PerformanceFallbackSelected;
         let attempts_before_failure = backend.attempts.load(Ordering::SeqCst);
         backend.fail_next();
         store
-            .record_performance_guardian_evidence(
+            .record_performance_guardian_evidence(durable_evidence(
                 &status.operation_id,
-                vec![fact.clone(), fact.clone()],
-                vec![diagnosis, diagnosis],
-            )
+                vec![fact],
+                vec![diagnosis],
+            ))
             .await
             .expect("accepted evidence commit converges after persistence failure");
         assert_eq!(
@@ -5277,17 +5449,17 @@ mod tests {
         );
         let entry = store.get(&status.operation_id).expect("visible evidence");
         assert_eq!(entry.completed_steps.len(), 1);
-        assert_eq!(entry.completed_steps[0].generated_facts, vec![fact.clone()]);
+        assert_eq!(entry.completed_steps[0].guardian_fact_ids(), &[fact]);
         assert_eq!(entry.guardian_diagnosis_ids, vec![diagnosis]);
 
         let exact_snapshot = store.snapshot().expect("snapshot exact evidence");
         let exact_attempts = backend.attempts.load(Ordering::SeqCst);
         store
-            .record_performance_guardian_evidence(
+            .record_performance_guardian_evidence(durable_evidence(
                 &status.operation_id,
-                vec![fact.clone()],
+                vec![fact],
                 vec![diagnosis],
-            )
+            ))
             .await
             .expect("exact evidence retry is stable");
         assert_eq!(backend.attempts.load(Ordering::SeqCst), exact_attempts);
@@ -5308,7 +5480,11 @@ mod tests {
             Err(OperationJournalStoreError::Persistence(_))
         ));
         store
-            .record_performance_guardian_evidence(&second.operation_id, vec![fact], vec![diagnosis])
+            .record_performance_guardian_evidence(durable_evidence(
+                &second.operation_id,
+                vec![fact],
+                vec![diagnosis],
+            ))
             .await
             .expect("foreign candidate drains before typed evidence is reapplied");
         assert_eq!(
@@ -5320,15 +5496,14 @@ mod tests {
             &store
                 .get(&second.operation_id)
                 .expect("second evidence visible"),
-            &["guardian_fact:performance_plan_allowed".to_string()],
-            &[diagnosis],
+            &durable_evidence(&second.operation_id, vec![fact], vec![diagnosis]),
         ));
         store.close().await.expect("close evidence store");
         cleanup(&root);
     }
 
     #[tokio::test]
-    async fn p03_b01_transitions_and_restart_settlement_converge_failed_commits() {
+    async fn behavior_transitions_and_restart_settlement_converge_failed_commits() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("performance-transition-convergence");
         let status = store
@@ -5398,7 +5573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b01_prepared_commit_accepts_a_proven_effect_started_descendant() {
+    async fn behavior_prepared_commit_accepts_a_proven_effect_started_descendant() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("performance-transition-descendant");
         let store = Arc::new(store);
@@ -5653,20 +5828,25 @@ mod tests {
     async fn success_with_guardian_evidence_is_one_terminal_transition() {
         let store = OperationJournalStore::new();
         let operation_id = OperationId::deterministic_test("integrity-sweep-atomic-success");
-        store
-            .create(planned_entry(&operation_id))
-            .await
-            .expect("create planned journal");
-        let mut step = completed_step("tier2_integrity_sweep");
-        step.generated_facts
-            .push("integrity_counter:processed_entry_count:1".to_string());
+        let mut planned = planned_entry(&operation_id);
+        planned.command = CommandKind::ValidateInstance;
+        store.create(planned).await.expect("create planned journal");
+        let mut step =
+            OperationJournalStep::new("tier2_integrity_sweep", OperationPhase::Validating);
+        step.result = OperationStepResult::Completed;
+        step.set_metrics(OperationStepMetrics::Tier2Integrity(
+            Tier2IntegrityMetrics::new(1, 1, 1, 1, 1, 1, 0, 0, 0)
+                .expect("valid exact Tier 2 metrics"),
+        ));
 
         store
             .record_success_with_guardian_evidence(
-                &operation_id,
                 step,
-                vec!["guardian_fact:artifact_hash_mismatch".to_string()],
-                vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+                durable_evidence(
+                    &operation_id,
+                    vec![GuardianFactId::ArtifactHashMismatch],
+                    vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+                ),
             )
             .await
             .expect("record atomic terminal evidence");
@@ -5675,12 +5855,10 @@ mod tests {
         assert_eq!(stored.status, OperationStatus::Succeeded);
         assert_eq!(stored.outcome, Some(OperationOutcome::Succeeded));
         assert_eq!(stored.completed_steps.len(), 1);
+        assert!(stored.completed_steps[0].generated_facts.is_empty());
         assert_eq!(
-            stored.completed_steps[0].generated_facts,
-            vec![
-                "integrity_counter:processed_entry_count:1",
-                "guardian_fact:artifact_hash_mismatch",
-            ]
+            stored.completed_steps[0].guardian_fact_ids(),
+            vec![GuardianFactId::ArtifactHashMismatch]
         );
         assert_eq!(
             stored.guardian_diagnosis_ids,
@@ -5689,38 +5867,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_terminal_methods_reject_mismatched_step_results_without_mutation() {
+        let store = OperationJournalStore::new();
+
+        let success_id = OperationId::deterministic_test("typed-success-result-mismatch");
+        let mut success_entry = planned_entry(&success_id);
+        success_entry.command = CommandKind::ValidateInstance;
+        store
+            .create(success_entry)
+            .await
+            .expect("create success entry");
+        let success_before = store.get(&success_id).expect("success entry");
+        let mut failed_metrics =
+            OperationJournalStep::new("tier2_integrity_sweep", OperationPhase::Validating);
+        failed_metrics.result = OperationStepResult::Failed;
+        failed_metrics.set_metrics(OperationStepMetrics::Tier2Integrity(
+            Tier2IntegrityMetrics::new(1, 1, 1, 1, 1, 1, 0, 0, 0).expect("valid Tier 2 metrics"),
+        ));
+        assert!(matches!(
+            store
+                .record_success_with_metrics(&success_id, failed_metrics)
+                .await,
+            Err(OperationJournalStoreError::InvalidOperationMetrics)
+        ));
+        assert_eq!(store.get(&success_id), Some(success_before));
+
+        let failure_id = OperationId::deterministic_test("typed-failure-result-mismatch");
+        let mut failure_entry = planned_entry(&failure_id);
+        failure_entry.command = CommandKind::ValidateInstance;
+        store
+            .create(failure_entry)
+            .await
+            .expect("create failure entry");
+        let failure_before = store.get(&failure_id).expect("failure entry");
+        let completed = completed_step("tier2_integrity_sweep");
+        assert!(matches!(
+            store
+                .record_failure_with_guardian_evidence(
+                    completed,
+                    "integrity_failed",
+                    OperationOutcome::Failed,
+                    durable_evidence(
+                        &failure_id,
+                        vec![GuardianFactId::ArtifactMissing],
+                        vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+                    ),
+                )
+                .await,
+            Err(OperationJournalStoreError::InvalidGuardianOutcome)
+        ));
+        assert_eq!(store.get(&failure_id), Some(failure_before));
+
+        let cancellation_id = OperationId::deterministic_test("typed-cancellation-result-mismatch");
+        let mut cancellation_entry = planned_entry(&cancellation_id);
+        cancellation_entry.command = CommandKind::ValidateInstance;
+        store
+            .create(cancellation_entry)
+            .await
+            .expect("create cancellation entry");
+        let cancellation_before = store.get(&cancellation_id).expect("cancellation entry");
+        let mut completed_metrics = completed_step("tier2_integrity_sweep");
+        completed_metrics.set_metrics(OperationStepMetrics::Tier2Integrity(
+            Tier2IntegrityMetrics::new(1, 1, 1, 1, 1, 1, 0, 0, 0).expect("valid Tier 2 metrics"),
+        ));
+        assert!(matches!(
+            store
+                .record_cancellation_with_metrics(&cancellation_id, completed_metrics)
+                .await,
+            Err(OperationJournalStoreError::InvalidOperationMetrics)
+        ));
+        assert_eq!(store.get(&cancellation_id), Some(cancellation_before));
+    }
+
+    #[tokio::test]
     async fn cancellation_atomically_replaces_nonterminal_findings() {
         let store = OperationJournalStore::new();
         let operation_id = OperationId::deterministic_test("integrity-sweep-atomic-cancel");
-        store
-            .create(planned_entry(&operation_id))
-            .await
-            .expect("create planned journal");
-        let mut prior = completed_step("obsolete_progress");
-        prior
-            .generated_facts
-            .push("guardian_fact:artifact_missing".to_string());
+        let mut planned = planned_entry(&operation_id);
+        planned.command = CommandKind::ValidateInstance;
+        store.create(planned).await.expect("create planned journal");
+        let prior = completed_step("obsolete_progress");
         store
             .record_checkpoint(&operation_id, prior)
             .await
-            .expect("record nonterminal evidence");
+            .expect("record nonterminal progress");
         store
-            .record_guardian_evidence(
+            .record_guardian_evidence(durable_evidence(
                 &operation_id,
-                Vec::new(),
+                vec![GuardianFactId::ArtifactMissing],
                 vec![DiagnosisId::LauncherManagedArtifactCorrupt],
-            )
+            ))
             .await
             .expect("record nonterminal diagnosis");
         let mut cancelled =
             OperationJournalStep::new("tier2_integrity_sweep", OperationPhase::Validating);
         cancelled.result = crate::state::contracts::OperationStepResult::Skipped;
-        cancelled
-            .generated_facts
-            .push("integrity_counter:processed_entry_count:0".to_string());
+        cancelled.set_metrics(OperationStepMetrics::Tier2Integrity(
+            Tier2IntegrityMetrics::new(0, 0, 0, 0, 0, 0, 0, 0, 0)
+                .expect("valid empty Tier 2 metrics"),
+        ));
 
         store
-            .record_cancellation(&operation_id, cancelled)
+            .record_cancellation_with_metrics(&operation_id, cancelled)
             .await
             .expect("record atomic cancellation");
 
@@ -5728,10 +5976,11 @@ mod tests {
         assert_eq!(stored.status, OperationStatus::Cancelled);
         assert_eq!(stored.outcome, Some(OperationOutcome::Cancelled));
         assert_eq!(stored.completed_steps.len(), 1);
-        assert_eq!(
-            stored.completed_steps[0].generated_facts,
-            vec!["integrity_counter:processed_entry_count:0"]
-        );
+        assert!(stored.completed_steps[0].generated_facts.is_empty());
+        assert!(matches!(
+            stored.completed_steps[0].metrics(),
+            Some(OperationStepMetrics::Tier2Integrity(_))
+        ));
         assert!(stored.guardian_diagnosis_ids.is_empty());
         assert_eq!(stored.failure_point, None);
     }
@@ -5756,14 +6005,14 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_operation_journals_v9_fixture_is_strict() {
-        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V9_FIXTURE)
+    fn behavior_contract_checked_in_operation_journals_v10_fixture_is_strict() {
+        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V10_FIXTURE)
             .expect("strict fixture");
         assert_eq!(
             super::OPERATION_JOURNAL_SCHEMA,
-            "axial.state.operation_journals.v9"
+            "axial.state.operation_journals.v10"
         );
-        assert_eq!(snapshot.schema, "axial.state.operation_journals.v9");
+        assert_eq!(snapshot.schema, "axial.state.operation_journals.v10");
         assert_eq!(snapshot.next_sequence, 8);
         assert_eq!(
             snapshot
@@ -5771,17 +6020,48 @@ mod tests {
                 .iter()
                 .map(|entry| entry.sequence)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 7],
-            "fixture must retain sequence 6 only through the durable high-water"
+            vec![1, 2, 4, 5, 7],
+            "fixture removes vocabulary pins and retains the durable high-water"
         );
-        let diagnosis_ids = snapshot
+        let tier2_step = snapshot
             .entries
             .iter()
-            .take(3)
-            .flat_map(|entry| entry.guardian_diagnosis_ids.iter())
-            .copied()
-            .collect::<Vec<_>>();
-        assert_eq!(diagnosis_ids.as_slice(), DiagnosisId::ALL.as_slice());
+            .flat_map(|entry| &entry.completed_steps)
+            .find(|step| step.step_id == "tier2_integrity_sweep")
+            .expect("typed Tier2 metrics fixture");
+        assert!(matches!(
+            tier2_step.metrics(),
+            Some(OperationStepMetrics::Tier2Integrity(_))
+        ));
+        let install = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.command == CommandKind::InstallVersion)
+            .expect("typed install fixture");
+        assert!(matches!(
+            install.completed_steps[0].metrics(),
+            Some(OperationStepMetrics::ContentDownload(_))
+        ));
+        let install_terminal = install
+            .guardian_install_terminal()
+            .expect("typed install terminal fixture");
+        assert_eq!(install_terminal.action(), GuardianActionKind::Retry);
+        assert!(install_terminal.memory().is_some());
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .flat_map(|entry| &entry.completed_steps)
+                .flat_map(|step| step.guardian_fact_ids().iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            [
+                GuardianFactId::ArtifactChecksumMismatch,
+                GuardianFactId::DownloadProviderUnavailable,
+                GuardianFactId::ArtifactHashMismatch,
+                GuardianFactId::ManagedRuntimeCorrupt,
+            ]
+        );
 
         let attempts = snapshot
             .entries
@@ -5876,7 +6156,7 @@ mod tests {
         ));
 
         let mut unknown_snapshot =
-            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V9_FIXTURE)
+            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V10_FIXTURE)
                 .expect("fixture value");
         unknown_snapshot["entries"][0]["guardian_diagnosis_ids"][0] =
             serde_json::Value::String("future_diagnosis".to_string());
@@ -5886,7 +6166,7 @@ mod tests {
         assert!(!error.contains("future_diagnosis"));
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V9_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V10_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded =
@@ -5957,15 +6237,11 @@ mod tests {
 
         store.create(entry).await.expect("create journal");
         store
-            .record_guardian_evidence(
+            .record_guardian_evidence(durable_evidence(
                 &operation_id,
-                vec![
-                    "guardian_outcome_decision:retry".to_string(),
-                    "guardian_outcome_summary:Guardian treated install download failure as retryable."
-                        .to_string(),
-                ],
+                vec![GuardianFactId::DownloadProviderUnavailable],
                 vec![DiagnosisId::DownloadUnavailable],
-            )
+            ))
             .await
             .expect("record Guardian evidence");
 
@@ -6000,7 +6276,7 @@ mod tests {
         let path = operation_journal_path(&paths);
         fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
         let future =
-            r#"{"schema":"axial.state.operation_journals.v10","next_sequence":1,"entries":[]}"#;
+            r#"{"schema":"axial.state.operation_journals.v11","next_sequence":1,"entries":[]}"#;
         fs::write(&path, future).expect("write future journal snapshot");
 
         let result = OperationJournalStore::try_load_from_paths(&paths);
@@ -6019,23 +6295,21 @@ mod tests {
 
     #[test]
     fn previous_operation_journal_schema_is_strict_invalid_and_preserved_byte_exact() {
-        let legacy = OPERATION_JOURNALS_V9_FIXTURE
-            .replacen(
-                "axial.state.operation_journals.v9",
-                "axial.state.operation_journals.v8",
-                1,
-            )
-            .replacen("artifact_ownership_unsafe", "launch_command_prepared", 1);
+        let legacy = OPERATION_JOURNALS_V10_FIXTURE.replacen(
+            "axial.state.operation_journals.v10",
+            "axial.state.operation_journals.v9",
+            1,
+        );
         assert!(matches!(
             OperationJournalSnapshot::from_json(&legacy),
             Err(super::OperationJournalLoadError::InvalidSchema)
         ));
 
-        let root = test_root("preserve-v8-schema");
+        let root = test_root("preserve-v9-schema");
         let paths = test_paths(&root);
         let path = operation_journal_path(&paths);
         fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
-        fs::write(&path, legacy.as_bytes()).expect("write v8 journal snapshot");
+        fs::write(&path, legacy.as_bytes()).expect("write v9 journal snapshot");
 
         assert!(matches!(
             OperationJournalStore::try_load_from_paths(&paths),
@@ -6044,7 +6318,7 @@ mod tests {
             ))
         ));
         assert_eq!(
-            fs::read(&path).expect("v8 journal remains"),
+            fs::read(&path).expect("v9 journal remains"),
             legacy.as_bytes()
         );
         cleanup(&root);
@@ -6113,7 +6387,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b02_contract_journal_snapshot_encoder_accepts_exact_bound_and_rejects_one_more_byte() {
+    fn behavior_contract_journal_snapshot_encoder_accepts_exact_bound_and_rejects_one_more_byte() {
         let mut snapshot = OperationJournalSnapshot {
             schema: String::new(),
             next_sequence: 1,
@@ -6142,10 +6416,10 @@ mod tests {
     }
 
     #[test]
-    fn p03_b02_contract_revision_reuses_unchanged_entries_and_encodes_canonically() {
+    fn behavior_contract_revision_reuses_unchanged_entries_and_encodes_canonically() {
         let mut entries = OrdMap::new();
         for index in 0..super::DEFAULT_OPERATION_JOURNAL_LIMIT {
-            let mut entry = test_entry(&format!("operation-p03-b02-cached-{index:03}"));
+            let mut entry = test_entry(&format!("operation-temporal-journal-cached-{index:03}"));
             entry.sequence = index as u64 + 1;
             entries.insert(
                 entry.operation_id.clone(),
@@ -6230,8 +6504,8 @@ mod tests {
     }
 
     #[test]
-    fn p03_b02_contract_revision_accounts_exact_eight_mib_before_encoding() {
-        let mut entry = test_entry("operation-p03-b02-exact-size");
+    fn behavior_contract_revision_accounts_exact_eight_mib_before_encoding() {
+        let mut entry = test_entry("operation-temporal-journal-exact-size");
         entry.sequence = 1;
         let operation_id = entry.operation_id.clone();
         let accepted = AcceptedJournalEntry::accept(entry).expect("accept size test entry");
@@ -6269,7 +6543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b02_contract_oversized_candidate_is_rejected_before_visibility() {
+    async fn behavior_contract_oversized_candidate_is_rejected_before_visibility() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("oversized-candidate-preflight");
         let mut oversized = test_entry("operation-oversized-candidate");
@@ -6457,14 +6731,10 @@ mod tests {
             .await
             .expect("create journal");
 
-        store
-            .record_guardian_evidence(
-                &operation_id,
-                vec![r"C:\Users\Alice\.minecraft --accessToken secret -Xmx8192M".to_string()],
-                Vec::new(),
-            )
-            .await
-            .expect_err("reject unsafe evidence");
+        assert_eq!(
+            DurableGuardianEvidence::new(operation_id.clone(), Vec::new(), Vec::new(), None),
+            Err(DurableGuardianEvidenceError::Empty)
+        );
 
         let entry = store.get(&operation_id).expect("journal");
         let facts = &entry.completed_steps[0].generated_facts;
@@ -6473,11 +6743,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b02_contract_blocked_encoder_keeps_queries_responsive_and_candidate_hidden() {
+    async fn behavior_contract_blocked_encoder_keeps_queries_responsive_and_candidate_hidden() {
         let (root, _paths, _backend, _coordinator, store) =
-            persistence_fixture("p03-b02-blocked-encoder-query");
+            persistence_fixture("temporal-journal-blocked-encoder-query");
         let store = Arc::new(store);
-        let operation_id = OperationId::deterministic_test("operation-p03-b02-blocked-encoder");
+        let operation_id =
+            OperationId::deterministic_test("operation-temporal-journal-blocked-encoder");
         store
             .create(planned_entry(&operation_id))
             .await
@@ -6668,7 +6939,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b02_contract_cross_owner_coalesced_revision_reloads_exactly() {
+    async fn behavior_contract_cross_owner_coalesced_revision_reloads_exactly() {
         let (root, paths, backend, coordinator, store) =
             persistence_fixture("progress-burst-reload");
         let operation_id = OperationId::deterministic_test("operation-progress-burst");
@@ -6703,7 +6974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b02_contract_failed_debounced_commit_retries_latest_snapshot() {
+    async fn behavior_contract_failed_debounced_commit_retries_latest_snapshot() {
         let (root, paths, backend, coordinator, store) =
             persistence_fixture("close-retries-debounced-progress");
         let operation_id = OperationId::deterministic_test("operation-close-progress-retry");
@@ -6744,7 +7015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b02_contract_failed_immediate_commit_retries_exact_hidden_candidate() {
+    async fn behavior_contract_failed_immediate_commit_retries_exact_hidden_candidate() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("failure-retry-latest");
         let store = Arc::new(store);
@@ -7258,9 +7529,115 @@ mod tests {
         entry
     }
 
+    fn temporal_install_memory_entry(
+        operation: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> OperationJournalEntry {
+        let mut entry = test_entry(operation);
+        let target = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            "minecraft_client_1.21.5",
+            OwnershipClass::LauncherManaged,
+        );
+        let suppression_until = observed_at + chrono::Duration::minutes(5);
+        let memory = GuardianInstallMemoryEvidence::new(
+            GuardianMemoryBindingDigest::from_sha256([0x2a; 32]),
+            target.clone(),
+            observed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            suppression_until.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .expect("structurally valid install memory");
+        entry.status = OperationStatus::Failed;
+        entry.outcome = Some(OperationOutcome::Failed);
+        entry.failure_point = Some("content_progress_download".to_string());
+        entry.targets.push(target);
+        entry
+            .guardian_diagnosis_ids
+            .push(DiagnosisId::DownloadUnavailable);
+        entry.guardian_install_terminal = Some(
+            GuardianInstallTerminalEvidence::new(
+                DiagnosisId::DownloadUnavailable,
+                GuardianActionKind::Retry,
+                Some(memory),
+            )
+            .expect("valid install terminal"),
+        );
+        entry
+    }
+
+    #[test]
+    fn behavior_contract_install_memory_load_is_structural_and_rejects_invalid_window() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("fixed timestamp")
+            .with_timezone(&chrono::Utc);
+        let store = OperationJournalStore::with_max_entries_and_temporal(
+            2,
+            Arc::new(crate::state::temporal::BoundedTemporalPolicy::fixed(now)),
+        );
+        let mut future = temporal_install_memory_entry(
+            "evidence-contracts-future-install-memory",
+            now + chrono::Duration::seconds(301),
+        );
+        future.sequence = 1;
+        let mut current = test_entry("evidence-contracts-current-after-future");
+        current.sequence = 2;
+        store
+            .load_snapshot(OperationJournalSnapshot {
+                schema: OPERATION_JOURNAL_SCHEMA.to_string(),
+                next_sequence: 3,
+                entries: vec![future, current.clone()],
+            })
+            .expect("structurally valid install memory is not journal temporal authority");
+        assert_eq!(store.list().len(), 2);
+        assert!(store.get(&current.operation_id).is_some());
+        assert_eq!(store.temporal_load_issues().future_observation(), 0);
+
+        let valid =
+            temporal_install_memory_entry("evidence-contracts-overlong-install-memory", now);
+        let mut encoded = serde_json::to_value(OperationJournalSnapshot {
+            schema: OPERATION_JOURNAL_SCHEMA.to_string(),
+            next_sequence: 2,
+            entries: vec![valid],
+        })
+        .expect("encode structurally valid snapshot");
+        encoded["entries"][0]["guardian_install_terminal"]["memory"]["suppression_until"] =
+            serde_json::Value::String("2026-08-14T11:00:00.000Z".to_string());
+        assert!(matches!(
+            OperationJournalSnapshot::from_json(&encoded.to_string()),
+            Err(super::OperationJournalLoadError::Json(_))
+        ));
+    }
+
     #[tokio::test]
-    async fn p03_b02_contract_restart_retains_only_live_child_predecessor() {
-        let root = test_root("p03-b02-relational-temporal-reload");
+    async fn behavior_contract_install_memory_does_not_protect_operation_from_capacity_pruning() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .expect("fixed timestamp")
+            .with_timezone(&chrono::Utc);
+        let store = OperationJournalStore::with_max_entries_and_temporal(
+            1,
+            Arc::new(crate::state::temporal::BoundedTemporalPolicy::fixed(now)),
+        );
+        let unprotected =
+            temporal_install_memory_entry("evidence-contracts-current-install-memory", now);
+        let unprotected_id = unprotected.operation_id.clone();
+        store
+            .create(unprotected)
+            .await
+            .expect("admit install memory");
+        let replacement = test_entry("evidence-contracts-expired-replacement");
+        let replacement_id = replacement.operation_id.clone();
+        store
+            .create(replacement)
+            .await
+            .expect("install memory does not protect operation capacity");
+        assert!(store.get(&unprotected_id).is_none());
+        assert!(store.get(&replacement_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn behavior_contract_restart_retains_only_live_child_predecessor() {
+        let root = test_root("temporal-journal-relational-temporal-reload");
         let paths = test_paths(&root);
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("fixed timestamp")
@@ -7360,7 +7737,7 @@ mod tests {
     }
 
     #[test]
-    fn p03_b02_contract_temporal_load_filters_before_capacity_and_counts_reasons() {
+    fn behavior_contract_temporal_load_filters_before_capacity_and_counts_reasons() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("fixed timestamp")
             .with_timezone(&chrono::Utc);
@@ -7406,7 +7783,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b02_contract_temporal_admission_rejects_future_and_overlong_attempts() {
+    async fn behavior_contract_temporal_admission_rejects_future_and_overlong_attempts() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("fixed timestamp")
             .with_timezone(&chrono::Utc);
@@ -7465,7 +7842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b02_contract_expired_pending_publication_ack_becomes_evictable() {
+    async fn behavior_contract_expired_pending_publication_ack_becomes_evictable() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("fixed timestamp")
             .with_timezone(&chrono::Utc);
@@ -7517,7 +7894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p03_b02_contract_expired_reconciliation_settlement_commits_then_is_evictable() {
+    async fn behavior_contract_expired_reconciliation_settlement_commits_then_is_evictable() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
             .expect("fixed timestamp")
             .with_timezone(&chrono::Utc);

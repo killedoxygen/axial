@@ -1583,20 +1583,14 @@ pub(super) async fn record_performance_operation_result(
 
 pub(super) async fn record_performance_guardian_supervision(
     state: &AppState,
-    operation_id: &OperationId,
     supervision: &GuardianPerformanceSupervisionPlan,
 ) -> Result<(), OperationJournalStoreError> {
+    let Some(evidence) = supervision.durable_evidence.clone() else {
+        return Ok(());
+    };
     state
         .journals()
-        .record_performance_guardian_evidence(
-            operation_id,
-            supervision
-                .fact_ids
-                .iter()
-                .map(|fact_id| fact_id.as_str().to_string())
-                .collect(),
-            supervision.decision.diagnoses().to_vec(),
-        )
+        .record_performance_guardian_evidence(evidence)
         .await
 }
 

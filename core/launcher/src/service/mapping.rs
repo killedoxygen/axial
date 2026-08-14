@@ -105,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_launcher_mapping_keeps_preparing_and_starting_adjacent() {
+    fn behavior_contract_launcher_mapping_keeps_preparing_and_starting_adjacent() {
         assert_eq!(launch_state_name(LaunchState::Preparing), "preparing");
         assert_eq!(launch_stage_label("preparing"), "Preparing files");
         assert_eq!(launch_state_name(LaunchState::Starting), "starting");

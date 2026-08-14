@@ -1828,7 +1828,7 @@ mod tests {
     use tokio::sync::Notify;
 
     #[test]
-    fn p02_b05_contract_cross_owner_benchmark_task_loss_is_not_a_storage_failure() {
+    fn behavior_contract_cross_owner_benchmark_task_loss_is_not_a_storage_failure() {
         let (status, Json(owner_body)) = benchmark_launch_owner_stopped_response();
         let (_, Json(storage_body)) = benchmark_suite_storage_error_response();
 

@@ -256,14 +256,14 @@ tasks:
     cmds:
       - task: toolchain:rust
       - node --test scripts/tests/capability.test.mjs
-      - node --test scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
-      - node --test scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs
-      - node --test scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs
+      - node --test scripts/tests/contracts/asset-integrity-contract.test.mjs scripts/tests/contracts/asset-integrity-cross-owner-contract.test.mjs
+      - node --test scripts/tests/contracts/release-build-contract.test.mjs scripts/tests/contracts/release-build-cross-owner-contract.test.mjs
+      - node --test scripts/tests/contracts/process-containment-contract.test.mjs scripts/tests/contracts/process-containment-cross-owner-contract.test.mjs
       - node scripts/verify-assets.mjs
       - node scripts/cargo-target.mjs run -- cargo check --workspace --all-targets --no-default-features --locked
-      - task: verify:phase:p01:native
+      - task: verify:native:filesystem
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft contained_
-      - task: capability:phase:p00
+      - task: capability:offline-assets
         vars:
           PLATFORM: windows
 
@@ -275,24 +275,24 @@ tasks:
     cmds:
       - task: toolchain:rust
       - node --test scripts/tests/capability.test.mjs
-      - node --test scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
-      - node --test scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs
-      - node --test scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs
+      - node --test scripts/tests/contracts/asset-integrity-contract.test.mjs scripts/tests/contracts/asset-integrity-cross-owner-contract.test.mjs
+      - node --test scripts/tests/contracts/release-build-contract.test.mjs scripts/tests/contracts/release-build-cross-owner-contract.test.mjs
+      - node --test scripts/tests/contracts/process-containment-contract.test.mjs scripts/tests/contracts/process-containment-cross-owner-contract.test.mjs
       - node scripts/verify-assets.mjs
       - node scripts/cargo-target.mjs run -- cargo check --workspace --all-targets --no-default-features --locked
-      - task: verify:phase:p01:native
+      - task: verify:native:filesystem
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft contained_
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-api --no-default-features macos_system_low_priority_round_trip_restores_disk_policy
       - node scripts/cargo-target.mjs run -- cargo check --locked -p axial-desktop --target x86_64-apple-darwin
-      - task: capability:phase:p00
+      - task: capability:offline-assets
         vars:
           PLATFORM: macos
 
-  verify:phase:p01:native:
-    desc: run the P01 native filesystem, resource, transfer, and owner matrix
+  verify:native:filesystem:
+    desc: run the native filesystem, resource, transfer, and owner matrix
     cmds:
       - task: verify:contracts
-      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-api --lib --no-default-features p01_b0 -- --test-threads=1
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-api --lib --no-default-features native_filesystem_contract_ -- --test-threads=1
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-fs --lib -- --test-threads=1
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-resource --lib -- --test-threads=1
       - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft download::transient_transfer::tests -- --test-threads=1
@@ -321,8 +321,8 @@ tasks:
     cmds:
       - node scripts/capability.mjs run
 
-  capability:phase:p00:
-    desc: run the five P00 offline asset capabilities on one concrete PLATFORM
+  capability:offline-assets:
+    desc: run the five offline asset capabilities on one concrete PLATFORM
     cmds:
       - task: toolchain:frontend
       - pnpm --dir frontend install --frozen-lockfile --ignore-scripts
@@ -347,13 +347,13 @@ tasks:
           SCENARIO: CP-OA-PROVENANCE
           PLATFORM: "{{.PLATFORM}}"
 
-  capability:boundary:p01-b02:
-    desc: run the P01-B02 anchored filesystem behavioral capability on Linux
+  capability:anchored-filesystem:
+    desc: run the anchored filesystem behavioral capability on Linux
     cmds:
       - task: toolchain:rust
       - task: capability:run
         vars:
-          SCENARIO: CP-P01-B02-ANCHORED-FS
+          SCENARIO: CP-ANCHORED-FILESYSTEM
           PLATFORM: "{{.PLATFORM}}"
 
   capability:platform:
@@ -545,7 +545,8 @@ tasks:
   verify:contracts:
     internal: true
     cmds:
-      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/p01-b02-capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs scripts/tests/contracts/p01-b02-performance-transfer-contract.test.mjs scripts/tests/contracts/p01-b03-named-publication-contract.test.mjs frontend/test/contracts/p00-b06-contract-cross-owner.test.mjs
+      - node scripts/verify-behavioral-names.mjs
+      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/behavioral-names.test.mjs scripts/tests/anchored-filesystem-capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/workflow-integrity-contract.test.mjs scripts/tests/contracts/workflow-integrity-cross-owner-contract.test.mjs scripts/tests/contracts/capability-workflow-contract.test.mjs scripts/tests/contracts/asset-integrity-contract.test.mjs scripts/tests/contracts/asset-integrity-cross-owner-contract.test.mjs scripts/tests/contracts/release-build-contract.test.mjs scripts/tests/contracts/release-build-cross-owner-contract.test.mjs scripts/tests/contracts/process-containment-contract.test.mjs scripts/tests/contracts/process-containment-cross-owner-contract.test.mjs scripts/tests/contracts/performance-transfer-contract.test.mjs scripts/tests/contracts/named-publication-contract.test.mjs frontend/test/contracts/frontend-quality-cross-owner-contract.test.mjs
       - task: capability:audit
 
   assets:verify:

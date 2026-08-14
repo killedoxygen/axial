@@ -419,7 +419,7 @@ fn replay_source_diagnosis(
         }],
         SourceInput::Empty => Vec::new(),
     };
-    let mut diagnoses = diagnose(&facts, phase);
+    let mut diagnoses = diagnose(&crate::guardian::unscoped_evidence_for_test(&facts), phase);
     assert_eq!(diagnoses.len(), 1, "snapshot source at {phase:?}");
     diagnoses
         .pop()

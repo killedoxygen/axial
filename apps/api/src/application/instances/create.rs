@@ -1589,7 +1589,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn p00_b07_contract_create_selection_install_request_is_total_and_exact() {
+    fn behavior_contract_create_selection_install_request_is_total_and_exact() {
         let vanilla = CreateSelection::Vanilla {
             version_id: "1.21.5".to_string(),
         };

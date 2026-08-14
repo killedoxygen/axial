@@ -28,385 +28,213 @@ macro_rules! guardian_modes {
 
 guardian_modes!(Managed, Custom, Disabled);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum GuardianFactId {
-    AgentHookFailed,
-    AgentUnavailable,
-    ArtifactChecksumMismatch,
-    ArtifactHashMismatch,
-    ArtifactMissing,
-    ArtifactQuarantined,
-    ArtifactSizeDrift,
-    ArtifactSizeMismatch,
-    AssetIndexMissing,
-    AtomicPromotionCompleted,
-    AtomicPromotionFailed,
-    AuthModeIncompatible,
-    BootMarkerObserved,
-    BootMilestoneOverdue,
-    BootMilestoneReached,
-    ClasspathModuleConflict,
-    ClientJarMissing,
-    CustomJavaOverridePresent,
-    CustomJvmArgsPresent,
-    CustomJvmPresetPresent,
-    DownloadInterrupted,
-    DownloadProviderUnavailable,
-    DownloadWrittenToTemp,
-    ExitCodeNonzero,
-    ExitCodeUnknown,
-    ExitCodeZero,
-    FilesystemPermissionDenied,
-    FrameBudgetExceeded,
-    GcPauseStorm,
-    GraphicsDriverCrash,
-    HeapPressureCritical,
-    IncompleteInstall,
-    InstallDependencyFailed,
-    InstallExecutionFailed,
-    InstallProcessorFailed,
-    InstalledVersionsDegraded,
-    JavaMajorMismatch,
-    JavaOverrideEmpty,
-    JavaOverrideMissing,
-    JavaOverrideUndefinedSentinel,
-    JavaProbeFailed,
-    JavaUpdateTooOld,
-    JvmArgAgentOverride,
-    JvmArgExperimentalUnlockMissing,
-    JvmArgMemoryConflict,
-    JvmArgReservedLauncherFlag,
-    JvmArgUnlockOrderInvalid,
-    JvmArgUnsafeClasspathOverride,
-    JvmArgUnsafeNativePathOverride,
-    JvmArgUnsupported,
-    JvmArgUnsupportedGc,
-    JvmArgsEmpty,
-    JvmArgsParseFailed,
-    JvmPresetCompatibilityAdjusted,
-    LaunchFailureClassified,
-    LaunchJvmPresetDowngradeAvailable,
-    LaunchJvmStripAvailable,
-    LaunchMemoryAllocationLow,
-    LaunchMemoryMinClamped,
-    LaunchResourceCpuPressure,
-    LaunchResourceDiskPressure,
-    LaunchResourceInstallPressure,
-    LaunchResourceMemoryPressure,
-    LaunchRuntimeFallbackAvailable,
-    LauncherManagedArtifactSignatureCorruption,
-    LauncherStopRequested,
-    LibrariesMissing,
-    LoaderBootstrapFailure,
-    ManagedRuntimeCorrupt,
-    ManagedRuntimeMissing,
-    ManagedRuntimeReadyMarkerMissing,
-    ManagedRuntimeRepairApplied,
-    ManagedRuntimeRosettaRequired,
-    ManagedRuntimeUnavailableForPlatform,
-    MissingDependency,
-    ModAttributedCrash,
-    ModTransformationFailure,
-    NoStructuredFact(OperationPhase),
-    OutOfMemory,
-    ParentVersionMissing,
-    PerformanceFallbackSelected,
-    PerformanceHealthInvalid,
-    PerformanceRulesInvalid,
-    PerformanceUserOwnedConflict,
-    PersistedStateRepairAvailable,
-    PersistedStateSchemaInvalid,
-    PrimitiveRefused,
-    ProcessExited,
-    ProcessExitedAfterBoot,
-    ProcessExitedBeforeBoot,
-    ProcessKilled,
-    ProcessSpawned,
-    ProviderDataInvalid,
-    RecentRepairFailed,
-    RecentStartupFailure,
-    RegisteredArtifactRepairAvailable,
-    RegisteredComponentRebuildFailed,
-    RepairSuppressedUntil,
-    StartupWindowExpired,
-    TempFileWriteFailed,
-    UnknownLaunchFailure,
-    UserModSetDrift,
-    VersionJsonMissing,
-    WatchdogActionObserved,
-    WatchdogKilledProcess,
-}
-
-impl GuardianFactId {
-    pub const ALL: [Self; 116] = [
-        Self::AgentHookFailed,
-        Self::AgentUnavailable,
-        Self::ArtifactChecksumMismatch,
-        Self::ArtifactHashMismatch,
-        Self::ArtifactMissing,
-        Self::ArtifactQuarantined,
-        Self::ArtifactSizeDrift,
-        Self::ArtifactSizeMismatch,
-        Self::AssetIndexMissing,
-        Self::AtomicPromotionCompleted,
-        Self::AtomicPromotionFailed,
-        Self::AuthModeIncompatible,
-        Self::BootMarkerObserved,
-        Self::BootMilestoneOverdue,
-        Self::BootMilestoneReached,
-        Self::ClasspathModuleConflict,
-        Self::ClientJarMissing,
-        Self::CustomJavaOverridePresent,
-        Self::CustomJvmArgsPresent,
-        Self::CustomJvmPresetPresent,
-        Self::DownloadInterrupted,
-        Self::DownloadProviderUnavailable,
-        Self::DownloadWrittenToTemp,
-        Self::ExitCodeNonzero,
-        Self::ExitCodeUnknown,
-        Self::ExitCodeZero,
-        Self::FilesystemPermissionDenied,
-        Self::FrameBudgetExceeded,
-        Self::GcPauseStorm,
-        Self::GraphicsDriverCrash,
-        Self::HeapPressureCritical,
-        Self::IncompleteInstall,
-        Self::InstallDependencyFailed,
-        Self::InstallExecutionFailed,
-        Self::InstallProcessorFailed,
-        Self::InstalledVersionsDegraded,
-        Self::JavaMajorMismatch,
-        Self::JavaOverrideEmpty,
-        Self::JavaOverrideMissing,
-        Self::JavaOverrideUndefinedSentinel,
-        Self::JavaProbeFailed,
-        Self::JavaUpdateTooOld,
-        Self::JvmArgAgentOverride,
-        Self::JvmArgExperimentalUnlockMissing,
-        Self::JvmArgMemoryConflict,
-        Self::JvmArgReservedLauncherFlag,
-        Self::JvmArgUnlockOrderInvalid,
-        Self::JvmArgUnsafeClasspathOverride,
-        Self::JvmArgUnsafeNativePathOverride,
-        Self::JvmArgUnsupported,
-        Self::JvmArgUnsupportedGc,
-        Self::JvmArgsEmpty,
-        Self::JvmArgsParseFailed,
-        Self::JvmPresetCompatibilityAdjusted,
-        Self::LaunchFailureClassified,
-        Self::LaunchJvmPresetDowngradeAvailable,
-        Self::LaunchJvmStripAvailable,
-        Self::LaunchMemoryAllocationLow,
-        Self::LaunchMemoryMinClamped,
-        Self::LaunchResourceCpuPressure,
-        Self::LaunchResourceDiskPressure,
-        Self::LaunchResourceInstallPressure,
-        Self::LaunchResourceMemoryPressure,
-        Self::LaunchRuntimeFallbackAvailable,
-        Self::LauncherManagedArtifactSignatureCorruption,
-        Self::LauncherStopRequested,
-        Self::LibrariesMissing,
-        Self::LoaderBootstrapFailure,
-        Self::ManagedRuntimeCorrupt,
-        Self::ManagedRuntimeMissing,
-        Self::ManagedRuntimeReadyMarkerMissing,
-        Self::ManagedRuntimeRepairApplied,
-        Self::ManagedRuntimeRosettaRequired,
-        Self::ManagedRuntimeUnavailableForPlatform,
-        Self::MissingDependency,
-        Self::ModAttributedCrash,
-        Self::ModTransformationFailure,
-        Self::NoStructuredFact(OperationPhase::Completed),
-        Self::NoStructuredFact(OperationPhase::Downloading),
-        Self::NoStructuredFact(OperationPhase::Failed),
-        Self::NoStructuredFact(OperationPhase::Installing),
-        Self::NoStructuredFact(OperationPhase::Launching),
-        Self::NoStructuredFact(OperationPhase::Planning),
-        Self::NoStructuredFact(OperationPhase::Preparing),
-        Self::NoStructuredFact(OperationPhase::Repairing),
-        Self::NoStructuredFact(OperationPhase::RollingBack),
-        Self::NoStructuredFact(OperationPhase::Running),
-        Self::NoStructuredFact(OperationPhase::Startup),
-        Self::NoStructuredFact(OperationPhase::Validating),
-        Self::OutOfMemory,
-        Self::ParentVersionMissing,
-        Self::PerformanceFallbackSelected,
-        Self::PerformanceHealthInvalid,
-        Self::PerformanceRulesInvalid,
-        Self::PerformanceUserOwnedConflict,
-        Self::PersistedStateRepairAvailable,
-        Self::PersistedStateSchemaInvalid,
-        Self::PrimitiveRefused,
-        Self::ProcessExited,
-        Self::ProcessExitedAfterBoot,
-        Self::ProcessExitedBeforeBoot,
-        Self::ProcessKilled,
-        Self::ProcessSpawned,
-        Self::ProviderDataInvalid,
-        Self::RecentRepairFailed,
-        Self::RecentStartupFailure,
-        Self::RegisteredArtifactRepairAvailable,
-        Self::RegisteredComponentRebuildFailed,
-        Self::RepairSuppressedUntil,
-        Self::StartupWindowExpired,
-        Self::TempFileWriteFailed,
-        Self::UnknownLaunchFailure,
-        Self::UserModSetDrift,
-        Self::VersionJsonMissing,
-        Self::WatchdogActionObserved,
-        Self::WatchdogKilledProcess,
-    ];
-
-    pub const fn as_str(&self) -> &'static str {
+impl GuardianMode {
+    pub const fn failure_memory_id(self) -> &'static str {
         match self {
-            Self::AgentHookFailed => "agent_hook_failed",
-            Self::AgentUnavailable => "agent_unavailable",
-            Self::ArtifactChecksumMismatch => "artifact_checksum_mismatch",
-            Self::ArtifactHashMismatch => "artifact_hash_mismatch",
-            Self::ArtifactMissing => "artifact_missing",
-            Self::ArtifactQuarantined => "artifact_quarantined",
-            Self::ArtifactSizeDrift => "artifact_size_drift",
-            Self::ArtifactSizeMismatch => "artifact_size_mismatch",
-            Self::AssetIndexMissing => "asset_index_missing",
-            Self::AtomicPromotionCompleted => "atomic_promotion_completed",
-            Self::AtomicPromotionFailed => "atomic_promotion_failed",
-            Self::AuthModeIncompatible => "auth_mode_incompatible",
-            Self::BootMarkerObserved => "boot_marker_observed",
-            Self::BootMilestoneOverdue => "boot_milestone_overdue",
-            Self::BootMilestoneReached => "boot_milestone_reached",
-            Self::ClasspathModuleConflict => "classpath_module_conflict",
-            Self::ClientJarMissing => "client_jar_missing",
-            Self::CustomJavaOverridePresent => "custom_java_override_present",
-            Self::CustomJvmArgsPresent => "custom_jvm_args_present",
-            Self::CustomJvmPresetPresent => "custom_jvm_preset_present",
-            Self::DownloadInterrupted => "download_interrupted",
-            Self::DownloadProviderUnavailable => "download_provider_unavailable",
-            Self::DownloadWrittenToTemp => "download_written_to_temp",
-            Self::ExitCodeNonzero => "exit_code_nonzero",
-            Self::ExitCodeUnknown => "exit_code_unknown",
-            Self::ExitCodeZero => "exit_code_zero",
-            Self::FilesystemPermissionDenied => "filesystem_permission_denied",
-            Self::FrameBudgetExceeded => "frame_budget_exceeded",
-            Self::GcPauseStorm => "gc_pause_storm",
-            Self::GraphicsDriverCrash => "graphics_driver_crash",
-            Self::HeapPressureCritical => "heap_pressure_critical",
-            Self::IncompleteInstall => "incomplete_install",
-            Self::InstallDependencyFailed => "install_dependency_failed",
-            Self::InstallExecutionFailed => "install_execution_failed",
-            Self::InstallProcessorFailed => "install_processor_failed",
-            Self::InstalledVersionsDegraded => "installed_versions_degraded",
-            Self::JavaMajorMismatch => "java_major_mismatch",
-            Self::JavaOverrideEmpty => "java_override_empty",
-            Self::JavaOverrideMissing => "java_override_missing",
-            Self::JavaOverrideUndefinedSentinel => "java_override_undefined_sentinel",
-            Self::JavaProbeFailed => "java_probe_failed",
-            Self::JavaUpdateTooOld => "java_update_too_old",
-            Self::JvmArgAgentOverride => "jvm_arg_agent_override",
-            Self::JvmArgExperimentalUnlockMissing => "jvm_arg_experimental_unlock_missing",
-            Self::JvmArgMemoryConflict => "jvm_arg_memory_conflict",
-            Self::JvmArgReservedLauncherFlag => "jvm_arg_reserved_launcher_flag",
-            Self::JvmArgUnlockOrderInvalid => "jvm_arg_unlock_order_invalid",
-            Self::JvmArgUnsafeClasspathOverride => "jvm_arg_unsafe_classpath_override",
-            Self::JvmArgUnsafeNativePathOverride => "jvm_arg_unsafe_native_path_override",
-            Self::JvmArgUnsupported => "jvm_arg_unsupported",
-            Self::JvmArgUnsupportedGc => "jvm_arg_unsupported_gc",
-            Self::JvmArgsEmpty => "jvm_args_empty",
-            Self::JvmArgsParseFailed => "jvm_args_parse_failed",
-            Self::JvmPresetCompatibilityAdjusted => "jvm_preset_compatibility_adjusted",
-            Self::LaunchFailureClassified => "launch_failure_classified",
-            Self::LaunchJvmPresetDowngradeAvailable => "launch_jvm_preset_downgrade_available",
-            Self::LaunchJvmStripAvailable => "launch_jvm_strip_available",
-            Self::LaunchMemoryAllocationLow => "launch_memory_allocation_low",
-            Self::LaunchMemoryMinClamped => "launch_memory_min_clamped",
-            Self::LaunchResourceCpuPressure => "launch_resource_cpu_pressure",
-            Self::LaunchResourceDiskPressure => "launch_resource_disk_pressure",
-            Self::LaunchResourceInstallPressure => "launch_resource_install_pressure",
-            Self::LaunchResourceMemoryPressure => "launch_resource_memory_pressure",
-            Self::LaunchRuntimeFallbackAvailable => "launch_runtime_fallback_available",
-            Self::LauncherManagedArtifactSignatureCorruption => {
-                "launcher_managed_artifact_signature_corruption"
-            }
-            Self::LauncherStopRequested => "launcher_stop_requested",
-            Self::LibrariesMissing => "libraries_missing",
-            Self::LoaderBootstrapFailure => "loader_bootstrap_failure",
-            Self::ManagedRuntimeCorrupt => "managed_runtime_corrupt",
-            Self::ManagedRuntimeMissing => "managed_runtime_missing",
-            Self::ManagedRuntimeReadyMarkerMissing => "managed_runtime_ready_marker_missing",
-            Self::ManagedRuntimeRepairApplied => "managed_runtime_repair_applied",
-            Self::ManagedRuntimeRosettaRequired => "managed_runtime_rosetta_required",
-            Self::ManagedRuntimeUnavailableForPlatform => {
-                "managed_runtime_unavailable_for_platform"
-            }
-            Self::MissingDependency => "missing_dependency",
-            Self::ModAttributedCrash => "mod_attributed_crash",
-            Self::ModTransformationFailure => "mod_transformation_failure",
-            Self::NoStructuredFact(phase) => match phase {
-                OperationPhase::Startup => "no_structured_fact_startup",
-                OperationPhase::Planning => "no_structured_fact_planning",
-                OperationPhase::Validating => "no_structured_fact_validating",
-                OperationPhase::Downloading => "no_structured_fact_downloading",
-                OperationPhase::Installing => "no_structured_fact_installing",
-                OperationPhase::Preparing => "no_structured_fact_preparing",
-                OperationPhase::Launching => "no_structured_fact_launching",
-                OperationPhase::Running => "no_structured_fact_running",
-                OperationPhase::Repairing => "no_structured_fact_repairing",
-                OperationPhase::RollingBack => "no_structured_fact_rolling_back",
-                OperationPhase::Completed => "no_structured_fact_completed",
-                OperationPhase::Failed => "no_structured_fact_failed",
-            },
-            Self::OutOfMemory => "out_of_memory",
-            Self::ParentVersionMissing => "parent_version_missing",
-            Self::PerformanceFallbackSelected => "performance_fallback_selected",
-            Self::PerformanceHealthInvalid => "performance_health_invalid",
-            Self::PerformanceRulesInvalid => "performance_rules_invalid",
-            Self::PerformanceUserOwnedConflict => "performance_user_owned_conflict",
-            Self::PersistedStateRepairAvailable => "persisted_state_repair_available",
-            Self::PersistedStateSchemaInvalid => "persisted_state_schema_invalid",
-            Self::PrimitiveRefused => "primitive_refused",
-            Self::ProcessExited => "process_exited",
-            Self::ProcessExitedAfterBoot => "process_exited_after_boot",
-            Self::ProcessExitedBeforeBoot => "process_exited_before_boot",
-            Self::ProcessKilled => "process_killed",
-            Self::ProcessSpawned => "process_spawned",
-            Self::ProviderDataInvalid => "provider_data_invalid",
-            Self::RecentRepairFailed => "recent_repair_failed",
-            Self::RecentStartupFailure => "recent_startup_failure",
-            Self::RegisteredArtifactRepairAvailable => "registered_artifact_repair_available",
-            Self::RegisteredComponentRebuildFailed => "registered_component_rebuild_failed",
-            Self::RepairSuppressedUntil => "repair_suppressed_until",
-            Self::StartupWindowExpired => "startup_window_expired",
-            Self::TempFileWriteFailed => "temp_file_write_failed",
-            Self::UnknownLaunchFailure => "unknown_launch_failure",
-            Self::UserModSetDrift => "user_mod_set_drift",
-            Self::VersionJsonMissing => "version_json_missing",
-            Self::WatchdogActionObserved => "watchdog_action_observed",
-            Self::WatchdogKilledProcess => "watchdog_killed_process",
+            Self::Managed => "Managed",
+            Self::Custom => "Custom",
+            Self::Disabled => "Disabled",
         }
     }
-
-    fn from_wire(value: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|candidate| candidate.as_str() == value)
-    }
 }
 
-impl Serialize for GuardianFactId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
+macro_rules! stable_phase_id_registry {
+    (
+        $error:literal;
+        $count:literal;
+        pub enum $name:ident {
+            before { $($before:ident => $before_id:literal),* $(,)? }
+            phase $phase_variant:ident($phase_type:ty) {
+                $($phase:ident => $phase_id:literal),* $(,)?
+            }
+            after { $($after:ident => $after_id:literal),* $(,)? }
+        }
+    ) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+        pub enum $name {
+            $($before,)*
+            $phase_variant($phase_type),
+            $($after,)*
+        }
+
+        impl $name {
+            pub const ALL: [Self; $count] = [
+                $(Self::$before,)*
+                $(Self::$phase_variant(OperationPhase::$phase),)*
+                $(Self::$after,)*
+            ];
+
+            pub const fn as_str(&self) -> &'static str {
+                match self {
+                    $(Self::$before => $before_id,)*
+                    Self::$phase_variant(phase) => match phase {
+                        $(OperationPhase::$phase => $phase_id,)*
+                    },
+                    $(Self::$after => $after_id,)*
+                }
+            }
+
+            fn from_wire(value: &str) -> Option<Self> {
+                Self::ALL
+                    .into_iter()
+                    .find(|candidate| candidate.as_str() == value)
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::from_wire(&value).ok_or_else(|| D::Error::custom($error))
+            }
+        }
+    };
 }
 
-impl<'de> Deserialize<'de> for GuardianFactId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::from_wire(&value).ok_or_else(|| D::Error::custom("unknown Guardian fact id"))
+stable_phase_id_registry! {
+    "unknown Guardian fact id";
+    117;
+    pub enum GuardianFactId {
+        before {
+        AgentHookFailed => "agent_hook_failed",
+        AgentUnavailable => "agent_unavailable",
+        ArtifactChecksumMismatch => "artifact_checksum_mismatch",
+        ArtifactHashMismatch => "artifact_hash_mismatch",
+        ArtifactMissing => "artifact_missing",
+        ArtifactQuarantined => "artifact_quarantined",
+        ArtifactSizeDrift => "artifact_size_drift",
+        ArtifactSizeMismatch => "artifact_size_mismatch",
+        AssetIndexMissing => "asset_index_missing",
+        AtomicPromotionCompleted => "atomic_promotion_completed",
+        AtomicPromotionFailed => "atomic_promotion_failed",
+        AuthModeIncompatible => "auth_mode_incompatible",
+        BootMarkerObserved => "boot_marker_observed",
+        BootMilestoneOverdue => "boot_milestone_overdue",
+        BootMilestoneReached => "boot_milestone_reached",
+        ClasspathModuleConflict => "classpath_module_conflict",
+        ClientJarMissing => "client_jar_missing",
+        CustomJavaOverridePresent => "custom_java_override_present",
+        CustomJvmArgsPresent => "custom_jvm_args_present",
+        CustomJvmPresetPresent => "custom_jvm_preset_present",
+        DownloadInterrupted => "download_interrupted",
+        DownloadProviderUnavailable => "download_provider_unavailable",
+        DownloadTempDiscarded => "download_temp_discarded",
+        DownloadWrittenToTemp => "download_written_to_temp",
+        ExitCodeNonzero => "exit_code_nonzero",
+        ExitCodeUnknown => "exit_code_unknown",
+        ExitCodeZero => "exit_code_zero",
+        FilesystemPermissionDenied => "filesystem_permission_denied",
+        FrameBudgetExceeded => "frame_budget_exceeded",
+        GcPauseStorm => "gc_pause_storm",
+        GraphicsDriverCrash => "graphics_driver_crash",
+        HeapPressureCritical => "heap_pressure_critical",
+        IncompleteInstall => "incomplete_install",
+        InstallDependencyFailed => "install_dependency_failed",
+        InstallExecutionFailed => "install_execution_failed",
+        InstallProcessorFailed => "install_processor_failed",
+        InstalledVersionsDegraded => "installed_versions_degraded",
+        JavaMajorMismatch => "java_major_mismatch",
+        JavaOverrideEmpty => "java_override_empty",
+        JavaOverrideMissing => "java_override_missing",
+        JavaOverrideUndefinedSentinel => "java_override_undefined_sentinel",
+        JavaProbeFailed => "java_probe_failed",
+        JavaUpdateTooOld => "java_update_too_old",
+        JvmArgAgentOverride => "jvm_arg_agent_override",
+        JvmArgExperimentalUnlockMissing => "jvm_arg_experimental_unlock_missing",
+        JvmArgMemoryConflict => "jvm_arg_memory_conflict",
+        JvmArgReservedLauncherFlag => "jvm_arg_reserved_launcher_flag",
+        JvmArgUnlockOrderInvalid => "jvm_arg_unlock_order_invalid",
+        JvmArgUnsafeClasspathOverride => "jvm_arg_unsafe_classpath_override",
+        JvmArgUnsafeNativePathOverride => "jvm_arg_unsafe_native_path_override",
+        JvmArgUnsupported => "jvm_arg_unsupported",
+        JvmArgUnsupportedGc => "jvm_arg_unsupported_gc",
+        JvmArgsEmpty => "jvm_args_empty",
+        JvmArgsParseFailed => "jvm_args_parse_failed",
+        JvmPresetCompatibilityAdjusted => "jvm_preset_compatibility_adjusted",
+        LaunchFailureClassified => "launch_failure_classified",
+        LaunchJvmPresetDowngradeAvailable => "launch_jvm_preset_downgrade_available",
+        LaunchJvmStripAvailable => "launch_jvm_strip_available",
+        LaunchMemoryAllocationLow => "launch_memory_allocation_low",
+        LaunchMemoryMinClamped => "launch_memory_min_clamped",
+        LaunchResourceCpuPressure => "launch_resource_cpu_pressure",
+        LaunchResourceDiskPressure => "launch_resource_disk_pressure",
+        LaunchResourceInstallPressure => "launch_resource_install_pressure",
+        LaunchResourceMemoryPressure => "launch_resource_memory_pressure",
+        LaunchRuntimeFallbackAvailable => "launch_runtime_fallback_available",
+        LauncherManagedArtifactSignatureCorruption => "launcher_managed_artifact_signature_corruption",
+        LauncherStopRequested => "launcher_stop_requested",
+        LibrariesMissing => "libraries_missing",
+        LoaderBootstrapFailure => "loader_bootstrap_failure",
+        ManagedRuntimeCorrupt => "managed_runtime_corrupt",
+        ManagedRuntimeMissing => "managed_runtime_missing",
+        ManagedRuntimeReadyMarkerMissing => "managed_runtime_ready_marker_missing",
+        ManagedRuntimeRepairApplied => "managed_runtime_repair_applied",
+        ManagedRuntimeRosettaRequired => "managed_runtime_rosetta_required",
+        ManagedRuntimeUnavailableForPlatform => "managed_runtime_unavailable_for_platform",
+        MissingDependency => "missing_dependency",
+        ModAttributedCrash => "mod_attributed_crash",
+        ModTransformationFailure => "mod_transformation_failure",
+        }
+        phase NoStructuredFact(OperationPhase) {
+        Startup => "no_structured_fact_startup",
+        Planning => "no_structured_fact_planning",
+        Validating => "no_structured_fact_validating",
+        Downloading => "no_structured_fact_downloading",
+        Installing => "no_structured_fact_installing",
+        Preparing => "no_structured_fact_preparing",
+        Launching => "no_structured_fact_launching",
+        Running => "no_structured_fact_running",
+        Repairing => "no_structured_fact_repairing",
+        RollingBack => "no_structured_fact_rolling_back",
+        Completed => "no_structured_fact_completed",
+        Failed => "no_structured_fact_failed",
+        }
+        after {
+        OutOfMemory => "out_of_memory",
+        ParentVersionMissing => "parent_version_missing",
+        PerformanceFallbackSelected => "performance_fallback_selected",
+        PerformanceHealthInvalid => "performance_health_invalid",
+        PerformanceRulesInvalid => "performance_rules_invalid",
+        PerformanceUserOwnedConflict => "performance_user_owned_conflict",
+        PersistedStateRepairAvailable => "persisted_state_repair_available",
+        PersistedStateSchemaInvalid => "persisted_state_schema_invalid",
+        PrimitiveRefused => "primitive_refused",
+        ProcessExited => "process_exited",
+        ProcessExitedAfterBoot => "process_exited_after_boot",
+        ProcessExitedBeforeBoot => "process_exited_before_boot",
+        ProcessKilled => "process_killed",
+        ProcessSpawned => "process_spawned",
+        ProviderDataInvalid => "provider_data_invalid",
+        RecentRepairFailed => "recent_repair_failed",
+        RecentStartupFailure => "recent_startup_failure",
+        RegisteredArtifactRepairAvailable => "registered_artifact_repair_available",
+        RegisteredComponentRebuildFailed => "registered_component_rebuild_failed",
+        RepairSuppressedUntil => "repair_suppressed_until",
+        StartupWindowExpired => "startup_window_expired",
+        TempFileWriteFailed => "temp_file_write_failed",
+        UnknownLaunchFailure => "unknown_launch_failure",
+        UserModSetDrift => "user_mod_set_drift",
+        VersionJsonMissing => "version_json_missing",
+        WatchdogActionObserved => "watchdog_action_observed",
+        WatchdogKilledProcess => "watchdog_killed_process",
+        }
     }
 }
 
@@ -424,6 +252,74 @@ pub struct GuardianFact {
     pub fields: Vec<EvidenceField>,
 }
 
+pub const MAX_OPERATION_EVIDENCE_FACTS: usize = 64;
+pub const MAX_OPERATION_EVIDENCE_FIELDS_PER_FACT: usize = 8;
+pub const MAX_OPERATION_EVIDENCE_FIELD_KEY_BYTES: usize = 32;
+pub const MAX_OPERATION_EVIDENCE_VALUE_BYTES: usize = 96;
+pub const MAX_OPERATION_EVIDENCE_TARGET_BYTES: usize = 96;
+pub const MAX_OPERATION_EVIDENCE_SERIALIZED_BYTES: usize = 131_072;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum EvidenceScope {
+    Operation(OperationId),
+    Unscoped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OperationEvidenceBatchRejection {
+    TooManyFacts,
+    MissingOperation {
+        fact_index: usize,
+    },
+    ForeignOperation {
+        fact_index: usize,
+    },
+    UnexpectedOperation {
+        fact_index: usize,
+    },
+    TooManyFields {
+        fact_index: usize,
+    },
+    FieldKeyTooLong {
+        fact_index: usize,
+        field_index: usize,
+    },
+    FieldValueTooLong {
+        fact_index: usize,
+        field_index: usize,
+    },
+    TargetTooLong {
+        fact_index: usize,
+    },
+    SerializedTooLarge,
+    SerializationFailed,
+}
+
+impl std::fmt::Display for OperationEvidenceBatchRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::TooManyFacts => "operation evidence exceeds its fact bound",
+            Self::MissingOperation { .. } => {
+                "operation-scoped evidence contains a fact without operation provenance"
+            }
+            Self::ForeignOperation { .. } => {
+                "operation-scoped evidence contains foreign operation provenance"
+            }
+            Self::UnexpectedOperation { .. } => "unscoped evidence contains operation provenance",
+            Self::TooManyFields { .. } => "operation evidence exceeds its per-fact field bound",
+            Self::FieldKeyTooLong { .. } => "operation evidence contains an oversized field key",
+            Self::FieldValueTooLong { .. } => {
+                "operation evidence contains an oversized field value"
+            }
+            Self::TargetTooLong { .. } => "operation evidence contains an oversized target",
+            Self::SerializedTooLarge => "operation evidence exceeds its serialized byte bound",
+            Self::SerializationFailed => "operation evidence could not be serialized",
+        })
+    }
+}
+
+impl std::error::Error for OperationEvidenceBatchRejection {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FactReliability {
     DirectStructured,
@@ -435,271 +331,93 @@ pub enum FactReliability {
     UserReported,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum DiagnosisId {
-    ArtifactOwnershipUnsafe,
-    AtomicPromotionFailed,
-    DownloadUnavailable,
-    FilesystemPermissionDenied,
-    InstallArtifactMetadataInvalid,
-    InstallDependencyFailed,
-    InstallExecutionFailed,
-    InstallProcessorFailed,
-    JavaOverrideUnavailable,
-    JavaProbeFailed,
-    JavaRuntimeMajorMismatch,
-    JavaRuntimeUpdateTooOld,
-    JvmArgUnsafeOverride,
-    JvmArgUnsupported,
-    JvmArgsEmpty,
-    JvmArgsMalformed,
-    LauncherManagedArtifactCorrupt,
-    LauncherManagedArtifactSignatureCorrupt,
-    ManagedRuntimeCorrupt,
-    ManagedRuntimeMissing,
-    ManagedRuntimeRosettaRequired,
-    ManagedRuntimeUnavailableForPlatform,
-    PerformanceFallbackSelected,
-    PerformanceRulesInvalid,
-    PerformanceUserOwnedConflict,
-    PersistedStateSchemaInvalid,
-    ProcessLifecycleObserved,
-    TempFileWriteFailed,
-    InstalledVersionMetadataMissing,
-    ParentVersionMetadataMissing,
-    InstallIncomplete,
-    ClientJarMissing,
-    LibrariesMissing,
-    AssetIndexMissing,
-    LaunchMemoryMinClamped,
-    LaunchMemoryAllocationLow,
-    LaunchResourceMemoryPressure,
-    LaunchResourceCpuPressure,
-    LaunchResourceInstallPressure,
-    LaunchResourceDiskPressure,
-    CustomJavaOverridePresent,
-    CustomJvmPresetPresent,
-    CustomJvmArgsPresent,
-    PerformanceHealthInvalid,
-    JvmPresetAdjusted,
-    LaunchPrepareFailed,
-    StartupStalled,
-    OutOfMemory,
-    GraphicsDriverCrash,
-    MissingDependency,
-    ModTransformationFailure,
-    ModAttributedCrash,
-    ClasspathModuleConflict,
-    AuthModeIncompatible,
-    LoaderBootstrapFailure,
-    StartupFailedUnknown,
-    JavaRuntimeRecovery,
-    JvmPresetRecovery,
-    LaunchFailureUnknown,
-    JvmUnsupportedOption,
-    JvmExperimentalUnlock,
-    JvmOptionOrdering,
-    JavaRuntimeMismatch,
-    LauncherManagedArtifactSignature,
-    UnknownFailure(OperationPhase),
-}
-
-impl DiagnosisId {
-    pub const ALL: [Self; 76] = [
-        Self::ArtifactOwnershipUnsafe,
-        Self::AtomicPromotionFailed,
-        Self::DownloadUnavailable,
-        Self::FilesystemPermissionDenied,
-        Self::InstallArtifactMetadataInvalid,
-        Self::InstallDependencyFailed,
-        Self::InstallExecutionFailed,
-        Self::InstallProcessorFailed,
-        Self::JavaOverrideUnavailable,
-        Self::JavaProbeFailed,
-        Self::JavaRuntimeMajorMismatch,
-        Self::JavaRuntimeUpdateTooOld,
-        Self::JvmArgUnsafeOverride,
-        Self::JvmArgUnsupported,
-        Self::JvmArgsEmpty,
-        Self::JvmArgsMalformed,
-        Self::LauncherManagedArtifactCorrupt,
-        Self::LauncherManagedArtifactSignatureCorrupt,
-        Self::ManagedRuntimeCorrupt,
-        Self::ManagedRuntimeMissing,
-        Self::ManagedRuntimeRosettaRequired,
-        Self::ManagedRuntimeUnavailableForPlatform,
-        Self::PerformanceFallbackSelected,
-        Self::PerformanceRulesInvalid,
-        Self::PerformanceUserOwnedConflict,
-        Self::PersistedStateSchemaInvalid,
-        Self::ProcessLifecycleObserved,
-        Self::TempFileWriteFailed,
-        Self::InstalledVersionMetadataMissing,
-        Self::ParentVersionMetadataMissing,
-        Self::InstallIncomplete,
-        Self::ClientJarMissing,
-        Self::LibrariesMissing,
-        Self::AssetIndexMissing,
-        Self::LaunchMemoryMinClamped,
-        Self::LaunchMemoryAllocationLow,
-        Self::LaunchResourceMemoryPressure,
-        Self::LaunchResourceCpuPressure,
-        Self::LaunchResourceInstallPressure,
-        Self::LaunchResourceDiskPressure,
-        Self::CustomJavaOverridePresent,
-        Self::CustomJvmPresetPresent,
-        Self::CustomJvmArgsPresent,
-        Self::PerformanceHealthInvalid,
-        Self::JvmPresetAdjusted,
-        Self::LaunchPrepareFailed,
-        Self::StartupStalled,
-        Self::OutOfMemory,
-        Self::GraphicsDriverCrash,
-        Self::MissingDependency,
-        Self::ModTransformationFailure,
-        Self::ModAttributedCrash,
-        Self::ClasspathModuleConflict,
-        Self::AuthModeIncompatible,
-        Self::LoaderBootstrapFailure,
-        Self::StartupFailedUnknown,
-        Self::JavaRuntimeRecovery,
-        Self::JvmPresetRecovery,
-        Self::LaunchFailureUnknown,
-        Self::JvmUnsupportedOption,
-        Self::JvmExperimentalUnlock,
-        Self::JvmOptionOrdering,
-        Self::JavaRuntimeMismatch,
-        Self::LauncherManagedArtifactSignature,
-        Self::UnknownFailure(OperationPhase::Startup),
-        Self::UnknownFailure(OperationPhase::Planning),
-        Self::UnknownFailure(OperationPhase::Validating),
-        Self::UnknownFailure(OperationPhase::Downloading),
-        Self::UnknownFailure(OperationPhase::Installing),
-        Self::UnknownFailure(OperationPhase::Preparing),
-        Self::UnknownFailure(OperationPhase::Launching),
-        Self::UnknownFailure(OperationPhase::Running),
-        Self::UnknownFailure(OperationPhase::Repairing),
-        Self::UnknownFailure(OperationPhase::RollingBack),
-        Self::UnknownFailure(OperationPhase::Completed),
-        Self::UnknownFailure(OperationPhase::Failed),
-    ];
-
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::ArtifactOwnershipUnsafe => "artifact_ownership_unsafe",
-            Self::AtomicPromotionFailed => "atomic_promotion_failed",
-            Self::DownloadUnavailable => "download_unavailable",
-            Self::FilesystemPermissionDenied => "filesystem_permission_denied",
-            Self::InstallArtifactMetadataInvalid => "install_artifact_metadata_invalid",
-            Self::InstallDependencyFailed => "install_dependency_failed",
-            Self::InstallExecutionFailed => "install_execution_failed",
-            Self::InstallProcessorFailed => "install_processor_failed",
-            Self::JavaOverrideUnavailable => "java_override_unavailable",
-            Self::JavaProbeFailed => "java_probe_failed",
-            Self::JavaRuntimeMajorMismatch => "java_runtime_major_mismatch",
-            Self::JavaRuntimeUpdateTooOld => "java_runtime_update_too_old",
-            Self::JvmArgUnsafeOverride => "jvm_arg_unsafe_override",
-            Self::JvmArgUnsupported => "jvm_arg_unsupported",
-            Self::JvmArgsEmpty => "jvm_args_empty",
-            Self::JvmArgsMalformed => "jvm_args_malformed",
-            Self::LauncherManagedArtifactCorrupt => "launcher_managed_artifact_corrupt",
-            Self::LauncherManagedArtifactSignatureCorrupt => {
-                "launcher_managed_artifact_signature_corrupt"
-            }
-            Self::ManagedRuntimeCorrupt => "managed_runtime_corrupt",
-            Self::ManagedRuntimeMissing => "managed_runtime_missing",
-            Self::ManagedRuntimeRosettaRequired => "managed_runtime_rosetta_required",
-            Self::ManagedRuntimeUnavailableForPlatform => {
-                "managed_runtime_unavailable_for_platform"
-            }
-            Self::PerformanceFallbackSelected => "performance_fallback_selected",
-            Self::PerformanceRulesInvalid => "performance_rules_invalid",
-            Self::PerformanceUserOwnedConflict => "performance_user_owned_conflict",
-            Self::PersistedStateSchemaInvalid => "persisted_state_schema_invalid",
-            Self::ProcessLifecycleObserved => "process_lifecycle_observed",
-            Self::TempFileWriteFailed => "temp_file_write_failed",
-            Self::InstalledVersionMetadataMissing => "installed_version_metadata_missing",
-            Self::ParentVersionMetadataMissing => "parent_version_metadata_missing",
-            Self::InstallIncomplete => "install_incomplete",
-            Self::ClientJarMissing => "client_jar_missing",
-            Self::LibrariesMissing => "libraries_missing",
-            Self::AssetIndexMissing => "asset_index_missing",
-            Self::LaunchMemoryMinClamped => "launch_memory_min_clamped",
-            Self::LaunchMemoryAllocationLow => "launch_memory_allocation_low",
-            Self::LaunchResourceMemoryPressure => "launch_resource_memory_pressure",
-            Self::LaunchResourceCpuPressure => "launch_resource_cpu_pressure",
-            Self::LaunchResourceInstallPressure => "launch_resource_install_pressure",
-            Self::LaunchResourceDiskPressure => "launch_resource_disk_pressure",
-            Self::CustomJavaOverridePresent => "custom_java_override_present",
-            Self::CustomJvmPresetPresent => "custom_jvm_preset_present",
-            Self::CustomJvmArgsPresent => "custom_jvm_args_present",
-            Self::PerformanceHealthInvalid => "performance_health_invalid",
-            Self::JvmPresetAdjusted => "jvm_preset_adjusted",
-            Self::LaunchPrepareFailed => "launch_prepare_failed",
-            Self::StartupStalled => "startup_stalled",
-            Self::OutOfMemory => "out_of_memory",
-            Self::GraphicsDriverCrash => "graphics_driver_crash",
-            Self::MissingDependency => "missing_dependency",
-            Self::ModTransformationFailure => "mod_transformation_failure",
-            Self::ModAttributedCrash => "mod_attributed_crash",
-            Self::ClasspathModuleConflict => "classpath_module_conflict",
-            Self::AuthModeIncompatible => "auth_mode_incompatible",
-            Self::LoaderBootstrapFailure => "loader_bootstrap_failure",
-            Self::StartupFailedUnknown => "startup_failed_unknown",
-            Self::JavaRuntimeRecovery => "java_runtime_recovery",
-            Self::JvmPresetRecovery => "jvm_preset_recovery",
-            Self::LaunchFailureUnknown => "unknown",
-            Self::JvmUnsupportedOption => "jvm_unsupported_option",
-            Self::JvmExperimentalUnlock => "jvm_experimental_unlock",
-            Self::JvmOptionOrdering => "jvm_option_ordering",
-            Self::JavaRuntimeMismatch => "java_runtime_mismatch",
-            Self::LauncherManagedArtifactSignature => "launcher_managed_artifact_signature",
-            Self::UnknownFailure(phase) => match phase {
-                OperationPhase::Startup => "unknown_failure_startup",
-                OperationPhase::Planning => "unknown_failure_planning",
-                OperationPhase::Validating => "unknown_failure_validating",
-                OperationPhase::Downloading => "unknown_failure_downloading",
-                OperationPhase::Installing => "unknown_failure_installing",
-                OperationPhase::Preparing => "unknown_failure_preparing",
-                OperationPhase::Launching => "unknown_failure_launching",
-                OperationPhase::Running => "unknown_failure_running",
-                OperationPhase::Repairing => "unknown_failure_repairing",
-                OperationPhase::RollingBack => "unknown_failure_rolling_back",
-                OperationPhase::Completed => "unknown_failure_completed",
-                OperationPhase::Failed => "unknown_failure_failed",
-            },
+stable_phase_id_registry! {
+    "unknown Guardian diagnosis id";
+    76;
+    pub enum DiagnosisId {
+        before {
+        ArtifactOwnershipUnsafe => "artifact_ownership_unsafe",
+        AtomicPromotionFailed => "atomic_promotion_failed",
+        DownloadUnavailable => "download_unavailable",
+        FilesystemPermissionDenied => "filesystem_permission_denied",
+        InstallArtifactMetadataInvalid => "install_artifact_metadata_invalid",
+        InstallDependencyFailed => "install_dependency_failed",
+        InstallExecutionFailed => "install_execution_failed",
+        InstallProcessorFailed => "install_processor_failed",
+        JavaOverrideUnavailable => "java_override_unavailable",
+        JavaProbeFailed => "java_probe_failed",
+        JavaRuntimeMajorMismatch => "java_runtime_major_mismatch",
+        JavaRuntimeUpdateTooOld => "java_runtime_update_too_old",
+        JvmArgUnsafeOverride => "jvm_arg_unsafe_override",
+        JvmArgUnsupported => "jvm_arg_unsupported",
+        JvmArgsEmpty => "jvm_args_empty",
+        JvmArgsMalformed => "jvm_args_malformed",
+        LauncherManagedArtifactCorrupt => "launcher_managed_artifact_corrupt",
+        LauncherManagedArtifactSignatureCorrupt => "launcher_managed_artifact_signature_corrupt",
+        ManagedRuntimeCorrupt => "managed_runtime_corrupt",
+        ManagedRuntimeMissing => "managed_runtime_missing",
+        ManagedRuntimeRosettaRequired => "managed_runtime_rosetta_required",
+        ManagedRuntimeUnavailableForPlatform => "managed_runtime_unavailable_for_platform",
+        PerformanceFallbackSelected => "performance_fallback_selected",
+        PerformanceRulesInvalid => "performance_rules_invalid",
+        PerformanceUserOwnedConflict => "performance_user_owned_conflict",
+        PersistedStateSchemaInvalid => "persisted_state_schema_invalid",
+        ProcessLifecycleObserved => "process_lifecycle_observed",
+        TempFileWriteFailed => "temp_file_write_failed",
+        InstalledVersionMetadataMissing => "installed_version_metadata_missing",
+        ParentVersionMetadataMissing => "parent_version_metadata_missing",
+        InstallIncomplete => "install_incomplete",
+        ClientJarMissing => "client_jar_missing",
+        LibrariesMissing => "libraries_missing",
+        AssetIndexMissing => "asset_index_missing",
+        LaunchMemoryMinClamped => "launch_memory_min_clamped",
+        LaunchMemoryAllocationLow => "launch_memory_allocation_low",
+        LaunchResourceMemoryPressure => "launch_resource_memory_pressure",
+        LaunchResourceCpuPressure => "launch_resource_cpu_pressure",
+        LaunchResourceInstallPressure => "launch_resource_install_pressure",
+        LaunchResourceDiskPressure => "launch_resource_disk_pressure",
+        CustomJavaOverridePresent => "custom_java_override_present",
+        CustomJvmPresetPresent => "custom_jvm_preset_present",
+        CustomJvmArgsPresent => "custom_jvm_args_present",
+        PerformanceHealthInvalid => "performance_health_invalid",
+        JvmPresetAdjusted => "jvm_preset_adjusted",
+        LaunchPrepareFailed => "launch_prepare_failed",
+        StartupStalled => "startup_stalled",
+        OutOfMemory => "out_of_memory",
+        GraphicsDriverCrash => "graphics_driver_crash",
+        MissingDependency => "missing_dependency",
+        ModTransformationFailure => "mod_transformation_failure",
+        ModAttributedCrash => "mod_attributed_crash",
+        ClasspathModuleConflict => "classpath_module_conflict",
+        AuthModeIncompatible => "auth_mode_incompatible",
+        LoaderBootstrapFailure => "loader_bootstrap_failure",
+        StartupFailedUnknown => "startup_failed_unknown",
+        JavaRuntimeRecovery => "java_runtime_recovery",
+        JvmPresetRecovery => "jvm_preset_recovery",
+        LaunchFailureUnknown => "unknown",
+        JvmUnsupportedOption => "jvm_unsupported_option",
+        JvmExperimentalUnlock => "jvm_experimental_unlock",
+        JvmOptionOrdering => "jvm_option_ordering",
+        JavaRuntimeMismatch => "java_runtime_mismatch",
+        LauncherManagedArtifactSignature => "launcher_managed_artifact_signature",
         }
-    }
+        phase UnknownFailure(OperationPhase) {
+        Startup => "unknown_failure_startup",
+        Planning => "unknown_failure_planning",
+        Validating => "unknown_failure_validating",
+        Downloading => "unknown_failure_downloading",
+        Installing => "unknown_failure_installing",
+        Preparing => "unknown_failure_preparing",
+        Launching => "unknown_failure_launching",
+        Running => "unknown_failure_running",
+        Repairing => "unknown_failure_repairing",
+        RollingBack => "unknown_failure_rolling_back",
+        Completed => "unknown_failure_completed",
+        Failed => "unknown_failure_failed",
+        }
+        after {
 
-    fn from_wire(value: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|candidate| candidate.as_str() == value)
-    }
-}
-
-impl Serialize for DiagnosisId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for DiagnosisId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::from_wire(&value).ok_or_else(|| D::Error::custom("unknown Guardian diagnosis id"))
-    }
-}
-
-impl std::fmt::Display for DiagnosisId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
+        }
     }
 }
 
@@ -720,6 +438,28 @@ pub enum GuardianDomain {
     Auth,
     State,
     Unknown,
+}
+
+impl GuardianDomain {
+    pub const fn failure_memory_id(self) -> &'static str {
+        match self {
+            Self::Config => "Config",
+            Self::Library => "Library",
+            Self::Runtime => "Runtime",
+            Self::Jvm => "Jvm",
+            Self::Install => "Install",
+            Self::Download => "Download",
+            Self::Performance => "Performance",
+            Self::Launch => "Launch",
+            Self::Startup => "Startup",
+            Self::Session => "Session",
+            Self::Filesystem => "Filesystem",
+            Self::Network => "Network",
+            Self::Auth => "Auth",
+            Self::State => "State",
+            Self::Unknown => "Unknown",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -787,7 +527,7 @@ pub struct GuardianAction {
     pub reason: DiagnosisId,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuardianActionKind {
     Allow,
     Warn,
@@ -802,6 +542,64 @@ pub enum GuardianActionKind {
     RecordOnly,
 }
 
+impl GuardianActionKind {
+    pub const ALL: &'static [Self] = &[
+        Self::Allow,
+        Self::Warn,
+        Self::Repair,
+        Self::Retry,
+        Self::Strip,
+        Self::Downgrade,
+        Self::Fallback,
+        Self::Quarantine,
+        Self::AskUser,
+        Self::Block,
+        Self::RecordOnly,
+    ];
+
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Allow => "Allow",
+            Self::Warn => "Warn",
+            Self::Repair => "Repair",
+            Self::Retry => "Retry",
+            Self::Strip => "Strip",
+            Self::Downgrade => "Downgrade",
+            Self::Fallback => "Fallback",
+            Self::Quarantine => "Quarantine",
+            Self::AskUser => "AskUser",
+            Self::Block => "Block",
+            Self::RecordOnly => "RecordOnly",
+        }
+    }
+
+    fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_wire() == value)
+    }
+}
+
+impl Serialize for GuardianActionKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire())
+    }
+}
+
+impl<'de> Deserialize<'de> for GuardianActionKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_wire(&value).ok_or_else(|| D::Error::custom("unknown Guardian action kind"))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SafetyOutcome {
     pub decision: GuardianActionKind,
@@ -812,7 +610,7 @@ pub struct SafetyOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::GuardianMode;
+    use super::{GuardianActionKind, GuardianMode};
 
     #[test]
     fn config_modes_have_one_canonical_guardian_parser() {
@@ -824,5 +622,23 @@ mod tests {
         );
         assert_eq!(GuardianMode::from_config("unknown"), GuardianMode::Managed);
         assert_eq!(GuardianMode::from_config(""), GuardianMode::Managed);
+    }
+
+    #[test]
+    fn durable_guardian_enum_bytes_are_explicit_and_strict() {
+        assert_eq!(GuardianMode::Managed.failure_memory_id(), "Managed");
+        assert_eq!(GuardianMode::Custom.failure_memory_id(), "Custom");
+        assert_eq!(GuardianMode::Disabled.failure_memory_id(), "Disabled");
+
+        for action in GuardianActionKind::ALL {
+            let encoded = serde_json::to_string(action).expect("serialize Guardian action");
+            assert_eq!(encoded, format!("\"{}\"", action.as_wire()));
+            assert_eq!(
+                serde_json::from_str::<GuardianActionKind>(&encoded)
+                    .expect("deserialize Guardian action"),
+                *action
+            );
+        }
+        assert!(serde_json::from_str::<GuardianActionKind>("\"record_only\"").is_err());
     }
 }

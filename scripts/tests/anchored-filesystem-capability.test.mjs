@@ -8,9 +8,9 @@ import {
   parseLibtestSummary,
   runAnchoredFsScenario,
   scenario,
-} from "../capabilities/scenarios/p01-b02-anchored-fs.mjs";
+} from "../capabilities/scenarios/anchored-filesystem.mjs";
 
-const repositoryRoot = path.resolve("/tmp/axial-p01-b02-capability");
+const repositoryRoot = path.resolve("/tmp/axial-anchored-filesystem-capability");
 const passingResult = (passed = 1, filteredOut = 0) => ({
   exit_code: 0,
   test_result: "ok",
@@ -23,7 +23,7 @@ const passingResult = (passed = 1, filteredOut = 0) => ({
   stderr_bytes: 0,
 });
 
-test("P01-B02 capability binds the declared proof to exact serialized Cargo checks", async () => {
+test("anchored-filesystem capability binds the declared proof to exact serialized Cargo checks", async () => {
   const commands = [];
   const result = await runAnchoredFsScenario(
     {
@@ -40,9 +40,9 @@ test("P01-B02 capability binds the declared proof to exact serialized Cargo chec
   );
 
   assert.deepEqual(scenario, {
-    scenario_id: "CP-P01-B02-ANCHORED-FS",
-    proof_id: "CAP-P01-B02-ANCHORED-FS",
-    capability_id: "p01-b02-anchored-fs",
+    scenario_id: "CP-ANCHORED-FILESYSTEM",
+    proof_id: "CAP-ANCHORED-FILESYSTEM",
+    capability_id: "anchored-filesystem",
   });
   assert.deepEqual(
     anchoredFsChecks.map(({ cargo_arguments }) => cargo_arguments),
@@ -54,7 +54,7 @@ test("P01-B02 capability binds the declared proof to exact serialized Cargo chec
         "axial-api",
         "--lib",
         "--no-default-features",
-        "state::managed_library::tests::p01_b02_contract",
+        "state::managed_library::tests::anchored_filesystem_contract",
         "--",
         "--exact",
       ],
@@ -65,7 +65,7 @@ test("P01-B02 capability binds the declared proof to exact serialized Cargo chec
         "axial-api",
         "--lib",
         "--no-default-features",
-        "state::managed_library::tests::p01_b02_contract_cross_owner",
+        "state::managed_library::tests::anchored_filesystem_contract_cross_owner",
         "--",
         "--exact",
       ],
@@ -124,12 +124,12 @@ test("P01-B02 capability binds the declared proof to exact serialized Cargo chec
   assert.deepEqual(result.artifacts, []);
 });
 
-test("P01-B02 capability parses exactly one typed libtest summary", () => {
+test("anchored-filesystem capability parses exactly one typed libtest summary", () => {
   assert.deepEqual(
     parseLibtestSummary(
       Buffer.from(
         "running 1 test\n" +
-          "test state::managed_library::tests::p01_b02_contract ... ok\n\n" +
+          "test state::managed_library::tests::anchored_filesystem_contract ... ok\n\n" +
           "test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 44 filtered out; finished in 0.01s\n",
       ),
     ),
@@ -159,7 +159,7 @@ test("P01-B02 capability parses exactly one typed libtest summary", () => {
   }
 });
 
-test("P01-B02 capability fails closed on unsupported native platforms", async () => {
+test("anchored-filesystem capability fails closed on unsupported native platforms", async () => {
   for (const platform of ["windows", "macos"]) {
     await assert.rejects(
       runAnchoredFsScenario({
@@ -174,7 +174,7 @@ test("P01-B02 capability fails closed on unsupported native platforms", async ()
   }
 });
 
-test("P01-B02 capability rejects zero-match API and zero-test native summaries", async () => {
+test("anchored-filesystem capability rejects zero-match API and zero-test native summaries", async () => {
   const context = {
     platform: "linux",
     repository_root: repositoryRoot,
@@ -206,7 +206,7 @@ test("P01-B02 capability rejects zero-match API and zero-test native summaries",
   );
 });
 
-test("P01-B02 capability rejects failed, malformed, and over-budget command evidence", async () => {
+test("anchored-filesystem capability rejects failed, malformed, and over-budget command evidence", async () => {
   const context = {
     platform: "linux",
     repository_root: repositoryRoot,

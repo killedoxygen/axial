@@ -1727,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b11_contract_pack_manifest_derives_missing_size_from_authenticated_bytes() {
+    fn behavior_contract_pack_manifest_derives_missing_size_from_authenticated_bytes() {
         let hash = "a".repeat(128);
         let mut prepared = PreparedPackManifest {
             manifest: ContentManifest::default(),
@@ -1748,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b11_contract_pack_manifest_rejects_zero_or_mismatched_authenticated_evidence() {
+    fn behavior_contract_pack_manifest_rejects_zero_or_mismatched_authenticated_evidence() {
         let hash = "a".repeat(128);
         for installed in [
             authenticated_pack_file(&hash, 0),

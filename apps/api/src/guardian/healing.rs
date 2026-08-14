@@ -799,7 +799,7 @@ fn runtime_refusal_transition_matches(
 fn fact_ids(facts: &[ExecutionFact]) -> Vec<String> {
     facts
         .iter()
-        .map(|fact| format!("{:?}", fact.kind))
+        .map(|fact| fact.kind.as_str().to_string())
         .map(|fact| safe_id(&fact, "execution_fact"))
         .collect()
 }
@@ -868,6 +868,7 @@ mod tests {
         GuardianRepairOutcome, GuardianRepairStatus, READY_MARKER_REPAIR_STEP,
         RUNTIME_REPAIR_START_STEP, execute_managed_runtime_ready_marker_repair,
     };
+    use crate::execution::ExecutionFactKind;
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::execution::runtime::ManagedRuntimeRoot;
     use crate::guardian::{
@@ -1000,7 +1001,7 @@ mod tests {
             outcome
                 .facts
                 .iter()
-                .any(|fact| fact == "RuntimeRepairApplied")
+                .any(|fact| fact == ExecutionFactKind::RuntimeRepairApplied.as_str())
         );
 
         let journal = stores
@@ -1419,9 +1420,14 @@ mod tests {
             !outcome
                 .facts
                 .iter()
-                .any(|fact| fact == "RuntimeRepairApplied")
+                .any(|fact| fact == ExecutionFactKind::RuntimeRepairApplied.as_str())
         );
-        assert!(outcome.facts.iter().any(|fact| fact == "RuntimeCorrupt"));
+        assert!(
+            outcome
+                .facts
+                .iter()
+                .any(|fact| fact == ExecutionFactKind::RuntimeCorrupt.as_str())
+        );
         let journal = stores
             .journals
             .get(&outcome.operation_id)

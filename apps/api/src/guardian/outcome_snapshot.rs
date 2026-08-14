@@ -1,11 +1,15 @@
 use super::{
     DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianCopyRequest,
-    GuardianDirective, GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianLaunchRecoveryPlanRequest, GuardianManagedJavaReason, GuardianMode,
+    GuardianDirective, GuardianLaunchRecoveryPlanRequest, GuardianManagedJavaReason, GuardianMode,
     GuardianPerformanceSupervisionRejection, GuardianRepairStatus, GuardianStripJvmArgsReason,
-    GuardianUserOutcome, author_guardian_copy, plan_launch_recovery_directive,
+    GuardianUserOutcome, OperationEvidenceBatch, author_guardian_copy,
+    plan_launch_recovery_directive,
 };
-use crate::state::contracts::OperationPhase;
+use crate::execution::{ExecutionFact, ExecutionFactKind};
+use crate::observability::{EvidenceField, EvidenceSensitivity};
+use crate::state::contracts::{
+    OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+};
 use axial_launcher::LaunchFailureClass;
 use serde::{Deserialize, Serialize};
 
@@ -239,28 +243,47 @@ fn install_failure_evidence(
     diagnosis: DiagnosisId,
     component: Option<&str>,
     platform: Option<&str>,
-) -> Vec<GuardianInstallArtifactFailureEvidence> {
+) -> OperationEvidenceBatch {
     let kind = match diagnosis {
         DiagnosisId::ManagedRuntimeUnavailableForPlatform => {
-            GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform
+            Some(ExecutionFactKind::RuntimeUnavailableForPlatform)
         }
         DiagnosisId::ManagedRuntimeRosettaRequired => {
-            GuardianInstallArtifactFailureKind::RuntimeRosettaRequired
+            Some(ExecutionFactKind::RuntimeRosettaRequired)
         }
-        _ => return Vec::new(),
+        _ => None,
     };
-    let mut evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-        None,
-        "copy-snapshot-artifact",
-        kind,
-    );
+    let mut fields = Vec::new();
     if let Some(component) = component {
-        evidence = evidence.with_field("component", component);
+        fields.push(EvidenceField::new(
+            "component",
+            component,
+            EvidenceSensitivity::Public,
+        ));
     }
     if let Some(platform) = platform {
-        evidence = evidence.with_field("platform", platform);
+        fields.push(EvidenceField::new(
+            "platform",
+            platform,
+            EvidenceSensitivity::Public,
+        ));
     }
-    vec![evidence]
+    let facts = kind
+        .map(|kind| ExecutionFact {
+            operation_id: None,
+            kind,
+            target: Some(TargetDescriptor::new(
+                StabilizationSystem::Execution,
+                TargetKind::Runtime,
+                "copy-snapshot-artifact",
+                OwnershipClass::LauncherManaged,
+            )),
+            fields,
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    OperationEvidenceBatch::try_from_execution_unscoped(OperationPhase::Downloading, &facts)
+        .expect("outcome snapshot evidence must be bounded and unscoped")
 }
 
 fn launch_recovery_plan(kind: RecoveryKindInput) -> super::GuardianLaunchRecoveryPlan {

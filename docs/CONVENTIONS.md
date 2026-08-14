@@ -95,6 +95,12 @@ keep this short and real. if the codebase changes, update this file.
 - use `docs/adr/` for major decisions that need rationale, not for current-state walkthroughs
 - do not land architecture shifts without updating the matching docs
 
+## Behavioral naming and verification
+- Name production symbols, comments, tests, tracked test scripts, fixtures, temporary paths, environment variables, task entries, manifests, and ordinary documentation after the behavior or domain they exercise.
+- Never put execution-plan identifiers or numbered implementation phase/boundary labels in implementation, comments, tracked tests/scripts, fixtures, task wiring, environment variables, filenames, ordinary architecture/product docs, or tracked evidence and control records. These surfaces use behavior-based names and executable paths.
+- Temporary filtering or inventory scripts may use execution-plan identifiers only when they are genuinely needed, both ignored and untracked, and excluded from the tracked verification loop; never encode them in a tracked gate.
+- `node scripts/verify-behavioral-names.mjs` is the fail-closed repository gate for this policy and runs from `task verify:contracts`.
+
 ## Build shape
 - frontend entry is `frontend/src/main.tsx`
 - frontend CSS is imported through `frontend/src/styles.ts`; `frontend/static` contains source assets only

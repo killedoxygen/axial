@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn p01_b04_contract_cross_owner_reserves_foreground_capacity() {
+    async fn native_filesystem_contract_cross_owner_reserves_foreground_capacity() {
         let owner = process_physical_work();
         let background = owner.group();
         let queued = owner.group();

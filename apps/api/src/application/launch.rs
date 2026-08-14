@@ -204,7 +204,7 @@ mod tests {
     use axial_launcher::LaunchStageEvidence;
 
     #[test]
-    fn p00_b07_contract_launch_stage_evidence_is_unchanged() {
+    fn behavior_contract_launch_stage_evidence_is_unchanged() {
         let evidence = launch_application_stage_evidence();
 
         assert_eq!(evidence.len(), 1);
@@ -225,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b11_contract_command_evidence_is_bounded_without_command_material() {
+    fn behavior_contract_command_evidence_is_bounded_without_command_material() {
         let prepared = launch_command_stage_evidence(true, 3);
         let invalid = launch_command_stage_evidence(false, 1);
 
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_cross_owner_retires_launch_trace_and_obsolete_stage_surfaces() {
+    fn behavior_contract_cross_owner_retires_launch_trace_and_obsolete_stage_surfaces() {
         let launch = include_str!("launch.rs");
         let launch_session = include_str!("launch/session.rs");
         let runner = include_str!("launch/runner.rs");
@@ -299,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b09_contract_reconciliation_vocabulary_is_closed() {
+    fn behavior_contract_reconciliation_vocabulary_is_closed() {
         assert_eq!(
             ReconciliationRung::ALL,
             &[

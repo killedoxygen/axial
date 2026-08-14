@@ -3,23 +3,23 @@
 
 This document is a deterministic human-readable projection of Guardian's strict invariant coverage artifact. The JSON artifact remains the complete machine-readable inventory, including all kernel cells.
 
-- Schema: `axial.guardian.invariant_coverage.v4`
-- Machine-readable artifact: [guardian-invariant-coverage-v4.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v4.json)
+- Schema: `axial.guardian.invariant_coverage.v5`
+- Machine-readable artifact: [guardian-invariant-coverage-v5.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v5.json)
 - Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test --locked -p axial-api --no-default-features regenerate_guardian_invariant_coverage_artifacts -- --ignored`
 
 ## Invariant Status
 | Invariant | Status |
 | --- | --- |
-| I1 | launch_failure_matrix_and_rules_registered |
-| I2 | current_guardian_reconciliation_and_persisted_state_repair_typed_hands_registered |
-| I3 | public_launch_failure_guidance_complete |
-| I4 | current_guardian_reconciliation_and_persisted_state_repair_hand_attempt_bounds_registered |
-| I5 | launch_failure_surfaces_bounded_and_redacted |
-| I6 | implemented_memory_trigger_rules_registered |
-| I7 | typed_loader_worker_delegated_dispatch_and_named_boundary_single_assessment_complete |
-| I8 | preflight_costs_declared_reviewed_warm_cache_tier0_rotational_measurement |
-| I9 | reserved_facts_unused_agent_demo_pending_phase_5 |
-| I10 | persisted_state_repair_durability_and_fail_closed_restart_contract_registered |
+| launch-failure-matrix | launch_failure_matrix_and_rules_registered |
+| guardian-reconciliation | current_guardian_reconciliation_and_persisted_state_repair_typed_hands_registered |
+| launch-failure-guidance | public_launch_failure_guidance_complete |
+| repair-attempt-bounds | current_guardian_reconciliation_and_persisted_state_repair_hand_attempt_bounds_registered |
+| bounded-failure-surfaces | launch_failure_surfaces_bounded_and_redacted |
+| memory-trigger-rules | implemented_memory_trigger_rules_registered |
+| loader-worker-dispatch | typed_loader_worker_delegated_dispatch_and_named_boundary_single_assessment_complete |
+| warm-cache-integrity | preflight_costs_declared_reviewed_warm_cache_tier0_rotational_measurement |
+| agent-fallback-reservation | reserved_facts_unused_agent_fallback_demonstration_pending |
+| persisted-repair-durability | persisted_state_repair_durability_and_fail_closed_restart_contract_registered |
 
 ## Coverage Summary
 | Surface | Covered |
@@ -32,9 +32,9 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Persisted-state repair hands | 1 |
 | Public kernel cells | 96 |
 | Diagnosis rules | 56 |
-| Registered facts | 116 |
+| Registered facts | 117 |
 | Preflight senses | 7 |
-| Adapter sources | 93 |
+| Adapter sources | 81 |
 | Repair hands | 2 |
 | Reconciliation hands | 2 |
 
@@ -52,7 +52,7 @@ The complete kernel matrix remains in the JSON artifact.
 ## Persisted-State Durable Repair Hands
 | Admission | Attempt | Terminal | Phase | Mode | Diagnosis | Stable key dimensions | Maximum attempts per key/window | Window (hours) | Journal schema | Memory schema | Terminal outcomes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| PersistedStateRepairAdmission | PersistedStateRepairAttempt | PersistedStateRepairTerminal | Startup | Managed | persisted_state_schema_invalid | store, record_id, physical_identity, mode | 1 | 24 | axial.state.operation_journals.v9 | axial.guardian.failure_memory.v7 | Quarantined, Refused, AppliedUnverified |
+| PersistedStateRepairAdmission | PersistedStateRepairAttempt | PersistedStateRepairTerminal | Startup | Managed | persisted_state_schema_invalid | store, record_id, physical_identity, mode | 1 | 24 | axial.state.operation_journals.v10 | axial.guardian.failure_memory.v7 | Quarantined, Refused, AppliedUnverified |
 
 ### Durability Order
 | Admission | Contract |
@@ -81,13 +81,13 @@ The complete kernel matrix remains in the JSON artifact.
 ## Preflight Senses
 | Sense | Declared cost | Timing signal | Measurement | Ceiling (ms) | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| memory | metadata_io | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
-| installed_versions | content_io | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
-| overrides | external_probe | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
-| resources | metadata_io | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
+| memory | metadata_io | launch_preflight_sense_timing | measurement_pending | pending | pending |
+| installed_versions | content_io | launch_preflight_sense_timing | measurement_pending | pending | pending |
+| overrides | external_probe | launch_preflight_sense_timing | measurement_pending | pending | pending |
+| resources | metadata_io | launch_preflight_sense_timing | measurement_pending | pending | pending |
 | integrity_tier0 | metadata_io | launch_preflight_sense_timing | reviewed_warm_metadata_cache_rotational_measurement | 9 | 30bc856d; native Windows MSVC release; NTFS healthy SATA HDD; 512 entries; 1 warmup + 101 hot; warm metadata cache without flush; p50/p95/max 5.862/7.348/8.421 ms; cold cache not measured |
-| readiness | content_io | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
-| guardian_policy | in_process | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
+| readiness | content_io | launch_preflight_sense_timing | measurement_pending | pending | pending |
+| guardian_policy | in_process | launch_preflight_sense_timing | measurement_pending | pending | pending |
 
 ## Repair Hands
 | Kind | Diagnosis | Maximum attempts |
@@ -102,6 +102,6 @@ The complete kernel matrix remains in the JSON artifact.
 | RegisteredComponentRebuildAdmission | RebuildComponent | 1 |
 
 ## Deferred Demonstrations
-| Invariant | Phase | Status |
+| Invariant | Capability | Status |
 | --- | --- | --- |
-| I9 | phase_5 | agent_fallback_execution_pending |
+| agent-fallback-reservation | agent_fallback_execution | pending |

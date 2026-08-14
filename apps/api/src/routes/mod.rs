@@ -187,8 +187,8 @@ mod tests {
         consumer_fragment: &'static str,
     }
 
-    fn retained_p02_b08_routes() -> Vec<FrozenRoute> {
-        let mut lines = include_str!("P02_B08_ROUTES.tsv").lines();
+    fn retained_behavior_routes() -> Vec<FrozenRoute> {
+        let mut lines = include_str!("route-manifest.tsv").lines();
         assert_eq!(
             lines.next(),
             Some(
@@ -218,7 +218,7 @@ mod tests {
             .collect()
     }
 
-    const REMOVED_P02_B08_ROUTES: &[(&str, &str, u16)] = &[
+    const REMOVED_ROUTE_MANIFEST_ROUTES: &[(&str, &str, u16)] = &[
         ("GET", "/api/v1/catalog", 404),
         ("GET", "/api/v1/versions/watch", 404),
         ("GET", "/api/v1/versions/missing/info", 404),
@@ -241,10 +241,10 @@ mod tests {
     ];
 
     #[tokio::test]
-    async fn p02_b08_contract_supported_and_removed_routes_match_manifest() {
+    async fn behavior_contract_supported_and_removed_routes_match_manifest() {
         let fixture = TestFixture::new("route-manifest");
         let app = router(fixture.state.clone());
-        let retained = retained_p02_b08_routes();
+        let retained = retained_behavior_routes();
 
         assert_eq!(retained.len(), 122);
         for route in &retained {
@@ -296,7 +296,7 @@ mod tests {
             );
         }
 
-        for (method, path, expected_status) in REMOVED_P02_B08_ROUTES {
+        for (method, path, expected_status) in REMOVED_ROUTE_MANIFEST_ROUTES {
             let response = app
                 .clone()
                 .oneshot(
@@ -317,11 +317,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b08_contract_cross_owner_callers_and_gates_match_manifest() {
+    async fn behavior_contract_cross_owner_callers_and_gates_match_manifest() {
         let fixture = TestFixture::new("route-manifest-auth");
         let authority = LocalApiAuthority::new("127.0.0.1:43431".parse().unwrap(), None).unwrap();
         let app = router_with_authority(fixture.state.clone(), authority.clone());
-        let retained = retained_p02_b08_routes();
+        let retained = retained_behavior_routes();
 
         for route in &retained {
             let response = app
@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b03_contract_cross_owner_production_routes_share_bounded_rejections() {
+    async fn behavior_contract_cross_owner_production_routes_share_bounded_rejections() {
         let fixture = TestFixture::new("bounded-extraction");
         let app = router(fixture.state.clone());
         let private = "private-request-token";
@@ -454,7 +454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b06_contract_api_fallthrough_is_json_and_method_specific() {
+    async fn behavior_contract_api_fallthrough_is_json_and_method_specific() {
         let fixture = TestFixture::new("api-routing-contract");
         let app = router(fixture.state.clone());
 

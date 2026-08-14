@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn p02_b02_contract_persisted_semantic_and_range_violations_latch_mutation_closed() {
+    fn behavior_contract_persisted_semantic_and_range_violations_latch_mutation_closed() {
         for (name, config) in [
             (
                 "unknown-guardian-mode",

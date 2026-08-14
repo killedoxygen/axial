@@ -1,8 +1,8 @@
 use super::{
     FactReliability, GuardianActionKind, GuardianCopyRequest, GuardianDecision, GuardianDirective,
     GuardianDomain, GuardianFact, GuardianFactId, GuardianManagedJavaReason, GuardianMode,
-    GuardianPolicyContext, GuardianStripJvmArgsReason, GuardianUserOutcome, SafetyCase,
-    author_guardian_copy, build_safety_case, decide_guardian_policy,
+    GuardianPolicyContext, GuardianStripJvmArgsReason, GuardianUserOutcome, OperationEvidenceBatch,
+    SafetyCase, author_guardian_copy, build_safety_case, decide_guardian_policy,
 };
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::RegisteredArtifactRepairCandidate;
@@ -69,7 +69,9 @@ pub fn guardian_prepare_failure_outcome(
     request: GuardianPrepareFailureRequest<'_>,
 ) -> GuardianLaunchFailureOutcome {
     let facts = prepare_failure_facts(&request);
-    let safety_case = build_safety_case(None, request.mode, OperationPhase::Preparing, &facts);
+    let evidence = OperationEvidenceBatch::try_from_guardian_unscoped(&facts)
+        .expect("Guardian-authored prepare evidence is bounded and unscoped");
+    let safety_case = build_safety_case(request.mode, OperationPhase::Preparing, &evidence);
     let guardian_decision = decide_guardian_policy(
         &safety_case,
         policy_context(request_has_explicit_prepare_intent(&request)),
@@ -122,7 +124,9 @@ fn evaluate_preset_adjustment(
         ownership,
         "jvm_preset",
     )];
-    let safety_case = build_safety_case(None, request.mode, OperationPhase::Preparing, &facts);
+    let evidence = OperationEvidenceBatch::try_from_guardian_unscoped(&facts)
+        .expect("Guardian-authored preset evidence is bounded and unscoped");
+    let safety_case = build_safety_case(request.mode, OperationPhase::Preparing, &evidence);
     let decision = decide_guardian_policy(
         &safety_case,
         policy_context(request.explicit_jvm_preset_present),
@@ -157,7 +161,9 @@ pub fn guardian_startup_failure_outcome(
     let failure_class = startup_failure_class(request.observation);
     let recovery_options = startup_recovery_options(&request, failure_class);
     let facts = startup_failure_facts(&request, failure_class, &recovery_options);
-    let safety_case = build_safety_case(None, request.mode, OperationPhase::Launching, &facts);
+    let evidence = OperationEvidenceBatch::try_from_guardian_unscoped(&facts)
+        .expect("Guardian-authored startup evidence is bounded and unscoped");
+    let safety_case = build_safety_case(request.mode, OperationPhase::Launching, &evidence);
     let guardian_decision = decide_guardian_policy(
         &safety_case,
         policy_context(request_has_explicit_startup_intent(&request)),
@@ -726,7 +732,9 @@ pub(super) fn failure_class_matrix_decision(
             fields: Vec::new(),
         });
     }
-    let safety_case = build_safety_case(None, mode, phase, &facts);
+    let evidence = OperationEvidenceBatch::try_from_guardian_unscoped(&facts)
+        .expect("Guardian-authored launch evidence is bounded and unscoped");
+    let safety_case = build_safety_case(mode, phase, &evidence);
     decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation())
 }
 
@@ -1415,7 +1423,7 @@ mod tests {
     }
 
     #[test]
-    fn p02_b05_contract_cross_owner_rosetta_keeps_its_runtime_fact_and_blocking_copy() {
+    fn behavior_contract_cross_owner_rosetta_keeps_its_runtime_fact_and_blocking_copy() {
         let request = GuardianPrepareFailureRequest {
             mode: GuardianMode::Managed,
             failure_class: LaunchFailureClass::RosettaRequired,

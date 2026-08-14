@@ -1674,7 +1674,7 @@ mod tests {
         assert_eq!(coverage.suppression_hours, 24);
         assert_eq!(
             coverage.operation_journal_schema,
-            "axial.state.operation_journals.v9"
+            "axial.state.operation_journals.v10"
         );
         assert_eq!(
             coverage.failure_memory_schema,

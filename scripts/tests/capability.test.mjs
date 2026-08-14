@@ -133,7 +133,7 @@ async function harness(t, body, options = {}) {
     scenario_id: "CP-TEST-PASS",
     proof_id: "CAP-TEST-PASS",
     capability_id: "test-pass",
-    owner_phase: "P00",
+    owner_domain: "offline-assets",
     toolchain_profile: "frontend",
     allowed_platforms: ["linux"],
     timeout_ms: options.timeout ?? 1_500,
@@ -384,7 +384,7 @@ test("registry records fail closed and bind each proof to its narrow toolchain",
       ["CP-OA-LOADER-MARKS", "frontend"],
       ["CP-OA-PROVENANCE", "frontend"],
       ["CP-OA-FRONTEND", "frontend"],
-      ["CP-P01-B02-ANCHORED-FS", "rust"],
+      ["CP-ANCHORED-FILESYSTEM", "rust"],
     ],
   );
   assert.deepEqual(capabilityRegistry.at(-1).allowed_platforms, ["linux"]);
@@ -935,7 +935,7 @@ test("matrix aggregation rejects mixed commits and toolchain manifests", async (
       scenario_id: linux.scenario_id,
       proof_id: linux.proof_id,
       capability_id: linux.capability_id,
-      owner_phase: linux.owner_phase,
+      owner_domain: linux.owner_domain,
       allowed_platforms: ["linux", "windows"],
     },
     required_platforms: ["linux", "windows"],
@@ -970,7 +970,7 @@ test("matrix aggregation rejects mixed commits and toolchain manifests", async (
   );
 
   const wrongOwner = structuredClone(windows);
-  wrongOwner.owner_phase = "P01";
+  wrongOwner.owner_domain = "other-domain";
   await rejectsCode(
     async () => aggregateCapabilityEvidence([linux, wrongOwner], expected),
     "mixed_evidence_identity",

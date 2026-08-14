@@ -165,7 +165,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn p02_b05_contract_cross_owner_rosetta_guidance_uses_typed_class_without_display_parsing() {
+    fn behavior_contract_cross_owner_rosetta_guidance_uses_typed_class_without_display_parsing() {
         let public_message = sanitize_live_launch_failure_message_for_class(
             LaunchFailureClass::RosettaRequired,
             "untrusted /home/alice/runtime --secret raw-token",

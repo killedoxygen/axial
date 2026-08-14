@@ -24,8 +24,9 @@ use crate::guardian::{
     GuardianLaunchAdmission, GuardianLaunchFailureMemoryIntakeRequest,
     GuardianLaunchRecoveryCurrentIntent, GuardianManagedJavaReason, GuardianPreflightOutcome,
     GuardianPreflightOutcomeRequest, GuardianPreflightReadiness, GuardianStripJvmArgsReason,
-    GuardianSummary, guardian_fact_from_execution, guardian_preflight_outcome,
+    GuardianSummary, OperationEvidenceBatch, OperationEvidenceBatchRejection,
     guardian_summary_from_admission, launch_failure_memory_guardian_facts, launch_notice,
+    try_guardian_preflight_outcome,
 };
 use crate::logging::timestamp_utc;
 use crate::state::contracts::OperationPhase;
@@ -283,7 +284,8 @@ async fn prepare_launch_session_with_auth_refresh(
         },
         None,
     )
-    .await;
+    .await
+    .map_err(launch_evidence_rejection_response)?;
     let preflight_elapsed = preflight_started_at.elapsed();
     let repair_started_at = Instant::now();
     let repair_launch = ManagedRuntimeRepairLaunch {
@@ -517,6 +519,15 @@ fn launch_instance_busy_error_response() -> (StatusCode, Json<serde_json::Value>
     )
 }
 
+fn launch_evidence_rejection_response(
+    _: OperationEvidenceBatchRejection,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "launch evidence could not be validated" })),
+    )
+}
+
 fn launch_preflight_guardian_error_response(
     readiness: LaunchReadiness,
     guardian: GuardianSummary,
@@ -630,7 +641,8 @@ async fn prepare_launch_preflight_with_memory_capture(
         None,
         capture_memory,
     )
-    .await;
+    .await
+    .map_err(launch_evidence_rejection_response)?;
 
     trace_launch_preflight_response(LaunchPreflightResponseTiming {
         instance_id: &instance.id,
@@ -661,7 +673,7 @@ async fn build_launch_preflight_facts(
     producer: &crate::state::ProducerLease,
     request: LaunchPreflightBuild<'_>,
     prior_java_probe_receipt: Option<JavaRuntimeProbeReceipt>,
-) -> LaunchPreflightFacts {
+) -> Result<LaunchPreflightFacts, OperationEvidenceBatchRejection> {
     build_launch_preflight_facts_with_memory_capture(
         state,
         producer,
@@ -678,7 +690,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
     request: LaunchPreflightBuild<'_>,
     prior_java_probe_receipt: Option<JavaRuntimeProbeReceipt>,
     capture_memory: impl FnOnce() -> LaunchMemoryEvidence,
-) -> LaunchPreflightFacts {
+) -> Result<LaunchPreflightFacts, OperationEvidenceBatchRejection> {
     let LaunchPreflightBuild {
         integrity_foreground,
         instance_lifecycle,
@@ -831,10 +843,11 @@ async fn build_launch_preflight_facts_with_memory_capture(
     };
     let integrity_elapsed = integrity_started_at.elapsed();
     execution_facts.extend(integrity_report.facts.iter().cloned());
-    let mut guardian_facts = execution_facts
-        .iter()
-        .map(|fact| guardian_fact_from_execution(fact, OperationPhase::Validating))
-        .collect::<Vec<_>>();
+    let execution_evidence = OperationEvidenceBatch::try_from_execution_unscoped(
+        OperationPhase::Validating,
+        &execution_facts,
+    )?;
+    let mut guardian_facts = execution_evidence.facts().to_vec();
     let performance_mode = policy::selected_performance_mode(instance, config);
     let resources_started_at = Instant::now();
     let resource_budget = capture_resource_budget_snapshot(
@@ -915,7 +928,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
     let readiness_elapsed = readiness_started_at.elapsed();
     guardian_facts.extend(structural_readiness_facts.iter().cloned());
     let guardian_policy_started_at = Instant::now();
-    let guardian_outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
+    let guardian_outcome = try_guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
         operation_id: None,
         mode: api_guardian_mode(guardian.mode),
         phase: OperationPhase::Validating,
@@ -927,7 +940,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
         resources: preflight_resource_signals(raw_min_memory_mb, max_memory_mb, &resource_budget),
         overrides: preflight_override_signals(&guardian),
         explicit_user_intent: guardian.has_risky_overrides(),
-    });
+    })?;
     let preflight_stage_evidence =
         launch_preflight_stage_evidence(&guardian_outcome, &performance_mode);
     apply_guardian_preflight_interventions(
@@ -970,7 +983,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
         integrity_suppressed_fact_count: integrity_report.suppressed_fact_count,
     });
 
-    LaunchPreflightFacts {
+    Ok(LaunchPreflightFacts {
         config: config.clone(),
         max_memory_mb,
         raw_min_memory_mb,
@@ -990,7 +1003,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
         readiness,
         resource_budget,
         java_probe_receipt,
-    }
+    })
 }
 
 fn apply_guardian_preflight_interventions(

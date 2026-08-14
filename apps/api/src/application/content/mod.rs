@@ -801,7 +801,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p00_b11_contract_cross_owner_direct_service_projects_without_sources() {
+    async fn behavior_contract_cross_owner_direct_service_projects_without_sources() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind Application content fixture");
@@ -867,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b11_contract_search_install_state_requires_exact_live_bytes() {
+    fn behavior_contract_search_install_state_requires_exact_live_bytes() {
         let root = std::env::temp_dir().join(format!(
             "axial-content-search-presence-{}-{}",
             std::process::id(),
@@ -924,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b11_contract_instance_content_is_an_exact_live_projection() {
+    fn behavior_contract_instance_content_is_an_exact_live_projection() {
         let root = std::env::temp_dir().join(format!(
             "axial-content-live-projection-{}-{}",
             std::process::id(),

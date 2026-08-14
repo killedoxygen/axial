@@ -9,7 +9,6 @@ mod component_rebuild;
 mod copy;
 mod directive;
 mod healing;
-mod install_evidence;
 mod integrity;
 pub mod jvm_preset;
 pub mod launch_decision;
@@ -65,11 +64,10 @@ pub(crate) use component_rebuild::{
 };
 pub(crate) use copy::GuardianSummaryDecision;
 pub(crate) use copy::{
-    GuardianCopyRequest, GuardianInstallOutcomeFactGroupParse,
-    GuardianInstallOutcomeMemoryPersistence, GuardianLaunchAdmission, GuardianRuntimeRepairCopy,
+    GuardianCopyRequest, GuardianInstallAssessment, GuardianInstallOutcomeMemoryPersistence,
+    GuardianLaunchAdmission, GuardianRuntimeRepairCopy, assess_install_failure,
     author_guardian_copy, guardian_directive_description, guardian_failed_launch_recovery_log,
-    guardian_install_outcome_fact_group, guardian_install_outcome_from_persisted_group,
-    guardian_install_outcome_persistence_facts, guardian_launch_stage_evidence,
+    guardian_install_outcome_from_terminal, guardian_launch_stage_evidence,
     guardian_proof_evidence, guardian_summary_from_admission,
     guardian_summary_from_persisted_export_value, guardian_summary_with_artifact_repair_outcome,
     guardian_summary_with_blocked_outcome, guardian_summary_with_intervention,
@@ -85,29 +83,38 @@ pub(crate) use copy::{
     guardian_launch_stage_evidence_for_test, guardian_summary_for_test,
     guardian_user_outcome_for_test,
 };
-pub use diagnosis::{Diagnosis, build_safety_case, diagnose};
+pub use diagnosis::{
+    Diagnosis, GuardianEvidenceAssessment, assess_operation_evidence, build_safety_case, diagnose,
+};
 pub use directive::{
     GuardianDirective, GuardianManagedJavaReason, GuardianPresetDowngradeReason,
     GuardianPresetValue, GuardianStripJvmArgsReason,
 };
 pub(crate) use directive::{GuardianRecoveryIntentAxis, GuardianRecoveryMetadata};
-pub use facts::guardian_fact_from_execution;
+pub use facts::OperationEvidenceBatch;
+#[cfg(test)]
+pub(crate) fn guardian_fact_from_execution(
+    fact: &crate::execution::ExecutionFact,
+    phase: crate::state::contracts::OperationPhase,
+) -> GuardianFact {
+    let evidence = match fact.operation_id.as_ref() {
+        Some(operation_id) => OperationEvidenceBatch::try_from_execution_operation(
+            operation_id,
+            phase,
+            std::slice::from_ref(fact),
+        ),
+        None => {
+            OperationEvidenceBatch::try_from_execution_unscoped(phase, std::slice::from_ref(fact))
+        }
+    }
+    .expect("valid one-fact execution evidence batch");
+    evidence.facts()[0].clone()
+}
 pub(crate) use healing::execute_managed_runtime_ready_marker_repair;
 pub use healing::{GuardianRepairOutcome, GuardianRepairStatus};
-#[cfg(test)]
-pub(crate) use install_evidence::assess_install_artifact_failure;
-pub use install_evidence::{
-    GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    install_artifact_failure_from_minecraft_download_fact, install_artifact_failure_guardian_fact,
-};
-pub(crate) use install_evidence::{
-    GuardianInstallAssessment, assess_install_artifact_failure_with_context,
-    install_artifact_failure_safety_case,
-};
 pub(crate) use integrity::{
-    TIER2_INTEGRITY_COUNTER_TOKEN_COUNT, Tier2IntegrityGuardianEvidence,
-    Tier2RegisteredArtifactAssessment, assess_tier2_registered_artifact_repair,
-    tier2_integrity_guardian_evidence,
+    Tier2IntegrityGuardianEvidence, Tier2RegisteredArtifactAssessment,
+    assess_tier2_registered_artifact_repair, try_tier2_integrity_guardian_evidence,
 };
 pub use jvm_preset::{
     GuardianJvmPresetId, GuardianJvmPresetResolution, normalize_create_jvm_preset,
@@ -136,9 +143,10 @@ pub use launch_recovery::{
     record_launch_recovery_success,
 };
 pub use model::{
-    ActionPlanPrerequisite, DiagnosisId, FactReliability, GuardianAction, GuardianActionKind,
-    GuardianActionPlan, GuardianConfidence, GuardianDomain, GuardianFact, GuardianFactId,
-    GuardianMode, GuardianSeverity, SafetyCase, SafetyOutcome,
+    ActionPlanPrerequisite, DiagnosisId, EvidenceScope, FactReliability, GuardianAction,
+    GuardianActionKind, GuardianActionPlan, GuardianConfidence, GuardianDomain, GuardianFact,
+    GuardianFactId, GuardianMode, GuardianSeverity, MAX_OPERATION_EVIDENCE_FACTS,
+    OperationEvidenceBatchRejection, SafetyCase, SafetyOutcome,
 };
 pub use performance::{
     GuardianPerformanceOperationKind, GuardianPerformanceSupervisionPlan,
@@ -155,9 +163,11 @@ pub use policy::{GuardianDecision, GuardianPolicyContext, decide_guardian_policy
 pub(crate) use policy::{
     guardian_policy_evaluation_count_scope, with_guardian_policy_evaluation_count_scope,
 };
+#[cfg(test)]
+pub use preflight::guardian_preflight_outcome;
 pub use preflight::{
     GuardianPreflightOutcome, GuardianPreflightOutcomeRequest, GuardianPreflightOverrideSignals,
-    GuardianPreflightReadiness, GuardianPreflightResourceSignals, guardian_preflight_outcome,
+    GuardianPreflightReadiness, GuardianPreflightResourceSignals, try_guardian_preflight_outcome,
 };
 #[cfg(test)]
 pub(crate) use repair_authorization::RepairAuthorizationRejection;
@@ -165,3 +175,9 @@ pub(crate) use repair_authorization::{
     ReadyMarkerRepairAuthorization, authorize_managed_runtime_ready_marker_repair,
 };
 pub(crate) use state_evidence::persisted_state_load_guardian_outcome;
+
+#[cfg(test)]
+pub(crate) fn unscoped_evidence_for_test(facts: &[GuardianFact]) -> OperationEvidenceBatch {
+    OperationEvidenceBatch::try_from_guardian_unscoped(facts)
+        .expect("test Guardian evidence must be bounded and unscoped")
+}

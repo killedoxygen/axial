@@ -1414,7 +1414,6 @@ pub(super) async fn start_loader_install_with_foreground(
 
             let exact_terminal = match result {
                 Err(error) => {
-                    let observed_at = worker_journals.now_timestamp();
                     let progress = loader_install_error_progress(&error);
                     dispatch_loader_install_failure(
                         &guardian_owner,
@@ -1425,7 +1424,6 @@ pub(super) async fn start_loader_install_with_foreground(
                             loader_target_id: &loader_target_id,
                             base_version_id: &base_version_id,
                             error,
-                            observed_at: &observed_at,
                         },
                     )
                     .await;
@@ -2030,7 +2028,6 @@ pub(super) fn spawn_recovering_loader_install<Reconstruct, Reconstruction>(
             let exact_terminal = match result {
                 Ok(progress) => progress,
                 Err(error) => {
-                    let observed_at = worker_journals.now_timestamp();
                     let progress = loader_install_error_progress(&error);
                     let loader_target_id =
                         format!("loader_{}_{}", component_id.short_key(), build_id);
@@ -2043,7 +2040,6 @@ pub(super) fn spawn_recovering_loader_install<Reconstruct, Reconstruction>(
                             loader_target_id: &loader_target_id,
                             base_version_id: &base_version_id,
                             error,
-                            observed_at: &observed_at,
                         },
                     )
                     .await;
@@ -2142,7 +2138,6 @@ pub(super) struct LoaderInstallFailureRequest<'a> {
     pub(super) loader_target_id: &'a str,
     pub(super) base_version_id: &'a str,
     pub(super) error: LoaderInstallError,
-    pub(super) observed_at: &'a str,
 }
 
 pub(super) async fn dispatch_loader_install_failure(
@@ -2156,7 +2151,6 @@ pub(super) async fn dispatch_loader_install_failure(
         loader_target_id,
         base_version_id,
         error,
-        observed_at,
     } = request;
     match error {
         LoaderInstallError::PublicationIndeterminate(_) => {}
@@ -2179,7 +2173,6 @@ pub(super) async fn dispatch_loader_install_failure(
                 operation_id,
                 failure.error(),
                 failure.facts(),
-                observed_at,
             )
             .await
         }
@@ -2190,7 +2183,6 @@ pub(super) async fn dispatch_loader_install_failure(
                 failure_memory,
                 operation_id,
                 failure.facts(),
-                observed_at,
             )
             .await
         }
@@ -2202,7 +2194,6 @@ pub(super) async fn dispatch_loader_install_failure(
                 operation_id,
                 loader_target_id,
                 &failure,
-                observed_at,
             )
             .await
             .ok();

@@ -1223,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn p02_b09_contract_posthog_host_requires_https_except_exact_loopback() {
+    fn behavior_contract_posthog_host_requires_https_except_exact_loopback() {
         assert_eq!(
             sanitize_posthog_host(" https://eu.i.posthog.com/ "),
             Some("https://eu.i.posthog.com".to_string())
@@ -1330,7 +1330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p00_b10_contract_telemetry_off_admits_no_export_work() {
+    async fn behavior_contract_telemetry_off_admits_no_export_work() {
         let fixture = TestConfig::new(
             "consent-off",
             AppConfig {
@@ -1526,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn p02_b09_contract_panic_hook_is_nonblocking_and_always_chains_previous_hook() {
+    fn behavior_contract_panic_hook_is_nonblocking_and_always_chains_previous_hook() {
         for mode in [
             "hub-slot",
             "config",
@@ -1639,7 +1639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b09_contract_panic_sink_exports_only_precomputed_redacted_evidence() {
+    async fn behavior_contract_panic_sink_exports_only_precomputed_redacted_evidence() {
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -1692,7 +1692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b09_contract_cross_owner_revocation_drops_stale_panic_and_sink_quiesces() {
+    async fn behavior_contract_cross_owner_revocation_drops_stale_panic_and_sink_quiesces() {
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -1741,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn p02_b09_contract_cross_owner_authoritative_consent_rejects_stale_generation() {
+    fn behavior_contract_cross_owner_authoritative_consent_rejects_stale_generation() {
         let config = Arc::new(MutableConfig {
             current: Mutex::new(enabled_config_with_install_id()),
         });
@@ -1768,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn p02_b09_contract_panic_sink_preserves_error_storm_bounds() {
+    fn behavior_contract_panic_sink_preserves_error_storm_bounds() {
         let fixture = TestConfig::new("panic-storm", enabled_config_with_install_id());
         let hub = test_hub(fixture.store.clone());
         hub.refresh_panic_capture(&fixture.store.current());
@@ -1786,7 +1786,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b09_contract_telemetry_requests_do_not_follow_redirects() {
+    async fn behavior_contract_telemetry_requests_do_not_follow_redirects() {
         let target = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind redirect target");
@@ -1829,7 +1829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b09_contract_unresponsive_collector_has_a_bounded_sink_lifetime() {
+    async fn behavior_contract_unresponsive_collector_has_a_bounded_sink_lifetime() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind unresponsive collector");

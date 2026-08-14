@@ -2,12 +2,11 @@ use super::rules::{DIAGNOSIS_RULES, rule_for_diagnosis};
 use super::{
     DiagnosisId, FactReliability, GuardianAction, GuardianActionKind, GuardianActionPlan,
     GuardianConfidence, GuardianDecision, GuardianDomain, GuardianFact, GuardianFactId,
-    GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind, GuardianMode,
-    GuardianPerformanceOperationKind, GuardianPerformanceSupervisionRejection,
+    GuardianMode, GuardianPerformanceOperationKind, GuardianPerformanceSupervisionRejection,
     GuardianPerformanceSupervisionRequest, GuardianPolicyContext, GuardianPreflightOutcomeRequest,
     GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest, GuardianSeverity,
     GuardianSeverity::Repairable, GuardianStartupFailureObservation, GuardianStartupFailureRequest,
-    assess_install_artifact_failure, build_safety_case, diagnose, guardian_fact_from_execution,
+    assess_install_failure, build_safety_case, diagnose, guardian_fact_from_execution,
     guardian_preflight_outcome, guardian_prelaunch_preset_adjustment_directive,
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
     persisted_state_load_guardian_outcome, plan_performance_supervision,
@@ -47,10 +46,6 @@ impl GuardianDecisionFixture {
 const GUARDIAN_DECISION_ACTIONS_FIXTURE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/guardian/guardian-decision-actions.json"
-));
-const GUARDIAN_FACT_IDS_FIXTURE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/guardian/guardian-fact-ids.json"
 ));
 
 #[test]
@@ -139,28 +134,6 @@ fn assert_fixture_action_kind(kind: GuardianActionKind) {
 }
 
 #[test]
-fn checked_in_guardian_fact_ids_fixture_is_byte_stable() {
-    let fact_ids = serde_json::from_str::<Vec<GuardianFactId>>(GUARDIAN_FACT_IDS_FIXTURE)
-        .expect("fact-id fixture");
-    assert_eq!(fact_ids.as_slice(), GuardianFactId::ALL.as_slice());
-
-    let pretty = serde_json::to_string_pretty(&fact_ids).expect("pretty fact-id fixture");
-    assert_eq!(format!("{pretty}\n"), GUARDIAN_FACT_IDS_FIXTURE);
-
-    let compact = serde_json::to_string(&fact_ids).expect("compact fact-id fixture");
-    let decoded =
-        serde_json::from_str::<Vec<GuardianFactId>>(&compact).expect("decode compact fact ids");
-    assert_eq!(
-        serde_json::to_string(&decoded).expect("re-encode compact fact ids"),
-        compact
-    );
-    let error = serde_json::from_str::<GuardianFactId>(r#""future_fact""#)
-        .expect_err("unknown fact id must be rejected")
-        .to_string();
-    assert!(!error.contains("future_fact"));
-}
-
-#[test]
 fn execution_runtime_fact_maps_to_confirmed_runtime_diagnosis() {
     let target = target(
         "runtime",
@@ -175,7 +148,10 @@ fn execution_runtime_fact_maps_to_confirmed_runtime_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Preparing);
-    let diagnoses = diagnose(&[fact], OperationPhase::Preparing);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(&[fact]),
+        OperationPhase::Preparing,
+    );
 
     assert_eq!(diagnoses.len(), 1);
     let diagnosis = &diagnoses[0];
@@ -208,7 +184,10 @@ fn execution_hash_mismatch_maps_to_launcher_managed_corruption() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Launching);
-    let diagnoses = diagnose(std::slice::from_ref(&fact), OperationPhase::Launching);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(std::slice::from_ref(&fact)),
+        OperationPhase::Launching,
+    );
 
     assert_eq!(fact.id, GuardianFactId::ArtifactHashMismatch);
     assert_eq!(fact.domain, GuardianDomain::Library);
@@ -313,7 +292,10 @@ fn execution_java_override_sentinel_maps_to_unavailable_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    let diagnoses = diagnose(std::slice::from_ref(&fact), OperationPhase::Validating);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(std::slice::from_ref(&fact)),
+        OperationPhase::Validating,
+    );
 
     assert_eq!(fact.id.as_str(), "java_override_undefined_sentinel");
     assert_eq!(fact.domain, GuardianDomain::Runtime);
@@ -347,7 +329,10 @@ fn execution_java_update_fact_maps_to_update_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    let diagnoses = diagnose(std::slice::from_ref(&fact), OperationPhase::Validating);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(std::slice::from_ref(&fact)),
+        OperationPhase::Validating,
+    );
 
     assert_eq!(fact.id.as_str(), "java_update_too_old");
     assert_eq!(fact.domain, GuardianDomain::Runtime);
@@ -381,7 +366,10 @@ fn launch_readiness_fact_maps_to_blocking_install_diagnosis() {
         fields: Vec::new(),
     };
 
-    let diagnoses = diagnose(&[fact], OperationPhase::Validating);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(&[fact]),
+        OperationPhase::Validating,
+    );
 
     assert_eq!(diagnoses.len(), 1);
     assert_eq!(diagnoses[0].id().as_str(), "install_incomplete");
@@ -414,7 +402,10 @@ fn managed_runtime_readiness_fact_maps_to_recoverable_diagnosis() {
         fields: Vec::new(),
     };
 
-    let diagnoses = diagnose(&[fact], OperationPhase::Validating);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(&[fact]),
+        OperationPhase::Validating,
+    );
 
     assert_eq!(diagnoses.len(), 1);
     assert_eq!(diagnoses[0].id().as_str(), "managed_runtime_missing");
@@ -545,7 +536,10 @@ fn eight_multi_fact_rule_families_emit_once_with_declared_support_order() {
                 )
             })
             .collect::<Vec<_>>();
-        let diagnoses = diagnose(&facts, OperationPhase::Failed);
+        let diagnoses = diagnose(
+            &crate::guardian::unscoped_evidence_for_test(&facts),
+            OperationPhase::Failed,
+        );
         let diagnosis = diagnoses
             .iter()
             .find(|diagnosis| diagnosis.id() == *diagnosis_id)
@@ -586,7 +580,7 @@ fn duplicate_source_instances_keep_distinct_real_targets_without_fake_fallbacks(
     without_target.target = None;
 
     let diagnosis = diagnose(
-        &[first, without_target, second],
+        &crate::guardian::unscoped_evidence_for_test(&[first, without_target, second]),
         OperationPhase::Downloading,
     )
     .remove(0);
@@ -638,7 +632,11 @@ fn conservative_ownership_join_covers_every_pair_and_input_permutation() {
                 vec![right_fact.clone(), left_fact.clone()],
             ] {
                 assert_eq!(
-                    diagnose(&facts, OperationPhase::Downloading)[0].ownership(),
+                    diagnose(
+                        &crate::guardian::unscoped_evidence_for_test(&facts),
+                        OperationPhase::Downloading
+                    )[0]
+                    .ownership(),
                     expected,
                     "{left:?} + {right:?}"
                 );
@@ -666,7 +664,11 @@ fn targetless_fused_rule_emits_one_resolved_fallback() {
     );
     interrupted.target = None;
 
-    let diagnosis = diagnose(&[interrupted, provider], OperationPhase::Downloading).remove(0);
+    let diagnosis = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(&[interrupted, provider]),
+        OperationPhase::Downloading,
+    )
+    .remove(0);
 
     assert_eq!(diagnosis.id(), DiagnosisId::DownloadUnavailable);
     assert_eq!(diagnosis.ownership(), OwnershipClass::UserOwned);
@@ -719,10 +721,13 @@ fn diagnosis_order_follows_first_matching_input_then_rule_order() {
         ),
     ] {
         assert_eq!(
-            diagnose(&facts, OperationPhase::Preparing)
-                .iter()
-                .map(|diagnosis| diagnosis.id())
-                .collect::<Vec<_>>(),
+            diagnose(
+                &crate::guardian::unscoped_evidence_for_test(&facts),
+                OperationPhase::Preparing
+            )
+            .iter()
+            .map(|diagnosis| diagnosis.id())
+            .collect::<Vec<_>>(),
             expected
         );
     }
@@ -743,9 +748,12 @@ fn phase_agnostic_rule_triggers_match_in_rollback() {
                 OwnershipClass::Unknown,
             );
             assert!(
-                diagnose(&[fact], OperationPhase::RollingBack)
-                    .iter()
-                    .any(|diagnosis| diagnosis.id() == rule.id),
+                diagnose(
+                    &crate::guardian::unscoped_evidence_for_test(&[fact]),
+                    OperationPhase::RollingBack
+                )
+                .iter()
+                .any(|diagnosis| diagnosis.id() == rule.id),
                 "{}",
                 fact_id.as_str()
             );
@@ -772,7 +780,10 @@ fn execution_jvm_parse_fact_maps_to_malformed_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    let diagnoses = diagnose(std::slice::from_ref(&fact), OperationPhase::Validating);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(std::slice::from_ref(&fact)),
+        OperationPhase::Validating,
+    );
 
     assert_eq!(fact.id.as_str(), "jvm_args_parse_failed");
     assert_eq!(fact.domain, GuardianDomain::Jvm);
@@ -808,7 +819,10 @@ fn execution_jvm_unsafe_fact_maps_to_unsafe_override_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    let diagnoses = diagnose(&[fact], OperationPhase::Validating);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(&[fact]),
+        OperationPhase::Validating,
+    );
 
     assert_eq!(diagnoses.len(), 1);
     assert_eq!(diagnoses[0].id().as_str(), "jvm_arg_unsafe_override");
@@ -927,7 +941,10 @@ fn exit_code_fact_maps_zero_and_nonzero_without_exit_classification() {
             OperationPhase::Running,
         );
         assert_eq!(fact.id.as_str(), expected);
-        let diagnoses = diagnose(&[fact], OperationPhase::Running);
+        let diagnoses = diagnose(
+            &crate::guardian::unscoped_evidence_for_test(&[fact]),
+            OperationPhase::Running,
+        );
         assert_eq!(diagnoses[0].id().as_str(), "process_lifecycle_observed");
         assert_eq!(
             diagnoses[0].candidate_actions(),
@@ -1083,7 +1100,10 @@ fn unclassified_exit_context_stays_out_of_shared_rule_evidence() {
             OwnershipClass::LauncherManaged,
         );
 
-        let diagnoses = diagnose(&[process, cause], OperationPhase::Launching);
+        let diagnoses = diagnose(
+            &crate::guardian::unscoped_evidence_for_test(&[process, cause]),
+            OperationPhase::Launching,
+        );
         let cause_diagnosis = diagnoses
             .iter()
             .find(|diagnosis| diagnosis.id() == expected_id)
@@ -1140,7 +1160,11 @@ fn launch_conditions_are_phase_bound_and_incomplete_classification_blocks() {
         );
 
         let unclassified = diagnose(
-            &[cause.clone(), wrong_phase_classified, wrong_phase_available],
+            &crate::guardian::unscoped_evidence_for_test(&[
+                cause.clone(),
+                wrong_phase_classified,
+                wrong_phase_available,
+            ]),
             OperationPhase::Launching,
         );
         let unclassified = unclassified
@@ -1157,7 +1181,10 @@ fn launch_conditions_are_phase_bound_and_incomplete_classification_blocks() {
             FactReliability::DirectStructured,
             OwnershipClass::UserOwned,
         );
-        let classified = diagnose(&[cause, classified], OperationPhase::Launching);
+        let classified = diagnose(
+            &crate::guardian::unscoped_evidence_for_test(&[cause, classified]),
+            OperationPhase::Launching,
+        );
         let classified = classified
             .iter()
             .find(|diagnosis| diagnosis.id() == diagnosis_id)
@@ -1183,7 +1210,7 @@ fn launch_conditions_are_phase_bound_and_incomplete_classification_blocks() {
     );
     assert!(
         diagnose(
-            &[signature, wrong_phase_classified],
+            &crate::guardian::unscoped_evidence_for_test(&[signature, wrong_phase_classified]),
             OperationPhase::Preparing
         )
         .iter()
@@ -1219,12 +1246,12 @@ fn launch_conditions_are_phase_bound_and_incomplete_classification_blocks() {
         OwnershipClass::LauncherManaged,
     );
     let diagnoses = diagnose(
-        &[
+        &crate::guardian::unscoped_evidence_for_test(&[
             stale_java,
             current_classified.clone(),
             current_process,
             current_fallback,
-        ],
+        ]),
         OperationPhase::Launching,
     );
     let java = diagnoses
@@ -1254,7 +1281,7 @@ fn launch_conditions_are_phase_bound_and_incomplete_classification_blocks() {
     );
     assert!(
         diagnose(
-            &[stale_signature, preparing_classified],
+            &crate::guardian::unscoped_evidence_for_test(&[stale_signature, preparing_classified]),
             OperationPhase::Preparing
         )
         .iter()
@@ -1277,7 +1304,10 @@ fn launch_conditions_are_phase_bound_and_incomplete_classification_blocks() {
     );
     assert!(
         diagnose(
-            &[wrong_phase_stall, launching_classified],
+            &crate::guardian::unscoped_evidence_for_test(&[
+                wrong_phase_stall,
+                launching_classified
+            ]),
             OperationPhase::Launching
         )
         .iter()
@@ -1309,7 +1339,10 @@ fn classified_startup_context_does_not_contaminate_diagnosis_properties() {
         OwnershipClass::UserOwned,
     );
 
-    let diagnoses = diagnose(&[cause, process, classified], OperationPhase::Launching);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(&[cause, process, classified]),
+        OperationPhase::Launching,
+    );
 
     assert_eq!(
         diagnoses
@@ -1350,7 +1383,10 @@ fn condition_only_input_falls_back_without_public_condition_evidence() {
         )
     });
 
-    let diagnoses = diagnose(&facts, OperationPhase::Preparing);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(&facts),
+        OperationPhase::Preparing,
+    );
 
     assert_eq!(diagnoses.len(), 1);
     assert_eq!(
@@ -1378,7 +1414,10 @@ fn unknown_facts_produce_low_confidence_unknown_diagnosis() {
         OwnershipClass::Unknown,
     );
 
-    let diagnoses = diagnose(&[fact], OperationPhase::Launching);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(&[fact]),
+        OperationPhase::Launching,
+    );
 
     assert_eq!(diagnoses.len(), 1);
     assert_eq!(diagnoses[0].id().as_str(), "unknown_failure_launching");
@@ -1410,10 +1449,13 @@ fn action_plan_representation_carries_prerequisite_metadata() {
         target: Some(target.clone()),
         fields: Vec::new(),
     };
-    let diagnosis = diagnose(&[fact], OperationPhase::Preparing)
-        .into_iter()
-        .next()
-        .expect("managed runtime diagnosis");
+    let diagnosis = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(&[fact]),
+        OperationPhase::Preparing,
+    )
+    .into_iter()
+    .next()
+    .expect("managed runtime diagnosis");
     let prerequisite = diagnosis.action_prerequisite();
     let plan = GuardianActionPlan::new(
         StabilizationSystem::Guardian,
@@ -1445,7 +1487,10 @@ fn targetless_fact_receives_guardian_fallback_target() {
         OperationPhase::Preparing,
     );
 
-    let diagnoses = diagnose(&[fact], OperationPhase::Preparing);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(&[fact]),
+        OperationPhase::Preparing,
+    );
 
     assert_eq!(diagnoses.len(), 1);
     assert_eq!(diagnoses[0].id().as_str(), "java_probe_failed");
@@ -1463,7 +1508,10 @@ fn targetless_fact_receives_guardian_fallback_target() {
 
 #[test]
 fn empty_fact_set_unknown_diagnosis_has_fallback_target() {
-    let diagnoses = diagnose(&[], OperationPhase::Launching);
+    let diagnoses = diagnose(
+        &crate::guardian::unscoped_evidence_for_test(&[]),
+        OperationPhase::Launching,
+    );
 
     assert_eq!(diagnoses.len(), 1);
     assert_eq!(diagnoses[0].id().as_str(), "unknown_failure_launching");
@@ -1533,10 +1581,9 @@ fn safety_case_carries_diagnosis() {
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Preparing);
 
     let safety_case = build_safety_case(
-        None,
         GuardianMode::Managed,
         OperationPhase::Preparing,
-        &[fact],
+        &crate::guardian::unscoped_evidence_for_test(&[fact]),
     );
 
     assert_eq!(safety_case.diagnoses.len(), 1);
@@ -1619,16 +1666,28 @@ impl NamedPolicyBoundaryCase {
                 assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Block);
             }
             Self::InstallAssessment => {
-                let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
-                    Some(OperationId::deterministic_test("install-named-boundary")),
-                    "minecraft_client_1_21_1",
-                    GuardianInstallArtifactFailureKind::ProviderFailure,
-                );
-                let assessment = assess_install_artifact_failure(
-                    Some(OperationId::deterministic_test("install-named-boundary")),
+                let operation_id = OperationId::deterministic_test("install-named-boundary");
+                let fact = ExecutionFact {
+                    operation_id: Some(operation_id.clone()),
+                    kind: ExecutionFactKind::DownloadProviderFailure,
+                    target: Some(target(
+                        "minecraft_client_1_21_1",
+                        TargetKind::Artifact,
+                        OwnershipClass::LauncherManaged,
+                    )),
+                    fields: Vec::new(),
+                };
+                let evidence = super::OperationEvidenceBatch::try_from_execution_operation(
+                    &operation_id,
+                    OperationPhase::Downloading,
+                    &[fact],
+                )
+                .expect("bounded install evidence");
+                let assessment = assess_install_failure(
                     GuardianMode::Managed,
                     OperationPhase::Downloading,
-                    &[evidence],
+                    &evidence,
+                    GuardianPolicyContext::current_operation(),
                 );
                 assert!(assessment.is_some());
             }
@@ -1669,11 +1728,16 @@ impl NamedPolicyBoundaryCase {
                 assert!(directive.is_none());
             }
             Self::EmptyInstallEvidence => {
-                let assessment = assess_install_artifact_failure(
-                    Some(OperationId::deterministic_test("install-empty-boundary")),
-                    GuardianMode::Managed,
+                let evidence = super::OperationEvidenceBatch::try_from_execution_unscoped(
                     OperationPhase::Downloading,
                     &[],
+                )
+                .expect("empty bounded evidence");
+                let assessment = assess_install_failure(
+                    GuardianMode::Managed,
+                    OperationPhase::Downloading,
+                    &evidence,
+                    GuardianPolicyContext::current_operation(),
                 );
                 assert!(assessment.is_none());
             }
@@ -1701,10 +1765,8 @@ impl NamedPolicyBoundaryCase {
 fn performance_supervision_request(
     ownership: OwnershipClass,
 ) -> GuardianPerformanceSupervisionRequest<'static> {
+    let evidence = Box::leak(Box::new(super::unscoped_evidence_for_test(&[])));
     GuardianPerformanceSupervisionRequest {
-        operation_id: Some(OperationId::deterministic_test(
-            "performance-named-boundary",
-        )),
         mode: GuardianMode::Managed,
         phase: OperationPhase::Installing,
         operation: GuardianPerformanceOperationKind::RemoveManagedComposition,
@@ -1714,7 +1776,7 @@ fn performance_supervision_request(
             "managed-composition",
             ownership,
         ),
-        facts: &[],
+        evidence,
         rollback_state: RollbackState::NotApplicable,
         context: GuardianPolicyContext::current_operation(),
     }

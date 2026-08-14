@@ -1,7 +1,7 @@
 use super::{
     DiagnosisId, FactReliability, GuardianActionKind, GuardianCopyRequest, GuardianDomain,
     GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianUserOutcome,
-    author_guardian_copy, build_safety_case, decide_guardian_policy,
+    OperationEvidenceBatch, author_guardian_copy, build_safety_case, decide_guardian_policy,
 };
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::OperationPhase;
@@ -37,12 +37,9 @@ pub(crate) fn persisted_state_load_guardian_outcome(
             EvidenceSensitivity::Public,
         ));
     }
-    let safety_case = build_safety_case(
-        None,
-        GuardianMode::Managed,
-        OperationPhase::Startup,
-        std::slice::from_ref(&fact),
-    );
+    let evidence = OperationEvidenceBatch::try_from_guardian_unscoped(std::slice::from_ref(&fact))
+        .expect("persisted-state load evidence is bounded and unscoped");
+    let safety_case = build_safety_case(GuardianMode::Managed, OperationPhase::Startup, &evidence);
     let decision = decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
     let diagnosis_id = safety_case.diagnoses.first()?.id();
 

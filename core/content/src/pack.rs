@@ -1199,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b11_contract_pack_report_replaces_missing_size_with_observed_bytes() {
+    fn behavior_contract_pack_report_replaces_missing_size_with_observed_bytes() {
         let file = PackFile {
             path: "mods/managed.jar".to_string(),
             url: "https://cdn.modrinth.com/managed.jar".to_string(),

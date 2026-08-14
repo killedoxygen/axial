@@ -11,7 +11,7 @@ import { updateFlowFromResponse, updateInfoResponse } from '../src/updater';
 import { createBackendViewResponse } from '../src/views/create/CreateView';
 import { launcherAccountsResponse, savedSkinsResponse } from '../src/views/accounts/api';
 
-test('P02-B04 retained bootstrap, update, content, and create DTOs reject malformed payloads', async () => {
+test('dto-validation retained bootstrap, update, content, and create DTOs reject malformed payloads', async () => {
   const config = dtoRecord(await mockApi('GET', '/config'), 'Config fixture');
   assert.equal(configResponse(config).username, 'MockPlayer');
   assert.throws(() => configResponse({ ...config, music_track: undefined }), /Config music track response was invalid/);
@@ -55,7 +55,7 @@ test('P02-B04 retained bootstrap, update, content, and create DTOs reject malfor
   assert.equal(savedSkinsResponse({ pending_apply_texture_key: null, skins: [null] }), null);
 });
 
-test('P02-B04 content queue DTO retains the exact strict retry request', () => {
+test('dto-validation content queue DTO retains the exact strict retry request', () => {
   const response = installQueueStateResponse({
     active: null,
     items: [

@@ -4,9 +4,14 @@
 //! This submodule exposes the durable vocabulary for journals, ownership,
 //! snapshots, and persistence boundaries used by the target systems.
 
-use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
+use crate::guardian::{
+    DiagnosisId, GuardianActionKind, GuardianDomain, GuardianFactId, GuardianMode,
+};
 use crate::observability::evidence_text_looks_sensitive;
-use axial_minecraft::ManagedInstallActivationContractId;
+use axial_minecraft::{
+    ManagedInstallActivationContractId,
+    known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ENTRIES},
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -14,6 +19,8 @@ use uuid::{Uuid, Variant, Version};
 
 pub(crate) const RECONCILIATION_EVIDENCE_CAPACITY: usize = 128;
 pub const RECONCILIATION_QUARANTINE_CAPACITY: usize = 8;
+pub(crate) const MAX_DURABLE_GUARDIAN_FACT_IDS: usize = 64;
+pub(crate) const MAX_DURABLE_GUARDIAN_DIAGNOSES: usize = 32;
 pub(super) const PERSISTED_STATE_REPAIR_SUPPRESSION_HOURS: i64 = 24;
 pub(super) const PERSISTED_STATE_REPAIR_MAX_ATTEMPTS_PER_STABLE_KEY_PER_SUPPRESSION_WINDOW: usize =
     1;
@@ -22,6 +29,17 @@ pub(super) const PERSISTED_STATE_REPAIR_MAX_ATTEMPTS_PER_STABLE_KEY_PER_SUPPRESS
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PersistedStateRecordStore {
     BenchmarkSuiteDriver,
+}
+
+impl PersistedStateRecordStore {
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[Self::BenchmarkSuiteDriver];
+
+    pub(crate) const fn failure_memory_id(self) -> &'static str {
+        match self {
+            Self::BenchmarkSuiteDriver => "BenchmarkSuiteDriver",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
@@ -199,6 +217,13 @@ const RECONCILIATION_MAX_ATTEMPTS_PER_SUPPRESSION_WINDOW: usize = 1;
 impl ReconciliationRung {
     pub const ALL: &'static [Self] = &[Self::RepairArtifact, Self::RebuildComponent];
 
+    pub(crate) const fn failure_memory_id(self) -> &'static str {
+        match self {
+            Self::RepairArtifact => "RepairArtifact",
+            Self::RebuildComponent => "RebuildComponent",
+        }
+    }
+
     pub(crate) const fn max_attempts_per_suppression_window(self) -> usize {
         match self {
             Self::RepairArtifact | Self::RebuildComponent => {
@@ -214,6 +239,24 @@ pub enum ReconciliationComponent {
     Libraries,
     Assets,
     Runtime,
+}
+
+impl ReconciliationComponent {
+    pub const ALL: &'static [Self] = &[
+        Self::VersionBundle,
+        Self::Libraries,
+        Self::Assets,
+        Self::Runtime,
+    ];
+
+    pub(crate) const fn failure_memory_id(self) -> &'static str {
+        match self {
+            Self::VersionBundle => "VersionBundle",
+            Self::Libraries => "Libraries",
+            Self::Assets => "Assets",
+            Self::Runtime => "Runtime",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -942,6 +985,30 @@ pub enum StabilizationSystem {
     Interface,
 }
 
+impl StabilizationSystem {
+    pub const ALL: &'static [Self] = &[
+        Self::Application,
+        Self::Execution,
+        Self::Guardian,
+        Self::Performance,
+        Self::Observability,
+        Self::State,
+        Self::Interface,
+    ];
+
+    pub(crate) const fn failure_memory_id(self) -> &'static str {
+        match self {
+            Self::Application => "Application",
+            Self::Execution => "Execution",
+            Self::Guardian => "Guardian",
+            Self::Performance => "Performance",
+            Self::Observability => "Observability",
+            Self::State => "State",
+            Self::Interface => "Interface",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum CommandKind {
     LaunchInstance,
@@ -961,6 +1028,27 @@ pub enum OwnershipClass {
     UserOwned,
     ExternalProviderDerived,
     Unknown,
+}
+
+impl OwnershipClass {
+    pub const ALL: &'static [Self] = &[
+        Self::LauncherManaged,
+        Self::CompositionManaged,
+        Self::UserOwned,
+        Self::ExternalProviderDerived,
+        Self::Unknown,
+    ];
+
+    #[cfg(test)]
+    pub(crate) const fn failure_memory_id(self) -> &'static str {
+        match self {
+            Self::LauncherManaged => "LauncherManaged",
+            Self::CompositionManaged => "CompositionManaged",
+            Self::UserOwned => "UserOwned",
+            Self::ExternalProviderDerived => "ExternalProviderDerived",
+            Self::Unknown => "Unknown",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -1032,6 +1120,36 @@ pub enum TargetKind {
     PerformanceComposition,
     FilesystemPath,
     NetworkResource,
+}
+
+impl TargetKind {
+    pub const ALL: &'static [Self] = &[
+        Self::Instance,
+        Self::Version,
+        Self::Artifact,
+        Self::Runtime,
+        Self::Session,
+        Self::Account,
+        Self::Config,
+        Self::PerformanceComposition,
+        Self::FilesystemPath,
+        Self::NetworkResource,
+    ];
+
+    pub(crate) const fn failure_memory_id(self) -> &'static str {
+        match self {
+            Self::Instance => "Instance",
+            Self::Version => "Version",
+            Self::Artifact => "Artifact",
+            Self::Runtime => "Runtime",
+            Self::Session => "Session",
+            Self::Account => "Account",
+            Self::Config => "Config",
+            Self::PerformanceComposition => "PerformanceComposition",
+            Self::FilesystemPath => "FilesystemPath",
+            Self::NetworkResource => "NetworkResource",
+        }
+    }
 }
 
 macro_rules! operation_phases {
@@ -1193,6 +1311,314 @@ pub enum OperationIntent {
     Performance(PerformanceOperationLifecycle),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DurableGuardianEvidenceError {
+    Empty,
+    TooManyFacts,
+    DuplicateFact,
+    TooManyDiagnoses,
+    DuplicateDiagnosis,
+    TerminalDiagnosisMissing,
+    InvalidInstallTerminal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DurableGuardianEvidence {
+    operation_id: OperationId,
+    fact_ids: Vec<GuardianFactId>,
+    diagnosis_ids: Vec<DiagnosisId>,
+    install_terminal: Option<GuardianInstallTerminalEvidence>,
+}
+
+impl DurableGuardianEvidence {
+    pub(crate) fn new(
+        operation_id: OperationId,
+        fact_ids: Vec<GuardianFactId>,
+        diagnosis_ids: Vec<DiagnosisId>,
+        install_terminal: Option<GuardianInstallTerminalEvidence>,
+    ) -> Result<Self, DurableGuardianEvidenceError> {
+        if fact_ids.is_empty() && diagnosis_ids.is_empty() && install_terminal.is_none() {
+            return Err(DurableGuardianEvidenceError::Empty);
+        }
+        if fact_ids.len() > MAX_DURABLE_GUARDIAN_FACT_IDS {
+            return Err(DurableGuardianEvidenceError::TooManyFacts);
+        }
+        if contains_duplicate(&fact_ids) {
+            return Err(DurableGuardianEvidenceError::DuplicateFact);
+        }
+        if diagnosis_ids.len() > MAX_DURABLE_GUARDIAN_DIAGNOSES {
+            return Err(DurableGuardianEvidenceError::TooManyDiagnoses);
+        }
+        if contains_duplicate(&diagnosis_ids) {
+            return Err(DurableGuardianEvidenceError::DuplicateDiagnosis);
+        }
+        if let Some(terminal) = &install_terminal {
+            terminal
+                .validate()
+                .map_err(|_| DurableGuardianEvidenceError::InvalidInstallTerminal)?;
+            if !diagnosis_ids.contains(&terminal.diagnosis_id) {
+                return Err(DurableGuardianEvidenceError::TerminalDiagnosisMissing);
+            }
+        }
+        Ok(Self {
+            operation_id,
+            fact_ids,
+            diagnosis_ids,
+            install_terminal,
+        })
+    }
+
+    pub(crate) fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub(crate) fn fact_ids(&self) -> &[GuardianFactId] {
+        &self.fact_ids
+    }
+
+    pub(crate) fn diagnosis_ids(&self) -> &[DiagnosisId] {
+        &self.diagnosis_ids
+    }
+
+    pub(crate) fn install_terminal(&self) -> Option<&GuardianInstallTerminalEvidence> {
+        self.install_terminal.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuardianInstallTerminalEvidenceError {
+    Shape,
+    Target,
+    Window,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GuardianInstallTerminalEvidence {
+    diagnosis_id: DiagnosisId,
+    action: GuardianActionKind,
+    memory: Option<GuardianInstallMemoryEvidence>,
+}
+
+impl GuardianInstallTerminalEvidence {
+    pub(crate) fn new(
+        diagnosis_id: DiagnosisId,
+        action: GuardianActionKind,
+        memory: Option<GuardianInstallMemoryEvidence>,
+    ) -> Result<Self, GuardianInstallTerminalEvidenceError> {
+        let terminal = Self {
+            diagnosis_id,
+            action,
+            memory,
+        };
+        terminal.validate()?;
+        Ok(terminal)
+    }
+
+    pub const fn diagnosis_id(&self) -> DiagnosisId {
+        self.diagnosis_id
+    }
+
+    pub const fn action(&self) -> GuardianActionKind {
+        self.action
+    }
+
+    pub fn memory(&self) -> Option<&GuardianInstallMemoryEvidence> {
+        self.memory.as_ref()
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), GuardianInstallTerminalEvidenceError> {
+        match (self.action, &self.memory) {
+            (GuardianActionKind::Retry, Some(memory)) => memory.validate(),
+            (GuardianActionKind::Retry, None) | (_, Some(_)) => {
+                Err(GuardianInstallTerminalEvidenceError::Shape)
+            }
+            (_, None) => Ok(()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GuardianInstallTerminalEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            diagnosis_id: DiagnosisId,
+            action: GuardianActionKind,
+            memory: Option<GuardianInstallMemoryEvidence>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.diagnosis_id, wire.action, wire.memory)
+            .map_err(|_| serde::de::Error::custom("invalid Guardian install terminal evidence"))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GuardianInstallMemoryEvidence {
+    binding: GuardianMemoryBindingDigest,
+    target: TargetDescriptor,
+    observed_at: String,
+    suppression_until: String,
+}
+
+impl<'de> Deserialize<'de> for GuardianInstallMemoryEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            binding: GuardianMemoryBindingDigest,
+            target: TargetDescriptor,
+            observed_at: String,
+            suppression_until: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.binding,
+            wire.target,
+            wire.observed_at,
+            wire.suppression_until,
+        )
+        .map_err(|_| serde::de::Error::custom("invalid Guardian install memory evidence"))
+    }
+}
+
+impl GuardianInstallMemoryEvidence {
+    pub(crate) fn new(
+        binding: GuardianMemoryBindingDigest,
+        target: TargetDescriptor,
+        observed_at: String,
+        suppression_until: String,
+    ) -> Result<Self, GuardianInstallTerminalEvidenceError> {
+        let memory = Self {
+            binding,
+            target,
+            observed_at,
+            suppression_until,
+        };
+        memory.validate()?;
+        Ok(memory)
+    }
+
+    pub const fn binding(&self) -> GuardianMemoryBindingDigest {
+        self.binding
+    }
+
+    pub fn target(&self) -> &TargetDescriptor {
+        &self.target
+    }
+
+    pub fn observed_at(&self) -> &str {
+        &self.observed_at
+    }
+
+    pub fn suppression_until(&self) -> &str {
+        &self.suppression_until
+    }
+
+    fn validate(&self) -> Result<(), GuardianInstallTerminalEvidenceError> {
+        if self.target.system != StabilizationSystem::Execution
+            || self.target.kind != TargetKind::Artifact
+            || !matches!(
+                self.target.ownership,
+                OwnershipClass::LauncherManaged | OwnershipClass::ExternalProviderDerived
+            )
+            || TargetDescriptor::new(
+                self.target.system,
+                self.target.kind,
+                &self.target.id,
+                self.target.ownership,
+            ) != self.target
+        {
+            return Err(GuardianInstallTerminalEvidenceError::Target);
+        }
+        let observed_at = canonical_guardian_install_timestamp(&self.observed_at)
+            .ok_or(GuardianInstallTerminalEvidenceError::Window)?;
+        let suppression_until = canonical_guardian_install_timestamp(&self.suppression_until)
+            .ok_or(GuardianInstallTerminalEvidenceError::Window)?;
+        if observed_at.checked_add_signed(chrono::Duration::minutes(5)) != Some(suppression_until) {
+            return Err(GuardianInstallTerminalEvidenceError::Window);
+        }
+        Ok(())
+    }
+}
+
+fn canonical_guardian_install_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if value.len() > 40 {
+        return None;
+    }
+    let parsed = chrono::DateTime::parse_from_rfc3339(value)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    (parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) == value).then_some(parsed)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct GuardianMemoryBindingDigest([u8; 32]);
+
+impl GuardianMemoryBindingDigest {
+    pub(crate) const fn from_sha256(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl Serialize for GuardianMemoryBindingDigest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut encoded = String::with_capacity(64);
+        for byte in self.0 {
+            encoded.push(LOWER_HEX[usize::from(byte >> 4)] as char);
+            encoded.push(LOWER_HEX[usize::from(byte & 0x0f)] as char);
+        }
+        serializer.serialize_str(&encoded)
+    }
+}
+
+impl<'de> Deserialize<'de> for GuardianMemoryBindingDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        if encoded.len() != 64
+            || !encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(serde::de::Error::custom(
+                "Guardian memory binding must be a lowercase SHA-256 digest",
+            ));
+        }
+        let mut digest = [0_u8; 32];
+        for (output, pair) in digest.iter_mut().zip(encoded.as_bytes().chunks_exact(2)) {
+            *output = (lower_hex_nibble(pair[0]) << 4) | lower_hex_nibble(pair[1]);
+        }
+        Ok(Self(digest))
+    }
+}
+
+const fn lower_hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => 0,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationJournalEntry {
@@ -1217,6 +1643,7 @@ pub struct OperationJournalEntry {
     pub(super) reconciliation_terminal: Option<ReconciliationTerminal>,
     pub(super) persisted_state_repair_attempt: Option<PersistedStateRepairAttempt>,
     pub(super) persisted_state_repair_terminal: Option<PersistedStateRepairTerminal>,
+    pub(crate) guardian_install_terminal: Option<GuardianInstallTerminalEvidence>,
 }
 
 impl OperationJournalEntry {
@@ -1249,11 +1676,16 @@ impl OperationJournalEntry {
             reconciliation_terminal: None,
             persisted_state_repair_attempt: None,
             persisted_state_repair_terminal: None,
+            guardian_install_terminal: None,
         }
     }
 
     pub(crate) fn reconciliation_terminal(&self) -> Option<&ReconciliationTerminal> {
         self.reconciliation_terminal.as_ref()
+    }
+
+    pub fn guardian_install_terminal(&self) -> Option<&GuardianInstallTerminalEvidence> {
+        self.guardian_install_terminal.as_ref()
     }
 
     pub(crate) fn performance_lifecycle(&self) -> Option<&PerformanceOperationLifecycle> {
@@ -1282,6 +1714,177 @@ impl OperationJournalEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationMetricsValidationError {
+    InvalidTier2IntegrityMetrics,
+    ContentDownloadMetricOverflow,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tier2IntegrityMetrics {
+    selected_entry_count: u64,
+    verified_entry_count: u64,
+    processed_entry_count: u64,
+    hashed_entry_count: u64,
+    expected_content_byte_count: u64,
+    content_read_byte_count: u64,
+    metadata_lookup_count: u64,
+    link_lookup_count: u64,
+    suppressed_fact_count: u64,
+}
+
+impl Tier2IntegrityMetrics {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        selected_entry_count: u64,
+        verified_entry_count: u64,
+        processed_entry_count: u64,
+        hashed_entry_count: u64,
+        expected_content_byte_count: u64,
+        content_read_byte_count: u64,
+        metadata_lookup_count: u64,
+        link_lookup_count: u64,
+        suppressed_fact_count: u64,
+    ) -> Result<Self, OperationMetricsValidationError> {
+        let metrics = Self {
+            selected_entry_count,
+            verified_entry_count,
+            processed_entry_count,
+            hashed_entry_count,
+            expected_content_byte_count,
+            content_read_byte_count,
+            metadata_lookup_count,
+            link_lookup_count,
+            suppressed_fact_count,
+        };
+        metrics.validate()?;
+        Ok(metrics)
+    }
+
+    pub const fn selected_entry_count(&self) -> u64 {
+        self.selected_entry_count
+    }
+
+    pub const fn verified_entry_count(&self) -> u64 {
+        self.verified_entry_count
+    }
+
+    pub const fn processed_entry_count(&self) -> u64 {
+        self.processed_entry_count
+    }
+
+    pub const fn hashed_entry_count(&self) -> u64 {
+        self.hashed_entry_count
+    }
+
+    pub const fn expected_content_byte_count(&self) -> u64 {
+        self.expected_content_byte_count
+    }
+
+    pub const fn content_read_byte_count(&self) -> u64 {
+        self.content_read_byte_count
+    }
+
+    pub const fn metadata_lookup_count(&self) -> u64 {
+        self.metadata_lookup_count
+    }
+
+    pub const fn link_lookup_count(&self) -> u64 {
+        self.link_lookup_count
+    }
+
+    pub const fn suppressed_fact_count(&self) -> u64 {
+        self.suppressed_fact_count
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), OperationMetricsValidationError> {
+        let entry_limit = MAX_TIER2_ENTRIES as u64;
+        if self.selected_entry_count > entry_limit
+            || self.verified_entry_count > self.processed_entry_count
+            || self.processed_entry_count > self.selected_entry_count
+            || self.hashed_entry_count > self.processed_entry_count
+            || self.metadata_lookup_count > self.processed_entry_count
+            || self
+                .hashed_entry_count
+                .checked_add(self.metadata_lookup_count)
+                .is_none_or(|observed| observed > self.processed_entry_count)
+            || self.link_lookup_count > self.metadata_lookup_count
+            || self.suppressed_fact_count > self.selected_entry_count
+            || self.expected_content_byte_count > MAX_TIER2_AGGREGATE_BYTES
+            || self.content_read_byte_count > self.expected_content_byte_count
+        {
+            return Err(OperationMetricsValidationError::InvalidTier2IntegrityMetrics);
+        }
+        Ok(())
+    }
+}
+
+macro_rules! content_download_metrics {
+    ($($field:ident),+ $(,)?) => {
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct ContentDownloadMetrics {
+            $($field: u64),+
+        }
+
+        impl ContentDownloadMetrics {
+            #[allow(clippy::too_many_arguments)]
+            pub(crate) const fn new($($field: u64),+) -> Self {
+                Self { $($field),+ }
+            }
+
+            #[cfg(test)]
+            pub(crate) const fn zero() -> Self {
+                Self { $($field: 0),+ }
+            }
+
+            $(
+                pub const fn $field(&self) -> u64 {
+                    self.$field
+                }
+            )+
+        }
+    };
+}
+
+content_download_metrics! {
+    checksum_mismatch,
+    metadata_invalid,
+    metadata_missing,
+    interrupted,
+    network_failure,
+    permission_failure,
+    promote_failed,
+    provider_failure,
+    size_mismatch,
+    temp_discarded,
+    temp_write_failed,
+    written_to_temp,
+    promoted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "values",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum OperationStepMetrics {
+    Tier2Integrity(Tier2IntegrityMetrics),
+    ContentDownload(ContentDownloadMetrics),
+}
+
+impl OperationStepMetrics {
+    pub(crate) fn validate(&self) -> Result<(), OperationMetricsValidationError> {
+        match self {
+            Self::Tier2Integrity(metrics) => metrics.validate(),
+            Self::ContentDownload(_) => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationJournalStep {
@@ -1291,6 +1894,8 @@ pub struct OperationJournalStep {
     pub changed_target: Option<TargetDescriptor>,
     pub generated_facts: Vec<String>,
     pub rollback: RollbackState,
+    guardian_fact_ids: Vec<GuardianFactId>,
+    metrics: Option<OperationStepMetrics>,
 }
 
 impl OperationJournalStep {
@@ -1302,8 +1907,42 @@ impl OperationJournalStep {
             changed_target: None,
             generated_facts: Vec::new(),
             rollback: RollbackState::NotApplicable,
+            guardian_fact_ids: Vec::new(),
+            metrics: None,
         }
     }
+
+    pub fn guardian_fact_ids(&self) -> &[GuardianFactId] {
+        &self.guardian_fact_ids
+    }
+
+    pub fn metrics(&self) -> Option<&OperationStepMetrics> {
+        self.metrics.as_ref()
+    }
+
+    pub(crate) fn set_metrics(&mut self, metrics: OperationStepMetrics) {
+        self.metrics = Some(metrics);
+    }
+
+    pub(super) fn merge_guardian_fact_ids(&mut self, fact_ids: &[GuardianFactId]) {
+        for fact_id in fact_ids {
+            if !self.guardian_fact_ids.contains(fact_id) {
+                self.guardian_fact_ids.push(*fact_id);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_guardian_fact_ids_for_test(&mut self, fact_ids: Vec<GuardianFactId>) {
+        self.guardian_fact_ids = fact_ids;
+    }
+}
+
+fn contains_duplicate<T: Eq>(values: &[T]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| values[..index].contains(value))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -1334,17 +1973,22 @@ pub enum RollbackState {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
-        OperationOutcome, OperationPhase, OperationStatus, OwnershipClass,
-        PersistedStateRecordStore, ReconciliationAttempt, ReconciliationComponent,
-        ReconciliationIncarnationFingerprint, ReconciliationInventoryFingerprint,
-        ReconciliationLineage, ReconciliationQuarantineCheckpoint, ReconciliationQuarantineRecord,
-        ReconciliationRung, ReconciliationScope, ReconciliationTerminal,
-        ReconciliationTerminalOutcome, ReconciliationTerminalValidationError,
-        ReconciliationVersionBundleOutcome, RestartStableRecordIdentity, RollbackState,
-        StabilizationSystem, TargetDescriptor, TargetKind,
+        CommandKind, ContentDownloadMetrics, DurableGuardianEvidence, DurableGuardianEvidenceError,
+        GuardianInstallMemoryEvidence, GuardianInstallTerminalEvidence,
+        GuardianInstallTerminalEvidenceError, GuardianMemoryBindingDigest, JournalId, OperationId,
+        OperationJournalEntry, OperationJournalStep, OperationOutcome, OperationPhase,
+        OperationStatus, OwnershipClass, PersistedStateRecordStore, ReconciliationAttempt,
+        ReconciliationComponent, ReconciliationIncarnationFingerprint,
+        ReconciliationInventoryFingerprint, ReconciliationLineage,
+        ReconciliationQuarantineCheckpoint, ReconciliationQuarantineRecord, ReconciliationRung,
+        ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
+        ReconciliationTerminalValidationError, ReconciliationVersionBundleOutcome,
+        RestartStableRecordIdentity, RollbackState, StabilizationSystem, TargetDescriptor,
+        TargetKind, Tier2IntegrityMetrics,
     };
-    use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
+    use crate::guardian::{
+        DiagnosisId, GuardianActionKind, GuardianDomain, GuardianFactId, GuardianMode,
+    };
     use static_assertions::assert_not_impl_any;
     use std::collections::HashSet;
     use std::path::Path;
@@ -1355,6 +1999,214 @@ mod tests {
             AsRef<[u8]>
     );
     assert_not_impl_any!(OperationId: Copy, Default, AsRef<str>, From<String>);
+
+    #[test]
+    fn behavior_contract_failure_memory_ids_preserve_exact_historical_literals() {
+        for system in StabilizationSystem::ALL {
+            assert_eq!(system.failure_memory_id(), format!("{system:?}"));
+        }
+        for kind in TargetKind::ALL {
+            assert_eq!(kind.failure_memory_id(), format!("{kind:?}"));
+        }
+        for ownership in OwnershipClass::ALL {
+            assert_eq!(ownership.failure_memory_id(), format!("{ownership:?}"));
+        }
+        for rung in ReconciliationRung::ALL {
+            assert_eq!(rung.failure_memory_id(), format!("{rung:?}"));
+        }
+        for component in ReconciliationComponent::ALL {
+            assert_eq!(component.failure_memory_id(), format!("{component:?}"));
+        }
+        for store in PersistedStateRecordStore::ALL {
+            assert_eq!(store.failure_memory_id(), format!("{store:?}"));
+        }
+    }
+
+    #[test]
+    fn behavior_contract_durable_evidence_is_bounded_unique_and_operation_owned() {
+        let operation_id = OperationId::deterministic_test("evidence-contracts-durable-evidence");
+        let evidence = DurableGuardianEvidence::new(
+            operation_id.clone(),
+            vec![GuardianFactId::ArtifactMissing],
+            vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+            None,
+        )
+        .expect("valid evidence projection");
+        assert_eq!(evidence.operation_id(), &operation_id);
+        assert_eq!(evidence.fact_ids(), [GuardianFactId::ArtifactMissing]);
+        assert_eq!(
+            evidence.diagnosis_ids(),
+            [DiagnosisId::LauncherManagedArtifactCorrupt]
+        );
+        assert_eq!(
+            DurableGuardianEvidence::new(operation_id.clone(), Vec::new(), Vec::new(), None),
+            Err(DurableGuardianEvidenceError::Empty)
+        );
+        assert_eq!(
+            DurableGuardianEvidence::new(
+                operation_id,
+                vec![GuardianFactId::ArtifactMissing; 2],
+                Vec::new(),
+                None,
+            ),
+            Err(DurableGuardianEvidenceError::DuplicateFact)
+        );
+
+        let operation_id =
+            OperationId::deterministic_test("evidence-contracts-exact-evidence-caps");
+        let exact_facts = GuardianFactId::ALL[..super::MAX_DURABLE_GUARDIAN_FACT_IDS].to_vec();
+        let exact_diagnoses = DiagnosisId::ALL[..super::MAX_DURABLE_GUARDIAN_DIAGNOSES].to_vec();
+        assert!(
+            DurableGuardianEvidence::new(operation_id.clone(), exact_facts, exact_diagnoses, None,)
+                .is_ok(),
+            "the exact closed evidence limits must remain admissible"
+        );
+        assert_eq!(
+            DurableGuardianEvidence::new(
+                operation_id.clone(),
+                GuardianFactId::ALL[..=super::MAX_DURABLE_GUARDIAN_FACT_IDS].to_vec(),
+                Vec::new(),
+                None,
+            ),
+            Err(DurableGuardianEvidenceError::TooManyFacts)
+        );
+        assert_eq!(
+            DurableGuardianEvidence::new(
+                operation_id,
+                vec![GuardianFactId::ArtifactMissing],
+                DiagnosisId::ALL[..=super::MAX_DURABLE_GUARDIAN_DIAGNOSES].to_vec(),
+                None,
+            ),
+            Err(DurableGuardianEvidenceError::TooManyDiagnoses)
+        );
+    }
+
+    #[test]
+    fn behavior_contract_install_memory_requires_millis_z_and_exact_five_minutes() {
+        let target = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            "minecraft_client_1.21.5",
+            OwnershipClass::LauncherManaged,
+        );
+        let digest = GuardianMemoryBindingDigest::from_sha256([0x5a; 32]);
+        let memory = GuardianInstallMemoryEvidence::new(
+            digest,
+            target.clone(),
+            "2026-08-13T10:00:00.000Z".to_string(),
+            "2026-08-13T10:05:00.000Z".to_string(),
+        )
+        .expect("canonical exact five-minute memory");
+        assert_eq!(memory.binding().as_bytes(), &[0x5a; 32]);
+        assert_eq!(memory.target(), &target);
+        assert_eq!(
+            GuardianInstallMemoryEvidence::new(
+                digest,
+                target.clone(),
+                "2026-08-13T12:00:00.000+02:00".to_string(),
+                "2026-08-13T12:05:00.000+02:00".to_string(),
+            ),
+            Err(GuardianInstallTerminalEvidenceError::Window)
+        );
+        assert_eq!(
+            GuardianInstallMemoryEvidence::new(
+                digest,
+                target,
+                "2026-08-13T10:00:00Z".to_string(),
+                "2026-08-13T10:05:00Z".to_string(),
+            ),
+            Err(GuardianInstallTerminalEvidenceError::Window)
+        );
+        let terminal = GuardianInstallTerminalEvidence::new(
+            DiagnosisId::DownloadUnavailable,
+            GuardianActionKind::Retry,
+            Some(memory),
+        )
+        .expect("Retry owns exact memory");
+        assert_eq!(terminal.action(), GuardianActionKind::Retry);
+    }
+
+    #[test]
+    fn behavior_contract_install_terminal_deserialization_preserves_private_invariants() {
+        let memory = serde_json::json!({
+            "binding": "5a".repeat(32),
+            "target": {
+                "system": "Execution",
+                "kind": "Artifact",
+                "id": "minecraft_client_1.21.5",
+                "ownership": "LauncherManaged"
+            },
+            "observed_at": "2026-08-13T10:00:00.000Z",
+            "suppression_until": "2026-08-13T10:05:00.000Z"
+        });
+        let valid = serde_json::json!({
+            "diagnosis_id": "download_unavailable",
+            "action": "Retry",
+            "memory": memory
+        });
+        assert!(serde_json::from_value::<GuardianInstallTerminalEvidence>(valid.clone()).is_ok());
+
+        let mut missing_memory = valid.clone();
+        missing_memory["memory"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<GuardianInstallTerminalEvidence>(missing_memory).is_err());
+
+        let mut memory_on_block = valid.clone();
+        memory_on_block["action"] = serde_json::Value::String("Block".to_string());
+        assert!(
+            serde_json::from_value::<GuardianInstallTerminalEvidence>(memory_on_block).is_err()
+        );
+
+        let mut noncanonical_timestamp = valid.clone();
+        noncanonical_timestamp["memory"]["observed_at"] =
+            serde_json::Value::String("2026-08-13T10:00:00Z".to_string());
+        assert!(
+            serde_json::from_value::<GuardianInstallTerminalEvidence>(noncanonical_timestamp)
+                .is_err()
+        );
+
+        let mut uppercase_binding = valid.clone();
+        uppercase_binding["memory"]["binding"] = serde_json::Value::String("5A".repeat(32));
+        assert!(
+            serde_json::from_value::<GuardianInstallTerminalEvidence>(uppercase_binding).is_err()
+        );
+
+        let mut unknown = valid;
+        unknown["future"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<GuardianInstallTerminalEvidence>(unknown).is_err());
+    }
+
+    #[test]
+    fn behavior_contract_tier2_metrics_reject_invalid_shapes() {
+        assert!(Tier2IntegrityMetrics::new(1, 1, 1, 1, 1, 1, 0, 0, 0).is_ok());
+        assert!(Tier2IntegrityMetrics::new(1, 2, 1, 1, 1, 1, 0, 0, 0).is_err());
+        assert!(
+            Tier2IntegrityMetrics::new(2, 1, 1, 1, 1, 1, 1, 1, 0).is_err(),
+            "hash plus metadata work cannot exceed processed entries"
+        );
+    }
+
+    #[test]
+    fn behavior_contract_content_metrics_round_trip_exact_u64_maximum() {
+        let maximum = ContentDownloadMetrics::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+        );
+        let encoded = serde_json::to_string(&maximum).expect("encode exact u64 maxima");
+        let decoded = serde_json::from_str::<ContentDownloadMetrics>(&encoded)
+            .expect("decode exact u64 maxima");
+        assert_eq!(decoded, maximum);
+    }
 
     #[test]
     fn operation_id_has_one_exact_wire_representation() {
@@ -1633,7 +2485,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b09_contract_every_reconciliation_rung_rejects_unowned_and_non_managed_attempts() {
+    fn behavior_contract_every_reconciliation_rung_rejects_unowned_and_non_managed_attempts() {
         let rung_shapes = [
             (
                 ReconciliationRung::RepairArtifact,

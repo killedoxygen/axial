@@ -1,13 +1,13 @@
 use super::{
     FactReliability, GuardianActionKind, GuardianConfidence, GuardianDecision, GuardianDomain,
     GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianSeverity,
-    SafetyCase, build_safety_case, decide_guardian_policy,
+    OperationEvidenceBatch,
 };
 use crate::observability::{
     EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_token,
 };
 use crate::state::contracts::{
-    OperationId, OperationPhase, OwnershipClass, RollbackState, StabilizationSystem,
+    DurableGuardianEvidence, OperationPhase, OwnershipClass, RollbackState, StabilizationSystem,
     TargetDescriptor, TargetKind,
 };
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
@@ -25,12 +25,11 @@ pub enum GuardianPerformanceOperationKind {
 
 #[derive(Clone, Debug)]
 pub struct GuardianPerformanceSupervisionRequest<'a> {
-    pub operation_id: Option<OperationId>,
     pub mode: GuardianMode,
     pub phase: OperationPhase,
     pub operation: GuardianPerformanceOperationKind,
     pub target: TargetDescriptor,
-    pub facts: &'a [GuardianFact],
+    pub evidence: &'a OperationEvidenceBatch,
     pub rollback_state: RollbackState,
     pub context: GuardianPolicyContext,
 }
@@ -41,6 +40,7 @@ pub struct GuardianPerformanceSupervisionPlan {
     pub target: TargetDescriptor,
     pub decision: GuardianDecision,
     pub fact_ids: Vec<GuardianFactId>,
+    pub(crate) durable_evidence: Option<DurableGuardianEvidence>,
     pub rollback_authorized: bool,
     pub public_summary: String,
 }
@@ -71,22 +71,24 @@ pub fn plan_performance_supervision(
     {
         return Err(GuardianPerformanceSupervisionRejection::RollbackUnavailable);
     }
-    let safety_case = if request.facts.is_empty() {
-        SafetyCase {
-            operation_id: request.operation_id.clone(),
-            mode: request.mode,
-            phase: request.phase,
-            diagnoses: Vec::new(),
-        }
-    } else {
-        build_safety_case(
-            request.operation_id.clone(),
-            request.mode,
-            request.phase,
-            request.facts,
+    let assessment = super::assess_operation_evidence(
+        request.mode,
+        request.phase,
+        request.evidence,
+        request.context,
+    );
+    let durable_evidence = if request.evidence.facts().is_empty() {
+        None
+    } else if request.evidence.operation_id().is_some() {
+        Some(
+            assessment
+                .durable_evidence(request.evidence, None)
+                .map_err(|_| GuardianPerformanceSupervisionRejection::GuardianBlocked)?,
         )
+    } else {
+        None
     };
-    let decision = decide_guardian_policy(&safety_case, request.context);
+    let decision = assessment.decision().clone();
 
     if !performance_supervision_allows(request.operation, decision.kind()) {
         return Err(GuardianPerformanceSupervisionRejection::GuardianBlocked);
@@ -95,7 +97,13 @@ pub fn plan_performance_supervision(
         operation: request.operation,
         target: request.target,
         decision,
-        fact_ids: request.facts.iter().map(|fact| fact.id).collect(),
+        fact_ids: request
+            .evidence
+            .facts()
+            .iter()
+            .map(|fact| fact.id)
+            .collect(),
+        durable_evidence,
         rollback_authorized: matches!(
             request.operation,
             GuardianPerformanceOperationKind::RollbackManagedComposition
@@ -386,7 +394,10 @@ mod tests {
         };
 
         let facts = performance_plan_guardian_facts(&plan, OperationPhase::Planning);
-        let diagnoses = diagnose(&facts, OperationPhase::Planning);
+        let diagnoses = diagnose(
+            &crate::guardian::unscoped_evidence_for_test(&facts),
+            OperationPhase::Planning,
+        );
 
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].id.as_str(), "performance_fallback_selected");
@@ -420,7 +431,10 @@ mod tests {
         assert_eq!(fact.id.as_str(), "performance_user_owned_conflict");
         assert_eq!(fact.ownership, OwnershipClass::UserOwned);
         assert_eq!(fact.severity, Some(GuardianSeverity::Blocking));
-        let diagnoses = diagnose(&[fact], OperationPhase::Validating);
+        let diagnoses = diagnose(
+            &crate::guardian::unscoped_evidence_for_test(&[fact]),
+            OperationPhase::Validating,
+        );
         assert_eq!(
             diagnoses[0].id().as_str(),
             "performance_user_owned_conflict"
@@ -442,14 +456,14 @@ mod tests {
             fallback_reason: "A faster performance bundle is not compatible.".to_string(),
         };
         let facts = performance_plan_guardian_facts(&plan, OperationPhase::Installing);
+        let evidence = crate::guardian::unscoped_evidence_for_test(&facts);
 
         let supervision = plan_performance_supervision(GuardianPerformanceSupervisionRequest {
-            operation_id: None,
             mode: GuardianMode::Managed,
             phase: OperationPhase::Installing,
             operation: GuardianPerformanceOperationKind::ApplyManagedComposition,
             target: performance_target("family-f-fabric-core", OwnershipClass::CompositionManaged),
-            facts: &facts,
+            evidence: &evidence,
             rollback_state: RollbackState::Available,
             context: GuardianPolicyContext::current_operation(),
         })
@@ -468,13 +482,13 @@ mod tests {
 
     #[test]
     fn performance_supervision_rejects_user_owned_mutation_target() {
+        let evidence = crate::guardian::unscoped_evidence_for_test(&[]);
         let error = plan_performance_supervision(GuardianPerformanceSupervisionRequest {
-            operation_id: None,
             mode: GuardianMode::Managed,
             phase: OperationPhase::Installing,
             operation: GuardianPerformanceOperationKind::ApplyManagedComposition,
             target: performance_target("user-mods", OwnershipClass::UserOwned),
-            facts: &[],
+            evidence: &evidence,
             rollback_state: RollbackState::Unavailable,
             context: GuardianPolicyContext::current_operation(),
         })
@@ -487,14 +501,14 @@ mod tests {
     }
 
     #[test]
-    fn p02_b05_contract_cross_owner_performance_rejects_unavailable_rollback() {
+    fn behavior_contract_cross_owner_performance_rejects_unavailable_rollback() {
+        let evidence = crate::guardian::unscoped_evidence_for_test(&[]);
         let rejection = plan_performance_supervision(GuardianPerformanceSupervisionRequest {
-            operation_id: None,
             mode: GuardianMode::Managed,
             phase: OperationPhase::RollingBack,
             operation: GuardianPerformanceOperationKind::RollbackManagedComposition,
             target: performance_target("family-f-fabric-core", OwnershipClass::CompositionManaged),
-            facts: &[],
+            evidence: &evidence,
             rollback_state: RollbackState::Unavailable,
             context: GuardianPolicyContext::current_operation(),
         })

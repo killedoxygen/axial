@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_recovery_journal_diagnostic_transitions_are_closed_tokens() {
+    fn behavior_contract_recovery_journal_diagnostic_transitions_are_closed_tokens() {
         assert_eq!(
             launch_recovery_journal_transition_name(
                 GuardianLaunchRecoveryJournalTransition::Attempt
@@ -1391,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b11_contract_cross_owner_recovery_uses_application_instance_identity() {
+    fn behavior_contract_cross_owner_recovery_uses_application_instance_identity() {
         let root = Path::new("/tmp/axial-test");
         let intent = test_launch_intent(root, "application-session");
         let application_instance_id = "application-instance";

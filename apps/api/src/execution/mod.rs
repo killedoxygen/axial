@@ -21,7 +21,7 @@ use crate::observability::{
 };
 use crate::state::contracts::{OperationId, TargetDescriptor};
 use axial_launcher::LaunchStageEvidence;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 const MAX_STAGE_EVIDENCE_DETAILS: usize = 8;
 
@@ -52,7 +52,7 @@ impl ExecutionFactSemantics {
 
 macro_rules! execution_fact_kinds {
     ($($variant:ident => ($id:literal, $semantics:ident)),+ $(,)?) => {
-        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub enum ExecutionFactKind {
             $($variant),+
         }
@@ -71,6 +71,33 @@ macro_rules! execution_fact_kinds {
                     $(Self::$variant => ExecutionFactSemantics::$semantics),+
                 }
             }
+
+            fn from_wire(value: &str) -> Option<Self> {
+                Self::ALL
+                    .iter()
+                    .copied()
+                    .find(|candidate| candidate.as_str() == value)
+            }
+        }
+
+        impl Serialize for ExecutionFactKind {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for ExecutionFactKind {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::from_wire(&value)
+                    .ok_or_else(|| D::Error::custom("unknown Execution fact kind"))
+            }
         }
     };
 }
@@ -86,6 +113,7 @@ execution_fact_kinds! {
     DownloadPromotionFailed => ("download_promotion_failed", Diagnostic),
     DownloadProviderFailure => ("download_provider_failure", Diagnostic),
     DownloadSizeMismatch => ("download_size_mismatch", Diagnostic),
+    DownloadTempDiscarded => ("download_temp_discarded", NonFailure),
     DownloadTempWriteFailed => ("download_temp_write_failed", Diagnostic),
     DownloadWrittenToTemp => ("download_written_to_temp", NonFailure),
     FileMissing => ("file_missing", Diagnostic),
@@ -198,4 +226,35 @@ fn execution_fact_stage_details(fields: &[EvidenceField]) -> Vec<String> {
         })
         .take(MAX_STAGE_EVIDENCE_DETAILS)
         .collect()
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::{ExecutionFactKind, ExecutionFactSemantics};
+
+    #[test]
+    fn behavior_contract_execution_fact_kind_registry_is_unique_and_strict() {
+        let mut ids = ExecutionFactKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>();
+        let original_len = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+
+        assert_eq!(ids.len(), original_len);
+        for kind in ExecutionFactKind::ALL {
+            let encoded = serde_json::to_string(kind).expect("serialize execution fact kind");
+            assert_eq!(
+                serde_json::from_str::<ExecutionFactKind>(&encoded)
+                    .expect("deserialize execution fact kind"),
+                *kind
+            );
+        }
+        assert!(serde_json::from_str::<ExecutionFactKind>("\"DownloadPromoted\"").is_err());
+        assert_eq!(
+            ExecutionFactKind::DownloadTempDiscarded.semantics(),
+            ExecutionFactSemantics::NonFailure
+        );
+    }
 }

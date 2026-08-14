@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn p01_b01_contract_cross_owner() {
+    fn native_filesystem_contract_cross_owner() {
         let root = absolute_root("cross-owner");
         let paths = resolve_app_paths_with_local_data(AppRootSelection::test(root.clone()), None)
             .expect("explicit test root");
@@ -407,8 +407,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b07_contract_typed_loader_gates_serving_and_joins_owned_work() {
-        let root = absolute_root("p02-b07-typed-loader");
+    async fn behavior_contract_typed_loader_gates_serving_and_joins_owned_work() {
+        let root = absolute_root("bootstrap-lifecycle-typed-loader");
         let _ = std::fs::remove_dir_all(&root);
         let loaded = load_application(ApplicationLoadRequest {
             root: AppRootSelection::test(root.clone()),
@@ -441,9 +441,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p02_b07_contract_cross_owner_refuses_mismatched_request_handoff() {
-        let first_root = absolute_root("p02-b07-first-state");
-        let second_root = absolute_root("p02-b07-second-state");
+    async fn behavior_contract_cross_owner_refuses_mismatched_request_handoff() {
+        let first_root = absolute_root("bootstrap-lifecycle-first-state");
+        let second_root = absolute_root("bootstrap-lifecycle-second-state");
         let _ = std::fs::remove_dir_all(&first_root);
         let _ = std::fs::remove_dir_all(&second_root);
         let first = load_application(ApplicationLoadRequest {

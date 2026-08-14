@@ -7,9 +7,9 @@ use crate::execution::runtime::{
 use crate::guardian::{
     DiagnosisId, GuardianComponentRebuildOutcome, GuardianComponentRebuildStatus,
     GuardianPreflightOutcomeRequest, GuardianRepairStatus, GuardianRuntimeRepairCopy,
-    authorize_managed_runtime_ready_marker_repair, execute_managed_runtime_component_rebuild,
-    execute_managed_runtime_ready_marker_repair, guardian_fact_from_execution,
-    guardian_preflight_outcome,
+    OperationEvidenceBatch, authorize_managed_runtime_ready_marker_repair,
+    execute_managed_runtime_component_rebuild, execute_managed_runtime_ready_marker_repair,
+    try_guardian_preflight_outcome,
 };
 use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
@@ -138,15 +138,16 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
     let Err(verification_error) = verification else {
         return Ok(preflight);
     };
-    let guardian_facts = verification_error
-        .facts
-        .iter()
-        .map(|fact| guardian_fact_from_execution(fact, OperationPhase::Validating))
-        .collect::<Vec<_>>();
-    let repair_outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
+    let evidence = OperationEvidenceBatch::try_from_execution_unscoped(
+        OperationPhase::Validating,
+        &verification_error.facts,
+    )
+    .map_err(|_| OperationJournalStoreError::InvalidGuardianOutcome)?;
+    let repair_outcome = try_guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
         api_guardian_mode(preflight.guardian.mode),
-        &guardian_facts,
-    ));
+        evidence.facts(),
+    ))
+    .map_err(|_| OperationJournalStoreError::InvalidGuardianOutcome)?;
     match state.active_recorded_runtime_artifact_failure(launch.instance_lifecycle) {
         Ok(evidence) => {
             let diagnosis_id = Some(evidence.diagnosis_id());
@@ -405,7 +406,8 @@ async fn finish_managed_runtime_repair(
                 },
                 prior_java_probe_receipt,
             )
-            .await;
+            .await
+            .map_err(|_| OperationJournalStoreError::InvalidGuardianOutcome)?;
             repaired.guardian_summary = repair_copy.guardian_summary(&repaired.guardian_summary);
             Ok(repaired)
         }

@@ -88,7 +88,7 @@ function budgets(maximum = 100_000) {
 }
 
 async function fixture() {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'axial-p00-b05-'));
+  const root = await mkdtemp(path.join(os.tmpdir(), 'axial-frontend-generation-'));
   await mkdir(path.join(root, 'src'), { recursive: true });
   await mkdir(path.join(root, 'static'), { recursive: true });
   await writeFile(
@@ -201,7 +201,7 @@ test('asset and budget manifests are canonical closed inputs', () => {
 });
 
 test('graph projection deduplicates imports with static reachability winning', () => {
-  const root = path.join(os.tmpdir(), 'axial-p00-b05-graph');
+  const root = path.join(os.tmpdir(), 'axial-frontend-generation-graph');
   const outputRoot = path.join(root, 'dist');
   const app = path.join(outputRoot, 'app.js');
   const shared = path.join(outputRoot, 'chunks/shared.js');
@@ -439,7 +439,7 @@ test('independent staged verification rejects malformed output before replacemen
 
 test('capability proof rebuilds a stale valid generation before attestation', async () => {
   const existing = await fixture();
-  const repository = await mkdtemp(path.join(os.tmpdir(), 'axial-p00-b05-capability-'));
+  const repository = await mkdtemp(path.join(os.tmpdir(), 'axial-frontend-generation-capability-'));
   const frontendRoot = path.join(repository, 'frontend');
   try {
     await renameFile(existing.root, frontendRoot);
@@ -489,7 +489,7 @@ test('clean removes current generations and retired generated static outputs onl
 });
 
 test('clean remains dependency-free when node_modules is absent', async () => {
-  const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'axial-p00-b05-clean-'));
+  const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'axial-frontend-generation-clean-'));
   const frontendRoot = path.join(fixtureRoot, 'frontend');
   try {
     await mkdir(frontendRoot);
@@ -601,7 +601,7 @@ test('the real development server starts and serves the frontend within a bound'
 
 test('promotion faults preserve or recover exactly one complete generation', async () => {
   for (const failure of ['move-current', 'promote-stage', 'restore-current', 'remove-previous']) {
-    const root = await mkdtemp(path.join(os.tmpdir(), `axial-p00-b05-${failure}-`));
+    const root = await mkdtemp(path.join(os.tmpdir(), `axial-frontend-generation-${failure}-`));
     const outputRoot = path.join(root, 'dist');
     const stage = path.join(root, 'dist.stage-test');
     try {
@@ -658,7 +658,7 @@ test('hard exits at both promotion boundaries reconcile without a partial tree',
     [1, 'old'],
     [2, 'new'],
   ]) {
-    const root = await mkdtemp(path.join(os.tmpdir(), `axial-p00-b05-crash-${boundary}-`));
+    const root = await mkdtemp(path.join(os.tmpdir(), `axial-frontend-generation-crash-${boundary}-`));
     const outputRoot = path.join(root, 'dist');
     const stage = path.join(root, 'dist.stage-test');
     try {
@@ -728,7 +728,7 @@ test('crash residue is reconciled before a failing rebuild can return', async ()
 });
 
 test('reconciliation never promotes a linked previous generation', async (context) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'axial-p00-b05-linked-previous-'));
+  const root = await mkdtemp(path.join(os.tmpdir(), 'axial-frontend-generation-linked-previous-'));
   const outputRoot = path.join(root, 'dist');
   const previous = `${outputRoot}.previous-forged`;
   const target = path.join(root, 'target');
@@ -878,7 +878,7 @@ test('accepted local connections cannot delay lease release or reacquisition', a
 });
 
 test('filesystem aliases resolve to the same lease identity when supported', async (context) => {
-  const container = await mkdtemp(path.join(os.tmpdir(), 'axial-p00-b05-alias-'));
+  const container = await mkdtemp(path.join(os.tmpdir(), 'axial-frontend-generation-alias-'));
   const realRoot = path.join(container, 'real');
   const aliasRoot = path.join(container, 'alias');
   /** @type {(() => Promise<void>) | undefined} */
@@ -907,7 +907,7 @@ test('filesystem aliases resolve to the same lease identity when supported', asy
 });
 
 test('portable case variants map to one publication lease', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'axial-p00-b05-case-'));
+  const root = await mkdtemp(path.join(os.tmpdir(), 'axial-frontend-generation-case-'));
   try {
     assert.equal(
       await frontendGenerationLeasePort(path.join(root, 'dist')),

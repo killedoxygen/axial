@@ -1,12 +1,10 @@
+use super::facts::{EvidenceFactSource, SourcedOperationEvidenceBatch};
 use super::{
     FactReliability, GuardianActionKind, GuardianConfidence, GuardianCopyRequest, GuardianDecision,
     GuardianDirective, GuardianDomain, GuardianFact, GuardianFactId, GuardianManagedJavaReason,
     GuardianMode, GuardianPolicyContext, GuardianSeverity, GuardianStripJvmArgsReason,
-    GuardianUserOutcome, PreflightAdmission, SafetyCase, SafetyOutcome, author_guardian_copy,
-    build_safety_case, decide_guardian_policy,
-};
-use crate::observability::{
-    EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_token,
+    GuardianUserOutcome, OperationEvidenceBatch, OperationEvidenceBatchRejection,
+    PreflightAdmission, SafetyCase, SafetyOutcome, assess_operation_evidence, author_guardian_copy,
 };
 use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -86,14 +84,19 @@ pub struct GuardianPreflightOutcome {
     pub directives: Vec<GuardianDirective>,
 }
 
-pub fn guardian_preflight_outcome(
+pub fn try_guardian_preflight_outcome(
     request: GuardianPreflightOutcomeRequest<'_>,
-) -> GuardianPreflightOutcome {
-    let operation_id = request.operation_id.clone();
-    let facts = preflight_facts(&request, operation_id.clone());
-    let safety_case = build_safety_case(operation_id, request.mode, request.phase, &facts);
-    let guardian_decision =
-        decide_guardian_policy(&safety_case, preflight_policy_context(&request, &facts));
+) -> Result<GuardianPreflightOutcome, OperationEvidenceBatchRejection> {
+    let sourced_evidence = preflight_evidence(&request)?;
+    let evidence = sourced_evidence.batch();
+    let assessment = assess_operation_evidence(
+        request.mode,
+        request.phase,
+        evidence,
+        preflight_policy_context(&request, &sourced_evidence),
+    );
+    let safety_case = assessment.safety_case().clone();
+    let guardian_decision = assessment.decision().clone();
     let preflight_decision = preflight_boundary_verdict(guardian_decision.kind());
     let directives = preflight_directives(guardian_decision.kind());
     let diagnosis_ids = safety_case
@@ -106,7 +109,7 @@ pub fn guardian_preflight_outcome(
         preflight_decision,
         request.phase,
         &diagnosis_ids,
-        &facts,
+        evidence.facts(),
     ))
     .expect("preflight copy summary table covers every preflight verdict");
     let safety = SafetyOutcome {
@@ -116,54 +119,65 @@ pub fn guardian_preflight_outcome(
         diagnoses: guardian_decision.diagnoses().to_vec(),
     };
 
-    GuardianPreflightOutcome {
+    Ok(GuardianPreflightOutcome {
         safety_case,
         guardian_decision,
         safety,
         user_outcome,
         directives,
-    }
+    })
 }
 
-fn preflight_facts(
+#[cfg(test)]
+pub fn guardian_preflight_outcome(
+    request: GuardianPreflightOutcomeRequest<'_>,
+) -> GuardianPreflightOutcome {
+    try_guardian_preflight_outcome(request).expect("valid Guardian preflight evidence")
+}
+
+fn preflight_evidence(
     request: &GuardianPreflightOutcomeRequest<'_>,
-    operation_id: Option<OperationId>,
-) -> Vec<GuardianFact> {
-    let mut facts = Vec::new();
-    for fact in request.facts.iter().chain(request.readiness.facts.iter()) {
-        push_unique_fact(&mut facts, public_safe_fact(fact));
-    }
-    for fact in resource_signal_facts(operation_id.clone(), request.resources) {
-        push_unique_fact(&mut facts, fact);
-    }
+) -> Result<SourcedOperationEvidenceBatch, OperationEvidenceBatchRejection> {
+    let mut trusted = resource_signal_facts(request.resources);
     if request.mode == GuardianMode::Custom {
-        for fact in override_signal_facts(operation_id, request.overrides) {
-            push_unique_fact(&mut facts, fact);
+        trusted.extend(override_signal_facts(request.overrides));
+    }
+    let fact_count = request
+        .facts
+        .len()
+        .checked_add(request.readiness.facts.len())
+        .and_then(|count| count.checked_add(trusted.len()))
+        .ok_or(OperationEvidenceBatchRejection::TooManyFacts)?;
+    if fact_count > super::model::MAX_OPERATION_EVIDENCE_FACTS {
+        return Err(OperationEvidenceBatchRejection::TooManyFacts);
+    }
+    match request.operation_id.as_ref() {
+        Some(operation_id) => {
+            OperationEvidenceBatch::try_from_guardian_operation_with_sourced_trusted(
+                operation_id,
+                request.facts,
+                request.readiness.facts,
+                trusted,
+            )
         }
+        None => OperationEvidenceBatch::try_from_guardian_unscoped_with_sourced_trusted(
+            request.facts,
+            request.readiness.facts,
+            trusted,
+        ),
     }
-    facts
-}
-
-fn push_unique_fact(facts: &mut Vec<GuardianFact>, fact: GuardianFact) {
-    let target_id = fact.target.as_ref().map(|target| target.id.as_str());
-    if facts.iter().any(|existing| {
-        existing.id == fact.id
-            && existing.target.as_ref().map(|target| target.id.as_str()) == target_id
-    }) {
-        return;
-    }
-    facts.push(fact);
 }
 
 fn preflight_policy_context(
     request: &GuardianPreflightOutcomeRequest<'_>,
-    facts: &[GuardianFact],
+    sourced_evidence: &SourcedOperationEvidenceBatch,
 ) -> GuardianPolicyContext {
+    let evidence = sourced_evidence.batch();
     let explicit_user_intent = request.explicit_user_intent
         || request.overrides.explicit_java_override
         || request.overrides.explicit_jvm_args
         || request.overrides.explicit_jvm_preset
-        || facts.iter().any(|fact| {
+        || evidence.facts().iter().any(|fact| {
             matches!(fact.domain, GuardianDomain::Runtime | GuardianDomain::Jvm)
                 && fact.ownership == OwnershipClass::UserOwned
         });
@@ -174,17 +188,15 @@ fn preflight_policy_context(
         context
     };
     let admission = if !request.readiness.launchable
-        || request
-            .readiness
-            .facts
-            .iter()
+        || sourced_evidence
+            .facts_from(EvidenceFactSource::Readiness)
             .any(|fact| fact.severity == Some(GuardianSeverity::Blocking))
     {
         PreflightAdmission::Blocked
     } else {
         PreflightAdmission::Ready
     };
-    context.for_launch_preflight(admission, facts)
+    context.for_launch_preflight(admission, evidence)
 }
 
 fn preflight_boundary_verdict(decision: GuardianActionKind) -> GuardianActionKind {
@@ -206,14 +218,11 @@ fn preflight_directives(decision: GuardianActionKind) -> Vec<GuardianDirective> 
     }
 }
 
-fn resource_signal_facts(
-    operation_id: Option<OperationId>,
-    signals: GuardianPreflightResourceSignals,
-) -> Vec<GuardianFact> {
+fn resource_signal_facts(signals: GuardianPreflightResourceSignals) -> Vec<GuardianFact> {
     let mut facts = Vec::new();
     if signals.memory_clamped {
         facts.push(signal_fact(
-            operation_id.clone(),
+            None,
             GuardianFactId::LaunchMemoryMinClamped,
             GuardianDomain::Launch,
             OwnershipClass::LauncherManaged,
@@ -223,7 +232,7 @@ fn resource_signal_facts(
     }
     if signals.low_memory_allocation {
         facts.push(signal_fact(
-            operation_id.clone(),
+            None,
             GuardianFactId::LaunchMemoryAllocationLow,
             GuardianDomain::Launch,
             OwnershipClass::LauncherManaged,
@@ -233,7 +242,7 @@ fn resource_signal_facts(
     }
     if signals.memory_pressure {
         facts.push(signal_fact(
-            operation_id.clone(),
+            None,
             GuardianFactId::LaunchResourceMemoryPressure,
             GuardianDomain::Performance,
             OwnershipClass::LauncherManaged,
@@ -243,7 +252,7 @@ fn resource_signal_facts(
     }
     if signals.cpu_pressure {
         facts.push(signal_fact(
-            operation_id.clone(),
+            None,
             GuardianFactId::LaunchResourceCpuPressure,
             GuardianDomain::Performance,
             OwnershipClass::LauncherManaged,
@@ -253,7 +262,7 @@ fn resource_signal_facts(
     }
     if signals.install_pressure {
         facts.push(signal_fact(
-            operation_id.clone(),
+            None,
             GuardianFactId::LaunchResourceInstallPressure,
             GuardianDomain::Performance,
             OwnershipClass::LauncherManaged,
@@ -263,7 +272,7 @@ fn resource_signal_facts(
     }
     if signals.disk_pressure {
         facts.push(signal_fact(
-            operation_id,
+            None,
             GuardianFactId::LaunchResourceDiskPressure,
             GuardianDomain::Filesystem,
             OwnershipClass::LauncherManaged,
@@ -274,14 +283,11 @@ fn resource_signal_facts(
     facts
 }
 
-fn override_signal_facts(
-    operation_id: Option<OperationId>,
-    signals: GuardianPreflightOverrideSignals,
-) -> Vec<GuardianFact> {
+fn override_signal_facts(signals: GuardianPreflightOverrideSignals) -> Vec<GuardianFact> {
     let mut facts = Vec::new();
     if signals.explicit_java_override {
         facts.push(signal_fact(
-            operation_id.clone(),
+            None,
             GuardianFactId::CustomJavaOverridePresent,
             GuardianDomain::Runtime,
             OwnershipClass::UserOwned,
@@ -291,7 +297,7 @@ fn override_signal_facts(
     }
     if signals.explicit_jvm_preset {
         facts.push(signal_fact(
-            operation_id.clone(),
+            None,
             GuardianFactId::CustomJvmPresetPresent,
             GuardianDomain::Jvm,
             OwnershipClass::UserOwned,
@@ -301,7 +307,7 @@ fn override_signal_facts(
     }
     if signals.explicit_jvm_args {
         facts.push(signal_fact(
-            operation_id,
+            None,
             GuardianFactId::CustomJvmArgsPresent,
             GuardianDomain::Jvm,
             OwnershipClass::UserOwned,
@@ -337,47 +343,6 @@ fn signal_fact(
         )),
         fields: Vec::new(),
     }
-}
-
-fn public_safe_fact(fact: &GuardianFact) -> GuardianFact {
-    GuardianFact {
-        operation_id: fact.operation_id.clone(),
-        id: fact.id,
-        domain: fact.domain,
-        phase: fact.phase,
-        reliability: fact.reliability,
-        severity: fact.severity,
-        confidence: fact.confidence,
-        ownership: fact.ownership,
-        target: fact.target.as_ref().map(public_safe_target),
-        fields: public_safe_fields(&fact.fields),
-    }
-}
-
-fn public_safe_target(target: &TargetDescriptor) -> TargetDescriptor {
-    TargetDescriptor::new(
-        target.system,
-        target.kind,
-        public_safe_token(target.id.as_str(), "target"),
-        target.ownership,
-    )
-}
-
-fn public_safe_fields(fields: &[EvidenceField]) -> Vec<EvidenceField> {
-    fields
-        .iter()
-        .filter_map(|field| {
-            let key = sanitize_evidence_token(&field.key, RedactionAudience::UserVisible, 32)?;
-            let value = field.value_for(RedactionAudience::UserVisible)?;
-            let value = sanitize_evidence_token(value, RedactionAudience::UserVisible, 96)?;
-            Some(EvidenceField::new(key, value, EvidenceSensitivity::Public))
-        })
-        .collect()
-}
-
-fn public_safe_token(value: &str, fallback: &str) -> String {
-    sanitize_evidence_token(value, RedactionAudience::UserVisible, 96)
-        .unwrap_or_else(|| fallback.to_string())
 }
 
 #[cfg(test)]
@@ -701,6 +666,57 @@ mod tests {
             ready.user_outcome.decision(),
             GuardianActionKind::RecordOnly
         );
+    }
+
+    #[test]
+    fn discarded_duplicate_severity_cannot_change_preflight_admission() {
+        let canonical_fact = fact(
+            GuardianFactId::ExitCodeZero,
+            GuardianDomain::Session,
+            GuardianSeverity::Warning,
+            OwnershipClass::LauncherManaged,
+            TargetKind::Session,
+            "session",
+        );
+        let mut duplicate = canonical_fact.clone();
+        duplicate.severity = Some(GuardianSeverity::Blocking);
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
+            readiness: GuardianPreflightReadiness::from_facts(true, &[duplicate]),
+            ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[canonical_fact])
+        });
+
+        assert_eq!(
+            outcome.guardian_decision.kind(),
+            GuardianActionKind::RecordOnly
+        );
+        assert_eq!(
+            outcome.user_outcome.decision(),
+            GuardianActionKind::RecordOnly
+        );
+    }
+
+    #[test]
+    fn discarded_readiness_duplicate_cannot_reclassify_direct_actionable_fact() {
+        let direct = fact(
+            GuardianFactId::JvmArgsParseFailed,
+            GuardianDomain::Jvm,
+            GuardianSeverity::Blocking,
+            OwnershipClass::UserOwned,
+            TargetKind::Config,
+            "explicit_jvm_args",
+        );
+        let mut discarded_readiness = direct.clone();
+        discarded_readiness.severity = Some(GuardianSeverity::Warning);
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
+            readiness: GuardianPreflightReadiness::from_facts(true, &[discarded_readiness]),
+            explicit_user_intent: true,
+            ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[direct])
+        });
+
+        assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Strip);
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Strip);
     }
 
     #[test]

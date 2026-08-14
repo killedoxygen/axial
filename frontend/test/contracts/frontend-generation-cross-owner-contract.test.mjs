@@ -32,7 +32,7 @@ test('the public asset manifest exactly owns tracked frontend source assets', as
   assert.ok(!manifest.files.some((filePath) => /^(?:app\.(?:js|css)|chunks\/)/.test(filePath)));
 });
 
-test('frozen graph budgets cannot exceed the reviewed P00 baseline', async () => {
+test('frozen graph budgets cannot exceed the reviewed reviewed baseline', async () => {
   const policy = JSON.parse(await read('frontend/bundle-budgets.json'));
   assert.deepEqual(policy, {
     schema_version: 1,

@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn phase1_auto_select_preset_gate_matrix() {
+    fn auto_select_preset_gate_matrix() {
         struct Case {
             name: &'static str,
             version_id: &'static str,

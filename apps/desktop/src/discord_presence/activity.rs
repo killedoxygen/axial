@@ -69,7 +69,7 @@ mod tests {
     use axial_api::state::presence::{PresenceActivity, PresenceActivityKind};
 
     #[test]
-    fn p00_b08_contract_cross_owner_discord_maps_playing_snapshot() {
+    fn behavior_contract_cross_owner_discord_maps_playing_snapshot() {
         let snapshot = PresenceSnapshot {
             enabled: true,
             activity: PresenceActivity {
@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_cross_owner_discord_maps_idle_snapshot() {
+    fn behavior_contract_cross_owner_discord_maps_idle_snapshot() {
         let snapshot = PresenceSnapshot {
             enabled: true,
             activity: PresenceActivity {
@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_cross_owner_discord_maps_multi_snapshot() {
+    fn behavior_contract_cross_owner_discord_maps_multi_snapshot() {
         let snapshot = PresenceSnapshot {
             enabled: true,
             activity: PresenceActivity {
@@ -141,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_cross_owner_discord_maps_launching_snapshot() {
+    fn behavior_contract_cross_owner_discord_maps_launching_snapshot() {
         let snapshot = PresenceSnapshot {
             enabled: true,
             activity: PresenceActivity {

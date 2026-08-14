@@ -7,20 +7,19 @@ use crate::execution::integrity::{
     IntegrityTier2OwnedWork, IntegrityTier2OwnedWorkRejection, IntegrityTier2Report,
     IntegrityTier2Status,
 };
-use crate::guardian::{
-    TIER2_INTEGRITY_COUNTER_TOKEN_COUNT, Tier2IntegrityGuardianEvidence,
-    tier2_integrity_guardian_evidence,
-};
+use crate::guardian::{Tier2IntegrityGuardianEvidence, try_tier2_integrity_guardian_evidence};
 use crate::state::contracts::{
     CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
-    OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
-    RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
+    OperationOutcome, OperationPhase, OperationStatus, OperationStepMetrics, OperationStepResult,
+    OwnershipClass, RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
+    Tier2IntegrityMetrics,
 };
 use crate::state::{
     AppState, IdleSweepCancellation, IdleSweepReserveError, IdleSweepSettlement,
     IdleSweepSettlementOwner, IdleSweepTerminal, IntegrityIdleEpoch, KnownGoodTier2CleanReceipt,
     KnownGoodTier2CleanSeal, KnownGoodVerificationUnavailable, OperationJournalReconciliation,
     OperationJournalStore, OperationJournalStoreError, ProducerLease,
+    operation_journal_terminal_is_visible,
 };
 use axial_config::is_canonical_instance_id;
 use std::time::Duration;
@@ -464,8 +463,7 @@ where
                 IntegrityTier2Status::Complete => {
                     debug_assert_eq!(settlement, IdleSweepSettlement::Authoritative);
                     let counters = Tier2IntegrityCounters::from(&report);
-                    let evidence =
-                        tier2_integrity_guardian_evidence(&journal.operation_id, &report.facts);
+                    let evidence = tier2_guardian_evidence(&journal.operation_id, &report.facts)?;
                     (
                         Tier2TerminalTransition::succeeded(counters, evidence),
                         IdleIntegrityTerminal::Succeeded,
@@ -480,8 +478,7 @@ where
                 IntegrityTier2Status::Refused => {
                     debug_assert_eq!(settlement, IdleSweepSettlement::Superseded);
                     let counters = Tier2IntegrityCounters::from(&report);
-                    let evidence =
-                        tier2_integrity_guardian_evidence(&journal.operation_id, &report.facts);
+                    let evidence = tier2_guardian_evidence(&journal.operation_id, &report.facts)?;
                     (
                         Tier2TerminalTransition::failed(counters, evidence),
                         IdleIntegrityTerminal::Refused,
@@ -637,10 +634,10 @@ fn planned_tier2_integrity_journal(
         instance_id,
         OwnershipClass::LauncherManaged,
     ));
-    journal.planned_steps.push(tier2_integrity_step(
-        OperationStepResult::Planned,
-        Tier2IntegrityCounters::none(),
-    ));
+    journal.planned_steps.push(
+        tier2_integrity_step(OperationStepResult::Planned, Tier2IntegrityCounters::none())
+            .expect("a planned Tier 2 step has no metrics"),
+    );
     journal
 }
 
@@ -662,45 +659,26 @@ impl Tier2IntegrityCounters {
         None
     }
 
-    fn tokens(self) -> [String; TIER2_INTEGRITY_COUNTER_TOKEN_COUNT] {
-        [
-            format!(
-                "integrity_counter:selected_entry_count:{}",
-                self.selected_entry_count
-            ),
-            format!(
-                "integrity_counter:verified_entry_count:{}",
-                self.verified_entry_count
-            ),
-            format!(
-                "integrity_counter:processed_entry_count:{}",
-                self.processed_entry_count
-            ),
-            format!(
-                "integrity_counter:hashed_entry_count:{}",
-                self.hashed_entry_count
-            ),
-            format!(
-                "integrity_counter:expected_content_byte_count:{}",
-                self.expected_content_byte_count
-            ),
-            format!(
-                "integrity_counter:content_read_byte_count:{}",
-                self.content_read_byte_count
-            ),
-            format!(
-                "integrity_counter:metadata_lookup_count:{}",
-                self.metadata_lookup_count
-            ),
-            format!(
-                "integrity_counter:link_lookup_count:{}",
-                self.link_lookup_count
-            ),
-            format!(
-                "integrity_counter:suppressed_fact_count:{}",
-                self.suppressed_fact_count
-            ),
-        ]
+    fn metrics(self) -> Result<Tier2IntegrityMetrics, OperationJournalStoreError> {
+        Tier2IntegrityMetrics::new(
+            u64::try_from(self.selected_entry_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            u64::try_from(self.verified_entry_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            u64::try_from(self.processed_entry_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            u64::try_from(self.hashed_entry_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            self.expected_content_byte_count,
+            self.content_read_byte_count,
+            u64::try_from(self.metadata_lookup_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            u64::try_from(self.link_lookup_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            u64::try_from(self.suppressed_fact_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+        )
+        .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)
     }
 }
 
@@ -724,13 +702,11 @@ impl From<&IntegrityTier2Report> for Tier2IntegrityCounters {
 enum Tier2TerminalTransition {
     Succeeded {
         step: OperationJournalStep,
-        fact_ids: Vec<String>,
-        diagnosis_ids: Vec<crate::guardian::DiagnosisId>,
+        evidence: Option<crate::state::contracts::DurableGuardianEvidence>,
     },
     Failed {
         step: OperationJournalStep,
-        fact_ids: Vec<String>,
-        diagnosis_ids: Vec<crate::guardian::DiagnosisId>,
+        evidence: Option<crate::state::contracts::DurableGuardianEvidence>,
     },
     Cancelled {
         step: OperationJournalStep,
@@ -743,23 +719,24 @@ impl Tier2TerminalTransition {
         evidence: Tier2IntegrityGuardianEvidence,
     ) -> Self {
         Self::Succeeded {
-            step: tier2_integrity_step(OperationStepResult::Completed, Some(counters)),
-            fact_ids: evidence.fact_ids().to_vec(),
-            diagnosis_ids: evidence.diagnosis_ids().to_vec(),
+            step: tier2_integrity_step(OperationStepResult::Completed, Some(counters))
+                .expect("validated Tier 2 completion metrics"),
+            evidence: evidence.durable().cloned(),
         }
     }
 
     fn failed(counters: Tier2IntegrityCounters, evidence: Tier2IntegrityGuardianEvidence) -> Self {
         Self::Failed {
-            step: tier2_integrity_step(OperationStepResult::Failed, Some(counters)),
-            fact_ids: evidence.fact_ids().to_vec(),
-            diagnosis_ids: evidence.diagnosis_ids().to_vec(),
+            step: tier2_integrity_step(OperationStepResult::Failed, Some(counters))
+                .expect("validated Tier 2 failure metrics"),
+            evidence: evidence.durable().cloned(),
         }
     }
 
     fn cancelled(counters: Tier2IntegrityCounters) -> Self {
         Self::Cancelled {
-            step: tier2_integrity_step(OperationStepResult::Skipped, Some(counters)),
+            step: tier2_integrity_step(OperationStepResult::Skipped, Some(counters))
+                .expect("validated Tier 2 cancellation metrics"),
         }
     }
 
@@ -769,39 +746,40 @@ impl Tier2TerminalTransition {
         operation_id: &OperationId,
     ) -> Result<(), OperationJournalStoreError> {
         match self {
-            Self::Succeeded {
-                step,
-                fact_ids,
-                diagnosis_ids,
-            } => {
-                journals
-                    .record_success_with_guardian_evidence(
-                        operation_id,
-                        step.clone(),
-                        fact_ids.clone(),
-                        diagnosis_ids.clone(),
-                    )
-                    .await
+            Self::Succeeded { step, evidence } => {
+                if let Some(evidence) = evidence {
+                    journals
+                        .record_success_with_guardian_evidence(step.clone(), evidence.clone())
+                        .await
+                } else {
+                    journals
+                        .record_success_with_metrics(operation_id, step.clone())
+                        .await
+                }
             }
-            Self::Failed {
-                step,
-                fact_ids,
-                diagnosis_ids,
-            } => {
-                journals
-                    .record_failure_with_guardian_evidence(
-                        operation_id,
-                        step.clone(),
-                        TIER2_INTEGRITY_FAILURE,
-                        OperationOutcome::Failed,
-                        fact_ids.clone(),
-                        diagnosis_ids.clone(),
-                    )
-                    .await
+            Self::Failed { step, evidence } => {
+                if let Some(evidence) = evidence {
+                    journals
+                        .record_failure_with_guardian_evidence(
+                            step.clone(),
+                            TIER2_INTEGRITY_FAILURE,
+                            OperationOutcome::Failed,
+                            evidence.clone(),
+                        )
+                        .await
+                } else {
+                    journals
+                        .record_failure_with_metrics(
+                            operation_id,
+                            step.clone(),
+                            TIER2_INTEGRITY_FAILURE,
+                        )
+                        .await
+                }
             }
             Self::Cancelled { step } => {
                 journals
-                    .record_cancellation(operation_id, step.clone())
+                    .record_cancellation_with_metrics(operation_id, step.clone())
                     .await
             }
         }
@@ -810,41 +788,23 @@ impl Tier2TerminalTransition {
     fn expected(&self, planned: &OperationJournalEntry) -> OperationJournalEntry {
         let mut expected = planned.clone();
         match self {
-            Self::Succeeded {
-                step,
-                fact_ids,
-                diagnosis_ids,
-            } => {
+            Self::Succeeded { step, evidence } => {
                 expected.status = OperationStatus::Succeeded;
                 expected.completed_steps.push(step.clone());
-                append_unique(
-                    &mut expected
-                        .completed_steps
-                        .last_mut()
-                        .expect("Tier 2 success step")
-                        .generated_facts,
-                    fact_ids,
-                );
-                expected.guardian_diagnosis_ids = diagnosis_ids.clone();
+                expected.guardian_diagnosis_ids = evidence
+                    .as_ref()
+                    .map(|evidence| evidence.diagnosis_ids().to_vec())
+                    .unwrap_or_default();
                 expected.outcome = Some(OperationOutcome::Succeeded);
             }
-            Self::Failed {
-                step,
-                fact_ids,
-                diagnosis_ids,
-            } => {
+            Self::Failed { step, evidence } => {
                 expected.status = OperationStatus::Failed;
                 expected.completed_steps.push(step.clone());
-                append_unique(
-                    &mut expected
-                        .completed_steps
-                        .last_mut()
-                        .expect("Tier 2 failure step")
-                        .generated_facts,
-                    fact_ids,
-                );
                 expected.failure_point = Some(TIER2_INTEGRITY_FAILURE.to_string());
-                expected.guardian_diagnosis_ids = diagnosis_ids.clone();
+                expected.guardian_diagnosis_ids = evidence
+                    .as_ref()
+                    .map(|evidence| evidence.diagnosis_ids().to_vec())
+                    .unwrap_or_default();
                 expected.outcome = Some(OperationOutcome::Failed);
             }
             Self::Cancelled { step } => {
@@ -857,26 +817,56 @@ impl Tier2TerminalTransition {
         }
         expected
     }
+
+    fn is_visible(&self, entry: &OperationJournalEntry, expected: &OperationJournalEntry) -> bool {
+        let expected_fact_ids = match self {
+            Self::Succeeded { evidence, .. } | Self::Failed { evidence, .. } => evidence
+                .as_ref()
+                .map(|evidence| evidence.fact_ids())
+                .unwrap_or_default(),
+            Self::Cancelled { .. } => &[],
+        };
+        operation_journal_terminal_is_visible(entry, expected)
+            && expected_fact_ids.iter().all(|fact_id| {
+                entry
+                    .completed_steps
+                    .iter()
+                    .any(|step| step.guardian_fact_ids().contains(fact_id))
+            })
+    }
 }
 
 fn tier2_integrity_step(
     result: OperationStepResult,
     counters: Option<Tier2IntegrityCounters>,
-) -> OperationJournalStep {
+) -> Result<OperationJournalStep, OperationJournalStoreError> {
     let mut step = OperationJournalStep::new(TIER2_INTEGRITY_STEP, OperationPhase::Validating);
     step.result = result;
     if let Some(counters) = counters {
-        step.generated_facts.extend(counters.tokens());
+        step.set_metrics(OperationStepMetrics::Tier2Integrity(counters.metrics()?));
     }
-    step
+    Ok(step)
 }
 
-fn append_unique(target: &mut Vec<String>, values: &[String]) {
-    for value in values {
-        if !target.contains(value) {
-            target.push(value.clone());
+fn tier2_guardian_evidence(
+    operation_id: &OperationId,
+    facts: &[crate::execution::ExecutionFact],
+) -> Result<Tier2IntegrityGuardianEvidence, OperationJournalStoreError> {
+    let mut bound = Vec::with_capacity(facts.len());
+    for fact in facts {
+        if fact
+            .operation_id
+            .as_ref()
+            .is_some_and(|fact_operation_id| fact_operation_id != operation_id)
+        {
+            return Err(OperationJournalStoreError::InvalidGuardianOutcome);
         }
+        let mut fact = fact.clone();
+        fact.operation_id = Some(operation_id.clone());
+        bound.push(fact);
     }
+    try_tier2_integrity_guardian_evidence(operation_id, &bound)
+        .map_err(|_| OperationJournalStoreError::InvalidGuardianOutcome)
 }
 
 #[cfg(test)]
@@ -957,7 +947,7 @@ async fn record_terminal_reconciled(
                 assert!(
                     journals
                         .get(&planned.operation_id)
-                        .is_some_and(|entry| entry.matches_store_entry(&expected)),
+                        .is_some_and(|entry| transition.is_visible(&entry, &expected)),
                     "successful Tier 2 terminal journal write must be immediately visible"
                 );
                 return Ok(());
@@ -965,7 +955,7 @@ async fn record_terminal_reconciled(
             Err(OperationJournalStoreError::AlreadyTerminal)
                 if journals
                     .get(&planned.operation_id)
-                    .is_some_and(|entry| entry.matches_store_entry(&expected)) =>
+                    .is_some_and(|entry| transition.is_visible(&entry, &expected)) =>
             {
                 return Ok(());
             }
@@ -975,7 +965,7 @@ async fn record_terminal_reconciled(
                     error,
                     JOURNAL_RETRY_INITIAL_DELAY,
                     JOURNAL_RETRY_MAX_DELAY,
-                    |entry| entry.matches_store_entry(&expected),
+                    |entry| transition.is_visible(entry, &expected),
                 )
                 .await?
             {
@@ -1001,10 +991,10 @@ fn tier2_restart_journal_is_exact(entry: &OperationJournalEntry) -> bool {
         && is_canonical_instance_id(&entry.targets[0].id)
         && entry.targets[0].ownership == OwnershipClass::LauncherManaged
         && entry.planned_steps
-            == vec![tier2_integrity_step(
-                OperationStepResult::Planned,
-                Tier2IntegrityCounters::none(),
-            )]
+            == vec![
+                tier2_integrity_step(OperationStepResult::Planned, Tier2IntegrityCounters::none())
+                    .expect("a planned Tier 2 step has no metrics"),
+            ]
         && entry.completed_steps.is_empty()
         && entry.failure_point.is_none()
         && entry.rollback == RollbackState::NotApplicable
@@ -1016,6 +1006,7 @@ fn tier2_restart_journal_is_exact(entry: &OperationJournalEntry) -> bool {
 mod tests {
     use super::*;
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
+    use crate::guardian::GuardianFactId;
     use crate::state::contracts::{ReconciliationComponent, ReconciliationRung};
     use crate::state::{AppStateInit, InstallStore, SessionStore, reconciliation_attempt_key};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
@@ -1040,19 +1031,19 @@ mod tests {
     const FIRST_OPERATION_ID: &str = "integrity-sweep-00000000-0000-4000-8000-000000000001";
     const SECOND_OPERATION_ID: &str = "integrity-sweep-00000000-0000-4000-8000-000000000002";
     #[cfg(target_os = "linux")]
-    const R5_REPRESENTATIVE_ENTRY_COUNT: usize = 442;
+    const REPRESENTATIVE_ENTRY_COUNT: usize = 442;
     #[cfg(target_os = "linux")]
-    const R5_REPRESENTATIVE_CONTENT_BYTES: u64 = 344_363_465;
+    const REPRESENTATIVE_CONTENT_BYTES: u64 = 344_363_465;
     #[cfg(target_os = "linux")]
-    const R5_LAUNCH_SAMPLE_COUNT: usize = 21;
+    const REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT: usize = 21;
     #[cfg(target_os = "linux")]
-    const R5_LAUNCH_IMPACT_CEILING: Duration = Duration::from_millis(10);
+    const REPRESENTATIVE_SWEEP_LAUNCH_IMPACT_CEILING: Duration = Duration::from_millis(10);
 
     #[cfg(target_os = "linux")]
-    struct R5MeasurementRoot(PathBuf);
+    struct RepresentativeSweepMeasurementRoot(PathBuf);
 
     #[cfg(target_os = "linux")]
-    impl Drop for R5MeasurementRoot {
+    impl Drop for RepresentativeSweepMeasurementRoot {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
@@ -1468,14 +1459,19 @@ mod tests {
         snapshot.epoch()
     }
 
-    fn journal_fact_ids(entry: &OperationJournalEntry) -> Vec<&str> {
+    fn journal_fact_ids(entry: &OperationJournalEntry) -> Vec<GuardianFactId> {
         entry
             .completed_steps
             .iter()
-            .flat_map(|step| step.generated_facts.iter())
-            .map(String::as_str)
-            .filter(|value| value.starts_with("guardian_fact:"))
+            .flat_map(|step| step.guardian_fact_ids().iter().copied())
             .collect()
+    }
+
+    fn tier2_metrics(entry: &OperationJournalEntry) -> &Tier2IntegrityMetrics {
+        match entry.completed_steps[0].metrics() {
+            Some(OperationStepMetrics::Tier2Integrity(metrics)) => metrics,
+            _ => panic!("Tier 2 terminal step must carry typed metrics"),
+        }
     }
 
     fn write_user_owned_sentinels(paths: &AppPaths, instance_id: &str) -> Vec<(PathBuf, Vec<u8>)> {
@@ -1599,50 +1595,59 @@ exit 0
     }
 
     #[cfg(target_os = "linux")]
-    fn r5_measurement_root() -> R5MeasurementRoot {
+    fn representative_sweep_measurement_root() -> RepresentativeSweepMeasurementRoot {
         let supplied_parent = PathBuf::from(
-            std::env::var_os("AXIAL_R5_MEASUREMENT_ROOT")
-                .expect("AXIAL_R5_MEASUREMENT_ROOT is required"),
+            std::env::var_os("AXIAL_REPRESENTATIVE_SWEEP_MEASUREMENT_ROOT")
+                .expect("AXIAL_REPRESENTATIVE_SWEEP_MEASUREMENT_ROOT is required"),
         );
-        let metadata =
-            fs::symlink_metadata(&supplied_parent).expect("R5 measurement root metadata");
-        assert!(metadata.is_dir(), "R5 measurement root must be a directory");
+        let metadata = fs::symlink_metadata(&supplied_parent)
+            .expect("representative integrity sweep measurement root metadata");
+        assert!(
+            metadata.is_dir(),
+            "representative integrity sweep measurement root must be a directory"
+        );
         assert!(
             !metadata.file_type().is_symlink(),
-            "R5 measurement root must not be a symlink"
+            "representative integrity sweep measurement root must not be a symlink"
         );
-        let parent = fs::canonicalize(supplied_parent).expect("canonical R5 measurement root");
+        let parent = fs::canonicalize(supplied_parent)
+            .expect("canonical representative integrity sweep measurement root");
         let root = parent.join(format!(
-            "axial-r5-launch-impact-{}-{}",
+            "axial-representative-sweep-launch-impact-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos()
         ));
-        fs::create_dir(&root).expect("create isolated R5 measurement fixture");
-        R5MeasurementRoot(root)
+        fs::create_dir(&root)
+            .expect("create isolated representative integrity sweep measurement fixture");
+        RepresentativeSweepMeasurementRoot(root)
     }
 
     #[cfg(target_os = "linux")]
-    fn r5_entry_size(index: usize) -> u64 {
-        let base = R5_REPRESENTATIVE_CONTENT_BYTES / R5_REPRESENTATIVE_ENTRY_COUNT as u64;
-        let remainder = R5_REPRESENTATIVE_CONTENT_BYTES % R5_REPRESENTATIVE_ENTRY_COUNT as u64;
+    fn representative_sweep_entry_size(index: usize) -> u64 {
+        let base = REPRESENTATIVE_CONTENT_BYTES / REPRESENTATIVE_ENTRY_COUNT as u64;
+        let remainder = REPRESENTATIVE_CONTENT_BYTES % REPRESENTATIVE_ENTRY_COUNT as u64;
         base + u64::from(index < remainder as usize)
     }
 
     #[cfg(target_os = "linux")]
-    fn r5_write_patterned_file(path: &Path, size: u64, pattern: u8) -> String {
-        fs::create_dir_all(path.parent().expect("R5 fixture parent"))
-            .expect("create R5 fixture parent");
-        let mut file = fs::File::create(path).expect("create R5 fixture file");
+    fn representative_sweep_write_patterned_file(path: &Path, size: u64, pattern: u8) -> String {
+        fs::create_dir_all(
+            path.parent()
+                .expect("representative integrity sweep fixture parent"),
+        )
+        .expect("create representative integrity sweep fixture parent");
+        let mut file =
+            fs::File::create(path).expect("create representative integrity sweep fixture file");
         let chunk = vec![pattern; 64 * 1024];
         let mut remaining = size;
         let mut hasher = Sha1::new();
         while remaining > 0 {
             let count = remaining.min(chunk.len() as u64) as usize;
             file.write_all(&chunk[..count])
-                .expect("write R5 fixture file");
+                .expect("write representative integrity sweep fixture file");
             hasher.update(&chunk[..count]);
             remaining -= count as u64;
         }
@@ -1650,25 +1655,28 @@ exit 0
     }
 
     #[cfg(target_os = "linux")]
-    fn r5_write_version_json(path: &Path, version_id: &str, size: u64) -> String {
+    fn representative_sweep_write_version_json(path: &Path, version_id: &str, size: u64) -> String {
         let mut bytes = serde_json::to_vec(&serde_json::json!({
             "id": version_id,
             "type": "release",
-            "mainClass": "org.axial.GuardianR5Fixture",
+            "mainClass": "org.axial.GuardianRepresentativeSweepFixture",
             "assetIndex": {},
             "libraries": []
         }))
-        .expect("encode R5 version metadata");
+        .expect("encode representative integrity sweep version metadata");
         assert!(bytes.len() < size as usize);
         bytes.resize(size as usize, b' ');
-        fs::create_dir_all(path.parent().expect("R5 version parent"))
-            .expect("create R5 version parent");
-        fs::write(path, &bytes).expect("write R5 version metadata");
+        fs::create_dir_all(
+            path.parent()
+                .expect("representative integrity sweep version parent"),
+        )
+        .expect("create representative integrity sweep version parent");
+        fs::write(path, &bytes).expect("write representative integrity sweep version metadata");
         format!("{:x}", Sha1::digest(&bytes))
     }
 
     #[cfg(target_os = "linux")]
-    fn r5_activate_representative_inventory(
+    fn representative_sweep_activate_representative_inventory(
         state: &AppState,
         paths: &AppPaths,
         instance_id: &str,
@@ -1676,9 +1684,17 @@ exit 0
     ) {
         let version_dir = paths.library_dir().join("versions").join(version_id);
         let version_path = version_dir.join(format!("{version_id}.json"));
-        let version_digest = r5_write_version_json(&version_path, version_id, r5_entry_size(0));
+        let version_digest = representative_sweep_write_version_json(
+            &version_path,
+            version_id,
+            representative_sweep_entry_size(0),
+        );
         let client_path = version_dir.join(format!("{version_id}.jar"));
-        let client_digest = r5_write_patterned_file(&client_path, r5_entry_size(1), 0x51);
+        let client_digest = representative_sweep_write_patterned_file(
+            &client_path,
+            representative_sweep_entry_size(1),
+            0x51,
+        );
         let mut entries = vec![
             TestKnownGoodEntry {
                 root: TestKnownGoodRoot::Versions,
@@ -1686,7 +1702,7 @@ exit 0
                 kind: KnownGoodArtifactKind::VersionMetadata,
                 integrity: TestKnownGoodIntegrity::Sha1 {
                     digest: version_digest,
-                    size: r5_entry_size(0),
+                    size: representative_sweep_entry_size(0),
                 },
             },
             TestKnownGoodEntry {
@@ -1695,14 +1711,14 @@ exit 0
                 kind: KnownGoodArtifactKind::ClientJar,
                 integrity: TestKnownGoodIntegrity::Sha1 {
                     digest: client_digest,
-                    size: r5_entry_size(1),
+                    size: representative_sweep_entry_size(1),
                 },
             },
         ];
-        for index in 2..R5_REPRESENTATIVE_ENTRY_COUNT {
-            let relative = format!("guardian-r5/{index:04}.jar");
-            let size = r5_entry_size(index);
-            let digest = r5_write_patterned_file(
+        for index in 2..REPRESENTATIVE_ENTRY_COUNT {
+            let relative = format!("guardian-representative-sweep/{index:04}.jar");
+            let size = representative_sweep_entry_size(index);
+            let digest = representative_sweep_write_patterned_file(
                 &paths.library_dir().join("libraries").join(&relative),
                 size,
                 (index % 251) as u8,
@@ -1715,17 +1731,18 @@ exit 0
             });
         }
         let inventory = KnownGoodInventory::from_test_entries(entries)
-            .expect("synthetic representative R5 inventory");
-        assert_eq!(inventory.entries().len(), R5_REPRESENTATIVE_ENTRY_COUNT);
+            .expect("synthetic representative representative integrity sweep inventory");
+        assert_eq!(inventory.entries().len(), REPRESENTATIVE_ENTRY_COUNT);
         state.activate_known_good_inventory_for_test(instance_id, inventory);
     }
 
     #[cfg(target_os = "linux")]
-    fn r5_install_booting_java(state: &AppState, root: &Path, instance_id: &str) {
+    fn representative_sweep_install_booting_java(state: &AppState, root: &Path, instance_id: &str) {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let java_dir = root.join("guardian-r5-java/bin");
-        fs::create_dir_all(&java_dir).expect("create R5 Java fixture directory");
+        let java_dir = root.join("guardian-representative-sweep-java/bin");
+        fs::create_dir_all(&java_dir)
+            .expect("create representative integrity sweep Java fixture directory");
         let java_path = java_dir.join("java");
         fs::write(
             &java_path,
@@ -1735,31 +1752,35 @@ if [ "$1" = "-XshowSettings:property" ]; then
   exit 0
 fi
 count=0
-if [ -f guardian-r5-process-count ]; then
-  count=$(cat guardian-r5-process-count)
+if [ -f guardian-representative-sweep-process-count ]; then
+  count=$(cat guardian-representative-sweep-process-count)
 fi
 count=$((count + 1))
-printf '%s' "$count" > guardian-r5-process-count
+printf '%s' "$count" > guardian-representative-sweep-process-count
 printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2
 exec sleep 30
 "#,
         )
-        .expect("write R5 Java fixture");
+        .expect("write representative integrity sweep Java fixture");
         let mut permissions = fs::metadata(&java_path)
-            .expect("R5 Java fixture metadata")
+            .expect("representative integrity sweep Java fixture metadata")
             .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&java_path, permissions).expect("make R5 Java fixture executable");
-        let mut instance = state.instances().get(instance_id).expect("R5 instance");
+        fs::set_permissions(&java_path, permissions)
+            .expect("make representative integrity sweep Java fixture executable");
+        let mut instance = state
+            .instances()
+            .get(instance_id)
+            .expect("representative integrity sweep instance");
         instance.java_path = java_path.to_string_lossy().into_owned();
         state
             .instances()
             .replace_for_test(instance)
-            .expect("set R5 Java fixture");
+            .expect("set representative integrity sweep Java fixture");
     }
 
     #[cfg(target_os = "linux")]
-    fn r5_process_count(path: &Path) -> usize {
+    fn representative_sweep_process_count(path: &Path) -> usize {
         fs::read_to_string(path)
             .ok()
             .and_then(|value| value.parse().ok())
@@ -1767,20 +1788,22 @@ exec sleep 30
     }
 
     #[cfg(target_os = "linux")]
-    async fn r5_wait_until_stably_idle(state: &AppState) {
+    async fn representative_sweep_wait_until_stably_idle(state: &AppState) {
         tokio::time::timeout(Duration::from_secs(5), async {
             while !state.subscribe_integrity_idle().borrow().is_stably_idle() {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("R5 fixture returns to stable idle");
+        .expect("representative integrity sweep fixture returns to stable idle");
     }
 
     #[cfg(target_os = "linux")]
-    async fn r5_launch_once(state: &AppState, instance_id: &str) -> Duration {
+    async fn representative_sweep_launch_once(state: &AppState, instance_id: &str) -> Duration {
         let started_at = Instant::now();
-        let producer = state.try_claim_producer().expect("claim R5 launch owner");
+        let producer = state
+            .try_claim_producer()
+            .expect("claim representative integrity sweep launch owner");
         let prepared = crate::application::launch::prepare_launch_session_owned(
             state,
             crate::application::launch::LaunchRequest {
@@ -1793,62 +1816,64 @@ exec sleep 30
             &producer,
         )
         .await
-        .unwrap_or_else(|(_, payload)| panic!("prepare R5 launch: {payload:?}"));
+        .unwrap_or_else(|(_, payload)| {
+            panic!("prepare representative integrity sweep launch: {payload:?}")
+        });
         let session_id = prepared.task.session_id.0.clone();
         tokio::time::timeout(
             Duration::from_secs(10),
             crate::application::launch::launch_session(state.clone(), prepared.task, producer),
         )
         .await
-        .expect("R5 launch deadline")
-        .unwrap_or_else(|error| panic!("R5 launch: {}", error.message));
+        .expect("representative integrity sweep launch deadline")
+        .unwrap_or_else(|error| panic!("representative integrity sweep launch: {}", error.message));
         let elapsed = started_at.elapsed();
         let running = state
             .sessions()
             .get(&session_id)
             .await
-            .expect("R5 running session");
+            .expect("representative integrity sweep running session");
         assert!(running.boot_completed_at_ms.is_some());
         state
             .sessions()
             .kill(&session_id)
             .await
-            .expect("stop R5 launch");
+            .expect("stop representative integrity sweep launch");
         tokio::time::timeout(Duration::from_secs(5), async {
             while state.sessions().has_active_instance(instance_id).await {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .expect("R5 launch session becomes terminal");
-        r5_wait_until_stably_idle(state).await;
+        .expect("representative integrity sweep launch session becomes terminal");
+        representative_sweep_wait_until_stably_idle(state).await;
         elapsed
     }
 
     #[cfg(target_os = "linux")]
-    async fn r5_wait_for_content_read(observer: &IntegrityTier2ProgressObserver) {
+    async fn representative_sweep_wait_for_content_read(observer: &IntegrityTier2ProgressObserver) {
         tokio::time::timeout(Duration::from_secs(5), async {
             while observer.content_read_count() == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("R5 Tier 2 worker enters physical content sensing");
+        .expect("representative integrity sweep Tier 2 worker enters physical content sensing");
     }
 
     #[cfg(target_os = "linux")]
-    async fn r5_assert_process_effect_after_settlement(
+    async fn representative_sweep_assert_process_effect_after_settlement(
         process_count_path: &Path,
         expected_count: usize,
         observer: &IntegrityTier2ProgressObserver,
     ) {
         tokio::time::timeout(Duration::from_secs(10), async {
-            while r5_process_count(process_count_path) < expected_count {
+            while representative_sweep_process_count(process_count_path) < expected_count {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("R5 launch reaches its process effect");
+        .expect("representative integrity sweep launch reaches its process effect");
         assert!(
             observer.settled_at().is_some(),
             "Tier 2 physical ownership must settle before the launch process effect"
@@ -1856,17 +1881,25 @@ exec sleep 30
     }
 
     #[cfg(target_os = "linux")]
-    fn r5_timing_summary(samples: &[Duration]) -> (Duration, Duration, Duration) {
-        assert_eq!(samples.len(), R5_LAUNCH_SAMPLE_COUNT);
+    fn representative_sweep_timing_summary(samples: &[Duration]) -> (Duration, Duration, Duration) {
+        assert_eq!(samples.len(), REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT);
         let mut sorted = samples.to_vec();
         sorted.sort_unstable();
         let p50 = sorted[sorted.len() / 2];
         let p95_index = (sorted.len() * 95).div_ceil(100) - 1;
-        (p50, sorted[p95_index], *sorted.last().expect("R5 samples"))
+        (
+            p50,
+            sorted[p95_index],
+            *sorted
+                .last()
+                .expect("representative integrity sweep samples"),
+        )
     }
 
     #[cfg(target_os = "linux")]
-    fn r5_timing_json(summary: (Duration, Duration, Duration)) -> serde_json::Value {
+    fn representative_sweep_timing_json(
+        summary: (Duration, Duration, Duration),
+    ) -> serde_json::Value {
         serde_json::json!({
             "p50_micros": summary.0.as_micros(),
             "p95_micros": summary.1.as_micros(),
@@ -1876,23 +1909,23 @@ exec sleep 30
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires a release build and explicit AXIAL_R5_* physical evidence bindings"]
+    #[ignore = "requires a release build and explicit AXIAL_REPRESENTATIVE_SWEEP_* physical evidence bindings"]
     async fn representative_idle_sweep_launch_preemption_measurement() {
         #[cfg(debug_assertions)]
-        panic!("R5 physical evidence must use cargo test --release");
+        panic!("representative integrity sweep physical evidence must use cargo test --release");
         #[cfg_attr(
             debug_assertions,
             expect(
                 unreachable_code,
-                reason = "R5 physical evidence is release-only by contract"
+                reason = "representative integrity sweep physical evidence is release-only by contract"
             )
         )]
-        let device_evidence = std::env::var("AXIAL_R5_DEVICE_EVIDENCE")
-            .expect("AXIAL_R5_DEVICE_EVIDENCE is required");
-        let filesystem_evidence = std::env::var("AXIAL_R5_FILESYSTEM_EVIDENCE")
-            .expect("AXIAL_R5_FILESYSTEM_EVIDENCE is required");
-        let source_binding =
-            std::env::var("AXIAL_R5_SOURCE_BINDING").expect("AXIAL_R5_SOURCE_BINDING is required");
+        let device_evidence = std::env::var("AXIAL_REPRESENTATIVE_SWEEP_DEVICE_EVIDENCE")
+            .expect("AXIAL_REPRESENTATIVE_SWEEP_DEVICE_EVIDENCE is required");
+        let filesystem_evidence = std::env::var("AXIAL_REPRESENTATIVE_SWEEP_FILESYSTEM_EVIDENCE")
+            .expect("AXIAL_REPRESENTATIVE_SWEEP_FILESYSTEM_EVIDENCE is required");
+        let source_binding = std::env::var("AXIAL_REPRESENTATIVE_SWEEP_SOURCE_BINDING")
+            .expect("AXIAL_REPRESENTATIVE_SWEEP_SOURCE_BINDING is required");
         assert!(
             !device_evidence.trim().is_empty(),
             "device evidence is empty"
@@ -1911,19 +1944,27 @@ exec sleep 30
             "this evidence contract is scoped to the current WSL2 host"
         );
 
-        let measurement_root = r5_measurement_root();
+        let measurement_root = representative_sweep_measurement_root();
         let (state, root, paths) = state_fixture_at(measurement_root.0.clone());
-        let version_id = "guardian-r5-representative";
+        let version_id = "guardian-representative-sweep";
         let instance = state
             .instances()
-            .insert_for_test("R5 synthetic representative", version_id)
-            .expect("register R5 representative instance");
-        r5_activate_representative_inventory(&state, &paths, &instance.id, version_id);
-        r5_install_booting_java(&state, &root, &instance.id);
+            .insert_for_test(
+                "representative integrity sweep synthetic representative",
+                version_id,
+            )
+            .expect("register representative integrity sweep representative instance");
+        representative_sweep_activate_representative_inventory(
+            &state,
+            &paths,
+            &instance.id,
+            version_id,
+        );
+        representative_sweep_install_booting_java(&state, &root, &instance.id);
         let process_count_path = state
             .instances()
             .game_dir(&instance.id)
-            .join("guardian-r5-process-count");
+            .join("guardian-representative-sweep-process-count");
 
         let full_sweep_started = Instant::now();
         let full_sweep = reserve(
@@ -1937,7 +1978,7 @@ exec sleep 30
         )
         .execute()
         .await
-        .expect("execute full representative R5 sweep");
+        .expect("execute full representative representative integrity sweep sweep");
         let full_sweep_elapsed = full_sweep_started.elapsed();
         assert_eq!(full_sweep, IdleIntegrityTerminal::Succeeded);
         let full_journal = state
@@ -1945,33 +1986,42 @@ exec sleep 30
             .get(&OperationId::deterministic_test(
                 "integrity-sweep-00000000-0000-4000-8000-000000000500",
             ))
-            .expect("full representative R5 terminal journal");
+            .expect("full representative representative integrity sweep terminal journal");
         assert_eq!(full_journal.status, OperationStatus::Succeeded);
         assert_eq!(full_journal.outcome, Some(OperationOutcome::Succeeded));
-        let full_facts = &full_journal.completed_steps[0].generated_facts;
-        for expected in [
-            format!("integrity_counter:selected_entry_count:{R5_REPRESENTATIVE_ENTRY_COUNT}"),
-            format!("integrity_counter:verified_entry_count:{R5_REPRESENTATIVE_ENTRY_COUNT}"),
-            format!("integrity_counter:processed_entry_count:{R5_REPRESENTATIVE_ENTRY_COUNT}"),
-            format!("integrity_counter:hashed_entry_count:{R5_REPRESENTATIVE_ENTRY_COUNT}"),
-            format!(
-                "integrity_counter:expected_content_byte_count:{R5_REPRESENTATIVE_CONTENT_BYTES}"
-            ),
-            format!("integrity_counter:content_read_byte_count:{R5_REPRESENTATIVE_CONTENT_BYTES}"),
-        ] {
-            assert!(
-                full_facts.contains(&expected),
-                "missing R5 counter {expected}"
-            );
-        }
+        let metrics = tier2_metrics(&full_journal);
+        assert_eq!(
+            metrics.selected_entry_count(),
+            REPRESENTATIVE_ENTRY_COUNT as u64
+        );
+        assert_eq!(
+            metrics.verified_entry_count(),
+            REPRESENTATIVE_ENTRY_COUNT as u64
+        );
+        assert_eq!(
+            metrics.processed_entry_count(),
+            REPRESENTATIVE_ENTRY_COUNT as u64
+        );
+        assert_eq!(
+            metrics.hashed_entry_count(),
+            REPRESENTATIVE_ENTRY_COUNT as u64
+        );
+        assert_eq!(
+            metrics.expected_content_byte_count(),
+            REPRESENTATIVE_CONTENT_BYTES
+        );
+        assert_eq!(
+            metrics.content_read_byte_count(),
+            REPRESENTATIVE_CONTENT_BYTES
+        );
 
-        r5_launch_once(&state, &instance.id).await;
-        let mut baseline = Vec::with_capacity(R5_LAUNCH_SAMPLE_COUNT);
-        let mut concurrent = Vec::with_capacity(R5_LAUNCH_SAMPLE_COUNT);
-        let mut paired_impact = Vec::with_capacity(R5_LAUNCH_SAMPLE_COUNT);
-        let mut preemption = Vec::with_capacity(R5_LAUNCH_SAMPLE_COUNT);
-        for sample_index in 0..R5_LAUNCH_SAMPLE_COUNT {
-            let baseline_elapsed = r5_launch_once(&state, &instance.id).await;
+        representative_sweep_launch_once(&state, &instance.id).await;
+        let mut baseline = Vec::with_capacity(REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT);
+        let mut concurrent = Vec::with_capacity(REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT);
+        let mut paired_impact = Vec::with_capacity(REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT);
+        let mut preemption = Vec::with_capacity(REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT);
+        for sample_index in 0..REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT {
+            let baseline_elapsed = representative_sweep_launch_once(&state, &instance.id).await;
             baseline.push(baseline_elapsed);
 
             let operation_id = format!(
@@ -1984,14 +2034,15 @@ exec sleep 30
                 idle_epoch(&state),
             )
             .start_with_progress_observer(observer.clone());
-            r5_wait_for_content_read(&observer).await;
+            representative_sweep_wait_for_content_read(&observer).await;
             assert!(observer.settled_at().is_none());
 
-            let expected_process_count = r5_process_count(&process_count_path) + 1;
+            let expected_process_count =
+                representative_sweep_process_count(&process_count_path) + 1;
             let preemption_started = Instant::now();
             let (concurrent_elapsed, ()) = tokio::join!(
-                r5_launch_once(&state, &instance.id),
-                r5_assert_process_effect_after_settlement(
+                representative_sweep_launch_once(&state, &instance.id),
+                representative_sweep_assert_process_effect_after_settlement(
                     &process_count_path,
                     expected_process_count,
                     &observer,
@@ -1999,7 +2050,7 @@ exec sleep 30
             );
             let settled_at = observer
                 .settled_at()
-                .expect("R5 sweep settles before launch effect");
+                .expect("representative integrity sweep sweep settles before launch effect");
             preemption.push(settled_at.saturating_duration_since(preemption_started));
             paired_impact.push(concurrent_elapsed.saturating_sub(baseline_elapsed));
             concurrent.push(concurrent_elapsed);
@@ -2007,29 +2058,31 @@ exec sleep 30
                 execution
                     .wait()
                     .await
-                    .expect("R5 cancelled sweep terminal")
+                    .expect("representative integrity sweep cancelled sweep terminal")
                     .terminal,
                 IdleIntegrityTerminal::Cancelled
             );
             let journal = state
                 .journals()
                 .get(&OperationId::deterministic_test(operation_id))
-                .expect("R5 cancelled sweep journal");
+                .expect("representative integrity sweep cancelled sweep journal");
             assert_eq!(journal.status, OperationStatus::Cancelled);
             assert_eq!(journal.outcome, Some(OperationOutcome::Cancelled));
         }
 
-        let baseline_summary = r5_timing_summary(&baseline);
-        let concurrent_summary = r5_timing_summary(&concurrent);
-        let paired_impact_summary = r5_timing_summary(&paired_impact);
-        let preemption_summary = r5_timing_summary(&preemption);
-        let launch_impact_within_ceiling = paired_impact_summary.1 <= R5_LAUNCH_IMPACT_CEILING;
-        let preemption_within_ceiling = preemption_summary.1 <= R5_LAUNCH_IMPACT_CEILING;
+        let baseline_summary = representative_sweep_timing_summary(&baseline);
+        let concurrent_summary = representative_sweep_timing_summary(&concurrent);
+        let paired_impact_summary = representative_sweep_timing_summary(&paired_impact);
+        let preemption_summary = representative_sweep_timing_summary(&preemption);
+        let launch_impact_within_ceiling =
+            paired_impact_summary.1 <= REPRESENTATIVE_SWEEP_LAUNCH_IMPACT_CEILING;
+        let preemption_within_ceiling =
+            preemption_summary.1 <= REPRESENTATIVE_SWEEP_LAUNCH_IMPACT_CEILING;
 
         println!(
             "{}",
             serde_json::json!({
-                "schema": "axial.guardian.r5.launch-impact.v1",
+                "schema": "axial.guardian.representative-sweep.launch-impact.v1",
                 "source_binding": source_binding,
                 "host_scope": "linux_wsl2_virtual_disk_only",
                 "kernel_release": kernel_release,
@@ -2038,17 +2091,17 @@ exec sleep 30
                 "fixture_root_supplied": true,
                 "fixture_kind": "synthetic_representative",
                 "fixture_basis": "current_local_axial_runtime_footprint",
-                "entry_count": R5_REPRESENTATIVE_ENTRY_COUNT,
-                "content_bytes": R5_REPRESENTATIVE_CONTENT_BYTES,
+                "entry_count": REPRESENTATIVE_ENTRY_COUNT,
+                "content_bytes": REPRESENTATIVE_CONTENT_BYTES,
                 "full_sweep_elapsed_micros": full_sweep_elapsed.as_micros(),
                 "full_sweep_status": "succeeded",
                 "warmup_launch_samples": 1,
-                "paired_launch_samples": R5_LAUNCH_SAMPLE_COUNT,
-                "baseline_launch": r5_timing_json(baseline_summary),
-                "concurrent_launch": r5_timing_json(concurrent_summary),
-                "paired_launch_impact": r5_timing_json(paired_impact_summary),
-                "physical_preemption_settlement": r5_timing_json(preemption_summary),
-                "ceiling_ms": R5_LAUNCH_IMPACT_CEILING.as_millis(),
+                "paired_launch_samples": REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT,
+                "baseline_launch": representative_sweep_timing_json(baseline_summary),
+                "concurrent_launch": representative_sweep_timing_json(concurrent_summary),
+                "paired_launch_impact": representative_sweep_timing_json(paired_impact_summary),
+                "physical_preemption_settlement": representative_sweep_timing_json(preemption_summary),
+                "ceiling_ms": REPRESENTATIVE_SWEEP_LAUNCH_IMPACT_CEILING.as_millis(),
                 "launch_impact_within_ceiling": launch_impact_within_ceiling,
                 "preemption_within_ceiling": preemption_within_ceiling,
                 "cache_condition": "warm_without_cache_flush",
@@ -2062,11 +2115,11 @@ exec sleep 30
         );
         assert!(
             launch_impact_within_ceiling,
-            "R5 paired p95 launch impact exceeded the predeclared 10 ms ceiling"
+            "representative integrity sweep paired p95 launch impact exceeded the predeclared 10 ms ceiling"
         );
         assert!(
             preemption_within_ceiling,
-            "R5 p95 physical sweep settlement exceeded the predeclared 10 ms ceiling"
+            "representative integrity sweep p95 physical sweep settlement exceeded the predeclared 10 ms ceiling"
         );
 
         close_fixture(state, &root).await;
@@ -2252,7 +2305,8 @@ exec sleep 30
         assert_eq!(journal.outcome, Some(OperationOutcome::Succeeded));
         assert!(journal_fact_ids(&journal).is_empty());
         assert!(journal.guardian_diagnosis_ids.is_empty());
-        assert_eq!(journal.completed_steps[0].generated_facts.len(), 9);
+        assert!(journal.completed_steps[0].generated_facts.is_empty());
+        assert!(journal.completed_steps[0].metrics().is_some());
         drop(clean_receipt);
         close_fixture(state, &root).await;
     }
@@ -2358,7 +2412,7 @@ exec sleep 30
             .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
             .expect("corrupt terminal journal");
         assert_eq!(journal.status, OperationStatus::Succeeded);
-        assert!(journal_fact_ids(&journal).contains(&"guardian_fact:artifact_hash_mismatch"));
+        assert!(journal_fact_ids(&journal).contains(&GuardianFactId::ArtifactHashMismatch));
         assert_eq!(
             journal.guardian_diagnosis_ids,
             vec![crate::guardian::DiagnosisId::LauncherManagedArtifactCorrupt]
@@ -2501,7 +2555,7 @@ exec sleep 30
             .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
             .expect("VersionBundle parent journal");
         assert_eq!(parent.status, OperationStatus::Succeeded);
-        assert!(journal_fact_ids(&parent).contains(&"guardian_fact:artifact_size_drift"));
+        assert!(journal_fact_ids(&parent).contains(&GuardianFactId::ArtifactSizeDrift));
         assert_eq!(
             parent.guardian_diagnosis_ids,
             vec![crate::guardian::DiagnosisId::LauncherManagedArtifactCorrupt]
@@ -2700,7 +2754,8 @@ exec sleep 30
             .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
             .expect("cancelled terminal journal");
         assert_eq!(journal.status, OperationStatus::Cancelled);
-        assert_eq!(journal.completed_steps[0].generated_facts.len(), 9);
+        assert!(journal.completed_steps[0].generated_facts.is_empty());
+        assert!(journal.completed_steps[0].metrics().is_some());
         assert!(journal_fact_ids(&journal).is_empty());
         assert!(journal.guardian_diagnosis_ids.is_empty());
         close_fixture(state, &root).await;
@@ -2736,12 +2791,10 @@ exec sleep 30
         );
         assert!(journal_fact_ids(&journal).is_empty());
         assert!(journal.guardian_diagnosis_ids.is_empty());
-        assert!(
-            journal.completed_steps[0]
-                .generated_facts
-                .iter()
-                .all(|value| value.ends_with(":0"))
-        );
+        let metrics = tier2_metrics(&journal);
+        assert_eq!(metrics.selected_entry_count(), 0);
+        assert_eq!(metrics.processed_entry_count(), 0);
+        assert_eq!(metrics.content_read_byte_count(), 0);
         close_fixture(state, &root).await;
     }
 
@@ -2819,13 +2872,13 @@ exec sleep 30
                 .expect("create restart fixture");
         }
         journals
-            .record_success(
+            .record_success_with_metrics(
                 &OperationId::deterministic_test(SECOND_OPERATION_ID),
                 tier2_integrity_step(
                     OperationStepResult::Completed,
                     Some(Tier2IntegrityCounters::default()),
-                ),
-                OperationOutcome::Succeeded,
+                )
+                .expect("valid terminal Tier 2 metrics"),
             )
             .await
             .expect("terminalize completed fixture");

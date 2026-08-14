@@ -1,7 +1,8 @@
 use super::rules::rule_order;
 use super::{
     ActionPlanPrerequisite, Diagnosis, DiagnosisId, GuardianAction, GuardianActionKind,
-    GuardianActionPlan, GuardianFact, GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase,
+    GuardianActionPlan, GuardianFact, GuardianFactId, GuardianMode, GuardianSeverity,
+    OperationEvidenceBatch, SafetyCase,
 };
 use crate::state::contracts::{OperationId, OwnershipClass, StabilizationSystem, TargetDescriptor};
 use serde::Serialize;
@@ -164,11 +165,11 @@ impl GuardianPolicyContext {
     pub(super) fn for_launch_preflight(
         mut self,
         admission: PreflightAdmission,
-        facts: &[GuardianFact],
+        evidence: &OperationEvidenceBatch,
     ) -> Self {
         self.scope = DecisionScope::LaunchPreflight {
             admission,
-            signals: PreflightSignals::from_facts(facts),
+            signals: PreflightSignals::from_facts(evidence.facts()),
         };
         self
     }
@@ -998,7 +999,10 @@ mod tests {
         ];
 
         for case in cases {
-            let diagnoses = diagnose(&case.facts, case.phase);
+            let diagnoses = diagnose(
+                &crate::guardian::unscoped_evidence_for_test(&case.facts),
+                case.phase,
+            );
             assert_eq!(
                 strongest_diagnosis(&diagnoses).map(|diagnosis| diagnosis.id()),
                 Some(case.expected)
@@ -1116,13 +1120,17 @@ mod tests {
             OperationPhase::Validating,
             OwnershipClass::UserOwned,
         );
-        let diagnosis = diagnose(std::slice::from_ref(&fact), OperationPhase::Validating)
-            .into_iter()
-            .next()
-            .expect("Java override diagnosis");
+        let diagnosis = diagnose(
+            &crate::guardian::unscoped_evidence_for_test(std::slice::from_ref(&fact)),
+            OperationPhase::Validating,
+        )
+        .into_iter()
+        .next()
+        .expect("Java override diagnosis");
         let original_candidates = diagnosis.candidate_actions().to_vec();
         assert!(!original_candidates.contains(&GuardianActionKind::Warn));
         let safety_case = safety_case(GuardianMode::Managed, diagnosis);
+        let evidence = crate::guardian::unscoped_evidence_for_test(&[fact]);
 
         let general =
             decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
@@ -1139,7 +1147,7 @@ mod tests {
         let scoped = decide_guardian_policy(
             &safety_case,
             GuardianPolicyContext::current_operation()
-                .for_launch_preflight(PreflightAdmission::Ready, &[fact]),
+                .for_launch_preflight(PreflightAdmission::Ready, &evidence),
         );
         assert_eq!(scoped.kind, GuardianActionKind::Warn);
         let scoped_candidates = scoped
@@ -1193,10 +1201,13 @@ mod tests {
             }),
             fields: Vec::new(),
         };
-        let diagnosis = diagnose(&[fact], OperationPhase::Preparing)
-            .into_iter()
-            .next()
-            .expect("managed runtime diagnosis");
+        let diagnosis = diagnose(
+            &crate::guardian::unscoped_evidence_for_test(&[fact]),
+            OperationPhase::Preparing,
+        )
+        .into_iter()
+        .next()
+        .expect("managed runtime diagnosis");
         let safety_case = safety_case(GuardianMode::Managed, diagnosis);
 
         let decision =
@@ -1296,7 +1307,10 @@ mod tests {
             )),
             fields: Vec::new(),
         };
-        let diagnoses = diagnose(&[fact], OperationPhase::Launching);
+        let diagnoses = diagnose(
+            &crate::guardian::unscoped_evidence_for_test(&[fact]),
+            OperationPhase::Launching,
+        );
         let diagnosis = diagnoses
             .first()
             .expect("unknown diagnosis should be generated")
@@ -1798,7 +1812,7 @@ mod tests {
         ownership: OwnershipClass,
     ) -> Diagnosis {
         let fact = rule_fact(fact_id, domain, phase, ownership);
-        let diagnoses = diagnose(&[fact], phase);
+        let diagnoses = diagnose(&crate::guardian::unscoped_evidence_for_test(&[fact]), phase);
         assert_eq!(diagnoses.len(), 1, "{}", fact_id.as_str());
         diagnoses
             .into_iter()

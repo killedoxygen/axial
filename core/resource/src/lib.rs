@@ -817,7 +817,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p01_b04_contract_scratch_waiter_does_not_hold_background_capacity() {
+    async fn native_filesystem_contract_scratch_waiter_does_not_hold_background_capacity() {
         let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
             workers: 2,
             background: 1,
@@ -868,7 +868,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn p01_b04_contract_saturation_records_phase_gate_measurements() {
+    async fn native_filesystem_contract_saturation_records_capacity_measurements() {
         const RUNS: usize = 20;
         const WORKER_SCRATCH_BYTES: u64 = SCRATCH_LIMIT_BYTES / PROCESS_WORKER_LIMIT as u64;
 
@@ -1010,7 +1010,7 @@ mod tests {
         shutdown_samples.sort_unstable();
         let p95_index = RUNS * 95 / 100 - 1;
         println!(
-            "p01_resource_admission_measurement={{\"runs\":{RUNS},\"peak_workers\":{PROCESS_WORKER_LIMIT},\"peak_scratch_bytes\":{SCRATCH_LIMIT_BYTES},\"heartbeat_p95_ns\":{},\"queue_wait_p95_ns\":{},\"shutdown_p95_ns\":{}}}",
+            "resource_admission_measurement={{\"runs\":{RUNS},\"peak_workers\":{PROCESS_WORKER_LIMIT},\"peak_scratch_bytes\":{SCRATCH_LIMIT_BYTES},\"heartbeat_p95_ns\":{},\"queue_wait_p95_ns\":{},\"shutdown_p95_ns\":{}}}",
             heartbeat_samples[p95_index].as_nanos(),
             queue_wait_samples[p95_index].as_nanos(),
             shutdown_samples[p95_index].as_nanos(),
@@ -1074,7 +1074,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn p01_b04_contract_deadline_retains_capacity_until_physical_exit() {
+    async fn native_filesystem_contract_deadline_retains_capacity_until_physical_exit() {
         let owner = test_owner();
         let stalled = owner.group();
         let other = owner.group();
@@ -1130,7 +1130,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn p01_b04_contract_cross_owner_reserves_foreground_and_scratch() {
+    async fn native_filesystem_contract_cross_owner_reserves_foreground_and_scratch() {
         let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
             workers: 2,
             background: 1,
@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn p01_b04_contract_queue_wait_is_inside_the_deadline() {
+    async fn native_filesystem_contract_queue_wait_is_inside_the_deadline() {
         let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
             workers: 2,
             background: 2,

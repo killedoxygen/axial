@@ -1,7 +1,6 @@
 use super::{
-    DiagnosisId, GuardianInstallOutcomeFactGroupParse, GuardianSummaryDecision,
-    guardian_install_outcome_fact_group, guardian_install_outcome_from_persisted_group,
-    guardian_proof_evidence, guardian_summary_for_test,
+    DiagnosisId, GuardianActionKind, GuardianSummaryDecision,
+    guardian_install_outcome_from_terminal, guardian_proof_evidence, guardian_summary_for_test,
 };
 use axial_launcher::GuardianMode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -11,7 +10,7 @@ const COPY_FIXTURE: &str = include_str!(concat!(
     "/tests/fixtures/guardian/guardian-projection-copy-v1.json"
 ));
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_PROJECTION_COPY_SNAPSHOT";
-const EXPECTED_CASE_IDS: [&str; 20] = [
+const EXPECTED_CASE_IDS: [&str; 16] = [
     "proof.blocked",
     "proof.warned",
     "proof.intervened",
@@ -28,10 +27,6 @@ const EXPECTED_CASE_IDS: [&str; 20] = [
     "install.temp_write_failed",
     "install.atomic_promotion",
     "install.ownership_unsafe",
-    "install.malformed_summary",
-    "install.missing_detail",
-    "install.unsafe_detail",
-    "install.duplicate_summary",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -88,9 +83,9 @@ enum GuardianProjectionCopyInput {
         #[serde(default)]
         intervention_details: Vec<String>,
     },
-    InstallPersistence {
+    InstallTerminal {
         diagnosis_id: DiagnosisId,
-        facts: Vec<String>,
+        action: GuardianActionKind,
     },
 }
 
@@ -100,7 +95,7 @@ enum GuardianProjectionCopyOutput {
     Proof {
         evidence: Option<GuardianProofEvidenceFixture>,
     },
-    InstallPersistence {
+    InstallTerminal {
         outcome: Option<GuardianInstallOutcomeFixture>,
         #[serde(skip_serializing_if = "Option::is_none")]
         retry_disabled_reason: Option<String>,
@@ -213,23 +208,16 @@ fn render_output(input: &GuardianProjectionCopyInput) -> GuardianProjectionCopyO
                 evidence: guardian_proof_evidence(&guardian).map(project_serialized),
             }
         }
-        GuardianProjectionCopyInput::InstallPersistence {
+        GuardianProjectionCopyInput::InstallTerminal {
             diagnosis_id,
-            facts,
+            action,
         } => {
-            let outcome =
-                match guardian_install_outcome_fact_group(facts.iter().map(String::as_str)) {
-                    GuardianInstallOutcomeFactGroupParse::Valid(group) => {
-                        guardian_install_outcome_from_persisted_group(*diagnosis_id, group)
-                    }
-                    GuardianInstallOutcomeFactGroupParse::Absent
-                    | GuardianInstallOutcomeFactGroupParse::Invalid => None,
-                };
+            let outcome = guardian_install_outcome_from_terminal(*diagnosis_id, *action);
             let retry_disabled_reason = outcome
                 .as_ref()
                 .filter(|outcome| outcome.decision() == "block")
                 .map(|outcome| outcome.retry_disabled_reason().to_string());
-            GuardianProjectionCopyOutput::InstallPersistence {
+            GuardianProjectionCopyOutput::InstallTerminal {
                 outcome: outcome.map(project_serialized),
                 retry_disabled_reason,
             }
@@ -267,7 +255,7 @@ fn assert_snapshot_coverage(snapshot: &GuardianProjectionCopySnapshot) {
                 .cases
                 .iter()
                 .filter_map(|case| match &case.output {
-                    GuardianProjectionCopyOutput::InstallPersistence {
+                    GuardianProjectionCopyOutput::InstallTerminal {
                         outcome: Some(outcome),
                         ..
                     } if outcome.diagnosis_id == diagnosis_id && outcome.decision == decision =>
@@ -295,7 +283,7 @@ fn assert_public_bounds_and_privacy(snapshot: &GuardianProjectionCopySnapshot) {
                     );
                 }
             }
-            GuardianProjectionCopyOutput::InstallPersistence {
+            GuardianProjectionCopyOutput::InstallTerminal {
                 outcome,
                 retry_disabled_reason,
             } => {

@@ -1642,7 +1642,7 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     #[tokio::test]
-    async fn p01_b04_contract_cross_pool_scratch_is_process_bounded() {
+    async fn native_filesystem_contract_cross_pool_scratch_is_process_bounded() {
         let workers = ManagedBlockingWorkers::new();
         let assets = AssetSourcePool::new_with_workers(workers.clone()).expect("asset pool");
         let libraries = LibrarySourcePool::new_with_workers(workers).expect("library pool");

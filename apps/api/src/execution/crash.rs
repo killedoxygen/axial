@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn p01_b04_contract_crash_shutdown_reports_physical_stall_until_exit() {
+    async fn native_filesystem_contract_crash_shutdown_reports_physical_stall_until_exit() {
         let workers = collection_workers();
         let gate = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
         let gate_for_worker = std::sync::Arc::clone(&gate);

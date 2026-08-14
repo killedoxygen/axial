@@ -6368,10 +6368,10 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_foreground_artifact_repair_rejects_active_and_earlier_writers() {
-        let (state, root) = state_fixture("fresh-r1-artifact-epoch", None);
+        let (state, root) = state_fixture("fresh-repair-artifact-epoch", None);
         let instance = state
             .instances()
-            .insert_for_test("Fresh R1 artifact epoch", "1.21.5")
+            .insert_for_test("Fresh RepairArtifact artifact epoch", "1.21.5")
             .expect("instance");
         let inventory = KnownGoodInventory::from_test_entries([entry(
             TestKnownGoodRoot::Libraries,
@@ -6402,16 +6402,16 @@ mod tests {
             .registered_artifact_recovery_entry(authorization)
             .expect("fresh recovery entry")
         else {
-            panic!("new foreground finding must enter R1 as Fresh")
+            panic!("new foreground finding must enter RepairArtifact as Fresh")
         };
         let admission = state
             .admit_registered_artifact_repair(
                 authorization,
-                OperationId::deterministic_test("fresh-r1-artifact-epoch"),
+                OperationId::deterministic_test("fresh-repair-artifact-epoch"),
                 chrono::Duration::minutes(15),
             )
             .await
-            .expect("fresh R1 admission");
+            .expect("fresh RepairArtifact admission");
         let writer = state
             .admit_managed_artifact_mutation()
             .expect("intervening active writer");
@@ -6893,10 +6893,10 @@ mod tests {
     async fn foreground_component_rebuild_rejects_an_intervening_writer() {
         let expected = b"foreground-assets-epoch";
         let corrupt = vec![b'x'; expected.len()];
-        let (state, root) = state_fixture("foreground-r2-artifact-epoch", None);
+        let (state, root) = state_fixture("foreground-rebuild-component-epoch", None);
         let instance = state
             .instances()
-            .insert_for_test("Foreground R2 artifact epoch", "1.21.5")
+            .insert_for_test("Foreground RebuildComponent artifact epoch", "1.21.5")
             .expect("instance");
         let inventory = KnownGoodInventory::from_test_entries([entry(
             TestKnownGoodRoot::Assets,
@@ -6938,36 +6938,36 @@ mod tests {
             .registered_artifact_recovery_entry(authorization)
             .expect("fresh Assets recovery entry")
         else {
-            panic!("new foreground finding must enter R1 as Fresh")
+            panic!("new foreground finding must enter RepairArtifact as Fresh")
         };
-        let r1_admission = state
+        let repair_artifact_admission = state
             .admit_registered_artifact_repair(
                 authorization,
-                OperationId::deterministic_test("foreground-r2-artifact-epoch-r1"),
+                OperationId::deterministic_test("foreground-rebuild-component-epoch-repair"),
                 chrono::Duration::minutes(15),
             )
             .await
-            .expect("fresh R1 admission");
+            .expect("fresh RepairArtifact admission");
         let failure = match execute_registered_guardian_artifact_repair(
-            r1_admission,
+            repair_artifact_admission,
             &reqwest::Client::new(),
         )
         .await
-        .expect("R1 component-required settlement")
+        .expect("RepairArtifact component-required settlement")
         {
             GuardianArtifactRepairSettlement::Failed(failure) => failure,
             GuardianArtifactRepairSettlement::Completed(_) => {
-                panic!("corrupt Assets finding must continue to R2")
+                panic!("corrupt Assets finding must continue to RebuildComponent")
             }
         };
         let component = state
             .admit_registered_artifact_component_rebuild(
                 (*failure).into_continuation(),
-                OperationId::deterministic_test("foreground-r2-artifact-epoch-r2"),
+                OperationId::deterministic_test("foreground-rebuild-component-epoch-rebuild"),
                 chrono::Duration::minutes(15),
             )
             .await
-            .expect("natural foreground R2 admission");
+            .expect("natural foreground RebuildComponent admission");
 
         drop(
             state
@@ -6977,11 +6977,11 @@ mod tests {
         let outcome = execute_managed_assets_component_rebuild_fixture_for_test(
             state
                 .try_claim_producer()
-                .expect("claim stale R2 settlement owner"),
+                .expect("claim stale RebuildComponent settlement owner"),
             component,
         )
         .await
-        .expect("stale R2 settlement");
+        .expect("stale RebuildComponent settlement");
 
         assert_eq!(
             outcome.status,
@@ -8337,26 +8337,27 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires AXIAL_I8_ROTATIONAL_FIXTURE_ROOT and AXIAL_I8_DEVICE_EVIDENCE"]
+    #[ignore = "requires AXIAL_WARM_CACHE_INTEGRITY_FIXTURE_ROOT and AXIAL_WARM_CACHE_INTEGRITY_DEVICE_EVIDENCE"]
     async fn rotational_fixture_integrity_tier_zero_p95_is_within_declared_ceiling() {
-        let fixture_root = std::env::var_os("AXIAL_I8_ROTATIONAL_FIXTURE_ROOT")
+        let fixture_root = std::env::var_os("AXIAL_WARM_CACHE_INTEGRITY_FIXTURE_ROOT")
             .map(PathBuf::from)
-            .expect("AXIAL_I8_ROTATIONAL_FIXTURE_ROOT is required");
-        let device_evidence = std::env::var("AXIAL_I8_DEVICE_EVIDENCE")
-            .expect("AXIAL_I8_DEVICE_EVIDENCE is required");
-        let filesystem_evidence = std::env::var("AXIAL_I8_FILESYSTEM_EVIDENCE")
-            .expect("AXIAL_I8_FILESYSTEM_EVIDENCE is required");
-        let cache_evidence =
-            std::env::var("AXIAL_I8_CACHE_EVIDENCE").expect("AXIAL_I8_CACHE_EVIDENCE is required");
-        let cold_candidate_evidence = std::env::var("AXIAL_I8_COLD_CANDIDATE_EVIDENCE")
-            .expect("AXIAL_I8_COLD_CANDIDATE_EVIDENCE is required");
-        let entry_count = std::env::var("AXIAL_I8_FIXTURE_ENTRY_COUNT")
-            .expect("AXIAL_I8_FIXTURE_ENTRY_COUNT is required")
+            .expect("AXIAL_WARM_CACHE_INTEGRITY_FIXTURE_ROOT is required");
+        let device_evidence = std::env::var("AXIAL_WARM_CACHE_INTEGRITY_DEVICE_EVIDENCE")
+            .expect("AXIAL_WARM_CACHE_INTEGRITY_DEVICE_EVIDENCE is required");
+        let filesystem_evidence = std::env::var("AXIAL_WARM_CACHE_INTEGRITY_FILESYSTEM_EVIDENCE")
+            .expect("AXIAL_WARM_CACHE_INTEGRITY_FILESYSTEM_EVIDENCE is required");
+        let cache_evidence = std::env::var("AXIAL_WARM_CACHE_INTEGRITY_CACHE_EVIDENCE")
+            .expect("AXIAL_WARM_CACHE_INTEGRITY_CACHE_EVIDENCE is required");
+        let cold_candidate_evidence =
+            std::env::var("AXIAL_WARM_CACHE_INTEGRITY_COLD_CANDIDATE_EVIDENCE")
+                .expect("AXIAL_WARM_CACHE_INTEGRITY_COLD_CANDIDATE_EVIDENCE is required");
+        let entry_count = std::env::var("AXIAL_WARM_CACHE_INTEGRITY_FIXTURE_ENTRY_COUNT")
+            .expect("AXIAL_WARM_CACHE_INTEGRITY_FIXTURE_ENTRY_COUNT is required")
             .parse::<usize>()
-            .expect("AXIAL_I8_FIXTURE_ENTRY_COUNT must be an integer");
+            .expect("AXIAL_WARM_CACHE_INTEGRITY_FIXTURE_ENTRY_COUNT must be an integer");
         assert!(
             entry_count >= 128,
-            "I8 fixture must contain at least 128 entries"
+            "warm-cache-integrity fixture must contain at least 128 entries"
         );
         let library_root = fs::canonicalize(&fixture_root).expect("canonical fixture root");
         let entries = (0..entry_count)
@@ -8373,14 +8374,14 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let (state, root) = state_fixture("i8", Some(library_root.clone()));
+        let (state, root) = state_fixture("warm-cache-integrity", Some(library_root.clone()));
         let instance = state
             .instances()
-            .insert_for_test("I8", "1.21.5")
+            .insert_for_test("warm-cache-integrity", "1.21.5")
             .expect("instance");
         state.activate_known_good_inventory_for_test(
             &instance.id,
-            KnownGoodInventory::from_test_entries(entries).expect("I8 inventory"),
+            KnownGoodInventory::from_test_entries(entries).expect("warm-cache-integrity inventory"),
         );
         let foreground = test_integrity_foreground(&state).await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
@@ -8394,7 +8395,10 @@ mod tests {
         )
         .await
         .expect("warmup sensing");
-        assert!(warmup_report.facts.is_empty(), "I8 fixture must be healthy");
+        assert!(
+            warmup_report.facts.is_empty(),
+            "warm-cache-integrity fixture must be healthy"
+        );
 
         let mut samples = Vec::with_capacity(101);
         for _ in 0..101 {
@@ -8411,7 +8415,7 @@ mod tests {
             samples.push(started_at.elapsed());
             assert!(
                 report.facts.is_empty(),
-                "I8 fixture drifted during measurement"
+                "warm-cache-integrity fixture drifted during measurement"
             );
             assert_eq!(report.metadata_lookup_count, entry_count);
         }
@@ -8422,7 +8426,7 @@ mod tests {
         println!(
             "{}",
             serde_json::json!({
-                "schema": "axial.guardian.i8.integrity-tier0.v1",
+                "schema": "axial.guardian.warm-cache-integrity.integrity-tier0.v1",
                 "fixture_root_supplied": true,
                 "device_evidence": device_evidence,
                 "filesystem_evidence": filesystem_evidence,

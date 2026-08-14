@@ -1,11 +1,13 @@
 use super::operation::install_failure_target_and_kind_from_download_error;
 use super::*;
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
-use crate::guardian::{DiagnosisId, GuardianInstallArtifactFailureKind};
+use crate::execution::{ExecutionFact, ExecutionFactKind};
+use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianFactId};
+use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{
-    CommandKind, JournalId, OperationId, OperationJournalStep, OperationOutcome, OperationPhase,
-    OperationStatus, OperationStepResult, OwnershipClass, RollbackState, StabilizationSystem,
-    TargetKind,
+    CommandKind, ContentDownloadMetrics, OperationId, OperationJournalStep, OperationOutcome,
+    OperationPhase, OperationStatus, OperationStepMetrics, OperationStepResult, OwnershipClass,
+    TargetDescriptor, TargetKind,
 };
 use crate::state::{
     AppState, AppStateInit, GuardianFailureMemoryStore, InstallStore, OperationJournalStore,
@@ -451,7 +453,7 @@ fn content_queue_view_model_retains_semantic_intent_without_urls() {
 }
 
 #[test]
-fn p02_b04_contract_content_queue_item_round_trips_as_retry_request() {
+fn behavior_contract_content_queue_item_round_trips_as_retry_request() {
     let spec = InstallQueueSpec::Content {
         instance_id: "0000000000000001".to_string(),
         label: "Updating Sodium".to_string(),
@@ -495,7 +497,7 @@ fn p02_b04_contract_content_queue_item_round_trips_as_retry_request() {
 }
 
 #[test]
-fn p02_b04_contract_cross_owner_rejects_parallel_content_request_shapes() {
+fn behavior_contract_cross_owner_rejects_parallel_content_request_shapes() {
     for payload in [
         serde_json::json!({
             "kind": "content",
@@ -514,42 +516,42 @@ fn p02_b04_contract_cross_owner_rejects_parallel_content_request_shapes() {
 }
 
 #[test]
-fn p02_b05_contract_cross_owner_download_io_classes_select_exact_guardian_evidence() {
+fn behavior_contract_cross_owner_download_io_classes_select_exact_guardian_evidence() {
     let cases = [
         (
             io::ErrorKind::PermissionDenied,
             axial_minecraft::DownloadFileFailureClass::PermissionDenied,
-            GuardianInstallArtifactFailureKind::PermissionDenied,
+            crate::execution::ExecutionFactKind::FilePermissionDenied,
         ),
         (
             io::ErrorKind::StorageFull,
             axial_minecraft::DownloadFileFailureClass::StorageFull,
-            GuardianInstallArtifactFailureKind::TempWriteFailed,
+            crate::execution::ExecutionFactKind::DownloadTempWriteFailed,
         ),
         (
             io::ErrorKind::NotFound,
             axial_minecraft::DownloadFileFailureClass::NotFound,
-            GuardianInstallArtifactFailureKind::DependencyFailed,
+            crate::execution::ExecutionFactKind::InstallDependencyFailed,
         ),
         (
             io::ErrorKind::AlreadyExists,
             axial_minecraft::DownloadFileFailureClass::Conflict,
-            GuardianInstallArtifactFailureKind::PromotionFailed,
+            crate::execution::ExecutionFactKind::DownloadPromotionFailed,
         ),
         (
             io::ErrorKind::WouldBlock,
             axial_minecraft::DownloadFileFailureClass::Unsettled,
-            GuardianInstallArtifactFailureKind::PromotionFailed,
+            crate::execution::ExecutionFactKind::DownloadPromotionFailed,
         ),
         (
             io::ErrorKind::Interrupted,
             axial_minecraft::DownloadFileFailureClass::Interrupted,
-            GuardianInstallArtifactFailureKind::ExecutionFailed,
+            crate::execution::ExecutionFactKind::InstallExecutionFailed,
         ),
         (
             io::ErrorKind::Other,
             axial_minecraft::DownloadFileFailureClass::Other,
-            GuardianInstallArtifactFailureKind::ExecutionFailed,
+            crate::execution::ExecutionFactKind::InstallExecutionFailed,
         ),
     ];
 
@@ -1381,7 +1383,7 @@ async fn install_events_return_bounded_not_found_for_unknown_install() {
 }
 
 #[tokio::test]
-async fn p00_b07_contract_install_response_uses_direct_operation_identity() {
+async fn behavior_contract_install_response_uses_direct_operation_identity() {
     let root = temp_root("install-existing-active-operation");
     let library_dir = root.join("library");
     let state = build_test_state_with_library(&root, &library_dir);
@@ -4052,7 +4054,6 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
         Arc::new(GuardianFailureMemoryStore::new()),
         &operation_id,
         &facts,
-        "2026-07-09T10:00:00+00:00",
     )
     .await;
 
@@ -4135,7 +4136,6 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
         &operation_id,
         &error,
         &facts,
-        "2026-07-09T10:00:00+00:00",
     )
     .await;
 
@@ -4163,10 +4163,9 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
         guardian.label(),
         "This Minecraft version needs a Java runtime that is not available for this device."
     );
-    assert!(
-        guardian
-            .detail()
-            .is_some_and(|detail| detail.contains("jre-legacy") && detail.contains("mac-os-arm64"))
+    assert_eq!(
+        guardian.detail(),
+        Some("Java runtime component the required runtime is not available for this device.")
     );
     let failure_view_model = response
         .failure_view_model
@@ -4228,7 +4227,6 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
         &operation_id,
         &error,
         &facts,
-        "2026-07-09T10:00:00+00:00",
     )
     .await;
 
@@ -4256,10 +4254,9 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
         guardian.label(),
         "This Minecraft version needs Rosetta 2 on Apple Silicon Macs."
     );
-    assert!(
-        guardian
-            .detail()
-            .is_some_and(|detail| detail.contains("jre-legacy") && detail.contains("Rosetta 2"))
+    assert_eq!(
+        guardian.detail(),
+        Some("Java runtime component the required runtime needs Rosetta 2 on this Mac.")
     );
     assert!(guardian.guidance().iter().any(|guidance| {
         guidance.contains("softwareupdate --install-rosetta --agree-to-license")
@@ -4330,7 +4327,6 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
         &operation_id,
         &error,
         &facts,
-        "2026-07-09T10:05:00+00:00",
     )
     .await;
 
@@ -4394,7 +4390,6 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
         &operation_id,
         &error,
         &facts,
-        "2026-07-09T10:05:00+00:00",
     )
     .await;
 
@@ -6048,7 +6043,6 @@ async fn local_runtime_install_failure_cannot_record_provider_failure_memory() {
         &operation_id,
         &error,
         &facts,
-        "2026-07-17T10:05:00+00:00",
     )
     .await;
 
@@ -6078,8 +6072,16 @@ async fn unavailable_runtime_source_failure_records_component_provider_memory() 
     assert_eq!(
         evidence.fields,
         vec![
-            ("component".to_string(), "java-runtime-delta".to_string()),
-            ("source_failure_kind".to_string(), "unavailable".to_string(),),
+            EvidenceField::new(
+                "component",
+                "java-runtime-delta",
+                EvidenceSensitivity::Public,
+            ),
+            EvidenceField::new(
+                "source_failure_kind",
+                "unavailable",
+                EvidenceSensitivity::Public,
+            ),
         ]
     );
     begin_install_operation_journal(&journals, &operation_id, "26.2")
@@ -6093,7 +6095,6 @@ async fn unavailable_runtime_source_failure_records_component_provider_memory() 
         &operation_id,
         &error,
         &[],
-        "2026-07-17T10:05:00+00:00",
     )
     .await;
 
@@ -6132,17 +6133,26 @@ async fn permanent_runtime_source_failures_block_without_provider_memory_or_stal
         ));
         let evidence = typed_runtime_failure_evidence(&operation_id, &error)
             .expect("typed runtime source evidence");
-        assert_eq!(evidence.target_id, "java_runtime_source_java-runtime-gamma");
-        assert_eq!(evidence.ownership, OwnershipClass::ExternalProviderDerived);
+        let target = evidence.target.as_ref().expect("runtime source target");
+        assert_eq!(target.id, "java_runtime_source_java-runtime-gamma");
+        assert_eq!(target.ownership, OwnershipClass::ExternalProviderDerived);
         assert_eq!(
             evidence.kind,
-            GuardianInstallArtifactFailureKind::MetadataInvalid
+            crate::execution::ExecutionFactKind::ProviderDataInvalid
         );
         assert_eq!(
             evidence.fields,
             vec![
-                ("component".to_string(), "java-runtime-gamma".to_string()),
-                ("source_failure_kind".to_string(), kind.as_str().to_string(),),
+                EvidenceField::new(
+                    "component",
+                    "java-runtime-gamma",
+                    EvidenceSensitivity::Public,
+                ),
+                EvidenceField::new(
+                    "source_failure_kind",
+                    kind.as_str(),
+                    EvidenceSensitivity::Public,
+                ),
             ]
         );
         let facts = [download_fact(
@@ -6160,7 +6170,6 @@ async fn permanent_runtime_source_failures_block_without_provider_memory_or_stal
             &operation_id,
             &error,
             &facts,
-            "2026-07-17T10:05:00+00:00",
         )
         .await;
 
@@ -6206,7 +6215,6 @@ async fn runtime_source_failure_memory_is_isolated_by_component() {
             &operation_id,
             &error,
             &[],
-            "2026-07-17T10:05:00+00:00",
         )
         .await;
     }
@@ -6322,7 +6330,6 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
             Arc::new(GuardianFailureMemoryStore::new()),
             &operation_id,
             &facts,
-            "2026-07-09T10:00:00+00:00",
         )
         .await;
 
@@ -7886,13 +7893,13 @@ async fn content_journal_uses_instance_command_and_exports_bounded_redacted_succ
             fields: Vec::new(),
         });
     }
-    let journal_facts = download_facts.journal_facts();
+    let metrics = download_facts.metrics().expect("bounded content metrics");
     let mut progress_journal = InstallProgressJournalTracker::default();
     super::operation::record_content_operation_progress(
         &journals,
         &operation_id,
         &progress("planning", false, None),
-        &[],
+        None,
         &mut progress_journal,
     )
     .await
@@ -7901,7 +7908,7 @@ async fn content_journal_uses_instance_command_and_exports_bounded_redacted_succ
         &journals,
         &operation_id,
         &progress("done", true, None),
-        &journal_facts,
+        Some(&metrics),
         &mut progress_journal,
     )
     .await
@@ -7922,17 +7929,10 @@ async fn content_journal_uses_instance_command_and_exports_bounded_redacted_succ
             && target.id == "target"
     }));
     let terminal = entry.completed_steps.last().expect("terminal step");
-    assert!(
-        terminal
-            .generated_facts
-            .contains(&"execution_download_fact:written_to_temp:500".to_string())
+    assert_eq!(
+        terminal.metrics(),
+        Some(&OperationStepMetrics::ContentDownload(metrics))
     );
-    assert!(
-        terminal
-            .generated_facts
-            .contains(&"execution_download_fact:promoted:500".to_string())
-    );
-    assert!(terminal.generated_facts.len() <= crate::state::MAX_OPERATION_JOURNAL_STEP_FACTS);
 
     let proof = operation_journal_proof_record(&entry);
     let encoded = serde_json::to_string(&proof).expect("proof json");
@@ -7963,8 +7963,9 @@ async fn content_journal_records_download_failure_guardian_outcome_and_proof() {
             ),
         ],
     });
-    let journal_facts = download_facts.journal_facts();
+    let metrics = download_facts.metrics().expect("bounded content metrics");
     let facts = download_facts.facts();
+    let terminal_progress = progress("error", true, Some("content failed"));
     super::operation::record_content_failure_outcome(
         &test_producer(),
         journals.clone(),
@@ -7974,22 +7975,12 @@ async fn content_journal_records_download_failure_guardian_outcome_and_proof() {
             download_facts: &facts,
             additional_evidence: None,
             phase: OperationPhase::Downloading,
-            observed_at: "2026-07-16T10:00:00+00:00",
+            terminal_progress: &terminal_progress,
+            metrics: &metrics,
         },
     )
     .await
     .expect("record content Guardian outcome");
-    let mut progress_journal = InstallProgressJournalTracker::default();
-    super::operation::record_content_operation_progress(
-        &journals,
-        &operation_id,
-        &progress("error", true, Some("content failed")),
-        &journal_facts,
-        &mut progress_journal,
-    )
-    .await
-    .expect("record content failure");
-
     let entry = journals.get(&operation_id).expect("content journal");
     assert_eq!(entry.command, CommandKind::ModifyInstanceContent);
     assert_eq!(entry.status, OperationStatus::Failed);
@@ -8002,13 +7993,13 @@ async fn content_journal_records_download_failure_guardian_outcome_and_proof() {
         entry.failure_point.as_deref(),
         Some("content_progress_error")
     );
-    assert!(
+    assert_eq!(
         entry
             .completed_steps
             .last()
             .expect("terminal step")
-            .generated_facts
-            .contains(&"execution_download_fact:metadata_invalid:1".to_string())
+            .metrics(),
+        Some(&OperationStepMetrics::ContentDownload(metrics))
     );
     assert!(
         install_guardian_outcome_summary_from_journal(&entry)
@@ -8031,6 +8022,8 @@ async fn content_journal_records_typed_metadata_failure_without_download_facts()
         &operation_id,
         crate::application::content::ContentExecutionFailureKind::MetadataInvalid,
     );
+    let terminal_progress = progress("error", true, Some("content failed"));
+    let metrics = ContentDownloadMetrics::zero();
 
     super::operation::record_content_failure_outcome(
         &test_producer(),
@@ -8041,22 +8034,12 @@ async fn content_journal_records_typed_metadata_failure_without_download_facts()
             download_facts: &[],
             additional_evidence: Some(evidence),
             phase,
-            observed_at: "2026-07-16T10:00:00+00:00",
+            terminal_progress: &terminal_progress,
+            metrics: &metrics,
         },
     )
     .await
     .expect("record content Guardian outcome");
-    let mut progress_journal = InstallProgressJournalTracker::default();
-    super::operation::record_content_operation_progress(
-        &journals,
-        &operation_id,
-        &progress("error", true, Some("content failed")),
-        &[],
-        &mut progress_journal,
-    )
-    .await
-    .expect("record content failure");
-
     let entry = journals.get(&operation_id).expect("content journal");
     assert_eq!(
         entry.guardian_diagnosis_ids,
@@ -8079,6 +8062,7 @@ async fn first_observable_content_terminal_already_contains_typed_guardian_outco
         .await
         .expect("create content journal");
     installs.insert(install_id.to_string()).await;
+    let metrics = ContentDownloadMetrics::zero();
 
     commit_and_emit_content_terminal_progress(
         &installs,
@@ -8090,7 +8074,7 @@ async fn first_observable_content_terminal_already_contains_typed_guardian_outco
             install_id,
             progress: progress("error", true, Some("content failed")),
             execution_facts: &[],
-            journal_facts: &[],
+            metrics: &metrics,
             failure_kind: Some(
                 crate::application::content::ContentExecutionFailureKind::MetadataInvalid,
             ),
@@ -8131,6 +8115,7 @@ async fn guardian_persistence_failure_cannot_publish_incomplete_content_terminal
         .expect("create content journal");
     installs.insert(install_id.to_string()).await;
     let terminal = progress("error", true, Some("content failed"));
+    let metrics = ContentDownloadMetrics::zero();
     backend.fail_attempts(64);
 
     assert!(
@@ -8144,7 +8129,7 @@ async fn guardian_persistence_failure_cannot_publish_incomplete_content_terminal
                 install_id,
                 progress: terminal.clone(),
                 execution_facts: &[],
-                journal_facts: &[],
+                metrics: &metrics,
                 failure_kind: Some(
                     crate::application::content::ContentExecutionFailureKind::MetadataInvalid,
                 ),
@@ -8175,7 +8160,7 @@ async fn guardian_persistence_failure_cannot_publish_incomplete_content_terminal
         ContentWorkerInterruptionRequest {
             operation_id: &operation_id,
             fallback: content_interrupted_progress(false),
-            journal_facts: &[],
+            metrics: &metrics,
             execution_facts: &[],
             attempted_terminal: Some((
                 terminal,
@@ -8222,33 +8207,25 @@ async fn late_terminal_persistence_recovery_returns_original_content_terminal() 
         .expect("create content journal");
     installs.insert(install_id.to_string()).await;
     let terminal = progress("error", true, Some("content failed"));
+    let metrics = ContentDownloadMetrics::zero();
     let (evidence, phase) = content_execution_failure_evidence(
         &operation_id,
         crate::application::content::ContentExecutionFailureKind::MetadataInvalid,
     );
-    super::operation::record_content_failure_outcome(
-        &test_producer(),
-        journals.clone(),
-        failure_memory.clone(),
-        ContentFailureOutcomeRequest {
-            operation_id: &operation_id,
-            download_facts: &[],
-            additional_evidence: Some(evidence),
-            phase,
-            observed_at: "2026-07-16T10:00:00+00:00",
-        },
-    )
-    .await
-    .expect("record Guardian outcome before terminal");
     backend.fail_attempts(64);
-    let mut progress_journal = InstallProgressJournalTracker::default();
     assert!(
-        super::operation::record_content_operation_progress(
-            &journals,
-            &operation_id,
-            &terminal,
-            &[],
-            &mut progress_journal,
+        super::operation::record_content_failure_outcome(
+            &test_producer(),
+            journals.clone(),
+            failure_memory.clone(),
+            ContentFailureOutcomeRequest {
+                operation_id: &operation_id,
+                download_facts: &[],
+                additional_evidence: Some(evidence),
+                phase,
+                terminal_progress: &terminal,
+                metrics: &metrics,
+            },
         )
         .await
         .is_err()
@@ -8270,7 +8247,7 @@ async fn late_terminal_persistence_recovery_returns_original_content_terminal() 
         ContentWorkerInterruptionRequest {
             operation_id: &operation_id,
             fallback: content_interrupted_progress(false),
-            journal_facts: &[],
+            metrics: &metrics,
             execution_facts: &[],
             attempted_terminal: Some((
                 terminal.clone(),
@@ -8315,7 +8292,7 @@ async fn late_terminal_persistence_recovery_returns_original_content_terminal() 
 #[tokio::test]
 async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() {
     let root = temp_root("content-provider-terminal-replay");
-    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let (_backend, journals) = install_journal_persistence_fixture(&root);
     let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
     let operation_id = test_operation_id("content-provider-terminal-replay");
     super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
@@ -8325,6 +8302,8 @@ async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() 
         ExecutionDownloadFactKind::ProviderFailure,
         "content_provider_project",
     )];
+    let terminal_progress = progress("error", true, Some("content failed"));
+    let metrics = ContentDownloadMetrics::zero();
     let (recorded, initial_evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
         super::operation::record_content_failure_outcome(
             &test_producer(),
@@ -8335,7 +8314,8 @@ async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() 
                 download_facts: &facts,
                 additional_evidence: None,
                 phase: OperationPhase::Downloading,
-                observed_at: "2026-07-16T10:00:00+00:00",
+                terminal_progress: &terminal_progress,
+                metrics: &metrics,
             },
         ),
     )
@@ -8345,21 +8325,6 @@ async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() 
     let initial_memory = failure_memory.list();
     assert_eq!(initial_memory.len(), 1);
 
-    backend.fail_attempts(64);
-    let mut progress_journal = InstallProgressJournalTracker::default();
-    assert!(
-        super::operation::record_content_operation_progress(
-            &journals,
-            &operation_id,
-            &progress("error", true, Some("content failed")),
-            &[],
-            &mut progress_journal,
-        )
-        .await
-        .is_err()
-    );
-    assert!(journals.has_retry_candidate());
-    backend.allow_writes();
     let (recovery_evidence, recovery_phase) = content_execution_failure_evidence(
         &operation_id,
         crate::application::content::ContentExecutionFailureKind::MetadataInvalid,
@@ -8375,7 +8340,8 @@ async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() 
                 download_facts: &[],
                 additional_evidence: Some(recovery_evidence),
                 phase: recovery_phase,
-                observed_at: "2026-07-16T10:01:00+00:00",
+                terminal_progress: &terminal_progress,
+                metrics: &metrics,
             },
         ),
     )
@@ -8389,29 +8355,12 @@ async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() 
         .expect("replayed Guardian outcome remains valid");
     assert_eq!(summary.diagnosis_id(), DiagnosisId::DownloadUnavailable);
     assert_eq!(summary.decision(), "retry");
-    for prefix in [
-        "guardian_outcome_decision:",
-        "guardian_outcome_summary:",
-        "guardian_outcome_detail:",
-        "guardian_outcome_memory_binding:",
-        "guardian_outcome_memory_observed_at:",
-        "guardian_outcome_memory_suppression_until:",
-        "guardian_outcome_memory_target_system:",
-        "guardian_outcome_memory_target_kind:",
-        "guardian_outcome_memory_target_ownership:",
-        "guardian_outcome_memory_target_id:",
-    ] {
-        assert_eq!(
-            entry
-                .completed_steps
-                .iter()
-                .flat_map(|step| step.generated_facts.iter())
-                .filter(|fact| fact.starts_with(prefix))
-                .count(),
-            1,
-            "duplicate persisted outcome marker: {prefix}"
-        );
-    }
+    let terminal = entry
+        .guardian_install_terminal()
+        .expect("one typed install terminal");
+    assert_eq!(terminal.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(terminal.action(), GuardianActionKind::Retry);
+    assert!(terminal.memory().is_some());
     assert!(!journals.has_retry_candidate());
     journals.close().await.expect("close journals");
     fs::remove_dir_all(root).expect("cleanup");
@@ -8431,11 +8380,12 @@ async fn content_journal_records_interruption_without_crossing_install_command_i
         Err(OperationJournalStoreError::AlreadyExists)
     ));
 
+    let metrics = ContentDownloadMetrics::new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2);
     super::operation::record_content_operation_interrupted(
         &journals,
         &operation_id,
         &content_interrupted_progress(false),
-        &["execution_download_fact:promoted:2".to_string()],
+        &metrics,
         &[],
     )
     .await
@@ -8450,14 +8400,19 @@ async fn content_journal_records_interruption_without_crossing_install_command_i
         entry.failure_point.as_deref(),
         Some("content_worker_interrupted")
     );
-    assert!(
-        entry
-            .completed_steps
-            .last()
-            .expect("terminal step")
-            .generated_facts
-            .contains(&"execution_download_fact:promoted:2".to_string())
+    let terminal = entry.completed_steps.last().expect("terminal step");
+    assert_eq!(
+        terminal.generated_facts,
+        [
+            "install_phase:error",
+            "install_done:true",
+            "install_error:true"
+        ]
     );
+    let Some(OperationStepMetrics::ContentDownload(metrics)) = terminal.metrics() else {
+        panic!("terminal step must carry typed content metrics");
+    };
+    assert_eq!(metrics.promoted(), 2);
 }
 
 #[tokio::test]
@@ -8757,7 +8712,6 @@ async fn install_journal_records_guardian_evidence_from_core_download_facts() {
                 fields: Vec::new(),
             },
         ],
-        "2026-07-09T10:00:00+00:00",
     )
     .await;
 
@@ -8768,16 +8722,12 @@ async fn install_journal_records_guardian_evidence_from_core_download_facts() {
         vec![DiagnosisId::LauncherManagedArtifactCorrupt]
     );
     let terminal_step = entry.completed_steps.last().expect("terminal step");
-    assert!(
-        terminal_step
-            .generated_facts
-            .contains(&"guardian_fact:artifact_checksum_mismatch".to_string())
-    );
-    assert!(
-        !terminal_step
-            .generated_facts
-            .iter()
-            .any(|fact| fact.contains("Promoted"))
+    assert_eq!(
+        terminal_step.guardian_fact_ids(),
+        &[
+            GuardianFactId::ArtifactChecksumMismatch,
+            GuardianFactId::AtomicPromotionCompleted,
+        ]
     );
     let guardian = install_guardian_outcome_summary_from_journal(&entry)
         .expect("persisted corruption outcome");
@@ -8788,6 +8738,53 @@ async fn install_journal_records_guardian_evidence_from_core_download_facts() {
     assert!(failure_view_model.retry_action.enabled);
     assert_eq!(failure_view_model.retry_action.disabled_reason, None);
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
+}
+
+#[tokio::test]
+async fn mixed_operation_evidence_is_rejected_before_journal_mutation() {
+    let journals = Arc::new(OperationJournalStore::new());
+    let operation_id = test_operation_id("install-current-evidence");
+    let foreign_operation_id = test_operation_id("install-foreign-evidence");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
+    let before = journals.get(&operation_id).expect("planned journal");
+    let target = TargetDescriptor::new(
+        crate::state::contracts::StabilizationSystem::Execution,
+        TargetKind::Artifact,
+        "minecraft_client_1.21.5",
+        OwnershipClass::LauncherManaged,
+    );
+    let evidence = [
+        ExecutionFact {
+            operation_id: Some(operation_id.clone()),
+            kind: ExecutionFactKind::DownloadProviderFailure,
+            target: Some(target.clone()),
+            fields: Vec::new(),
+        },
+        ExecutionFact {
+            operation_id: Some(foreign_operation_id),
+            kind: ExecutionFactKind::DownloadNetworkFailure,
+            target: Some(target),
+            fields: Vec::new(),
+        },
+    ];
+
+    let result = super::operation::record_install_guardian_failure_outcome(
+        &test_producer(),
+        journals.clone(),
+        Arc::new(GuardianFailureMemoryStore::new()),
+        &operation_id,
+        &evidence,
+        OperationPhase::Downloading,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(OperationJournalStoreError::InvalidGuardianOutcome)
+    ));
+    assert_eq!(journals.get(&operation_id), Some(before));
 }
 
 #[tokio::test]
@@ -8821,7 +8818,6 @@ async fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
         Arc::new(GuardianFailureMemoryStore::new()),
         &operation_id,
         &facts,
-        "2026-07-09T10:00:00+00:00",
     )
     .await;
 
@@ -8829,11 +8825,9 @@ async fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
     assert!(install_guardian_outcome_summary_from_journal(&entry).is_none());
     assert!(entry.guardian_diagnosis_ids.is_empty());
     let terminal_step = entry.completed_steps.last().expect("terminal step");
-    assert!(
-        !terminal_step
-            .generated_facts
-            .iter()
-            .any(|fact| fact.contains("guardian_fact:"))
+    assert_eq!(
+        terminal_step.guardian_fact_ids(),
+        &[GuardianFactId::DownloadTempDiscarded]
     );
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
 }
@@ -8875,7 +8869,6 @@ async fn install_journal_records_guardian_download_failure_outcome_without_raw_d
         Arc::new(GuardianFailureMemoryStore::new()),
         &operation_id,
         &facts,
-        "2026-07-09T10:00:00+00:00",
     )
     .await;
 
@@ -8897,52 +8890,28 @@ async fn install_journal_records_guardian_download_failure_outcome_without_raw_d
     assert_no_sensitive_fragments(&serde_json::to_string(&summary).expect("summary json"));
 }
 
-fn persisted_download_outcome_entry() -> OperationJournalEntry {
-    let operation_id = OperationId::deterministic_test("install-persisted-guardian-outcome");
-    let mut entry = OperationJournalEntry::new(
-        JournalId::new("journal-install-persisted-guardian-outcome"),
-        operation_id,
-        CommandKind::InstallVersion,
-        StabilizationSystem::Application,
-        OwnershipClass::LauncherManaged,
-        RollbackState::NotApplicable,
-    );
-    entry
-        .guardian_diagnosis_ids
-        .push(DiagnosisId::DownloadUnavailable);
-    let mut step = OperationJournalStep::new("guardian-outcome", OperationPhase::Downloading);
-    step.result = OperationStepResult::Failed;
-    step.generated_facts = vec![
-        "guardian_outcome_decision:retry".to_string(),
-        "guardian_outcome_summary:Guardian classified the install download failure as retryable."
-            .to_string(),
-        "guardian_outcome_detail:The install stopped because a provider or network download was unavailable or interrupted."
-            .to_string(),
-        "guardian_outcome_memory_binding:0000000000000000000000000000000000000000000000000000000000000000"
-            .to_string(),
-        "guardian_outcome_memory_observed_at:2026-06-16T10:00:00+00:00".to_string(),
-        "guardian_outcome_memory_suppression_until:2026-06-16T10:05:00+00:00".to_string(),
-        "guardian_outcome_memory_target_system:execution".to_string(),
-        "guardian_outcome_memory_target_kind:artifact".to_string(),
-        "guardian_outcome_memory_target_ownership:launcher_managed".to_string(),
-        "guardian_outcome_memory_target_id:minecraft_client_1.21.5".to_string(),
-    ];
-    entry.completed_steps.push(step);
-    entry
+fn v10_retry_entry_fixture() -> OperationJournalEntry {
+    let snapshot: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/guardian/operation-journals-v10.json"
+    ))
+    .expect("parse v10 operation journal fixture");
+    let entry = snapshot["entries"]
+        .as_array()
+        .expect("fixture entries")
+        .iter()
+        .find(|entry| entry["command"] == "InstallVersion")
+        .expect("fixture Retry install entry")
+        .clone();
+    serde_json::from_value(entry).expect("decode typed Retry install entry")
 }
 
 fn persisted_install_guardian_memory_window(entry: &OperationJournalEntry) -> (String, String) {
-    let marker = |prefix: &str| {
-        entry
-            .completed_steps
-            .iter()
-            .flat_map(|step| step.generated_facts.iter())
-            .find_map(|fact| fact.strip_prefix(prefix))
-            .unwrap_or_else(|| panic!("missing persisted Guardian marker: {prefix}"))
-            .to_string()
-    };
-    let observed_at = marker("guardian_outcome_memory_observed_at:");
-    let suppression_until = marker("guardian_outcome_memory_suppression_until:");
+    let memory = entry
+        .guardian_install_terminal()
+        .and_then(|terminal| terminal.memory())
+        .expect("typed persisted Guardian memory");
+    let observed_at = memory.observed_at().to_string();
+    let suppression_until = memory.suppression_until().to_string();
     let observed = chrono::DateTime::parse_from_rfc3339(&observed_at)
         .expect("canonical persisted Guardian observation");
     let suppression = chrono::DateTime::parse_from_rfc3339(&suppression_until)
@@ -8964,201 +8933,127 @@ fn fixed_failure_memory(observed_at: &str) -> Arc<GuardianFailureMemoryStore> {
 }
 
 #[test]
-fn install_journal_outcome_replay_does_not_borrow_facts_from_an_older_step() {
-    let mut entry = persisted_download_outcome_entry();
-    assert!(install_guardian_outcome_summary_from_journal(&entry).is_some());
+fn typed_install_terminal_replay_is_entry_scoped_not_step_string_scoped() {
+    let mut entry = v10_retry_entry_fixture();
+    let original = install_guardian_outcome_summary_from_journal(&entry)
+        .expect("typed fixture terminal outcome");
 
-    let mut partial = OperationJournalStep::new("partial-guardian-outcome", OperationPhase::Failed);
-    partial.result = OperationStepResult::Failed;
-    partial.generated_facts = vec!["guardian_outcome_decision:block".to_string()];
-    entry.completed_steps.push(partial);
+    let mut unrelated = OperationJournalStep::new("unrelated", OperationPhase::Failed);
+    unrelated.result = OperationStepResult::Failed;
+    unrelated.generated_facts = vec!["ordinary_fact:value".to_string()];
+    entry.completed_steps.push(unrelated);
 
-    assert!(install_guardian_outcome_summary_from_journal(&entry).is_none());
+    let replayed = install_guardian_outcome_summary_from_journal(&entry)
+        .expect("entry-scoped typed terminal remains authoritative");
+    assert_eq!(replayed, original);
 }
 
 #[test]
-fn install_journal_outcome_replay_rejects_duplicate_markers() {
-    let entry = persisted_download_outcome_entry();
-    for prefix in [
-        "guardian_outcome_decision:",
-        "guardian_outcome_summary:",
-        "guardian_outcome_detail:",
-        "guardian_outcome_memory_binding:",
-        "guardian_outcome_memory_observed_at:",
-        "guardian_outcome_memory_suppression_until:",
-        "guardian_outcome_memory_target_system:",
-        "guardian_outcome_memory_target_kind:",
-        "guardian_outcome_memory_target_ownership:",
-        "guardian_outcome_memory_target_id:",
-    ] {
-        let mut duplicated = entry.clone();
-        let step = duplicated.completed_steps.last_mut().expect("outcome step");
-        let fact = step
-            .generated_facts
-            .iter()
-            .find(|fact| fact.starts_with(prefix))
-            .expect("outcome marker")
-            .clone();
-        step.generated_facts.push(fact);
+fn typed_install_terminal_deserialization_rejects_partial_or_noncanonical_evidence() {
+    let terminal = v10_retry_entry_fixture()
+        .guardian_install_terminal()
+        .expect("typed fixture terminal")
+        .clone();
+    let valid = serde_json::to_value(&terminal).expect("encode typed terminal");
+    assert_eq!(
+        serde_json::from_value::<crate::state::contracts::GuardianInstallTerminalEvidence>(
+            valid.clone()
+        )
+        .expect("strict typed terminal"),
+        terminal
+    );
 
+    let mut malformed = Vec::new();
+    let mut unknown = valid.clone();
+    unknown["unexpected"] = serde_json::json!(true);
+    malformed.push(unknown);
+    let mut missing_memory = valid.clone();
+    missing_memory
+        .as_object_mut()
+        .expect("terminal object")
+        .remove("memory");
+    malformed.push(missing_memory);
+    let mut memory_on_block = valid.clone();
+    memory_on_block["action"] = serde_json::json!("Block");
+    malformed.push(memory_on_block);
+    let mut legacy_timestamp = valid.clone();
+    legacy_timestamp["memory"]["observed_at"] = serde_json::json!("2026-08-13T10:00:00+00:00");
+    malformed.push(legacy_timestamp);
+    let mut invalid_window = valid;
+    invalid_window["memory"]["suppression_until"] = serde_json::json!("2026-08-13T10:06:00.000Z");
+    malformed.push(invalid_window);
+
+    for value in malformed {
         assert!(
-            install_guardian_outcome_summary_from_journal(&duplicated).is_none(),
-            "duplicate marker was accepted: {prefix}"
-        );
-    }
-}
-
-#[test]
-fn install_journal_outcome_replay_rejects_incomplete_or_noncanonical_memory_window() {
-    let entry = persisted_download_outcome_entry();
-    let mut incomplete = entry.clone();
-    incomplete
-        .completed_steps
-        .last_mut()
-        .expect("outcome step")
-        .generated_facts
-        .retain(|fact| !fact.starts_with("guardian_outcome_memory_observed_at:"));
-    assert!(install_guardian_outcome_summary_from_journal(&incomplete).is_none());
-
-    for (prefix, replacement) in [
-        (
-            "guardian_outcome_memory_observed_at:",
-            "guardian_outcome_memory_observed_at:2026-06-16T10:00:00Z",
-        ),
-        (
-            "guardian_outcome_memory_suppression_until:",
-            "guardian_outcome_memory_suppression_until:2026-06-16T10:06:00+00:00",
-        ),
-    ] {
-        let mut malformed = entry.clone();
-        let fact = malformed
-            .completed_steps
-            .last_mut()
-            .expect("outcome step")
-            .generated_facts
-            .iter_mut()
-            .find(|fact| fact.starts_with(prefix))
-            .expect("memory window marker");
-        *fact = replacement.to_string();
-        assert!(
-            install_guardian_outcome_summary_from_journal(&malformed).is_none(),
-            "invalid memory window was accepted: {replacement}"
+            serde_json::from_value::<crate::state::contracts::GuardianInstallTerminalEvidence>(
+                value
+            )
+            .is_err()
         );
     }
 }
 
 #[tokio::test]
-async fn partial_guardian_terminal_fails_closed_without_reassessment() {
-    let journals = Arc::new(OperationJournalStore::new());
-    let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = test_operation_id("partial-guardian-terminal-settlement");
-    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
-        .await
-        .expect("record install journal");
+async fn typed_retry_fixture_rehydrates_exact_failure_memory_once() {
+    let historical = crate::state::failure_memory::FailureMemorySnapshot::from_json(include_str!(
+        "../../../tests/fixtures/guardian/failure-memory-v7.json"
+    ))
+    .expect("historical failure-memory fixture remains accepted");
+    assert!(historical.entries[0].first_observed_at.ends_with('Z'));
+
+    let entry = v10_retry_entry_fixture();
+    let operation_id = entry.operation_id.clone();
+    let terminal = entry
+        .guardian_install_terminal()
+        .expect("typed Retry terminal");
+    let durable_memory = terminal.memory().expect("typed Retry memory").clone();
+    assert_eq!(durable_memory.observed_at(), "2026-08-13T10:00:00.000Z");
+    assert_eq!(
+        durable_memory.suppression_until(),
+        "2026-08-13T10:05:00.000Z"
+    );
+
+    let journals = OperationJournalStore::new();
     journals
-        .record_guardian_evidence(
-            &operation_id,
-            vec!["guardian_outcome_decision:retry".to_string()],
-            vec![DiagnosisId::DownloadUnavailable],
+        .create(entry)
+        .await
+        .expect("admit checked-in typed Retry carrier");
+    assert!(journals.get(&operation_id).is_some());
+    let failure_memory = GuardianFailureMemoryStore::at_for_test(
+        chrono::DateTime::parse_from_rfc3339("2026-08-13T10:01:00.000Z")
+            .expect("test time")
+            .with_timezone(&chrono::Utc),
+    );
+
+    for _ in 0..2 {
+        super::operation::settle_startup_install_guardian_failure_memory(
+            &journals,
+            &failure_memory,
         )
         .await
-        .expect("record partial Guardian terminal");
-    let facts = [download_fact(
-        ExecutionDownloadFactKind::ProviderFailure,
-        "minecraft_client_1.21.5",
-    )];
-    let evidence = install_failure_evidence_from_download_facts(&operation_id, &facts);
+        .expect("rehydrate typed Retry carrier");
+    }
 
-    let (result, evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
-        record_install_guardian_failure_outcome(
-            &test_producer(),
-            journals.clone(),
-            failure_memory.clone(),
-            &operation_id,
-            &evidence,
-            OperationPhase::Downloading,
-            "2026-06-16T10:00:00+00:00",
-        ),
-    )
-    .await;
-    assert!(matches!(
-        result,
-        Err(OperationJournalStoreError::InvalidGuardianOutcome)
-    ));
-    assert_eq!(evaluations, 0);
-    assert!(failure_memory.list().is_empty());
-    let entry = journals.get(&operation_id).expect("install journal");
+    let rows = failure_memory.list_current();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.diagnosis_id, DiagnosisId::DownloadUnavailable);
+    assert_eq!(row.domain, crate::guardian::GuardianDomain::Download);
+    assert_eq!(row.mode, crate::guardian::GuardianMode::Managed);
+    assert_eq!(row.target, *durable_memory.target());
+    assert_eq!(row.first_observed_at, "2026-08-13T10:00:00.000Z");
+    assert_eq!(row.last_observed_at, "2026-08-13T10:00:00.000Z");
+    assert_eq!(row.occurrence_count, 1);
+    assert_eq!(row.last_action_kind, Some(GuardianActionKind::Retry));
     assert_eq!(
-        entry
-            .completed_steps
-            .iter()
-            .flat_map(|step| step.generated_facts.iter())
-            .filter(|fact| fact.starts_with("guardian_outcome_"))
-            .count(),
-        1
+        row.last_action_outcome,
+        Some(crate::state::failure_memory::FailureMemoryActionOutcome::Retried)
     );
-}
-
-#[tokio::test]
-async fn cross_step_guardian_terminals_fail_closed_without_reassessment() {
-    let journals = Arc::new(OperationJournalStore::new());
-    let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let operation_id = test_operation_id("cross-step-guardian-terminal-settlement");
-    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
-        .await
-        .expect("record install journal");
-    journals
-        .record_guardian_evidence(
-            &operation_id,
-            persisted_download_outcome_entry().completed_steps[0]
-                .generated_facts
-                .clone(),
-            vec![DiagnosisId::DownloadUnavailable],
-        )
-        .await
-        .expect("record first Guardian terminal group");
-    let mut conflicting =
-        OperationJournalStep::new("conflicting-guardian-terminal", OperationPhase::Downloading);
-    conflicting.result = OperationStepResult::Failed;
-    conflicting.generated_facts = vec!["guardian_outcome_decision:block".to_string()];
-    journals
-        .record_progress(&operation_id, conflicting)
-        .await
-        .expect("record conflicting Guardian marker step");
-    let facts = [download_fact(
-        ExecutionDownloadFactKind::ProviderFailure,
-        "minecraft_client_1.21.5",
-    )];
-    let evidence = install_failure_evidence_from_download_facts(&operation_id, &facts);
-
-    let (result, evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
-        record_install_guardian_failure_outcome(
-            &test_producer(),
-            journals.clone(),
-            failure_memory.clone(),
-            &operation_id,
-            &evidence,
-            OperationPhase::Downloading,
-            "2026-06-16T10:00:00+00:00",
-        ),
-    )
-    .await;
-    assert!(matches!(
-        result,
-        Err(OperationJournalStoreError::InvalidGuardianOutcome)
-    ));
-    assert_eq!(evaluations, 0);
-    assert!(failure_memory.list().is_empty());
-    let entry = journals.get(&operation_id).expect("install journal");
     assert_eq!(
-        entry
-            .completed_steps
-            .iter()
-            .flat_map(|step| step.generated_facts.iter())
-            .filter(|fact| fact.starts_with("guardian_outcome_decision:"))
-            .count(),
-        2
+        row.suppression_until.as_deref(),
+        Some("2026-08-13T10:05:00.000Z")
     );
+    assert_eq!(failure_memory.get(&row.key).as_ref(), Some(row));
 }
 
 #[tokio::test]
@@ -9176,7 +9071,7 @@ async fn provider_retry_memory_waits_for_combined_terminal_journal_commit() {
     )];
 
     let attempts_before = backend.attempts.load(Ordering::SeqCst);
-    let retry_gate = backend.gate_attempt(attempts_before + 2);
+    let retry_gate = backend.gate_attempt(attempts_before + 1);
     let terminal = tokio::spawn({
         let journals = journals.clone();
         let failure_memory = failure_memory.clone();
@@ -9189,7 +9084,6 @@ async fn provider_retry_memory_waits_for_combined_terminal_journal_commit() {
                 failure_memory.clone(),
                 &operation_id,
                 &facts,
-                "2026-06-16T10:00:00+00:00",
             )
             .await
         }
@@ -9197,7 +9091,7 @@ async fn provider_retry_memory_waits_for_combined_terminal_journal_commit() {
 
     timeout(
         Duration::from_secs(1),
-        backend.wait_for_attempt(attempts_before + 2),
+        backend.wait_for_attempt(attempts_before + 1),
     )
     .await
     .expect("terminal journal reconciliation retries");
@@ -9246,7 +9140,7 @@ async fn cancelled_caller_cannot_release_provider_settlement_before_memory_commi
     )];
 
     let attempts_before = backend.attempts.load(Ordering::SeqCst);
-    let terminal_gate = backend.gate_attempt(attempts_before + 2);
+    let terminal_gate = backend.gate_attempt(attempts_before + 1);
     let first = tokio::spawn({
         let journals = journals.clone();
         let failure_memory = failure_memory.clone();
@@ -9259,14 +9153,13 @@ async fn cancelled_caller_cannot_release_provider_settlement_before_memory_commi
                 failure_memory,
                 &operation_id,
                 &facts,
-                "2026-06-16T10:00:00+00:00",
             )
             .await
         }
     });
     timeout(
         Duration::from_secs(1),
-        backend.wait_for_attempt(attempts_before + 2),
+        backend.wait_for_attempt(attempts_before + 1),
     )
     .await
     .expect("first terminal journal reaches gated physical write");
@@ -9301,7 +9194,6 @@ async fn cancelled_caller_cannot_release_provider_settlement_before_memory_commi
                     &operation_id,
                     &follower_evidence,
                     OperationPhase::Downloading,
-                    "2026-06-16T10:01:00+00:00",
                 ),
             )
             .await
@@ -9360,7 +9252,7 @@ async fn quiesce_waits_for_cancelled_callers_owned_provider_settlement() {
     )];
 
     let attempts_before = backend.attempts.load(Ordering::SeqCst);
-    let terminal_gate = backend.gate_attempt(attempts_before + 2);
+    let terminal_gate = backend.gate_attempt(attempts_before + 1);
     let caller = tokio::spawn({
         let journals = journals.clone();
         let failure_memory = failure_memory.clone();
@@ -9372,14 +9264,13 @@ async fn quiesce_waits_for_cancelled_callers_owned_provider_settlement() {
                 failure_memory,
                 &operation_id,
                 &facts,
-                "2026-06-16T10:00:00+00:00",
             )
             .await
         }
     });
     timeout(
         Duration::from_secs(1),
-        backend.wait_for_attempt(attempts_before + 2),
+        backend.wait_for_attempt(attempts_before + 1),
     )
     .await
     .expect("terminal journal reaches gated physical write");
@@ -9454,7 +9345,6 @@ async fn provider_retry_memory_failure_blocks_followers_until_durable() {
                 &operation_id,
                 &first_evidence,
                 OperationPhase::Downloading,
-                "2026-06-16T10:00:00+00:00",
             )
             .await
         }
@@ -9505,27 +9395,19 @@ async fn provider_retry_memory_failure_blocks_followers_until_durable() {
                 &operation_id,
                 &follower_evidence,
                 OperationPhase::Downloading,
-                "2026-06-16T10:01:00+00:00",
             )
             .await
         }
     });
-    timeout(Duration::from_secs(1), async {
-        loop {
-            if journals.get(&follower_operation).is_some_and(|entry| {
-                entry
-                    .guardian_diagnosis_ids
-                    .contains(&DiagnosisId::DownloadUnavailable)
-                    && install_guardian_outcome_summary_from_journal(&entry).is_none()
-            }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("follower journals evidence before waiting for settlement");
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
     assert!(!follower.is_finished());
+    let follower_entry = journals
+        .get(&follower_operation)
+        .expect("planned follower journal");
+    assert!(follower_entry.guardian_diagnosis_ids.is_empty());
+    assert!(install_guardian_outcome_summary_from_journal(&follower_entry).is_none());
 
     retry_gate.release();
     timeout(Duration::from_secs(2), async {
@@ -9604,7 +9486,6 @@ async fn permanent_memory_failure_returns_once_and_recovers_before_follower_asse
             &first_operation,
             &first_evidence,
             OperationPhase::Downloading,
-            "2026-06-16T10:00:00+00:00",
         ),
     )
     .await
@@ -9641,7 +9522,6 @@ async fn permanent_memory_failure_returns_once_and_recovers_before_follower_asse
                 &follower_operation,
                 &follower_evidence,
                 OperationPhase::Downloading,
-                "2026-06-16T10:01:00+00:00",
             ),
         ))
         .await;
@@ -9670,7 +9550,6 @@ async fn permanent_memory_failure_returns_once_and_recovers_before_follower_asse
                 &follower_operation,
                 &follower_evidence,
                 OperationPhase::Downloading,
-                "2026-06-16T10:01:00+00:00",
             ),
         )
         .await;
@@ -9723,7 +9602,6 @@ async fn transient_memory_failure_exhausts_fixed_budget_and_recovers_later() {
             &operation_id,
             &evidence,
             OperationPhase::Downloading,
-            "2026-06-16T10:00:00+00:00",
         ),
     )
     .await
@@ -9757,7 +9635,6 @@ async fn transient_memory_failure_exhausts_fixed_budget_and_recovers_later() {
             &operation_id,
             &evidence,
             OperationPhase::Downloading,
-            "2026-06-16T10:01:00+00:00",
         ),
     )
     .await;
@@ -9778,8 +9655,8 @@ async fn transient_memory_failure_exhausts_fixed_budget_and_recovers_later() {
 #[tokio::test]
 async fn provider_terminal_replay_backfills_missing_memory_only_once() {
     let journals = Arc::new(OperationJournalStore::new());
-    let initial_memory = fixed_failure_memory("2026-06-16T10:00:00+00:00");
-    let replay_memory = fixed_failure_memory("2026-06-16T10:00:00+00:00");
+    let initial_memory = fixed_failure_memory("2026-06-16T10:00:00.000Z");
+    let replay_memory = fixed_failure_memory("2026-06-16T10:00:00.000Z");
     let operation_id = test_operation_id("provider-terminal-memory-backfill");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
@@ -9794,7 +9671,6 @@ async fn provider_terminal_replay_backfills_missing_memory_only_once() {
         initial_memory.clone(),
         &operation_id,
         &facts,
-        "2026-06-16T10:00:00+00:00",
     )
     .await;
     assert_eq!(initial_memory.list().len(), 1);
@@ -9811,7 +9687,6 @@ async fn provider_terminal_replay_backfills_missing_memory_only_once() {
             replay_memory.clone(),
             &operation_id,
             &different_target_facts,
-            "2026-06-16T10:00:30+00:00",
         ))
         .await;
     assert_eq!(mismatched_replay_evaluations, 0);
@@ -9824,18 +9699,17 @@ async fn provider_terminal_replay_backfills_missing_memory_only_once() {
             replay_memory.clone(),
             &operation_id,
             &facts,
-            "2026-06-16T10:01:00+00:00",
         ))
         .await;
     assert_eq!(first_replay_evaluations, 0);
     let backfilled = replay_memory.list();
     assert_eq!(backfilled.len(), 1);
     assert_eq!(backfilled[0].occurrence_count, 1);
-    assert_eq!(backfilled[0].first_observed_at, "2026-06-16T10:00:00+00:00");
-    assert_eq!(backfilled[0].last_observed_at, "2026-06-16T10:00:00+00:00");
+    assert_eq!(backfilled[0].first_observed_at, "2026-06-16T10:00:00.000Z");
+    assert_eq!(backfilled[0].last_observed_at, "2026-06-16T10:00:00.000Z");
     assert_eq!(
         backfilled[0].suppression_until.as_deref(),
-        Some("2026-06-16T10:05:00+00:00")
+        Some("2026-06-16T10:05:00.000Z")
     );
 
     let ((), second_replay_evaluations) =
@@ -9845,7 +9719,6 @@ async fn provider_terminal_replay_backfills_missing_memory_only_once() {
             replay_memory.clone(),
             &operation_id,
             &facts,
-            "2026-06-16T10:02:00+00:00",
         ))
         .await;
     assert_eq!(second_replay_evaluations, 0);
@@ -9856,12 +9729,12 @@ async fn provider_terminal_replay_backfills_missing_memory_only_once() {
 async fn expired_provider_terminal_replay_does_not_resurrect_retry_memory() {
     let journals = Arc::new(OperationJournalStore::new());
     let initial_memory = Arc::new(GuardianFailureMemoryStore::at_for_test(
-        chrono::DateTime::parse_from_rfc3339("2026-06-16T10:00:00+00:00")
+        chrono::DateTime::parse_from_rfc3339("2026-06-16T10:00:00.000Z")
             .expect("test time")
             .with_timezone(&chrono::Utc),
     ));
     let replay_memory = Arc::new(GuardianFailureMemoryStore::at_for_test(
-        chrono::DateTime::parse_from_rfc3339("2026-06-16T10:05:00+00:00")
+        chrono::DateTime::parse_from_rfc3339("2026-06-16T10:05:00.000Z")
             .expect("test time")
             .with_timezone(&chrono::Utc),
     ));
@@ -9879,7 +9752,6 @@ async fn expired_provider_terminal_replay_does_not_resurrect_retry_memory() {
         initial_memory.clone(),
         &operation_id,
         &facts,
-        "2026-06-16T10:00:00+00:00",
     )
     .await;
     assert_eq!(initial_memory.list().len(), 1);
@@ -9891,7 +9763,6 @@ async fn expired_provider_terminal_replay_does_not_resurrect_retry_memory() {
             replay_memory.clone(),
             &operation_id,
             &facts,
-            "2026-06-16T10:05:00+00:00",
         ))
         .await;
 
@@ -9930,7 +9801,6 @@ async fn startup_reloads_journal_only_retry_and_blocks_the_next_matching_failure
         &operation_id,
         &evidence,
         OperationPhase::Downloading,
-        "2026-07-17T10:00:00+00:00",
     )
     .await;
     assert!(matches!(
@@ -9966,7 +9836,6 @@ async fn startup_reloads_journal_only_retry_and_blocks_the_next_matching_failure
         super::operation::settle_startup_install_guardian_failure_memory(
             &journals,
             &failure_memory,
-            "2026-07-17T10:01:00+00:00",
         ),
     )
     .await;
@@ -9993,7 +9862,6 @@ async fn startup_reloads_journal_only_retry_and_blocks_the_next_matching_failure
         &next_operation_id,
         &next_evidence,
         OperationPhase::Downloading,
-        "2026-07-17T10:02:00+00:00",
     )
     .await
     .expect("settle blocked matching failure");
@@ -10028,7 +9896,6 @@ async fn persistent_retry_startup_serves_restart_loaded_status_without_reassessm
         let paths = test_app_paths(&root);
         let install_id = "persistent-retry-live-api";
         let operation_id = test_operation_id(install_id);
-        let observed_at = chrono::Utc::now().to_rfc3339();
 
         let state = load_persistent_test_state(&root).await;
         operation::begin_install_operation_journal_for_session(
@@ -10063,7 +9930,6 @@ async fn persistent_retry_startup_serves_restart_loaded_status_without_reassessm
                 detached_memory.clone(),
                 &operation_id,
                 &facts,
-                &observed_at,
             ))
             .await;
         drop(producer);
@@ -10133,7 +9999,6 @@ async fn cancelled_startup_waiter_keeps_retry_backfill_owned_until_quiescence() 
     let journals = Arc::new(OperationJournalStore::new());
     let assessment_memory = Arc::new(GuardianFailureMemoryStore::new());
     let operation_id = test_operation_id("startup-provider-retry-cancel");
-    let observed_at = chrono::Utc::now().to_rfc3339();
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
@@ -10147,7 +10012,6 @@ async fn cancelled_startup_waiter_keeps_retry_backfill_owned_until_quiescence() 
         assessment_memory,
         &operation_id,
         &facts,
-        &observed_at,
     )
     .await;
 
@@ -10205,7 +10069,6 @@ async fn startup_retry_persistence_failure_stops_later_workflow_hooks() {
             ExecutionDownloadFactKind::ProviderFailure,
             "minecraft_client_1.21.5",
         )],
-        &chrono::Utc::now().to_rfc3339(),
     )
     .await;
 
@@ -10254,25 +10117,20 @@ async fn startup_retry_scan_skips_boundary_expiry_and_rejects_duplicate_active_k
     record_install_failure_outcome(
         &test_producer(),
         journals.clone(),
-        fixed_failure_memory("2026-07-17T10:00:00+00:00"),
+        fixed_failure_memory("2026-07-17T10:00:00.000Z"),
         &first_operation,
         &facts,
-        "2026-07-17T10:00:00+00:00",
     )
     .await;
 
     let boundary_memory = GuardianFailureMemoryStore::at_for_test(
-        chrono::DateTime::parse_from_rfc3339("2026-07-17T10:05:00+00:00")
+        chrono::DateTime::parse_from_rfc3339("2026-07-17T10:05:00.000Z")
             .expect("test time")
             .with_timezone(&chrono::Utc),
     );
-    super::operation::settle_startup_install_guardian_failure_memory(
-        &journals,
-        &boundary_memory,
-        "2026-07-17T10:05:00+00:00",
-    )
-    .await
-    .expect("expiry boundary is inactive");
+    super::operation::settle_startup_install_guardian_failure_memory(&journals, &boundary_memory)
+        .await
+        .expect("expiry boundary is inactive");
     assert!(boundary_memory.list().is_empty());
 
     let second_operation = test_operation_id("startup-duplicate-second");
@@ -10282,24 +10140,19 @@ async fn startup_retry_scan_skips_boundary_expiry_and_rejects_duplicate_active_k
     record_install_failure_outcome(
         &test_producer(),
         journals.clone(),
-        fixed_failure_memory("2026-07-17T10:00:00+00:00"),
+        fixed_failure_memory("2026-07-17T10:00:00.000Z"),
         &second_operation,
         &facts,
-        "2026-07-17T10:00:00+00:00",
     )
     .await;
 
     let active_memory = GuardianFailureMemoryStore::at_for_test(
-        chrono::DateTime::parse_from_rfc3339("2026-07-17T10:01:00+00:00")
+        chrono::DateTime::parse_from_rfc3339("2026-07-17T10:01:00.000Z")
             .expect("test time")
             .with_timezone(&chrono::Utc),
     );
     let (result, policy_evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
-        super::operation::settle_startup_install_guardian_failure_memory(
-            &journals,
-            &active_memory,
-            "2026-07-17T10:01:00+00:00",
-        ),
+        super::operation::settle_startup_install_guardian_failure_memory(&journals, &active_memory),
     )
     .await;
     assert!(matches!(
@@ -10326,31 +10179,30 @@ async fn startup_retry_scan_rejects_forged_target_and_binding_without_policy() {
             ExecutionDownloadFactKind::ProviderFailure,
             "minecraft_client_1.21.5",
         )],
-        "2026-06-16T10:00:00+00:00",
     )
     .await;
-    let valid = source.get(&operation_id).expect("valid v3 Retry carrier");
+    let valid = source
+        .get(&operation_id)
+        .expect("valid typed Retry carrier");
 
-    for (name, prefix, replacement) in [
+    for (name, field, replacement) in [
         (
             "binding",
-            "guardian_outcome_memory_binding:",
-            "guardian_outcome_memory_binding:0000000000000000000000000000000000000000000000000000000000000000",
+            "binding",
+            "0000000000000000000000000000000000000000000000000000000000000000",
         ),
-        (
-            "target",
-            "guardian_outcome_memory_target_system:",
-            "guardian_outcome_memory_target_system:state",
-        ),
+        ("target", "id", "forged_minecraft_client"),
     ] {
-        let mut entry = valid.clone();
-        let marker = entry
-            .completed_steps
-            .iter_mut()
-            .flat_map(|step| step.generated_facts.iter_mut())
-            .find(|fact| fact.starts_with(prefix))
-            .expect("tampered carrier marker");
-        *marker = replacement.to_string();
+        let mut encoded = serde_json::to_value(&valid).expect("encode typed Retry carrier");
+        let memory = encoded["guardian_install_terminal"]["memory"]
+            .as_object_mut()
+            .expect("typed Retry memory");
+        if field == "binding" {
+            memory[field] = serde_json::json!(replacement);
+        } else {
+            memory["target"][field] = serde_json::json!(replacement);
+        }
+        let entry = serde_json::from_value(encoded).expect("decode structurally valid forgery");
         let journals = OperationJournalStore::new();
         journals
             .create(entry)
@@ -10361,7 +10213,6 @@ async fn startup_retry_scan_rejects_forged_target_and_binding_without_policy() {
             super::operation::settle_startup_install_guardian_failure_memory(
                 &journals,
                 &failure_memory,
-                "2026-06-16T10:01:00+00:00",
             ),
         )
         .await;
@@ -10385,7 +10236,7 @@ async fn startup_retry_scan_replaces_expired_window_once_and_is_idempotent() {
         "minecraft_client_1.21.5",
     )];
     let old_journals = Arc::new(OperationJournalStore::new());
-    let old_memory = fixed_failure_memory("2026-07-17T10:00:00+00:00");
+    let old_memory = fixed_failure_memory("2026-07-17T10:00:00.000Z");
     let old_operation = test_operation_id("startup-stale-memory-old");
     begin_install_operation_journal(&old_journals, &old_operation, "1.21.5")
         .await
@@ -10396,11 +10247,10 @@ async fn startup_retry_scan_replaces_expired_window_once_and_is_idempotent() {
         old_memory.clone(),
         &old_operation,
         &facts,
-        "2026-07-17T10:00:00+00:00",
     )
     .await;
     let old_snapshot = old_memory.snapshot().expect("snapshot old Retry window");
-    let failure_memory = fixed_failure_memory("2026-07-17T10:10:00+00:00");
+    let failure_memory = fixed_failure_memory("2026-07-17T10:10:00.000Z");
     failure_memory
         .load_snapshot(old_snapshot)
         .expect("load expired Retry window");
@@ -10414,10 +10264,9 @@ async fn startup_retry_scan_replaces_expired_window_once_and_is_idempotent() {
     record_install_failure_outcome(
         &test_producer(),
         journals.clone(),
-        fixed_failure_memory("2026-07-17T10:10:00+00:00"),
+        fixed_failure_memory("2026-07-17T10:10:00.000Z"),
         &newer_operation,
         &facts,
-        "2026-07-17T10:10:00+00:00",
     )
     .await;
 
@@ -10426,7 +10275,6 @@ async fn startup_retry_scan_replaces_expired_window_once_and_is_idempotent() {
             super::operation::settle_startup_install_guardian_failure_memory(
                 &journals,
                 &failure_memory,
-                "2026-07-17T10:11:00+00:00",
             ),
         )
         .await;
@@ -10436,11 +10284,11 @@ async fn startup_retry_scan_replaces_expired_window_once_and_is_idempotent() {
     let merged = failure_memory.list();
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].occurrence_count, 1);
-    assert_eq!(merged[0].first_observed_at, "2026-07-17T10:10:00+00:00");
-    assert_eq!(merged[0].last_observed_at, "2026-07-17T10:10:00+00:00");
+    assert_eq!(merged[0].first_observed_at, "2026-07-17T10:10:00.000Z");
+    assert_eq!(merged[0].last_observed_at, "2026-07-17T10:10:00.000Z");
     assert_eq!(
         merged[0].suppression_until.as_deref(),
-        Some("2026-07-17T10:15:00+00:00")
+        Some("2026-07-17T10:15:00.000Z")
     );
 }
 
@@ -10464,7 +10312,6 @@ async fn startup_retry_scan_fails_atomically_when_active_set_exceeds_capacity() 
                 ExecutionDownloadFactKind::ProviderFailure,
                 target,
             )],
-            "2026-07-17T10:00:00+00:00",
         )
         .await;
     }
@@ -10474,7 +10321,6 @@ async fn startup_retry_scan_fails_atomically_when_active_set_exceeds_capacity() 
         super::operation::settle_startup_install_guardian_failure_memory(
             &journals,
             &failure_memory,
-            "2026-07-17T10:01:00+00:00",
         )
         .await,
         Err(OperationJournalStoreError::GuardianFailureMemoryUnavailable)
@@ -10498,7 +10344,6 @@ async fn startup_retry_scan_restores_vanilla_and_external_provider_ownership() {
             ExecutionDownloadFactKind::ProviderFailure,
             "minecraft_client_1.21.5",
         )],
-        "2026-07-17T10:00:00+00:00",
     )
     .await;
 
@@ -10523,19 +10368,14 @@ async fn startup_retry_scan_restores_vanilla_and_external_provider_ownership() {
             loader_target_id: "loader_fabric_build_startup",
             base_version_id: "26.2",
             error: LoaderInstallError::Active(external_failure),
-            observed_at: "2026-07-17T10:00:00+00:00",
         },
     )
     .await;
 
     let restored = GuardianFailureMemoryStore::new();
-    super::operation::settle_startup_install_guardian_failure_memory(
-        &journals,
-        &restored,
-        "2026-07-17T10:01:00+00:00",
-    )
-    .await
-    .expect("restore distinct provider ownership");
+    super::operation::settle_startup_install_guardian_failure_memory(&journals, &restored)
+        .await
+        .expect("restore distinct provider ownership");
     let mut ownership = restored
         .list()
         .into_iter()
@@ -10558,7 +10398,7 @@ async fn startup_retry_scan_restores_vanilla_and_external_provider_ownership() {
 #[tokio::test]
 async fn concurrent_provider_failures_open_one_fixed_retry_window() {
     let journals = Arc::new(OperationJournalStore::new());
-    let failure_memory = fixed_failure_memory("2026-06-16T10:00:00+00:00");
+    let failure_memory = fixed_failure_memory("2026-06-16T10:00:00.000Z");
     let first_operation = test_operation_id("concurrent-provider-first");
     let second_operation = test_operation_id("concurrent-provider-second");
     begin_install_operation_journal(&journals, &first_operation, "1.21.5")
@@ -10585,7 +10425,6 @@ async fn concurrent_provider_failures_open_one_fixed_retry_window() {
                 failure_memory.clone(),
                 &operation_id,
                 &facts,
-                "2026-06-16T10:00:00+00:00",
             )
             .await;
         }
@@ -10602,32 +10441,21 @@ async fn concurrent_provider_failures_open_one_fixed_retry_window() {
                 failure_memory.clone(),
                 &operation_id,
                 &facts,
-                "2026-06-16T10:00:00+00:00",
             )
             .await;
         }
     });
 
-    timeout(Duration::from_secs(1), async {
-        loop {
-            let both_waiting = [&first_operation, &second_operation]
-                .iter()
-                .all(|operation_id| {
-                    journals.get(operation_id).is_some_and(|entry| {
-                        entry
-                            .guardian_diagnosis_ids
-                            .contains(&DiagnosisId::DownloadUnavailable)
-                            && install_guardian_outcome_summary_from_journal(&entry).is_none()
-                    })
-                });
-            if both_waiting {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("both failures journal evidence before settlement");
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!first.is_finished());
+    assert!(!second.is_finished());
+    for operation_id in [&first_operation, &second_operation] {
+        let entry = journals.get(operation_id).expect("planned install journal");
+        assert!(entry.guardian_diagnosis_ids.is_empty());
+        assert!(install_guardian_outcome_summary_from_journal(&entry).is_none());
+    }
     drop(settlement);
     timeout(Duration::from_secs(1), async {
         first.await.expect("first settlement task");
@@ -10654,11 +10482,11 @@ async fn concurrent_provider_failures_open_one_fixed_retry_window() {
     let memory = failure_memory.list();
     assert_eq!(memory.len(), 1);
     assert_eq!(memory[0].occurrence_count, 1);
-    assert_eq!(memory[0].first_observed_at, "2026-06-16T10:00:00+00:00");
-    assert_eq!(memory[0].last_observed_at, "2026-06-16T10:00:00+00:00");
+    assert_eq!(memory[0].first_observed_at, "2026-06-16T10:00:00.000Z");
+    assert_eq!(memory[0].last_observed_at, "2026-06-16T10:00:00.000Z");
     assert_eq!(
         memory[0].suppression_until.as_deref(),
-        Some("2026-06-16T10:05:00+00:00")
+        Some("2026-06-16T10:05:00.000Z")
     );
 }
 
@@ -10687,26 +10515,19 @@ async fn cancelling_provider_settlement_waiter_releases_coordination() {
                 failure_memory.clone(),
                 &operation_id,
                 &facts,
-                "2026-06-16T10:00:00+00:00",
             )
             .await;
         }
     });
-    timeout(Duration::from_secs(1), async {
-        loop {
-            if journals.get(&operation_id).is_some_and(|entry| {
-                entry
-                    .guardian_diagnosis_ids
-                    .contains(&DiagnosisId::DownloadUnavailable)
-                    && install_guardian_outcome_summary_from_journal(&entry).is_none()
-            }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("waiter journals evidence before cancellation");
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!waiter.is_finished());
+    let entry = journals
+        .get(&operation_id)
+        .expect("planned install journal");
+    assert!(entry.guardian_diagnosis_ids.is_empty());
+    assert!(install_guardian_outcome_summary_from_journal(&entry).is_none());
     waiter.abort();
     assert!(
         waiter
@@ -10724,7 +10545,6 @@ async fn cancelling_provider_settlement_waiter_releases_coordination() {
             failure_memory.clone(),
             &operation_id,
             &facts,
-            "2026-06-16T10:00:00+00:00",
         ),
     )
     .await
@@ -10742,7 +10562,7 @@ async fn cancelling_provider_settlement_waiter_releases_coordination() {
 #[tokio::test]
 async fn vanilla_provider_failure_records_guardian_retry_then_suppression_without_raw_details() {
     let journals = Arc::new(OperationJournalStore::new());
-    let failure_memory = fixed_failure_memory("2026-06-16T10:00:00+00:00");
+    let failure_memory = fixed_failure_memory("2026-06-16T10:00:00.000Z");
     let operation_id = test_operation_id("vanilla-provider-failure");
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
@@ -10769,7 +10589,6 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
             failure_memory.clone(),
             &operation_id,
             &facts,
-            "2026-06-16T10:00:00+00:00",
         ))
         .await;
     assert_eq!(policy_evaluations, 1);
@@ -10787,11 +10606,11 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     assert_eq!(retry_memory.len(), 1);
     let retry_memory = retry_memory[0].clone();
     assert_eq!(retry_memory.occurrence_count, 1);
-    assert_eq!(retry_memory.first_observed_at, "2026-06-16T10:00:00+00:00");
-    assert_eq!(retry_memory.last_observed_at, "2026-06-16T10:00:00+00:00");
+    assert_eq!(retry_memory.first_observed_at, "2026-06-16T10:00:00.000Z");
+    assert_eq!(retry_memory.last_observed_at, "2026-06-16T10:00:00.000Z");
     assert_eq!(
         retry_memory.suppression_until.as_deref(),
-        Some("2026-06-16T10:05:00+00:00")
+        Some("2026-06-16T10:05:00.000Z")
     );
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
 
@@ -10814,7 +10633,6 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
         failure_memory.clone(),
         &suppressed_operation_id,
         &facts,
-        "2026-06-16T10:01:00+00:00",
     )
     .await;
 
@@ -10838,7 +10656,7 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed_entry).expect("journal json"));
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed).expect("summary json"));
 
-    let boundary_failure_memory = fixed_failure_memory("2026-06-16T10:05:00+00:00");
+    let boundary_failure_memory = fixed_failure_memory("2026-06-16T10:05:00.000Z");
     boundary_failure_memory
         .load_snapshot(
             failure_memory
@@ -10858,7 +10676,6 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
         boundary_failure_memory.clone(),
         &boundary_operation_id,
         &facts,
-        "2026-06-16T10:05:00+00:00",
     )
     .await;
 
@@ -10873,15 +10690,15 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     assert_eq!(renewed_memory[0].occurrence_count, 1);
     assert_eq!(
         renewed_memory[0].first_observed_at,
-        "2026-06-16T10:05:00+00:00"
+        "2026-06-16T10:05:00.000Z"
     );
     assert_eq!(
         renewed_memory[0].last_observed_at,
-        "2026-06-16T10:05:00+00:00"
+        "2026-06-16T10:05:00.000Z"
     );
     assert_eq!(
         renewed_memory[0].suppression_until.as_deref(),
-        Some("2026-06-16T10:10:00+00:00")
+        Some("2026-06-16T10:10:00.000Z")
     );
 }
 
@@ -10922,7 +10739,6 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
         &operation_id,
         "loader_fabric_build_1_21_5",
         &error,
-        "2026-06-16T10:00:00+00:00",
     )
     .await
     .expect("record loader failure outcome");
@@ -10961,7 +10777,6 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
         &suppressed_operation_id,
         "loader_fabric_build_1_21_5",
         &active_failure(),
-        "2026-06-16T10:01:00+00:00",
     )
     .await
     .expect("record suppressed loader failure outcome");
@@ -11014,7 +10829,6 @@ async fn delegated_base_provider_fact_uses_download_pipeline_without_dependency_
             loader_target_id: "loader_fabric_build_1_21_5",
             base_version_id: "1.21.5",
             error,
-            observed_at: "2026-06-16T10:00:00+00:00",
         },
     )
     .await;
@@ -11052,7 +10866,6 @@ async fn empty_base_install_payload_uses_only_dependency_fallback() {
             loader_target_id: "loader_fabric_build_1_21_5",
             base_version_id: "1.21.5",
             error,
-            observed_at: "2026-06-16T10:00:00+00:00",
         },
     )
     .await;

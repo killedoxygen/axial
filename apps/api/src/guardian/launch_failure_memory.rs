@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn p02_b05_contract_rosetta_memory_round_trips_without_java_major_collapse() {
+    fn behavior_contract_rosetta_memory_round_trips_without_java_major_collapse() {
         assert_eq!(
             launch_failure_diagnosis_id(LaunchFailureClass::RosettaRequired),
             DiagnosisId::ManagedRuntimeRosettaRequired

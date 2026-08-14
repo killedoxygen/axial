@@ -1006,7 +1006,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn p01_b05_contract_cross_owner_runtime_repair_consumes_retained_component() {
+    fn native_filesystem_contract_cross_owner_runtime_repair_consumes_retained_component() {
         let runtime_cache = managed_runtime_cache();
         let runtime_root_path = managed_runtime_root(&runtime_cache, "java-runtime-delta");
         let java_path = managed_runtime_java_path(&runtime_root_path);
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn p01_b05_contract_cross_owner_runtime_repair_refuses_root_replacement() {
+    fn native_filesystem_contract_cross_owner_runtime_repair_refuses_root_replacement() {
         use std::os::unix::fs::symlink;
 
         let runtime_cache = managed_runtime_cache();

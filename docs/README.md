@@ -77,6 +77,9 @@ Do not use them for:
 Guardian invariant coverage artifact. It is regenerated with the machine-readable JSON
 fixture and must not be edited by hand.
 
+## Naming and verification
+Implementation and verification artifacts use behavior-based names. Execution-plan identifiers and numbered phase/boundary labels are forbidden in implementation, tracked tests, task wiring, comments, ordinary documentation, and tracked evidence/control records. Any temporary inventory filter belongs in a script that is both ignored and untracked and is never part of the verification loop.
+
 ### `plans/stabilization/`
 Ignored local target architecture specs and stabilization execution control plane.
 

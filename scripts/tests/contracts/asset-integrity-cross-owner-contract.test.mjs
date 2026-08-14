@@ -167,7 +167,7 @@ test("font, favicon, Microsoft authentication, and sound consumers resolve retai
   );
 });
 
-const b03ScenarioIds = [
+const assetScenarioIds = [
   "CP-OA-FONTS",
   "CP-OA-ICONS",
   "CP-OA-LOADER-MARKS",
@@ -176,15 +176,15 @@ const b03ScenarioIds = [
 
 test("the production capability registry and Task gates own the four portable asset proofs", async () => {
   const records = capabilityRegistry.filter(({ scenario_id }) =>
-    b03ScenarioIds.includes(scenario_id),
+    assetScenarioIds.includes(scenario_id),
   );
   assert.deepEqual(
     records.map(({ scenario_id }) => scenario_id).sort(),
-    b03ScenarioIds,
+    assetScenarioIds,
   );
   for (const record of records) {
     assert.deepEqual(record.allowed_platforms, ["linux", "windows", "macos"]);
-    assert.equal(record.owner_phase, "P00");
+    assert.equal(record.owner_domain, "offline-assets");
     assert.match(record.proof_id, /^CAP-OA-/);
   }
 
@@ -200,7 +200,7 @@ test("the production capability registry and Task gates own the four portable as
     assert.match(
       taskfile,
       new RegExp(
-        `${task.replaceAll(":", "\\:")}:[\\s\\S]*?p00-b03-contract\\.test\\.mjs scripts/tests/contracts/p00-b03-contract-cross-owner\\.test\\.mjs[\\s\\S]*?node scripts/verify-assets\\.mjs`,
+        `${task.replaceAll(":", "\\:")}:[\\s\\S]*?asset-integrity-contract\\.test\\.mjs scripts/tests/contracts/asset-integrity-cross-owner-contract\\.test\\.mjs[\\s\\S]*?node scripts/verify-assets\\.mjs`,
       ),
     );
   }
@@ -208,14 +208,14 @@ test("the production capability registry and Task gates own the four portable as
 
 test("each portable asset scenario reruns to the same current receipt", async () => {
   for (const record of capabilityRegistry.filter(({ scenario_id }) =>
-    b03ScenarioIds.includes(scenario_id),
+  assetScenarioIds.includes(scenario_id),
   )) {
     const implementation = await import(record.module_url.href);
     const context = {
       scenario_id: record.scenario_id,
       proof_id: record.proof_id,
       capability_id: record.capability_id,
-      owner_phase: record.owner_phase,
+      owner_domain: record.owner_domain,
       platform:
         process.platform === "win32"
           ? "windows"

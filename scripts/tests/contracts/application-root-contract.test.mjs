@@ -14,7 +14,7 @@ const taskBody = (taskfile, name) => {
   return next === -1 ? remainder : remainder.slice(0, next);
 };
 
-test("P01-B01 keeps one explicit application-root authority", async () => {
+test("portable-identity keeps one explicit application-root authority", async () => {
   const [
     workspaceManifest,
     apiManifest,

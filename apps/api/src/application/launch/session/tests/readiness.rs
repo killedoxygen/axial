@@ -327,7 +327,8 @@ async fn launch_preflight_refuses_changed_library_root_despite_retained_installe
         },
         None,
     )
-    .await;
+    .await
+    .expect("valid changed-root launch preflight evidence");
 
     assert!(!preflight.readiness.launchable);
     assert!(
@@ -761,7 +762,8 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
         },
         None,
     )
-    .await;
+    .await
+    .expect("valid missing-runtime launch preflight evidence");
     assert!(
         readiness_has_managed_runtime_missing(&preflight.readiness),
         "missing managed runtime readiness reason: {:?}",
@@ -858,7 +860,8 @@ async fn launch_preparation_refuses_corrupt_managed_runtime_ready_marker() {
         },
         None,
     )
-    .await;
+    .await
+    .expect("valid corrupt-runtime launch preflight evidence");
     assert!(
         readiness_has_managed_runtime_missing(&preflight.readiness),
         "corrupt managed runtime should be readiness-visible before repair: {:?}",
@@ -971,7 +974,8 @@ async fn launch_preparation_blocks_component_rebuild_while_a_session_is_active()
         },
         None,
     )
-    .await;
+    .await
+    .expect("valid active-session launch preflight evidence");
     assert!(readiness_has_managed_runtime_missing(&preflight.readiness));
     fixture.add_active_launch("other", 1024).await;
 
@@ -1490,7 +1494,8 @@ async fn launch_preparation_blocks_on_active_prior_managed_runtime_repair() {
         },
         None,
     )
-    .await;
+    .await
+    .expect("valid repair launch preflight evidence");
 
     let producer = fixture
         .state

@@ -204,7 +204,7 @@ async fn prepare_launch_session_creates_no_user_owned_paths() {
 }
 
 #[tokio::test]
-async fn p00_b11_contract_preparation_uses_authenticated_player_and_application_identity() {
+async fn behavior_contract_preparation_uses_authenticated_player_and_application_identity() {
     let fixture = TestFixture::new("prepare-syncs-offline-account-name");
     fixture.write_ready_install("1.21.1");
     fixture

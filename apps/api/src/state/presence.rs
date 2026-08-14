@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_presence_empty_is_public_and_generic() {
+    fn behavior_contract_presence_empty_is_public_and_generic() {
         let activity = presence_activity(&config(), &[], &[], |_| None);
 
         assert_eq!(activity.kind, PresenceActivityKind::Idle);
@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_presence_single_playing_session_is_exact() {
+    fn behavior_contract_presence_single_playing_session_is_exact() {
         let versions = vec![version("fabric-loader-0.16.10-1.21.1", Some("Fabric"))];
         let active = vec![record(
             "session",
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_presence_multiple_active_sessions_are_exact() {
+    fn behavior_contract_presence_multiple_active_sessions_are_exact() {
         let active = vec![
             record("first", "a", "1.21.1", LaunchState::Running),
             record("second", "b", "1.20.1", LaunchState::Starting),
@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_presence_single_launching_session_is_exact() {
+    fn behavior_contract_presence_single_launching_session_is_exact() {
         let active = vec![record(
             "session",
             "instance",
@@ -450,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_presence_multiple_launching_sessions_are_exact() {
+    fn behavior_contract_presence_multiple_launching_sessions_are_exact() {
         let active = vec![
             record("first", "a", "1.21.1", LaunchState::Starting),
             record("second", "b", "1.20.1", LaunchState::Preparing),
@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn p00_b08_contract_presence_is_identical_for_all_three_session_permutations() {
+    fn behavior_contract_presence_is_identical_for_all_three_session_permutations() {
         let mut first = record("first", "a", "1.21.1", LaunchState::Starting);
         first.process_started_at_ms = Some(1_781_350_003_000);
         let mut second = record("second", "b", "1.20.1", LaunchState::Running);
@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p00_b08_contract_presence_disabled_snapshot_is_idle() {
+    async fn behavior_contract_presence_disabled_snapshot_is_idle() {
         let root = test_root("disabled");
         let paths = test_paths(&root);
         let root_session = crate::state::test_root_session(&paths);

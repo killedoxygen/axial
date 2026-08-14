@@ -1,13 +1,13 @@
-#[cfg(test)]
-use super::FactReliability;
 use super::state_evidence::{
     persisted_state_repair_available_fact, persisted_state_schema_invalid_fact,
 };
 use super::{
     DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDecision, GuardianDomain,
     GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianSeverity,
-    SafetyCase, build_safety_case, decide_guardian_policy,
+    OperationEvidenceBatch, SafetyCase, build_safety_case, decide_guardian_policy,
 };
+#[cfg(test)]
+use super::{FactReliability, OperationEvidenceBatchRejection};
 use crate::state::contracts::{OperationPhase, OwnershipClass};
 use crate::state::{
     PersistedStateRejectedRecordEligibility, PersistedStateRejectedRecordQuarantineAuthorization,
@@ -60,7 +60,9 @@ fn evaluate_persisted_state_repair_policy(
     mode: GuardianMode,
 ) -> Option<(PersistedStateRepairAssessmentProof, GuardianDecision)> {
     let facts = persisted_state_repair_facts();
-    let safety_case = build_safety_case(None, mode, OperationPhase::Startup, &facts);
+    let evidence = OperationEvidenceBatch::try_from_guardian_unscoped(&facts)
+        .expect("persisted-state evidence is bounded and unscoped");
+    let safety_case = build_safety_case(mode, OperationPhase::Startup, &evidence);
     let proof = seal_exact_assessment(&facts, &safety_case)?;
     let decision = decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
     Some((proof, decision))
@@ -206,8 +208,11 @@ mod tests {
         ));
         assert_eq!(facts[0].target, facts[1].target);
 
-        let safety_case =
-            build_safety_case(None, GuardianMode::Managed, OperationPhase::Startup, &facts);
+        let safety_case = build_safety_case(
+            GuardianMode::Managed,
+            OperationPhase::Startup,
+            &crate::guardian::unscoped_evidence_for_test(&facts),
+        );
         let proof = seal_exact_assessment(&facts, &safety_case).expect("sealed assessment");
         assert_eq!(proof.assessed_mode(), GuardianMode::Managed);
         let diagnosis = &safety_case.diagnoses[0];
@@ -226,7 +231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p00_b09_contract_startup_policy_is_total_and_evaluates_once_per_mode() {
+    async fn behavior_contract_startup_policy_is_total_and_evaluates_once_per_mode() {
         for (index, mode) in GuardianMode::ALL.iter().copied().enumerate() {
             let (root, eligibility) = eligibility_fixture(&format!("mode-{index}"));
             let (disposition, evaluations) = with_guardian_policy_evaluation_count(async move {
@@ -295,14 +300,24 @@ mod tests {
         variants.push(facts);
 
         for facts in variants {
+            let evidence = match OperationEvidenceBatch::try_from_guardian_unscoped(&facts) {
+                Ok(evidence) => evidence,
+                Err(OperationEvidenceBatchRejection::UnexpectedOperation { fact_index: 0 }) => {
+                    continue;
+                }
+                Err(rejection) => panic!("unexpected malformed evidence rejection: {rejection:?}"),
+            };
             let safety_case =
-                build_safety_case(None, GuardianMode::Managed, OperationPhase::Startup, &facts);
+                build_safety_case(GuardianMode::Managed, OperationPhase::Startup, &evidence);
             assert!(seal_exact_assessment(&facts, &safety_case).is_none());
         }
 
         let facts = persisted_state_repair_facts();
-        let mut safety_case =
-            build_safety_case(None, GuardianMode::Managed, OperationPhase::Startup, &facts);
+        let mut safety_case = build_safety_case(
+            GuardianMode::Managed,
+            OperationPhase::Startup,
+            &crate::guardian::unscoped_evidence_for_test(&facts),
+        );
         safety_case.phase = OperationPhase::Planning;
         assert!(seal_exact_assessment(&facts, &safety_case).is_none());
     }
