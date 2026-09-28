@@ -2189,14 +2189,15 @@ fn terminal_performance_import_rejects_incoherent_unknown_and_nonterminal_record
 #[tokio::test]
 async fn terminal_performance_import_preserves_source_bound_evidence_and_exact_completed_replay() {
     let mut source_ids = Vec::new();
-    for _ in 0..2 {
-        let fixture = Fixture::new();
+    // Keep both roots alive: filesystems may reuse deleted directory identities.
+    let fixtures = [Fixture::new(), Fixture::new()];
+    for fixture in &fixtures {
         let journal = terminal_performance_journal();
         fixture.write("state/operation-journals.json", &journal);
         let before = snapshot(&fixture.baseline);
         let (root, service) = import_service();
         let imported = service
-            .import_instance(prepare_first(&fixture))
+            .import_instance(prepare_first(fixture))
             .unwrap()
             .join()
             .await
@@ -2244,7 +2245,7 @@ async fn terminal_performance_import_preserves_source_bound_evidence_and_exact_c
         );
         source_ids.push(records[0]["id"].clone());
         let repeated = service
-            .import_instance(prepare_first(&fixture))
+            .import_instance(prepare_first(fixture))
             .unwrap()
             .join()
             .await
@@ -2266,7 +2267,7 @@ async fn terminal_performance_import_preserves_source_bound_evidence_and_exact_c
             .unwrap();
         assert!(
             service
-                .import_instance(prepare_first(&fixture))
+                .import_instance(prepare_first(fixture))
                 .unwrap()
                 .join()
                 .await
