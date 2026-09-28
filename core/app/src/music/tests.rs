@@ -315,6 +315,7 @@ async fn provider_failure_truncation_and_oversize_never_publish_and_allow_retry(
         provider.reply("200 OK", 5, b"retry");
         assert_eq!(&*fixture.music.track(None).await.unwrap().bytes, b"retry");
         provider.requested().await;
+        fixture.idle().await;
         assert!(!MusicError::DownloadFailed.to_string().contains("private"));
         assert!(!fixture.music.has_unsettled_effects());
     }
