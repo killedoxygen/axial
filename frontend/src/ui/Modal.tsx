@@ -4,6 +4,7 @@ import { createPortal } from 'preact/compat';
 import { useContext, useEffect, useRef } from 'preact/hooks';
 import { Icon } from './Icons';
 import { cn } from '../utils';
+import { dialogOpen } from './Dialog';
 
 interface ModalContextValue {
   close: () => void;
@@ -38,14 +39,16 @@ function ModalContent({
 }): JSX.Element {
   const { close } = useContext(ModalContext);
   const panelRef = useRef<HTMLDivElement>(null);
+  const suspended = dialogOpen.value;
 
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const panel = panelRef.current;
     const autofocus = panel?.querySelector<HTMLElement>('[data-autofocus], input, button');
-    (autofocus ?? panel)?.focus();
+    if (!dialogOpen.value) (autofocus ?? panel)?.focus();
 
     const onKeyDown = (e: KeyboardEvent): void => {
+      if (e.defaultPrevented || dialogOpen.value) return;
       if (e.key === 'Escape') {
         e.stopPropagation();
         close();
@@ -71,22 +74,30 @@ function ModalContent({
     document.addEventListener('keydown', onKeyDown);
     return () => {
       document.removeEventListener('keydown', onKeyDown);
-      previouslyFocused?.focus?.();
+      if (!dialogOpen.value) previouslyFocused?.focus?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return createPortal(
     <>
-      <div data-slot="modal-overlay" class="cp-modal-overlay" onClick={close} aria-hidden="true" />
+      <div
+        data-slot="modal-overlay"
+        class="cp-modal-overlay"
+        onClick={suspended ? undefined : close}
+        inert={suspended}
+        aria-hidden="true"
+      />
       <div
         data-slot="modal-content"
         role="dialog"
-        aria-modal="true"
         tabIndex={-1}
         ref={panelRef}
         class={cn('cp-modal-panel', className)}
         {...props}
+        aria-modal={suspended ? undefined : 'true'}
+        aria-hidden={suspended ? 'true' : undefined}
+        inert={suspended}
       >
         {children}
         {showCloseButton && (

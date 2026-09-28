@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { signal } from '@preact/signals';
+import { computed, signal } from '@preact/signals';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Button, Input } from './Atoms';
 
@@ -35,10 +35,51 @@ interface DialogSpec {
   validate?: (value: string) => string | null;
   normalizeInput?: (value: string) => string;
   normalizeValue?: (value: string) => string;
+  returnFocus: HTMLElement | null;
   resolve: (v: DialogResult) => void;
 }
 
 const current = signal<DialogSpec | null>(null);
+export const dialogOpen = computed(() => current.value !== null);
+let pendingFocusReturn: { cancel: () => void; target: HTMLElement | null } | undefined;
+
+function captureReturnFocus(): HTMLElement | null {
+  const pending = pendingFocusReturn;
+  pending?.cancel();
+  const spec = current.value;
+  if (spec) return spec.returnFocus;
+  if (pending) return pending.target;
+  return document.activeElement instanceof HTMLElement ? document.activeElement : null;
+}
+
+function finishDialog(spec: DialogSpec, result: DialogResult): void {
+  if (current.value !== spec) return;
+  current.value = null;
+  spec.resolve(result);
+  const focused = document.activeElement;
+  const onFocus = (event: FocusEvent): void => {
+    if (event.target !== focused && event.target !== document.body) cancel();
+  };
+  const frame = window.requestAnimationFrame(() => {
+    cancel();
+    const target = spec.returnFocus;
+    if (
+      !current.value &&
+      target?.isConnected &&
+      !target.closest('[inert]') &&
+      (document.activeElement === focused || document.activeElement === document.body)
+    ) {
+      target.focus();
+    }
+  });
+  const cancel = (): void => {
+    window.cancelAnimationFrame(frame);
+    document.removeEventListener('focusin', onFocus);
+    if (pendingFocusReturn?.cancel === cancel) pendingFocusReturn = undefined;
+  };
+  pendingFocusReturn = { cancel, target: spec.returnFocus };
+  document.addEventListener('focusin', onFocus);
+}
 
 function cancelCurrent(): void {
   const spec = current.value;
@@ -52,9 +93,11 @@ export function showConfirm(
   opts: { title?: string; confirmText?: string; cancelText?: string | null; destructive?: boolean } = {},
 ): Promise<boolean> {
   return new Promise((resolve) => {
+    const returnFocus = captureReturnFocus();
     cancelCurrent();
     current.value = {
       kind: 'confirm',
+      returnFocus,
       title: opts.title,
       message,
       confirmText: opts.confirmText || 'Confirm',
@@ -71,9 +114,11 @@ export function showChoice<T extends string>(
   opts: { title?: string; cancelText?: string | null } = {},
 ): Promise<T | null> {
   return new Promise((resolve) => {
+    const returnFocus = captureReturnFocus();
     cancelCurrent();
     current.value = {
       kind: 'choice',
+      returnFocus,
       title: opts.title,
       message,
       cancelText: opts.cancelText === null ? null : opts.cancelText || 'Cancel',
@@ -85,9 +130,11 @@ export function showChoice<T extends string>(
 
 export function prompt(message: string, initial = '', opts: PromptOptions = {}): Promise<string | null> {
   return new Promise((resolve) => {
+    const returnFocus = captureReturnFocus();
     cancelCurrent();
     current.value = {
       kind: 'prompt',
+      returnFocus,
       title: opts.title || message,
       message: opts.title ? message : '',
       initialValue: initial,
@@ -108,6 +155,7 @@ export function DialogHost(): JSX.Element | null {
   const [draft, setDraft] = useState('');
   const [touched, setTouched] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const primaryRef = useRef<HTMLButtonElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const choicePrimaryRef = useRef<HTMLButtonElement>(null);
@@ -129,14 +177,12 @@ export function DialogHost(): JSX.Element | null {
         payload = spec.normalizeValue ? spec.normalizeValue(draft) : draft.trim();
       }
     }
-    spec.resolve(payload);
-    current.value = null;
+    finishDialog(spec, payload);
   };
 
   const resolveChoice = (value: string): void => {
     if (!spec || spec.kind !== 'choice') return;
-    spec.resolve(value);
-    current.value = null;
+    finishDialog(spec, value);
   };
 
   useEffect(() => {
@@ -149,18 +195,18 @@ export function DialogHost(): JSX.Element | null {
 
   useEffect(() => {
     if (!spec) return;
-    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    if (spec.kind === 'choice') {
-      window.requestAnimationFrame(() => {
+    const focusFrame = window.requestAnimationFrame(() => {
+      if (current.value !== spec) return;
+      if (spec.kind === 'prompt') inputRef.current?.focus();
+      else if (spec.kind === 'choice') {
         (choicePrimaryRef.current || dialogRef.current?.querySelector<HTMLButtonElement>('button'))?.focus();
-      });
-    } else if (spec.kind !== 'prompt') {
-      window.requestAnimationFrame(() => primaryRef.current?.focus());
-    }
+      } else primaryRef.current?.focus();
+    });
     const dialog = dialogRef.current;
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') {
         e.preventDefault();
+        e.stopPropagation();
         resolveAs(false);
         return;
       }
@@ -187,7 +233,7 @@ export function DialogHost(): JSX.Element | null {
     dialog?.addEventListener('keydown', onKey);
     return () => {
       dialog?.removeEventListener('keydown', onKey);
-      previousFocus?.focus();
+      window.cancelAnimationFrame(focusFrame);
     };
   }, [spec]);
 
@@ -222,7 +268,7 @@ export function DialogHost(): JSX.Element | null {
                 setDraft(spec.normalizeInput ? spec.normalizeInput(value) : value);
               }}
               placeholder={spec.placeholder}
-              autoFocus
+              inputRef={inputRef}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') resolveAs(true);
               }}

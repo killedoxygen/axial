@@ -2283,6 +2283,7 @@ test('the reused modal traps Tab and Escape cancels the preview through its norm
       },
       './Icons': { Icon: 'Icon' },
       '../utils': { cn: (...names: string[]) => names.filter(Boolean).join(' ') },
+      './Dialog': { dialogOpen: { value: false } },
       'preact/jsx-runtime': jsx,
     },
     {
