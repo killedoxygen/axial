@@ -2505,8 +2505,8 @@ impl ManagedDir {
         if !guard.identity.matches(&file)? {
             return Ok(false);
         }
-        let matches = file.validate_revision(&guard.revision).is_ok()
-            && file.revision()?.size() == guard.size;
+        let matches =
+            file.validate_revision(&guard.revision).is_ok() && guard.revision.size() == guard.size;
         verify_operation_admission(&self.inner.operation_pin)?;
         Ok(matches)
     }
