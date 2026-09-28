@@ -535,6 +535,20 @@ impl ResourceService {
         id: &InstanceId,
         name: &str,
     ) -> Result<TaskHandle<Result<ResourceCommand, ResourceError>>, ResourceError> {
+        self.backup_world_inner(
+            id,
+            name,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn backup_world_inner(
+        &self,
+        id: &InstanceId,
+        name: &str,
+        #[cfg(test)] before_copy: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> Result<TaskHandle<Result<ResourceCommand, ResourceError>>, ResourceError> {
         use axial_minecraft::managed_path::{
             ManagedTreeCopyLimits, ManagedTreeCopyOutcome, ManagedTreeRoot,
         };
@@ -546,68 +560,84 @@ impl ResourceService {
         let owner = self.clone();
         self.tasks
             .try_spawn(instance.clone(), move |cancel| async move {
-                if cancel.is_cancelled() {
-                    return Err(ResourceError::Busy);
-                }
-                let native = instance.game_directory().capability();
-                let effects = native.create_effect_owner().map_err(read_error)?;
-                let root = match ManagedTreeRoot::from_directory(native.clone(), effects.clone()) {
-                    Ok(root) => root,
-                    Err(error) if !effects.has_pending() => return Err(read_error(error)),
-                    Err(_) => return Err(owner.retain((instance, effects))),
-                };
-                let operation = root.try_acquire().map_err(read_error)?;
-                let result = (|| {
-                    let game = operation.directory().map_err(read_error)?;
-                    let source = game
-                        .open_child("saves")
-                        .map_err(read_error)?
-                        .ok_or(ResourceError::NotFound)?
-                        .open_child(name.as_str())
-                        .map_err(read_error)?
-                        .ok_or(ResourceError::NotFound)?;
-                    let destination = game
-                        .open_or_create_child("backups")
-                        .map_err(read_error)?
-                        .open_or_create_child("worlds")
-                        .map_err(read_error)?;
-                    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-                    let final_names = (1..=worlds::BACKUP_NAME_ATTEMPTS)
-                        .map(|attempt| {
-                            axial_minecraft::portable_path::PortableFileName::new_exact(
-                                worlds::backup_name(&name, &timestamp, attempt).as_str(),
-                            )
-                            .expect("portable generated name")
-                        })
-                        .collect::<Vec<_>>();
-                    let stage = axial_minecraft::portable_path::PortableFileName::new_exact(
-                        &format!("stage-{}", uuid::Uuid::new_v4()),
-                    )
-                    .map_err(|_| ResourceError::InvalidName)?;
-                    match destination.copy_tree_no_replace(
-                        &source,
-                        &final_names,
-                        &[stage],
-                        ManagedTreeCopyLimits {
-                            max_depth: worlds::WORLD_BACKUP_MAX_DEPTH,
-                            max_entries: worlds::WORLD_BACKUP_MAX_ENTRIES,
-                            max_bytes: worlds::WORLD_BACKUP_MAX_BYTES,
-                        },
-                    ) {
-                        ManagedTreeCopyOutcome::Applied(name) => {
-                            let mut result = ResourceCommand::ok(None);
-                            result.backup = Some(name.as_str().into());
-                            result.location = Some(format!("backups/worlds/{}", name.as_str()));
-                            Ok(result)
-                        }
-                        ManagedTreeCopyOutcome::RefusedBeforeMove(_) => Err(ResourceError::Files),
-                        _ => Err(ResourceError::Pending),
+                tokio::task::spawn_blocking(move || {
+                    if cancel.is_cancelled() {
+                        return Err(ResourceError::Busy);
                     }
-                })();
-                if effects.has_pending() || matches!(result, Err(ResourceError::Pending)) {
-                    return Err(owner.retain((instance, root, operation, effects)));
-                }
-                result
+                    let native = instance.game_directory().capability();
+                    let effects = native.create_effect_owner().map_err(read_error)?;
+                    let root =
+                        match ManagedTreeRoot::from_directory(native.clone(), effects.clone()) {
+                            Ok(root) => root,
+                            Err(error) if !effects.has_pending() => return Err(read_error(error)),
+                            Err(_) => return Err(owner.retain((instance, effects))),
+                        };
+                    let operation = root.try_acquire().map_err(read_error)?;
+                    let result = (|| {
+                        let game = operation.directory().map_err(read_error)?;
+                        let source = game
+                            .open_child("saves")
+                            .map_err(read_error)?
+                            .ok_or(ResourceError::NotFound)?
+                            .open_child(name.as_str())
+                            .map_err(read_error)?
+                            .ok_or(ResourceError::NotFound)?;
+                        let destination = game
+                            .open_or_create_child("backups")
+                            .map_err(read_error)?
+                            .open_or_create_child("worlds")
+                            .map_err(read_error)?;
+                        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+                        let final_names = (1..=worlds::BACKUP_NAME_ATTEMPTS)
+                            .map(|attempt| {
+                                axial_minecraft::portable_path::PortableFileName::new_exact(
+                                    worlds::backup_name(&name, &timestamp, attempt).as_str(),
+                                )
+                                .expect("portable generated name")
+                            })
+                            .collect::<Vec<_>>();
+                        let stage = axial_minecraft::portable_path::PortableFileName::new_exact(
+                            &format!("stage-{}", uuid::Uuid::new_v4()),
+                        )
+                        .map_err(|_| ResourceError::InvalidName)?;
+                        #[cfg(test)]
+                        if let Some(before_copy) = before_copy {
+                            before_copy();
+                        }
+                        match destination.copy_tree_no_replace(
+                            &source,
+                            &final_names,
+                            &[stage],
+                            ManagedTreeCopyLimits {
+                                max_depth: worlds::WORLD_BACKUP_MAX_DEPTH,
+                                max_entries: worlds::WORLD_BACKUP_MAX_ENTRIES,
+                                max_bytes: worlds::WORLD_BACKUP_MAX_BYTES,
+                            },
+                        ) {
+                            ManagedTreeCopyOutcome::Applied(name) => {
+                                let mut result = ResourceCommand::ok(None);
+                                result.backup = Some(name.as_str().into());
+                                result.location = Some(format!("backups/worlds/{}", name.as_str()));
+                                Ok(result)
+                            }
+                            ManagedTreeCopyOutcome::RefusedBeforeMove(_) => {
+                                Err(ResourceError::Files)
+                            }
+                            _ => Err(ResourceError::Pending),
+                        }
+                    })();
+                    if effects.has_pending() || matches!(result, Err(ResourceError::Pending)) {
+                        return Err(owner.retain((instance, root, operation, effects)));
+                    }
+                    result
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    if error.is_panic() {
+                        std::panic::resume_unwind(error.into_panic());
+                    }
+                    Err(ResourceError::Busy)
+                })
             })
             .map_err(|_| ResourceError::Busy)
     }
@@ -1186,6 +1216,154 @@ mod tests {
             library.revoke_application_root().unwrap(),
             axial_fs::RootRevokeOutcome::Revoked
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn world_backup_keeps_current_thread_responsive_and_retains_dropped_waiter_until_joined()
+    {
+        use std::{future::Future, task::Poll, time::Duration};
+
+        let (root, service, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        std::fs::create_dir_all(game.join("saves/Original/region")).unwrap();
+        std::fs::write(game.join("saves/Original/region/r.0.0.mca"), b"world bytes").unwrap();
+        std::fs::create_dir(game.join("saves/Other")).unwrap();
+        std::fs::write(game.join("saves/Other/level.dat"), b"keep").unwrap();
+        let tasks = service.tasks.clone();
+        let library = service.directories.library().clone();
+        let runtime_thread = std::thread::current().id();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = service
+            .backup_world_inner(
+                &id,
+                "Original",
+                Some(Box::new(move || {
+                    let _ = entered_tx.send(std::thread::current().id());
+                    // Only a deadlock escape for the synchronous regression: let
+                    // the real copy settle before reporting any failed assertion.
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                })),
+            )
+            .unwrap();
+        let task_id = task.id();
+        let entered = entered_rx.await;
+        drop(task);
+        let pulse = tokio::spawn(async { std::thread::current().id() }).await;
+        let paused = tasks.status();
+        let exclusion_held = matches!(
+            service.directories.admit(&id),
+            Err(crate::instances::model::InstanceError::Busy)
+        );
+        let pins_while_paused = library.snapshot().current.unwrap().pins;
+        let idle_close_refused = tasks.try_close_idle().is_err();
+        let mut shutdown = Box::pin(tasks.shutdown(Duration::from_secs(5)));
+        let first_shutdown_poll =
+            std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+        let shutdown_waited = first_shutdown_poll.is_pending();
+
+        // Release and join accepted work before asserting, including on RED.
+        let explicitly_released = release_tx.send(()).is_ok();
+        let shutdown_result = match first_shutdown_poll {
+            Poll::Pending => shutdown.as_mut().await,
+            Poll::Ready(result) => result,
+        };
+        drop(shutdown);
+        let settled = tasks.status();
+        let pins_after = library.snapshot().current.unwrap().pins;
+        let unsettled_effects = service.has_unsettled_effects();
+        drop(service);
+        drop(tasks);
+        drop(library);
+
+        assert!(shutdown_result.is_ok(), "{shutdown_result:?}");
+        assert!(settled.is_idle(), "{settled:?}");
+        assert_eq!(pins_after, 0);
+        assert!(!unsettled_effects);
+        assert_ne!(
+            entered.unwrap(),
+            runtime_thread,
+            "backup blocked the async worker"
+        );
+        assert_eq!(pulse.unwrap(), runtime_thread);
+        assert!(
+            explicitly_released,
+            "scheduler did not progress before gate escape"
+        );
+        assert_eq!(paused.running, vec![task_id]);
+        assert!(paused.unsettled.is_empty());
+        assert!(exclusion_held);
+        assert!(pins_while_paused > 0);
+        assert!(idle_close_refused);
+        assert!(shutdown_waited);
+        let backups = std::fs::read_dir(game.join("backups/worlds"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read(backups[0].join("region/r.0.0.mca")).unwrap(),
+            b"world bytes"
+        );
+        assert_eq!(
+            std::fs::read(game.join("saves/Original/region/r.0.0.mca")).unwrap(),
+            b"world bytes"
+        );
+        assert_eq!(
+            std::fs::read(game.join("saves/Other/level.dat")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn world_backup_worker_panic_retains_unsettled_task_admission() {
+        let (root, service, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        std::fs::create_dir(game.join("saves/Original")).unwrap();
+        std::fs::write(game.join("saves/Original/level.dat"), b"world bytes").unwrap();
+        let task = service
+            .backup_world_inner(
+                &id,
+                "Original",
+                Some(Box::new(|| panic!("test backup worker panic"))),
+            )
+            .unwrap();
+        let task_id = task.id();
+        let outcome = task.join().await;
+        let status = service.tasks.status();
+        let exclusion_held = matches!(
+            service.directories.admit(&id),
+            Err(crate::instances::model::InstanceError::Busy)
+        );
+        let pins = service
+            .directories
+            .library()
+            .snapshot()
+            .current
+            .unwrap()
+            .pins;
+        let idle_close_refused = service.tasks.try_close_idle().is_err();
+        drop(service);
+
+        assert!(matches!(
+            outcome,
+            Err(crate::tasks::TaskJoinError::Panicked)
+        ));
+        assert!(status.running.is_empty());
+        assert_eq!(status.unsettled, vec![task_id]);
+        assert!(exclusion_held);
+        assert!(pins > 0);
+        assert!(idle_close_refused);
+        assert_eq!(
+            std::fs::read(game.join("saves/Original/level.dat")).unwrap(),
+            b"world bytes"
+        );
+        assert_eq!(
+            std::fs::read_dir(game.join("backups/worlds"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
