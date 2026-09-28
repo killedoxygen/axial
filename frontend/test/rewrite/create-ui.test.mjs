@@ -20,6 +20,7 @@ try {
 const instanceFile = resolve(frontend, 'src/instance-create.ts');
 const seam = `
   export const requests = [], added = [], queues = [], notices = [], navigation = [];
+  export const instances = { value: added };
   let response, requestError, queueError;
   export function arrange(value, failure, streamFailure) {
     response = value; requestError = failure; queueError = streamFailure;
@@ -63,7 +64,7 @@ const bundled = await build({
           if (
             args.path === 'create-test-seam' ||
             (args.importer === instanceFile &&
-              ['./api', './toast', './utils', './ui-state', './actions', './machines/downloads'].includes(args.path))
+              ['./api', './toast', './utils', './ui-state', './actions', './store', './machines/downloads'].includes(args.path))
           ) {
             return { path: 'create-test-seam', namespace: 'create-test' };
           }

@@ -20,7 +20,7 @@ use crate::{
         MetadataStore, Migration, StorageError,
         rusqlite::{self, OptionalExtension, params},
     },
-    tasks::{ArtifactKey, CancellationToken, ExclusionLease, Exclusions, TaskOwner},
+    tasks::{ArtifactKey, CancellationToken, ExclusionLease, Exclusions, TaskHandle, TaskOwner},
     telemetry::{Telemetry, TelemetryErrorKind, TelemetryEvent},
 };
 #[cfg(feature = "test-support")]
@@ -355,6 +355,11 @@ impl InstallQueue {
     }
     pub fn snapshot(&self) -> InstallQueueStateResponse {
         project(&self.inner.state.lock().expect("install queue lock"))
+    }
+    pub(crate) fn invalidate_registry(&self) {
+        let mut state = self.inner.state.lock().expect("install queue lock");
+        state.registry_revision = state.registry_revision.saturating_add(1);
+        publish(&self.inner, &mut state);
     }
     pub fn subscribe(
         &self,
@@ -1126,7 +1131,7 @@ impl InstallQueue {
                 let _ = persist_status(&self.inner.storage, &entry.status, "settlement_required");
             }
         }
-        if setup_changed {
+        if setup_changed || settled {
             state.registry_revision = state.registry_revision.saturating_add(1);
         }
         publish(&self.inner, &mut state);
@@ -1697,12 +1702,19 @@ impl InstallQueue {
             // This waiter owns no effects. Every new worker is accepted by the
             // task owner only after the previous one has fully joined.
             tokio::spawn(async move {
-                if handle.join().await.is_ok() {
-                    queue.resume_queued();
-                }
+                queue.join_worker(&id, handle).await;
             });
         }
         publish(&self.inner, &mut state);
+    }
+
+    async fn join_worker(&self, id: &str, handle: TaskHandle<()>) {
+        if handle.join().await.is_ok() {
+            if self.status(id).is_ok_and(|status| status.done) {
+                self.invalidate_registry();
+            }
+            self.resume_queued();
+        }
     }
 
     async fn run(
@@ -3316,6 +3328,100 @@ pub(crate) mod tests {
         ready.revalidate().unwrap();
     }
 
+    pub(crate) async fn interrupted_setup_fixture(
+        queue: &InstallQueue,
+        work: &SetupWork,
+    ) -> (InstallQueue, String) {
+        let request = work.request();
+        let item = queue.resolve_target(&request).await.unwrap();
+        let id = {
+            let mut state = queue.inner.state.lock().unwrap();
+            let id = queue
+                .admit_locked(
+                    &mut state,
+                    request,
+                    item,
+                    work.instance().generation().clone(),
+                    None,
+                    false,
+                )
+                .unwrap();
+            persist_status(&queue.inner.storage, &state.entries[&id].status, "running").unwrap();
+            id
+        };
+        queue.close_admission();
+        queue.shutdown_queued().unwrap();
+        let restored = InstallQueue::new(
+            queue.inner.storage.clone(),
+            queue.inner.library.clone(),
+            queue.inner.exclusions.clone(),
+            queue.inner.owner.clone(),
+            queue.inner.runtime.clone(),
+        )
+        .unwrap();
+        (restored, id)
+    }
+
+    #[tokio::test]
+    async fn terminal_worker_release_publishes_new_registry_revision() {
+        let (_root, _storage, library, exclusions, owner, queue) = fixture();
+        let pin = library.admit().unwrap();
+        let artifact = library_artifact(&pin.library_id().to_string());
+        let lease = exclusions
+            .try_acquire(["setup-target"], [artifact.clone()])
+            .unwrap();
+        let request = InstallQueueRequest::Vanilla {
+            version_id: "1.21.4".into(),
+        };
+        let item = queue.resolve_target(&request).await.unwrap();
+        let id = {
+            let mut state = queue.inner.state.lock().unwrap();
+            let id = queue
+                .admit_locked(&mut state, request, item, pin.clone(), None, false)
+                .unwrap();
+            assert_eq!(state.queued.pop_front().as_deref(), Some(id.as_str()));
+            state.active = Some(id.clone());
+            id
+        };
+        let worker_queue = queue.clone();
+        let worker_id = id.clone();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let worker_release = release.clone();
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let task = owner
+            .try_spawn((pin, lease), move |_| async move {
+                assert!(worker_queue.complete(&worker_id, InstallOutcome::Cancelled, None));
+                completed.send(()).unwrap();
+                worker_release.acquire_owned().await.unwrap().forget();
+            })
+            .unwrap();
+        let joined_queue = queue.clone();
+        let joined_id = id.clone();
+        let waiter = tokio::spawn(async move { joined_queue.join_worker(&joined_id, task).await });
+        completion.await.unwrap();
+        let (terminal, mut changes) = queue.subscribe();
+        assert!(queue.status(&id).unwrap().done);
+        assert!(terminal.active.is_none());
+        assert!(
+            exclusions
+                .try_acquire(["setup-target"], [artifact.clone()])
+                .is_err()
+        );
+        release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while changes.borrow_and_update().registry_revision == terminal.registry_revision {
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(exclusions.try_acquire(["setup-target"], [artifact]).is_ok());
+        waiter.await.unwrap();
+        assert!(owner.status().is_idle());
+        queue.close_admission();
+        queue.shutdown_queued().unwrap();
+    }
+
     #[tokio::test]
     async fn ready_version_ids_are_display_only_and_library_scoped() {
         let (root, storage, library, exclusions, owner, queue) = fixture();
@@ -3982,7 +4088,7 @@ pub(crate) mod tests {
             status.failure_view_model.unwrap().summary,
             InstallError::ContentInterrupted.to_string()
         );
-        assert_eq!(restarted.snapshot().registry_revision, 1);
+        assert_eq!(restarted.snapshot().registry_revision, 2);
         assert!(restarted.snapshot().active.is_none());
         restarted.close_admission();
         restarted.shutdown_queued().unwrap();
@@ -5113,7 +5219,7 @@ pub(crate) mod tests {
             restarted.status(&id).unwrap().outcome,
             Some(InstallOutcome::Succeeded)
         );
-        assert_eq!(restarted.snapshot().registry_revision, 1);
+        assert_eq!(restarted.snapshot().registry_revision, 2);
         assert!(!restarted.has_unsettled_effects());
         assert!(restarted.ready_version(&pin, version).await.is_ok());
     }

@@ -8,7 +8,6 @@ import * as contracts from '../../src/dto-contract';
 import * as core from '../../src/dto-core';
 import * as installs from '../../src/dto-install';
 import * as presenters from '../../src/create-presenters';
-import type { EnrichedInstance } from '../../src/types-instance';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const ts: typeof import('typescript') = createRequire(resolve(frontend, 'package.json'))('typescript');
@@ -45,9 +44,6 @@ function harness(options: { response?: unknown; requestError?: Error; queueError
       if (options.hold) await held;
       if (options.requestError) throw options.requestError;
       return options.response ?? response();
-    } },
-    './actions': { updateInstanceInList(instance: EnrichedInstance) {
-      state.instances = state.instances.map((existing) => existing.id === instance.id ? instance : existing);
     } },
     './create-presenters': presenters,
     './dto-contract': contracts,
@@ -94,7 +90,7 @@ test('resume uses the registered identity, shares repeated clicks and preserves 
   assert.equal(h.state.instances[0].launchable, false);
   assert.equal(h.state.instances[0].launch_action.label, 'Resume setup');
   assert.equal(h.queues.length, 1);
-  assert.equal(h.reads.length, 0);
+  assert.deepEqual(h.reads, [['instance', 'fixture-instance']]);
 });
 
 test('uncertain resume is reconciled with reads and never repeats creation or setup', async () => {

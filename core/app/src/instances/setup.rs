@@ -26,7 +26,7 @@ use crate::{
         queue::InstallQueue,
     },
     settings::SettingsStore,
-    tasks::CancellationToken,
+    tasks::{CancellationToken, TaskHandle},
 };
 use axial_minecraft::{
     VersionEntry,
@@ -51,6 +51,8 @@ pub struct SetupService {
     #[cfg(test)]
     loader_catalog_fixture: Option<readiness_tests::LoaderCatalogFixture>,
 }
+
+type QueuedSetup = (Instance, InstallQueueStateResponse, CreateResultView);
 
 /// The queue schedules this accepted setup, while instances retains its exact
 /// plan and completion authority. This value has no queue or scheduler owner.
@@ -356,9 +358,7 @@ impl SetupService {
                 service.queue_setup(admitted, None, false).await
             })
             .map_err(|_| InstanceError::Closed)?;
-        work.join()
-            .await
-            .map_err(|_| InstanceError::SettlementRequired)?
+        self.finish_setup(work).await
     }
 
     pub async fn resume_setup(
@@ -439,10 +439,11 @@ impl SetupService {
         }
         if phase == "complete" {
             let instance = self.instances.registry().get_live(id)?.instance;
+            let snapshot = self.installs.snapshot();
             let versions = self.installed().await.unwrap_or_default();
             return Ok(CreateInstanceResponse {
                 instance: self.enrich(instance, &versions).await,
-                install_queue: Some(self.installs.snapshot()),
+                install_queue: Some(snapshot),
                 view_model: match stored {
                     StoredSetupIntent::Content(_) => setup_result(true),
                     StoredSetupIntent::Modpack(_) => super::from_pack::pack_setup_result(true),
@@ -489,9 +490,42 @@ impl SetupService {
                     .insert(id.clone(), rejected);
                 InstanceError::Closed
             })?;
-        work.join()
+        self.finish_setup(work).await
+    }
+
+    pub(super) async fn finish_setup(
+        &self,
+        work: TaskHandle<InstanceResult<QueuedSetup>>,
+    ) -> InstanceResult<CreateInstanceResponse> {
+        let installs = self.installs.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        // Accepted work owns every effect and retained guard. This waiter only
+        // invalidates read projections after release, even if the caller leaves.
+        tokio::spawn(async move {
+            let result = match work.join().await {
+                Ok(result) => {
+                    installs.invalidate_registry();
+                    result.map(|(instance, accepted, view)| {
+                        let mut snapshot = installs.snapshot();
+                        snapshot.started_install = accepted.started_install;
+                        snapshot.notice = accepted.notice;
+                        snapshot.removed_instance_id = accepted.removed_instance_id;
+                        (instance, snapshot, view)
+                    })
+                }
+                Err(_) => Err(InstanceError::SettlementRequired),
+            };
+            let _ = sender.send(result);
+        });
+        let (instance, snapshot, view_model) = receiver
             .await
-            .map_err(|_| InstanceError::SettlementRequired)?
+            .map_err(|_| InstanceError::SettlementRequired)??;
+        let versions = self.installed().await.unwrap_or_default();
+        Ok(CreateInstanceResponse {
+            instance: self.enrich(instance, &versions).await,
+            install_queue: Some(snapshot),
+            view_model,
+        })
     }
 
     pub(super) async fn queue_setup(
@@ -499,7 +533,7 @@ impl SetupService {
         admitted: RegisteredInstance,
         prepared_pack: Option<super::from_pack::PreparedPackCreation>,
         retry: bool,
-    ) -> InstanceResult<CreateInstanceResponse> {
+    ) -> InstanceResult<QueuedSetup> {
         let (content, mutations) = self
             .content
             .as_ref()
@@ -547,16 +581,15 @@ impl SetupService {
                 .expect("setup pending lock poisoned")
                 .insert(instance.id.clone(), admitted);
         }
-        let versions = self.installed().await.unwrap_or_default();
-        Ok(CreateInstanceResponse {
-            instance: self.enrich(instance, &versions).await,
-            install_queue: Some(result.unwrap_or_else(|_| self.installs.snapshot())),
-            view_model: if success {
+        Ok((
+            instance,
+            result.unwrap_or_else(|_| self.installs.snapshot()),
+            if success {
                 setup_queued_result()
             } else {
                 setup_result(false)
             },
-        })
+        ))
     }
 
     pub fn instances(&self) -> &Arc<InstanceService> {

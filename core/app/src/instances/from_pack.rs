@@ -300,9 +300,7 @@ impl SetupService {
                 service.queue_setup(admitted, Some(prepared), false).await
             })
             .map_err(|_| InstanceError::Closed)?;
-        work.join()
-            .await
-            .map_err(|_| InstanceError::SettlementRequired)?
+        self.finish_setup(work).await
     }
 }
 

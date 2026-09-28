@@ -655,6 +655,227 @@ async fn unavailable_setup_metadata_does_not_fabricate_resume_or_install_permiss
 }
 
 #[cfg(unix)]
+async fn accepted_setup_fixture() -> (tempfile::TempDir, SetupService, SetupWork) {
+    use crate::content::provenance::{ContentManifest, MANIFEST_FILE, ManifestEntry};
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, mut service, accounts) = fixture();
+    crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+    accounts.create_offline_account("FixturePlayer").unwrap();
+    let java = root.path().join("java");
+    std::fs::write(
+        &java,
+        format!(
+            "#!/bin/sh\nprintf 'java.version = 21.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
+            std::env::consts::ARCH,
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+    service
+        .settings
+        .update(
+            serde_json::from_value(serde_json::json!({
+                "expected_revision": service.settings.current().unwrap().revision,
+                "java_path_override": java.to_str().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let client = ProviderClient::new(ClientConfig::default()).unwrap();
+    let content = Arc::new(ContentService::new(client.clone()).unwrap());
+    let mutations = Arc::new(ContentMutations::new(
+        service.instances.directories().clone(),
+        client,
+        service.instances.tasks.clone(),
+    ));
+    let work = super::tests::pending_content_work(
+        service.instances.clone(),
+        content.clone(),
+        mutations.clone(),
+    )
+    .await;
+    let directory = work.instance().game_directory().read_projection().unwrap();
+    let StoredSetupIntent::Content(stored) = &work.stored else {
+        unreachable!()
+    };
+    let mut manifest = ContentManifest::default();
+    for file in stored.artifacts.as_ref().unwrap() {
+        manifest
+            .try_upsert(
+                ManifestEntry::managed(
+                    file.canonical_id.clone(),
+                    file.provider,
+                    file.project_id.clone(),
+                    file.version_id.clone(),
+                    file.kind,
+                    &file.file,
+                    file.dependencies.clone(),
+                    file.title.clone(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        std::fs::write(
+            directory.join("resourcepacks").join(&file.file.filename),
+            b"fixture",
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        directory.join(MANIFEST_FILE),
+        manifest.encode_managed().unwrap(),
+    )
+    .unwrap();
+    service.installs = Arc::new(
+        service
+            .installs
+            .as_ref()
+            .clone()
+            .with_content(content.clone(), mutations.clone()),
+    );
+    (root, service.with_content(content, mutations), work)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resumed_setup_response_is_ready_after_accepted_admission_releases() {
+    let (_root, mut service, work) = accepted_setup_fixture().await;
+    let instance = work.instance().record().instance.clone();
+    let (restored, queue_id) =
+        crate::install::queue::tests::interrupted_setup_fixture(&service.installs, &work).await;
+    drop(work);
+    let (content, mutations) = service.content.as_ref().unwrap();
+    service.installs = Arc::new(restored.with_content(content.clone(), mutations.clone()));
+    let service = Arc::new(service);
+    let response = service.resume_setup(&instance.id).await.unwrap();
+    assert!(!has_pending(service.instances.registry().storage(), &instance.id).unwrap());
+    assert_eq!(
+        service.installs.status(&queue_id).unwrap().outcome,
+        Some(crate::install::model::InstallOutcome::Succeeded)
+    );
+    assert_eq!(
+        response
+            .install_queue
+            .unwrap()
+            .started_install
+            .unwrap()
+            .install_id,
+        queue_id
+    );
+    let current = service
+        .enrich(instance, &service.installed().await.unwrap())
+        .await;
+    assert!(current.launchable, "{}", current.status_detail);
+    assert!(
+        response.instance.launchable,
+        "{}",
+        response.instance.status_detail
+    );
+    assert_eq!(response.instance.launch_action.primary_action, "launch");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropped_setup_response_still_invalidates_after_accepted_admission_releases() {
+    let (_root, service, work) = accepted_setup_fixture().await;
+    let instance = work.instance().record().instance.clone();
+    let queued_instance = instance.clone();
+    let queue = service.installs.clone();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let worker_release = release.clone();
+    let (completed, completion) = tokio::sync::oneshot::channel();
+    let task = service
+        .instances
+        .tasks
+        .try_spawn(work.clone(), move |cancel| async move {
+            work.execute(&cancel, Arc::new(|_| {})).await?;
+            completed.send(()).unwrap();
+            worker_release.acquire_owned().await.unwrap().forget();
+            Ok((queued_instance, queue.snapshot(), setup_queued_result()))
+        })
+        .unwrap();
+    let mut response = Box::pin(service.finish_setup(task));
+    assert!(futures_util::poll!(&mut response).is_pending());
+    completion.await.unwrap();
+    let blocked = service.launch.preflight(instance.id.clone()).await;
+    assert_eq!(blocked.error.unwrap().code, LaunchError::InstanceBusy);
+    let (before, mut changes) = service.installs.subscribe();
+    drop(response);
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while changes.borrow_and_update().registry_revision == before.registry_revision {
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let current = service
+        .enrich(instance, &service.installed().await.unwrap())
+        .await;
+    assert!(current.launchable, "{}", current.status_detail);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejected_setup_result_invalidates_released_admission_without_claiming_success() {
+    let (_root, service, work) = accepted_setup_fixture().await;
+    let id = work.instance().record().instance.id.clone();
+    let before = service.installs.snapshot();
+    let task = service
+        .instances
+        .tasks
+        .try_spawn(work, |_| async { Err(InstanceError::SetupUnavailable) })
+        .unwrap();
+    assert!(matches!(
+        service.finish_setup(task).await,
+        Err(InstanceError::SetupUnavailable)
+    ));
+    assert!(service.installs.snapshot().registry_revision > before.registry_revision);
+    assert!(has_pending(service.instances.registry().storage(), &id).unwrap());
+    assert!(
+        service
+            .instances
+            .directories()
+            .exclusions()
+            .try_acquire([id.as_str()], [])
+            .is_ok()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn panicked_setup_keeps_admission_without_publishing_release() {
+    let (_root, service, work) = accepted_setup_fixture().await;
+    let id = work.instance().record().instance.id.clone();
+    let before = service.installs.snapshot();
+    let task = service
+        .instances
+        .tasks
+        .try_spawn(work, |_| async {
+            panic!("accepted setup interrupted before settlement");
+        })
+        .unwrap();
+    assert!(matches!(
+        service.finish_setup(task).await,
+        Err(InstanceError::SettlementRequired)
+    ));
+    assert_eq!(
+        service.installs.snapshot().registry_revision,
+        before.registry_revision
+    );
+    assert!(
+        service
+            .instances
+            .directories()
+            .exclusions()
+            .try_acquire([id.as_str()], [])
+            .is_err()
+    );
+    assert_eq!(service.instances.tasks.status().unsettled.len(), 1);
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn unavailable_setup_metadata_blocks_an_otherwise_launchable_instance() {
     use std::os::unix::fs::PermissionsExt;

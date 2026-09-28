@@ -1,5 +1,4 @@
 import { api } from './api';
-import { updateInstanceInList } from './actions';
 import { createResultToastMessage, createToastKind } from './create-presenters';
 import { dtoError, dtoOptionalString, dtoRecord, dtoString } from './dto-contract';
 import { enrichedInstanceResponse } from './dto-core';
@@ -37,7 +36,6 @@ async function resume(instanceId: string): Promise<boolean> {
       summary: dtoString(view.summary, 'Resume setup summary'),
       detail: view.detail == null ? null : dtoString(view.detail, 'Resume setup detail'),
     };
-    updateInstanceInList(instance);
     toast(createResultToastMessage({ view_model: viewModel }), createToastKind(viewModel.tone));
     // The accepted resume remains valid if queue decoding or connection fails.
     // The queue/readiness owners can recover status without another mutation.
@@ -45,6 +43,7 @@ async function resume(instanceId: string): Promise<boolean> {
       if (record.install_queue != null) {
         await applyInstallQueueResponse(installQueueStateResponse(record.install_queue), { connectActive: true });
       }
+      await refreshInstanceReadiness(instanceId);
     } catch (error) {
       toast(`Setup accepted, but download status could not be refreshed: ${errMessage(error)}`, 'error');
       await reconcile(instanceId);

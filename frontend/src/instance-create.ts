@@ -3,6 +3,7 @@ import { toast } from './toast';
 import { errMessage } from './utils';
 import { navigate } from './ui-state';
 import { addInstance } from './actions';
+import { instances } from './store';
 import { applyInstallQueueResponse } from './machines/downloads';
 import { createResultToastMessage, createToastKind, type CreateResultPresentationSource } from './create-presenters';
 import type { EnrichedInstance } from './types-instance';
@@ -80,8 +81,9 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
     return { ok: false, error: message };
   }
 
-  const created = res;
-  addInstance(created);
+  const existing = instances.value.find((instance) => instance.id === res.id);
+  const created = existing ?? res;
+  if (!existing) addInstance(created);
   let queueError: string | null = null;
   if (queueSnapshot != null) {
     try {
