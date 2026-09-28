@@ -785,6 +785,10 @@ impl InstanceService {
                         .operations
                         .insert_in(tx)
                         .map_err(super::import::operation_error)?;
+                    history
+                        .installs
+                        .insert_in(tx)
+                        .map_err(super::import::install_history_error)?;
                     if let Some(rules) = &history.rules {
                         rules.verify_in(tx).map_err(super::import::rules_error)?;
                     }
@@ -1078,6 +1082,10 @@ impl InstanceService {
                             .operations
                             .insert_in(tx)
                             .map_err(super::import::operation_error)?;
+                        history
+                            .installs
+                            .insert_in(tx)
+                            .map_err(super::import::install_history_error)?;
                         if let Some(rules) = &history.rules {
                             rules.verify_in(tx).map_err(super::import::rules_error)?;
                         }
@@ -1367,6 +1375,7 @@ pub(crate) mod tests {
                 crate::performance::mutation::MIGRATION,
                 crate::performance::mutation::MIGRATION_V2,
                 crate::launch::reports::REPORT_MIGRATION,
+                crate::install::history::MIGRATION,
                 crate::performance::benchmarks::MIGRATION,
                 crate::performance::benchmarks::MIGRATION_V2,
             ])

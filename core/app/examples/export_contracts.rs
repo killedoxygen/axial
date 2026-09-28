@@ -7,6 +7,7 @@ use axial_app::{
         RulesImportRequest, RulesImportResponse, RulesImportStatus, SkinImportRequest,
         SkinImportResponse, SkinImportStatus,
     },
+    install::history::HistoryPage,
     instances::{delete::DeletionSnapshot, setup::CreateLoaderBuildsView},
     public::{ErrorResponse, OperationId},
     resources::{InstanceLogTailResponse, InstanceResourcesResponse},
@@ -58,6 +59,7 @@ fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     InstanceImportRequest::export_all(&config)?;
     InstanceImportResponse::export_all(&config)?;
     InstanceImportMappings::export_all(&config)?;
+    HistoryPage::export_all(&config)?;
     DeletionSnapshot::export_all(&config)?;
     CreateLoaderBuildsView::export_all(&config)?;
     MetadataImportRequest::export_all(&config)?;

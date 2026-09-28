@@ -1,11 +1,12 @@
 use axial_app::{
     install::{
+        history::HistoryPage,
         model::{
             InstallEvent, InstallQueueRequest, InstallQueueStateResponse, InstallStatusResponse,
         },
         queue::{InstallError, InstallQueue},
     },
-    instances::setup::SetupService,
+    instances::{create::InstanceService, model::InstanceId, setup::SetupService},
 };
 use axum::{
     Json, Router,
@@ -29,8 +30,19 @@ struct RetryQuery {
     expected_install_id: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryQuery {
+    instance_id: InstanceId,
+    after: Option<String>,
+}
+
 /// Mount beneath the composition owner's capability and stream-ticket checks.
-pub fn router(queue: Arc<InstallQueue>, setup: Arc<SetupService>) -> Router {
+pub fn router(
+    queue: Arc<InstallQueue>,
+    setup: Arc<SetupService>,
+    instances: Arc<InstanceService>,
+) -> Router {
     Router::new()
         .route("/api/v1/install/queue", get(snapshot).post(enqueue))
         .route("/api/v1/install/queue/events", get(queue_events))
@@ -45,7 +57,26 @@ pub fn router(queue: Arc<InstallQueue>, setup: Arc<SetupService>) -> Router {
                 .route("/api/v1/install/queue/retry", post(retry))
                 .with_state((queue, setup)),
         )
+        .merge(
+            Router::new()
+                .route("/api/v1/install/history", get(history))
+                .with_state(instances),
+        )
         .layer(DefaultBodyLimit::max(64 << 10))
+}
+
+async fn history(
+    State(instances): State<Arc<InstanceService>>,
+    query: Result<Query<HistoryQuery>, QueryRejection>,
+) -> Result<Json<HistoryPage>, ApiError> {
+    let Query(query) = query.map_err(|_| failure(InstallError::InvalidRequest))?;
+    tokio::task::spawn_blocking(move || {
+        instances.imported_install_history(&query.instance_id, query.after.as_deref())
+    })
+    .await
+    .map_err(|_| failure(InstallError::Storage))?
+    .map(Json)
+    .map_err(super::instances::error)
 }
 async fn snapshot(State(queue): State<Arc<InstallQueue>>) -> Json<InstallQueueStateResponse> {
     Json(queue.snapshot())
@@ -188,11 +219,18 @@ pub(crate) fn failure(error: InstallError) -> ApiError {
 mod tests {
     use super::*;
     use axial_app::{
+        import::{Inventory, ReadOnlySource},
+        instances::duplicate::DuplicateRequest,
         instances::model::{Instance, InstanceError, InstanceId},
         settings::InstanceSettings,
-        storage::rusqlite::params,
+        storage::{StorageError, rusqlite::params},
     };
-    use std::time::Duration;
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+        time::{Duration, SystemTime},
+    };
     use tokio::{net::TcpListener, sync::Semaphore};
 
     async fn post(
@@ -213,6 +251,297 @@ mod tests {
             .await
             .unwrap();
         (response.status(), response.json().await.unwrap())
+    }
+
+    async fn get(services: &crate::DesktopServices, path: &str) -> (StatusCode, Value) {
+        let bootstrap = services.server.bootstrap();
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("{}{path}", bootstrap.base_url))
+            .header(crate::transport::CAPABILITY_HEADER, bootstrap.capability)
+            .send()
+            .await
+            .unwrap();
+        (response.status(), response.json().await.unwrap())
+    }
+
+    fn source_snapshot(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+        fn visit(root: &Path, path: &Path, result: &mut BTreeMap<PathBuf, (Vec<u8>, SystemTime)>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    visit(root, &entry.path(), result);
+                } else {
+                    result.insert(
+                        entry.path().strip_prefix(root).unwrap().to_owned(),
+                        (
+                            fs::read(entry.path()).unwrap(),
+                            entry.metadata().unwrap().modified().unwrap(),
+                        ),
+                    );
+                }
+            }
+        }
+        let mut result = BTreeMap::new();
+        visit(root, root, &mut result);
+        result
+    }
+
+    fn assert_no_install_authority(services: &crate::DesktopServices) {
+        let queue = services.installs.snapshot();
+        assert!(queue.active.is_none());
+        assert!(queue.items.is_empty());
+        assert!(services.sessions.snapshots().is_empty());
+        services
+            .settings
+            .metadata()
+            .read::<_, StorageError>(|connection| {
+                let counts: (u64, u64, u64) = connection.query_row(
+                    "SELECT (SELECT COUNT(*) FROM install_queue),
+                 (SELECT COUNT(*) FROM installed_versions), (SELECT COUNT(*) FROM launch_intents)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                assert_eq!(counts, (0, 0, 0));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn imported_content_history_http_preserves_lossless_read_only_evidence_after_reopen() {
+        const LEGACY: &str = "0000000000000001";
+        const SEQUENCE: u64 = 9_007_199_254_740_993;
+        const METRICS: [&str; 13] = [
+            "checksum_mismatch",
+            "metadata_invalid",
+            "metadata_missing",
+            "interrupted",
+            "network_failure",
+            "permission_failure",
+            "promote_failed",
+            "provider_failure",
+            "size_mismatch",
+            "temp_discarded",
+            "temp_write_failed",
+            "written_to_temp",
+            "promoted",
+        ];
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let baseline = root.path().join("baseline");
+        fs::create_dir(&baseline).unwrap();
+        super::super::import::tests::copy_fixture(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../acceptance/fixtures/profiles/offline-vanilla"),
+            &baseline,
+        );
+        let target = |kind: &str, id: &str| {
+            json!({
+                "system":"Application","kind":kind,"id":id,"ownership":"LauncherManaged"
+            })
+        };
+        let step = |id: &str, phase: &str, result: &str, facts: Value| {
+            json!({
+                "step_id":id,"phase":phase,"result":result,"changed_target":null,
+                "generated_facts":facts,"rollback":"NotApplicable","guardian_fact_ids":[],"metrics":null
+            })
+        };
+        let mut terminal = step(
+            "content_progress_done",
+            "Downloading",
+            "Completed",
+            json!(["install_phase:done", "install_done:true"]),
+        );
+        terminal["metrics"] = json!({"kind":"content_download","values":
+            METRICS.into_iter().map(|key| (key.to_owned(), json!(u64::MAX))).collect::<serde_json::Map<_, _>>()});
+        let operation_id = "op-00000000-0000-4000-8000-000000000001";
+        let operation = json!({
+            "journal_id":format!("journal-{operation_id}"),"operation_id":operation_id,
+            "sequence":SEQUENCE,"parent_operation_id":null,"command":"ModifyInstanceContent",
+            "intent":{"kind":"generic"},"status":"Succeeded","owner":"Application","ownership":"LauncherManaged",
+            "targets":[target("Session", "content-00000000000000000000000000000001"),target("Instance",LEGACY)],
+            "planned_steps":[step("modify_instance_content","Planning","Planned",json!([]))],
+            "completed_steps":[terminal],"failure_point":null,"rollback":"NotApplicable",
+            "guardian_diagnosis_ids":[],"outcome":"Succeeded","reconciliation_attempt":null,
+            "reconciliation_terminal":null,"persisted_state_repair_attempt":null,
+            "persisted_state_repair_terminal":null,"guardian_install_terminal":null
+        });
+        fs::create_dir_all(baseline.join("state")).unwrap();
+        fs::write(baseline.join("state/operation-journals.json"), serde_json::to_vec(&json!({
+            "schema":"axial.state.operation_journals.v10","next_sequence":SEQUENCE+1,"entries":[operation]
+        })).unwrap()).unwrap();
+        let unchanged = source_snapshot(&baseline);
+        let profile = root.path().join("replacement");
+        let services = crate::start_in_profile(profile.clone(), None)
+            .await
+            .unwrap();
+        let source = ReadOnlySource::from_native_selection(
+            services.library.admit_application_root().unwrap(),
+            &baseline,
+        )
+        .unwrap();
+        let inventory = Inventory::capture(&source, &BTreeMap::new()).unwrap();
+        let preview = services.imports.admit(inventory).unwrap();
+        assert!(
+            preview
+                .instances
+                .iter()
+                .find(|instance| instance.legacy_id == LEGACY)
+                .unwrap()
+                .ordinary_import_available
+        );
+        let bootstrap = services.server.bootstrap();
+        let unauthorized = reqwest::Client::new()
+            .get(format!("{}/api/v1/install/history", bootstrap.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        for query in [
+            "".to_owned(), "instance_id=not-a-uuid".to_owned(),
+            "instance_id=00000000-0000-0000-0000-000000000000".to_owned(),
+            "instance_id=12345678-1234-4234-8234-123456789abc&unknown=true".to_owned(),
+            "instance_id=12345678-1234-4234-8234-123456789abc&instance_id=12345678-1234-4234-8234-123456789abc".to_owned(),
+        ] {
+            assert_eq!(get(&services, &format!("/api/v1/install/history?{query}")).await.0,
+                StatusCode::BAD_REQUEST, "{query}");
+        }
+        assert_eq!(
+            get(
+                &services,
+                "/api/v1/install/history?instance_id=12345678-1234-4234-8234-123456789abc"
+            )
+            .await,
+            (
+                StatusCode::NOT_FOUND,
+                json!({"error":InstanceError::NotFound.to_string()})
+            )
+        );
+        let import_request = json!({"fingerprint":preview.fingerprint,"legacy_id":LEGACY});
+        let (status, imported) = post(
+            &services,
+            "/api/v1/import/instances",
+            import_request.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{imported}");
+        let id = imported["instance"]["id"].as_str().unwrap();
+        let path = format!("/api/v1/install/history?instance_id={id}");
+        let (status, page) = get(&services, &path).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert!(page["next_after"].is_null());
+        assert_eq!(page["records"].as_array().unwrap().len(), 1);
+        let record = &page["records"][0];
+        let history_id = record["id"].as_str().unwrap();
+        assert_eq!(
+            history_id.strip_prefix("legacy-install-").unwrap().len(),
+            64
+        );
+        assert_eq!(record["historical"], true);
+        assert_eq!(record["instance_id"], id);
+        assert_eq!(record["sequence"], SEQUENCE.to_string());
+        assert_eq!(record["operation_id"], operation_id);
+        assert_eq!(record["command"], "ModifyInstanceContent");
+        assert_eq!(record["outcome"], "Succeeded");
+        assert_eq!(record["rollback"], "NotApplicable");
+        assert_eq!(record["targets"], operation["targets"]);
+        assert_eq!(record["completed_steps"][0]["phase"], "Downloading");
+        assert_eq!(record["completed_steps"][0]["result"], "Completed");
+        assert_eq!(
+            record["completed_steps"][0]["metrics"]["kind"],
+            "content_download"
+        );
+        let counters = record["completed_steps"][0]["metrics"]["values"]
+            .as_object()
+            .unwrap();
+        assert_eq!(counters.len(), 13);
+        for key in METRICS {
+            assert_eq!(counters[key], u64::MAX.to_string(), "{key}");
+        }
+        for absent in [
+            "request",
+            "actions",
+            "can_cancel",
+            "can_retry",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(record.get(absent).is_none(), "{absent}");
+        }
+        assert_eq!(
+            get(&services, &format!("{path}&after={history_id}")).await,
+            (StatusCode::OK, json!({"records":[],"next_after":null}))
+        );
+        for after in ["", "../path", "legacy-install-invalid"] {
+            assert_eq!(
+                get(&services, &format!("{path}&after={after}")).await.0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            post(
+                &services,
+                &format!("/api/v1/install/{history_id}/cancel"),
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post(
+                &services,
+                &format!("/api/v1/install/queue/retry?expected_install_id={history_id}"),
+                json!({"kind":"vanilla","version_id":"must-not-enqueue"})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(&services, "/api/v1/import/instances", import_request).await,
+            (StatusCode::OK, imported.clone())
+        );
+        assert_eq!(get(&services, &path).await.1, page);
+        let duplicate = services
+            .instances
+            .duplicate(&id.parse().unwrap(), DuplicateRequest::default())
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        let unmapped = format!("/api/v1/install/history?instance_id={}", duplicate.id);
+        assert_eq!(
+            get(&services, &unmapped).await,
+            (StatusCode::OK, json!({"records":[],"next_after":null}))
+        );
+        assert_eq!(
+            get(&services, &format!("{unmapped}&after=bad")).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_no_install_authority(&services);
+        assert_eq!(source_snapshot(&baseline), unchanged);
+        services.imports.forget().unwrap();
+        drop(source);
+        assert_eq!(get(&services, &path).await.1, page);
+        services.server.shutdown().await.unwrap();
+        services.server.wait().await.unwrap();
+        drop(services);
+
+        let reopened = crate::start_in_profile(profile, None).await.unwrap();
+        assert_eq!(get(&reopened, &path).await, (StatusCode::OK, page));
+        assert_eq!(
+            get(&reopened, &unmapped).await,
+            (StatusCode::OK, json!({"records":[],"next_after":null}))
+        );
+        assert_no_install_authority(&reopened);
+        assert_eq!(source_snapshot(&baseline), unchanged);
+        reopened.server.shutdown().await.unwrap();
+        reopened.server.wait().await.unwrap();
     }
 
     #[tokio::test]

@@ -2,6 +2,11 @@
 
 use super::{ImportBlocker, ImportError, ImportResult, Inventory};
 use crate::{
+    install::history::{
+        PreparedImport as PreparedInstallImport, PreparedOperation as PreparedInstallOperation,
+        SourceIntent, SourceMetrics, SourceOperation, SourceStep,
+        SourceTarget as LegacyPerformanceTarget,
+    },
     instances::model::InstanceId,
     launch::{
         logs::Redactor,
@@ -29,7 +34,10 @@ use crate::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 const REPORT_PREFIX: &str = "profile/benchmarks/launch/";
 const SUITE_PREFIX: &str = "profile/benchmarks/suites/";
@@ -42,10 +50,13 @@ const UNBOUND_INSTANCE: &str = "00000000-0000-0000-0000-000000000001";
 
 #[derive(Clone)]
 pub(crate) struct PreparedHistory {
+    legacy_id: String,
     records: Vec<LaunchProofRecord>,
     suites: Vec<BenchmarkSuiteManifest>,
     drivers: Vec<BenchmarkSuiteDriverStatus>,
     operations: Vec<HistoricalOperation>,
+    global_installs: Arc<[PreparedInstallOperation]>,
+    content: Vec<PreparedInstallOperation>,
     rules: Option<CompletedRulesImport>,
 }
 
@@ -53,6 +64,7 @@ pub(crate) struct BoundHistory {
     pub(crate) reports: PreparedReportImport,
     pub(crate) benchmarks: PreparedBenchmarkImport,
     pub(crate) operations: PreparedOperationImport,
+    pub(crate) installs: PreparedInstallImport,
     pub(crate) rules: Option<CompletedRulesImport>,
 }
 
@@ -104,6 +116,16 @@ impl PreparedHistory {
                 .map_err(|_| ImportError::InvalidData)?,
             operations: PreparedOperationImport::prepare(operations)
                 .map_err(|_| ImportError::InvalidData)?,
+            installs: PreparedInstallImport::bind(
+                self.global_installs
+                    .iter()
+                    .chain(&self.content)
+                    .cloned()
+                    .collect(),
+                &self.legacy_id,
+                instance,
+            )
+            .map_err(|_| ImportError::InvalidData)?,
             rules: self.rules.clone(),
         })
     }
@@ -129,10 +151,13 @@ pub(super) fn prepare_history_with_rules(
                 (
                     instance.legacy_id.clone(),
                     PreparedHistory {
+                        legacy_id: instance.legacy_id.clone(),
                         records: Vec::new(),
                         suites: Vec::new(),
                         drivers: Vec::new(),
                         operations: Vec::new(),
+                        global_installs: Arc::from([]),
+                        content: Vec::new(),
                         rules: rules.cloned(),
                     },
                 )
@@ -145,6 +170,7 @@ pub(super) fn prepare_history_with_rules(
         ]),
     };
     let mut bytes = 0usize;
+    let mut global_installs = Vec::new();
     if inventory
         .file_manifests()
         .any(|file| file.relative == JOURNAL)
@@ -158,12 +184,31 @@ pub(super) fn prepare_history_with_rules(
             let instance = match &entry.intent {
                 LegacyIntent::Performance(intent) => intent.intent.instance_id.clone(),
                 LegacyIntent::Generic {} => {
-                    entry.convert_rules()?;
-                    if rules.is_some() {
-                        prepared
-                            .supported_records
-                            .insert(format!("{JOURNAL}#/entries/{index}"));
+                    match entry.command.as_str() {
+                        "RefreshPerformanceRules" => {
+                            entry.convert_rules()?;
+                            if rules.is_none() {
+                                continue;
+                            }
+                        }
+                        "InstallVersion" | "ModifyInstanceContent" => {
+                            let operation = entry.convert_install(&source)?;
+                            if let Some(instance) = operation.legacy_instance_id() {
+                                prepared
+                                    .instances
+                                    .get_mut(instance)
+                                    .ok_or(ImportError::InvalidData)?
+                                    .content
+                                    .push(operation);
+                            } else {
+                                global_installs.push(operation);
+                            }
+                        }
+                        _ => return Err(ImportError::InvalidData),
                     }
+                    prepared
+                        .supported_records
+                        .insert(format!("{JOURNAL}#/entries/{index}"));
                     continue;
                 }
             };
@@ -178,6 +223,23 @@ pub(super) fn prepare_history_with_rules(
                 .supported_records
                 .insert(format!("{JOURNAL}#/entries/{index}"));
         }
+    }
+    PreparedInstallImport::validate(
+        &global_installs
+            .iter()
+            .chain(
+                prepared
+                    .instances
+                    .values()
+                    .flat_map(|history| &history.content),
+            )
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| ImportError::InvalidData)?;
+    let global_installs: Arc<[PreparedInstallOperation]> = global_installs.into();
+    for history in prepared.instances.values_mut() {
+        history.global_installs = global_installs.clone();
     }
     let mut reports = BTreeMap::new();
     let mut suites = BTreeMap::new();
@@ -361,24 +423,39 @@ enum LegacyPerformanceTerminal {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LegacyPerformanceTarget {
-    system: String,
-    kind: String,
-    id: String,
-    ownership: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct LegacyGuardianStep {
     step_id: String,
     phase: String,
     result: String,
     changed_target: Option<LegacyPerformanceTarget>,
-    generated_facts: Vec<serde_json::Value>,
+    generated_facts: Vec<String>,
     rollback: HistoricalRollback,
     guardian_fact_ids: Vec<String>,
-    metrics: Option<serde_json::Value>,
+    metrics: Option<SourceMetrics>,
+}
+
+impl LegacyGuardianStep {
+    fn into_install(self) -> SourceStep {
+        SourceStep {
+            step_id: self.step_id,
+            phase: self.phase,
+            result: self.result,
+            changed_target: self.changed_target,
+            generated_facts: self.generated_facts,
+            rollback: rollback_label(self.rollback).to_owned(),
+            guardian_fact_ids: self.guardian_fact_ids,
+            metrics: self.metrics,
+        }
+    }
+}
+
+fn rollback_label(rollback: HistoricalRollback) -> &'static str {
+    match rollback {
+        HistoricalRollback::NotApplicable => "NotApplicable",
+        HistoricalRollback::Available => "Available",
+        HistoricalRollback::Unavailable => "Unavailable",
+        HistoricalRollback::Applied => "Applied",
+    }
 }
 
 fn decode_journal(raw: &[u8]) -> ImportResult<Vec<LegacyOperation>> {
@@ -417,21 +494,82 @@ pub(super) fn prepare_rules_history(
         return Ok(Vec::new());
     }
     let mut records = Vec::new();
+    let mut installs = Vec::new();
     let source = inventory.source_identity()?;
+    let instances: BTreeSet<_> = inventory
+        .instances()
+        .iter()
+        .map(|instance| instance.legacy_id.as_str())
+        .collect();
     for entry in decode_journal(&inventory.record_bytes(JOURNAL)?)? {
         match &entry.intent {
-            LegacyIntent::Generic {} => records.push(entry.convert_rules()?),
+            LegacyIntent::Generic {} => match entry.command.as_str() {
+                "RefreshPerformanceRules" => records.push(entry.convert_rules()?),
+                "InstallVersion" | "ModifyInstanceContent" => {
+                    let operation = entry.convert_install(&source)?;
+                    if operation
+                        .legacy_instance_id()
+                        .is_some_and(|id| !instances.contains(id))
+                    {
+                        return Err(ImportError::InvalidData);
+                    }
+                    installs.push(operation);
+                }
+                _ => return Err(ImportError::InvalidData),
+            },
             LegacyIntent::Performance(_) => {
                 PreparedOperationImport::prepare(vec![entry.convert(&source)?])
                     .map_err(|_| ImportError::InvalidData)?;
             }
         }
     }
+    PreparedInstallImport::validate(&installs).map_err(|_| ImportError::InvalidData)?;
     records.sort_by_key(|record| record.sequence);
     Ok(records)
 }
 
 impl LegacyOperation {
+    fn convert_install(self, source: &str) -> ImportResult<PreparedInstallOperation> {
+        if !matches!(self.intent, LegacyIntent::Generic {}) {
+            return Err(ImportError::InvalidData);
+        }
+        PreparedInstallOperation::prepare(
+            source,
+            SourceOperation {
+                journal_id: self.journal_id,
+                operation_id: self.operation_id,
+                sequence: self.sequence,
+                parent_operation_id: self.parent_operation_id,
+                command: self.command,
+                intent: SourceIntent::Generic {},
+                status: self.status,
+                owner: self.owner,
+                ownership: self.ownership,
+                targets: self.targets,
+                planned_steps: self
+                    .planned_steps
+                    .into_iter()
+                    .map(LegacyGuardianStep::into_install)
+                    .collect(),
+                completed_steps: self
+                    .completed_steps
+                    .into_iter()
+                    .map(LegacyGuardianStep::into_install)
+                    .collect(),
+                failure_point: self.failure_point,
+                rollback: rollback_label(self.rollback).to_owned(),
+                guardian_diagnosis_ids: self.guardian_diagnosis_ids,
+                outcome: self.outcome,
+                reconciliation_attempt: self.reconciliation_attempt,
+                reconciliation_terminal: self.reconciliation_terminal,
+                persisted_state_repair_attempt: self.persisted_state_repair_attempt,
+                persisted_state_repair_terminal: self.persisted_state_repair_terminal,
+                guardian_install_terminal: self.guardian_install_terminal,
+            },
+        )
+        .map_err(|_| ImportError::InvalidData)
+    }
+
     fn convert_rules(self) -> ImportResult<HistoricalRulesRefresh> {
         let cache_target = |target: &LegacyPerformanceTarget| {
             target.system == "Performance"

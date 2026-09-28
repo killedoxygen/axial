@@ -540,6 +540,7 @@ async fn start_profile_inner(
             axial_app::instances::create::MIGRATION, axial_app::instances::create::DUPLICATE_WITNESS_MIGRATION,
             axial_app::instances::import::MIGRATION,
             axial_app::install::queue::MIGRATION, axial_app::install::queue::MIGRATION_V2,
+            axial_app::install::history::MIGRATION,
             axial_app::content::install::MIGRATION, axial_app::performance::rules::MIGRATION,
             axial_app::performance::rules::IMPORT_MIGRATION,
             axial_app::performance::mutation::MIGRATION, axial_app::performance::mutation::MIGRATION_V2,
@@ -854,7 +855,11 @@ async fn start_profile_inner(
             sessions.clone(),
         ))
         .merge(routes::setup::router(setup.clone()))
-        .merge(routes::install::router(installs.clone(), setup.clone()))
+        .merge(routes::install::router(
+            installs.clone(),
+            setup.clone(),
+            instances.clone(),
+        ))
         .merge(routes::loaders::router(
             library.clone(),
             catalog.clone(),

@@ -375,7 +375,7 @@ fn instance_error(error: InstanceError) -> ApiError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use axial_app::{
         accounts::{
@@ -696,7 +696,7 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap())
     }
 
-    fn copy_fixture(source: &Path, destination: &Path) {
+    pub(crate) fn copy_fixture(source: &Path, destination: &Path) {
         for entry in fs::read_dir(source).unwrap() {
             let entry = entry.unwrap();
             let path = destination.join(entry.file_name());

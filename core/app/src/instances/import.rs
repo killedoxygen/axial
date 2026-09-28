@@ -13,7 +13,7 @@ use crate::{
     library::GenerationPin,
     storage::{
         Migration,
-        rusqlite::{OptionalExtension, Transaction, params},
+        rusqlite::{OptionalExtension, Row, Transaction, params},
     },
     tasks::{CancellationToken, ExclusionLease, TaskHandle},
 };
@@ -30,6 +30,16 @@ pub const MIGRATION: Migration = Migration {
     );",
 };
 
+const MAPPING_FIELDS: &str = "m.legacy_id,m.instance_id,c.phase,
+    CASE WHEN length(CAST(c.record_json AS BLOB))<=65536 THEN c.record_json END,
+    CASE WHEN length(CAST(c.directory_receipt AS BLOB))<=4096 THEN c.directory_receipt END,
+    i.lifecycle,
+    CASE WHEN length(CAST(i.record_json AS BLOB))<=65536 THEN i.record_json END,
+    CASE WHEN length(CAST(i.directory_receipt AS BLOB))<=4096 THEN i.directory_receipt END,
+    i.library_id,i.directory_name,i.revision,i.name,
+    CASE WHEN length(CAST(m.source_id AS BLOB))=64 THEN m.source_id END,
+    CASE WHEN length(CAST(m.fingerprint AS BLOB))=64 THEN m.fingerprint END";
+
 impl InstanceService {
     /// A read-only identity projection, not a payload or launch-readiness check.
     /// The completed creation and current live registration must agree on the
@@ -40,29 +50,17 @@ impl InstanceService {
         fingerprint: &str,
     ) -> InstanceResult<BTreeMap<String, String>> {
         for value in [source_id, fingerprint] {
-            if value.len() != 64
-                || !value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return Err(InstanceError::InvalidInput);
-            }
+            validate_mapping_digest(value)?;
         }
         self.registry().storage().read(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT m.legacy_id,m.instance_id,c.phase,
-                 CASE WHEN length(CAST(c.record_json AS BLOB))<=65536 THEN c.record_json END,
-                 CASE WHEN length(CAST(c.directory_receipt AS BLOB))<=4096 THEN c.directory_receipt END,
-                 i.lifecycle,
-                 i.record_json,
-                 CASE WHEN length(CAST(i.directory_receipt AS BLOB))<=4096 THEN i.directory_receipt END,
-                 i.library_id,i.directory_name,i.revision,i.name
+            let mut statement = connection.prepare(&format!(
+                "SELECT {MAPPING_FIELDS}
                  FROM instance_imports m
                  LEFT JOIN instance_creations c ON c.instance_id=m.instance_id
                  LEFT JOIN instances i ON i.id=m.instance_id
                  WHERE m.source_id=?1 AND m.fingerprint=?2
-                 ORDER BY m.legacy_id LIMIT 4097",
-            )?;
+                 ORDER BY m.legacy_id LIMIT 4097"
+            ))?;
             let mut rows = statement.query(params![source_id, fingerprint])?;
             let mut result = BTreeMap::new();
             let mut count = 0;
@@ -71,57 +69,62 @@ impl InstanceService {
                 if count > 4096 {
                     return Err(InstanceError::InvalidInput);
                 }
-                let legacy_id: String = row.get(0)?;
-                if !crate::import::model::legacy_id(&legacy_id) {
-                    return Err(InstanceError::InvalidInput);
-                }
-                let id: InstanceId = row.get::<_, String>(1)?.parse()?;
-                let phase: Option<String> = row.get(2)?;
-                let lifecycle: Option<String> = row.get(5)?;
-                if phase.as_deref().is_some_and(|value| {
-                    !matches!(
-                        value,
-                        "building"
-                            | "ready"
-                            | "published"
-                            | "cancelling"
-                            | "complete"
-                            | "cancelled"
-                    )
-                }) || lifecycle
-                    .as_deref()
-                    .is_some_and(|value| !matches!(value, "reserved" | "live" | "deleting"))
-                {
-                    return Err(InstanceError::InvalidInput);
-                }
-                if phase.as_deref() != Some("complete") || lifecycle.as_deref() != Some("live") {
+                let Some(mapping) = completed_mapping(row)? else {
                     continue;
-                }
-                let created = mapping_record(row.get(3)?, &id)?;
-                let current = mapping_record(row.get(6)?, &id)?;
-                let creation_receipt: Option<String> = row.get(4)?;
-                let receipt: Option<String> = row.get(7)?;
-                if created.lifecycle != super::model::InstanceLifecycle::Reserved
-                    || current.lifecycle != super::model::InstanceLifecycle::Live
-                    || created.directory_receipt.is_some()
-                    || created.revision != 1
-                    || current.revision <= created.revision
-                    || created.library_id != current.library_id
-                    || creation_receipt.as_deref().is_none_or(str::is_empty)
-                    || creation_receipt != receipt
-                    || current.directory_receipt != receipt
-                    || current.library_id != row.get::<_, String>(8)?
-                    || current.directory_name != row.get::<_, String>(9)?
-                    || current.revision != row.get::<_, u64>(10)?
-                    || current.instance.name != row.get::<_, String>(11)?
+                };
+                if result
+                    .insert(mapping.legacy_id, mapping.id.to_string())
+                    .is_some()
                 {
-                    return Err(InstanceError::InvalidInput);
-                }
-                if result.insert(legacy_id, id.to_string()).is_some() {
                     return Err(InstanceError::InvalidInput);
                 }
             }
             Ok(result)
+        })
+    }
+
+    /// Immutable imported evidence only. The stored completed mapping supplies
+    /// source identity; a name, selected instance or version never substitutes.
+    pub fn imported_install_history(
+        &self,
+        id: &InstanceId,
+        after: Option<&str>,
+    ) -> InstanceResult<crate::install::history::HistoryPage> {
+        crate::install::history::validate_cursor(after).map_err(install_history_error)?;
+        self.registry().storage().read(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            let mapping = {
+                let mut statement = transaction.prepare(&format!(
+                    "SELECT {MAPPING_FIELDS} FROM instances i
+                     LEFT JOIN instance_imports m ON m.instance_id=i.id
+                     LEFT JOIN instance_creations c ON c.instance_id=i.id
+                     WHERE i.id=?1"
+                ))?;
+                let mut rows = statement.query([id.as_str()])?;
+                let row = rows.next()?.ok_or(InstanceError::NotFound)?;
+                current_mapping_record(row, id)?;
+                if row.get::<_, Option<String>>(1)?.is_none() {
+                    None
+                } else {
+                    Some(completed_mapping(row)?.ok_or(InstanceError::Conflict)?)
+                }
+            };
+            let page = match mapping {
+                Some(mapping) => crate::install::history::read_in(
+                    &transaction,
+                    &mapping.source_id,
+                    &mapping.legacy_id,
+                    &mapping.id,
+                    after,
+                )
+                .map_err(install_history_error)?,
+                None => crate::install::history::HistoryPage {
+                    records: Vec::new(),
+                    next_after: None,
+                },
+            };
+            transaction.commit()?;
+            Ok(page)
         })
     }
 
@@ -284,6 +287,10 @@ impl InstanceService {
                 .operations
                 .verify_in(&transaction)
                 .map_err(operation_error)?;
+            history
+                .installs
+                .verify_in(&transaction)
+                .map_err(install_history_error)?;
             if let Some(rules) = &history.rules {
                 rules.verify_in(&transaction).map_err(rules_error)?;
             }
@@ -363,6 +370,90 @@ impl InstanceService {
     }
 }
 
+struct CompletedMapping {
+    source_id: String,
+    legacy_id: String,
+    id: InstanceId,
+}
+
+fn validate_mapping_digest(value: &str) -> InstanceResult<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(InstanceError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn completed_mapping(row: &Row<'_>) -> InstanceResult<Option<CompletedMapping>> {
+    let source_id: String = row
+        .get::<_, Option<String>>(12)?
+        .ok_or(InstanceError::InvalidInput)?;
+    let fingerprint: String = row
+        .get::<_, Option<String>>(13)?
+        .ok_or(InstanceError::InvalidInput)?;
+    validate_mapping_digest(&source_id)?;
+    validate_mapping_digest(&fingerprint)?;
+    let legacy_id: String = row.get(0)?;
+    if !crate::import::model::legacy_id(&legacy_id) {
+        return Err(InstanceError::InvalidInput);
+    }
+    let id: InstanceId = row.get::<_, String>(1)?.parse()?;
+    let phase: Option<String> = row.get(2)?;
+    let lifecycle: Option<String> = row.get(5)?;
+    if phase.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "building" | "ready" | "published" | "cancelling" | "complete" | "cancelled"
+        )
+    }) || lifecycle
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "reserved" | "live" | "deleting"))
+    {
+        return Err(InstanceError::InvalidInput);
+    }
+    if phase.as_deref() != Some("complete") || lifecycle.as_deref() != Some("live") {
+        return Ok(None);
+    }
+    let created = mapping_record(row.get(3)?, &id)?;
+    let current = current_mapping_record(row, &id)?;
+    let creation_receipt: Option<String> = row.get(4)?;
+    if created.lifecycle != super::model::InstanceLifecycle::Reserved
+        || created.directory_receipt.is_some()
+        || created.revision != 1
+        || current.revision <= created.revision
+        || created.library_id != current.library_id
+        || creation_receipt.as_deref().is_none_or(str::is_empty)
+        || creation_receipt != current.directory_receipt
+    {
+        return Err(InstanceError::InvalidInput);
+    }
+    Ok(Some(CompletedMapping {
+        source_id,
+        legacy_id,
+        id,
+    }))
+}
+
+fn current_mapping_record(row: &Row<'_>, id: &InstanceId) -> InstanceResult<InstanceRecord> {
+    let current = mapping_record(row.get(6)?, id)?;
+    if current.lifecycle.as_str() != row.get::<_, String>(5)?
+        || current.directory_receipt != row.get::<_, Option<String>>(7)?
+        || current.library_id != row.get::<_, String>(8)?
+        || current.directory_name != row.get::<_, String>(9)?
+        || current.revision != row.get::<_, u64>(10)?
+        || current.instance.name != row.get::<_, String>(11)?
+    {
+        return Err(InstanceError::InvalidInput);
+    }
+    if current.lifecycle != super::model::InstanceLifecycle::Live {
+        return Err(InstanceError::Busy);
+    }
+    Ok(current)
+}
+
 fn mapping_record(raw: Option<String>, id: &InstanceId) -> InstanceResult<InstanceRecord> {
     let record = super::directory::decode(&raw.ok_or(InstanceError::InvalidInput)?)?;
     if record.instance.id != *id {
@@ -400,6 +491,15 @@ pub(crate) fn operation_error(
         OperationImportError::Invalid => InstanceError::InvalidInput,
         OperationImportError::Conflict => InstanceError::Conflict,
         OperationImportError::Storage(error) => InstanceError::Storage(error),
+    }
+}
+
+pub(crate) fn install_history_error(error: crate::install::history::HistoryError) -> InstanceError {
+    use crate::install::history::HistoryError;
+    match error {
+        HistoryError::Invalid => InstanceError::InvalidInput,
+        HistoryError::Conflict => InstanceError::Conflict,
+        HistoryError::Storage(error) => InstanceError::Storage(error),
     }
 }
 
@@ -537,6 +637,55 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
         }
+    }
+
+    fn add_install_history(source: &Fixture) {
+        let directory = source.baseline.join("state");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("operation-journals.json"),
+            serde_json::to_vec(&crate::import::tests::successful_install_journal()).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn install_rows(service: &InstanceService) -> Vec<(String, String, Option<String>, Vec<u8>)> {
+        service
+            .registry()
+            .storage()
+            .read(|db| -> InstanceResult<_> {
+                let mut query = db.prepare(
+                    "SELECT id,source_id,instance_id,payload FROM install_history ORDER BY id",
+                )?;
+                Ok(query
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?
+                    .collect::<Result<_, _>>()?)
+            })
+            .unwrap()
+    }
+
+    fn assert_install_history(service: &InstanceService, id: &InstanceId) {
+        let page = service.imported_install_history(id, None).unwrap();
+        assert_eq!(page.records.len(), 3);
+        assert!(page.next_after.is_none());
+        assert!(page.records.iter().all(|record| record.historical));
+        assert_eq!(
+            page.records
+                .iter()
+                .filter(|record| record.instance_id.is_none())
+                .count(),
+            2
+        );
+        let content = page
+            .records
+            .iter()
+            .find(|record| record.instance_id.is_some())
+            .unwrap();
+        assert_eq!(content.instance_id.as_deref(), Some(id.as_str()));
+        assert_eq!(content.command, "ModifyInstanceContent");
+        assert_eq!(content.sequence, "13");
     }
 
     fn reports(root: &Path) -> Vec<LaunchProofRecord> {
@@ -861,11 +1010,13 @@ mod tests {
         for phase in ["ready", "published"] {
             let source = Fixture::new();
             add_history(&source, "0000000000000001", "session-a");
+            add_install_history(&source);
             let (root, service) = super::super::create::tests::fixture();
             let id = interrupted(&service, &prepared(&source), phase);
             let library_id = service.directories.library().admit().unwrap().library_id();
             assert!(service.registry().list().unwrap().is_empty());
             assert!(reports(root.path()).is_empty());
+            assert!(install_rows(&service).is_empty());
             let pending_benchmarks = benchmark_history(root.path());
             assert!(pending_benchmarks.suites.is_empty());
             assert!(pending_benchmarks.drivers.is_empty());
@@ -891,6 +1042,7 @@ mod tests {
             assert_eq!(imported_reports.len(), 1);
             assert_eq!(imported_reports[0].instance_id, id.as_str());
             assert_benchmark_history(&benchmark_history(root.path()), &id, &imported_reports[0]);
+            assert_install_history(&service, &id);
             assert!(!service.has_unsettled_effects());
             service
                 .directories
@@ -941,6 +1093,7 @@ mod tests {
     async fn cancellation_releases_building_stage_and_retry_reuses_reserved_mapping() {
         let source = Fixture::new();
         add_history(&source, "0000000000000001", "session-a");
+        add_install_history(&source);
         let (root, service) = super::super::create::tests::fixture();
         let imported = prepared(&source);
         let id = interrupted(&service, &imported, "building");
@@ -967,6 +1120,7 @@ mod tests {
         assert!(reports(root.path()).is_empty());
         assert!(benchmark_history(root.path()).suites.is_empty());
         assert!(benchmark_history(root.path()).drivers.is_empty());
+        assert!(install_rows(&service).is_empty());
         let instance = service
             .import_instance(prepared(&source))
             .unwrap()
@@ -975,6 +1129,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(instance.id, id);
+        assert_install_history(&service, &id);
         assert_eq!(reports(root.path())[0].instance_id, id.as_str());
         assert_benchmark_history(
             &benchmark_history(root.path()),
@@ -1061,6 +1216,7 @@ mod tests {
         for phase in ["initial", "ready", "published"] {
             let source = Fixture::new();
             add_history(&source, "0000000000000001", "session-a");
+            add_install_history(&source);
             let source_before = snapshot(&source.baseline);
             let (root, service) = super::super::create::tests::fixture();
             let imported = prepared(&source);
@@ -1089,6 +1245,7 @@ mod tests {
             assert!(reports(root.path()).is_empty());
             assert!(benchmark_history(root.path()).suites.is_empty());
             assert!(benchmark_history(root.path()).drivers.is_empty());
+            assert!(install_rows(&service).is_empty());
             assert_eq!(snapshot(&source.baseline), source_before);
             service
                 .registry()
@@ -1124,7 +1281,80 @@ mod tests {
             assert_eq!(saved[0].boot_duration_ms, Some(1000));
             assert_eq!(saved[0].recorded_at, "2026-01-01T00:00:02.000Z");
             assert_benchmark_history(&benchmark_history(root.path()), &id, &saved[0]);
+            assert_install_history(&service, &id);
             assert_eq!(snapshot(&source.baseline), source_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn install_history_refuses_ignored_or_conflicting_rows_before_publication() {
+        for phase in ["initial", "ready", "published"] {
+            for fault in ["ignored_insert", "conflicting_row"] {
+                let source = Fixture::new();
+                add_history(&source, "0000000000000001", "session-a");
+                add_install_history(&source);
+                let source_before = snapshot(&source.baseline);
+                let (_root, service) = super::super::create::tests::fixture();
+                let imported = prepared(&source);
+                let id = if phase == "initial" {
+                    imported.instance().id.clone()
+                } else {
+                    interrupted(&service, &imported, phase)
+                };
+                let history = imported.bind_history(&id).unwrap();
+                service.registry().storage().transaction(|tx| -> InstanceResult<()> {
+                    if fault == "ignored_insert" {
+                        tx.execute_batch("CREATE TRIGGER ignore_install_history BEFORE INSERT ON install_history BEGIN SELECT RAISE(IGNORE); END;")?;
+                    } else {
+                        history.installs.insert_in(tx).map_err(install_history_error)?;
+                        let (key, payload): (String, Vec<u8>) = tx.query_row(
+                            "SELECT id,payload FROM install_history WHERE instance_id IS NOT NULL", [],
+                            |row| Ok((row.get(0)?, row.get(1)?)))?;
+                        let mut changed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        changed["source"]["sequence"] = serde_json::json!(99);
+                        tx.execute("UPDATE install_history SET payload=?1 WHERE id=?2",
+                            params![serde_json::to_vec(&changed).unwrap(), key])?;
+                    }
+                    Ok(())
+                }).unwrap();
+                let stored_before = install_rows(&service);
+                let result = service
+                    .import_instance(imported)
+                    .unwrap()
+                    .join()
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(result, Err(InstanceError::Conflict)),
+                    "{phase}/{fault}"
+                );
+                assert!(service.registry().list().unwrap().is_empty());
+                assert_eq!(service.pending().unwrap()[0].instance_id, id);
+                assert_eq!(install_rows(&service), stored_before);
+                assert_eq!(snapshot(&source.baseline), source_before);
+                service
+                    .registry()
+                    .storage()
+                    .transaction(|tx| -> InstanceResult<()> {
+                        if fault == "ignored_insert" {
+                            tx.execute_batch("DROP TRIGGER ignore_install_history")?;
+                        } else {
+                            tx.execute("DELETE FROM install_history", [])?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                let recovered = service
+                    .import_instance(prepared(&source))
+                    .unwrap()
+                    .join()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(recovered.id, id);
+                assert_install_history(&service, &id);
+                assert_eq!(snapshot(&source.baseline), source_before);
+            }
         }
     }
 
@@ -1215,9 +1445,13 @@ mod tests {
             "suite_payload",
             "missing_driver",
             "driver_payload",
+            "missing_install",
+            "install_payload",
+            "install_index",
         ] {
             let source = Fixture::new();
             add_history(&source, "0000000000000001", "session-a");
+            add_install_history(&source);
             let before = snapshot(&source.baseline);
             let (root, service) = super::super::create::tests::fixture();
             let instance = service
@@ -1244,6 +1478,7 @@ mod tests {
                 .unwrap();
             assert_eq!(repeated.id, instance.id);
             assert_eq!(benchmark_history(root.path()), saved_benchmarks);
+            assert_install_history(&service, &instance.id);
             assert_eq!(
                 std::fs::read(&path).unwrap(),
                 b"later destination user edit"
@@ -1271,11 +1506,19 @@ mod tests {
                         changed["updated_at"] = serde_json::json!("2026-01-01T00:00:03.000Z");
                         tx.execute("UPDATE benchmark_drivers SET payload=?1 WHERE driver_id=?2", params![serde_json::to_vec(&changed).unwrap(), saved_benchmarks.drivers[0].0])?;
                     }
+                    "missing_install" => { tx.execute("DELETE FROM install_history", [])?; }
+                    "install_payload" => {
+                        tx.execute("UPDATE install_history SET payload=X'7b7d' WHERE instance_id IS NOT NULL", [])?;
+                    }
+                    "install_index" => {
+                        tx.execute("UPDATE install_history SET instance_id=?1 WHERE instance_id IS NOT NULL", [InstanceId::new().as_str()])?;
+                    }
                     _ => unreachable!(),
                 }
                 Ok(())
             }).unwrap();
             let corrupted_benchmarks = benchmark_history(root.path());
+            let corrupted_installs = install_rows(&service);
             let result = service
                 .import_instance(prepared(&source))
                 .unwrap()
@@ -1305,9 +1548,97 @@ mod tests {
             assert_eq!(std::fs::read(path).unwrap(), b"later destination user edit");
             assert_eq!(snapshot(&source.baseline), before);
             assert_eq!(benchmark_history(root.path()), corrupted_benchmarks);
+            assert_eq!(install_rows(&service), corrupted_installs);
             if corruption == "missing" {
                 assert!(reports(root.path()).is_empty());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn install_history_reader_requires_live_completed_mapping_and_owner_cursor() {
+        let (_root, service) = super::super::create::tests::fixture();
+        assert!(matches!(
+            service.imported_install_history(&InstanceId::new(), None),
+            Err(InstanceError::NotFound)
+        ));
+        let ordinary = super::super::create::tests::create(&service, "Not imported").await;
+        assert!(
+            service
+                .imported_install_history(&ordinary.id, None)
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        for after in ["", "invalid", "legacy-install-not-a-digest"] {
+            assert!(matches!(
+                service.imported_install_history(&ordinary.id, Some(after)),
+                Err(InstanceError::InvalidInput)
+            ));
+        }
+        let source = Fixture::new();
+        add_install_history(&source);
+        let id = interrupted(&service, &prepared(&source), "ready");
+        assert!(matches!(
+            service.imported_install_history(&id, None),
+            Err(InstanceError::Busy)
+        ));
+        service
+            .import_instance(prepared(&source))
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_install_history(&service, &id);
+        let held = service.directories.admit(&id).unwrap();
+        assert_install_history(&service, &id);
+        drop(held);
+        let page = service.imported_install_history(&id, None).unwrap();
+        assert!(
+            service
+                .imported_install_history(&id, Some(&page.records.last().unwrap().id))
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        for sql in [
+            "UPDATE instance_imports SET source_id='not-a-source'",
+            "UPDATE instance_imports SET fingerprint='not-a-fingerprint'",
+            "UPDATE instance_imports SET legacy_id='../source'",
+            "UPDATE instance_creations SET phase='published'",
+            "UPDATE instance_creations SET record_json='{}'",
+            "UPDATE instance_creations SET directory_receipt=NULL",
+            "UPDATE instances SET record_json='{}'",
+            "UPDATE instances SET revision=999",
+        ] {
+            let source = Fixture::new();
+            add_install_history(&source);
+            let (_root, service) = super::super::create::tests::fixture();
+            let imported = service
+                .import_instance(prepared(&source))
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_install_history(&service, &imported.id);
+            let rows_before = install_rows(&service);
+            service
+                .registry()
+                .storage()
+                .transaction(|tx| -> InstanceResult<()> {
+                    tx.execute_batch(sql)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                service
+                    .imported_install_history(&imported.id, None)
+                    .is_err(),
+                "{sql}"
+            );
+            assert_eq!(install_rows(&service), rows_before);
         }
     }
 
