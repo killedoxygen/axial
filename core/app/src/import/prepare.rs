@@ -27,6 +27,7 @@ pub struct PreparedInstanceImport {
     inventory: Arc<Inventory>,
     legacy_id: String,
     source_id: String,
+    was_last_instance: bool,
     instance: Instance,
     source_launch: EffectiveLaunchSettings,
     source: Directory,
@@ -53,6 +54,10 @@ impl PreparedInstanceImport {
 
     pub(crate) fn instance(&self) -> &Instance {
         &self.instance
+    }
+
+    pub(crate) fn was_last_instance(&self) -> bool {
+        self.was_last_instance
     }
 
     pub(crate) fn source(&self) -> &Directory {
@@ -165,6 +170,7 @@ impl Inventory {
             inventory: self.clone(),
             legacy_id: legacy_id.to_owned(),
             source_id: self.source_identity()?,
+            was_last_instance: input.was_last_instance,
             instance: input.instance,
             source_launch: input.source_launch,
             source: input.source,
@@ -244,6 +250,7 @@ impl Inventory {
             }
         }
         Ok(InstanceImportInput {
+            was_last_instance: registry.last_instance_id.as_deref() == Some(legacy_id),
             instance,
             source_launch,
             source,
@@ -369,6 +376,7 @@ fn managed_payload_error(error: axial_performance::StateError) -> ImportError {
 }
 
 pub(super) struct InstanceImportInput {
+    was_last_instance: bool,
     instance: Instance,
     source_launch: EffectiveLaunchSettings,
     source: Directory,

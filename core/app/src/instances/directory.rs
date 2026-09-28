@@ -359,6 +359,34 @@ impl Registry {
         })
     }
 
+    /// First import publication may fill an empty selection without recording
+    /// a new launch or replacing a destination choice.
+    pub(super) fn restore_import_selection(
+        &self,
+        tx: &Transaction<'_>,
+        expected: &InstanceRecord,
+    ) -> InstanceResult<()> {
+        let record = get_in(tx, &expected.instance.id)?;
+        require_exact(&record, expected, InstanceLifecycle::Live)?;
+        let selected: Option<String> = tx.query_row(
+            "SELECT instance_id FROM instance_selection WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if let Some(selected) = selected {
+            let _: InstanceId = selected.parse()?;
+            return Ok(());
+        }
+        let changed = tx.execute(
+            "UPDATE instance_selection SET instance_id = ?1 WHERE singleton = 1 AND instance_id IS NULL",
+            [record.instance.id.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(InstanceError::Conflict);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn select(&self, id: &InstanceId) -> InstanceResult<()> {
         self.storage.transaction(|tx| {

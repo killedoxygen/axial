@@ -434,6 +434,224 @@ fn retained_settings_and_unknown_state_block_without_erasing_records() {
     );
 }
 
+fn guardian_rejection_streak_snapshot(count: usize) -> Value {
+    json!({
+        "schema": "axial.state.persisted_state_rejection_streaks.v1",
+        "entries": (0..count).map(|index| json!({
+            "store": "benchmark_suite_driver",
+            "record_id": format!("benchmark-suite-driver-{index:016x}"),
+            "physical_identity": format!("sha256.{}", ["01234567"; 8].join(".")),
+            "consecutive_startups": index % 3 + 1,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+#[test]
+fn guardian_rejection_streaks_allow_import_without_adopting_eligibility() {
+    for count in [0, 1, 8] {
+        let fixture = Fixture::new();
+        let path = "state/persisted-state-rejection-streaks.json";
+        let mut record = guardian_rejection_streak_snapshot(count);
+        if count == 8 {
+            record["entries"][7]["record_id"] = json!("benchmark-suite-driver-ffffffffffffffff");
+        }
+        fixture.write(path, &record);
+        let mut bytes = fs::read(fixture.baseline.join(path)).unwrap();
+        if count == 8 {
+            bytes.resize(32 * 1024, b' ');
+            fs::write(fixture.baseline.join(path), &bytes).unwrap();
+        }
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        let preview = inventory.preview();
+        assert!(preview.instances[0].ordinary_import_available, "{count}");
+        assert!(!preview.cutover_available);
+        assert!(inventory.obligations().is_empty());
+        assert_eq!(
+            inventory.record_bytes(&format!("profile/{path}")).unwrap(),
+            bytes
+        );
+        let prepared = inventory
+            .prepare_instance(&preview.fingerprint, FIRST)
+            .unwrap();
+        assert_eq!(prepared.instance().version_id, "1.20.1");
+        prepared.revalidate().unwrap();
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn guardian_rejection_streaks_reject_invalid_original_records() {
+    for invalid in [
+        "schema",
+        "envelope-field",
+        "entry-field",
+        "missing-field",
+        "store",
+        "id",
+        "identity",
+        "low-count",
+        "high-count",
+        "entries-limit",
+        "duplicate-entry",
+        "entry-order",
+        "duplicate-field",
+        "malformed",
+        "bytes-limit",
+    ] {
+        let fixture = Fixture::new();
+        let path = "state/persisted-state-rejection-streaks.json";
+        let mut record = guardian_rejection_streak_snapshot(2);
+        match invalid {
+            "schema" => {
+                record["schema"] = json!("axial.state.persisted_state_rejection_streaks.v2")
+            }
+            "envelope-field" => record["effect"] = json!("retain"),
+            "entry-field" => record["entries"][0]["effect"] = json!("retain"),
+            "missing-field" => {
+                record["entries"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("physical_identity");
+            }
+            "store" => record["entries"][0]["store"] = json!("installation"),
+            "id" => {
+                record["entries"][0]["record_id"] = json!("benchmark-suite-driver-000000000000000A")
+            }
+            "identity" => record["entries"][0]["physical_identity"] = json!("sha256.01234567"),
+            "low-count" => record["entries"][0]["consecutive_startups"] = json!(0),
+            "high-count" => record["entries"][0]["consecutive_startups"] = json!(4),
+            "entries-limit" => record = guardian_rejection_streak_snapshot(9),
+            "duplicate-entry" => record["entries"][1] = record["entries"][0].clone(),
+            "entry-order" => record["entries"].as_array_mut().unwrap().reverse(),
+            "duplicate-field" | "malformed" | "bytes-limit" => {}
+            _ => unreachable!(),
+        }
+        fixture.write(path, &record);
+        let mut bytes = serde_json::to_vec(&record).unwrap();
+        match invalid {
+            "duplicate-field" => {
+                let original = String::from_utf8(bytes).unwrap();
+                bytes = original
+                    .replacen(
+                        "\"consecutive_startups\":1",
+                        "\"consecutive_startups\":1,\"consecutive_startups\":1",
+                        1,
+                    )
+                    .into_bytes();
+                assert_ne!(bytes, original.as_bytes());
+            }
+            "malformed" => bytes = b"{".to_vec(),
+            "bytes-limit" => bytes.resize(32 * 1024 + 1, b' '),
+            _ => {}
+        }
+        fs::write(fixture.baseline.join(path), &bytes).unwrap();
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        let preview = inventory.preview();
+        assert!(!preview.instances[0].ordinary_import_available, "{invalid}");
+        assert!(
+            preview.blockers.contains(&ImportBlocker::UnsupportedSchema),
+            "{invalid}"
+        );
+        assert!(
+            inventory
+                .prepare_instance(&preview.fingerprint, FIRST)
+                .is_err(),
+            "{invalid}"
+        );
+        assert_eq!(
+            inventory.record_bytes(&format!("profile/{path}")).unwrap(),
+            bytes
+        );
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn guardian_rejection_streaks_remain_in_the_source_fence() {
+    let fixture = Fixture::new();
+    let path = "state/persisted-state-rejection-streaks.json";
+    let mut record = guardian_rejection_streak_snapshot(1);
+    fixture.write(path, &record);
+    let inventory = Arc::new(fixture.capture());
+    let prepared = inventory
+        .prepare_instance(inventory.fingerprint(), FIRST)
+        .unwrap();
+    record["entries"][0]["consecutive_startups"] = json!(2);
+    fixture.write(path, &record);
+    let before = snapshot(&fixture.baseline);
+    assert!(matches!(
+        inventory.revalidate(),
+        Err(ImportError::SourceChanged)
+    ));
+    assert!(matches!(
+        prepared.revalidate(),
+        Err(ImportError::SourceChanged)
+    ));
+    assert!(matches!(
+        inventory.prepare_instance(inventory.fingerprint(), FIRST),
+        Err(ImportError::SourceChanged)
+    ));
+    let refreshed = fixture.capture();
+    assert_ne!(refreshed.fingerprint(), inventory.fingerprint());
+    assert!(refreshed.preview().instances[0].ordinary_import_available);
+    assert_eq!(snapshot(&fixture.baseline), before);
+}
+
+#[test]
+fn guardian_rejection_streaks_do_not_waive_retained_effects_or_unknown_records() {
+    for (other, blocker) in [
+        ("unknown", ImportBlocker::UnknownRetainedRecord),
+        ("deletion", ImportBlocker::PendingDeletion),
+        ("journal", ImportBlocker::UnsettledOperation),
+    ] {
+        let fixture = Fixture::new();
+        fixture.write(
+            "state/persisted-state-rejection-streaks.json",
+            &guardian_rejection_streak_snapshot(1),
+        );
+        match other {
+            "unknown" => fixture.write(
+                "state/other.json",
+                &json!({"instance_id": FIRST, "effect": "preserve"}),
+            ),
+            "deletion" => {
+                let mut registry = fixture.record("instances.json");
+                registry["pending_deletions"] =
+                    json!([{"instance_id": FIRST, "delete_files": true}]);
+                fixture.write("instances.json", &registry);
+            }
+            "journal" => {
+                let mut journal = terminal_performance_journal();
+                journal["entries"][0]["status"] = json!("Running");
+                journal["entries"][0]["outcome"] = Value::Null;
+                fixture.write("state/operation-journals.json", &journal);
+            }
+            _ => unreachable!(),
+        }
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        let preview = inventory.preview();
+        assert!(preview.blockers.contains(&blocker), "{other}");
+        assert!(!preview.instances[0].ordinary_import_available, "{other}");
+        assert!(
+            inventory
+                .prepare_instance(&preview.fingerprint, FIRST)
+                .is_err(),
+            "{other}"
+        );
+        assert!(
+            !inventory
+                .obligations()
+                .iter()
+                .any(|record| record.source_record
+                    == "profile/state/persisted-state-rejection-streaks.json")
+        );
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
 #[test]
 fn invalid_offline_identity_is_not_replaced_with_new_identity() {
     let fixture = Fixture::new();
@@ -2721,6 +2939,224 @@ fn reopen_import_service(
         InstanceDirectories::new(Registry::new(storage), library, Exclusions::new()),
         TaskOwner::new(16).unwrap(),
     )
+}
+
+#[tokio::test]
+async fn instance_import_last_selection_maps_once_and_preserves_destination_choices() {
+    use crate::instances::model::InstanceResult;
+
+    for existing_selection in [false, true] {
+        let fixture = Fixture::new();
+        fixture.two_instances();
+        let mut registry = fixture.record("instances.json");
+        registry["last_instance_id"] = json!(SECOND);
+        registry["instances"][1]["last_played_at"] = json!("2024-02-29T12:34:56Z");
+        fixture.write("instances.json", &registry);
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        let fingerprint = inventory.preview().fingerprint;
+        let (root, service) = import_service();
+        let first = service
+            .import_instance(inventory.prepare_instance(&fingerprint, FIRST).unwrap())
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(service.registry().last_instance_id().unwrap(), None);
+        if existing_selection {
+            service.registry().select(&first.id).unwrap();
+        }
+        let selected = service
+            .import_instance(inventory.prepare_instance(&fingerprint, SECOND).unwrap())
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = if existing_selection {
+            &first.id
+        } else {
+            &selected.id
+        };
+        assert_eq!(
+            service.registry().last_instance_id().unwrap().as_ref(),
+            Some(expected)
+        );
+        assert_eq!(selected.last_played_at, "2024-02-29T12:34:56Z");
+        assert_eq!(selected.created_at, registry["instances"][1]["created_at"]);
+        assert_eq!(
+            selected.revision, 2,
+            "selection must not fabricate a launch revision"
+        );
+        let selected_record = service.registry().get_live(&selected.id).unwrap();
+        let copied = snapshot(&imported_path(&service, &selected.id));
+        let library_id = service
+            .directories()
+            .library()
+            .admit()
+            .unwrap()
+            .library_id();
+        drop(service);
+        let service = reopen_import_service(root.path(), library_id);
+        assert_eq!(
+            service.registry().last_instance_id().unwrap().as_ref(),
+            Some(expected)
+        );
+
+        service.registry().select(&first.id).unwrap();
+        for cleared_selection in [false, true] {
+            if cleared_selection {
+                service
+                    .registry()
+                    .storage()
+                    .transaction(|tx| -> InstanceResult<()> {
+                        assert_eq!(
+                            tx.execute(
+                                "UPDATE instance_selection SET instance_id=NULL WHERE singleton=1",
+                                []
+                            )?,
+                            1
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let inventory = Arc::new(fixture.capture());
+            let repeated = service
+                .import_instance(
+                    inventory
+                        .prepare_instance(&inventory.preview().fingerprint, SECOND)
+                        .unwrap(),
+                )
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(repeated.id, selected.id);
+            assert_eq!(
+                service.registry().last_instance_id().unwrap(),
+                (!cleared_selection).then(|| first.id.clone())
+            );
+            assert_eq!(
+                service.registry().get_live(&selected.id).unwrap(),
+                selected_record
+            );
+            assert_eq!(snapshot(&imported_path(&service, &selected.id)), copied);
+        }
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[tokio::test]
+async fn instance_import_last_selection_rolls_back_and_recovers_with_publication() {
+    use crate::instances::model::{InstanceError, InstanceResult};
+
+    for failure in [
+        "ignored-selection",
+        "ignored-completion",
+        "failed-completion",
+        "missing-selection",
+    ] {
+        let fixture = Fixture::new();
+        let before = snapshot(&fixture.baseline);
+        let (root, service) = import_service();
+        let prepared = prepare_first(&fixture);
+        let id = prepared.instance().id.clone();
+        let (inject, repair) = match failure {
+            "ignored-selection" => (
+                "CREATE TRIGGER refuse_selection BEFORE UPDATE ON instance_selection BEGIN SELECT RAISE(IGNORE); END;",
+                "DROP TRIGGER refuse_selection",
+            ),
+            "ignored-completion" => (
+                "CREATE TRIGGER refuse_completion BEFORE UPDATE OF phase ON instance_creations WHEN NEW.phase='complete' BEGIN SELECT RAISE(IGNORE); END;",
+                "DROP TRIGGER refuse_completion",
+            ),
+            "failed-completion" => (
+                "CREATE TRIGGER refuse_completion BEFORE UPDATE OF phase ON instance_creations WHEN NEW.phase='complete' BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END;",
+                "DROP TRIGGER refuse_completion",
+            ),
+            _ => (
+                "DELETE FROM instance_selection WHERE singleton=1",
+                "INSERT INTO instance_selection(singleton,instance_id) VALUES(1,NULL)",
+            ),
+        };
+        service
+            .registry()
+            .storage()
+            .transaction(|tx| -> InstanceResult<()> {
+                tx.execute_batch(inject)?;
+                Ok(())
+            })
+            .unwrap();
+        let result = service
+            .import_instance(prepared)
+            .unwrap()
+            .join()
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(InstanceError::Conflict | InstanceError::Storage(_))
+            ),
+            "{failure}: {result:?}"
+        );
+        assert!(service.registry().list().unwrap().is_empty(), "{failure}");
+        if failure == "missing-selection" {
+            assert!(service.registry().last_instance_id().is_err());
+        } else {
+            assert_eq!(service.registry().last_instance_id().unwrap(), None);
+        }
+        assert_eq!(service.pending().unwrap()[0].instance_id, id);
+        let path = imported_path(&service, &id);
+        let copied = snapshot(&path);
+        assert_eq!(
+            fs::read(path.join("options.txt")).unwrap(),
+            fs::read(
+                fixture
+                    .baseline
+                    .join(format!("instances/{FIRST}/options.txt"))
+            )
+            .unwrap()
+        );
+        service
+            .registry()
+            .storage()
+            .transaction(|tx| -> InstanceResult<()> {
+                tx.execute_batch(repair)?;
+                Ok(())
+            })
+            .unwrap();
+        let library_id = service
+            .directories()
+            .library()
+            .admit()
+            .unwrap()
+            .library_id();
+        drop(service);
+        let service = reopen_import_service(root.path(), library_id);
+        assert!(
+            service.recover_pending().await.is_err(),
+            "source-free recovery must not publish {failure}"
+        );
+        assert_eq!(service.registry().last_instance_id().unwrap(), None);
+        let recovered = service
+            .import_instance(prepare_first(&fixture))
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.id, id);
+        assert_eq!(service.registry().last_instance_id().unwrap(), Some(id));
+        assert!(recovered.last_played_at.is_empty());
+        assert_eq!(recovered.revision, 2);
+        assert!(service.pending().unwrap().is_empty());
+        assert_eq!(snapshot(&path), copied);
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
 }
 
 #[tokio::test]

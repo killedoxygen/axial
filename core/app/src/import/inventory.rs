@@ -23,6 +23,68 @@ const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
 const RECORDS_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
 const RECORDS_LIMIT: usize = 4096;
 const MAX_DEPTH: usize = 64;
+const REJECTION_STREAK_RECORD: &str = "profile/state/persisted-state-rejection-streaks.json";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRejectionStreaks {
+    schema: String,
+    entries: Vec<LegacyRejectionStreak>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRejectionStreak {
+    store: String,
+    record_id: String,
+    physical_identity: String,
+    consecutive_startups: u8,
+}
+
+fn valid_rejection_streaks(bytes: &[u8]) -> bool {
+    if bytes.len() > 32 * 1024 {
+        return false;
+    }
+    let Ok(snapshot) = serde_json::from_slice::<LegacyRejectionStreaks>(bytes) else {
+        return false;
+    };
+    if snapshot.schema != "axial.state.persisted_state_rejection_streaks.v1"
+        || snapshot.entries.len() > 8
+    {
+        return false;
+    }
+    let mut previous = None;
+    for entry in &snapshot.entries {
+        let valid_identity =
+            entry
+                .physical_identity
+                .strip_prefix("sha256.")
+                .is_some_and(|digest| {
+                    let mut groups = digest.split('.');
+                    (0..8).all(|_| {
+                        groups.next().is_some_and(|group| {
+                            group.len() == 8
+                                && group.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        })
+                    }) && groups.next().is_none()
+                });
+        if entry.store != "benchmark_suite_driver"
+            || !entry
+                .record_id
+                .strip_prefix("benchmark-suite-driver-")
+                .is_some_and(legacy_id)
+            || !valid_identity
+            || !(1..=3).contains(&entry.consecutive_startups)
+            || previous.is_some_and(|previous| previous >= entry.record_id.as_str())
+        {
+            return false;
+        }
+        previous = Some(entry.record_id.as_str());
+    }
+    true
+}
 
 #[derive(Clone, Copy)]
 pub struct CaptureLimits {
@@ -532,6 +594,11 @@ impl Inventory {
             .validate_revision(&revision)
             .map_err(|_| ImportError::SourceChanged)?;
         if record {
+            // Guardian eligibility is excluded, but its exact source schema must
+            // be checked before JSON normalization can hide duplicate fields.
+            if relative == REJECTION_STREAK_RECORD && !valid_rejection_streaks(&bytes) {
+                self.retain(relative, None, ImportBlocker::UnsupportedSchema);
+            }
             if revision.size() <= RECORD_LIMIT {
                 if let Ok(value) = serde_json::from_slice(&bytes) {
                     self.records.insert(relative.into(), value);
@@ -827,6 +894,7 @@ impl Inventory {
                     | "profile/accounts.json"
                     | "profile/instances.json"
                     | "profile/state/operation-journals.json"
+                    | REJECTION_STREAK_RECORD
             ) {
                 None
             } else {

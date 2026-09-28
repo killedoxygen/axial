@@ -790,10 +790,16 @@ impl InstanceService {
                     }
                 }
                 let committed = self.registry().commit_reserved(tx, &record, &receipt)?;
-                tx.execute(
+                if imported.is_some_and(|input| input.was_last_instance()) {
+                    self.registry().restore_import_selection(tx, &committed)?;
+                }
+                let completed = tx.execute(
                     "UPDATE instance_creations SET phase='complete' WHERE instance_id=?1",
                     [id.as_str()],
                 )?;
+                if completed != 1 {
+                    return Err(InstanceError::Conflict);
+                }
                 Ok(committed)
             })?;
         self.emit_created(&committed.instance);
@@ -1051,10 +1057,16 @@ impl InstanceService {
                         }
                     }
                     let committed = self.registry().commit_reserved(tx, &record, &receipt)?;
-                    tx.execute(
+                    if matches!(&source, Some(PublicationSource::Import(input)) if input.was_last_instance()) {
+                        self.registry().restore_import_selection(tx, &committed)?;
+                    }
+                    let completed = tx.execute(
                         "UPDATE instance_creations SET phase='complete' WHERE instance_id=?1",
                         [record.instance.id.as_str()],
                     )?;
+                    if completed != 1 {
+                        return Err(InstanceError::Conflict);
+                    }
                     Ok(committed)
                 })?;
             self.emit_created(&committed.instance);

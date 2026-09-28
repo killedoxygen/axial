@@ -2109,7 +2109,18 @@ mod tests {
     #[tokio::test]
     async fn admitted_instance_import_is_repeatable_and_does_not_claim_profile_cutover() {
         let fixture = Fixture::new();
-        let preview = fixture.services.previews.current().unwrap();
+        let streak_path = fixture
+            .baseline
+            .join("state/persisted-state-rejection-streaks.json");
+        fs::create_dir_all(streak_path.parent().unwrap()).unwrap();
+        let streak =
+            br#"{"schema":"axial.state.persisted_state_rejection_streaks.v1","entries":[]}"#;
+        fs::write(&streak_path, streak).unwrap();
+        let preview = fixture
+            .services
+            .previews
+            .admit(Inventory::capture(&fixture.source, &BTreeMap::new()).unwrap())
+            .unwrap();
         let original = fs::read(
             fixture
                 .baseline
@@ -2124,6 +2135,17 @@ mod tests {
         assert_eq!(response["instance"]["name"], "Vanilla Fixture");
         assert_eq!(response["instance"]["extra_jvm_args"], "");
         assert_ne!(response["instance"]["id"], FIRST);
+        assert_eq!(
+            fixture
+                .services
+                .instances
+                .registry()
+                .last_instance_id()
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            response["instance"]["id"].as_str().unwrap()
+        );
         let (status, repeated) = fixture.post(request).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(repeated["instance"]["id"], response["instance"]["id"]);
@@ -2141,6 +2163,7 @@ mod tests {
             .unwrap()
         );
         assert!(!fixture.baseline.join(".axial-root.lease").exists());
+        assert_eq!(fs::read(&streak_path).unwrap(), streak);
         assert!(
             !fixture
                 .services
