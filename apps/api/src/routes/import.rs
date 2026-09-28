@@ -2648,6 +2648,20 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn composed_instance_import_preserves_queued_handoff_without_resuming() {
+        for has_report in [false, true] {
+            composed_instance_history_import(
+                "interrupted",
+                Some("driver automatic resume queued after restart"),
+                &[if has_report { "exited" } else { "pending" }, "pending"],
+                has_report,
+                true,
+            )
+            .await;
+        }
+    }
+
     async fn composed_instance_history_import(
         driver_state: &str,
         driver_error: Option<&str>,
@@ -2655,6 +2669,8 @@ mod tests {
         has_report: bool,
         canonical_plan: bool,
     ) {
+        let can_resume =
+            canonical_plan && driver_error != Some("driver automatic resume queued after restart");
         let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let baseline = root.path().join("baseline");
         fs::create_dir(&baseline).unwrap();
@@ -2761,7 +2777,7 @@ mod tests {
             let mut cases = Vec::new();
             if driver_error.is_some() {
                 cases.extend([
-                    "queued_handoff",
+                    "queued_handoff_wrong_state",
                     "resume_limit_wrong_state",
                     "wrong_state",
                     "active_session",
@@ -2783,7 +2799,7 @@ mod tests {
                     "pending_terminal_without_launch",
                     "pending_active_driver",
                     "pending_nonterminal_driver",
-                    "pending_queued_handoff",
+                    "pending_queued_handoff_active",
                     "pending_missing_last_run",
                     "pending_missing_last_report",
                 ]);
@@ -2804,7 +2820,8 @@ mod tests {
                     .position(|state| *state == "pending")
                     .unwrap_or(0);
                 match case {
-                    "queued_handoff" => {
+                    "queued_handoff_wrong_state" => {
+                        driver["state"] = json!("stopped");
                         driver["error"] = json!("driver automatic resume queued after restart");
                     }
                     "resume_limit_wrong_state" => {
@@ -2839,9 +2856,10 @@ mod tests {
                     }
                     "pending_active_driver" => driver["active_session_id"] = json!("session-a"),
                     "pending_nonterminal_driver" => driver["state"] = json!("scheduled"),
-                    "pending_queued_handoff" => {
+                    "pending_queued_handoff_active" => {
                         driver["state"] = json!("interrupted");
                         driver["error"] = json!("driver automatic resume queued after restart");
+                        driver["active_session_id"] = json!("session-a");
                     }
                     "pending_missing_last_run" => {
                         driver["run_count"] = json!(run_states.len() + 1);
@@ -3082,7 +3100,7 @@ mod tests {
                 format!("Historical {driver_state} (read-only)")
             );
             assert_eq!(driver["view_model"]["can_stop"], false);
-            assert_eq!(driver["view_model"]["can_resume"], canonical_plan);
+            assert_eq!(driver["view_model"]["can_resume"], can_resume);
             assert!(driver.get("resumed_driver_id").is_none());
             let suite: Value = request(
                 Method::GET,
@@ -3150,7 +3168,7 @@ mod tests {
             format!("{driver_path}/stop"),
             format!("{driver_path}/resume"),
         ] {
-            if canonical_plan && path == format!("{driver_path}/resume") {
+            if can_resume && path == format!("{driver_path}/resume") {
                 continue;
             }
             let response = request(Method::POST, &path)
@@ -3162,7 +3180,7 @@ mod tests {
             let error: Value = response.json().await.unwrap();
             assert_eq!(error, json!({"error":"benchmark input is invalid"}));
         }
-        let successor = if canonical_plan {
+        let successor = if can_resume {
             assert_eq!(services.benchmarks.resume_interrupted_drivers().unwrap(), 0);
             assert!(services.tasks.status().is_idle());
             assert!(services.sessions.snapshots().is_empty());
@@ -3333,10 +3351,10 @@ mod tests {
                 )?)
             })
             .unwrap();
-        assert!(stored_counts.0 <= i64::from(canonical_plan));
+        assert!(stored_counts.0 <= i64::from(can_resume));
         assert_eq!(
             (stored_counts.1, stored_counts.2, stored_counts.3),
-            if canonical_plan { (2, 2, 1) } else { (1, 1, 0) }
+            if can_resume { (2, 2, 1) } else { (1, 1, 0) }
         );
         services
             .instances

@@ -160,10 +160,8 @@ fn historical_admission_rejects_runnable_or_ambiguous_records() {
     let mut duplicate_session = suite();
     duplicate_session.suite_id = format!("legacy-suite-{}", "3".repeat(64));
     assert!(PreparedBenchmarkImport::prepare(vec![suite(), duplicate_session], vec![]).is_err());
-    let mut queued = driver();
-    queued.error = Some("driver automatic resume queued after restart".into());
-    assert!(PreparedBenchmarkImport::prepare(vec![suite()], vec![queued]).is_err());
     for marker in [
+        "driver automatic resume queued after restart",
         "driver automatic resume started after restart",
         "driver ignored after restart resume limit",
     ] {
@@ -886,6 +884,76 @@ async fn restart_limit_continuation_response_loss_and_task_refusal_reopen_the_sa
 }
 
 #[tokio::test]
+async fn queued_handoff_history_refuses_continuation_with_shared_suite_projection_after_reopen() {
+    for mixed in [false, true] {
+        let root = fixture_directory();
+        let path = root.path().join("metadata.sqlite");
+        let storage = open_storage(&path);
+        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+        let (source, previous, report) = continuation_history(&instance, mixed);
+        let mut queued = previous.clone();
+        queued.id = format!("legacy-driver-{}", "3".repeat(64));
+        queued.state = "interrupted".into();
+        queued.error = Some("driver automatic resume queued after restart".into());
+        let prepared = insert_continuation_history(&storage, &source, &queued, report.as_ref());
+        let other =
+            PreparedBenchmarkImport::prepare(vec![source.clone()], vec![previous.clone()]).unwrap();
+        storage.transaction(|tx| other.insert_in(tx)).unwrap();
+        drop(service);
+        drop(storage);
+        for _ in 0..2 {
+            let storage = open_storage(&path);
+            let service = self::service(root.path(), storage.clone());
+            storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
+            assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
+            for drivers in [
+                vec![previous.clone(), queued.clone()],
+                vec![queued.clone(), previous.clone()],
+            ] {
+                let actions = service.resume_actions(&drivers).unwrap();
+                assert_eq!(actions[&previous.id], (true, None));
+                assert_eq!(actions[&queued.id], (false, None));
+            }
+            assert!(!service.can_resume_driver(&queued.id).unwrap());
+            assert!(matches!(
+                service.resume_driver(&queued.id),
+                Err(BenchmarkError::Invalid)
+            ));
+            assert!(matches!(
+                service.stop_driver(&queued.id),
+                Err(BenchmarkError::Invalid)
+            ));
+            assert!(service.resumed_driver(&queued.id).unwrap().is_none());
+            assert_eq!(service.driver(&queued.id).unwrap(), queued);
+            assert_eq!(
+                service.suite(&source.suite_id).unwrap(),
+                Some(source.clone())
+            );
+            storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
+            assert!(service.tasks.status().is_idle());
+            assert!(service.sessions.sessions().is_empty());
+            storage
+                .read(|db| {
+                    let count: usize = db.query_row(
+                        "SELECT count(*) FROM benchmark_drivers WHERE request IS NOT NULL OR source_driver_id IS NOT NULL",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(count, 0);
+                    let count: usize = db.query_row(
+                        "SELECT count(*) FROM launch_intents",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(count, 0);
+                    Ok::<_, BenchmarkError>(())
+                })
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn continuation_inherited_rows_and_private_links_are_checked_on_read_and_write() {
     let root = fixture_directory();
     let storage = open_storage(&root.path().join("metadata.sqlite"));
@@ -900,6 +968,33 @@ async fn continuation_inherited_rows_and_private_links_are_checked_on_read_and_w
         .await
         .unwrap();
     let operational = service.suite(&accepted.suite_id).unwrap().unwrap();
+    let mut queued = previous.clone();
+    queued.state = "interrupted".into();
+    queued.error = Some("driver automatic resume queued after restart".into());
+    storage
+        .transaction(|tx| {
+            tx.execute(
+                "UPDATE benchmark_drivers SET payload=?1 WHERE driver_id=?2",
+                params![serde_json::to_vec(&queued).unwrap(), queued.id],
+            )?;
+            Ok::<_, BenchmarkError>(())
+        })
+        .unwrap();
+    assert!(service.driver(&accepted.id).is_err());
+    assert!(service.resumed_driver(&queued.id).is_err());
+    assert!(matches!(
+        service.resume_driver(&queued.id),
+        Err(BenchmarkError::Invalid)
+    ));
+    storage
+        .transaction(|tx| {
+            tx.execute(
+                "UPDATE benchmark_drivers SET payload=?1 WHERE driver_id=?2",
+                params![serde_json::to_vec(&previous).unwrap(), previous.id],
+            )?;
+            Ok::<_, BenchmarkError>(())
+        })
+        .unwrap();
     for fake_intent in [false, true] {
         let mut changed = operational.clone();
         if fake_intent {

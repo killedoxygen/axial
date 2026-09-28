@@ -356,6 +356,10 @@ fn terminal_benchmark_history_preserves_exact_read_only_records_and_source() {
     use crate::performance::benchmarks::{BenchmarkError, MIGRATION, MIGRATION_V2};
     for (state, error) in [
         ("stopped", "Stopped by the user"),
+        (
+            "interrupted",
+            "driver automatic resume queued after restart",
+        ),
         ("interrupted", "driver ignored after restart resume limit"),
     ] {
         let fixture = Fixture::new();
@@ -368,6 +372,11 @@ fn terminal_benchmark_history_preserves_exact_read_only_records_and_source() {
         let preview = inventory.preview();
         assert!(preview.instances[0].ordinary_import_available);
         assert!(!preview.cutover_available);
+        assert!(
+            preview
+                .blockers
+                .contains(&ImportBlocker::RetainedHistoryRequiresConversion)
+        );
         let prepared = inventory
             .prepare_instance(&preview.fingerprint, INSTANCE)
             .unwrap();
@@ -493,7 +502,11 @@ fn terminal_benchmark_history_rejects_unsupported_or_incoherent_source_without_w
         "driver_schema",
         "nonterminal_driver",
         "active_driver",
-        "handoff",
+        "handoff_state",
+        "handoff_active",
+        "handoff_missing_report",
+        "handoff_descriptor",
+        "handoff_unknown_driver",
         "limit_state",
         "limit_active",
         "limit_missing_report",
@@ -507,9 +520,13 @@ fn terminal_benchmark_history_rejects_unsupported_or_incoherent_source_without_w
         let fixture = Fixture::new();
         let mut manifest = suite();
         let mut status = driver();
-        if case.starts_with("limit_") {
+        if case.starts_with("limit_") || case.starts_with("handoff_") {
             status["state"] = json!("interrupted");
-            status["error"] = json!("driver ignored after restart resume limit");
+            status["error"] = json!(if case.starts_with("handoff_") {
+                "driver automatic resume queued after restart"
+            } else {
+                "driver ignored after restart resume limit"
+            });
         }
         match case {
             "schema" => manifest["schema_version"] = json!(3),
@@ -526,15 +543,15 @@ fn terminal_benchmark_history_rejects_unsupported_or_incoherent_source_without_w
             "driver_schema" => status["schema_version"] = json!(1),
             "nonterminal_driver" => status["state"] = json!("scheduled"),
             "active_driver" => status["active_session_id"] = json!("session-a"),
-            "handoff" => {
-                status["state"] = json!("interrupted");
-                status["error"] = json!("driver automatic resume queued after restart");
+            "limit_state" | "handoff_state" => status["state"] = json!("failed"),
+            "limit_active" | "handoff_active" => status["active_session_id"] = json!("session-a"),
+            "limit_missing_report" | "handoff_missing_report" => {
+                status["last_session_id"] = json!("missing")
             }
-            "limit_state" => status["state"] = json!("failed"),
-            "limit_active" => status["active_session_id"] = json!("session-a"),
-            "limit_missing_report" => status["last_session_id"] = json!("missing"),
-            "limit_descriptor" => manifest["runs"][0]["profile"] = json!("other"),
-            "limit_unknown_driver" => status["future"] = json!(true),
+            "limit_descriptor" | "handoff_descriptor" => {
+                manifest["runs"][0]["profile"] = json!("other")
+            }
+            "limit_unknown_driver" | "handoff_unknown_driver" => status["future"] = json!(true),
             "driver_counts" => status["launched_run_count"] = json!(2),
             "orphan_driver" => status["suite_id"] = json!("suite-dev-0000000000000002"),
             "missing_last" => status["last_session_id"] = json!("missing"),

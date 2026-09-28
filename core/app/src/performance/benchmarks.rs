@@ -845,6 +845,11 @@ fn require_mutable(historical: bool) -> Result<(), BenchmarkError> {
     }
 }
 
+fn has_queued_handoff(driver: &BenchmarkSuiteDriverStatus) -> bool {
+    driver.historical
+        && driver.error.as_deref() == Some("driver automatic resume queued after restart")
+}
+
 /// Historical metadata only. Preparation is outside the instance publication
 /// transaction; insertion grants neither launch intent nor driver authority.
 #[derive(Clone)]
@@ -1109,7 +1114,7 @@ fn validate_driver_link(
         .optional()?
         .ok_or(BenchmarkError::Unavailable)?;
     let source = decode_driver(source_id, &bytes, source_request.as_deref())?;
-    if !source.historical || parent.is_some() {
+    if !source.historical || has_queued_handoff(&source) || parent.is_some() {
         return Err(BenchmarkError::Unavailable);
     }
     if !suites.contains_key(&driver.suite_id) {
@@ -1172,7 +1177,7 @@ fn continuation_in(
     BenchmarkError,
 > {
     let driver = stored_driver(connection, id)?.ok_or(BenchmarkError::NotFound)?;
-    if !driver.historical {
+    if !driver.historical || has_queued_handoff(&driver) {
         return Err(BenchmarkError::Invalid);
     }
     let (source, parent) =
@@ -1889,6 +1894,8 @@ impl BenchmarkService {
                 let driver = by_id.get(requested.id.as_str()).ok_or(BenchmarkError::NotFound)?;
                 let (available, successor, instance) = if !driver.historical {
                     (matches!(driver.state.as_str(), "stopped" | "failed" | "interrupted") && !active.contains(driver.suite_id.as_str()), None, None)
+                } else if has_queued_handoff(driver) {
+                    (false, None, None)
                 } else if let Some(successor) = links.get(&driver.id) {
                     (false, Some(successor.clone()), None)
                 } else {
@@ -1930,6 +1937,11 @@ impl BenchmarkService {
         &self,
         source_driver: BenchmarkSuiteDriverStatus,
     ) -> Result<BenchmarkSuiteDriverStatus, BenchmarkError> {
+        // The predecessor cleared its active session when queuing this handoff.
+        // Preserving that snapshot cannot authorize a replacement continuation.
+        if has_queued_handoff(&source_driver) {
+            return Err(BenchmarkError::Invalid);
+        }
         let _source_lease = self.admit_suite(&source_driver.suite_id)?;
         if let Some(existing) = self
             .storage
@@ -2360,10 +2372,10 @@ fn validate_driver(driver: &BenchmarkSuiteDriverStatus) -> Result<(), BenchmarkE
                 || crate::launch::logs::Redactor::new(Vec::new()).redact_line(error) != error
                 || (matches!(
                     error,
-                    "driver automatic resume started after restart"
+                    "driver automatic resume queued after restart"
+                        | "driver automatic resume started after restart"
                         | "driver ignored after restart resume limit"
                 ) && driver.state != "interrupted")
-                || error == "driver automatic resume queued after restart"
         })
     {
         return Err(BenchmarkError::Unavailable);

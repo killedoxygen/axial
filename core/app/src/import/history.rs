@@ -810,10 +810,10 @@ impl LegacyDriver {
                     || error.chars().any(char::is_control)
                     || (matches!(
                         error,
-                        "driver automatic resume started after restart"
+                        "driver automatic resume queued after restart"
+                            | "driver automatic resume started after restart"
                             | "driver ignored after restart resume limit"
                     ) && self.state != "interrupted")
-                    || error == "driver automatic resume queued after restart"
             })
         {
             return Err(ImportError::InvalidData);
