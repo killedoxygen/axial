@@ -2649,7 +2649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn composed_instance_import_preserves_queued_handoff_without_resuming() {
+    async fn composed_instance_import_resumes_compatible_queued_handoff_explicitly() {
         for has_report in [false, true] {
             composed_instance_history_import(
                 "interrupted",
@@ -2669,8 +2669,7 @@ mod tests {
         has_report: bool,
         canonical_plan: bool,
     ) {
-        let can_resume =
-            canonical_plan && driver_error != Some("driver automatic resume queued after restart");
+        let can_resume = canonical_plan;
         let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let baseline = root.path().join("baseline");
         fs::create_dir(&baseline).unwrap();

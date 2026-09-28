@@ -1355,7 +1355,7 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
     assert!(reopened.server.is_shutdown_settled());
 }
 
-fn benchmark_predecessor_files(root: &Path, mixed: bool) -> Vec<(PathBuf, Vec<u8>)> {
+fn benchmark_predecessor_files(root: &Path, mixed: bool, queued: bool) -> Vec<(PathBuf, Vec<u8>)> {
     use axial_app::performance::benchmarks::{benchmark_suite_plan, benchmark_suite_run_id};
 
     const INSTANCE: &str = "0000000000000001";
@@ -1391,11 +1391,11 @@ fn benchmark_predecessor_files(root: &Path, mixed: bool) -> Vec<(PathBuf, Vec<u8
         "runs":runs
     });
     let driver = json!({
-        "id":DRIVER,"suite_id":SUITE,"mode":"development","state":"stopped",
+        "id":DRIVER,"suite_id":SUITE,"mode":"development","state":if queued { "interrupted" } else { "stopped" },
         "interval_ms":5000,"run_count":2,"launched_run_count":usize::from(mixed),
         "pending_run_index":usize::from(mixed),"active_session_id":null,
         "last_run_index":mixed.then_some(0),"last_session_id":mixed.then_some("session-a"),
-        "error":"Stopped by the user",
+        "error":if queued { "driver automatic resume queued after restart" } else { "Stopped by the user" },
         "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:02Z"
     });
     let mut files = vec![
@@ -1492,13 +1492,17 @@ fn retained_benchmark_bytes(
         .unwrap()
 }
 
-async fn imported_benchmark_resume_journey(mixed: bool) {
+async fn imported_benchmark_resume_journey(mixed: bool, queued: bool) {
     use axial_app::import::{Inventory, ReadOnlySource};
 
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let baseline = temporary.path().join("predecessor");
-    let originals = benchmark_predecessor_files(&baseline, mixed);
+    let originals = benchmark_predecessor_files(&baseline, mixed, queued);
+    let original_modified: Vec<_> = originals
+        .iter()
+        .map(|(path, _)| std::fs::metadata(path).unwrap().modified().unwrap())
+        .collect();
     let profile = temporary.path().join("replacement");
     let provider = Provider::start(false).await;
     let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
@@ -1540,15 +1544,18 @@ async fn imported_benchmark_resume_journey(mixed: bool) {
         preview["instances"][0]["ordinary_import_available"], true,
         "{preview}"
     );
+    assert_eq!(preview["cutover_available"], false);
+    let import_request = json!({
+        "fingerprint":preview["fingerprint"],"legacy_id":"0000000000000001"
+    });
     let imported = api
-        .post(
-            "/api/v1/import/instances",
-            json!({
-                "fingerprint":preview["fingerprint"],"legacy_id":"0000000000000001"
-            }),
-        )
+        .post("/api/v1/import/instances", import_request.clone())
         .await;
+    assert_eq!(imported["cutover_available"], false);
     let instance = imported["instance"]["id"].as_str().unwrap().to_owned();
+    let repeated = api.post("/api/v1/import/instances", import_request).await;
+    assert_eq!(repeated["instance"]["id"], instance);
+    assert_eq!(repeated["cutover_available"], false);
     wait_launchable(&api, &instance).await;
     assert!(
         services.sessions.snapshots().is_empty(),
@@ -1558,6 +1565,13 @@ async fn imported_benchmark_resume_journey(mixed: bool) {
     let drivers = api.get("/api/v1/launch/benchmark/suite/drivers").await;
     assert_eq!(drivers["drivers"].as_array().unwrap().len(), 1);
     let original_driver = drivers["drivers"][0]["driver"].clone();
+    if queued {
+        assert_eq!(original_driver["state"], "interrupted");
+        assert_eq!(
+            original_driver["error"],
+            "driver automatic resume queued after restart"
+        );
+    }
     let source_driver = original_driver["id"].as_str().unwrap().to_owned();
     let source_suite = original_driver["suite_id"].as_str().unwrap().to_owned();
     let driver_path = format!("/api/v1/launch/benchmark/suite/drivers/{source_driver}");
@@ -1572,6 +1586,33 @@ async fn imported_benchmark_resume_journey(mixed: bool) {
     for run in original_suite["runs"].as_array().unwrap() {
         assert!(run.get("launch_intent").is_none());
     }
+
+    services.imports.forget().unwrap();
+    drop(source);
+    services.server.shutdown().await.unwrap();
+    assert!(services.server.is_shutdown_settled());
+    drop(services);
+    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+        .await
+        .unwrap();
+    let api = Api::new(&services);
+    assert_eq!(api.get(&driver_path).await, ready);
+    assert_eq!(api.get(&suite_path).await, original_suite);
+    assert_eq!(services.benchmarks.resume_interrupted_drivers().unwrap(), 0);
+    assert!(services.sessions.snapshots().is_empty());
+    assert!(services.tasks.status().is_idle());
+    services.instances.registry().storage().read(|db| {
+        let (intents, drivers, runnable): (i64, i64, i64) = db.query_row(
+            "SELECT (SELECT COUNT(*) FROM launch_intents), (SELECT COUNT(*) FROM benchmark_drivers), (SELECT COUNT(*) FROM benchmark_drivers WHERE request IS NOT NULL)",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!((intents, drivers, runnable), (0, 1, 0), "import and reopen must not schedule predecessor work");
+        Ok::<_, axial_app::storage::StorageError>(())
+    }).unwrap();
+    assert_eq!(
+        retained_benchmark_bytes(&services, &source_suite, &source_driver, original_report),
+        historical_bytes
+    );
 
     // Discard the accepted HTTP response body. The source GET must recover the
     // durable successor without issuing a second command or inventing an ID.
@@ -1685,7 +1726,6 @@ async fn imported_benchmark_resume_journey(mixed: bool) {
     );
     provider.assert_requests(true);
     services.imports.forget().unwrap();
-    drop(source);
     services.server.shutdown().await.unwrap();
     assert!(services.server.is_shutdown_settled());
     drop(services);
@@ -1748,8 +1788,14 @@ async fn imported_benchmark_resume_journey(mixed: bool) {
         retained_benchmark_bytes(&reopened, &source_suite, &source_driver, original_report),
         historical_bytes
     );
-    for (path, bytes) in &originals {
+    for ((path, bytes), modified) in originals.iter().zip(original_modified) {
         assert_eq!(std::fs::read(path).unwrap(), *bytes, "{}", path.display());
+        assert_eq!(
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+            modified,
+            "{}",
+            path.display()
+        );
     }
     reopened.server.shutdown().await.unwrap();
     assert!(reopened.server.is_shutdown_settled());
@@ -1757,12 +1803,22 @@ async fn imported_benchmark_resume_journey(mixed: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_imported_benchmark_resume_all_pending_executes_once_and_reopens() {
-    imported_benchmark_resume_journey(false).await;
+    imported_benchmark_resume_journey(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_imported_benchmark_resume_mixed_preserves_terminal_and_executes_remaining() {
-    imported_benchmark_resume_journey(true).await;
+    imported_benchmark_resume_journey(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_imported_benchmark_resume_queued_all_pending_requires_explicit_command() {
+    imported_benchmark_resume_journey(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_imported_benchmark_resume_queued_mixed_preserves_source_and_executes_remaining() {
+    imported_benchmark_resume_journey(true, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

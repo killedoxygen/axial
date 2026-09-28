@@ -518,11 +518,15 @@ fn insert_continuation_history(
     prepared
 }
 
-async fn explicit_imported_driver_resume(mixed: bool, terminal_state: &str) {
+async fn explicit_imported_driver_resume(mixed: bool, terminal_state: &str, queued: bool) {
     let root = fixture_directory();
     let storage = open_storage(&root.path().join("metadata.sqlite"));
     let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-    let (mut source, previous, mut report) = continuation_history(&instance, mixed);
+    let (mut source, mut previous, mut report) = continuation_history(&instance, mixed);
+    if queued {
+        previous.state = "interrupted".into();
+        previous.error = Some("driver automatic resume queued after restart".into());
+    }
     if let Some(report) = &mut report {
         source.runs[0].state = terminal_state.into();
         report.stages[0].evidence[1].details[0] = terminal_state.into();
@@ -625,17 +629,27 @@ async fn explicit_imported_driver_resume(mixed: bool, terminal_state: &str) {
 
 #[tokio::test]
 async fn explicit_imported_driver_resume_accepts_all_pending_current_plan() {
-    explicit_imported_driver_resume(false, "exited").await;
+    explicit_imported_driver_resume(false, "exited", false).await;
 }
 
 #[tokio::test]
 async fn explicit_imported_driver_resume_accepts_mixed_terminal_and_pending_current_plan() {
-    explicit_imported_driver_resume(true, "exited").await;
+    explicit_imported_driver_resume(true, "exited", false).await;
 }
 
 #[tokio::test]
 async fn explicit_imported_driver_resume_accepts_original_completed_outcome() {
-    explicit_imported_driver_resume(true, "completed").await;
+    explicit_imported_driver_resume(true, "completed", false).await;
+}
+
+#[tokio::test]
+async fn explicit_imported_queued_driver_resume_accepts_all_pending_current_plan() {
+    explicit_imported_driver_resume(false, "exited", true).await;
+}
+
+#[tokio::test]
+async fn explicit_imported_queued_driver_resume_preserves_prior_terminal_run() {
+    explicit_imported_driver_resume(true, "exited", true).await;
 }
 
 #[tokio::test]
@@ -647,11 +661,14 @@ async fn explicit_imported_driver_resume_refuses_unsupported_or_contradictory_ev
         "wrong_outcome",
         "wrong_launch_time",
         "unsupported_plan",
+        "missing_destination",
     ] {
         let root = fixture_directory();
         let storage = open_storage(&root.path().join("metadata.sqlite"));
         let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-        let (mut source, previous, mut report) = continuation_history(&instance, true);
+        let (mut source, mut previous, mut report) = continuation_history(&instance, true);
+        previous.state = "interrupted".into();
+        previous.error = Some("driver automatic resume queued after restart".into());
         match case {
             "missing_report" => report = None,
             "wrong_instance" => {
@@ -665,11 +682,20 @@ async fn explicit_imported_driver_resume_refuses_unsupported_or_contradictory_ev
                 report.as_mut().unwrap().launched_at = "2026-01-01T00:06:00.000Z".into()
             }
             "unsupported_plan" => source.runs[1].profile = "retained+custom".into(),
+            "missing_destination" => {
+                source.instance_id = InstanceId::new().to_string();
+                report.as_mut().unwrap().instance_id = source.instance_id.clone();
+            }
             _ => unreachable!(),
         }
         let prepared = insert_continuation_history(&storage, &source, &previous, report.as_ref());
         assert!(!service.can_resume_driver(&previous.id).unwrap(), "{case}");
-        assert!(service.resume_driver(&previous.id).is_err(), "{case}");
+        let result = service.resume_driver(&previous.id);
+        if case == "missing_destination" {
+            assert!(matches!(result, Err(BenchmarkError::NotFound)));
+        } else {
+            assert!(result.is_err(), "{case}");
+        }
         storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
         assert_eq!(service.drivers().unwrap(), vec![previous]);
         assert!(service.tasks.status().is_idle());
@@ -823,68 +849,74 @@ async fn continuation_drivers_share_one_operational_suite_and_preserve_source_co
 }
 
 #[tokio::test]
-async fn restart_limit_continuation_response_loss_and_task_refusal_reopen_the_same_successor() {
-    for refuse_task in [false, true] {
-        let root = fixture_directory();
-        let path = root.path().join("metadata.sqlite");
-        let storage = open_storage(&path);
-        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-        let (source, mut previous, report) = continuation_history(&instance, true);
-        previous.state = "interrupted".into();
-        previous.error = Some("driver ignored after restart resume limit".into());
-        let prepared = insert_continuation_history(&storage, &source, &previous, report.as_ref());
-        assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
-        assert!(service.can_resume_driver(&previous.id).unwrap());
-        assert!(service.resumed_driver(&previous.id).unwrap().is_none());
-        if refuse_task {
-            service
-                .tasks
-                .shutdown(std::time::Duration::from_secs(2))
-                .await
-                .unwrap();
+async fn historical_continuation_response_loss_and_task_refusal_reopen_the_same_successor() {
+    for marker in [
+        "driver ignored after restart resume limit",
+        "driver automatic resume queued after restart",
+    ] {
+        for refuse_task in [false, true] {
+            let root = fixture_directory();
+            let path = root.path().join("metadata.sqlite");
+            let storage = open_storage(&path);
+            let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+            let (source, mut previous, report) = continuation_history(&instance, true);
+            previous.state = "interrupted".into();
+            previous.error = Some(marker.into());
+            let prepared =
+                insert_continuation_history(&storage, &source, &previous, report.as_ref());
+            assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
+            assert!(service.can_resume_driver(&previous.id).unwrap());
+            assert!(service.resumed_driver(&previous.id).unwrap().is_none());
+            if refuse_task {
+                service
+                    .tasks
+                    .shutdown(std::time::Duration::from_secs(2))
+                    .await
+                    .unwrap();
+            }
+            let result = service.resume_driver(&previous.id);
+            assert_eq!(result.is_err(), refuse_task);
+            drop(result);
+            let accepted = service.resumed_driver(&previous.id).unwrap().unwrap();
+            if refuse_task {
+                assert_eq!(accepted.state, "failed");
+            } else {
+                service.stop_driver(&accepted.id).unwrap();
+                service
+                    .tasks
+                    .shutdown(std::time::Duration::from_secs(2))
+                    .await
+                    .unwrap();
+            }
+            let terminal = service.driver(&accepted.id).unwrap();
+            assert_eq!(service.resume_driver(&previous.id).unwrap(), terminal);
+            drop(service);
+            drop(storage);
+            let storage = open_storage(&path);
+            let reopened = self::service(root.path(), storage.clone());
+            assert_eq!(
+                reopened.resumed_driver(&previous.id).unwrap(),
+                Some(terminal.clone())
+            );
+            assert_eq!(reopened.resume_driver(&previous.id).unwrap(), terminal);
+            assert!(reopened.tasks.status().is_idle());
+            assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
+            assert!(!reopened.can_resume_driver(&previous.id).unwrap());
+            assert!(reopened.can_resume_driver(&accepted.id).unwrap());
+            storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
+            assert_eq!(
+                reopened
+                    .reports
+                    .get(report.as_ref().unwrap().session_id.as_str())
+                    .unwrap(),
+                report
+            );
         }
-        let result = service.resume_driver(&previous.id);
-        assert_eq!(result.is_err(), refuse_task);
-        drop(result);
-        let accepted = service.resumed_driver(&previous.id).unwrap().unwrap();
-        if refuse_task {
-            assert_eq!(accepted.state, "failed");
-        } else {
-            service.stop_driver(&accepted.id).unwrap();
-            service
-                .tasks
-                .shutdown(std::time::Duration::from_secs(2))
-                .await
-                .unwrap();
-        }
-        let terminal = service.driver(&accepted.id).unwrap();
-        assert_eq!(service.resume_driver(&previous.id).unwrap(), terminal);
-        drop(service);
-        drop(storage);
-        let storage = open_storage(&path);
-        let reopened = self::service(root.path(), storage.clone());
-        assert_eq!(
-            reopened.resumed_driver(&previous.id).unwrap(),
-            Some(terminal.clone())
-        );
-        assert_eq!(reopened.resume_driver(&previous.id).unwrap(), terminal);
-        assert!(reopened.tasks.status().is_idle());
-        assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
-        assert!(!reopened.can_resume_driver(&previous.id).unwrap());
-        assert!(reopened.can_resume_driver(&accepted.id).unwrap());
-        storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-        assert_eq!(
-            reopened
-                .reports
-                .get(report.as_ref().unwrap().session_id.as_str())
-                .unwrap(),
-            report
-        );
     }
 }
 
 #[tokio::test]
-async fn queued_handoff_history_refuses_continuation_with_shared_suite_projection_after_reopen() {
+async fn queued_handoff_history_continuation_serializes_shared_suite_and_reopens() {
     for mixed in [false, true] {
         let root = fixture_directory();
         let path = root.path().join("metadata.sqlite");
@@ -901,6 +933,46 @@ async fn queued_handoff_history_refuses_continuation_with_shared_suite_projectio
         storage.transaction(|tx| other.insert_in(tx)).unwrap();
         drop(service);
         drop(storage);
+        let storage = open_storage(&path);
+        let service = self::service(root.path(), storage.clone());
+        assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
+        assert!(service.tasks.status().is_idle());
+        assert!(service.sessions.sessions().is_empty());
+        assert!(service.resumed_driver(&queued.id).unwrap().is_none());
+        for drivers in [
+            vec![previous.clone(), queued.clone()],
+            vec![queued.clone(), previous.clone()],
+        ] {
+            let actions = service.resume_actions(&drivers).unwrap();
+            assert_eq!(actions[&previous.id], (true, None));
+            assert_eq!(actions[&queued.id], (true, None));
+        }
+        assert!(matches!(
+            service.stop_driver(&queued.id),
+            Err(BenchmarkError::Invalid)
+        ));
+        let accepted = service.resume_driver(&queued.id).unwrap();
+        for drivers in [
+            vec![previous.clone(), queued.clone()],
+            vec![queued.clone(), previous.clone()],
+        ] {
+            let actions = service.resume_actions(&drivers).unwrap();
+            assert_eq!(actions[&previous.id], (false, None));
+            assert_eq!(actions[&queued.id], (false, Some(accepted.id.clone())));
+        }
+        assert!(matches!(
+            service.resume_driver(&previous.id),
+            Err(BenchmarkError::Busy)
+        ));
+        service.stop_driver(&accepted.id).unwrap();
+        service
+            .tasks
+            .shutdown(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let terminal = service.driver(&accepted.id).unwrap();
+        drop(service);
+        drop(storage);
         for _ in 0..2 {
             let storage = open_storage(&path);
             let service = self::service(root.path(), storage.clone());
@@ -912,24 +984,25 @@ async fn queued_handoff_history_refuses_continuation_with_shared_suite_projectio
             ] {
                 let actions = service.resume_actions(&drivers).unwrap();
                 assert_eq!(actions[&previous.id], (true, None));
-                assert_eq!(actions[&queued.id], (false, None));
+                assert_eq!(actions[&queued.id], (false, Some(accepted.id.clone())));
             }
             assert!(!service.can_resume_driver(&queued.id).unwrap());
-            assert!(matches!(
-                service.resume_driver(&queued.id),
-                Err(BenchmarkError::Invalid)
-            ));
+            assert_eq!(service.resume_driver(&queued.id).unwrap(), terminal);
             assert!(matches!(
                 service.stop_driver(&queued.id),
                 Err(BenchmarkError::Invalid)
             ));
-            assert!(service.resumed_driver(&queued.id).unwrap().is_none());
+            assert_eq!(
+                service.resumed_driver(&queued.id).unwrap(),
+                Some(terminal.clone())
+            );
             assert_eq!(service.driver(&queued.id).unwrap(), queued);
             assert_eq!(
                 service.suite(&source.suite_id).unwrap(),
                 Some(source.clone())
             );
             storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
+            storage.transaction(|tx| other.verify_in(tx)).unwrap();
             assert!(service.tasks.status().is_idle());
             assert!(service.sessions.sessions().is_empty());
             storage
@@ -939,7 +1012,7 @@ async fn queued_handoff_history_refuses_continuation_with_shared_suite_projectio
                         [],
                         |row| row.get(0),
                     )?;
-                    assert_eq!(count, 0);
+                    assert_eq!(count, 1);
                     let count: usize = db.query_row(
                         "SELECT count(*) FROM launch_intents",
                         [],
@@ -968,23 +1041,26 @@ async fn continuation_inherited_rows_and_private_links_are_checked_on_read_and_w
         .await
         .unwrap();
     let operational = service.suite(&accepted.suite_id).unwrap().unwrap();
-    let mut queued = previous.clone();
-    queued.state = "interrupted".into();
-    queued.error = Some("driver automatic resume queued after restart".into());
+    let mut invalid_source = previous.clone();
+    invalid_source.state = "stopped".into();
+    invalid_source.error = Some("driver automatic resume queued after restart".into());
     storage
         .transaction(|tx| {
             tx.execute(
                 "UPDATE benchmark_drivers SET payload=?1 WHERE driver_id=?2",
-                params![serde_json::to_vec(&queued).unwrap(), queued.id],
+                params![
+                    serde_json::to_vec(&invalid_source).unwrap(),
+                    invalid_source.id
+                ],
             )?;
             Ok::<_, BenchmarkError>(())
         })
         .unwrap();
     assert!(service.driver(&accepted.id).is_err());
-    assert!(service.resumed_driver(&queued.id).is_err());
+    assert!(service.resumed_driver(&invalid_source.id).is_err());
     assert!(matches!(
-        service.resume_driver(&queued.id),
-        Err(BenchmarkError::Invalid)
+        service.resume_driver(&invalid_source.id),
+        Err(BenchmarkError::Unavailable)
     ));
     storage
         .transaction(|tx| {
