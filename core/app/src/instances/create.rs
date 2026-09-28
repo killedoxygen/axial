@@ -880,6 +880,32 @@ impl InstanceService {
         Ok(public_instance(record.instance))
     }
 
+    /// Playing sessions may lend their existing admission for next-launch
+    /// metadata. File mutations and deletion still require a fresh exclusion.
+    pub fn update_with_sessions(
+        &self,
+        id: &InstanceId,
+        patch: super::model::InstancePatch,
+        sessions: &crate::launch::session::SessionManager,
+    ) -> InstanceResult<Instance> {
+        match self.directories.admit(id) {
+            Ok(admitted) => self
+                .registry()
+                .update(id, admitted.record().revision, patch)
+                .map(|record| public_instance(record.instance)),
+            Err(InstanceError::Busy) => {
+                if self.tasks.status().closing {
+                    return Err(InstanceError::Closed);
+                }
+                let admitted = sessions.running_instance(id).ok_or(InstanceError::Busy)?;
+                self.directories
+                    .update_retained(&admitted, patch)
+                    .map(|record| public_instance(record.instance))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn publish_instance(
         &self,
         instance: Instance,
@@ -1595,6 +1621,11 @@ pub(crate) mod tests {
             service.update(&instance.id, Default::default()),
             Err(InstanceError::Busy)
         ));
+        let sessions = crate::launch::session::SessionManager::new(service.tasks.clone());
+        assert!(matches!(
+            service.update_with_sessions(&instance.id, Default::default(), &sessions),
+            Err(InstanceError::Busy)
+        ));
         assert!(
             service
                 .delete(
@@ -1606,6 +1637,201 @@ pub(crate) mod tests {
         );
         drop(retained);
         assert!(service.update(&instance.id, Default::default()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn retained_metadata_edit_uses_fresh_revision_and_keeps_file_exclusion_until_drop() {
+        let (_root, service) = fixture();
+        let instance = create(&service, "Playing").await;
+        let captured = service.directories.admit(&instance.id).unwrap();
+        captured
+            .record_successful_launch("2026-09-27T10:00:00.000Z")
+            .unwrap();
+        let loan = captured.clone();
+        drop(captured);
+        let renamed = service
+            .directories
+            .update_retained(
+                &loan,
+                super::super::model::InstancePatch {
+                    name: Some("Renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let edited = service
+            .directories
+            .update_retained(
+                &loan,
+                super::super::model::InstancePatch {
+                    expected_revision: Some(renamed.revision),
+                    max_memory_mb: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(edited.instance.name, "Renamed");
+        assert_eq!(edited.instance.last_played_at, "2026-09-27T10:00:00.000Z");
+        assert_eq!(edited.instance.settings.max_memory_mb, 4096);
+        assert_eq!(loan.record().instance, instance);
+        assert!(matches!(
+            loan.validate_current(),
+            Err(InstanceError::Conflict)
+        ));
+        for patch in [
+            super::super::model::InstancePatch {
+                expected_revision: Some(renamed.revision),
+                ..Default::default()
+            },
+            super::super::model::InstancePatch {
+                version_id: Some("other-version".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                service.directories.update_retained(&loan, patch),
+                Err(InstanceError::Conflict)
+            ));
+        }
+        assert_eq!(service.registry().get_live(&instance.id).unwrap(), edited);
+        assert!(matches!(
+            service.directories.admit(&instance.id),
+            Err(InstanceError::Busy)
+        ));
+        assert!(
+            service
+                .delete(
+                    &instance.id,
+                    DeleteIntent::DeleteFiles,
+                    uuid::Uuid::new_v4()
+                )
+                .is_err()
+        );
+        drop(loan);
+        assert!(service.directories.admit(&instance.id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn retained_metadata_edit_refuses_pending_effects_and_foreign_authority() {
+        let (_root, service) = fixture();
+        let instance = create(&service, "Playing").await;
+        let loan = service.directories.admit(&instance.id).unwrap();
+        let (_other_root, other) = fixture();
+        assert!(matches!(
+            other.directories.update_retained(&loan, Default::default()),
+            Err(InstanceError::Conflict)
+        ));
+        let foreign_exclusions = InstanceDirectories::new(
+            service.registry().clone(),
+            service.directories.library().clone(),
+            Exclusions::new(),
+        );
+        assert!(matches!(
+            foreign_exclusions.update_retained(&loan, Default::default()),
+            Err(InstanceError::Conflict)
+        ));
+        for (insert, remove) in [
+            (
+                "INSERT INTO content_batches VALUES(?1,'pending','{}')",
+                "DELETE FROM content_batches WHERE instance_id=?1",
+            ),
+            (
+                "INSERT INTO performance_operations VALUES(?1,'pending',X'7b7d')",
+                "DELETE FROM performance_operations WHERE instance_id=?1",
+            ),
+            (
+                "INSERT INTO instance_setups VALUES(?1,'pending','{}','pending')",
+                "DELETE FROM instance_setups WHERE instance_id=?1",
+            ),
+        ] {
+            service
+                .registry()
+                .storage()
+                .transaction(|tx| -> InstanceResult<()> {
+                    tx.execute(insert, [instance.id.as_str()])?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(matches!(
+                service
+                    .directories
+                    .update_retained(&loan, Default::default()),
+                Err(InstanceError::Busy)
+            ));
+            assert_eq!(
+                service.registry().get_live(&instance.id).unwrap(),
+                *loan.record()
+            );
+            service
+                .registry()
+                .storage()
+                .transaction(|tx| -> InstanceResult<()> {
+                    tx.execute(remove, [instance.id.as_str()])?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(
+            service
+                .directories
+                .update_retained(&loan, Default::default())
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_metadata_edit_refuses_deleting_or_replaced_physical_binding() {
+        let (root, service) = fixture();
+        let instance = create(&service, "Playing").await;
+        let loan = service.directories.admit(&instance.id).unwrap();
+        let deleting = service
+            .registry()
+            .storage()
+            .transaction(|tx| {
+                service
+                    .registry()
+                    .mark_deleting(tx, &instance.id, loan.record().revision)
+            })
+            .unwrap();
+        assert!(matches!(
+            service
+                .directories
+                .update_retained(&loan, Default::default()),
+            Err(InstanceError::Busy)
+        ));
+        service
+            .registry()
+            .storage()
+            .transaction(|tx| service.registry().restore_live(tx, &deleting))
+            .unwrap();
+        let before = service.registry().get_live(&instance.id).unwrap();
+        let game = payload_path(&service, &instance.id);
+        std::fs::write(game.join("options.txt"), b"original").unwrap();
+        let preserved = root.path().join("preserved");
+        std::fs::rename(&game, &preserved).unwrap();
+        std::fs::create_dir(&game).unwrap();
+        std::fs::write(game.join("options.txt"), b"replacement").unwrap();
+        assert!(
+            service
+                .directories
+                .update_retained(
+                    &loan,
+                    super::super::model::InstancePatch {
+                        name: Some("Must not be stored".into()),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(service.registry().get_live(&instance.id).unwrap(), before);
+        assert_eq!(
+            std::fs::read(preserved.join("options.txt")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read(game.join("options.txt")).unwrap(),
+            b"replacement"
+        );
     }
 
     #[tokio::test]

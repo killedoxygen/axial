@@ -123,6 +123,8 @@ if "net.minecraft.client.main.Main" in sys.argv[1:]:
     native = next(arg.split("=", 1)[1] for arg in args if arg.startswith("-Djava.library.path="))
     assert (pathlib.Path(native) / "{native}").read_bytes() == {native_literal}
     assert "net.minecraft.client.main.Main" in args
+    heap_mb = int(next(arg[4:-1] for arg in args if arg.startswith("-Xmx") and arg.endswith("M")))
+    print("Fixture heap MiB " + str(heap_mb), flush=True)
     print("Fixture command validated", flush=True)
 "#,
         config_literal = serde_json::to_string(&config.to_string()).unwrap(),
@@ -2328,6 +2330,146 @@ async fn real_offline_vanilla_install_launch_stop_and_restart() {
     assert_eq!(
         std::fs::read(save).unwrap(),
         b"user-owned save survives stop and restart"
+    );
+    reopened.server.shutdown().await.unwrap();
+    assert!(reopened.server.is_shutdown_settled());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_playing_instance_edits_preserve_active_command_and_next_launch_settings() {
+    let temporary =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let profile = temporary.path().join("profile");
+    let provider = Provider::start(false).await;
+    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+        .await
+        .unwrap();
+    let api = Api::new(&services);
+    api.post(
+        "/api/v1/accounts/offline",
+        json!({"username":PLAYER,"expected_selection_revision":0}),
+    )
+    .await;
+    api.request(
+        reqwest::Method::PUT,
+        "/api/v1/config",
+        Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
+    )
+    .await;
+    let start = api
+        .post(
+            "/api/v1/install/queue",
+            json!({"kind":"vanilla","version_id":VERSION}),
+        )
+        .await;
+    assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
+    let created = api
+        .post(
+            "/api/v1/instances",
+            json!({
+                "name":"Playing edit","selection_id":format!("vanilla|{VERSION}"),
+                "max_memory_mb":768,"min_memory_mb":256
+            }),
+        )
+        .await;
+    let instance = created["id"].as_str().unwrap();
+    wait_launchable(&api, instance).await;
+    let launched = api
+        .post(
+            "/api/v1/launch",
+            json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()}),
+        )
+        .await;
+    let first = launched["session_id"].as_str().unwrap();
+    let (_, processes) = observe_running_session(&api, first).await;
+    let before = api.get(&format!("/api/v1/instances/{instance}")).await;
+    assert!(!before["last_played_at"].as_str().unwrap().is_empty());
+    let rename = api
+        .client
+        .put(format!("{}/api/v1/instances/{instance}", api.base))
+        .header(transport::CAPABILITY_HEADER, &api.capability)
+        .json(&json!({"name":"Renamed while playing","expected_revision":before["revision"]}))
+        .send()
+        .await
+        .unwrap();
+    let rename_status = rename.status();
+    let renamed: Value = rename.json().await.unwrap();
+    if !rename_status.is_success() {
+        // The intended red must still settle the real fixture process and API.
+        observe_and_stop_session(&api, first).await;
+        assert_fixture_processes_gone(&processes).await;
+        services.server.shutdown().await.unwrap();
+        drop(services);
+        provider.shutdown().await;
+        panic!("Playing metadata edit was refused: {rename_status}: {renamed}");
+    }
+    assert_eq!(renamed["name"], "Renamed while playing");
+    let edited = api
+        .request(
+            reqwest::Method::PUT,
+            &format!("/api/v1/instances/{instance}"),
+            Some(json!({"max_memory_mb":1024,"expected_revision":renamed["revision"]})),
+        )
+        .await;
+    assert_eq!(edited["max_memory_mb"], 1024);
+    assert_eq!(edited["last_played_at"], before["last_played_at"]);
+    for patch in [
+        json!({"max_memory_mb":2048,"expected_revision":renamed["revision"]}),
+        json!({"version_id":"another-version","expected_revision":edited["revision"]}),
+    ] {
+        let response = api
+            .client
+            .put(format!("{}/api/v1/instances/{instance}", api.base))
+            .header(transport::CAPABILITY_HEADER, &api.capability)
+            .json(&patch)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+    let deletion = api
+        .client
+        .delete(format!("{}/api/v1/instances/{instance}", api.base))
+        .header(transport::CAPABILITY_HEADER, &api.capability)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deletion.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        api.get(&format!("/api/v1/launch/{first}/status")).await["phase"],
+        "running"
+    );
+    observe_and_stop_session(&api, first).await;
+    assert_fixture_processes_gone(&processes).await;
+    let original = services.benchmarks.reports().get(first).unwrap().unwrap();
+    assert_eq!(original.scenario.requested_memory_mb, Some(768));
+    assert!(
+        original
+            .logs
+            .iter()
+            .any(|line| line.text == "Fixture heap MiB 768")
+    );
+    services.server.shutdown().await.unwrap();
+    drop(services);
+    provider.shutdown().await;
+
+    let reopened = start_in_profile(profile, None).await.unwrap();
+    let api = Api::new(&reopened);
+    let restored = api.get(&format!("/api/v1/instances/{instance}")).await;
+    assert_eq!(restored["name"], "Renamed while playing");
+    assert_eq!(restored["max_memory_mb"], 1024);
+    assert_eq!(restored["revision"], edited["revision"]);
+    let second = launch_and_stop(&api, instance).await;
+    let next = reopened.benchmarks.reports().get(&second).unwrap().unwrap();
+    assert_eq!(next.scenario.requested_memory_mb, Some(1024));
+    assert!(
+        next.logs
+            .iter()
+            .any(|line| line.text == "Fixture heap MiB 1024")
+    );
+    assert_eq!(
+        reopened.benchmarks.reports().get(first).unwrap().unwrap(),
+        original
     );
     reopened.server.shutdown().await.unwrap();
     assert!(reopened.server.is_shutdown_settled());

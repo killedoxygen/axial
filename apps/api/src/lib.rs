@@ -848,7 +848,11 @@ async fn start_profile_inner(
             )
             .map_err(|error| StartupError::with_library(error.to_string(), library.clone()))?,
         )
-        .merge(routes::instances::router(instances.clone(), setup.clone()))
+        .merge(routes::instances::router(
+            instances.clone(),
+            setup.clone(),
+            sessions.clone(),
+        ))
         .merge(routes::setup::router(setup.clone()))
         .merge(routes::install::router(installs.clone(), setup.clone()))
         .merge(routes::loaders::router(

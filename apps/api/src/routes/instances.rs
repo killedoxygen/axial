@@ -6,6 +6,7 @@ use axial_app::instances::{
     model::{InstanceError, InstanceId, InstancePatch},
     setup::{InstanceSetupExecuteRequest, InstanceSetupPlanRequest, SetupService},
 };
+use axial_app::launch::session::SessionManager;
 use axum::{
     Json, Router,
     extract::{
@@ -23,11 +24,16 @@ use std::sync::Arc;
 struct Services {
     instances: Arc<InstanceService>,
     setup: Arc<SetupService>,
+    sessions: SessionManager,
 }
 type ApiError = (StatusCode, Json<Value>);
 
 /// Authentication and origin admission are attached once by API composition.
-pub fn router(instances: Arc<InstanceService>, setup: Arc<SetupService>) -> Router<()> {
+pub fn router(
+    instances: Arc<InstanceService>,
+    setup: Arc<SetupService>,
+    sessions: SessionManager,
+) -> Router<()> {
     Router::new()
         .route("/api/v1/instances", get(list).post(create))
         .route("/api/v1/instances/modpack", post(create_modpack))
@@ -54,7 +60,11 @@ pub fn router(instances: Arc<InstanceService>, setup: Arc<SetupService>) -> Rout
         )
         .route("/api/v1/instances/{id}/duplicate", post(duplicate))
         .layer(DefaultBodyLimit::max(32 * 1024))
-        .with_state(Services { instances, setup })
+        .with_state(Services {
+            instances,
+            setup,
+            sessions,
+        })
 }
 
 async fn list(State(services): State<Services>) -> Result<Json<Value>, ApiError> {
@@ -110,7 +120,10 @@ async fn create_modpack(
     body: Result<Json<CreateFromModpackRequest>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(request) = body.map_err(|_| invalid())?;
-    services.setup.create_from_modpack(request).await
+    services
+        .setup
+        .create_from_modpack(request)
+        .await
         .map(|response| Json(json!(response)))
         .map_err(error)
 }
@@ -123,7 +136,7 @@ async fn update(
     let Json(patch) = body.map_err(|_| invalid())?;
     let instance = services
         .instances
-        .update(&identity(&id)?, patch)
+        .update_with_sessions(&identity(&id)?, patch, &services.sessions)
         .map_err(error)?;
     let versions = services.setup.installed().await.map_err(error)?;
     Ok(Json(json!(

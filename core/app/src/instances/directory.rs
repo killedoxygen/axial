@@ -64,6 +64,23 @@ impl InstanceDirectories {
         Ok(admitted)
     }
 
+    /// The session lends its existing exclusion for metadata only. Startup
+    /// recency and earlier edits may have advanced the row since launch.
+    pub(super) fn update_retained(
+        &self,
+        admitted: &RegisteredInstance,
+        patch: InstancePatch,
+    ) -> InstanceResult<InstanceRecord> {
+        if !Arc::ptr_eq(&self.registry.storage, &admitted.registry.storage)
+            || !admitted.exclusion.belongs_to(&self.exclusions)
+        {
+            return Err(InstanceError::Conflict);
+        }
+        let current = validate_live_binding(&self.registry, &admitted.record, &admitted.directory)?;
+        self.registry
+            .update(&current.instance.id, current.revision, patch)
+    }
+
     pub(crate) fn admit_content_settlement(
         &self,
         id: &InstanceId,
@@ -174,37 +191,45 @@ impl ReadInstance {
     }
 
     pub(crate) fn validate_current(&self) -> InstanceResult<()> {
-        self.directory
-            .pin()
-            .revalidate()
-            .map_err(|_| InstanceError::LibraryUnavailable)?;
-        self.directory
-            .verify_receipt(
-                self.record
-                    .directory_receipt
-                    .as_deref()
-                    .ok_or(InstanceError::DirectoryUnavailable)?,
-            )
-            .map_err(|_| InstanceError::DirectoryUnavailable)?;
-        let id = &self.record.instance.id;
-        let current = self.registry.get_live(id)?;
-        if current.library_id != self.record.library_id
-            || current.directory_name != self.record.directory_name
-            || current.directory_receipt != self.record.directory_receipt
-            || current.instance.version_id != self.record.instance.version_id
-            || current.instance.loader_key != self.record.instance.loader_key
-            || current.instance.minecraft_version != self.record.instance.minecraft_version
-        {
-            return Err(InstanceError::Conflict);
-        }
-        if crate::content::install::has_pending(self.registry.storage(), id)?
-            || crate::performance::mutation::has_pending(self.registry.storage(), id)?
-            || super::setup::has_pending(self.registry.storage(), id)?
-        {
-            return Err(InstanceError::Busy);
-        }
-        Ok(())
+        validate_live_binding(&self.registry, &self.record, &self.directory).map(|_| ())
     }
+}
+
+fn validate_live_binding(
+    registry: &Registry,
+    captured: &InstanceRecord,
+    directory: &ScopedDirectory,
+) -> InstanceResult<InstanceRecord> {
+    directory
+        .pin()
+        .revalidate()
+        .map_err(|_| InstanceError::LibraryUnavailable)?;
+    directory
+        .verify_receipt(
+            captured
+                .directory_receipt
+                .as_deref()
+                .ok_or(InstanceError::DirectoryUnavailable)?,
+        )
+        .map_err(|_| InstanceError::DirectoryUnavailable)?;
+    let id = &captured.instance.id;
+    let current = registry.get_live(id)?;
+    if current.library_id != captured.library_id
+        || current.directory_name != captured.directory_name
+        || current.directory_receipt != captured.directory_receipt
+        || current.instance.version_id != captured.instance.version_id
+        || current.instance.loader_key != captured.instance.loader_key
+        || current.instance.minecraft_version != captured.instance.minecraft_version
+    {
+        return Err(InstanceError::Conflict);
+    }
+    if crate::content::install::has_pending(registry.storage(), id)?
+        || crate::performance::mutation::has_pending(registry.storage(), id)?
+        || super::setup::has_pending(registry.storage(), id)?
+    {
+        return Err(InstanceError::Busy);
+    }
+    Ok(current)
 }
 
 /// Retain this value through all work, including process output drainage and

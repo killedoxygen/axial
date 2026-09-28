@@ -186,7 +186,7 @@ impl std::fmt::Debug for PreparedSession {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         content::catalog::ContentService,
@@ -204,7 +204,7 @@ mod tests {
     use sha1::{Digest, Sha1};
     use std::os::unix::fs::PermissionsExt;
 
-    async fn fixture() -> (
+    pub(in crate::launch) async fn fixture() -> (
         tempfile::TempDir,
         PreparedSession,
         crate::library::ApplicationRootPin,

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -278,6 +278,7 @@ struct SessionEntry {
     scenario: LaunchProofScenario,
     telemetry: Arc<LaunchAttemptTelemetry>,
     acceptance: Option<super::coordinator::AcceptedIntent>,
+    preparation: Weak<PreparedSession>,
 }
 
 /// Minted only after native cleanup and either verified child/tree/output
@@ -642,10 +643,12 @@ impl SessionManager {
             return Err(SessionError::Busy);
         }
         let snapshot = SessionSnapshot::starting(instance_id.clone(), session_id);
+        let secrets = prepared.take_secrets();
+        let prepared = Arc::new(prepared);
         let entry = Arc::new(SessionEntry {
             state: Mutex::new(EntryState {
                 snapshot: snapshot.clone(),
-                logs: LogCollector::new(prepared.take_secrets()),
+                logs: LogCollector::new(secrets),
                 report: None,
                 process_started: None,
                 boot_duration_ms: None,
@@ -661,6 +664,7 @@ impl SessionManager {
             scenario: prepared.scenario().clone(),
             telemetry: prepared.telemetry(),
             acceptance: Some(acceptance),
+            preparation: Arc::downgrade(&prepared),
             command_inspection: SessionCommandInspection {
                 session_id: snapshot.session_id.clone(),
                 command_arg_count: prepared.validated_command().args().len(),
@@ -694,7 +698,6 @@ impl SessionManager {
         {
             return Err(SessionError::Busy);
         }
-        let prepared = Arc::new(prepared);
         let worker_prepared = Arc::clone(&prepared);
         let worker_entry = Arc::clone(&entry);
         // The task owner retains a separate preparation reference across a panic.
@@ -717,6 +720,38 @@ impl SessionManager {
 
     pub fn snapshot(&self, instance_id: &InstanceId) -> Option<SessionSnapshot> {
         self.entry(instance_id).map(|entry| entry.current())
+    }
+
+    /// Borrow only an accepted live session's exact target admission. The
+    /// returned clone keeps its exclusion and generation pinned across Stop;
+    /// terminal history itself must not keep those capabilities alive.
+    pub(crate) fn running_instance(&self, instance_id: &InstanceId) -> Option<RegisteredInstance> {
+        if self.tasks.status().closing {
+            return None;
+        }
+        let registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if registry.closing {
+            return None;
+        }
+        let entry = registry
+            .current
+            .get(instance_id)
+            .and_then(|id| registry.sessions.get(id))?;
+        let state = entry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.snapshot.phase != SessionPhase::Running
+            || !state.snapshot.process_alive
+            || *entry.stop.borrow()
+        {
+            return None;
+        }
+        let prepared = entry.preparation.upgrade()?;
+        (prepared.instance_id() == instance_id).then(|| prepared.instance().clone())
     }
 
     pub fn snapshot_by_session_id(&self, session_id: &str) -> Option<SessionSnapshot> {
@@ -1314,6 +1349,7 @@ fn entry_for_instance(
         },
         telemetry: LaunchAttemptTelemetry::started(telemetry, "vanilla"),
         acceptance: None,
+        preparation: Weak::new(),
     })
 }
 
@@ -1360,6 +1396,109 @@ fn exit_signal(_status: std::process::ExitStatus) -> Option<i32> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metadata_loan_requires_current_live_running_preparation_and_open_owners() {
+        let (_root, prepared, _application) = super::super::prepare::tests::fixture().await;
+        let prepared = Arc::new(prepared);
+        let id = prepared.instance_id().clone();
+        let storage = Arc::new(crate::storage::MetadataStore::in_memory().unwrap());
+        storage
+            .migrate(&[super::super::reports::REPORT_MIGRATION])
+            .unwrap();
+        let reports = LaunchReportStore::new(storage).unwrap();
+        let mut entry = entry_for_instance(reports, None, id.clone());
+        Arc::get_mut(&mut entry).unwrap().preparation = Arc::downgrade(&prepared);
+        let tasks = TaskOwner::new(1).unwrap();
+        let sessions = SessionManager::new(tasks.clone());
+        {
+            let mut registry = sessions.registry.lock().unwrap();
+            registry
+                .current
+                .insert(id.clone(), entry.current().session_id.clone());
+            registry
+                .sessions
+                .insert(entry.current().session_id.clone(), entry.clone());
+        }
+        for phase in [
+            SessionPhase::Starting,
+            SessionPhase::Stopping,
+            SessionPhase::Settling,
+            SessionPhase::Unresolved,
+            SessionPhase::Exited,
+        ] {
+            entry.publish(|snapshot| {
+                snapshot.phase = phase;
+                snapshot.process_alive = true;
+            });
+            assert!(sessions.running_instance(&id).is_none(), "{phase:?}");
+        }
+        entry.publish(|snapshot| {
+            snapshot.phase = SessionPhase::Running;
+            snapshot.process_alive = false;
+        });
+        assert!(sessions.running_instance(&id).is_none());
+        entry.publish(|snapshot| snapshot.process_alive = true);
+        assert!(sessions.running_instance(&id).is_some());
+        entry.stop.send_replace(true);
+        assert!(sessions.running_instance(&id).is_none());
+        entry.stop.send_replace(false);
+        sessions.registry.lock().unwrap().closing = true;
+        assert!(sessions.running_instance(&id).is_none());
+        sessions.registry.lock().unwrap().closing = false;
+        sessions.registry.lock().unwrap().current.remove(&id);
+        assert!(sessions.running_instance(&id).is_none());
+        sessions
+            .registry
+            .lock()
+            .unwrap()
+            .current
+            .insert(id.clone(), entry.current().session_id.clone());
+        assert!(sessions.running_instance(&id).is_some());
+        tasks.try_close_idle().unwrap();
+        assert!(sessions.running_instance(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_loan_survives_stop_without_terminal_history_retaining_preparation() {
+        let (_root, prepared, _application) = super::super::prepare::tests::fixture().await;
+        let prepared = Arc::new(prepared);
+        let id = prepared.instance_id().clone();
+        let storage = Arc::new(crate::storage::MetadataStore::in_memory().unwrap());
+        storage
+            .migrate(&[super::super::reports::REPORT_MIGRATION])
+            .unwrap();
+        let mut entry =
+            entry_for_instance(LaunchReportStore::new(storage).unwrap(), None, id.clone());
+        Arc::get_mut(&mut entry).unwrap().preparation = Arc::downgrade(&prepared);
+        let sessions = SessionManager::new(TaskOwner::new(1).unwrap());
+        {
+            let mut registry = sessions.registry.lock().unwrap();
+            registry
+                .current
+                .insert(id.clone(), entry.current().session_id.clone());
+            registry
+                .sessions
+                .insert(entry.current().session_id.clone(), entry.clone());
+        }
+        entry.publish(|snapshot| {
+            snapshot.phase = SessionPhase::Running;
+            snapshot.process_alive = true;
+        });
+        let loan = sessions.running_instance(&id).unwrap();
+        sessions.stop(&id).unwrap();
+        assert!(sessions.running_instance(&id).is_none());
+        drop(prepared);
+        assert!(entry.preparation.upgrade().is_none());
+        loan.validate_current().unwrap();
+        // Even a stale Running projection cannot create a new loan once the
+        // process owner's preparation is gone.
+        entry.stop.send_replace(false);
+        entry.publish(|snapshot| snapshot.phase = SessionPhase::Running);
+        assert!(sessions.running_instance(&id).is_none());
+        entry.publish(|snapshot| snapshot.phase = SessionPhase::Exited);
+        loan.validate_current().unwrap();
+    }
 
     async fn native_fixture() -> (
         tempfile::TempDir,
