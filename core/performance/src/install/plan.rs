@@ -454,11 +454,11 @@ fn validate_download_url(url: &str) -> Result<(), ManagedInstallPlanError> {
         return Err(ManagedInstallPlanError::InvalidDownloadUrl);
     }
     let parsed = Url::parse(url).map_err(|_| ManagedInstallPlanError::InvalidDownloadUrl)?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let admitted_scheme = parsed.scheme() == "https"
         || axial_minecraft::download::TransferOrigin::from_loopback_http_for_test_support(&parsed)
             .is_ok();
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let admitted_scheme = parsed.scheme() == "https";
     if !admitted_scheme
         || parsed.host_str().is_none()

@@ -148,7 +148,8 @@ async fn install(
         ));
     }
     let inspected = match action {
-        "apply" | "reapply" => api.service.apply(&id, request).await,
+        "apply" => api.service.apply(&id, request).await,
+        "reapply" => api.service.reapply(&id, request).await,
         "remove" => api.service.remove(&id).await,
         "rollback" => api.service.rollback(&id, body.rollback_id).await,
         _ => return Err(invalid()),

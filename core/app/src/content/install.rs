@@ -160,7 +160,16 @@ pub fn validate_planned_artifact(
     {
         return Err(invalid());
     }
-    validate_download_url(&file.url).map_err(|_| invalid())?;
+    let admitted_url = validate_download_url(&file.url).is_ok();
+    #[cfg(any(test, feature = "test-support"))]
+    let admitted_url = admitted_url
+        || reqwest::Url::parse(&file.url).is_ok_and(|url| {
+            url.fragment().is_none()
+                && TransferOrigin::from_loopback_http_for_test_support(&url).is_ok()
+        });
+    if !admitted_url {
+        return Err(invalid());
+    }
     Ok((size, name))
 }
 

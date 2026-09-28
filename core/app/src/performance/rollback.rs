@@ -4,7 +4,10 @@
 //! copies and publication receipts. A status row is never a substitute for those
 //! receipts and never grants cleanup authority.
 
-use axial_performance::{CompositionState, ManagedCompositionInstallPlan, RollbackSnapshotSummary};
+use axial_performance::{
+    CompositionState, ManagedCompositionInstallPlan, RollbackSnapshotSummary,
+    RollbackSnapshotTarget,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +27,17 @@ pub(crate) enum ExpectedComposition {
     },
     Snapshot {
         snapshot_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prepared: Option<PreparedSnapshot>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedSnapshot {
+    target: RollbackSnapshotTarget,
+    composition_id: Option<String>,
+    artifact_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +51,17 @@ pub(crate) struct ExpectedArtifact {
 }
 
 impl ExpectedComposition {
+    pub(crate) fn from_snapshot(snapshot: &RollbackSnapshotSummary) -> Self {
+        Self::Snapshot {
+            snapshot_id: snapshot.id.clone(),
+            prepared: Some(PreparedSnapshot {
+                target: snapshot.target,
+                composition_id: snapshot.composition_id.clone(),
+                artifact_count: snapshot.artifact_count,
+            }),
+        }
+    }
+
     pub(crate) fn from_plan(plan: &ManagedCompositionInstallPlan) -> Self {
         Self::Graph {
             composition_id: plan.composition_id().to_owned(),
@@ -162,6 +186,7 @@ mod tests {
     fn snapshot_identifier_is_never_treated_as_restoration_evidence() {
         let expected = ExpectedComposition::Snapshot {
             snapshot_id: "snapshot-1".into(),
+            prepared: None,
         };
         assert!(!expected.matches_verified(None));
         assert_eq!(

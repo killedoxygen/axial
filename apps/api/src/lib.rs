@@ -439,6 +439,8 @@ async fn start_profile(
         collector,
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
     .await
 }
@@ -448,7 +450,24 @@ async fn start_profile_with_test_endpoints(
     profile_root: PathBuf,
     endpoints: axial_minecraft::download::InstallTestEndpoints,
 ) -> Result<DesktopServices, StartupError> {
-    start_profile_inner(profile_root, None, false, None, Some(endpoints)).await
+    start_profile_inner(profile_root, None, false, None, Some(endpoints), None).await
+}
+
+#[cfg(test)]
+async fn start_profile_with_performance_test_inputs(
+    profile_root: PathBuf,
+    content_base_url: String,
+    transfers: axial_performance::ManagedArtifactTransferResolver,
+) -> Result<DesktopServices, StartupError> {
+    start_profile_inner(
+        profile_root,
+        None,
+        false,
+        None,
+        None,
+        Some((content_base_url, transfers)),
+    )
+    .await
 }
 
 async fn start_profile_inner(
@@ -457,6 +476,10 @@ async fn start_profile_inner(
     native_login: bool,
     collector: Option<CollectorConfig>,
     #[cfg(test)] test_endpoints: Option<axial_minecraft::download::InstallTestEndpoints>,
+    #[cfg(test)] performance_inputs: Option<(
+        String,
+        axial_performance::ManagedArtifactTransferResolver,
+    )>,
 ) -> Result<DesktopServices, StartupError> {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -612,15 +635,33 @@ async fn start_profile_inner(
                 let client = ProviderClient::new(ClientConfig::default())
                     .map_err(|error| error.to_string())?;
                 let catalog = Arc::new(Catalog::new(client.clone()));
-                let content = Arc::new(
-                    ContentService::new(client.clone()).map_err(|error| error.to_string())?,
-                );
+                let content =
+                    ContentService::new(client.clone()).map_err(|error| error.to_string())?;
+                let transfers = axial_app::performance::public_transfer_resolver();
+                #[cfg(test)]
+                let (content, transfers) = match performance_inputs {
+                    Some((base_url, transfers)) => {
+                        let origin = url::Url::parse(&base_url)
+                            .map_err(|error| error.to_string())?
+                            .origin()
+                            .ascii_serialization();
+                        let origins =
+                            axial_app::network::OriginPolicy::loopback_for_tests([origin], 0)
+                                .map_err(|error| error.to_string())?;
+                        let content =
+                            ContentService::with_base_url(client.clone(), base_url, origins)
+                                .map_err(|error| error.to_string())?;
+                        (content, transfers)
+                    }
+                    None => (content, transfers),
+                };
+                let content = Arc::new(content);
                 let performance = PerformanceService::new(
                     metadata.clone(),
                     directories.clone(),
                     tasks.clone(),
                     content.clone(),
-                    axial_app::performance::public_transfer_resolver(),
+                    transfers,
                 )
                 .map_err(|error| error.to_string())?;
                 let content_mutations = Arc::new(

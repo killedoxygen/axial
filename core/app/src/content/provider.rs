@@ -542,7 +542,12 @@ pub(super) fn map_file(file: dto::VersionFile) -> ContentResult<FileRef> {
     let url = reqwest::Url::parse(&file.url).map_err(|_| {
         ContentError::ProviderMetadataInvalid("invalid content file URL".to_string())
     })?;
-    if url.scheme() != "https"
+    let admitted_scheme = url.scheme() == "https";
+    #[cfg(any(test, feature = "test-support"))]
+    let admitted_scheme = admitted_scheme
+        || axial_minecraft::download::TransferOrigin::from_loopback_http_for_test_support(&url)
+            .is_ok();
+    if !admitted_scheme
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()

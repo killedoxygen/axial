@@ -47,4 +47,5 @@ reqwest.workspace = true
 http-body-util.workspace = true
 png.workspace = true
 sha1.workspace = true
+sha2.workspace = true
 zip.workspace = true

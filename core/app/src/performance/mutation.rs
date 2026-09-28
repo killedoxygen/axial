@@ -15,7 +15,7 @@ use crate::{
         MetadataStore, Migration, StorageError,
         rusqlite::{self, Connection, OptionalExtension, Transaction, params},
     },
-    tasks::{CancellationToken, TaskOwner},
+    tasks::{CancellationToken, TaskHandle, TaskOwner},
 };
 use axial_performance::{
     CompositionPlan, CompositionState, ManagedArtifactTransferResolver,
@@ -94,7 +94,7 @@ impl From<RulesWorkflowError> for PerformanceMutationError {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingOperation {
     operation_id: String,
@@ -106,7 +106,7 @@ struct PendingOperation {
     result: Option<CompletedComposition>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "state", rename_all = "snake_case")]
 enum CompletedComposition {
     Absent,
@@ -138,9 +138,18 @@ struct BoundInstance {
 struct RetainedOperation {
     instance: RegisteredInstance,
     bound: Option<BoundInstance>,
+    claimed: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PreparedContinuation {
+    pending: PendingOperation,
+    command: PerformanceOperationStatus,
+    bound: BoundInstance,
+    inspection: ManagedCompositionInspection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerformanceOperationStatus {
     pub id: String,
     pub instance_id: String,
@@ -695,6 +704,154 @@ fn command_status(
     Ok(status)
 }
 
+fn pending_command(
+    connection: &Connection,
+    pending: &PendingOperation,
+) -> Result<Option<PerformanceOperationStatus>, PerformanceMutationError> {
+    let record: Option<(String, String, Vec<u8>)> = connection
+        .query_row(
+            "SELECT instance_id,state,payload FROM performance_commands WHERE id=?1",
+            [&pending.operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((instance, state, bytes)) = record else {
+        return Ok(None);
+    };
+    let status = command_status(&pending.operation_id, &instance, &state, &bytes)?;
+    let action_matches = matches!(
+        (&pending.expected, status.action.as_str()),
+        (ExpectedComposition::Graph { .. }, "apply" | "reapply")
+            | (ExpectedComposition::Absent, "apply" | "reapply" | "remove")
+            | (ExpectedComposition::Snapshot { .. }, "rollback")
+    );
+    if status.history.is_some()
+        || status.instance_id != pending.instance_id.as_str()
+        || uuid::Uuid::parse_str(&status.id).is_err()
+        || !matches!(status.state.as_str(), "running" | "unsettled")
+        || !action_matches
+    {
+        return Err(PerformanceMutationError::Unsettled);
+    }
+    Ok(Some(status))
+}
+
+fn prepared_command(pending: &PendingOperation, command: &PerformanceOperationStatus) -> bool {
+    command.state == "running"
+        && !pending.target_effect_started
+        && pending.result.is_none()
+        && matches!(
+            pending.expected,
+            ExpectedComposition::Graph { .. }
+                | ExpectedComposition::Absent
+                | ExpectedComposition::Snapshot {
+                    prepared: Some(_),
+                    ..
+                }
+        )
+}
+
+fn read_pending(
+    connection: &Connection,
+    instance: &InstanceId,
+) -> Result<Option<PendingOperation>, PerformanceMutationError> {
+    let record: Option<(String, Vec<u8>)> = connection
+        .query_row(
+            "SELECT operation_id,payload FROM performance_operations WHERE instance_id=?1",
+            [instance.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    record
+        .map(|(id, bytes)| decode_pending(instance.as_str(), &id, &bytes))
+        .transpose()
+}
+
+fn decode_pending(
+    instance: &str,
+    id: &str,
+    bytes: &[u8],
+) -> Result<PendingOperation, PerformanceMutationError> {
+    let pending: PendingOperation =
+        serde_json::from_slice(bytes).map_err(|_| PerformanceMutationError::Unsettled)?;
+    if pending.instance_id.as_str() != instance
+        || pending.operation_id != id
+        || uuid::Uuid::parse_str(id).is_err()
+    {
+        return Err(PerformanceMutationError::Unsettled);
+    }
+    Ok(pending)
+}
+
+fn write_command(
+    tx: &Transaction<'_>,
+    status: &PerformanceOperationStatus,
+) -> Result<(), PerformanceMutationError> {
+    if status.history.is_some()
+        || uuid::Uuid::parse_str(&status.id).is_err()
+        || !matches!(
+            status.action.as_str(),
+            "apply" | "reapply" | "remove" | "rollback"
+        )
+        || !matches!(
+            status.state.as_str(),
+            "queued" | "running" | "complete" | "failed" | "interrupted" | "unsettled"
+        )
+    {
+        return Err(PerformanceMutationError::Unsettled);
+    }
+    let previous: Option<(String, String, Vec<u8>)> = tx
+        .query_row(
+            "SELECT instance_id,state,payload FROM performance_commands WHERE id=?1",
+            [&status.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((instance, state, bytes)) = previous {
+        let previous = command_status(&status.id, &instance, &state, &bytes)?;
+        if previous.history.is_some()
+            || previous.instance_id != status.instance_id
+            || previous.action != status.action
+            || previous.created_at != status.created_at
+            || (matches!(
+                previous.state.as_str(),
+                "complete" | "failed" | "interrupted"
+            ) && (previous.state != status.state || previous.error != status.error))
+        {
+            return Err(PerformanceMutationError::Unsettled);
+        }
+    }
+    let bytes = serde_json::to_vec(status).map_err(|_| PerformanceMutationError::Unsettled)?;
+    if tx.execute("INSERT INTO performance_commands(id,instance_id,state,payload) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET state=excluded.state,payload=excluded.payload", params![status.id, status.instance_id, status.state, bytes])? != 1 {
+        return Err(PerformanceMutationError::Unsettled);
+    }
+    let saved: (String, String, Vec<u8>) = tx.query_row(
+        "SELECT instance_id,state,payload FROM performance_commands WHERE id=?1",
+        [&status.id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if saved != (status.instance_id.clone(), status.state.clone(), bytes) {
+        return Err(PerformanceMutationError::Unsettled);
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn crash_checkpoint_for_test(phase: &str) {
+    let requested = std::env::var("AXIAL_PERFORMANCE_PREPARED_CRASH").ok();
+    if requested.as_deref() == Some(phase)
+        || (requested.as_deref() == Some("1") && phase == "prepared")
+    {
+        std::process::exit(if phase == "planning" {
+            41
+        } else if phase == "effect" {
+            43
+        } else {
+            42
+        });
+    }
+}
+
 #[derive(Clone)]
 pub struct PerformanceService {
     storage: Arc<MetadataStore>,
@@ -748,6 +905,7 @@ impl PerformanceService {
         // Reserve all interrupted targets before other features admit work.
         // Corrupt records fail startup instead of silently releasing exclusion.
         for pending in service.pending()? {
+            service.storage.read(|db| pending_command(db, &pending))?;
             let instance = service
                 .instances
                 .admit_for_performance_settlement(&pending.instance_id)
@@ -768,15 +926,14 @@ impl PerformanceService {
             drop(query);
             for (id, instance, state, bytes) in records {
                 let mut status = command_status(&id, &instance, &state, &bytes)?;
+                let instance_id = instance.parse().map_err(|_| PerformanceMutationError::Unsettled)?;
+                if read_pending(tx, &instance_id)?.is_some_and(|pending| pending.operation_id == id) {
+                    continue;
+                }
                 status.state = "interrupted".into();
                 status.error =
                     Some("Operation interrupted; inspect the instance before retrying".into());
-                let bytes =
-                    serde_json::to_vec(&status).map_err(|_| PerformanceMutationError::Unsettled)?;
-                if tx.execute(
-                    "UPDATE performance_commands SET state=?1,payload=?2 WHERE id=?3",
-                    params![status.state, bytes, status.id],
-                )? != 1 { return Err(PerformanceMutationError::Unsettled); }
+                write_command(tx, &status)?;
             }
             Ok::<_, PerformanceMutationError>(())
         })?;
@@ -857,6 +1014,23 @@ impl PerformanceService {
         action: &str,
         snapshot: Option<String>,
     ) -> Result<PerformanceOperationStatus, PerformanceMutationError> {
+        self.start_command(id, Some(request), action, snapshot)
+            .map(|(status, _)| status)
+    }
+
+    fn start_command(
+        &self,
+        id: &InstanceId,
+        request: Option<ResolutionRequest>,
+        action: &str,
+        snapshot: Option<String>,
+    ) -> Result<
+        (
+            PerformanceOperationStatus,
+            TaskHandle<Result<ManagedCompositionInspection, PerformanceMutationError>>,
+        ),
+        PerformanceMutationError,
+    > {
         if !matches!(action, "apply" | "reapply" | "remove" | "rollback") {
             return Err(PerformanceMutationError::PlanUnavailable);
         }
@@ -865,7 +1039,12 @@ impl PerformanceService {
             .admit(id)
             .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
         if matches!(action, "apply" | "reapply") {
-            validate_target(&instance, &request)?;
+            validate_target(
+                &instance,
+                request
+                    .as_ref()
+                    .ok_or(PerformanceMutationError::PlanUnavailable)?,
+            )?;
         }
         let now = chrono::Utc::now().to_rfc3339();
         let status = PerformanceOperationStatus {
@@ -880,73 +1059,99 @@ impl PerformanceService {
         };
         self.save_operation(&status)?;
         let service = self.clone();
-        let mut running = status.clone();
+        let running = status.clone();
+        let target = id.clone();
         let accepted = self
             .tasks
             .try_spawn(instance.clone(), move |cancel| async move {
+                let mut running = running;
                 running.state = "running".into();
-                if service.save_operation(&running).is_err() {
-                    return;
-                }
-                let result = if matches!(running.action.as_str(), "apply" | "reapply") {
-                    service.apply_admitted(instance, request).await
-                } else {
-                    async {
-                        let bound = service.bind(instance).await?;
-                        let inspection = service.recover_bound(&bound).await?;
-                        let action = if running.action == "rollback" {
-                            Action::Rollback(
-                                select_snapshot(
-                                    &inspection.rollback_snapshots,
-                                    snapshot.as_deref(),
-                                )?
-                                .id
+                service.save_operation(&running)?;
+                #[cfg(any(test, feature = "test-support"))]
+                crash_checkpoint_for_test("planning");
+                let result = async {
+                    let bound = service.bind(instance).await?;
+                    let inspection = service.recover_bound(&bound).await?;
+                    let action = match running.action.as_str() {
+                        "apply" | "reapply" => {
+                            service
+                                .prepare_apply(
+                                    &bound.instance,
+                                    &inspection,
+                                    request.ok_or(PerformanceMutationError::PlanUnavailable)?,
+                                )
+                                .await?
+                        }
+                        "rollback" => Action::Rollback(
+                            select_snapshot(&inspection.rollback_snapshots, snapshot.as_deref())?
                                 .clone(),
-                            )
-                        } else {
-                            Action::Remove
-                        };
-                        service.execute(bound, inspection, action, cancel).await
-                    }
-                    .await
-                };
-                running.state = match &result {
-                    Ok(_) => "complete",
-                    Err(PerformanceMutationError::Unsettled) => "unsettled",
-                    Err(_) => "failed",
+                        ),
+                        "remove" => Action::Remove,
+                        _ => return Err(PerformanceMutationError::Unsettled),
+                    };
+                    service
+                        .execute(bound, inspection, action, cancel, &running.id, None)
+                        .await
                 }
-                .into();
-                running.error = result.err().map(|error| error.to_string());
-                let _ = service.save_operation(&running);
+                .await;
+                let completed = service.complete_command(&running, &result);
+                service.unclaim(&target);
+                completed?;
+                result
             });
-        if accepted.is_err() {
-            let mut failed = status;
-            failed.state = "failed".into();
-            failed.error = Some("Task owner refused operation".into());
-            self.save_operation(&failed)?;
-            return Err(PerformanceMutationError::InstanceUnavailable);
+        match accepted {
+            Ok(task) => Ok((status, task)),
+            Err(_) => {
+                let mut failed = status;
+                failed.state = "failed".into();
+                failed.error = Some("Task owner refused operation".into());
+                self.save_operation(&failed)?;
+                Err(PerformanceMutationError::InstanceUnavailable)
+            }
         }
-        Ok(status)
     }
 
     fn save_operation(
         &self,
         status: &PerformanceOperationStatus,
     ) -> Result<(), PerformanceMutationError> {
-        if status.history.is_some()
-            || status.id.starts_with("legacy-performance-")
-            || status.state == "historical"
-        {
-            return Err(PerformanceMutationError::Unsettled);
-        }
         let mut status = status.clone();
         status.updated_at = chrono::Utc::now().to_rfc3339();
-        let bytes = serde_json::to_vec(&status).map_err(|_| PerformanceMutationError::Unsettled)?;
         self.storage.transaction(|tx| {
-            if tx.execute("INSERT INTO performance_commands(id,instance_id,state,payload) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET state=excluded.state,payload=excluded.payload", params![status.id, status.instance_id, status.state, bytes])? != 1 { return Err(PerformanceMutationError::Unsettled); }
-            tx.execute("DELETE FROM performance_commands WHERE state IN ('complete','failed') AND rowid NOT IN (SELECT rowid FROM performance_commands WHERE state<>'historical' ORDER BY rowid DESC LIMIT 128)", [])?;
+            write_command(tx, &status)?;
+            tx.execute("DELETE FROM performance_commands WHERE state IN ('complete','failed') AND id NOT IN (SELECT operation_id FROM performance_operations) AND rowid NOT IN (SELECT rowid FROM performance_commands WHERE state<>'historical' ORDER BY rowid DESC LIMIT 128)", [])?;
             Ok(())
         })
+    }
+
+    fn complete_command(
+        &self,
+        command: &PerformanceOperationStatus,
+        result: &Result<ManagedCompositionInspection, PerformanceMutationError>,
+    ) -> Result<(), PerformanceMutationError> {
+        let current = self
+            .operation(&command.id)?
+            .ok_or(PerformanceMutationError::Unsettled)?;
+        if matches!(current.state.as_str(), "complete" | "failed") {
+            return Ok(());
+        }
+        let mut status = command.clone();
+        let id = command
+            .instance_id
+            .parse()
+            .map_err(|_| PerformanceMutationError::Unsettled)?;
+        let pending = self.storage.read(|db| read_pending(db, &id))?;
+        status.state = if pending.is_some() {
+            "unsettled"
+        } else if result.is_ok() {
+            "complete"
+        } else {
+            "failed"
+        }
+        .into();
+        status.error = result.as_ref().err().map(ToString::to_string);
+        self.save_operation(&status)?;
+        Ok(())
     }
     pub fn resolution_request(
         &self,
@@ -1036,7 +1241,7 @@ impl PerformanceService {
                             .iter()
                             .any(|pending| pending.operation_id == checkpoint.operation_id)
                         {
-                            service.finish(&checkpoint)?;
+                            service.finish(&checkpoint, None)?;
                         }
                         Ok(inspection)
                     }
@@ -1060,49 +1265,54 @@ impl PerformanceService {
         id: &InstanceId,
         request: ResolutionRequest,
     ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
-        let instance = self
-            .instances
-            .admit(id)
-            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
-        self.apply_admitted(instance, request).await
-    }
-
-    async fn apply_admitted(
-        &self,
-        instance: RegisteredInstance,
-        request: ResolutionRequest,
-    ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
-        validate_target(&instance, &request)?;
-        let service = self.clone();
-        self.tasks
-            .try_spawn(instance.clone(), move |cancel| async move {
-                let bound = service.bind(instance).await?;
-                let inspection = service.recover_bound(&bound).await?;
-                let mut request = request;
-                request.installed_mods = inspection.installed_mod_evidence.clone();
-                let planned = Arc::new(service.rules.plan(request).await?);
-                let action = if planned.plan().mode == PerformanceMode::Managed {
-                    Action::Apply(
-                        prepare_managed_install(&service.content, planned)
-                            .await
-                            .map_err(|_| PerformanceMutationError::PlanUnavailable)?,
-                    )
-                } else {
-                    Action::Remove
-                };
-                service.execute(bound, inspection, action, cancel).await
-            })
-            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?
+        self.start_command(id, Some(request), "apply", None)?
+            .1
             .join()
             .await
             .map_err(|_| PerformanceMutationError::Unsettled)?
+    }
+
+    pub async fn reapply(
+        &self,
+        id: &InstanceId,
+        request: ResolutionRequest,
+    ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
+        self.start_command(id, Some(request), "reapply", None)?
+            .1
+            .join()
+            .await
+            .map_err(|_| PerformanceMutationError::Unsettled)?
+    }
+
+    async fn prepare_apply(
+        &self,
+        instance: &RegisteredInstance,
+        inspection: &ManagedCompositionInspection,
+        mut request: ResolutionRequest,
+    ) -> Result<Action, PerformanceMutationError> {
+        validate_target(instance, &request)?;
+        request.installed_mods = inspection.installed_mod_evidence.clone();
+        let planned = Arc::new(self.rules.plan(request).await?);
+        if planned.plan().mode == PerformanceMode::Managed {
+            Ok(Action::Apply(
+                prepare_managed_install(&self.content, planned)
+                    .await
+                    .map_err(|_| PerformanceMutationError::PlanUnavailable)?,
+            ))
+        } else {
+            Ok(Action::Remove)
+        }
     }
 
     pub async fn remove(
         &self,
         id: &InstanceId,
     ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
-        self.simple_action(id, None, false).await
+        self.start_command(id, None, "remove", None)?
+            .1
+            .join()
+            .await
+            .map_err(|_| PerformanceMutationError::Unsettled)?
     }
 
     pub async fn rollback(
@@ -1110,36 +1320,8 @@ impl PerformanceService {
         id: &InstanceId,
         snapshot: Option<String>,
     ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
-        self.simple_action(id, snapshot, true).await
-    }
-
-    async fn simple_action(
-        &self,
-        id: &InstanceId,
-        snapshot: Option<String>,
-        rollback: bool,
-    ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
-        let instance = self
-            .instances
-            .admit(id)
-            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
-        let service = self.clone();
-        self.tasks
-            .try_spawn(instance.clone(), move |cancel| async move {
-                let bound = service.bind(instance).await?;
-                let inspection = service.recover_bound(&bound).await?;
-                let action = if rollback {
-                    Action::Rollback(
-                        select_snapshot(&inspection.rollback_snapshots, snapshot.as_deref())?
-                            .id
-                            .clone(),
-                    )
-                } else {
-                    Action::Remove
-                };
-                service.execute(bound, inspection, action, cancel).await
-            })
-            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?
+        self.start_command(id, None, "rollback", snapshot)?
+            .1
             .join()
             .await
             .map_err(|_| PerformanceMutationError::Unsettled)?
@@ -1179,46 +1361,210 @@ impl PerformanceService {
     /// Explicit restart settlement; no Guardian policy or discretionary repair.
     pub async fn recover_pending(&self) -> Result<usize, PerformanceMutationError> {
         let mut settled = 0;
+        let mut prepared = Vec::new();
+        let mut failure = None;
         for pending in self.pending()? {
-            let instance = self
-                .retained
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(pending.instance_id.as_str())
-                .map(|retained| retained.instance.clone())
-                .ok_or(PerformanceMutationError::Unsettled)?;
-            instance
-                .directory()
-                .verify_receipt(&pending.directory_receipt)
-                .map_err(|_| PerformanceMutationError::Unsettled)?;
-            let bound = self.bind(instance).await?;
-            let inspection = self.recover_bound(&bound).await?;
-            if inspection.health == axial_performance::BundleHealth::Invalid {
-                return Err(PerformanceMutationError::Unsettled);
-            }
-            if matches!(pending.expected, ExpectedComposition::Inspection) {
-                self.finish(&pending)?;
-                settled += 1;
-                continue;
-            }
-            let result = pending.result.as_ref().map(CompletedComposition::state);
-            match classify_recovered(
-                pending.before.as_ref(),
-                &pending.expected,
-                result.as_ref(),
-                inspection.state.as_ref(),
-            ) {
-                RestartDisposition::Applied | RestartDisposition::RestoredBefore => {
-                    self.finish(&pending)?;
-                    settled += 1;
+            let admission = (|| {
+                let mut retained = self.retained.lock().unwrap_or_else(|p| p.into_inner());
+                let retained = retained
+                    .get_mut(pending.instance_id.as_str())
+                    .ok_or(PerformanceMutationError::Unsettled)?;
+                if retained.claimed {
+                    return Ok(None);
                 }
-                RestartDisposition::Preserve => {
-                    self.retain(bound.instance.clone(), Some(bound));
+                retained.claimed = true;
+                Ok(Some(retained.instance.clone()))
+            })();
+            let instance = match admission {
+                Ok(Some(instance)) => instance,
+                Ok(None) => continue,
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                    continue;
+                }
+            };
+            let result = async {
+                instance
+                    .directory()
+                    .verify_receipt(&pending.directory_receipt)
+                    .map_err(|_| PerformanceMutationError::Unsettled)?;
+                let bound = self.bind(instance).await?;
+                let inspection = self.recover_bound(&bound).await?;
+                if inspection.health == axial_performance::BundleHealth::Invalid {
                     return Err(PerformanceMutationError::Unsettled);
+                }
+                let command = self.storage.read(|db| pending_command(db, &pending))?;
+                if let Some(command) = command.filter(|command| prepared_command(&pending, command))
+                {
+                    self.retain(bound.instance.clone(), Some(bound.clone()));
+                    return Ok(Some(PreparedContinuation {
+                        pending: pending.clone(),
+                        command,
+                        bound,
+                        inspection,
+                    }));
+                }
+                if matches!(pending.expected, ExpectedComposition::Inspection) {
+                    self.finish(&pending, None)?;
+                    return Ok(None);
+                }
+                let result = pending.result.as_ref().map(CompletedComposition::state);
+                match classify_recovered(
+                    pending.before.as_ref(),
+                    &pending.expected,
+                    result.as_ref(),
+                    inspection.state.as_ref(),
+                ) {
+                    RestartDisposition::Applied => self.finish(&pending, None)?,
+                    RestartDisposition::RestoredBefore => {
+                        self.finish(&pending, Some(&PerformanceMutationError::Failed))?
+                    }
+                    RestartDisposition::Preserve => {
+                        self.retain(bound.instance.clone(), Some(bound));
+                        return Err(PerformanceMutationError::Unsettled);
+                    }
+                }
+                Ok(None)
+            }
+            .await;
+            match result {
+                Ok(Some(continuation)) => prepared.push(continuation),
+                Ok(None) => settled += 1,
+                Err(error) => {
+                    self.unclaim(&pending.instance_id);
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
                 }
             }
         }
-        Ok(settled)
+        if !prepared.is_empty() {
+            let ids = prepared
+                .iter()
+                .map(|item| item.pending.instance_id.clone())
+                .collect::<Vec<_>>();
+            let count = prepared.len();
+            let service = self.clone();
+            if self
+                .tasks
+                .try_spawn(self.clone(), move |cancel| async move {
+                    for continuation in prepared {
+                        let result = service.resume_prepared(&continuation, cancel.clone()).await;
+                        let _ = service.complete_command(&continuation.command, &result);
+                        service.unclaim(&continuation.pending.instance_id);
+                    }
+                })
+                .is_err()
+            {
+                for id in ids {
+                    self.unclaim(&id);
+                }
+                return Err(PerformanceMutationError::InstanceUnavailable);
+            }
+            settled += count;
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(settled),
+        }
+    }
+
+    async fn resume_prepared(
+        &self,
+        continuation: &PreparedContinuation,
+        cancel: CancellationToken,
+    ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
+        let pending = &continuation.pending;
+        let bound = &continuation.bound;
+        let result = async {
+            if cancel.is_cancelled() {
+                return Err(PerformanceMutationError::Cancelled);
+            }
+            if continuation.inspection.state != pending.before {
+                return Err(PerformanceMutationError::Failed);
+            }
+            let action = match &pending.expected {
+                ExpectedComposition::Graph {
+                    game_version,
+                    loader,
+                    ..
+                } => {
+                    self.prepare_apply(
+                        &bound.instance,
+                        &continuation.inspection,
+                        self.resolution_request(
+                            game_version.clone(),
+                            loader.clone(),
+                            PerformanceMode::Managed,
+                        ),
+                    )
+                    .await?
+                }
+                ExpectedComposition::Absent => Action::Remove,
+                ExpectedComposition::Snapshot {
+                    snapshot_id,
+                    prepared: Some(_),
+                } => Action::Rollback(
+                    select_snapshot(
+                        &continuation.inspection.rollback_snapshots,
+                        Some(snapshot_id),
+                    )?
+                    .clone(),
+                ),
+                _ => return Err(PerformanceMutationError::Unsettled),
+            };
+            if action.expected() != pending.expected {
+                return Err(PerformanceMutationError::PlanUnavailable);
+            }
+            let inspection = self.recover_bound(bound).await?;
+            if inspection.health == axial_performance::BundleHealth::Invalid {
+                return Err(PerformanceMutationError::Unsettled);
+            }
+            if inspection.state != pending.before {
+                return Err(PerformanceMutationError::Failed);
+            }
+            Ok((inspection, action))
+        }
+        .await;
+        match result {
+            Ok((inspection, action)) => {
+                self.execute(
+                    bound.clone(),
+                    inspection,
+                    action,
+                    cancel,
+                    &pending.operation_id,
+                    Some(pending),
+                )
+                .await
+            }
+            Err(error) => {
+                if matches!(
+                    error,
+                    PerformanceMutationError::Cancelled
+                        | PerformanceMutationError::Failed
+                        | PerformanceMutationError::PlanUnavailable
+                        | PerformanceMutationError::SnapshotNotFound
+                        | PerformanceMutationError::SnapshotUnavailable
+                ) {
+                    self.finish(pending, Some(&error))?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn unclaim(&self, id: &InstanceId) {
+        if let Some(retained) = self
+            .retained
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(id.as_str())
+        {
+            retained.claimed = false;
+        }
     }
 
     async fn bind(
@@ -1288,7 +1634,7 @@ impl PerformanceService {
         {
             Ok(inspection) => {
                 if let Some(checkpoint) = checkpoint {
-                    self.finish(&checkpoint)?;
+                    self.finish(&checkpoint, None)?;
                 }
                 Ok(inspection)
             }
@@ -1305,19 +1651,17 @@ impl PerformanceService {
         before: ManagedCompositionInspection,
         action: Action,
         cancel: CancellationToken,
+        operation_id: &str,
+        existing: Option<&PendingOperation>,
     ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
         if cancel.is_cancelled() {
+            if let Some(existing) = existing {
+                self.finish(existing, Some(&PerformanceMutationError::Cancelled))?;
+            }
             return Err(PerformanceMutationError::Cancelled);
         }
-        let expected = match &action {
-            Action::Apply(plan) => ExpectedComposition::from_plan(plan.plan()),
-            Action::Remove => ExpectedComposition::Absent,
-            Action::Rollback(snapshot_id) => ExpectedComposition::Snapshot {
-                snapshot_id: snapshot_id.clone(),
-            },
-        };
         let mut pending = PendingOperation {
-            operation_id: uuid::Uuid::new_v4().to_string(),
+            operation_id: operation_id.into(),
             instance_id: bound.instance.record().instance.id.clone(),
             directory_receipt: bound
                 .instance
@@ -1325,12 +1669,30 @@ impl PerformanceService {
                 .receipt()
                 .map_err(|_| PerformanceMutationError::InstanceUnavailable)?,
             before: before.state,
-            expected,
+            expected: action.expected(),
             target_effect_started: false,
             result: None,
         };
-        self.begin(&pending)?;
-        self.retain(bound.instance.clone(), Some(bound.clone()));
+        if let Some(existing) = existing {
+            if existing != &pending
+                || self
+                    .storage
+                    .read(|db| read_pending(db, &pending.instance_id))?
+                    .as_ref()
+                    != Some(existing)
+            {
+                return Err(PerformanceMutationError::Unsettled);
+            }
+            self.storage
+                .read(|db| pending_command(db, &pending))?
+                .filter(|command| prepared_command(&pending, command))
+                .ok_or(PerformanceMutationError::Unsettled)?;
+        } else {
+            self.begin(&pending)?;
+        }
+        self.retain_claimed(bound.instance.clone(), Some(bound.clone()), true);
+        #[cfg(any(test, feature = "test-support"))]
+        crash_checkpoint_for_test("prepared");
         let result = match action {
             Action::Apply(plan) => {
                 plan.ensure_current()?;
@@ -1373,6 +1735,8 @@ impl PerformanceService {
             Action::Remove => {
                 pending.target_effect_started = true;
                 self.save(&pending)?;
+                #[cfg(any(test, feature = "test-support"))]
+                crash_checkpoint_for_test("effect");
                 bound
                     .authority
                     .remove_managed(&bound.identity, &bound.effects)
@@ -1383,9 +1747,11 @@ impl PerformanceService {
             Action::Rollback(snapshot) => {
                 pending.target_effect_started = true;
                 self.save(&pending)?;
+                #[cfg(any(test, feature = "test-support"))]
+                crash_checkpoint_for_test("effect");
                 bound
                     .authority
-                    .rollback_managed_snapshot(&bound.identity, &bound.effects, &snapshot)
+                    .rollback_managed_snapshot(&bound.identity, &bound.effects, &snapshot.id)
                     .await
                     .map(|outcome| match outcome {
                         ManagedRollbackOutcome::ManagedComposition(state) => Some(state),
@@ -1398,6 +1764,11 @@ impl PerformanceService {
             pending.result = Some(CompletedComposition::from_state(state.clone()));
             self.save(&pending)?;
         }
+        pending = self
+            .storage
+            .read(|db| read_pending(db, &pending.instance_id))?
+            .filter(|stored| same_preparation(stored, &pending))
+            .ok_or(PerformanceMutationError::Unsettled)?;
         let inspection = self.recover_bound(&bound).await?;
         if inspection.health == axial_performance::BundleHealth::Invalid {
             return Err(PerformanceMutationError::Unsettled);
@@ -1410,61 +1781,124 @@ impl PerformanceService {
             inspection.state.as_ref(),
         ) {
             RestartDisposition::Applied => {
-                self.finish(&pending)?;
+                self.finish(&pending, None)?;
                 Ok(inspection)
             }
             RestartDisposition::RestoredBefore => {
-                self.finish(&pending)?;
-                Err(result.err().unwrap_or(PerformanceMutationError::Failed))
+                let error = result.err().unwrap_or(PerformanceMutationError::Failed);
+                self.finish(&pending, Some(&error))?;
+                Err(error)
             }
             RestartDisposition::Preserve => Err(PerformanceMutationError::Unsettled),
         }
     }
 
     fn retain(&self, instance: RegisteredInstance, bound: Option<BoundInstance>) {
-        self.retained
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(
-                instance.record().instance.id.to_string(),
-                RetainedOperation { instance, bound },
-            );
+        self.retain_claimed(instance, bound, false);
+    }
+
+    fn retain_claimed(
+        &self,
+        instance: RegisteredInstance,
+        bound: Option<BoundInstance>,
+        claimed: bool,
+    ) {
+        let mut retained = self.retained.lock().unwrap_or_else(|p| p.into_inner());
+        let id = instance.record().instance.id.to_string();
+        let claimed = claimed || retained.get(&id).is_some_and(|retained| retained.claimed);
+        retained.insert(
+            id,
+            RetainedOperation {
+                instance,
+                bound,
+                claimed,
+            },
+        );
     }
     fn pending(&self) -> Result<Vec<PendingOperation>, PerformanceMutationError> {
         self.storage.read(|connection| {
             let mut query = connection.prepare("SELECT instance_id,operation_id,payload FROM performance_operations ORDER BY instance_id")?;
             query.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)))?.map(|row| {
                 let (instance_id, operation_id, bytes) = row?;
-                let record: PendingOperation = serde_json::from_slice(&bytes).map_err(|_| PerformanceMutationError::Unsettled)?;
-                if record.instance_id.as_str() != instance_id || record.operation_id != operation_id || uuid::Uuid::parse_str(&record.operation_id).is_err() {
-                    return Err(PerformanceMutationError::Unsettled);
-                }
-                Ok(record)
+                decode_pending(&instance_id, &operation_id, &bytes)
             }).collect()
         })
     }
     fn begin(&self, pending: &PendingOperation) -> Result<(), PerformanceMutationError> {
         let bytes = serde_json::to_vec(pending).map_err(|_| PerformanceMutationError::Unsettled)?;
         self.storage.transaction(|tx| {
-            tx.execute("INSERT INTO performance_operations(instance_id,operation_id,payload) VALUES(?1,?2,?3)", params![pending.instance_id.as_str(), pending.operation_id, bytes])?;
+            let command = pending_command(tx, pending)?;
+            if command.is_none() && !matches!(pending.expected, ExpectedComposition::Inspection) {
+                return Err(PerformanceMutationError::Unsettled);
+            }
+            if tx.execute("INSERT INTO performance_operations(instance_id,operation_id,payload) VALUES(?1,?2,?3)", params![pending.instance_id.as_str(), pending.operation_id, bytes])? != 1
+                || read_pending(tx, &pending.instance_id)?.as_ref() != Some(pending)
+                || pending_command(tx, pending)? != command {
+                return Err(PerformanceMutationError::Unsettled);
+            }
             Ok(())
         })
     }
     fn save(&self, pending: &PendingOperation) -> Result<(), PerformanceMutationError> {
         let bytes = serde_json::to_vec(pending).map_err(|_| PerformanceMutationError::Unsettled)?;
         self.storage.transaction(|tx| {
+            let previous = read_pending(tx, &pending.instance_id)?.ok_or(PerformanceMutationError::Unsettled)?;
+            if !same_preparation(&previous, pending)
+                || (previous.target_effect_started && !pending.target_effect_started)
+                || (previous.result.is_some() && previous.result != pending.result) {
+                return Err(PerformanceMutationError::Unsettled);
+            }
+            let command = pending_command(tx, pending)?.ok_or(PerformanceMutationError::Unsettled)?;
             if tx.execute("UPDATE performance_operations SET payload=?1 WHERE instance_id=?2 AND operation_id=?3", params![bytes, pending.instance_id.as_str(), pending.operation_id])? != 1 { return Err(PerformanceMutationError::Unsettled); }
+            if read_pending(tx, &pending.instance_id)?.as_ref() != Some(pending)
+                || pending_command(tx, pending)?.as_ref() != Some(&command) {
+                return Err(PerformanceMutationError::Unsettled);
+            }
             Ok(())
         })
     }
-    fn finish(&self, pending: &PendingOperation) -> Result<(), PerformanceMutationError> {
+    fn finish(
+        &self,
+        pending: &PendingOperation,
+        failure: Option<&PerformanceMutationError>,
+    ) -> Result<(), PerformanceMutationError> {
         self.storage.transaction(|tx| {
+            if read_pending(tx, &pending.instance_id)?.as_ref() != Some(pending) {
+                return Err(PerformanceMutationError::Unsettled);
+            }
+            let command = pending_command(tx, pending)?.map(|mut status| {
+                status.state = if failure.is_some() {
+                    "failed"
+                } else {
+                    "complete"
+                }
+                .into();
+                status.error = failure.map(ToString::to_string);
+                status.updated_at = chrono::Utc::now().to_rfc3339();
+                status
+            });
+            if let Some(status) = &command {
+                write_command(tx, status)?;
+            }
             if tx.execute(
                 "DELETE FROM performance_operations WHERE instance_id=?1 AND operation_id=?2",
                 params![pending.instance_id.as_str(), pending.operation_id],
             )? != 1
             {
                 return Err(PerformanceMutationError::Unsettled);
+            }
+            if read_pending(tx, &pending.instance_id)?.is_some() {
+                return Err(PerformanceMutationError::Unsettled);
+            }
+            if let Some(status) = &command {
+                let saved: (String, String, Vec<u8>) = tx.query_row(
+                    "SELECT instance_id,state,payload FROM performance_commands WHERE id=?1",
+                    [&status.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                if command_status(&status.id, &saved.0, &saved.1, &saved.2)? != *status {
+                    return Err(PerformanceMutationError::Unsettled);
+                }
             }
             Ok(())
         })?;
@@ -1479,7 +1913,25 @@ impl PerformanceService {
 enum Action {
     Apply(PreparedManagedPlan),
     Remove,
-    Rollback(String),
+    Rollback(axial_performance::RollbackSnapshotSummary),
+}
+
+impl Action {
+    fn expected(&self) -> ExpectedComposition {
+        match self {
+            Self::Apply(plan) => ExpectedComposition::from_plan(plan.plan()),
+            Self::Remove => ExpectedComposition::Absent,
+            Self::Rollback(snapshot) => ExpectedComposition::from_snapshot(snapshot),
+        }
+    }
+}
+
+fn same_preparation(left: &PendingOperation, right: &PendingOperation) -> bool {
+    left.operation_id == right.operation_id
+        && left.instance_id == right.instance_id
+        && left.directory_receipt == right.directory_receipt
+        && left.before == right.before
+        && left.expected == right.expected
 }
 
 fn validate_target(
@@ -1503,6 +1955,702 @@ fn validate_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn restart_service(
+        root: &std::path::Path,
+        library_id: crate::library::LibraryId,
+    ) -> PerformanceService {
+        use crate::{
+            instances::directory::Registry,
+            library::{LibraryLifecycle, LibraryOpenOutcome},
+            network::{ClientConfig, ProviderClient},
+            tasks::Exclusions,
+        };
+        let library = match LibraryLifecycle::open_with_id(root, library_id) {
+            LibraryOpenOutcome::Ready(library) => library,
+            other => panic!("restart fixture library unavailable: {other:?}"),
+        };
+        let storage = Arc::new(MetadataStore::open(root.join("metadata.sqlite")).unwrap());
+        storage
+            .migrate(&[
+                crate::instances::directory::MIGRATION,
+                crate::instances::create::MIGRATION,
+                crate::instances::create::DUPLICATE_WITNESS_MIGRATION,
+                crate::content::install::MIGRATION,
+                MIGRATION,
+                super::super::rules::MIGRATION,
+            ])
+            .unwrap();
+        let directories =
+            InstanceDirectories::new(Registry::new(storage.clone()), library, Exclusions::new());
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let content = ContentService::new(ProviderClient::new(ClientConfig::default()).unwrap())
+            .unwrap()
+            .with_cancellation(cancelled);
+        let mut service = PerformanceService::new(
+            storage.clone(),
+            directories,
+            TaskOwner::new(8).unwrap(),
+            Arc::new(content),
+            super::super::public_transfer_resolver(),
+        )
+        .unwrap();
+        service.rules = PerformanceRules::with_remote(storage, None, None).unwrap();
+        service
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated process fixture invoked by prepared_remove_restart tests"]
+    async fn prepared_remove_crash_child() {
+        use crate::instances::create::{CreateTarget, InstanceService, tests::request};
+        let root =
+            std::path::PathBuf::from(std::env::var_os("AXIAL_PERFORMANCE_PREPARED_ROOT").unwrap());
+        let library_id = crate::library::LibraryId::parse(
+            &std::env::var("AXIAL_PERFORMANCE_PREPARED_LIBRARY").unwrap(),
+        )
+        .unwrap();
+        let service = restart_service(&root, library_id);
+        let instances = InstanceService::new(service.instances.clone(), service.tasks.clone());
+        let mut request = request("Prepared remove restart");
+        request.selection_id = "fixture-fabric".into();
+        let instance = instances
+            .create(
+                request,
+                CreateTarget {
+                    selection_id: "fixture-fabric".into(),
+                    version_id: "fixture-fabric".into(),
+                    minecraft_version: "1.21.4".into(),
+                    loader_key: "fabric".into(),
+                },
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        let admitted = service.instances.admit(&instance.id).unwrap();
+        super::super::duplicate::seed_managed(&admitted).await;
+        let path = admitted.directory().read_projection().unwrap();
+        std::fs::write(path.join("mods/user.jar"), b"unrelated user artifact").unwrap();
+        let action = std::env::var("AXIAL_PERFORMANCE_PREPARED_ACTION").unwrap();
+        let snapshot = if action == "rollback" {
+            let bound = service.bind(admitted.clone()).await.unwrap();
+            let inspection = service.recover_bound(&bound).await.unwrap();
+            Some(
+                inspection
+                    .rollback_snapshots
+                    .iter()
+                    .find(|snapshot| {
+                        !snapshot.latest
+                            && snapshot.rollback_available
+                            && snapshot.target
+                                == axial_performance::RollbackSnapshotTarget::ManagedStateAbsent
+                    })
+                    .unwrap()
+                    .id
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        drop(admitted);
+        let request = service.resolution_request(
+            "1.21.4".into(),
+            "fabric".into(),
+            if matches!(action.as_str(), "apply" | "reapply") {
+                PerformanceMode::Custom
+            } else {
+                PerformanceMode::Managed
+            },
+        );
+        if std::env::var("AXIAL_PERFORMANCE_PREPARED_ENTRY").unwrap() == "queued" {
+            service
+                .submit(&instance.id, request, &action, snapshot)
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !service.tasks.status().is_idle() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        } else {
+            let _ = match action.as_str() {
+                "apply" => service.apply(&instance.id, request).await,
+                "reapply" => service.reapply(&instance.id, request).await,
+                "rollback" => service.rollback(&instance.id, snapshot).await,
+                _ => service.remove(&instance.id).await,
+            };
+        }
+        panic!("prepared remove did not reach its durable crash boundary");
+    }
+
+    async fn prepared_crash_fixture(
+        entry: &str,
+        action: &str,
+        phase: &str,
+    ) -> (tempfile::TempDir, crate::library::LibraryId) {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let library_id = crate::library::LibraryId::new();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "performance::mutation::tests::prepared_remove_crash_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("AXIAL_PERFORMANCE_PREPARED_ROOT", root.path())
+            .env("AXIAL_PERFORMANCE_PREPARED_LIBRARY", library_id.to_string())
+            .env("AXIAL_PERFORMANCE_PREPARED_ENTRY", entry)
+            .env("AXIAL_PERFORMANCE_PREPARED_ACTION", action)
+            .env("AXIAL_PERFORMANCE_PREPARED_CRASH", phase)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let timed_out = child.try_wait().unwrap().is_none();
+        if timed_out {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !timed_out,
+            "prepared child timed out: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(if phase == "planning" {
+                41
+            } else if phase == "effect" {
+                43
+            } else {
+                42
+            }),
+            "prepared crash boundary not reached: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (root, library_id)
+    }
+
+    async fn prepared_remove_restart(entry: &str, action: &str) {
+        let (root, library_id) = prepared_crash_fixture(entry, action, "prepared").await;
+        let storage = MetadataStore::open(root.path().join("metadata.sqlite")).unwrap();
+        let (pending_bytes, command) = storage
+            .read(|connection| {
+                let pending: Vec<u8> = connection.query_row(
+                    "SELECT payload FROM performance_operations",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let command = connection
+                    .query_row(
+                        "SELECT id,instance_id,state,payload FROM performance_commands",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Vec<u8>>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                Ok::<_, StorageError>((pending, command))
+            })
+            .unwrap();
+        let pending: PendingOperation = serde_json::from_slice(&pending_bytes).unwrap();
+        assert!(pending.before.is_some());
+        assert!(if action == "rollback" {
+            matches!(
+                pending.expected,
+                ExpectedComposition::Snapshot {
+                    prepared: Some(_),
+                    ..
+                }
+            )
+        } else {
+            pending.expected == ExpectedComposition::Absent
+        });
+        assert!(!pending.target_effect_started);
+        assert!(pending.result.is_none());
+        let (id, instance, state, bytes) =
+            command.expect("every accepted explicit entrypoint retains its command identity");
+        let command = command_status(&id, &instance, &state, &bytes).unwrap();
+        assert_eq!(command.action, action);
+        assert_eq!(command.state, "running");
+        assert_eq!(command.instance_id, pending.instance_id.as_str());
+        assert_eq!(
+            command.id, pending.operation_id,
+            "Prepared must remain linked to the accepted command"
+        );
+        drop(storage);
+
+        let service = restart_service(root.path(), library_id);
+        assert!(service.instances.admit(&pending.instance_id).is_err());
+        let bound = service
+            .retained
+            .lock()
+            .unwrap()
+            .get(pending.instance_id.as_str())
+            .unwrap()
+            .instance
+            .clone();
+        bound
+            .directory()
+            .verify_receipt(&pending.directory_receipt)
+            .unwrap();
+        let path = bound.directory().read_projection().unwrap();
+        assert!(path.join("mods/current.jar").is_file());
+        assert_eq!(
+            service
+                .storage
+                .read(|db| db
+                    .query_row("SELECT payload FROM performance_operations", [], |row| row
+                        .get::<_, Vec<
+                        u8,
+                    >>(
+                        0
+                    ))
+                    .map_err(StorageError::from))
+                .unwrap(),
+            pending_bytes
+        );
+        drop(bound);
+        service.recover_pending().await.unwrap();
+        assert_eq!(service.recover_pending().await.unwrap(), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !service.tasks.status().is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let completed = service.operation(&command.id).unwrap().unwrap();
+        assert_eq!(completed.state, "complete");
+        assert_eq!(completed.id, command.id);
+        assert_eq!(completed.action, action);
+        assert!(!path.join("mods/current.jar").exists());
+        assert_eq!(
+            std::fs::read(path.join("mods/user.jar")).unwrap(),
+            b"unrelated user artifact"
+        );
+        assert_eq!(service.pending_count().unwrap(), 0);
+        assert!(!service.has_unsettled_effects());
+        service.instances.admit(&pending.instance_id).unwrap();
+        let files = payload_files(&path);
+        service.instances.library().try_preserve().unwrap();
+        drop(service);
+
+        let reopened = restart_service(root.path(), library_id);
+        assert_eq!(reopened.recover_pending().await.unwrap(), 0);
+        assert!(reopened.tasks.status().is_idle());
+        assert_eq!(
+            reopened.operation(&command.id).unwrap().unwrap().state,
+            "complete"
+        );
+        assert_eq!(payload_files(&path), files);
+        reopened.instances.library().try_preserve().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_remove_restart_continues_queued_command() {
+        prepared_remove_restart("queued", "remove").await;
+    }
+
+    #[tokio::test]
+    async fn prepared_remove_restart_continues_synchronous_command() {
+        prepared_remove_restart("synchronous", "remove").await;
+    }
+
+    #[tokio::test]
+    async fn prepared_restart_preserves_effective_removal_and_requested_action() {
+        for entry in ["queued", "synchronous"] {
+            for action in ["apply", "reapply"] {
+                prepared_remove_restart(entry, action).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_restart_rollback_uses_original_nonlatest_snapshot() {
+        for entry in ["queued", "synchronous"] {
+            prepared_remove_restart(entry, "rollback").await;
+        }
+    }
+
+    async fn wait_for_mutation_tasks(service: &PerformanceService) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !service.tasks.status().is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_restart_never_replays_planning_effect_started_or_unlinked_work() {
+        for phase in ["planning", "effect", "unlinked"] {
+            let (root, library_id) = prepared_crash_fixture(
+                "queued",
+                "remove",
+                if phase == "unlinked" {
+                    "prepared"
+                } else {
+                    phase
+                },
+            )
+            .await;
+            let storage = MetadataStore::open(root.path().join("metadata.sqlite")).unwrap();
+            let bytes = storage
+                .read(|db| {
+                    db.query_row("SELECT payload FROM performance_commands", [], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .map_err(StorageError::from)
+                })
+                .unwrap();
+            let mut command: PerformanceOperationStatus = serde_json::from_slice(&bytes).unwrap();
+            if phase == "unlinked" {
+                let original = command.id.clone();
+                command.id = uuid::Uuid::new_v4().to_string();
+                storage
+                    .transaction(|tx| {
+                        tx.execute(
+                            "UPDATE performance_commands SET id=?1,payload=?2 WHERE id=?3",
+                            params![command.id, serde_json::to_vec(&command).unwrap(), original],
+                        )?;
+                        Ok::<_, StorageError>(())
+                    })
+                    .unwrap();
+            }
+            drop(storage);
+            let service = restart_service(root.path(), library_id);
+            let id = command.instance_id.parse().unwrap();
+            let path = if phase == "planning" {
+                service
+                    .instances
+                    .admit(&id)
+                    .unwrap()
+                    .directory()
+                    .read_projection()
+                    .unwrap()
+            } else {
+                service
+                    .retained
+                    .lock()
+                    .unwrap()
+                    .get(command.instance_id.as_str())
+                    .unwrap()
+                    .instance
+                    .directory()
+                    .read_projection()
+                    .unwrap()
+            };
+            let files = payload_files(&path);
+            assert_eq!(
+                service.recover_pending().await.unwrap(),
+                usize::from(phase != "planning")
+            );
+            assert!(service.tasks.status().is_idle());
+            assert_eq!(payload_files(&path), files, "{phase}");
+            assert_eq!(
+                service.operation(&command.id).unwrap().unwrap().state,
+                if phase == "effect" {
+                    "failed"
+                } else {
+                    "interrupted"
+                }
+            );
+            assert_eq!(service.pending_count().unwrap(), 0);
+            assert_eq!(service.recover_pending().await.unwrap(), 0);
+            service.instances.admit(&id).unwrap();
+            service.instances.library().try_preserve().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_restart_terminal_acknowledgement_is_atomic_and_retryable() {
+        for boundary in ["command", "pending"] {
+            for refusal in ["IGNORE", "ABORT,'fixture refusal'"] {
+                let (_root, service, admitted) = launch_fixture().await;
+                super::super::duplicate::seed_managed(&admitted).await;
+                let id = admitted.record().instance.id.clone();
+                let path = admitted.directory().read_projection().unwrap();
+                drop(admitted);
+                let trigger = if boundary == "command" {
+                    format!(
+                        "CREATE TRIGGER refuse_ack BEFORE UPDATE ON performance_commands WHEN NEW.state IN ('complete','unsettled') BEGIN SELECT RAISE({refusal}); END;"
+                    )
+                } else {
+                    format!(
+                        "CREATE TRIGGER refuse_ack BEFORE DELETE ON performance_operations WHEN OLD.operation_id IN (SELECT id FROM performance_commands) BEGIN SELECT RAISE({refusal}); END;"
+                    )
+                };
+                service
+                    .storage
+                    .transaction(|tx| {
+                        tx.execute_batch(&trigger)?;
+                        Ok::<_, StorageError>(())
+                    })
+                    .unwrap();
+                assert!(service.remove(&id).await.is_err());
+                wait_for_mutation_tasks(&service).await;
+                let command = service.instance_operation(&id).unwrap().unwrap();
+                assert_ne!(command.state, "complete");
+                assert!(service.instances.admit(&id).is_err());
+                let pending = service.pending().unwrap().pop().unwrap();
+                assert_eq!(pending.operation_id, command.id);
+                assert!(pending.target_effect_started);
+                assert!(matches!(pending.result, Some(CompletedComposition::Absent)));
+                assert!(!path.join("mods/current.jar").exists());
+                let settled_files = payload_files(&path);
+                service
+                    .storage
+                    .transaction(|tx| {
+                        tx.execute_batch("DROP TRIGGER refuse_ack")?;
+                        Ok::<_, StorageError>(())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    service.recover_pending().await.unwrap(),
+                    1,
+                    "{boundary} {refusal}"
+                );
+                assert!(service.tasks.status().is_idle());
+                assert_eq!(
+                    service.operation(&command.id).unwrap().unwrap().state,
+                    "complete"
+                );
+                assert_eq!(service.pending_count().unwrap(), 0);
+                assert_eq!(payload_files(&path), settled_files);
+                service.instances.admit(&id).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_admission_refuses_missing_or_changed_command_acknowledgement() {
+        for corruption in ["ignore", "delete", "change", "effect"] {
+            let (_root, service, admitted) = launch_fixture().await;
+            super::super::duplicate::seed_managed(&admitted).await;
+            let id = admitted.record().instance.id.clone();
+            let path = admitted.directory().read_projection().unwrap();
+            let files = payload_files(&path);
+            drop(admitted);
+            let trigger = match corruption {
+                "ignore" => {
+                    "CREATE TRIGGER corrupt_link BEFORE INSERT ON performance_operations WHEN NEW.operation_id IN (SELECT id FROM performance_commands) BEGIN SELECT RAISE(IGNORE); END;"
+                }
+                "delete" => {
+                    "CREATE TRIGGER corrupt_link AFTER INSERT ON performance_operations WHEN NEW.operation_id IN (SELECT id FROM performance_commands) BEGIN DELETE FROM performance_commands WHERE id=NEW.operation_id; END;"
+                }
+                "change" => {
+                    "CREATE TRIGGER corrupt_link AFTER INSERT ON performance_operations WHEN NEW.operation_id IN (SELECT id FROM performance_commands) BEGIN UPDATE performance_commands SET payload=CAST(json_set(CAST(payload AS TEXT),'$.action','reapply') AS BLOB) WHERE id=NEW.operation_id; END;"
+                }
+                "effect" => {
+                    "CREATE TRIGGER corrupt_link AFTER UPDATE ON performance_operations WHEN NEW.operation_id IN (SELECT id FROM performance_commands) BEGIN DELETE FROM performance_commands WHERE id=NEW.operation_id; END;"
+                }
+                _ => unreachable!(),
+            };
+            service
+                .storage
+                .transaction(|tx| {
+                    tx.execute_batch(trigger)?;
+                    Ok::<_, StorageError>(())
+                })
+                .unwrap();
+            assert!(service.remove(&id).await.is_err(), "{corruption}");
+            wait_for_mutation_tasks(&service).await;
+            assert_eq!(payload_files(&path), files);
+            let command = service.instance_operation(&id).unwrap().unwrap();
+            assert_eq!(command.action, "remove");
+            assert_ne!(command.state, "complete");
+            if corruption == "effect" {
+                let pending = service.pending().unwrap().pop().unwrap();
+                assert!(!pending.target_effect_started);
+                assert!(pending.result.is_none());
+                assert!(service.instances.admit(&id).is_err());
+            } else {
+                assert_eq!(service.pending_count().unwrap(), 0);
+            }
+            service
+                .storage
+                .transaction(|tx| {
+                    tx.execute_batch("DROP TRIGGER corrupt_link")?;
+                    Ok::<_, StorageError>(())
+                })
+                .unwrap();
+            assert_eq!(
+                service.recover_pending().await.unwrap(),
+                usize::from(corruption == "effect")
+            );
+            assert_eq!(payload_files(&path), files);
+            assert_eq!(
+                service.operation(&command.id).unwrap().unwrap().state,
+                "failed"
+            );
+            service.instances.admit(&id).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_restart_cancellation_settles_but_unknown_leaf_state_stays_reserved() {
+        for case in ["cancel", "changed_leaf"] {
+            let (root, library_id) = prepared_crash_fixture("queued", "remove", "prepared").await;
+            let service = restart_service(root.path(), library_id);
+            let pending = service.pending().unwrap().pop().unwrap();
+            let instance = service
+                .retained
+                .lock()
+                .unwrap()
+                .get(pending.instance_id.as_str())
+                .unwrap()
+                .instance
+                .clone();
+            let bound = service.bind(instance).await.unwrap();
+            let inspection = service.recover_bound(&bound).await.unwrap();
+            let path = bound.instance.directory().read_projection().unwrap();
+            let files = payload_files(&path);
+            if case == "cancel" {
+                let cancel = CancellationToken::new();
+                cancel.cancel();
+                assert!(matches!(
+                    service
+                        .execute(
+                            bound.clone(),
+                            inspection,
+                            Action::Remove,
+                            cancel,
+                            &pending.operation_id,
+                            Some(&pending)
+                        )
+                        .await,
+                    Err(PerformanceMutationError::Cancelled)
+                ));
+                assert_eq!(service.pending_count().unwrap(), 0);
+                assert_eq!(
+                    service
+                        .operation(&pending.operation_id)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "failed"
+                );
+                assert_eq!(payload_files(&path), files);
+            } else {
+                let original = std::fs::read(path.join("mods/current.jar")).unwrap();
+                std::fs::write(
+                    path.join("mods/current.jar"),
+                    b"changed after initial recovery",
+                )
+                .unwrap();
+                let continuation = PreparedContinuation {
+                    pending: pending.clone(),
+                    command: service.operation(&pending.operation_id).unwrap().unwrap(),
+                    bound: bound.clone(),
+                    inspection,
+                };
+                let result = service
+                    .resume_prepared(&continuation, CancellationToken::new())
+                    .await;
+                assert!(matches!(&result, Err(PerformanceMutationError::Unsettled)));
+                assert_eq!(service.pending().unwrap(), vec![pending.clone()]);
+                assert!(service.instances.admit(&pending.instance_id).is_err());
+                assert_eq!(
+                    std::fs::read(path.join("mods/current.jar")).unwrap(),
+                    b"changed after initial recovery"
+                );
+                service
+                    .complete_command(&continuation.command, &result)
+                    .unwrap();
+                service.unclaim(&pending.instance_id);
+                std::fs::write(path.join("mods/current.jar"), &original).unwrap();
+                drop(continuation);
+                service.recover_pending().await.unwrap();
+                wait_for_mutation_tasks(&service).await;
+                assert_eq!(
+                    service
+                        .operation(&pending.operation_id)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "failed"
+                );
+                assert_eq!(
+                    std::fs::read(path.join("mods/current.jar")).unwrap(),
+                    original
+                );
+            }
+            drop(bound);
+            service.instances.admit(&pending.instance_id).unwrap();
+            service.instances.library().try_preserve().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_restart_refuses_changed_rollback_target_or_count() {
+        for field in ["target", "composition_id", "artifact_count"] {
+            let (root, library_id) = prepared_crash_fixture("queued", "rollback", "prepared").await;
+            let storage = MetadataStore::open(root.path().join("metadata.sqlite")).unwrap();
+            storage
+                .transaction(|tx| {
+                    let bytes: Vec<u8> =
+                        tx.query_row("SELECT payload FROM performance_operations", [], |row| {
+                            row.get(0)
+                        })?;
+                    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    value["expected"]["prepared"][field] = match field {
+                        "target" => serde_json::json!("managed_composition"),
+                        "composition_id" => serde_json::json!("different-composition"),
+                        _ => serde_json::json!(1),
+                    };
+                    tx.execute(
+                        "UPDATE performance_operations SET payload=?1",
+                        [serde_json::to_vec(&value).unwrap()],
+                    )?;
+                    Ok::<_, StorageError>(())
+                })
+                .unwrap();
+            drop(storage);
+            let service = restart_service(root.path(), library_id);
+            let pending = service.pending().unwrap().pop().unwrap();
+            let path = service
+                .retained
+                .lock()
+                .unwrap()
+                .get(pending.instance_id.as_str())
+                .unwrap()
+                .instance
+                .directory()
+                .read_projection()
+                .unwrap();
+            let files = payload_files(&path);
+            service.recover_pending().await.unwrap();
+            wait_for_mutation_tasks(&service).await;
+            assert_eq!(
+                service
+                    .operation(&pending.operation_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "failed",
+                "{field}"
+            );
+            assert_eq!(payload_files(&path), files);
+            assert_eq!(service.pending_count().unwrap(), 0);
+            service.instances.library().try_preserve().unwrap();
+        }
+    }
 
     fn historical(instance: &InstanceId, sequence: u64) -> HistoricalOperation {
         HistoricalOperation {
@@ -1989,6 +3137,7 @@ mod tests {
             before: None,
             expected: ExpectedComposition::Snapshot {
                 snapshot_id: "snapshot".into(),
+                prepared: None,
             },
             target_effect_started: true,
             result: Some(CompletedComposition::Absent),

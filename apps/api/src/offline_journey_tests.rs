@@ -2,7 +2,10 @@
 //! Every install source comes over loopback HTTP and must pass the normal
 //! downloader, managed-runtime, publication, queue and launch owners.
 
-use super::{DesktopServices, start_in_profile, start_profile_with_test_endpoints, transport};
+use super::{
+    DesktopServices, start_in_profile, start_profile_with_performance_test_inputs,
+    start_profile_with_test_endpoints, transport,
+};
 use axial_minecraft::download::InstallTestEndpoints;
 use axum::{
     Router,
@@ -11,6 +14,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
+use sha2::Sha512;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Cursor, Write},
@@ -418,6 +422,193 @@ impl Drop for Provider {
     }
 }
 
+struct PerformanceProvider {
+    base: String,
+    routes: Arc<BTreeMap<String, Vec<u8>>>,
+    requests: Arc<Mutex<Vec<String>>>,
+    hold: tokio::sync::watch::Sender<bool>,
+    held: Arc<tokio::sync::Notify>,
+    changed_graph: Arc<std::sync::atomic::AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+impl PerformanceProvider {
+    async fn start() -> Self {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let make_routes = |mod_version: &str| {
+            let mut routes = BTreeMap::new();
+            for artifact in axial_performance::builtin_manifest().unwrap().artifacts {
+                let project = artifact.source.project_id;
+                let bytes = archive(
+                    "fabric.mod.json",
+                    &serde_json::to_vec(&json!({
+                        "schemaVersion":1,"id":artifact.id.replace('-', "_"),
+                        "version":mod_version,"environment":"client"
+                    }))
+                    .unwrap(),
+                );
+                let filename = format!("fixture-{project}.jar");
+                let version = json!({
+                    "id":project,"project_id":project,
+                    "name":"Fixture","version_number":"1.0.0","version_type":"release",
+                    "game_versions":["1.21.4"],"loaders":["fabric"],"dependencies":[],
+                    "files":[{"hashes":{"sha512":format!("{:x}", Sha512::digest(&bytes))},
+                        "url":format!("{base}/artifacts/{filename}"),"filename":filename,
+                        "primary":true,"size":bytes.len()}]
+                });
+                routes.insert(format!("/artifacts/{filename}"), bytes);
+                routes.insert(
+                    format!("/v2/project/{project}"),
+                    serde_json::to_vec(
+                        &json!({"id":project,"title":artifact.id,"project_type":"mod"}),
+                    )
+                    .unwrap(),
+                );
+                routes.insert(
+                    format!("/v2/project/{project}/version"),
+                    serde_json::to_vec(&json!([version])).unwrap(),
+                );
+            }
+            routes
+        };
+        let routes = Arc::new(make_routes("1.0.0"));
+        let changed_routes = Arc::new(make_routes("1.0.1"));
+        let changed_graph = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (hold, gate) = tokio::sync::watch::channel(false);
+        let held = Arc::new(tokio::sync::Notify::new());
+        let router = Router::new().fallback({
+            let routes = routes.clone();
+            let requests = requests.clone();
+            let held = held.clone();
+            let changed_graph = changed_graph.clone();
+            move |method: Method, OriginalUri(uri): OriginalUri| {
+                let routes = routes.clone();
+                let changed_routes = changed_routes.clone();
+                let changed_graph = changed_graph.clone();
+                let requests = requests.clone();
+                let held = held.clone();
+                let mut gate = gate.clone();
+                async move {
+                    requests.lock().unwrap().push(format!("{method} {uri}"));
+                    let should_hold = *gate.borrow();
+                    if should_hold {
+                        held.notify_one();
+                        if tokio::time::timeout(Duration::from_secs(30), async {
+                            loop {
+                                let should_hold = *gate.borrow_and_update();
+                                if !should_hold {
+                                    break;
+                                }
+                                if gate.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                        .await
+                        .is_err()
+                        {
+                            return (
+                                StatusCode::GATEWAY_TIMEOUT,
+                                b"fixture gate deadline".to_vec(),
+                            );
+                        }
+                    }
+                    let routes = if changed_graph.load(std::sync::atomic::Ordering::SeqCst) {
+                        changed_routes
+                    } else {
+                        routes
+                    };
+                    let bytes = if method == Method::GET && uri.path() == "/v2/projects" {
+                        url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+                            .find(|(key, _)| key == "ids")
+                            .and_then(|(_, ids)| serde_json::from_str::<Vec<String>>(&ids).ok())
+                            .and_then(|ids| {
+                                ids.into_iter()
+                                    .map(|id| {
+                                        routes.get(&format!("/v2/project/{id}")).and_then(|bytes| {
+                                            serde_json::from_slice::<Value>(bytes).ok()
+                                        })
+                                    })
+                                    .collect::<Option<Vec<_>>>()
+                            })
+                            .map(|projects| serde_json::to_vec(&projects).unwrap())
+                    } else if method == Method::GET {
+                        routes.get(uri.path()).cloned()
+                    } else {
+                        None
+                    };
+                    match bytes {
+                        Some(bytes) => (StatusCode::OK, bytes),
+                        None => (
+                            StatusCode::NOT_IMPLEMENTED,
+                            b"unmatched performance fixture request".to_vec(),
+                        ),
+                    }
+                }
+            }
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        Self {
+            base,
+            routes,
+            requests,
+            hold,
+            held,
+            changed_graph,
+            task,
+        }
+    }
+
+    fn artifact_requests(&self) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for request in self.requests.lock().unwrap().iter() {
+            if let Some(path) = request.strip_prefix("GET /artifacts/") {
+                *counts.entry(path.to_owned()).or_default() += 1;
+            }
+        }
+        counts
+    }
+}
+
+impl Drop for PerformanceProvider {
+    fn drop(&mut self) {
+        self.hold.send_replace(false);
+        self.task.abort();
+    }
+}
+
+fn performance_fixture_transfers(base: &str) -> axial_performance::ManagedArtifactTransferResolver {
+    use axial_minecraft::download::{
+        RetryPolicy, TransferClient, TransferClientConfig, TransferOrigin,
+    };
+    let expected = url::Url::parse(base).unwrap().origin();
+    axial_performance::ManagedArtifactTransferResolver::new(
+        move |url| {
+            let expected = expected.clone();
+            async move {
+                if url.origin() != expected {
+                    return Err(std::io::Error::other("artifact escaped the fixture origin"));
+                }
+                let origin = TransferOrigin::from_loopback_http_for_test_support(&url)
+                    .map_err(std::io::Error::other)?;
+                let config = TransferClientConfig::bounded(
+                    Duration::from_secs(2),
+                    Duration::from_secs(35),
+                    Duration::from_secs(40),
+                    vec![origin],
+                )
+                .map_err(std::io::Error::other)?;
+                TransferClient::build(config).map_err(std::io::Error::other)
+            }
+        },
+        RetryPolicy::none(),
+    )
+}
+
 struct Api {
     client: reqwest::Client,
     base: String,
@@ -699,6 +890,462 @@ async fn assert_fixture_child_exit(
     let tail = fixture_child_log_tail(output);
     assert!(result.is_ok(), "fixture helper timed out: {tail:?}");
     assert_eq!(result.unwrap().unwrap().code(), Some(expected), "{tail:?}");
+}
+
+const PREPARED_PROFILE: &str = "AXIAL_TEST_PREPARED_PERFORMANCE_PROFILE";
+const PREPARED_INSTANCE: &str = "AXIAL_TEST_PREPARED_PERFORMANCE_INSTANCE";
+const PREPARED_PROVIDER: &str = "AXIAL_TEST_PREPARED_PERFORMANCE_PROVIDER";
+const PREPARED_QUEUED: &str = "AXIAL_TEST_PREPARED_PERFORMANCE_QUEUED";
+const PREPARED_ACTION: &str = "AXIAL_TEST_PREPARED_PERFORMANCE_ACTION";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_prepared_performance_apply_resumes_queued_without_blocking_startup() {
+    prepared_performance_restart_journey(true, "apply", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_prepared_performance_apply_resumes_synchronous_without_blocking_startup() {
+    prepared_performance_restart_journey(false, "apply", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_prepared_performance_reapply_resumes_synchronous_without_blocking_startup() {
+    prepared_performance_restart_journey(false, "reapply", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_prepared_performance_rejects_changed_provider_graph_without_file_effects() {
+    prepared_performance_restart_journey(true, "apply", true).await;
+}
+
+async fn prepared_performance_restart_journey(queued: bool, action: &str, changed_graph: bool) {
+    use axial_app::{
+        import::{Inventory, ReadOnlySource},
+        storage::{MetadataStore, StorageError},
+    };
+    use axial_minecraft::loaders::{LoaderComponentId, installed_version_id_for};
+    use std::process::Stdio;
+
+    let temporary = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let profile = temporary.path().join("replacement");
+    let baseline = temporary.path().join("predecessor");
+    let source_mods = baseline.join("instances/0000000000000001/mods");
+    std::fs::create_dir_all(&source_mods).unwrap();
+    let canary = archive(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"fixture_user","version":"1.0.0"}"#,
+    );
+    std::fs::write(source_mods.join("user.jar"), &canary).unwrap();
+    let mut predecessor: Value = serde_json::from_str(include_str!(
+        "../../../acceptance/fixtures/profiles/offline-vanilla/instances.json"
+    ))
+    .unwrap();
+    predecessor["instances"][0]["version_id"] =
+        json!(installed_version_id_for(LoaderComponentId::Fabric, "1.21.4", "0.16.9").unwrap());
+    predecessor["instances"][0]["minecraft_version"] = json!("1.21.4");
+    predecessor["instances"][0]["loader_key"] = json!("fabric");
+    predecessor["instances"][0]["performance_mode"] = json!("managed");
+    let source_registry = serde_json::to_vec(&predecessor).unwrap();
+    std::fs::write(baseline.join("instances.json"), &source_registry).unwrap();
+    for (name, bytes) in [
+        (
+            "config.json",
+            include_bytes!("../../../acceptance/fixtures/profiles/offline-vanilla/config.json")
+                .as_slice(),
+        ),
+        (
+            "accounts.json",
+            include_bytes!("../../../acceptance/fixtures/profiles/offline-vanilla/accounts.json")
+                .as_slice(),
+        ),
+    ] {
+        std::fs::write(baseline.join(name), bytes).unwrap();
+    }
+
+    let provider = PerformanceProvider::start().await;
+    let services = start_profile_with_performance_test_inputs(
+        profile.clone(),
+        format!("{}/v2", provider.base),
+        performance_fixture_transfers(&provider.base),
+    )
+    .await
+    .unwrap();
+    let api = Api::new(&services);
+    let source = ReadOnlySource::from_native_selection(
+        services.library.admit_application_root().unwrap(),
+        &baseline,
+    )
+    .unwrap();
+    services
+        .imports
+        .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
+        .unwrap();
+    let preview = api.get("/api/v1/import/preview").await;
+    assert_eq!(
+        preview["instances"][0]["ordinary_import_available"], true,
+        "{preview}"
+    );
+    let imported = api
+        .post(
+            "/api/v1/import/instances",
+            json!({
+                "fingerprint":preview["fingerprint"],"legacy_id":"0000000000000001"
+            }),
+        )
+        .await;
+    let instance = imported["instance"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(imported["instance"]["loader_key"], "fabric");
+    assert_eq!(imported["instance"]["minecraft_version"], "1.21.4");
+    let mods = services
+        .library
+        .admit()
+        .unwrap()
+        .read_projection()
+        .unwrap()
+        .join("instances")
+        .join(&instance)
+        .join("mods");
+    services.imports.forget().unwrap();
+    drop(source);
+    services.server.shutdown().await.unwrap();
+    drop(services);
+
+    let mut output = tempfile::tempfile_in(temporary.path()).unwrap();
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "offline_journey_tests::prepared_performance_crash_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(PREPARED_PROFILE, &profile)
+        .env(PREPARED_INSTANCE, &instance)
+        .env(PREPARED_PROVIDER, &provider.base)
+        .env(PREPARED_QUEUED, if queued { "1" } else { "0" })
+        .env(PREPARED_ACTION, action)
+        .env("AXIAL_PERFORMANCE_PREPARED_CRASH", "1")
+        .stdout(Stdio::from(output.try_clone().unwrap()))
+        .stderr(Stdio::from(output.try_clone().unwrap()))
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(60), child.wait()).await;
+    if exit.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let requests: Vec<_> = provider
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .take(20)
+        .cloned()
+        .collect();
+    let tail = fixture_child_log_tail(&mut output);
+    assert_eq!(
+        exit.ok()
+            .and_then(Result::ok)
+            .and_then(|status| status.code()),
+        Some(42),
+        "Prepared helper did not reach its checkpoint: {tail:?}; fixture request tail: {requests:?}"
+    );
+    let (command, prepared) = MetadataStore::open(profile.join("metadata.sqlite"))
+        .unwrap()
+        .read(|db| -> Result<_, StorageError> {
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM performance_commands", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))?,
+                1
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM performance_operations", [], |row| row
+                    .get::<_, i64>(0))?,
+                1
+            );
+            let command: String = db.query_row(
+                "SELECT id FROM performance_commands WHERE instance_id=?1",
+                [&instance],
+                |row| row.get(0),
+            )?;
+            let (operation, bytes): (String, Vec<u8>) = db.query_row(
+                "SELECT operation_id,payload FROM performance_operations WHERE instance_id=?1",
+                [&instance],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(
+                operation, command,
+                "Prepared retains the accepted command, including synchronous entry"
+            );
+            Ok((command, serde_json::from_slice::<Value>(&bytes).unwrap()))
+        })
+        .unwrap();
+    assert_eq!(prepared["operation_id"], command);
+    assert_eq!(prepared["instance_id"], instance);
+    assert_eq!(prepared["target_effect_started"], false);
+    assert!(prepared["before"].is_null());
+    assert!(prepared["result"].is_null());
+    assert!(!prepared["directory_receipt"].as_str().unwrap().is_empty());
+    let expected = prepared["expected"]["artifacts"].as_array().unwrap();
+    assert!(!expected.is_empty());
+    assert!(
+        provider.artifact_requests().is_empty(),
+        "Prepared cannot transfer artifacts before the crash"
+    );
+    assert_eq!(std::fs::read(mods.join("user.jar")).unwrap(), canary);
+    assert_eq!(std::fs::read_dir(&mods).unwrap().count(), 1);
+
+    provider.hold.send_replace(true);
+    let started = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            start_profile_with_performance_test_inputs(
+                profile.clone(),
+                format!("{}/v2", provider.base),
+                performance_fixture_transfers(&provider.base),
+            ),
+            provider.held.notified(),
+        )
+    })
+    .await;
+    if started.is_err() {
+        provider.hold.send_replace(false);
+    }
+    let (services, ()) =
+        started.expect("startup must return while resumed provider I/O is still held");
+    let services = services.unwrap();
+    let api = Api::new(&services);
+    let operation_path = format!("/api/v1/performance/operations/{command}");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        api.get("/api/v1/config").await;
+        let operation = api.get(&operation_path).await;
+        assert_eq!(operation["id"], command);
+        assert_eq!(operation["instance_id"], instance);
+        assert_eq!(operation["action"], action);
+        assert_eq!(operation["view_model"]["is_terminal"], false, "{operation}");
+        assert_eq!(
+            api.get(&format!(
+                "/api/v1/performance/instances/{instance}/operation"
+            ))
+            .await["operation"],
+            operation
+        );
+        for (method, path, body) in [
+            (
+                reqwest::Method::PUT,
+                format!("/api/v1/instances/{instance}"),
+                json!({"name":"Must remain reserved"}),
+            ),
+            (
+                reqwest::Method::DELETE,
+                format!("/api/v1/instances/{instance}?keep_files=true"),
+                Value::Null,
+            ),
+        ] {
+            let response = api
+                .client
+                .request(method, format!("{}{path}", api.base))
+                .header(transport::CAPABILITY_HEADER, &api.capability)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+            assert_eq!(
+                response.json::<Value>().await.unwrap(),
+                json!({
+                    "error":axial_app::instances::model::InstanceError::Busy.to_string()
+                })
+            );
+        }
+    })
+    .await
+    .expect("held recovery must leave unrelated reads and Busy refusals responsive");
+    assert!(provider.artifact_requests().is_empty());
+    assert_eq!(std::fs::read(mods.join("user.jar")).unwrap(), canary);
+    provider
+        .changed_graph
+        .store(changed_graph, std::sync::atomic::Ordering::SeqCst);
+    provider.hold.send_replace(false);
+    let completed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let operation = api.get(&operation_path).await;
+            if operation["view_model"]["is_terminal"] == true && services.tasks.status().is_idle() {
+                break operation;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the original accepted operation must finish after the provider is released");
+    assert_eq!(
+        completed["state"],
+        if changed_graph { "failed" } else { "complete" },
+        "{completed}"
+    );
+    assert_eq!(completed["id"], command);
+    assert_eq!(
+        services
+            .instances
+            .registry()
+            .storage()
+            .read(|db| -> Result<i64, StorageError> {
+                Ok(
+                    db.query_row("SELECT count(*) FROM performance_operations", [], |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
+            .unwrap(),
+        0
+    );
+    let health = api
+        .get(&format!(
+            "/api/v1/performance/health?instance_id={instance}"
+        ))
+        .await;
+    let transferred = provider.artifact_requests();
+    if changed_graph {
+        assert!(
+            transferred.is_empty(),
+            "a newly resolved graph cannot replace the accepted Prepared graph"
+        );
+        assert!(health["state"].is_null(), "{health}");
+        assert_eq!(health["view_model"]["state_id"], "disabled");
+        assert_eq!(std::fs::read_dir(&mods).unwrap().count(), 1);
+        api.request(
+            reqwest::Method::PUT,
+            &format!("/api/v1/instances/{instance}"),
+            Some(json!({"name":imported["instance"]["name"]})),
+        )
+        .await;
+    } else {
+        assert_eq!(health["view_model"]["state_id"], "healthy", "{health}");
+        assert_eq!(
+            health["state"]["graph_sha512"],
+            prepared["expected"]["graph_sha512"]
+        );
+        assert_eq!(
+            health["state"]["installed_mods"].as_array().unwrap().len(),
+            expected.len()
+        );
+        assert_eq!(transferred.len(), expected.len());
+        for artifact in expected {
+            let filename = artifact["filename"].as_str().unwrap();
+            assert_eq!(transferred.get(filename), Some(&1));
+            let bytes = std::fs::read(mods.join(filename)).unwrap();
+            assert_eq!(bytes, provider.routes[&format!("/artifacts/{filename}")]);
+            assert_eq!(format!("{:x}", Sha512::digest(&bytes)), artifact["sha512"]);
+        }
+    }
+    services.server.shutdown().await.unwrap();
+    drop(services);
+    let services = start_profile_with_performance_test_inputs(
+        profile.clone(),
+        format!("{}/v2", provider.base),
+        performance_fixture_transfers(&provider.base),
+    )
+    .await
+    .unwrap();
+    let api = Api::new(&services);
+    assert_eq!(api.get(&operation_path).await, completed);
+    assert_eq!(
+        api.get(&format!(
+            "/api/v1/performance/health?instance_id={instance}"
+        ))
+        .await,
+        health
+    );
+    services.server.shutdown().await.unwrap();
+    assert_eq!(
+        provider.artifact_requests(),
+        transferred,
+        "cold startup cannot replay artifact effects"
+    );
+    services
+        .instances
+        .registry()
+        .storage()
+        .read(|db| -> Result<(), StorageError> {
+            assert_eq!(
+                db.query_row("SELECT id FROM performance_commands", [], |row| row
+                    .get::<_, String>(0))?,
+                command
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM performance_commands", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))?,
+                1
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM performance_operations", [], |row| row
+                    .get::<_, i64>(0))?,
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(std::fs::read(mods.join("user.jar")).unwrap(), canary);
+    assert_eq!(std::fs::read(source_mods.join("user.jar")).unwrap(), canary);
+    assert_eq!(
+        std::fs::read(baseline.join("instances.json")).unwrap(),
+        source_registry
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "subprocess helper for the actual Prepared Performance boundary"]
+async fn prepared_performance_crash_helper() {
+    let Some(profile) = std::env::var_os(PREPARED_PROFILE) else {
+        return;
+    };
+    let profile = PathBuf::from(profile);
+    assert_eq!(profile.canonicalize().unwrap(), profile);
+    assert!(std::env::var_os("AXIAL_PERFORMANCE_PREPARED_CRASH").is_some());
+    let base = std::env::var(PREPARED_PROVIDER).unwrap();
+    let instance = std::env::var(PREPARED_INSTANCE).unwrap();
+    let queued = std::env::var(PREPARED_QUEUED).unwrap() == "1";
+    let action = std::env::var(PREPARED_ACTION).unwrap();
+    assert!(matches!(action.as_str(), "apply" | "reapply"));
+    let services = start_profile_with_performance_test_inputs(
+        profile,
+        format!("{base}/v2"),
+        performance_fixture_transfers(&base),
+    )
+    .await
+    .unwrap();
+    let api = Api::new(&services);
+    let accepted = api
+        .post(
+            "/api/v1/performance/install",
+            json!({
+                "instance_id":instance,"action":action,"mode":"managed","queued":queued
+            }),
+        )
+        .await;
+    assert!(
+        queued,
+        "synchronous Apply returned without reaching its Prepared crash: {accepted}"
+    );
+    let command = accepted["install_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let operation = api
+                .get(&format!("/api/v1/performance/operations/{command}"))
+                .await;
+            assert_ne!(
+                operation["view_model"]["is_terminal"], true,
+                "Apply did not reach Prepared: {operation}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("Apply must reach its real Prepared crash hook");
 }
 
 fn unobserved_intent_payload(storage: &axial_app::storage::MetadataStore, intent: &str) -> Vec<u8> {
