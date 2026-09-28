@@ -369,9 +369,28 @@ mod tests {
             "reconciliation_terminal":null,"persisted_state_repair_attempt":null,
             "persisted_state_repair_terminal":null,"guardian_install_terminal":null
         });
+        let cancelled_id = "op-00000000-0000-4000-8000-000000000002";
+        let mut cancelled = operation.clone();
+        cancelled["journal_id"] = json!(format!("journal-{cancelled_id}"));
+        cancelled["operation_id"] = json!(cancelled_id);
+        cancelled["sequence"] = json!(SEQUENCE + 1);
+        cancelled["targets"][0] = target("Session", "content-00000000000000000000000000000002");
+        cancelled["status"] = json!("Failed");
+        cancelled["outcome"] = json!("Failed");
+        cancelled["failure_point"] = json!("content_initialization_cancelled");
+        cancelled["completed_steps"] = json!([step(
+            "content_progress_initializing",
+            "Failed",
+            "Failed",
+            json!([
+                "install_phase:initializing",
+                "install_done:true",
+                "install_error:true"
+            ])
+        )]);
         fs::create_dir_all(baseline.join("state")).unwrap();
         fs::write(baseline.join("state/operation-journals.json"), serde_json::to_vec(&json!({
-            "schema":"axial.state.operation_journals.v10","next_sequence":SEQUENCE+1,"entries":[operation]
+            "schema":"axial.state.operation_journals.v10","next_sequence":SEQUENCE+2,"entries":[operation,cancelled]
         })).unwrap()).unwrap();
         let unchanged = source_snapshot(&baseline);
         let profile = root.path().join("replacement");
@@ -433,8 +452,12 @@ mod tests {
         let (status, page) = get(&services, &path).await;
         assert_eq!(status, StatusCode::OK, "{page}");
         assert!(page["next_after"].is_null());
-        assert_eq!(page["records"].as_array().unwrap().len(), 1);
-        let record = &page["records"][0];
+        let records = page["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        let record = records
+            .iter()
+            .find(|record| record["operation_id"] == operation_id)
+            .unwrap();
         let history_id = record["id"].as_str().unwrap();
         assert_eq!(
             history_id.strip_prefix("legacy-install-").unwrap().len(),
@@ -446,6 +469,7 @@ mod tests {
         assert_eq!(record["operation_id"], operation_id);
         assert_eq!(record["command"], "ModifyInstanceContent");
         assert_eq!(record["outcome"], "Succeeded");
+        assert!(record.get("failure_point").is_none());
         assert_eq!(record["rollback"], "NotApplicable");
         assert_eq!(record["targets"], operation["targets"]);
         assert_eq!(record["completed_steps"][0]["phase"], "Downloading");
@@ -461,18 +485,43 @@ mod tests {
         for key in METRICS {
             assert_eq!(counters[key], u64::MAX.to_string(), "{key}");
         }
-        for absent in [
-            "request",
-            "actions",
-            "can_cancel",
-            "can_retry",
-            "created_at",
-            "updated_at",
-        ] {
-            assert!(record.get(absent).is_none(), "{absent}");
-        }
+        let failed = records
+            .iter()
+            .find(|record| record["operation_id"] == cancelled_id)
+            .unwrap();
+        assert_eq!(failed["historical"], true);
+        assert_eq!(failed["instance_id"], id);
+        assert_eq!(failed["sequence"], (SEQUENCE + 1).to_string());
+        assert_eq!(failed["command"], "ModifyInstanceContent");
+        assert_eq!(failed["outcome"], "Failed");
+        assert_eq!(failed["failure_point"], "content_initialization_cancelled");
+        assert_eq!(failed["rollback"], "NotApplicable");
+        assert_eq!(failed["targets"], cancelled["targets"]);
         assert_eq!(
-            get(&services, &format!("{path}&after={history_id}")).await,
+            failed["completed_steps"],
+            json!([{
+                "step_id":"content_progress_initializing","phase":"Failed","result":"Failed",
+                "changed_target":null,
+                "generated_facts":["install_phase:initializing","install_done:true","install_error:true"],
+                "rollback":"NotApplicable","metrics":null
+            }])
+        );
+        for record in records {
+            for absent in [
+                "status",
+                "request",
+                "actions",
+                "can_cancel",
+                "can_retry",
+                "created_at",
+                "updated_at",
+            ] {
+                assert!(record.get(absent).is_none(), "{absent}");
+            }
+        }
+        let last_id = records.last().unwrap()["id"].as_str().unwrap();
+        assert_eq!(
+            get(&services, &format!("{path}&after={last_id}")).await,
             (StatusCode::OK, json!({"records":[],"next_after":null}))
         );
         for after in ["", "../path", "legacy-install-invalid"] {
@@ -481,26 +530,29 @@ mod tests {
                 StatusCode::BAD_REQUEST
             );
         }
-        assert_eq!(
-            post(
-                &services,
-                &format!("/api/v1/install/{history_id}/cancel"),
-                Value::Null
-            )
-            .await
-            .0,
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            post(
-                &services,
-                &format!("/api/v1/install/queue/retry?expected_install_id={history_id}"),
-                json!({"kind":"vanilla","version_id":"must-not-enqueue"})
-            )
-            .await
-            .0,
-            StatusCode::BAD_REQUEST
-        );
+        for record in records {
+            let history_id = record["id"].as_str().unwrap();
+            assert_eq!(
+                post(
+                    &services,
+                    &format!("/api/v1/install/{history_id}/cancel"),
+                    Value::Null
+                )
+                .await
+                .0,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                post(
+                    &services,
+                    &format!("/api/v1/install/queue/retry?expected_install_id={history_id}"),
+                    json!({"kind":"vanilla","version_id":"must-not-enqueue"})
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
         assert_eq!(
             post(&services, "/api/v1/import/instances", import_request).await,
             (StatusCode::OK, imported.clone())

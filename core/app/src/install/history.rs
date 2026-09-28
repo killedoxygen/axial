@@ -187,6 +187,8 @@ pub struct HistoryRecord {
     pub planned_steps: Vec<HistoryStep>,
     pub completed_steps: Vec<HistoryStep>,
     pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_point: Option<String>,
     pub rollback: String,
 }
 
@@ -568,10 +570,8 @@ impl ReadRecord {
                 .iter()
                 .map(HistoryStep::from)
                 .collect(),
-            outcome: source
-                .outcome
-                .clone()
-                .expect("validated successful history"),
+            outcome: source.outcome.clone().expect("validated terminal history"),
+            failure_point: source.failure_point.clone(),
             rollback: source.rollback.clone(),
         }
     }
@@ -627,9 +627,6 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
         || source.parent_operation_id.is_some()
         || source.owner != "Application"
         || source.ownership != "LauncherManaged"
-        || source.status != "Succeeded"
-        || source.outcome.as_deref() != Some("Succeeded")
-        || source.failure_point.is_some()
         || source.rollback != "NotApplicable"
         || !source.guardian_diagnosis_ids.is_empty()
         || source.reconciliation_attempt.is_some()
@@ -729,6 +726,42 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
         }
         _ => return Err(HistoryError::Invalid),
     };
+    match (
+        &identity,
+        source.status.as_str(),
+        source.outcome.as_deref(),
+        source.failure_point.as_deref(),
+    ) {
+        (
+            Identity::Content(id),
+            "Failed",
+            Some("Failed"),
+            Some("content_initialization_cancelled"),
+        ) => {
+            let [step] = source.completed_steps.as_slice() else {
+                return Err(HistoryError::Invalid);
+            };
+            if step.step_id != "content_progress_initializing"
+                || step.phase != "Failed"
+                || step.result != "Failed"
+                || step.changed_target.is_some()
+                || step.generated_facts
+                    != [
+                        "install_phase:initializing",
+                        "install_done:true",
+                        "install_error:true",
+                    ]
+                || step.rollback != "NotApplicable"
+                || !step.guardian_fact_ids.is_empty()
+                || step.metrics.is_some()
+            {
+                return Err(HistoryError::Invalid);
+            }
+            return Ok(Some(id.clone()));
+        }
+        (_, "Succeeded", Some("Succeeded"), None) => {}
+        _ => return Err(HistoryError::Invalid),
+    }
     let namespace = if matches!(&identity, Identity::Content(_)) {
         "content"
     } else {
@@ -1057,6 +1090,11 @@ mod tests {
         serde_json::from_value(journal["entries"].clone()).unwrap()
     }
 
+    fn cancelled_initialization() -> SourceOperation {
+        let journal = crate::import::tests::cancelled_content_initialization_journal();
+        serde_json::from_value(journal["entries"][0].clone()).unwrap()
+    }
+
     fn prepare(records: Vec<SourceOperation>) -> Vec<PreparedOperation> {
         records
             .into_iter()
@@ -1134,6 +1172,7 @@ mod tests {
                 serde_json::to_value(&original.targets).unwrap()
             );
             assert!(saved.get("status").is_none());
+            assert!(saved.get("failure_point").is_none());
             assert!(saved.get("accepted_at").is_none());
             assert!(saved.get("created_at").is_none());
             assert!(saved.get("allowed_actions").is_none());
@@ -1571,5 +1610,196 @@ mod tests {
             [], |row| row.get(0),
         ).map_err(StorageError::from)).unwrap();
         assert_eq!(live_tables, 0);
+    }
+
+    #[test]
+    fn initialization_cancelled_history_preserves_failed_reason_without_execution_state() {
+        let (store, instance, legacy, mut records) = fixture();
+        let source = cancelled_initialization();
+        records.push(PreparedOperation::prepare(SOURCE, source.clone()).unwrap());
+        let batch = PreparedImport::bind(records, &legacy, &instance).unwrap();
+        store.transaction(|tx| batch.insert_in(tx)).unwrap();
+        store.transaction(|tx| batch.insert_in(tx)).unwrap();
+        store.transaction(|tx| batch.verify_in(tx)).unwrap();
+        let page = read(&store, &legacy, &instance, None).unwrap();
+        let wire = serde_json::to_value(&page).unwrap();
+        let records = wire["records"].as_array().unwrap();
+        assert_eq!(records.len(), 4);
+        let saved = records
+            .iter()
+            .find(|record| record["operation_id"] == source.operation_id)
+            .unwrap();
+        assert_eq!(saved["instance_id"], instance.as_str());
+        assert_eq!(saved["historical"], true);
+        assert_eq!(saved["command"], "ModifyInstanceContent");
+        assert_eq!(saved["outcome"], "Failed");
+        assert_eq!(saved["failure_point"], "content_initialization_cancelled");
+        assert_eq!(saved["sequence"], source.sequence.to_string());
+        assert_eq!(
+            saved["targets"],
+            serde_json::to_value(&source.targets).unwrap()
+        );
+        assert_eq!(
+            saved["completed_steps"],
+            json!([{
+                "step_id":"content_progress_initializing", "phase":"Failed", "result":"Failed",
+                "changed_target":null, "generated_facts":["install_phase:initializing", "install_done:true", "install_error:true"],
+                "rollback":"NotApplicable", "metrics":null
+            }])
+        );
+        assert!(saved.get("allowed_actions").is_none());
+        assert!(saved.get("status").is_none());
+        assert!(saved.get("created_at").is_none());
+        for success in records
+            .iter()
+            .filter(|record| record["outcome"] == "Succeeded")
+        {
+            assert!(success.get("failure_point").is_none());
+        }
+        assert_eq!(count(&store), 4);
+    }
+
+    #[test]
+    fn initialization_cancelled_history_does_not_admit_worker_failures_or_effects() {
+        let source = cancelled_initialization();
+        PreparedOperation::prepare(SOURCE, source.clone()).unwrap();
+        let mut invalid = Vec::new();
+        for mutate in [
+            |record: &mut SourceOperation| record.status = "Cancelled".into(),
+            |record: &mut SourceOperation| record.outcome = Some("Cancelled".into()),
+            |record: &mut SourceOperation| record.failure_point = None,
+            |record: &mut SourceOperation| {
+                record.failure_point = Some("content_worker_interrupted".into())
+            },
+            |record: &mut SourceOperation| {
+                record.failure_point = Some("content_progress_initializing".into())
+            },
+            |record: &mut SourceOperation| {
+                record.completed_steps[0].step_id = "content_progress_error".into()
+            },
+            |record: &mut SourceOperation| record.completed_steps[0].phase = "Downloading".into(),
+            |record: &mut SourceOperation| record.completed_steps[0].result = "Completed".into(),
+            |record: &mut SourceOperation| {
+                record.completed_steps[0].generated_facts.pop();
+            },
+            |record: &mut SourceOperation| record.completed_steps[0].generated_facts.swap(1, 2),
+            |record: &mut SourceOperation| record.completed_steps[0].rollback = "Applied".into(),
+            |record: &mut SourceOperation| {
+                record.completed_steps[0]
+                    .guardian_fact_ids
+                    .push("DownloadUnavailable".into())
+            },
+            |record: &mut SourceOperation| {
+                record
+                    .guardian_diagnosis_ids
+                    .push("DownloadUnavailable".into())
+            },
+            |record: &mut SourceOperation| record.reconciliation_attempt = Some(json!({})),
+            |record: &mut SourceOperation| record.guardian_install_terminal = Some(json!({})),
+        ] {
+            let mut changed = source.clone();
+            mutate(&mut changed);
+            invalid.push(changed);
+        }
+        let successes = source_records();
+        let mut with_metrics = source.clone();
+        with_metrics.completed_steps[0].metrics =
+            successes[2].completed_steps.last().unwrap().metrics.clone();
+        invalid.push(with_metrics);
+        let mut with_effect = source.clone();
+        with_effect.completed_steps[0].changed_target = Some(source.targets[1].clone());
+        invalid.push(with_effect);
+        let mut with_progress = source.clone();
+        with_progress
+            .completed_steps
+            .insert(0, successes[2].completed_steps[0].clone());
+        invalid.push(with_progress);
+        let mut vanilla = successes[0].clone();
+        vanilla.status = source.status.clone();
+        vanilla.outcome = source.outcome.clone();
+        vanilla.failure_point = source.failure_point.clone();
+        vanilla.completed_steps = source.completed_steps.clone();
+        invalid.push(vanilla);
+        for (index, record) in invalid.into_iter().enumerate() {
+            assert!(
+                matches!(
+                    PreparedOperation::prepare(SOURCE, record),
+                    Err(HistoryError::Invalid)
+                ),
+                "mutation {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn initialization_cancelled_history_readback_revalidates_reason_and_effect_absence() {
+        for mutation in [
+            "reason",
+            "progress",
+            "metrics",
+            "changed_target",
+            "guardian",
+        ] {
+            let (store, instance, legacy, _) = fixture();
+            let operation = PreparedOperation::prepare(SOURCE, cancelled_initialization()).unwrap();
+            let id = operation.0.id.clone();
+            let batch = PreparedImport::bind(vec![operation], &legacy, &instance).unwrap();
+            store.transaction(|tx| batch.insert_in(tx)).unwrap();
+            let successes = source_records();
+            store
+                .transaction(|tx| -> Result<(), StorageError> {
+                    let bytes: Vec<u8> = tx.query_row(
+                        "SELECT payload FROM install_history WHERE id=?1",
+                        [&id],
+                        |row| row.get(0),
+                    )?;
+                    let mut payload: Value = serde_json::from_slice(&bytes).unwrap();
+                    match mutation {
+                        "reason" => {
+                            payload["source"]["failure_point"] = json!("content_worker_interrupted")
+                        }
+                        "progress" => payload["source"]["completed_steps"]
+                            .as_array_mut()
+                            .unwrap()
+                            .insert(
+                                0,
+                                serde_json::to_value(&successes[2].completed_steps[0]).unwrap(),
+                            ),
+                        "metrics" => {
+                            payload["source"]["completed_steps"][0]["metrics"] =
+                                serde_json::to_value(
+                                    &successes[2].completed_steps.last().unwrap().metrics,
+                                )
+                                .unwrap()
+                        }
+                        "changed_target" => {
+                            payload["source"]["completed_steps"][0]["changed_target"] =
+                                payload["source"]["targets"][1].clone()
+                        }
+                        "guardian" => payload["source"]["guardian_install_terminal"] = json!({}),
+                        _ => unreachable!(),
+                    }
+                    tx.execute(
+                        "UPDATE install_history SET payload=?1 WHERE id=?2",
+                        params![serde_json::to_vec(&payload).unwrap(), id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    read(&store, &legacy, &instance, None),
+                    Err(HistoryError::Conflict)
+                ),
+                "{mutation}"
+            );
+            assert!(
+                matches!(
+                    store.transaction(|tx| batch.verify_in(tx)),
+                    Err(HistoryError::Conflict)
+                ),
+                "{mutation}"
+            );
+        }
     }
 }

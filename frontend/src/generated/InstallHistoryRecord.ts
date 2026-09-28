@@ -2,4 +2,4 @@
 import type { InstallHistoryStep } from "./InstallHistoryStep";
 import type { InstallHistoryTarget } from "./InstallHistoryTarget";
 
-export type InstallHistoryRecord = { id: string, historical: boolean, source_id: string, instance_id: string | null, journal_id: string, operation_id: string, sequence: string, command: string, targets: Array<InstallHistoryTarget>, planned_steps: Array<InstallHistoryStep>, completed_steps: Array<InstallHistoryStep>, outcome: string, rollback: string, };
+export type InstallHistoryRecord = { id: string, historical: boolean, source_id: string, instance_id: string | null, journal_id: string, operation_id: string, sequence: string, command: string, targets: Array<InstallHistoryTarget>, planned_steps: Array<InstallHistoryStep>, completed_steps: Array<InstallHistoryStep>, outcome: string, failure_point?: string | null, rollback: string, };

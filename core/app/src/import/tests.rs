@@ -2838,6 +2838,380 @@ pub(crate) fn successful_install_journal() -> Value {
     json!({"schema":"axial.state.operation_journals.v10", "next_sequence":14, "entries":entries})
 }
 
+pub(crate) fn cancelled_content_initialization_journal() -> Value {
+    let mut entry = successful_install_journal()["entries"][2].clone();
+    let operation = "op-00000000-0000-4000-8000-00000000000e";
+    entry["journal_id"] = json!(format!("journal-{operation}"));
+    entry["operation_id"] = json!(operation);
+    entry["sequence"] = json!(14);
+    entry["targets"][0]["id"] = json!("content-0000000000000000000000000000000e");
+    entry["status"] = json!("Failed");
+    entry["outcome"] = json!("Failed");
+    entry["failure_point"] = json!("content_initialization_cancelled");
+    // Reservation cleanup runs before worker hand-off and records no metrics.
+    entry["completed_steps"] = json!([{
+        "step_id":"content_progress_initializing", "phase":"Failed", "result":"Failed",
+        "changed_target":null,
+        "generated_facts":["install_phase:initializing", "install_done:true", "install_error:true"],
+        "rollback":"NotApplicable", "guardian_fact_ids":[], "metrics":null
+    }]);
+    json!({"schema":"axial.state.operation_journals.v10", "next_sequence":15, "entries":[entry]})
+}
+
+#[tokio::test]
+async fn content_initialization_cancelled_import_copies_reopens_and_replays_exact_history() {
+    let fixture = Fixture::new();
+    fixture.two_instances();
+    let mut journal = cancelled_content_initialization_journal();
+    journal["entries"][0]["sequence"] = json!(u64::MAX - 1);
+    journal["next_sequence"] = json!(u64::MAX);
+    fixture.write("state/operation-journals.json", &journal);
+    let before = snapshot(&fixture.baseline);
+    let inventory = Arc::new(fixture.capture());
+    let preview = inventory.preview();
+    assert!(
+        preview
+            .instances
+            .iter()
+            .all(|row| row.ordinary_import_available)
+    );
+    assert!(
+        preview
+            .blockers
+            .contains(&ImportBlocker::UnsettledOperation)
+    );
+    assert!(!preview.cutover_available);
+    let (root, service) = import_service();
+    service
+        .registry()
+        .storage()
+        .migrate(&[crate::install::queue::MIGRATION])
+        .unwrap();
+    let second = service
+        .import_instance(
+            inventory
+                .prepare_instance(&preview.fingerprint, SECOND)
+                .unwrap(),
+        )
+        .unwrap()
+        .join()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        service
+            .imported_install_history(&second.id, None)
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    let imported = service
+        .import_instance(
+            inventory
+                .prepare_instance(&preview.fingerprint, FIRST)
+                .unwrap(),
+        )
+        .unwrap()
+        .join()
+        .await
+        .unwrap()
+        .unwrap();
+    let destination = imported_path(&service, &imported.id);
+    assert_eq!(
+        fs::read(destination.join("options.txt")).unwrap(),
+        fs::read(
+            fixture
+                .baseline
+                .join(format!("instances/{FIRST}/options.txt"))
+        )
+        .unwrap()
+    );
+    let history = service
+        .imported_install_history(&imported.id, None)
+        .unwrap();
+    assert_eq!(history.records.len(), 1);
+    assert!(history.next_after.is_none());
+    let record = &history.records[0];
+    let wire = serde_json::to_value(record).unwrap();
+    let source = &journal["entries"][0];
+    assert!(record.historical);
+    assert_eq!(record.instance_id.as_deref(), Some(imported.id.as_str()));
+    assert_eq!(wire["sequence"], (u64::MAX - 1).to_string());
+    for field in [
+        "journal_id",
+        "operation_id",
+        "command",
+        "targets",
+        "outcome",
+        "failure_point",
+        "rollback",
+    ] {
+        assert_eq!(wire[field], source[field], "{field}");
+    }
+    // Guardian-only empty lists are not part of the public history projection.
+    for field in ["planned_steps", "completed_steps"] {
+        let mut expected = source[field].clone();
+        expected[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("guardian_fact_ids");
+        assert_eq!(wire[field], expected, "{field}");
+    }
+    let library_id = service
+        .directories()
+        .library()
+        .admit()
+        .unwrap()
+        .library_id();
+    drop(service);
+    let service = reopen_import_service(root.path(), library_id);
+    assert_eq!(
+        service
+            .imported_install_history(&imported.id, None)
+            .unwrap(),
+        history
+    );
+    fs::write(
+        destination.join("options.txt"),
+        b"destination edit after import",
+    )
+    .unwrap();
+    let copied = snapshot(&destination);
+    let repeated = service
+        .import_instance(prepare_first(&fixture))
+        .unwrap()
+        .join()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.id, imported.id);
+    assert_eq!(
+        service
+            .imported_install_history(&imported.id, None)
+            .unwrap(),
+        history
+    );
+    assert!(
+        service
+            .imported_install_history(&second.id, None)
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    let counts = service.registry().storage().read(|db| -> Result<_, crate::storage::StorageError> {
+        Ok(db.query_row("SELECT (SELECT COUNT(*) FROM install_history), (SELECT COUNT(*) FROM install_queue), (SELECT COUNT(*) FROM installed_versions)", [], |row| Ok((row.get::<_,u64>(0)?, row.get::<_,u64>(1)?, row.get::<_,u64>(2)?)))?)
+    }).unwrap();
+    assert_eq!(counts, (1, 0, 0));
+    assert_eq!(snapshot(&destination), copied);
+    assert_eq!(snapshot(&fixture.baseline), before);
+}
+
+#[tokio::test]
+async fn content_initialization_cancelled_import_preserves_mixed_success_and_rules_history() {
+    let fixture = Fixture::new();
+    let (_, key) = seed_rules_source(&fixture);
+    let mut journal = cancelled_content_initialization_journal();
+    for other in [successful_install_journal(), terminal_rules_journal()] {
+        journal["entries"]
+            .as_array_mut()
+            .unwrap()
+            .extend(other["entries"].as_array().unwrap().iter().cloned());
+    }
+    fixture.write("state/operation-journals.json", &journal);
+    let before = snapshot(&fixture.baseline);
+    let previews = ImportPreviews::new();
+    let preview = previews.admit(fixture.capture()).unwrap();
+    assert!(preview.rules_import_available);
+    assert!(!preview.instances[0].ordinary_import_available);
+    assert!(!preview.cutover_available);
+    let (root, service) = import_service();
+    let rules = rules_import_owner(root.path(), &service, key);
+    let pin = service
+        .directories()
+        .library()
+        .admit_application_root()
+        .unwrap();
+    let result = previews
+        .prepare_rules(&preview.fingerprint)
+        .unwrap()
+        .commit(
+            &rules,
+            &pin,
+            &model::RulesImportRequest {
+                fingerprint: preview.fingerprint.clone(),
+                rules_import_id: preview.rules_import_id,
+            },
+            &crate::tasks::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.receipt.refresh_history.len(), 4);
+    let count: u64 = service
+        .registry()
+        .storage()
+        .read(|db| -> Result<_, crate::storage::StorageError> {
+            Ok(db.query_row("SELECT COUNT(*) FROM install_history", [], |row| row.get(0))?)
+        })
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "rules publication does not publish install history"
+    );
+    assert!(previews.current_with_rules(&rules).unwrap().instances[0].ordinary_import_available);
+    let imported = service
+        .import_instance(
+            previews
+                .prepare_instance_with_rules(&preview.fingerprint, FIRST, &rules)
+                .unwrap(),
+        )
+        .unwrap()
+        .join()
+        .await
+        .unwrap()
+        .unwrap();
+    let history = service
+        .imported_install_history(&imported.id, None)
+        .unwrap();
+    assert_eq!(history.records.len(), 4);
+    assert_eq!(
+        history
+            .records
+            .iter()
+            .filter(|row| row.outcome == "Succeeded")
+            .count(),
+        3
+    );
+    let failed = history
+        .records
+        .iter()
+        .find(|row| row.outcome == "Failed")
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(failed).unwrap()["failure_point"],
+        "content_initialization_cancelled"
+    );
+    assert_eq!(failed.instance_id.as_deref(), Some(imported.id.as_str()));
+    assert_eq!(snapshot(&fixture.baseline), before);
+}
+
+#[test]
+fn content_initialization_cancelled_import_refuses_worker_effects_and_raw_malformed_evidence() {
+    for invalid in [
+        "cancelled",
+        "missing-failure",
+        "worker-failure",
+        "wrong-instance",
+        "extra-step",
+        "metrics",
+        "changed-target",
+        "facts-order",
+        "missing-fact",
+        "unknown-step",
+        "duplicate-failure",
+        "duplicate-phase",
+        "reconciliation",
+    ] {
+        let fixture = Fixture::new();
+        let mut journal = cancelled_content_initialization_journal();
+        let entry = &mut journal["entries"][0];
+        match invalid {
+            "cancelled" => {
+                entry["status"] = json!("Cancelled");
+                entry["outcome"] = json!("Cancelled");
+            }
+            "missing-failure" => entry["failure_point"] = Value::Null,
+            "worker-failure" => entry["failure_point"] = json!("operation_worker_stopped"),
+            "wrong-instance" => entry["targets"][1]["id"] = json!(SECOND),
+            "extra-step" => entry["completed_steps"].as_array_mut().unwrap().insert(
+                0,
+                successful_install_journal()["entries"][2]["completed_steps"][0].clone(),
+            ),
+            "metrics" => {
+                entry["completed_steps"][0]["metrics"] = successful_install_journal()["entries"][2]
+                    ["completed_steps"][1]["metrics"]
+                    .clone()
+            }
+            "changed-target" => {
+                entry["completed_steps"][0]["changed_target"] = entry["targets"][1].clone()
+            }
+            "facts-order" => entry["completed_steps"][0]["generated_facts"]
+                .as_array_mut()
+                .unwrap()
+                .swap(1, 2),
+            "missing-fact" => {
+                entry["completed_steps"][0]["generated_facts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+            }
+            "unknown-step" => entry["completed_steps"][0]["effect"] = json!(true),
+            "reconciliation" => entry["reconciliation_attempt"] = json!({"retained_effect":true}),
+            _ => {}
+        }
+        journal["entries"].as_array_mut().unwrap().extend(
+            terminal_rules_journal()["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+        fixture.write("state/operation-journals.json", &journal);
+        let raw = serde_json::to_string(&journal).unwrap();
+        let raw = match invalid {
+            "duplicate-failure" => raw.replacen("\"failure_point\":\"content_initialization_cancelled\"", "\"failure_point\":\"content_initialization_cancelled\",\"failure_point\":\"content_initialization_cancelled\"", 1),
+            "duplicate-phase" => raw.replacen("\"phase\":\"Failed\"", "\"phase\":\"Failed\",\"phase\":\"Failed\"", 1),
+            _ => raw,
+        };
+        fs::write(
+            fixture.baseline.join("state/operation-journals.json"),
+            raw.as_bytes(),
+        )
+        .unwrap();
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        let preview = inventory.preview();
+        assert!(!preview.instances[0].ordinary_import_available, "{invalid}");
+        assert!(!preview.rules_import_available, "{invalid}");
+        assert!(
+            inventory
+                .prepare_instance(inventory.fingerprint(), FIRST)
+                .is_err(),
+            "{invalid}"
+        );
+        assert_eq!(
+            inventory
+                .record_bytes("profile/state/operation-journals.json")
+                .unwrap(),
+            raw.as_bytes()
+        );
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn content_initialization_cancelled_import_keeps_source_fences() {
+    let fixture = Fixture::new();
+    let mut journal = cancelled_content_initialization_journal();
+    fixture.write("state/operation-journals.json", &journal);
+    let inventory = Arc::new(fixture.capture());
+    let prepared = inventory
+        .prepare_instance(inventory.fingerprint(), FIRST)
+        .unwrap();
+    journal["entries"][0]["sequence"] = json!(15);
+    journal["next_sequence"] = json!(16);
+    fixture.write("state/operation-journals.json", &journal);
+    let before = snapshot(&fixture.baseline);
+    assert!(matches!(
+        inventory.revalidate(),
+        Err(ImportError::SourceChanged)
+    ));
+    let (_root, service) = import_service();
+    assert!(service.import_instance(prepared).is_err());
+    assert!(service.registry().list().unwrap().is_empty());
+    assert!(service.pending().unwrap().is_empty());
+    assert_eq!(snapshot(&fixture.baseline), before);
+}
+
 #[tokio::test]
 async fn successful_install_history_import_allows_real_copy_and_reopen() {
     let fixture = Fixture::new();
