@@ -2,36 +2,27 @@ import type { JSX } from 'preact';
 import { Icon } from '../../../ui/Icons';
 import { Button, Meter } from '../../../ui/Atoms';
 import { DownloadFailureNotice } from '../../../ui/DownloadFailureNotice';
-import { openContextMenu } from '../../../ui/ContextMenu';
+import { openContextMenu, type ContextMenuItem } from '../../../ui/ContextMenu';
 import { navigate } from '../../../ui-state';
 import { clearLaunchNotice } from '../../../actions';
 import { toast } from '../../../toast';
 import type { LaunchState } from '../../../store';
 import type { DownloadFailure } from '../../../machines/downloads';
 import type { InstanceInstallProgress } from '../../../instance-install-status';
-import type { LaunchActionState, LaunchNotice, LaunchNoticeTone } from '../../../types-launch';
+import type { LaunchActionState, LaunchNotice } from '../../../types-launch';
 import type { EnrichedInstance } from '../../../types-instance';
 import type { InstallQueuedItemViewModel } from '../../../types-install';
+import { launchActionPresentation, launchNoticePresentation } from '../../../launch-presenters';
 import { openInstanceFolder } from '../instance-actions';
 
-function launchNoticeIcon(tone: LaunchNoticeTone): string {
-  if (tone === 'success') return 'check-circle';
-  if (tone === 'error') return 'alert';
-  if (tone === 'warned') return 'alert';
-  if (tone === 'intervened') return 'shield-check';
-  return 'info';
-}
-
 export function LaunchOutcomeNotice({ inst, notice }: { inst: EnrichedInstance; notice: LaunchNotice }): JSX.Element {
-  const details = (notice.details ?? []).map((detail) => detail.trim()).filter(Boolean);
-  const primaryDetail = notice.detail?.trim() || (details.length === 1 ? details[0] : '');
-  const listDetails = details.length > 1 ? details.filter((detail) => !primaryDetail || detail !== primaryDetail) : [];
+  const { icon, primaryDetail, listDetails } = launchNoticePresentation(notice);
 
   return (
     <div class="cp-instance-notice-shell">
       <section class="cp-notice" data-tone={notice.tone} aria-live="polite">
         <span class="cp-notice-mark" aria-hidden="true">
-          <Icon name={launchNoticeIcon(notice.tone)} size={15} stroke={2.2} />
+          <Icon name={icon} size={15} stroke={2.2} />
         </span>
         <div class="cp-notice-copy">
           <strong>{notice.message}</strong>
@@ -83,19 +74,15 @@ export function LaunchSplitButton({
   onOpenSettings: () => void;
   preparing: Extract<LaunchState, { status: 'preparing' }> | null;
 }): JSX.Element {
-  const progress = preparing
-    ? { pct: preparing.pct, label: preparing.label, determinate: preparing.determinate !== false }
-    : installProgress
-      ? { ...installProgress, determinate: true }
-      : null;
-  const usesInstallAction = launchAction.primary_action === 'install';
-  const blocked = launchAction.primary_action === 'blocked';
-  const label = progress?.label || (installQueued ? installQueuedView?.title || 'Queued' : launchAction.label);
-  const icon = progress || installQueued ? 'clock' : blocked ? 'alert' : usesInstallAction ? 'download' : 'play';
-  const pct = progress?.determinate ? progress.pct : 0;
-  const disabled = Boolean(progress) || installQueued || blocked;
+  const { progress, usesInstallAction, blocked, label, icon, pct, disabled } = launchActionPresentation({
+    launchAction,
+    installQueued,
+    installQueuedView,
+    installProgress,
+    preparing,
+  });
   const primaryAction = usesInstallAction ? onInstall : onLaunch;
-  const primaryMenuItem = blocked
+  const primaryMenuItem: ContextMenuItem = blocked
     ? {
         icon: 'alert',
         label: launchAction.disabled_reason || launchAction.label,

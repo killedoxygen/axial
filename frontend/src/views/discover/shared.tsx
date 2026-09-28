@@ -1,12 +1,12 @@
 import type { JSX } from 'preact';
-import { Icon } from '../../ui/Icons';
+import { Icon, type IconName } from '../../ui/Icons';
 import { SelectField } from '../../ui/Select';
 import type { SegmentedOption } from '../../ui/Segmented';
 import type { ContentKind, ContentVersion } from '../../types-content';
 import type { EnrichedInstance } from '../../types-instance';
 import { contentTargets } from './state';
 
-export const KIND_ICON: Record<ContentKind, string> = {
+export const KIND_ICON: Record<ContentKind, IconName> = {
   mod: 'puzzle',
   modpack: 'stack',
   resource_pack: 'image',

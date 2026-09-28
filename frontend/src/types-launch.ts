@@ -1,5 +1,3 @@
-import type { GuardianFact, GuardianMode, GuardianSummary } from './types-guardian';
-
 export type LaunchActionTone = 'ok' | 'warn' | 'err' | 'mute';
 export type LaunchPrimaryAction = 'launch' | 'install' | 'blocked';
 
@@ -12,27 +10,19 @@ export interface LaunchActionState {
   disabled_reason?: string;
 }
 
-export interface LaunchBenchmarkMetadata {
-  id?: string;
-  profile?: string;
-  run_type?: string;
-  mode?: string;
-}
-
-export interface RunningSession {
+export interface LaunchSession {
   sessionId: string;
-  versionId: string;
-  pid: number;
-  state?: string;
   stopping?: boolean;
   launchedAt: string;
-  allocatedMB: number;
-  viewModel?: LaunchStatusViewModel;
-  benchmark?: LaunchBenchmarkMetadata;
-  healing?: LaunchHealingSummary;
-  guardian?: GuardianSummary;
-  outcome?: LaunchSessionOutcome;
-  eventSource?: EventSource;
+  viewModel: LaunchStatusViewModel;
+  statusRevision: number;
+}
+
+export interface LaunchLogEntry {
+  sequence: number;
+  source: 'stdout' | 'stderr';
+  text: string;
+  truncated: boolean;
 }
 
 export type LaunchOverrideOrigin = 'global' | 'instance';
@@ -94,31 +84,10 @@ export interface LaunchReadiness {
 
 export interface LaunchPreflightResponse {
   status: 'ready';
-  guardian: GuardianSummary;
-  mode: GuardianMode;
   memory: LaunchPreflightMemory;
   overrides: LaunchPreflightOverrides;
   readiness: LaunchReadiness;
-  guardian_facts: GuardianFact[];
   resource_budget: LaunchPreflightResourceBudget;
-}
-
-export type HealingEventKind = 'runtime_bypassed' | 'preset_downgraded' | 'fallback_applied';
-
-export interface HealingEvent {
-  kind: HealingEventKind;
-  detail?: string;
-}
-
-export interface LaunchHealingSummary {
-  requested_preset?: string;
-  effective_preset?: string;
-  auth_mode?: string;
-  warnings?: string[];
-  fallback_applied?: string;
-  retry_count?: number;
-  failure_class?: string;
-  events?: HealingEvent[];
 }
 
 export interface InstanceLaunchDraft {
@@ -142,6 +111,9 @@ export interface LaunchStatusViewModel {
   label: string;
   progress_pct: number;
   terminal: boolean;
+  playing: boolean;
+  process_live: boolean;
+  can_stop: boolean;
 }
 
 export type LaunchSessionOutcomeKind = 'clean' | 'stopped' | 'failed' | 'unknown';
@@ -162,6 +134,13 @@ export interface LaunchSessionOutcome {
   reason: LaunchSessionExitReason;
   kind: LaunchSessionOutcomeKind;
   summary: string;
+}
+
+export interface LaunchStatusUpdate {
+  revision: number;
+  viewModel: LaunchStatusViewModel;
+  notice: LaunchNotice | null;
+  outcome: LaunchSessionOutcome | null;
 }
 
 export interface LaunchProofScenario {
@@ -260,8 +239,6 @@ export interface LaunchProofRecord {
   boot_duration_ms?: number;
   failure_class?: string;
   failure_detail?: string;
-  guardian?: GuardianSummary | null;
-  healing?: LaunchHealingSummary | null;
   comparison?: LaunchProofComparison | null;
   view_model: LaunchProofViewModel;
   resource_budget?: LaunchProofResourceBudget | null;

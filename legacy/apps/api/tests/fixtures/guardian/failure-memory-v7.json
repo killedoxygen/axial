@@ -1,0 +1,382 @@
+{
+  "schema": "axial.guardian.failure_memory.v7",
+  "entries": [
+    {
+      "key": "Launch:launch_prepare_failed:Guardian.Config.fixture_target_01:Managed:intent_01",
+      "diagnosis_id": "launch_prepare_failed",
+      "domain": "Launch",
+      "mode": "Managed",
+      "target": {
+        "system": "Guardian",
+        "kind": "Config",
+        "id": "fixture_target_01",
+        "ownership": "LauncherManaged"
+      },
+      "ownership": "LauncherManaged",
+      "first_observed_at": "2026-07-01T00:01:00Z",
+      "last_observed_at": "2026-07-01T00:01:00Z",
+      "occurrence_count": 1,
+      "last_action_kind": null,
+      "last_action_outcome": null,
+      "repair_attempt_count": 0,
+      "quarantine_checkpoint": {
+        "records": []
+      },
+      "suppression_until": null,
+      "target_content_hash": null,
+      "user_intent_hash": "intent_01",
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "key": "Jvm:custom_jvm_args_present:Guardian.Config.fixture_target_02:Custom:intent_02",
+      "diagnosis_id": "custom_jvm_args_present",
+      "domain": "Jvm",
+      "mode": "Custom",
+      "target": {
+        "system": "Guardian",
+        "kind": "Config",
+        "id": "fixture_target_02",
+        "ownership": "UserOwned"
+      },
+      "ownership": "UserOwned",
+      "first_observed_at": "2026-07-01T00:02:00Z",
+      "last_observed_at": "2026-07-01T00:02:00Z",
+      "occurrence_count": 1,
+      "last_action_kind": null,
+      "last_action_outcome": null,
+      "repair_attempt_count": 0,
+      "quarantine_checkpoint": {
+        "records": []
+      },
+      "suppression_until": null,
+      "target_content_hash": null,
+      "user_intent_hash": "intent_02",
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "key": "Runtime:managed_runtime_corrupt:Guardian.Runtime.java-runtime-delta:Managed:no_intent:rung.RebuildComponent:component.Runtime:scope.registered.0123456789abcdef.sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef.sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888.managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+      "diagnosis_id": "managed_runtime_corrupt",
+      "domain": "Runtime",
+      "mode": "Managed",
+      "target": {
+        "system": "Guardian",
+        "kind": "Runtime",
+        "id": "java-runtime-delta",
+        "ownership": "LauncherManaged"
+      },
+      "ownership": "LauncherManaged",
+      "first_observed_at": "2026-07-01T00:03:00Z",
+      "last_observed_at": "2026-07-01T00:03:00Z",
+      "occurrence_count": 1,
+      "last_action_kind": "Repair",
+      "last_action_outcome": "Repaired",
+      "repair_attempt_count": 1,
+      "quarantine_checkpoint": {
+        "records": [
+          {
+            "RuntimeComponent": {
+              "component_id": "java-runtime-delta"
+            }
+          }
+        ]
+      },
+      "suppression_until": "2026-07-01T01:03:00Z",
+      "target_content_hash": "content_hash_03",
+      "user_intent_hash": null,
+      "reconciliation_terminal": {
+        "attempt": {
+          "operation_id": "op-97dc1970-82d5-4c20-b011-e6102ed9fc1a",
+          "diagnosis_id": "managed_runtime_corrupt",
+          "domain": "Runtime",
+          "rung": "RebuildComponent",
+          "scope": {
+            "RegisteredInstance": {
+              "instance_id": "0123456789abcdef",
+              "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
+              "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+              "activation_contract_id": "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"
+            }
+          },
+          "component": "Runtime",
+          "target": {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "java-runtime-delta",
+            "ownership": "LauncherManaged"
+          },
+          "mode": "Managed",
+          "ownership": "LauncherManaged",
+          "observed_at": "2026-07-01T00:03:00Z",
+          "suppression_until": "2026-07-01T01:03:00Z",
+          "lineage": {
+            "Predecessor": {
+              "operation_id": "op-d0c3bba9-962f-4439-a457-52cb29e5b6a5"
+            }
+          }
+        },
+        "outcome": "Succeeded",
+        "quarantine_checkpoint": {
+          "records": [
+            {
+              "RuntimeComponent": {
+                "component_id": "java-runtime-delta"
+              }
+            }
+          ]
+        },
+        "version_bundle_publication": null
+      },
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "key": "Startup:startup_stalled:Guardian.Config.fixture_target_04:Managed:intent_04",
+      "diagnosis_id": "startup_stalled",
+      "domain": "Startup",
+      "mode": "Managed",
+      "target": {
+        "system": "Guardian",
+        "kind": "Config",
+        "id": "fixture_target_04",
+        "ownership": "LauncherManaged"
+      },
+      "ownership": "LauncherManaged",
+      "first_observed_at": "2026-07-01T00:04:00Z",
+      "last_observed_at": "2026-07-01T00:04:00Z",
+      "occurrence_count": 2,
+      "last_action_kind": "Retry",
+      "last_action_outcome": "Retried",
+      "repair_attempt_count": 0,
+      "quarantine_checkpoint": {
+        "records": []
+      },
+      "suppression_until": "2026-07-01T01:04:00Z",
+      "target_content_hash": null,
+      "user_intent_hash": "intent_04",
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "key": "Jvm:jvm_args_malformed:Guardian.Config.fixture_target_06:Custom:intent_06",
+      "diagnosis_id": "jvm_args_malformed",
+      "domain": "Jvm",
+      "mode": "Custom",
+      "target": {
+        "system": "Guardian",
+        "kind": "Config",
+        "id": "fixture_target_06",
+        "ownership": "UserOwned"
+      },
+      "ownership": "UserOwned",
+      "first_observed_at": "2026-07-01T00:06:00Z",
+      "last_observed_at": "2026-07-01T00:06:00Z",
+      "occurrence_count": 1,
+      "last_action_kind": "Strip",
+      "last_action_outcome": "Repaired",
+      "repair_attempt_count": 0,
+      "quarantine_checkpoint": {
+        "records": []
+      },
+      "suppression_until": null,
+      "target_content_hash": null,
+      "user_intent_hash": "intent_06",
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "key": "Launch:jvm_arg_unsupported:Guardian.Instance.fixture_target_07:Managed:intent_07",
+      "diagnosis_id": "jvm_arg_unsupported",
+      "domain": "Launch",
+      "mode": "Managed",
+      "target": {
+        "system": "Guardian",
+        "kind": "Instance",
+        "id": "fixture_target_07",
+        "ownership": "LauncherManaged"
+      },
+      "ownership": "LauncherManaged",
+      "first_observed_at": "2026-07-01T00:07:00Z",
+      "last_observed_at": "2026-07-01T00:07:00Z",
+      "occurrence_count": 1,
+      "last_action_kind": "Downgrade",
+      "last_action_outcome": "Failed",
+      "repair_attempt_count": 1,
+      "quarantine_checkpoint": {
+        "records": []
+      },
+      "suppression_until": "2026-07-01T01:07:00Z",
+      "target_content_hash": null,
+      "user_intent_hash": "intent_07",
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "key": "Runtime:java_override_unavailable:Guardian.Config.fixture_target_09:Managed:intent_09",
+      "diagnosis_id": "java_override_unavailable",
+      "domain": "Runtime",
+      "mode": "Managed",
+      "target": {
+        "system": "Guardian",
+        "kind": "Config",
+        "id": "fixture_target_09",
+        "ownership": "UserOwned"
+      },
+      "ownership": "UserOwned",
+      "first_observed_at": "2026-07-01T00:09:00Z",
+      "last_observed_at": "2026-07-01T00:09:00Z",
+      "occurrence_count": 1,
+      "last_action_kind": "Fallback",
+      "last_action_outcome": "Failed",
+      "repair_attempt_count": 0,
+      "quarantine_checkpoint": {
+        "records": []
+      },
+      "suppression_until": "2026-07-01T01:09:00Z",
+      "target_content_hash": null,
+      "user_intent_hash": "intent_09",
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "key": "Library:launcher_managed_artifact_corrupt:Execution.Artifact.fixture_target_10:Managed:no_intent:rung.RepairArtifact:component.Libraries:scope.registered.0123456789abcdef.sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef.sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888.managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+      "diagnosis_id": "launcher_managed_artifact_corrupt",
+      "domain": "Library",
+      "mode": "Managed",
+      "target": {
+        "system": "Execution",
+        "kind": "Artifact",
+        "id": "fixture_target_10",
+        "ownership": "LauncherManaged"
+      },
+      "ownership": "LauncherManaged",
+      "first_observed_at": "2026-07-01T00:10:00Z",
+      "last_observed_at": "2026-07-01T00:10:00Z",
+      "occurrence_count": 1,
+      "last_action_kind": "Repair",
+      "last_action_outcome": "Failed",
+      "repair_attempt_count": 1,
+      "quarantine_checkpoint": {
+        "records": []
+      },
+      "suppression_until": "2026-07-01T01:10:00Z",
+      "target_content_hash": null,
+      "user_intent_hash": null,
+      "reconciliation_terminal": {
+        "attempt": {
+          "operation_id": "op-292b4837-2fef-41d9-b75f-971efa473553",
+          "diagnosis_id": "launcher_managed_artifact_corrupt",
+          "domain": "Library",
+          "rung": "RepairArtifact",
+          "scope": {
+            "RegisteredInstance": {
+              "instance_id": "0123456789abcdef",
+              "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
+              "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+              "activation_contract_id": "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"
+            }
+          },
+          "component": "Libraries",
+          "target": {
+            "system": "Execution",
+            "kind": "Artifact",
+            "id": "fixture_target_10",
+            "ownership": "LauncherManaged"
+          },
+          "mode": "Managed",
+          "ownership": "LauncherManaged",
+          "observed_at": "2026-07-01T00:10:00Z",
+          "suppression_until": "2026-07-01T01:10:00Z",
+          "lineage": "Initial"
+        },
+        "outcome": "Failed",
+        "quarantine_checkpoint": {
+          "records": []
+        },
+        "version_bundle_publication": null
+      },
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "key": "Config:custom_java_override_present:Guardian.Config.fixture_target_12:Custom:intent_12",
+      "diagnosis_id": "custom_java_override_present",
+      "domain": "Config",
+      "mode": "Custom",
+      "target": {
+        "system": "Guardian",
+        "kind": "Config",
+        "id": "fixture_target_12",
+        "ownership": "UserOwned"
+      },
+      "ownership": "UserOwned",
+      "first_observed_at": "2026-07-01T00:12:00Z",
+      "last_observed_at": "2026-07-01T00:12:00Z",
+      "occurrence_count": 1,
+      "last_action_kind": null,
+      "last_action_outcome": null,
+      "repair_attempt_count": 0,
+      "quarantine_checkpoint": {
+        "records": []
+      },
+      "suppression_until": null,
+      "target_content_hash": null,
+      "user_intent_hash": "intent_12",
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "key": "State:persisted_state_schema_invalid:Guardian.Config.fixture_target_13:Disabled:intent_13",
+      "diagnosis_id": "persisted_state_schema_invalid",
+      "domain": "State",
+      "mode": "Disabled",
+      "target": {
+        "system": "Guardian",
+        "kind": "Config",
+        "id": "fixture_target_13",
+        "ownership": "LauncherManaged"
+      },
+      "ownership": "LauncherManaged",
+      "first_observed_at": "2026-07-01T00:13:00Z",
+      "last_observed_at": "2026-07-01T00:13:00Z",
+      "occurrence_count": 1,
+      "last_action_kind": "Block",
+      "last_action_outcome": "Blocked",
+      "repair_attempt_count": 0,
+      "quarantine_checkpoint": {
+        "records": []
+      },
+      "suppression_until": null,
+      "target_content_hash": null,
+      "user_intent_hash": "intent_13",
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "key": "Unknown:unknown_failure_failed:Guardian.Config.fixture_target_14:Disabled:intent_14",
+      "diagnosis_id": "unknown_failure_failed",
+      "domain": "Unknown",
+      "mode": "Disabled",
+      "target": {
+        "system": "Guardian",
+        "kind": "Config",
+        "id": "fixture_target_14",
+        "ownership": "Unknown"
+      },
+      "ownership": "Unknown",
+      "first_observed_at": "2026-07-01T00:14:00Z",
+      "last_observed_at": "2026-07-01T00:14:00Z",
+      "occurrence_count": 1,
+      "last_action_kind": null,
+      "last_action_outcome": null,
+      "repair_attempt_count": 0,
+      "quarantine_checkpoint": {
+        "records": []
+      },
+      "suppression_until": null,
+      "target_content_hash": null,
+      "user_intent_hash": "intent_14",
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
+    }
+  ]
+}

@@ -100,21 +100,6 @@ function ModalContent({
   );
 }
 
-function ModalClose({
-  className,
-  children,
-  ...props
-}: Omit<JSX.HTMLAttributes<HTMLButtonElement>, 'className'> & {
-  className?: string;
-}): JSX.Element {
-  const { close } = useContext(ModalContext);
-  return (
-    <button type="button" data-slot="modal-close" class={cn(className)} onClick={close} {...props}>
-      {children}
-    </button>
-  );
-}
-
 function ModalHeader({
   className,
   children,
@@ -122,18 +107,6 @@ function ModalHeader({
 }: Omit<JSX.HTMLAttributes<HTMLDivElement>, 'className'> & { className?: string }): JSX.Element {
   return (
     <div data-slot="modal-header" class={cn('cp-modal-head', className)} {...props}>
-      {children}
-    </div>
-  );
-}
-
-function ModalFooter({
-  className,
-  children,
-  ...props
-}: Omit<JSX.HTMLAttributes<HTMLDivElement>, 'className'> & { className?: string }): JSX.Element {
-  return (
-    <div data-slot="modal-footer" class={cn('cp-modal-foot', className)} {...props}>
       {children}
     </div>
   );
@@ -151,16 +124,4 @@ function ModalTitle({
   );
 }
 
-function ModalDescription({
-  className,
-  children,
-  ...props
-}: Omit<JSX.HTMLAttributes<HTMLParagraphElement>, 'className'> & { className?: string }): JSX.Element {
-  return (
-    <p data-slot="modal-description" class={cn('cp-modal-desc', className)} {...props}>
-      {children}
-    </p>
-  );
-}
-
-export { Modal, ModalClose, ModalContent, ModalDescription, ModalFooter, ModalHeader, ModalTitle };
+export { Modal, ModalContent, ModalHeader, ModalTitle };

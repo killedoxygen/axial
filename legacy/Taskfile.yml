@@ -1,0 +1,644 @@
+# axial dev cli — the single entrypoint on macOS, Linux, WSL, and Windows.
+#
+# Task runs every recipe through its built-in cross-platform shell, so the
+# commands below behave identically on all three OSes. Desktop dev and
+# bundling are orchestrated by tauri-cli (`cargo tauri`), which spawns the
+# frontend dev server, waits for it, hot-restarts Rust on change, and cleans
+# up on exit.
+#
+# install task: https://taskfile.dev/installation
+#   macOS:   brew install go-task
+#   Windows: winget install Task.Task
+#   Linux:   sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b ~/.local/bin
+
+version: "3"
+
+set: [errexit]
+
+dotenv: [".env.local", ".env"]
+
+vars:
+  TAURI_CLI_VERSION: "2.11.2"
+  # override with `DEV_PORT=3001 task dev` or `task dev DEV_PORT=3001`
+  DEV_PORT: '{{.DEV_PORT | default "1420"}}'
+  DEV_TAURI_CONFIG: '{"build":{"beforeDevCommand":{"script":"pnpm run dev:desktop","cwd":"{{toSlash .ROOT_DIR}}/frontend"},"devUrl":"http://localhost:{{.DEV_PORT}}"},"app":{"security":{"capabilities":[{"identifier":"main-development-capability","description":"Exact development webview authority","windows":["main"],"permissions":["core:event:allow-listen","core:event:allow-unlisten",{"identifier":"opener:allow-open-url","allow":[{"url":"https://*"}]}],"remote":{"urls":["http://localhost:{{.DEV_PORT}}/*"]}}]}}}'
+  BUNDLE_TAURI_CONFIG: '{"build":{"beforeBuildCommand":{"script":"pnpm run build","cwd":"{{toSlash .ROOT_DIR}}/frontend"}}}'
+  NATIVE_VERIFY_TAURI_CONFIG: '{"build":{"devUrl":"http://localhost:1420"}}'
+
+tasks:
+  default:
+    silent: true
+    cmds:
+      - task --list
+
+  setup:
+    desc: one-time setup — frontend deps, Rust deps, tauri-cli, and (Linux/WSL) Windows cross-build prerequisites
+    cmds:
+      - node scripts/toolchain.mjs verify --profile orchestration
+      - task: ensure:pnpm
+      - task: toolchain:preflight
+      - pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+      - cargo fetch --locked
+      - task: ensure:cargo-deny
+      - cmd: node scripts/toolchain.mjs verify --profile dependencies
+        platforms: [linux]
+      - task: ensure:tauri-cli
+      - node scripts/toolchain.mjs verify --profile desktop
+      - cmd: |
+          if ! rustup target list --installed | grep -Fxq "x86_64-pc-windows-gnu"; then
+            rustup target add "x86_64-pc-windows-gnu"
+          fi
+          if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            exit 0
+          fi
+          if ! command -v apt-get >/dev/null 2>&1; then
+            exit 0
+          fi
+          if [ "${CI:-}" = "true" ]; then
+            echo "skipping apt install for Windows cross-build prerequisites in CI"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get install -y gcc-mingw-w64-x86-64
+          elif command -v sudo >/dev/null 2>&1; then
+            sudo apt-get install -y gcc-mingw-w64-x86-64
+          else
+            echo "missing MinGW linker: x86_64-w64-mingw32-gcc" >&2
+            echo "install it with: sudo apt-get install -y gcc-mingw-w64-x86-64" >&2
+            exit 1
+          fi
+        platforms: [linux]
+
+  assets:generate:
+    desc: regenerate the selected desktop and frontend brand assets
+    cmds:
+      - task: ensure:tauri-cli
+      - node scripts/generate-icons.mjs
+      - node scripts/verify-assets.mjs
+
+  assets:check:
+    desc: verify deterministic generated assets and the strict provenance inventory
+    cmds:
+      - task: ensure:tauri-cli
+      - node scripts/generate-icons.mjs --check
+      - node scripts/verify-assets.mjs
+
+  dev:
+    desc: run the desktop app in dev mode (frontend dev server + Rust hot-restart)
+    env:
+      AXIAL_APP_ROOT_MODE: development
+      PORT: "{{.DEV_PORT}}"
+    cmds:
+      - task: toolchain:preflight
+      - task: assets:verify
+      - task: ensure:tauri-cli
+      - task: toolchain:desktop
+      - cmd: |
+          if [ -n "${WSL_DISTRO_NAME:-}" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+            echo "desktop dev needs WSLg or another Linux GUI session." >&2
+            echo "use 'task dev:web' for frontend-only work, or 'task dev:windows' to run the Windows build from WSL." >&2
+            exit 1
+          fi
+        platforms: [linux]
+      - "node scripts/cargo-target.mjs run -- cargo tauri dev --config '{{.DEV_TAURI_CONFIG}}' -- --locked"
+
+  dev:windows:
+    desc: run the desktop app in dev mode as a Windows app from Linux/WSL
+    platforms: [linux]
+    env:
+      AXIAL_APP_ROOT_MODE: development
+      PORT: "{{.DEV_PORT}}"
+    cmds:
+      - task: toolchain:preflight
+      - task: assets:verify
+      - task: ensure:tauri-cli
+      - task: toolchain:desktop
+      - task: ensure:windows-cross
+      - "node scripts/cargo-windows-target.mjs run -- cargo tauri dev --config '{{.DEV_TAURI_CONFIG}}' -- --locked"
+
+  dev:web:
+    desc: run the frontend-only dev server (browser mode, works headless)
+    aliases: [web]
+    cmds:
+      - task: toolchain:frontend
+      - task: assets:verify
+      - pnpm --dir frontend run dev
+
+  dev:web:mock:
+    desc: run the frontend-only dev server with a mocked API (no backend needed)
+    cmds:
+      - task: toolchain:frontend
+      - task: assets:verify
+      - pnpm --dir frontend run dev:mock
+
+  watch:
+    desc: rebuild frontend assets to disk on file changes
+    cmds:
+      - task: toolchain:frontend
+      - task: assets:verify
+      - pnpm --dir frontend run watch
+
+  api:
+    desc: run the local API server
+    env:
+      AXIAL_APP_ROOT_MODE: development
+    cmds:
+      - task: toolchain:rust
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo run --locked -p axial-api
+
+  check:
+    desc: run all static checks (matches CI)
+    cmds:
+      - task: toolchain:preflight
+      - task: frontend:lint:semantic
+      - task: frontend:test
+      - pnpm --dir frontend run format:check
+      - task: frontend:build
+      - cargo fmt --all --check
+      - node scripts/cargo-target.mjs run -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    desc: run Rust workspace tests
+    cmds:
+      - task: toolchain:rust
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo test --workspace --locked
+
+  verify:
+    desc: run checks, tests, and a release desktop build (full CI parity)
+    cmds:
+      - task: verify:delivery
+
+  toolchain:verify:
+    desc: verify every exact local delivery tool and tracked mirror
+    cmds:
+      - task: ensure:cargo-deny
+      - cmd: node scripts/toolchain.mjs verify --profile dependencies
+        platforms: [linux]
+      - task: toolchain:desktop
+
+  dependencies:check:
+    desc: enforce the Cargo and pnpm advisory, license, and source policy
+    platforms: [linux]
+    cmds:
+      - task: ensure:cargo-deny
+      - node scripts/toolchain.mjs verify --profile dependencies
+      - node scripts/dependency-policy.mjs check
+
+  toolchain:preflight:
+    desc: reject delivery tool drift before dependency installation or compilation
+    cmds:
+      - node scripts/toolchain.mjs verify --profile frontend --profile rust
+
+  frontend:test:
+    desc: run the complete frontend test inventory or one exact TEST member
+    env:
+      AXIAL_FRONTEND_TEST: '{{.TEST | default ""}}'
+    cmds:
+      - task: toolchain:frontend
+      - pnpm --dir frontend run test
+
+  frontend:lint:semantic:
+    internal: true
+    cmds:
+      - pnpm --dir frontend run lint:semantic
+
+  verify:frontend:
+    desc: typecheck, test, format-check, and build the frontend exactly once
+    cmds:
+      - task: toolchain:frontend
+      - task: assets:verify
+      - pnpm --dir frontend run verify
+
+  frontend:build-budget:
+    desc: build, verify, and report the canonical frontend payload budgets
+    cmds:
+      - task: frontend:build
+      - node frontend/verify-generation.mjs
+
+  verify:rust:
+    desc: format-check, lint, and test the Rust workspace
+    cmds:
+      - task: frontend:build
+      - task: verify:rust:ready
+
+  verify:rust:ready:
+    internal: true
+    cmds:
+      - task: toolchain:rust
+      - cargo fmt --all --check
+      - node scripts/cargo-target.mjs run -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - node scripts/cargo-target.mjs run -- cargo test --workspace --locked
+
+  verify:delivery:
+    internal: true
+    cmds:
+      - task: toolchain:preflight
+      - task: verify:contracts
+      - task: verify:frontend
+      - task: verify:rust:ready
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop --release
+
+  verify:linux:
+    desc: run the canonical Linux delivery inventory
+    platforms: [linux]
+    cmds:
+      - task: assets:check
+      - task: dependencies:check
+      - task: verify:delivery
+
+  verify:native:windows:
+    desc: compile the workspace and run native Windows containment contracts
+    platforms: [windows]
+    env:
+      TAURI_CONFIG: "{{.NATIVE_VERIFY_TAURI_CONFIG}}"
+    cmds:
+      - task: toolchain:rust
+      - node --test scripts/tests/capability.test.mjs
+      - node --test scripts/tests/contracts/asset-integrity-contract.test.mjs scripts/tests/contracts/asset-integrity-cross-owner-contract.test.mjs
+      - node --test scripts/tests/contracts/release-build-contract.test.mjs scripts/tests/contracts/release-build-cross-owner-contract.test.mjs
+      - node --test scripts/tests/contracts/process-containment-contract.test.mjs scripts/tests/contracts/process-containment-cross-owner-contract.test.mjs
+      - node scripts/verify-assets.mjs
+      - node scripts/cargo-target.mjs run -- cargo check --workspace --all-targets --no-default-features --locked
+      - task: verify:native:filesystem
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft contained_
+      - task: capability:offline-assets
+        vars:
+          PLATFORM: windows
+
+  verify:native:macos:
+    desc: compile the workspace and run native macOS process and priority contracts
+    platforms: [darwin]
+    env:
+      TAURI_CONFIG: "{{.NATIVE_VERIFY_TAURI_CONFIG}}"
+    cmds:
+      - task: toolchain:rust
+      - node --test scripts/tests/capability.test.mjs
+      - node --test scripts/tests/contracts/asset-integrity-contract.test.mjs scripts/tests/contracts/asset-integrity-cross-owner-contract.test.mjs
+      - node --test scripts/tests/contracts/release-build-contract.test.mjs scripts/tests/contracts/release-build-cross-owner-contract.test.mjs
+      - node --test scripts/tests/contracts/process-containment-contract.test.mjs scripts/tests/contracts/process-containment-cross-owner-contract.test.mjs
+      - node scripts/verify-assets.mjs
+      - node scripts/cargo-target.mjs run -- cargo check --workspace --all-targets --no-default-features --locked
+      - task: verify:native:filesystem
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft contained_
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-api --no-default-features macos_system_low_priority_round_trip_restores_disk_policy
+      - node scripts/cargo-target.mjs run -- cargo check --locked -p axial-desktop --target x86_64-apple-darwin
+      - task: capability:offline-assets
+        vars:
+          PLATFORM: macos
+
+  verify:native:filesystem:
+    desc: run the native filesystem, resource, transfer, and owner matrix
+    cmds:
+      - task: verify:contracts
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-api --lib --no-default-features native_filesystem_contract_ -- --test-threads=1
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-fs --lib -- --test-threads=1
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-resource --lib -- --test-threads=1
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft download::transient_transfer::tests -- --test-threads=1
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-performance install::tests -- --test-threads=1
+
+  capability:self-test:
+    desc: verify the fail-closed capability, toolchain, workflow, and frontend contracts
+    cmds:
+      - task: toolchain:frontend
+      - task: verify:contracts
+      - task: frontend:test
+        vars:
+          TEST: test/contracts/runner-contract.test.ts
+
+  capability:audit:
+    desc: audit every registered capability identity and implementation declaration
+    cmds:
+      - task: toolchain:frontend
+      - node scripts/capability.mjs audit
+
+  capability:run:
+    desc: run one registered capability SCENARIO on PLATFORM
+    env:
+      SCENARIO: '{{.SCENARIO | default ""}}'
+      PLATFORM: '{{.PLATFORM | default ""}}'
+    cmds:
+      - node scripts/capability.mjs run
+
+  capability:offline-assets:
+    desc: run the five offline asset capabilities on one concrete PLATFORM
+    cmds:
+      - task: toolchain:frontend
+      - pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+      - task: capability:run
+        vars:
+          SCENARIO: CP-OA-FRONTEND
+          PLATFORM: "{{.PLATFORM}}"
+      - task: capability:run
+        vars:
+          SCENARIO: CP-OA-ICONS
+          PLATFORM: "{{.PLATFORM}}"
+      - task: capability:run
+        vars:
+          SCENARIO: CP-OA-FONTS
+          PLATFORM: "{{.PLATFORM}}"
+      - task: capability:run
+        vars:
+          SCENARIO: CP-OA-LOADER-MARKS
+          PLATFORM: "{{.PLATFORM}}"
+      - task: capability:run
+        vars:
+          SCENARIO: CP-OA-PROVENANCE
+          PLATFORM: "{{.PLATFORM}}"
+
+  capability:anchored-filesystem:
+    desc: run the anchored filesystem behavioral capability on Linux
+    cmds:
+      - task: toolchain:rust
+      - task: capability:run
+        vars:
+          SCENARIO: CP-ANCHORED-FILESYSTEM
+          PLATFORM: "{{.PLATFORM}}"
+
+  capability:platform:
+    desc: run one CAPABILITY-bound SCENARIO on PLATFORM
+    env:
+      CAPABILITY: '{{.CAPABILITY | default ""}}'
+      SCENARIO: '{{.SCENARIO | default ""}}'
+      PLATFORM: '{{.PLATFORM | default ""}}'
+    cmds:
+      - node scripts/capability.mjs platform
+
+  fmt:
+    desc: format Rust and frontend code
+    cmds:
+      - task: toolchain:preflight
+      - cargo fmt --all
+      - pnpm --dir frontend run format
+
+  build:
+    desc: build the release desktop binary
+    cmds:
+      - task: toolchain:preflight
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop --release
+      - cmd: echo "artifact → target/release/axial-desktop{{exeExt}}"
+        silent: true
+
+  build:dev:
+    desc: build the debug desktop binary (bundled static assets, no dev server)
+    cmds:
+      - task: toolchain:preflight
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop
+      - cmd: echo "artifact → target/debug/axial-desktop{{exeExt}}"
+        silent: true
+
+  build:dev:full:
+    desc: build the desktop binary with full local debug information
+    cmds:
+      - task: toolchain:preflight
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop --profile dev-full
+      - cmd: echo "artifact → target/dev-full/axial-desktop{{exeExt}}"
+        silent: true
+
+  build:windows:
+    desc: cross-build the release Windows desktop binary from Linux/WSL
+    cmds:
+      - task: toolchain:preflight
+      - task: ensure:windows-cross
+      - task: frontend:build
+      - node scripts/cargo-windows-target.mjs run -- cargo build --locked -p axial-desktop --release
+      - cmd: echo "artifact → target/windows-gnu/x86_64-pc-windows-gnu/release/axial-desktop.exe"
+        silent: true
+
+  build:windows:dev:
+    desc: cross-build the debug Windows desktop binary from Linux/WSL
+    cmds:
+      - task: toolchain:preflight
+      - task: ensure:windows-cross
+      - task: frontend:build
+      - node scripts/cargo-windows-target.mjs run -- cargo build --locked -p axial-desktop
+      - cmd: echo "artifact → target/windows-gnu/x86_64-pc-windows-gnu/debug/axial-desktop.exe"
+        silent: true
+
+  build:api:
+    desc: build the debug API binary
+    cmds:
+      - task: toolchain:preflight
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-api
+
+  build:api:release:
+    desc: build the release API binary
+    cmds:
+      - task: toolchain:preflight
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-api --release
+
+  bundle:
+    desc: build native installers/bundles via tauri (.app/.dmg, .msi/.exe, .deb/.rpm)
+    cmds:
+      - task: toolchain:preflight
+      - task: assets:verify
+      - task: ensure:tauri-cli
+      - task: toolchain:desktop
+      - "node scripts/cargo-target.mjs run -- cargo tauri build --config '{{.BUNDLE_TAURI_CONFIG}}' -- --locked"
+
+  doctor:
+    desc: show detected tools and platform state
+    silent: true
+    cmds:
+      - cmd: |
+          echo "os       {{OS}}/{{ARCH}}"
+          echo "rustc    $(rustc --version 2>/dev/null || echo missing)"
+          echo "cargo    $(cargo --version 2>/dev/null || echo missing)"
+          echo "rustfmt  $(cargo fmt --version 2>/dev/null || echo missing)"
+          echo "clippy   $(cargo clippy --version 2>/dev/null || echo missing)"
+          echo "tauri    $(cargo tauri --version 2>/dev/null || echo 'missing — run: task setup')"
+          echo "deny     $(cargo deny --version 2>/dev/null || echo 'missing — run: task setup')"
+          echo "node     $(node --version 2>/dev/null || echo missing)"
+          echo "pnpm     $(pnpm --version 2>/dev/null || echo 'missing — run: task setup')"
+      - cmd: |
+          if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+            echo "wsl      yes"
+            if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
+              echo "gui      detected"
+            else
+              echo "gui      missing — use 'task dev:web' or run under WSLg"
+            fi
+          else
+            echo "wsl      no"
+          fi
+          if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            echo "mingw    present (Windows cross-builds available)"
+          else
+            echo "mingw    missing (run 'task setup' to enable Windows cross-builds)"
+          fi
+        platforms: [linux]
+
+  host:launch-evidence:
+    desc: report Windows host Java and Minecraft/Axial folder evidence (redacted, no paths)
+    silent: true
+    cmds:
+      - cmd: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/host-launch-evidence.ps1
+        platforms: [windows]
+      - cmd: |
+          if [ -z "${WSL_DISTRO_NAME:-}" ] && ! grep -qi microsoft /proc/version 2>/dev/null; then
+            echo "wsl no"
+            echo "windows_host_evidence skipped"
+            exit 0
+          fi
+          echo "wsl yes"
+          if ! command -v powershell.exe >/dev/null 2>&1; then
+            echo "powershell no"
+            echo "windows_host_evidence unavailable"
+            exit 0
+          fi
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(wslpath -w scripts/host-launch-evidence.ps1)"
+        platforms: [linux]
+      - cmd: echo "windows_host_evidence skipped (not applicable on macOS)"
+        platforms: [darwin]
+
+  storage:report:
+    desc: report bounded storage facts for this repository's canonical Cargo target
+    silent: true
+    cmds:
+      - node scripts/build-storage.mjs report
+
+  clean:cargo:release:
+    desc: remove this repository's host release Cargo output
+    cmds:
+      - node scripts/cargo-target.mjs run -- cargo clean --profile release
+
+  clean:cargo:windows:
+    desc: remove this repository's Windows GNU Cargo output
+    cmds:
+      - node scripts/cargo-windows-target.mjs run -- cargo clean
+
+  clean:cargo:dev-full:
+    desc: remove this repository's opt-in full-debug Cargo output
+    cmds:
+      - node scripts/cargo-target.mjs run -- cargo clean --profile dev-full
+
+  clean:
+    desc: remove build outputs and caches
+    cmds:
+      - node scripts/cargo-target.mjs run -- cargo clean
+      - pnpm --dir frontend run clean
+      - rm -rf dist
+
+  # ── internal helpers ──────────────────────────────────────────────
+
+  toolchain:frontend:
+    internal: true
+    cmds:
+      - node scripts/toolchain.mjs verify --profile frontend
+
+  toolchain:rust:
+    internal: true
+    cmds:
+      - node scripts/toolchain.mjs verify --profile rust
+
+  toolchain:desktop:
+    internal: true
+    cmds:
+      - node scripts/toolchain.mjs verify --profile desktop
+
+  verify:contracts:
+    internal: true
+    cmds:
+      - node scripts/verify-behavioral-names.mjs
+      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/behavioral-names.test.mjs scripts/tests/anchored-filesystem-capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/workflow-integrity-contract.test.mjs scripts/tests/contracts/workflow-integrity-cross-owner-contract.test.mjs scripts/tests/contracts/capability-workflow-contract.test.mjs scripts/tests/contracts/asset-integrity-contract.test.mjs scripts/tests/contracts/asset-integrity-cross-owner-contract.test.mjs scripts/tests/contracts/release-build-contract.test.mjs scripts/tests/contracts/release-build-cross-owner-contract.test.mjs scripts/tests/contracts/process-containment-contract.test.mjs scripts/tests/contracts/process-containment-cross-owner-contract.test.mjs scripts/tests/contracts/performance-transfer-contract.test.mjs scripts/tests/contracts/named-publication-contract.test.mjs frontend/test/contracts/frontend-quality-cross-owner-contract.test.mjs
+      - task: capability:audit
+
+  assets:verify:
+    internal: true
+    cmds:
+      - node scripts/verify-assets.mjs
+
+  frontend:build:
+    internal: true
+    cmds:
+      - task: toolchain:frontend
+      - task: assets:verify
+      - pnpm --dir frontend run build
+
+  ensure:pnpm:
+    internal: true
+    cmds:
+      - cmd: |
+          if command -v pnpm >/dev/null 2>&1; then
+            exit 0
+          fi
+          pnpm_version="$(node --input-type=module -e "import { readToolchainIdentity } from './scripts/toolchain.mjs'; process.stdout.write(readToolchainIdentity().pnpm)")"
+          echo "pnpm not found — installing exact pnpm $pnpm_version via corepack…"
+          if command -v corepack >/dev/null 2>&1 \
+            && corepack install --global "pnpm@$pnpm_version" \
+            && corepack enable pnpm; then
+            exit 0
+          fi
+          echo "could not enable pnpm automatically." >&2
+          echo "install it manually: https://pnpm.io/installation (or run 'corepack enable pnpm' with sufficient permissions)" >&2
+          exit 1
+
+  ensure:tauri-cli:
+    internal: true
+    cmds:
+      - cmd: |
+          tauri_cli_version='{{.TAURI_CLI_VERSION}}'
+
+          install_tauri_cli() {
+            if command -v cargo-binstall >/dev/null 2>&1; then
+              cargo binstall -y --force --locked tauri-cli --version "=$tauri_cli_version"
+            else
+              echo "(tip: cargo-binstall turns this long compile into a ~15s download: https://github.com/cargo-bins/cargo-binstall)"
+              cargo install tauri-cli --version "=$tauri_cli_version" --locked --force
+            fi
+          }
+
+          tauri_version_output="$(cargo tauri --version 2>/dev/null || true)"
+          if [ "$tauri_version_output" = "tauri-cli $tauri_cli_version" ]; then
+            exit 0
+          fi
+
+          echo "${tauri_version_output:-tauri-cli not found}; installing exact tauri-cli $tauri_cli_version…"
+
+          install_tauri_cli
+          test "$(cargo tauri --version)" = "tauri-cli $tauri_cli_version"
+
+  ensure:cargo-deny:
+    internal: true
+    platforms: [linux]
+    cmds:
+      - cmd: |
+          cargo_deny_version="$(node --input-type=module -e "import { readToolchainIdentity } from './scripts/toolchain.mjs'; process.stdout.write(readToolchainIdentity().cargo_deny.release)")"
+          cargo_deny_target="$(node --input-type=module -e "import { readToolchainIdentity } from './scripts/toolchain.mjs'; process.stdout.write(readToolchainIdentity().cargo_deny.linux_archive.target)")"
+          cargo_deny_sha256="$(node --input-type=module -e "import { readToolchainIdentity } from './scripts/toolchain.mjs'; process.stdout.write(readToolchainIdentity().cargo_deny.linux_archive.sha256)")"
+          if [ "$(cargo deny --version 2>/dev/null || true)" = "cargo-deny $cargo_deny_version" ]; then
+            exit 0
+          fi
+
+          archive_root="$(mktemp -d)"
+          trap 'rm -rf "$archive_root"' EXIT
+          archive="$archive_root/cargo-deny.tar.gz"
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/$cargo_deny_version/cargo-deny-$cargo_deny_version-$cargo_deny_target.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
+          printf '%s  %s\n' "$cargo_deny_sha256" "$archive" | sha256sum --check --status
+          mkdir -p "$archive_root/unpacked" "$HOME/.cargo/bin"
+          tar -xzf "$archive" --strip-components=1 -C "$archive_root/unpacked"
+          install -m 0755 "$archive_root/unpacked/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+          test "$(cargo deny --version)" = "cargo-deny $cargo_deny_version"
+
+  ensure:windows-cross:
+    internal: true
+    cmds:
+      - cmd: |
+          if ! rustup target list --installed 2>/dev/null | grep -Fxq "x86_64-pc-windows-gnu"; then
+            echo "missing Rust target: x86_64-pc-windows-gnu" >&2
+            echo "run 'task setup' or: rustup target add x86_64-pc-windows-gnu" >&2
+            exit 1
+          fi
+          if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            echo "missing MinGW linker: x86_64-w64-mingw32-gcc" >&2
+            echo "  Ubuntu/WSL: sudo apt-get install -y gcc-mingw-w64-x86-64 (or run 'task setup')" >&2
+            echo "  macOS:      brew install mingw-w64" >&2
+            exit 1
+          fi

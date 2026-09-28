@@ -1,8 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect } from 'preact/hooks';
-import { accountsSnapshot, activeAccount, refreshAccountsData } from '../../machines/accounts';
+import { accountsSnapshot, activeAccount, refreshAccountsData, renameOfflineIdentity } from '../../machines/accounts';
 import { loadDefaultSkinKeys, refreshWardrobe, setWardrobeContext } from '../../machines/skin-wardrobe';
-import { promptPlayerName, savePlayerName } from '../../player-name';
 import { FALLBACK_SKIN_ACCOUNT_KEY, launcherSkinAccountKey } from '../../player-skin';
 import { config } from '../../store';
 import { SavedSkinLibrary } from './SavedSkinLibrary';
@@ -13,7 +12,7 @@ export function AccountsView(): JSX.Element {
   const active = activeAccount(snapshot);
   const onlineActive = active?.kind === 'microsoft';
   const skinAction = snapshot.state === 'ready' ? snapshot.status?.skin_action : undefined;
-  const minecraftProfile = onlineActive ? (active?.minecraft_profile ?? snapshot.status?.minecraft_profile) : undefined;
+  const minecraftProfile = onlineActive ? active.minecraft_profile : undefined;
   const profileName = minecraftProfile?.name;
   const playerName = active?.display_name || (onlineActive && profileName ? profileName : savedUsername);
   const skinAccountKey = active ? launcherSkinAccountKey(active.account_id) : FALLBACK_SKIN_ACCOUNT_KEY;
@@ -30,24 +29,18 @@ export function AccountsView(): JSX.Element {
   useEffect(() => {
     setWardrobeContext({
       accountKey: skinAccountKey,
+      selectionRevision: snapshot.selection_revision,
       skinActionsEnabled,
       profile: minecraftProfile ?? null,
     });
-  }, [skinAccountKey, skinActionsEnabled, minecraftProfile]);
+  }, [skinAccountKey, snapshot.selection_revision, skinActionsEnabled, minecraftProfile]);
 
-  const renameNametag =
-    onlineActive && profileName
-      ? undefined
-      : async (): Promise<void> => {
-          const next = await promptPlayerName(savedUsername);
-          if (!next) return;
-          const saved = await savePlayerName(next);
-          if (saved) void refreshAccountsData();
-        };
+  const renameNametag = active?.kind === 'offline' ? () => renameOfflineIdentity(active) : undefined;
 
   return (
     <div class="cp-skinhall">
       <SavedSkinLibrary
+        key={skinAccountKey}
         skinActionDisabledReason={skinActionDisabledReason}
         playerName={playerName}
         onRenameNametag={renameNametag ? () => void renameNametag() : undefined}

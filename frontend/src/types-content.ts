@@ -3,12 +3,6 @@ export type ProviderId = 'modrinth';
 export type ReleaseChannel = 'release' | 'beta' | 'alpha';
 export type ContentSort = 'relevance' | 'downloads' | 'follows' | 'newest' | 'updated';
 
-export interface ProviderRef {
-  provider: ProviderId;
-  project_id: string;
-  slug?: string;
-}
-
 export interface CanonicalContent {
   canonical_id: string;
   kind: ContentKind;
@@ -25,7 +19,6 @@ export interface CanonicalContent {
   game_versions: string[];
   loaders: string[];
   updated?: string;
-  sources: ProviderRef[];
 }
 
 export interface FileRef {
@@ -169,7 +162,7 @@ export interface ModpackTarget {
 }
 
 export interface ModpackFileOption {
-  path: string;
+  selection_id: string;
   filename: string;
   kind: Exclude<ContentKind, 'modpack'>;
   size?: number | null;
@@ -188,8 +181,6 @@ export interface ModpackFilesPlan {
   files: ModpackFileOption[];
 }
 
-export type EntrySource = 'managed' | 'imported';
-
 export interface InstanceContentEntry {
   canonical_id: string;
   title?: string;
@@ -199,7 +190,6 @@ export interface InstanceContentEntry {
   version_id: string;
   filename: string;
   enabled: boolean;
-  source: EntrySource;
 }
 
 export interface InstanceContentResponse {

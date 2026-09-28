@@ -1,19 +1,106 @@
 use super::model::{JavaRuntimeInfo, JavaRuntimeLookupError};
 use super::rosetta::{is_rosetta_exec_error, rosetta_required_error_for_current_host};
+use sha2::{Digest, Sha256};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const JAVA_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const JAVA_RUNTIME_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const JAVA_EXECUTABLE_FINGERPRINT_MAX_BYTES: u64 = 64 << 20;
 
-pub fn probe_java_runtime_info(
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct JavaExecutableFingerprint {
+    canonical_path: PathBuf,
+    size: u64,
+    modified: SystemTime,
+    sha256: [u8; 32],
+    #[cfg(unix)]
+    mode: u32,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct JavaExecutableTargetFingerprint {
+    requested_path: PathBuf,
+    selected_executable_path: PathBuf,
+    requested: JavaExecutableFingerprint,
+    probe: Option<JavaExecutableFingerprint>,
+}
+
+pub struct JavaRuntimeProbeReceipt {
+    fingerprint: JavaExecutableTargetFingerprint,
+    info: JavaRuntimeInfo,
+}
+
+pub(super) struct JavaRuntimeProbeValidation {
+    fingerprint: JavaExecutableTargetFingerprint,
+    info: JavaRuntimeInfo,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct JavaRuntimeProbeSnapshot(JavaExecutableSnapshotState);
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+enum JavaExecutableSnapshotState {
+    Missing(PathBuf),
+    Present(JavaExecutableTargetFingerprint),
+}
+
+pub struct JavaRuntimeProbeResolution {
+    pub major: u32,
+    pub update: u32,
+    pub receipt: JavaRuntimeProbeReceipt,
+    pub usage: super::model::RuntimeProbeUsage,
+}
+
+pub struct JavaRuntimeProbeResolutionError {
+    pub error: JavaRuntimeLookupError,
+    pub usage: super::model::RuntimeProbeUsage,
+}
+
+impl JavaRuntimeProbeReceipt {
+    pub(crate) fn revalidate_cli_executable(&self) -> Result<PathBuf, JavaRuntimeLookupError> {
+        let current = fingerprint_java_targets(&self.fingerprint.requested_path)?;
+        if current != self.fingerprint {
+            return Err(JavaRuntimeLookupError::Probe(
+                "java executable changed after the authenticated probe".to_string(),
+            ));
+        }
+        Ok(self.fingerprint.selected_executable_path.clone())
+    }
+
+    pub(super) fn into_info(self) -> JavaRuntimeInfo {
+        self.info
+    }
+
+    pub(super) fn validation(&self) -> JavaRuntimeProbeValidation {
+        JavaRuntimeProbeValidation {
+            fingerprint: self.fingerprint.clone(),
+            info: self.info.clone(),
+        }
+    }
+}
+
+impl JavaRuntimeProbeValidation {
+    pub(super) fn matches_path(&self, java_path: &Path) -> Result<bool, JavaRuntimeLookupError> {
+        Ok(fingerprint_java_targets(java_path)? == self.fingerprint)
+    }
+
+    pub(super) fn into_info(self) -> JavaRuntimeInfo {
+        self.info
+    }
+}
+
+pub(super) fn probe_java_runtime_info(
     java_path: &Path,
     id_hint: Option<&str>,
 ) -> Result<JavaRuntimeInfo, JavaRuntimeLookupError> {
-    let exec_path = java_probe_executable(java_path);
+    let requested_path = absolute_java_path(java_path)?;
+    let exec_path = java_probe_executable(&requested_path);
     let mut command = Command::new(&exec_path);
-    command.args(["-XshowSettings:property", "-version"]);
+    command.args(["-XshowSettings:properties", "-version"]);
     let output =
         command_output_with_timeout(command, JAVA_RUNTIME_PROBE_TIMEOUT).map_err(|error| {
             if error.kind() == std::io::ErrorKind::TimedOut {
@@ -41,7 +128,261 @@ pub fn probe_java_runtime_info(
         major,
         update,
         distribution: detect_distribution(&text),
-        path: java_path.to_string_lossy().to_string(),
+        path: requested_path.to_string_lossy().to_string(),
+    })
+}
+
+pub fn probe_java_runtime_receipt(
+    java_path: &Path,
+    id_hint: Option<&str>,
+) -> Result<JavaRuntimeProbeReceipt, JavaRuntimeLookupError> {
+    let requested_path = absolute_java_path(java_path)?;
+    let before = fingerprint_java_targets(&requested_path)?;
+    let info = probe_java_runtime_info(&requested_path, id_hint)?;
+    let after = fingerprint_java_targets(&requested_path)?;
+    if before != after {
+        return Err(JavaRuntimeLookupError::Probe(
+            "java executable changed while it was being probed".to_string(),
+        ));
+    }
+    Ok(JavaRuntimeProbeReceipt {
+        fingerprint: after,
+        info,
+    })
+}
+
+pub fn snapshot_java_runtime(
+    java_path: &Path,
+) -> Result<JavaRuntimeProbeSnapshot, JavaRuntimeLookupError> {
+    let requested_path = absolute_java_path(java_path)?;
+    if !requested_path.exists() {
+        return Ok(JavaRuntimeProbeSnapshot(
+            JavaExecutableSnapshotState::Missing(requested_path),
+        ));
+    }
+    Ok(JavaRuntimeProbeSnapshot(
+        JavaExecutableSnapshotState::Present(fingerprint_java_targets(&requested_path)?),
+    ))
+}
+
+pub fn resolve_java_runtime_probe(
+    snapshot: JavaRuntimeProbeSnapshot,
+    receipt: Option<JavaRuntimeProbeReceipt>,
+    id_hint: Option<&str>,
+) -> Result<JavaRuntimeProbeResolution, JavaRuntimeProbeResolutionError> {
+    let receipt_supplied = receipt.is_some();
+    let java_path = match &snapshot.0 {
+        JavaExecutableSnapshotState::Missing(_path) => {
+            return Err(JavaRuntimeProbeResolutionError {
+                error: JavaRuntimeLookupError::NotFound {
+                    component: "external-java-override".to_string(),
+                    major: 0,
+                },
+                usage: super::model::RuntimeProbeUsage::default(),
+            });
+        }
+        JavaExecutableSnapshotState::Present(fingerprint) => fingerprint.requested_path.clone(),
+    };
+    let receipt_matches = receipt.as_ref().is_some_and(|receipt| {
+        matches!(
+            &snapshot.0,
+            JavaExecutableSnapshotState::Present(fingerprint)
+                if receipt.fingerprint == *fingerprint
+        )
+    });
+    if receipt_matches {
+        let receipt = receipt.expect("matching receipt");
+        return Ok(JavaRuntimeProbeResolution {
+            major: receipt.info.major,
+            update: receipt.info.update,
+            receipt,
+            usage: super::model::RuntimeProbeUsage {
+                spawn_count: 0,
+                source: super::model::RuntimeProbeSource::Receipt,
+            },
+        });
+    }
+
+    let before =
+        fingerprint_java_targets(&java_path).map_err(|error| JavaRuntimeProbeResolutionError {
+            error,
+            usage: super::model::RuntimeProbeUsage::default(),
+        })?;
+    let info = probe_java_runtime_info(&java_path, id_hint).map_err(|error| {
+        JavaRuntimeProbeResolutionError {
+            error,
+            usage: super::model::RuntimeProbeUsage {
+                spawn_count: 1,
+                source: if receipt_supplied {
+                    super::model::RuntimeProbeSource::FreshAfterReceiptMismatch
+                } else {
+                    super::model::RuntimeProbeSource::Fresh
+                },
+            },
+        }
+    })?;
+    let after =
+        fingerprint_java_targets(&java_path).map_err(|error| JavaRuntimeProbeResolutionError {
+            error,
+            usage: super::model::RuntimeProbeUsage {
+                spawn_count: 1,
+                source: if receipt_supplied {
+                    super::model::RuntimeProbeSource::FreshAfterReceiptMismatch
+                } else {
+                    super::model::RuntimeProbeSource::Fresh
+                },
+            },
+        })?;
+    if before != after {
+        return Err(JavaRuntimeProbeResolutionError {
+            error: JavaRuntimeLookupError::Probe(
+                "java executable changed while it was being probed".to_string(),
+            ),
+            usage: super::model::RuntimeProbeUsage {
+                spawn_count: 1,
+                source: if receipt_supplied {
+                    super::model::RuntimeProbeSource::FreshAfterReceiptMismatch
+                } else {
+                    super::model::RuntimeProbeSource::Fresh
+                },
+            },
+        });
+    }
+    let receipt = JavaRuntimeProbeReceipt {
+        fingerprint: after,
+        info,
+    };
+    Ok(JavaRuntimeProbeResolution {
+        major: receipt.info.major,
+        update: receipt.info.update,
+        receipt,
+        usage: super::model::RuntimeProbeUsage {
+            spawn_count: 1,
+            source: if receipt_supplied {
+                super::model::RuntimeProbeSource::FreshAfterReceiptMismatch
+            } else {
+                super::model::RuntimeProbeSource::Fresh
+            },
+        },
+    })
+}
+
+fn fingerprint_java_targets(
+    java_path: &Path,
+) -> Result<JavaExecutableTargetFingerprint, JavaRuntimeLookupError> {
+    let requested_path = absolute_java_path(java_path)?;
+    let requested = fingerprint_java_executable(&requested_path)?;
+    let probe_path = java_probe_executable(&requested_path);
+    let probe = if probe_path == requested_path {
+        None
+    } else {
+        Some(fingerprint_java_executable(&probe_path)?)
+    };
+    Ok(JavaExecutableTargetFingerprint {
+        requested_path,
+        selected_executable_path: probe_path,
+        requested,
+        probe,
+    })
+}
+
+fn absolute_java_path(java_path: &Path) -> Result<PathBuf, JavaRuntimeLookupError> {
+    std::path::absolute(java_path).map_err(|error| JavaRuntimeLookupError::Probe(error.to_string()))
+}
+
+fn fingerprint_java_executable(
+    java_path: &Path,
+) -> Result<JavaExecutableFingerprint, JavaRuntimeLookupError> {
+    let canonical_before = fs::canonicalize(java_path)
+        .map_err(|error| JavaRuntimeLookupError::Probe(error.to_string()))?;
+    let before = fingerprint_opened_executable(&canonical_before)?;
+    let canonical_after = fs::canonicalize(java_path)
+        .map_err(|error| JavaRuntimeLookupError::Probe(error.to_string()))?;
+    let after = fingerprint_opened_executable(&canonical_after)?;
+    if canonical_before != canonical_after || before != after {
+        return Err(JavaRuntimeLookupError::Probe(
+            "java executable changed while it was fingerprinted".to_string(),
+        ));
+    }
+    Ok(after)
+}
+
+fn fingerprint_opened_executable(
+    canonical_path: &Path,
+) -> Result<JavaExecutableFingerprint, JavaRuntimeLookupError> {
+    let mut file = File::open(canonical_path)
+        .map_err(|error| JavaRuntimeLookupError::Probe(error.to_string()))?;
+    let metadata_before = file
+        .metadata()
+        .map_err(|error| JavaRuntimeLookupError::Probe(error.to_string()))?;
+    if !metadata_before.is_file() {
+        return Err(JavaRuntimeLookupError::Probe(
+            "java executable is not a regular file".to_string(),
+        ));
+    }
+    if metadata_before.len() > JAVA_EXECUTABLE_FINGERPRINT_MAX_BYTES {
+        return Err(JavaRuntimeLookupError::Probe(
+            "java executable exceeds the fingerprint size limit".to_string(),
+        ));
+    }
+    let modified_before = metadata_before
+        .modified()
+        .map_err(|error| JavaRuntimeLookupError::Probe(error.to_string()))?;
+    #[cfg(unix)]
+    let mode_before = {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata_before.permissions().mode()
+    };
+    let mut hasher = Sha256::new();
+    let mut read = 0_u64;
+    let mut buffer = [0_u8; 16 << 10];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| JavaRuntimeLookupError::Probe(error.to_string()))?;
+        if count == 0 {
+            break;
+        }
+        read = read.saturating_add(count as u64);
+        if read > JAVA_EXECUTABLE_FINGERPRINT_MAX_BYTES {
+            return Err(JavaRuntimeLookupError::Probe(
+                "java executable exceeds the fingerprint size limit".to_string(),
+            ));
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let metadata_after = file
+        .metadata()
+        .map_err(|error| JavaRuntimeLookupError::Probe(error.to_string()))?;
+    let modified_after = metadata_after
+        .modified()
+        .map_err(|error| JavaRuntimeLookupError::Probe(error.to_string()))?;
+    #[cfg(unix)]
+    let mode_after = {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata_after.permissions().mode()
+    };
+    #[cfg(unix)]
+    let mode_changed = mode_after != mode_before;
+    #[cfg(not(unix))]
+    let mode_changed = false;
+    if !metadata_after.is_file()
+        || read != metadata_before.len()
+        || metadata_after.len() != metadata_before.len()
+        || modified_after != modified_before
+        || mode_changed
+    {
+        return Err(JavaRuntimeLookupError::Probe(
+            "java executable changed while it was fingerprinted".to_string(),
+        ));
+    }
+    Ok(JavaExecutableFingerprint {
+        canonical_path: canonical_path.to_path_buf(),
+        size: metadata_after.len(),
+        modified: modified_after,
+        sha256: hasher.finalize().into(),
+        #[cfg(unix)]
+        mode: mode_after,
     })
 }
 pub(super) fn java_probe_executable(java_path: &Path) -> PathBuf {
@@ -90,7 +431,20 @@ fn command_output_with_timeout(mut command: Command, timeout: Duration) -> std::
 pub(super) fn parse_java_version(text: &str) -> (u32, u32) {
     let Some(version) = text
         .lines()
-        .find_map(|line| line.split('"').nth(1))
+        .find_map(|line| {
+            let line = line.trim_start();
+            let version = line
+                .strip_prefix("openjdk ")
+                .or_else(|| line.strip_prefix("java "))?;
+            let version = version.strip_prefix("version ").unwrap_or(version);
+            let version = version.split_whitespace().next()?.trim_matches('"');
+            version
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_digit)
+                .then_some(version)
+        })
+        .or_else(|| text.lines().find_map(|line| line.split('"').nth(1)))
         .or_else(|| {
             text.split_whitespace()
                 .find(|token| token.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
@@ -177,9 +531,18 @@ pub(super) fn detect_distribution(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_output_with_timeout, parse_java_version};
+    use super::parse_java_version;
+    #[cfg(unix)]
+    use super::{
+        command_output_with_timeout, probe_java_runtime_receipt, resolve_java_runtime_probe,
+        snapshot_java_runtime,
+    };
+    #[cfg(unix)]
+    use crate::runtime::RuntimeProbeSource;
     use std::fs;
+    #[cfg(unix)]
     use std::process::Command;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     #[test]
@@ -202,13 +565,111 @@ mod tests {
         );
     }
 
+    #[test]
+    fn java_version_parser_prefers_banner_over_quoted_settings_notices() {
+        let notices = r#"Locale settings summary:
+    Use "-XshowSettings:locale" option for verbose locale settings options
+Security settings summary:
+    See "java -X" for verbose security settings options"#;
+        for (banner, expected) in [
+            (r#"openjdk version "17.0.15" 2025-04-15 LTS"#, (17, 15)),
+            (r#"java version "1.8.0_311""#, (8, 311)),
+            ("openjdk 21.0.8 2025-07-15", (21, 8)),
+            (r#"openjdk version "25-ea""#, (25, 0)),
+        ] {
+            assert_eq!(
+                parse_java_version(&format!("{notices}\n{banner}")),
+                expected,
+                "{banner}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_version_parser_ignores_help_lines_before_version_banner() {
+        assert_eq!(
+            parse_java_version("java -X\nopenjdk help\nopenjdk version \"17.0.15\""),
+            (17, 15)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn receipt_revalidation_returns_the_fingerprinted_cli_sibling() {
+        use crate::runtime::JavaRuntimeInfo;
+
+        let root = crate::test_temp_root().join(format!(
+            "axial-java-probe-cli-sibling-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("CLI sibling root");
+        let javaw = root.join("javaw.exe");
+        let java = root.join("java.exe");
+        fs::write(&javaw, b"windowed executable").expect("javaw");
+        fs::write(&java, b"console executable").expect("java");
+        let receipt = super::JavaRuntimeProbeReceipt {
+            fingerprint: super::fingerprint_java_targets(&javaw).expect("fingerprinted siblings"),
+            info: JavaRuntimeInfo {
+                id: String::new(),
+                major: 21,
+                update: 0,
+                distribution: String::new(),
+                path: javaw.to_string_lossy().to_string(),
+            },
+        };
+
+        assert_eq!(
+            receipt
+                .revalidate_cli_executable()
+                .expect("revalidated CLI"),
+            java
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn receipt_revalidation_never_reselects_a_raced_in_cli_sibling() {
+        use crate::runtime::JavaRuntimeInfo;
+
+        let root = crate::test_temp_root()
+            .join(format!("axial-java-probe-cli-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("CLI race root");
+        let javaw = root.join("javaw.exe");
+        let java = root.join("java.exe");
+        fs::write(&javaw, b"windowed executable").expect("javaw");
+        let receipt = super::JavaRuntimeProbeReceipt {
+            fingerprint: super::fingerprint_java_targets(&javaw)
+                .expect("fingerprinted windowed executable"),
+            info: JavaRuntimeInfo {
+                id: String::new(),
+                major: 21,
+                update: 0,
+                distribution: String::new(),
+                path: javaw.to_string_lossy().to_string(),
+            },
+        };
+        assert_eq!(
+            receipt
+                .revalidate_cli_executable()
+                .expect("windowed CLI remains selected"),
+            javaw
+        );
+
+        fs::write(&java, b"raced console executable").expect("raced java");
+        assert!(receipt.revalidate_cli_executable().is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn java_probe_command_output_is_bounded_by_timeout() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root =
-            std::env::temp_dir().join(format!("axial-java-probe-timeout-{}", std::process::id()));
+        let root = crate::test_temp_root()
+            .join(format!("axial-java-probe-timeout-{}", std::process::id()));
         fs::create_dir_all(&root).expect("probe timeout test dir");
         let java_path = root.join("java");
         fs::write(&java_path, "#!/bin/sh\nsleep 60\n").expect("probe timeout script");
@@ -225,6 +686,79 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_binds_the_requested_alias_and_symlink_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = crate::test_temp_root().join(format!(
+            "axial-java-probe-receipt-alias-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("receipt alias root");
+        let first = root.join("java-first");
+        let second = root.join("java-second");
+        for path in [&first, &second] {
+            fs::write(path, "#!/bin/sh\necho 'openjdk version \"21.0.3\"' >&2\n")
+                .expect("fake java");
+            let mut permissions = fs::metadata(path)
+                .expect("fake java metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("fake java permissions");
+        }
+        let first_alias = root.join("java-alias-a");
+        let second_alias = root.join("java-alias-b");
+        symlink(&first, &first_alias).expect("first alias");
+        symlink(&first, &second_alias).expect("second alias");
+
+        let receipt = probe_java_runtime_receipt(&first_alias, None).expect("probe receipt");
+        let resolution = resolve_java_runtime_probe(
+            snapshot_java_runtime(&first_alias).expect("matching snapshot"),
+            Some(receipt),
+            None,
+        )
+        .unwrap_or_else(|_| panic!("matching receipt resolution"));
+        assert_eq!(resolution.usage.source, RuntimeProbeSource::Receipt);
+
+        let receipt = probe_java_runtime_receipt(&first_alias, None).expect("probe receipt");
+        let resolution = resolve_java_runtime_probe(
+            snapshot_java_runtime(&second_alias).expect("different alias snapshot"),
+            Some(receipt),
+            None,
+        )
+        .unwrap_or_else(|_| panic!("different alias resolution"));
+        assert_eq!(
+            resolution.usage.source,
+            RuntimeProbeSource::FreshAfterReceiptMismatch
+        );
+
+        let receipt = probe_java_runtime_receipt(&first_alias, None).expect("probe receipt");
+        assert_eq!(
+            receipt
+                .revalidate_cli_executable()
+                .expect("revalidated CLI executable"),
+            first_alias
+        );
+        fs::remove_file(&first_alias).expect("remove old alias");
+        symlink(&second, &first_alias).expect("retarget alias");
+        assert!(receipt.revalidate_cli_executable().is_err());
+        let resolution = resolve_java_runtime_probe(
+            snapshot_java_runtime(&first_alias).expect("retargeted alias snapshot"),
+            Some(receipt),
+            None,
+        );
+        assert_eq!(
+            resolution
+                .unwrap_or_else(|_| panic!("retargeted alias resolution"))
+                .usage
+                .source,
+            RuntimeProbeSource::FreshAfterReceiptMismatch
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

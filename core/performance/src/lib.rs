@@ -1,14 +1,18 @@
 pub mod effective;
-pub mod health;
+mod health;
 pub mod install;
-pub mod modrinth;
 pub mod resolve;
 pub mod rules;
 pub mod rules_cache;
 pub mod signature;
-pub mod state;
+mod state;
 pub mod status;
+mod storage;
 pub mod types;
+
+pub(crate) const MANAGED_ARTIFACT_MAX_BYTES: u64 = 512 << 20;
+pub const PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_SCHEMA: u16 = 1;
+pub const PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER: &[u8] = b"performance-composition-state";
 
 pub use effective::{
     EffectiveContributionSource, EffectiveFallbackPlan, EffectiveInstrumentationMode,
@@ -17,23 +21,40 @@ pub use effective::{
     EffectivePerformanceComposition, EffectivePerformanceExplanation,
     EffectivePerformanceHealthRequirements, EffectivePerformancePlan, effective_performance_plan,
 };
-pub use health::{BundleHealth, derive_health};
-pub use install::{InstallError, PERFORMANCE_RULES_URL_ENV, PerformanceManager, RulesRefreshError};
-pub use resolve::{ResolveError, builtin_manifest, detect_hardware, parse_mode, resolve_plan};
+pub use health::BundleHealth;
+pub use install::{
+    InstallError, ManagedArtifactPin, ManagedArtifactRole, ManagedArtifactTransferResolver,
+    ManagedArtifactWitnessProof, ManagedCompositionAuthority, ManagedCompositionInspection,
+    ManagedCompositionInstallPlan, ManagedDependencyEdge, ManagedIdentityError,
+    ManagedIndeterminate, ManagedInstallExecutionError, ManagedInstallExecutionOutcome,
+    ManagedInstallPlanError, ManagedInstanceEffectAuthority, ManagedInstanceIdentity,
+    ManagedMutationError, ManagedResolvedInspection, PERFORMANCE_RULES_URL_ENV, PerformanceManager,
+    PerformanceRulesAuthority, RulesRefreshError, VerifiedRemoteRules,
+    remote_rules_refresh_warning,
+};
+pub use resolve::{
+    PERFORMANCE_MANIFEST_SCHEMA_VERSION, ResolveError, builtin_manifest, detect_hardware,
+    parse_mode, resolve_plan,
+};
 pub use rules_cache::{
-    LoadedRulesCache, RulesCacheSnapshot, RulesCacheState, RulesCacheStatus, rules_cache_path,
+    RULES_CACHE_MAX_BYTES, RulesCacheSnapshot, RulesCacheStartupSource, RulesCacheState,
+    RulesCacheStatus,
 };
 pub use signature::{
     PERFORMANCE_RULES_PUBLIC_KEY_ENV, RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER,
     RemoteRulesVerifier, RulesSignatureError, RulesSignatureMetadata, canonical_manifest_payload,
 };
-pub use state::{RollbackSnapshotSummary, StateError, load_state, remove_state, save_state};
+pub use state::{
+    ManagedDuplicateFile, ManagedDuplicatePayload, ManagedRollbackOutcome, RollbackSnapshotSummary,
+    RollbackSnapshotTarget, StateError,
+};
 pub use status::{
     FamilyCoverage, PerformanceRulesStatus, RuleChannel, RuleSource, RulesValidation, rules_status,
     rules_status_for,
 };
 pub use types::{
     CompositionPlan, CompositionState, CompositionTier, HardwareProfile, InstalledMod,
-    ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactSource, Manifest,
-    ModCondition, OwnershipClass, PerformanceMode, ResolutionRequest,
+    ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactSource,
+    ManagedDependencyStateEdge, Manifest, ModCondition, OwnershipClass, PerformanceMode,
+    ResolutionRequest,
 };

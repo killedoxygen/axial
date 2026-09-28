@@ -1,7 +1,21 @@
 import type { JSX } from 'preact';
-import { Icon } from '../../../ui/Icons';
+import { Icon, type IconName } from '../../../ui/Icons';
 import { Button } from '../../../ui/Atoms';
 import type { ResourceLoadState } from '../resources';
+import { resourceMutationState } from '../bulk-actions';
+
+export function ResourceMutationStatus({ instanceId }: { instanceId: string }): JSX.Element | null {
+  const state = resourceMutationState(instanceId);
+  if (state.status === 'idle') return null;
+  return (
+    <div
+      class={`cp-resource-note${state.status === 'error' ? ' cp-resource-note--error' : ''}`}
+      role={state.status === 'error' ? 'alert' : 'status'}
+    >
+      {state.status === 'error' ? state.error : `${state.label}…`}
+    </div>
+  );
+}
 
 export function ResourceStatus({
   state,
@@ -33,7 +47,7 @@ export function ResourceToolbar({
 }: {
   title: string;
   onRefresh: () => void;
-  action: { icon: string; label: string; onClick: () => void };
+  action: { icon: IconName; label: string; onClick: () => void };
 }): JSX.Element {
   return (
     <div class="cp-resource-toolbar">
@@ -50,7 +64,7 @@ export function ResourceToolbar({
   );
 }
 
-export function ResourceEmpty({ icon, title, hint }: { icon: string; title: string; hint: string }): JSX.Element {
+export function ResourceEmpty({ icon, title, hint }: { icon: IconName; title: string; hint: string }): JSX.Element {
   return (
     <div class="cp-resource-empty">
       <span>
@@ -73,7 +87,7 @@ export function ResourceRow({
 }: {
   leading?: JSX.Element;
   selected?: boolean;
-  icon: string;
+  icon: IconName;
   name: string;
   meta: string;
   actions?: JSX.Element;

@@ -1,11 +1,12 @@
 import { api, apiResourceUrl } from '../../api';
 import { toast } from '../../toast';
-import { errMessage } from '../../utils';
 import { prompt } from '../../ui/Dialog';
 import type { ContextMenuItem } from '../../ui/ContextMenu';
 import type { EnrichedInstance, InstanceScreenshot } from '../../types-instance';
 import { openInstanceFolder } from './instance-actions';
-import { confirmDeleteItems, partialFailureMessage, runBulkMutation } from './bulk-actions';
+import { confirmDeleteItems, partialFailureMessage, runBulkMutation, runResourceMutation } from './bulk-actions';
+import { dtoString } from '../../dto-contract';
+import { requireResourceCommandSuccess } from './resources';
 
 function screenshotKind(name: string): 'png' | 'jpeg' | 'webp' | '' {
   const lower = name.toLowerCase();
@@ -16,23 +17,20 @@ function screenshotKind(name: string): 'png' | 'jpeg' | 'webp' | '' {
 }
 
 function screenshotNameError(value: string, currentName?: string): string | null {
-  const name = value.trim();
-  if (!name || name === '.' || name === '..') return 'Use a screenshot filename.';
-  if (name !== value) return 'Screenshot names cannot start or end with spaces.';
-  if (name.startsWith('.')) return 'Screenshot names cannot start with a dot.';
-  if (/[\\/]/.test(name)) return 'Screenshot names cannot include folders.';
-  if (/[\u0000-\u001f\u007f]/.test(name)) return 'Screenshot names cannot include control characters.';
-  if (!/\.(png|jpe?g|webp)$/i.test(name)) return 'Use a PNG, JPG, JPEG, or WEBP filename.';
-  if (currentName && screenshotKind(name) !== screenshotKind(currentName)) return 'Keep the same screenshot file type.';
+  if (!value) return 'Use a screenshot filename.';
+  if (!screenshotKind(value)) return 'Use a PNG, JPG, JPEG, or WEBP filename.';
+  if (currentName && screenshotKind(value) !== screenshotKind(currentName)) {
+    return 'Keep the same screenshot file type.';
+  }
   return null;
 }
 
 async function removeScreenshot(inst: EnrichedInstance, screenshotName: string): Promise<void> {
-  const res: any = await api(
+  const res = await api(
     'DELETE',
     `/instances/${encodeURIComponent(inst.id)}/screenshots/${encodeURIComponent(screenshotName)}`,
   );
-  if (res?.error) throw new Error(res.error);
+  requireResourceCommandSuccess(res, 'Screenshot deletion');
 }
 
 export function screenshotFileUrl(inst: EnrichedInstance, name: string): string {
@@ -44,47 +42,50 @@ export async function renameScreenshot(
   screenshotName: string,
   onDone: (newName: string) => void,
 ): Promise<void> {
-  const next = await prompt('New name for this screenshot', screenshotName, {
-    title: 'Rename screenshot',
-    confirmText: 'Rename',
-    validate: (value) => screenshotNameError(value, screenshotName),
-  });
-  const nextName = next ?? '';
-  if (!nextName || nextName === screenshotName) return;
-  try {
-    const res: any = await api(
+  await runResourceMutation(inst.id, 'Rename screenshot', async () => {
+    const next = await prompt('New name for this screenshot', screenshotName, {
+      title: 'Rename screenshot',
+      confirmText: 'Rename',
+      validate: (value) => screenshotNameError(value, screenshotName),
+    });
+    const nextName = next ?? '';
+    if (!nextName || nextName === screenshotName) return;
+    const res = await api(
       'PUT',
       `/instances/${encodeURIComponent(inst.id)}/screenshots/${encodeURIComponent(screenshotName)}`,
       { name: nextName },
     );
-    if (res?.error) throw new Error(res.error);
+    const renamed = dtoString(requireResourceCommandSuccess(res, 'Screenshot rename').name, 'Screenshot name');
     toast('Screenshot renamed');
-    onDone(nextName);
-  } catch (err) {
-    toast(`Could not rename the screenshot: ${errMessage(err)}`, 'error');
-  }
+    onDone(renamed);
+  });
 }
 
 export async function deleteScreenshots(
   inst: EnrichedInstance,
   shots: InstanceScreenshot[],
   onDone: () => void,
+  onFailure?: () => void,
 ): Promise<void> {
-  const confirmed = await confirmDeleteItems({
-    count: shots.length,
-    itemLabel: 'screenshot',
-    message:
-      shots.length === 1
-        ? `Delete "${shots[0]!.name}" from this instance. This removes the screenshot file from disk.`
-        : `Delete ${shots.length} screenshots from this instance. This removes the selected screenshot files from disk.`,
-  });
-  if (!confirmed) return;
-  await runBulkMutation({
-    items: shots,
-    action: (shot) => removeScreenshot(inst, shot.name),
-    success: (count) => (count === 1 ? 'Screenshot deleted' : `${count} screenshots deleted`),
-    partial: (done, total, err) => partialFailureMessage('Deleted', done, total, err),
-    onDone,
+  if (shots.length === 0) return;
+  await runResourceMutation(inst.id, 'Delete screenshots', async () => {
+    const confirmed = await confirmDeleteItems({
+      count: shots.length,
+      itemLabel: 'screenshot',
+      message:
+        shots.length === 1
+          ? `Delete "${shots[0]!.name}" from this instance. This removes the screenshot file from disk.`
+          : `Delete ${shots.length} screenshots from this instance. This removes the selected screenshot files from disk.`,
+    });
+    if (!confirmed) return;
+    await runBulkMutation({
+      items: shots,
+      action: (shot) => removeScreenshot(inst, shot.name),
+      success: (count) => (count === 1 ? 'Screenshot deleted' : `${count} screenshots deleted`),
+      partial: (done, total, err) => partialFailureMessage('Deleted', done, total, err),
+      onDone,
+      onFailure,
+    });
   });
 }
 
@@ -112,6 +113,11 @@ export function screenshotMenuItems({
       onSelect: () => void openInstanceFolder(inst.id, 'screenshots'),
     },
     { divider: true, label: '', onSelect: () => undefined },
-    { icon: 'trash', label: 'Delete', onSelect: () => void deleteScreenshots(inst, [shot], onRefresh), danger: true },
+    {
+      icon: 'trash',
+      label: 'Delete',
+      onSelect: () => void deleteScreenshots(inst, [shot], onRefresh, onRefresh),
+      danger: true,
+    },
   ];
 }

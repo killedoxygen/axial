@@ -1,10 +1,10 @@
 import { signal } from '@preact/signals';
 import { commandPaletteOpen, navigate, openCreate, route } from './ui-state';
-import { instances, launchState, runningSessions, selectedInstance } from './store';
+import { instances, launchSessions, launchState, selectedInstance } from './store';
 import { selectInstance } from './actions';
 import { launchGame } from './launch';
 import { Sound } from './sound';
-import { local, saveLocalState } from './state';
+import { local, saveLocalState, canEditPreferences } from './state';
 import type { ShortcutBinding } from './types-ui';
 
 export type ShortcutId = 'open-settings' | 'new-instance' | 'command-palette' | 'launch-selected' | 'dismiss';
@@ -64,7 +64,7 @@ export const SHORTCUTS: ShortcutDef[] = [
         if (inst) selectInstance(inst.id);
       }
       if (!inst) return;
-      if (runningSessions.value[inst.id]) return;
+      if (launchSessions.value[inst.id]) return;
       if (launchState.value.status === 'preparing') return;
       Sound.ui('launchPress');
       void launchGame();
@@ -92,6 +92,7 @@ export function shortcutOverride(id: ShortcutId): ShortcutBinding | null {
 }
 
 export function setShortcutOverride(id: ShortcutId, combo: ShortcutBinding | null): void {
+  if (!canEditPreferences()) return;
   const overrides = { ...local.shortcuts };
   if (combo) overrides[id] = combo;
   else delete overrides[id];

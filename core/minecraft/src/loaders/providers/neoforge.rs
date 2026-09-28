@@ -1,13 +1,14 @@
 use super::common::{
-    NEOFORGE_MAVEN_BASE, NEOFORGE_MAVEN_META, fetch_text, infer_loader_build_metadata,
-    is_prerelease_loader_version, neoforge_to_minecraft_version, parse_maven_versions,
+    NEOFORGE_MAVEN_META, fetch_text, infer_loader_build_metadata, is_prerelease_loader_version,
+    neoforge_install_source, parse_maven_versions,
+    provider_installed_version_id,
 };
+pub use super::common::neoforge_to_minecraft_version;
 use crate::lifecycle::LifecycleMeta;
-use crate::loaders::api::{build_id_for, installed_version_id_for};
+use crate::loaders::api::build_id_for;
 use crate::loaders::types::{
-    LoaderArtifactKind, LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId,
-    LoaderGameVersion, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
-    LoaderVersionIndex,
+    LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId, LoaderGameVersion,
+    LoaderInstallability, LoaderVersionIndex,
 };
 use crate::types::VersionSubjectKind;
 use crate::version_meta::MinecraftVersionMeta;
@@ -18,7 +19,7 @@ pub async fn fetch_game_versions()
     Ok(parse_game_versions_from_maven_metadata(&xml))
 }
 
-fn parse_game_versions_from_maven_metadata(xml: &str) -> Vec<LoaderGameVersion> {
+pub fn parse_game_versions_from_maven_metadata(xml: &str) -> Vec<LoaderGameVersion> {
     let mut versions_by_stability = std::collections::HashMap::<String, bool>::new();
     for entry in parse_maven_versions(xml) {
         let Some(minecraft_version) = neoforge_to_minecraft_version(&entry) else {
@@ -49,10 +50,18 @@ pub async fn fetch_builds(
     minecraft_version: &str,
 ) -> Result<LoaderVersionIndex, crate::loaders::types::LoaderError> {
     let xml = fetch_text(NEOFORGE_MAVEN_META).await?;
+    parse_builds_from_maven_metadata(minecraft_version, &xml)
+}
+
+/// Normalize provider bytes without performing network or filesystem work.
+pub fn parse_builds_from_maven_metadata(
+    minecraft_version: &str,
+    xml: &str,
+) -> Result<LoaderVersionIndex, crate::loaders::types::LoaderError> {
     let component_id = LoaderComponentId::NeoForge;
     let mut builds = Vec::new();
 
-    for entry in parse_maven_versions(&xml) {
+    for entry in parse_maven_versions(xml) {
         let Some(resolved_minecraft_version) = neoforge_to_minecraft_version(&entry) else {
             continue;
         };
@@ -60,6 +69,7 @@ pub async fn fetch_builds(
             continue;
         }
         let prerelease = is_prerelease_loader_version(&entry);
+        let (strategy, artifact_kind, install_source) = neoforge_install_source(&entry)?;
         builds.push(LoaderBuildRecord {
             subject_kind: LoaderBuildSubjectKind::LoaderBuild,
             component_id,
@@ -67,17 +77,12 @@ pub async fn fetch_builds(
             build_id: build_id_for(component_id, minecraft_version, &entry),
             minecraft_version: minecraft_version.to_string(),
             loader_version: entry.clone(),
-            version_id: installed_version_id_for(component_id, minecraft_version, &entry),
+            version_id: provider_installed_version_id(component_id, minecraft_version, &entry)?,
             build_meta: infer_loader_build_metadata(&entry, &[], false, false, Some(!prerelease)),
-            strategy: LoaderInstallStrategy::NeoForgeModern,
-            artifact_kind: LoaderArtifactKind::InstallerJar,
+            strategy,
+            artifact_kind,
             installability: LoaderInstallability::Installable,
-            install_source: LoaderInstallSource::InstallerJar {
-                url: format!(
-                    "{NEOFORGE_MAVEN_BASE}/net/neoforged/neoforge/{0}/neoforge-{0}-installer.jar",
-                    entry
-                ),
-            },
+            install_source,
         });
     }
 

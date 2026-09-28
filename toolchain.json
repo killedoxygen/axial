@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "task": "3.52.0",
+  "node": "24.13.1",
+  "node_types": "24.13.3",
+  "pnpm": "11.1.3",
+  "rust": {
+    "release": "1.93.1",
+    "rustc_commit": "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
+    "cargo_commit": "083ac5135f967fd9dc906ab057a2315861c7a80d"
+  },
+  "tauri_cli": "2.11.2",
+  "cargo_deny": {
+    "release": "0.20.2",
+    "linux_archive": {
+      "target": "x86_64-unknown-linux-musl",
+      "sha256": "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+    }
+  },
+  "linux_ci_image": {
+    "reference": "ghcr.io/mateoltd/axial-linux-ci@sha256:c13788b4e92861ecec09652d88c220e8fe3ae5fd75ebda09820a219ff0c7091a",
+    "source_revision": "87dfb56eca0907c85983e5c34a30f434e8546e04"
+  },
+  "ubuntu_base": {
+    "reference": "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
+  },
+  "ubuntu_apt_snapshot": "20260719T000000Z"
+}

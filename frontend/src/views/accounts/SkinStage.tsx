@@ -259,14 +259,13 @@ export function SkinStage({
       }
       case 'profile': {
         const saving = op?.kind === 'save-profile';
-        const menu: ContextMenuItem[] = [
-          ...(skinActionsEnabled
-            ? [{ icon: 'x', label: 'Reset profile skin', onSelect: () => void resetProfileSkin() }]
-            : []),
-          ...(skinActionsEnabled && activeMinecraftCape(profile ?? undefined)
-            ? [{ icon: 'x', label: 'Reset profile cape', onSelect: () => void resetProfileCape() }]
-            : []),
-        ];
+        const menu: ContextMenuItem[] = [];
+        if (skinActionsEnabled) {
+          menu.push({ icon: 'x', label: 'Reset profile skin', onSelect: () => void resetProfileSkin() });
+        }
+        if (skinActionsEnabled && activeMinecraftCape(profile ?? undefined)) {
+          menu.push({ icon: 'x', label: 'Reset profile cape', onSelect: () => void resetProfileCape() });
+        }
         return (
           <>
             {model.returnable && (
@@ -306,13 +305,13 @@ export function SkinStage({
         const menu: ContextMenuItem[] = [
           { icon: 'refresh', label: 'Reset preview to Steve', onSelect: () => resetWardrobePreview() },
           { icon: 'download', label: 'Download PNG', onSelect: () => void downloadSavedSkin(model.skin) },
-          ...(!model.worn
-            ? [
-                { label: '', onSelect: () => {}, divider: true },
-                { icon: 'trash', label: 'Delete', onSelect: () => void deleteSavedSkin(model.skin), danger: true },
-              ]
-            : []),
         ];
+        if (!model.worn) {
+          menu.push(
+            { label: '', onSelect: () => {}, divider: true },
+            { icon: 'trash', label: 'Delete', onSelect: () => void deleteSavedSkin(model.skin), danger: true },
+          );
+        }
         if (model.queued) {
           return (
             <>

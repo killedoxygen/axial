@@ -1,0 +1,399 @@
+[
+  {
+    "operation_id": "op-b09cfd2f-1722-40ae-a28f-5c09e6d472df",
+    "mode": "Managed",
+    "kind": "Allow",
+    "diagnoses": [],
+    "action_plan": null
+  },
+  {
+    "operation_id": "op-8010cf73-bce4-4d05-8d7e-c42d474581db",
+    "mode": "Custom",
+    "kind": "Warn",
+    "diagnoses": [
+      "launch_memory_allocation_low"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "launch_memory_allocation_low",
+        "ownership": "UserOwned",
+        "confidence": "High",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_memory",
+            "ownership": "UserOwned"
+          }
+        ],
+        "candidate_actions": [
+          "Warn"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Warn",
+          "target": {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_memory",
+            "ownership": "UserOwned"
+          },
+          "reason": "launch_memory_allocation_low"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "op-09c5034b-6a74-4b5f-87f8-441a80a1df2c",
+    "mode": "Managed",
+    "kind": "Repair",
+    "diagnoses": [
+      "managed_runtime_corrupt"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "managed_runtime_corrupt",
+        "ownership": "LauncherManaged",
+        "confidence": "Confirmed",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "fixture_runtime",
+            "ownership": "LauncherManaged"
+          }
+        ],
+        "candidate_actions": [
+          "Repair"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Repair",
+          "target": {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "fixture_runtime",
+            "ownership": "LauncherManaged"
+          },
+          "reason": "managed_runtime_corrupt"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "op-9c053534-8c68-47ae-8fc7-ac4ab2f4c42e",
+    "mode": "Managed",
+    "kind": "Retry",
+    "diagnoses": [
+      "process_lifecycle_observed"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "process_lifecycle_observed",
+        "ownership": "LauncherManaged",
+        "confidence": "Confirmed",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Session",
+            "id": "fixture_session",
+            "ownership": "LauncherManaged"
+          }
+        ],
+        "candidate_actions": [
+          "Retry"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Retry",
+          "target": {
+            "system": "Guardian",
+            "kind": "Session",
+            "id": "fixture_session",
+            "ownership": "LauncherManaged"
+          },
+          "reason": "process_lifecycle_observed"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "op-9bd54821-d145-4825-8427-c548958ae914",
+    "mode": "Managed",
+    "kind": "Strip",
+    "diagnoses": [
+      "jvm_args_malformed"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "jvm_args_malformed",
+        "ownership": "UserOwned",
+        "confidence": "Confirmed",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_jvm_args",
+            "ownership": "UserOwned"
+          }
+        ],
+        "candidate_actions": [
+          "Strip"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Strip",
+          "target": {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_jvm_args",
+            "ownership": "UserOwned"
+          },
+          "reason": "jvm_args_malformed"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "op-cee44ef2-cea3-41e9-a31d-a635a28b1647",
+    "mode": "Managed",
+    "kind": "Downgrade",
+    "diagnoses": [
+      "jvm_preset_recovery"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "jvm_preset_recovery",
+        "ownership": "UserOwned",
+        "confidence": "High",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_jvm_preset",
+            "ownership": "UserOwned"
+          }
+        ],
+        "candidate_actions": [
+          "Downgrade"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Downgrade",
+          "target": {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_jvm_preset",
+            "ownership": "UserOwned"
+          },
+          "reason": "jvm_preset_recovery"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "op-883f7318-2842-4620-be85-2c145db7d7a9",
+    "mode": "Managed",
+    "kind": "Fallback",
+    "diagnoses": [
+      "java_override_unavailable"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "java_override_unavailable",
+        "ownership": "UserOwned",
+        "confidence": "Confirmed",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "fixture_java_override",
+            "ownership": "UserOwned"
+          }
+        ],
+        "candidate_actions": [
+          "Fallback"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Fallback",
+          "target": {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "fixture_java_override",
+            "ownership": "UserOwned"
+          },
+          "reason": "java_override_unavailable"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "op-46330a41-6623-42cd-aa05-f94b44372069",
+    "mode": "Managed",
+    "kind": "Quarantine",
+    "diagnoses": [
+      "launcher_managed_artifact_corrupt"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "launcher_managed_artifact_corrupt",
+        "ownership": "LauncherManaged",
+        "confidence": "Confirmed",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Artifact",
+            "id": "fixture_artifact",
+            "ownership": "LauncherManaged"
+          }
+        ],
+        "candidate_actions": [
+          "Quarantine"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Quarantine",
+          "target": {
+            "system": "Guardian",
+            "kind": "Artifact",
+            "id": "fixture_artifact",
+            "ownership": "LauncherManaged"
+          },
+          "reason": "launcher_managed_artifact_corrupt"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "op-448a89ac-4c51-41a0-bf93-2cd63e03d4e9",
+    "mode": "Custom",
+    "kind": "AskUser",
+    "diagnoses": [
+      "custom_java_override_present"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "custom_java_override_present",
+        "ownership": "UserOwned",
+        "confidence": "High",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_custom_java",
+            "ownership": "UserOwned"
+          }
+        ],
+        "candidate_actions": [
+          "AskUser"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "AskUser",
+          "target": {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_custom_java",
+            "ownership": "UserOwned"
+          },
+          "reason": "custom_java_override_present"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "op-76a19c93-ce2b-4eef-8c04-b154ca08a699",
+    "mode": "Disabled",
+    "kind": "Block",
+    "diagnoses": [
+      "persisted_state_schema_invalid"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "persisted_state_schema_invalid",
+        "ownership": "LauncherManaged",
+        "confidence": "Certain",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_state",
+            "ownership": "LauncherManaged"
+          }
+        ],
+        "candidate_actions": [
+          "Block"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Block",
+          "target": {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_state",
+            "ownership": "LauncherManaged"
+          },
+          "reason": "persisted_state_schema_invalid"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "op-fb191b79-d16b-4b04-b0d4-b8c8c201328d",
+    "mode": "Disabled",
+    "kind": "RecordOnly",
+    "diagnoses": [
+      "unknown_failure_planning"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "unknown_failure_planning",
+        "ownership": "Unknown",
+        "confidence": "Low",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Instance",
+            "id": "fixture_unknown",
+            "ownership": "Unknown"
+          }
+        ],
+        "candidate_actions": [
+          "RecordOnly"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "RecordOnly",
+          "target": {
+            "system": "Guardian",
+            "kind": "Instance",
+            "id": "fixture_unknown",
+            "ownership": "Unknown"
+          },
+          "reason": "unknown_failure_planning"
+        }
+      ]
+    }
+  }
+]

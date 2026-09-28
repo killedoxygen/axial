@@ -1,0 +1,501 @@
+{
+  "schema": "axial.guardian.preset_stage_copy.v1",
+  "cases": [
+    {
+      "id": "preset_catalog.all",
+      "input": {
+        "surface": "preset_catalog"
+      },
+      "output": {
+        "surface": "preset_catalog",
+        "options": [
+          {
+            "id": "",
+            "label": "Auto",
+            "detail": "Axial picks safe JVM flags automatically.",
+            "default": true
+          },
+          {
+            "id": "smooth",
+            "label": "Smooth",
+            "detail": "Balances throughput and steady frame times.",
+            "default": false
+          },
+          {
+            "id": "performance",
+            "label": "Performance",
+            "detail": "Pushes higher throughput on modern hardware.",
+            "default": false
+          },
+          {
+            "id": "ultra_low_latency",
+            "label": "Low latency",
+            "detail": "Shortens JVM pauses, sometimes trading peak FPS.",
+            "default": false
+          },
+          {
+            "id": "graalvm",
+            "label": "GraalVM",
+            "detail": "Uses flags intended for GraalVM-based Java runtimes.",
+            "default": false
+          },
+          {
+            "id": "legacy",
+            "label": "Legacy",
+            "detail": "Keeps conservative flags for older Minecraft and Java stacks.",
+            "default": false
+          },
+          {
+            "id": "legacy_pvp",
+            "label": "Legacy PvP",
+            "detail": "Legacy tuning biased toward fast input response.",
+            "default": false
+          },
+          {
+            "id": "legacy_heavy",
+            "label": "Legacy heavy",
+            "detail": "Legacy tuning for larger heaps and heavier old modpacks.",
+            "default": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "preset_normalization.absent",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": null
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.empty",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": ""
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.whitespace",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "   "
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.auto_lower",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "auto"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.auto_upper",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "AUTO"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.smooth",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "smooth"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "smooth",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.performance",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "performance"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "performance",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.ultra_low_latency",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "ultra_low_latency"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "ultra_low_latency",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.graalvm",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "graalvm"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "graalvm",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.legacy",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "legacy"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "legacy",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.legacy_pvp",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "legacy_pvp"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "legacy_pvp",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.legacy_heavy",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "legacy_heavy"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "legacy_heavy",
+        "notice": null
+      }
+    },
+    {
+      "id": "preset_normalization.unknown",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "unknown_preset"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "",
+        "notice": {
+          "state_id": "unknown_reset_to_auto",
+          "tone": "warn",
+          "message": "Guardian adjusted the JVM preset",
+          "detail": "Guardian reset an unknown JVM preset to Automatic so launch safety stays backend-owned."
+        }
+      }
+    },
+    {
+      "id": "preset_normalization.hostile",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "C:\\Users\\Alice\\java.exe --accessToken secret"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "",
+        "notice": {
+          "state_id": "unknown_reset_to_auto",
+          "tone": "warn",
+          "message": "Guardian adjusted the JVM preset",
+          "detail": "Guardian reset an unknown JVM preset to Automatic so launch safety stays backend-owned."
+        }
+      }
+    },
+    {
+      "id": "preset_normalization.multibyte",
+      "input": {
+        "surface": "preset_normalization",
+        "requested": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+      },
+      "output": {
+        "surface": "preset_normalization",
+        "stored_preset": "",
+        "notice": {
+          "state_id": "unknown_reset_to_auto",
+          "tone": "warn",
+          "message": "Guardian adjusted the JVM preset",
+          "detail": "Guardian reset an unknown JVM preset to Automatic so launch safety stays backend-owned."
+        }
+      }
+    },
+    {
+      "id": "launch_stage.allow",
+      "input": {
+        "surface": "launch_stage",
+        "mode": "Managed",
+        "decision": "Allow",
+        "diagnosis_count": 0
+      },
+      "output": {
+        "surface": "launch_stage",
+        "evidence": {
+          "id": "guardian_launch_safety_decision",
+          "system": "guardian",
+          "summary": "Guardian recorded the launch safety decision.",
+          "details": [
+            "mode:Managed",
+            "decision:Allow",
+            "diagnoses:0"
+          ]
+        }
+      }
+    },
+    {
+      "id": "launch_stage.warn",
+      "input": {
+        "surface": "launch_stage",
+        "mode": "Managed",
+        "decision": "Warn",
+        "diagnosis_count": 1
+      },
+      "output": {
+        "surface": "launch_stage",
+        "evidence": {
+          "id": "guardian_launch_safety_decision",
+          "system": "guardian",
+          "summary": "Guardian recorded the launch safety decision.",
+          "details": [
+            "mode:Managed",
+            "decision:Warn",
+            "diagnoses:1"
+          ]
+        }
+      }
+    },
+    {
+      "id": "launch_stage.repair",
+      "input": {
+        "surface": "launch_stage",
+        "mode": "Managed",
+        "decision": "Repair",
+        "diagnosis_count": 2
+      },
+      "output": {
+        "surface": "launch_stage",
+        "evidence": {
+          "id": "guardian_launch_safety_decision",
+          "system": "guardian",
+          "summary": "Guardian recorded the launch safety decision.",
+          "details": [
+            "mode:Managed",
+            "decision:Repair",
+            "diagnoses:2"
+          ]
+        }
+      }
+    },
+    {
+      "id": "launch_stage.retry",
+      "input": {
+        "surface": "launch_stage",
+        "mode": "Managed",
+        "decision": "Retry",
+        "diagnosis_count": 3
+      },
+      "output": {
+        "surface": "launch_stage",
+        "evidence": {
+          "id": "guardian_launch_safety_decision",
+          "system": "guardian",
+          "summary": "Guardian recorded the launch safety decision.",
+          "details": [
+            "mode:Managed",
+            "decision:Retry",
+            "diagnoses:3"
+          ]
+        }
+      }
+    },
+    {
+      "id": "launch_stage.strip",
+      "input": {
+        "surface": "launch_stage",
+        "mode": "Managed",
+        "decision": "Strip",
+        "diagnosis_count": 4
+      },
+      "output": {
+        "surface": "launch_stage",
+        "evidence": {
+          "id": "guardian_launch_safety_decision",
+          "system": "guardian",
+          "summary": "Guardian recorded the launch safety decision.",
+          "details": [
+            "mode:Managed",
+            "decision:Strip",
+            "diagnoses:4"
+          ]
+        }
+      }
+    },
+    {
+      "id": "launch_stage.downgrade",
+      "input": {
+        "surface": "launch_stage",
+        "mode": "Managed",
+        "decision": "Downgrade",
+        "diagnosis_count": 5
+      },
+      "output": {
+        "surface": "launch_stage",
+        "evidence": {
+          "id": "guardian_launch_safety_decision",
+          "system": "guardian",
+          "summary": "Guardian recorded the launch safety decision.",
+          "details": [
+            "mode:Managed",
+            "decision:Downgrade",
+            "diagnoses:5"
+          ]
+        }
+      }
+    },
+    {
+      "id": "launch_stage.fallback",
+      "input": {
+        "surface": "launch_stage",
+        "mode": "Managed",
+        "decision": "Fallback",
+        "diagnosis_count": 6
+      },
+      "output": {
+        "surface": "launch_stage",
+        "evidence": {
+          "id": "guardian_launch_safety_decision",
+          "system": "guardian",
+          "summary": "Guardian recorded the launch safety decision.",
+          "details": [
+            "mode:Managed",
+            "decision:Fallback",
+            "diagnoses:6"
+          ]
+        }
+      }
+    },
+    {
+      "id": "launch_stage.quarantine",
+      "input": {
+        "surface": "launch_stage",
+        "mode": "Custom",
+        "decision": "Quarantine",
+        "diagnosis_count": 7
+      },
+      "output": {
+        "surface": "launch_stage",
+        "evidence": {
+          "id": "guardian_launch_safety_decision",
+          "system": "guardian",
+          "summary": "Guardian recorded the launch safety decision.",
+          "details": [
+            "mode:Custom",
+            "decision:Quarantine",
+            "diagnoses:7"
+          ]
+        }
+      }
+    },
+    {
+      "id": "launch_stage.ask_user",
+      "input": {
+        "surface": "launch_stage",
+        "mode": "Custom",
+        "decision": "AskUser",
+        "diagnosis_count": 8
+      },
+      "output": {
+        "surface": "launch_stage",
+        "evidence": {
+          "id": "guardian_launch_safety_decision",
+          "system": "guardian",
+          "summary": "Guardian recorded the launch safety decision.",
+          "details": [
+            "mode:Custom",
+            "decision:AskUser",
+            "diagnoses:8"
+          ]
+        }
+      }
+    },
+    {
+      "id": "launch_stage.block",
+      "input": {
+        "surface": "launch_stage",
+        "mode": "Disabled",
+        "decision": "Block",
+        "diagnosis_count": 9
+      },
+      "output": {
+        "surface": "launch_stage",
+        "evidence": {
+          "id": "guardian_launch_safety_decision",
+          "system": "guardian",
+          "summary": "Guardian recorded the launch safety decision.",
+          "details": [
+            "mode:Disabled",
+            "decision:Block",
+            "diagnoses:9"
+          ]
+        }
+      }
+    },
+    {
+      "id": "launch_stage.record_only",
+      "input": {
+        "surface": "launch_stage",
+        "mode": "Disabled",
+        "decision": "RecordOnly",
+        "diagnosis_count": 10
+      },
+      "output": {
+        "surface": "launch_stage",
+        "evidence": {
+          "id": "guardian_launch_safety_decision",
+          "system": "guardian",
+          "summary": "Guardian recorded the launch safety decision.",
+          "details": [
+            "mode:Disabled",
+            "decision:RecordOnly",
+            "diagnoses:10"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,105 +1,44 @@
-import { api, apiUrl, isApiError } from './api';
+import { api, isApiError } from './api';
+import { subscribeApiEvents } from './backend/events';
 import { Sound } from './sound';
 import { Music } from './music';
 import { showError, appendLog, errMessage } from './utils';
-import {
-  hasNativeDesktopRuntime,
-  nativeLaunchLogEventName,
-  nativeLaunchStatusEventName,
-  onNativeEvent,
-  startNativeLaunchEvents,
-} from './native';
-import { config, launchState, runningSessions, selectedInstance, instanceLaunchDrafts } from './store';
+import { config, instances, launchSessions, launchState, selectedInstance, instanceLaunchDrafts } from './store';
 import {
   clearLaunchNotice,
   confirmLaunch,
+  convergeLaunchStatus,
   endLaunchPrep,
-  endSession,
+  endSessionIfCurrent,
   setLaunchNotice,
   startLaunch,
   updateInstanceInList,
   updateLaunchPrep,
   updateLaunchPrepView,
-  updateRunningSessionState,
+  updateLaunchSessionState,
 } from './actions';
-import type { LaunchNotice, LaunchSessionOutcome, LaunchStatusViewModel } from './types-launch';
-import type { Instance } from './types-instance';
-import type { Config } from './types-settings';
-
-const LIVE_LAUNCH_UPDATES_UNAVAILABLE = 'Live launch updates are unavailable.';
+import type { LaunchSessionOutcome } from './types-launch';
+import { createBackendLaunchNoticeTracker, type BackendLaunchNoticeTracker } from './launch-notice-tracker';
+import { launchStatusUpdate } from './launch-response-adapters';
+import { dtoEnum, dtoError, dtoRecord, dtoString } from './dto-contract';
+import { enrichedInstanceResponse } from './dto-core';
+import { launchLogEntryResponse, launchLogsResponse } from './dto-launch';
+import { refreshInstanceReadiness } from './instance-readiness';
 
 function rollbackLaunch(instanceId: string): void {
-  endSession(instanceId);
-  if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
+  if (launchSessions.value[instanceId]) return;
+  if (Object.keys(launchSessions.value).length === 0) Music.unsuppress();
 
-  endLaunchPrep();
+  if (launchState.value.status === 'preparing' && launchState.value.instanceId === instanceId) endLaunchPrep();
 }
 
-function updateRunningSession(instanceId: string, patch: Partial<import('./types-launch').RunningSession>): void {
-  updateRunningSessionState(instanceId, patch);
-}
-
-function launchSessionOutcome(value: unknown): LaunchSessionOutcome | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const candidate = value as Partial<LaunchSessionOutcome>;
-  if (
-    candidate.kind !== 'clean' &&
-    candidate.kind !== 'stopped' &&
-    candidate.kind !== 'failed' &&
-    candidate.kind !== 'unknown'
-  ) {
-    return undefined;
-  }
-  if (typeof candidate.reason !== 'string' || typeof candidate.summary !== 'string') return undefined;
-  return candidate as LaunchSessionOutcome;
-}
-
-function launchStatusViewModel(value: unknown): LaunchStatusViewModel | null {
-  if (!value || typeof value !== 'object') return null;
-  const candidate = value as Partial<LaunchStatusViewModel>;
-  if (typeof candidate.state_id !== 'string' || typeof candidate.label !== 'string') return null;
-  const pct =
-    typeof candidate.progress_pct === 'number' && Number.isFinite(candidate.progress_pct) ? candidate.progress_pct : 0;
-  return {
-    state_id: candidate.state_id,
-    label: candidate.label,
-    progress_pct: Math.max(0, Math.min(100, pct)),
-    terminal: candidate.terminal === true,
-  };
-}
-
-function primaryNoticeDetail(details: string[]): string {
-  return details[0] || '';
-}
-
-function backendLaunchNotice(value: unknown): LaunchNotice | null {
-  if (!value || typeof value !== 'object') return null;
-  const candidate = value as Partial<LaunchNotice>;
-  if (typeof candidate.message !== 'string' || !candidate.message.trim()) return null;
-  if (
-    candidate.tone !== 'info' &&
-    candidate.tone !== 'success' &&
-    candidate.tone !== 'warned' &&
-    candidate.tone !== 'intervened' &&
-    candidate.tone !== 'error'
-  ) {
-    return null;
-  }
-  const details = Array.isArray(candidate.details)
-    ? candidate.details.filter((detail): detail is string => typeof detail === 'string' && Boolean(detail.trim()))
-    : [];
-  const detail =
-    typeof candidate.detail === 'string' && candidate.detail.trim() ? candidate.detail : primaryNoticeDetail(details);
-  return {
-    message: candidate.message,
-    detail,
-    details,
-    tone: candidate.tone,
-  };
-}
-
-function surfaceBackendLaunchNotice(value: unknown, instanceId: string, instanceName: string): boolean {
-  const notice = backendLaunchNotice(value);
+function surfaceBackendLaunchNotice(
+  value: unknown,
+  instanceId: string,
+  instanceName: string,
+  tracker: BackendLaunchNoticeTracker,
+): boolean {
+  const notice = tracker.consume(value);
   if (!notice) return false;
   for (const detail of notice.details || []) {
     appendLog('system', detail, instanceId, instanceName);
@@ -108,49 +47,70 @@ function surfaceBackendLaunchNotice(value: unknown, instanceId: string, instance
   return true;
 }
 
-function selectedLaunchMaxMemoryMB(response: any, inst: Instance, cfg: Config | null): number {
-  if (typeof response?.max_memory_mb === 'number' && response.max_memory_mb > 0) return response.max_memory_mb;
-  if (typeof inst.max_memory_mb === 'number' && inst.max_memory_mb > 0) return inst.max_memory_mb;
-  if (typeof cfg?.max_memory_mb === 'number' && cfg.max_memory_mb > 0) return cfg.max_memory_mb;
-  return 4096;
-}
-
 export async function launchGame(): Promise<void> {
   const inst = selectedInstance.value;
   if (!inst?.launch_action?.launchable) return;
-  if (runningSessions.value[inst.id]) return;
+  if (launchSessions.value[inst.id]) return;
   if (launchState.value.status === 'preparing') return;
 
   const cfg = config.value;
-  const username = cfg?.username || 'Player';
+  const username = cfg?.username;
+  const intentKey = crypto.randomUUID();
+  const noticeTracker = createBackendLaunchNoticeTracker();
 
   Sound.init();
 
   clearLaunchNotice(inst.id);
   startLaunch(inst.id);
 
-  let launchCommitted = false;
+  let launchRequested = false;
   let launchInst = inst;
+
+  const acceptLaunch = (value: unknown): void => {
+    const res = dtoRecord(value, 'Launch');
+    const sessionId = dtoString(res.session_id, 'Launch session id');
+    const initialStatus = launchStatusUpdate(res, sessionId);
+    if (!initialStatus) throw new Error('Launch response did not match the status contract.');
+    const launchedAt = dtoString(res.launched_at, 'Launch time');
+    if (!Number.isFinite(Date.parse(launchedAt)))
+      throw new Error('Launch response did not include a valid start time.');
+    updateLaunchPrepView(inst.id, initialStatus.viewModel);
+    confirmLaunch(inst.id, {
+      sessionId,
+      launchedAt,
+      viewModel: initialStatus.viewModel,
+      statusRevision: initialStatus.revision,
+    });
+    surfaceBackendLaunchNotice(initialStatus.notice, inst.id, inst.name, noticeTracker);
+    if (initialStatus.viewModel.terminal) {
+      onSessionTerminal(initialStatus.outcome, inst.id, inst.name, sessionId, { close() {} });
+      return;
+    }
+
+    Music.suppress();
+    let launchStarted = false;
+    const onStarted = (): void => {
+      if (launchStarted) return;
+      launchStarted = true;
+      Sound.ui('launchSuccess');
+      const current = instances.value.find((item) => item.id === inst.id);
+      if (current) updateInstanceInList({ ...current, last_played_at: launchedAt });
+    };
+    if (initialStatus.viewModel.playing) onStarted();
+    connectLaunchEvents(sessionId, inst.id, inst.name, noticeTracker, onStarted);
+  };
 
   try {
     const launchDraft = instanceLaunchDrafts.value[inst.id];
     if (launchDraft?.dirty) {
       updateLaunchPrep(inst.id, 0, 'Saving launch settings');
-      const saved = await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
-        java_path: launchDraft.javaPath.trim(),
-        jvm_preset: launchDraft.jvmPreset,
-        extra_jvm_args: launchDraft.extraJvmArgs.trim(),
-      });
-      if (saved.error) {
-        setLaunchNotice(inst.id, {
-          message: 'Axial could not save the pending launch overrides.',
-          detail: saved.error,
-          tone: 'error',
-        });
-        showError(saved.error);
-        rollbackLaunch(inst.id);
-        return;
-      }
+      const saved = enrichedInstanceResponse(
+        await api('PUT', `/instances/${encodeURIComponent(inst.id)}`, {
+          java_path: launchDraft.javaPath.trim(),
+          jvm_preset: launchDraft.jvmPreset,
+          extra_jvm_args: launchDraft.extraJvmArgs.trim(),
+        }),
+      );
       launchInst = saved;
       updateInstanceInList(saved);
       instanceLaunchDrafts.value = {
@@ -166,87 +126,94 @@ export async function launchGame(): Promise<void> {
     }
 
     updateLaunchPrep(inst.id, 0, 'Requesting launch');
-    const res = await api('POST', '/launch', {
-      instance_id: launchInst.id,
-      username,
-      client_started_at_ms: Date.now(),
-    });
+    launchRequested = true;
+    const res = dtoRecord(
+      await api('POST', '/launch', {
+        instance_id: launchInst.id,
+        username,
+        intent_key: intentKey,
+        client_started_at_ms: Date.now(),
+      }),
+      'Launch',
+    );
 
-    if (res.error) {
-      if (!surfaceBackendLaunchNotice(res.notice, inst.id, inst.name)) {
-        showError(res.error);
+    const launchError = dtoError(res);
+    if (launchError) {
+      if (!surfaceBackendLaunchNotice(res.notice, inst.id, inst.name, noticeTracker)) {
+        showError(launchError);
       }
-      launchCommitted = false;
       rollbackLaunch(inst.id);
       return;
     }
-    const initialViewModel = launchStatusViewModel(res.view_model) ?? undefined;
-    if (initialViewModel) updateLaunchPrepView(inst.id, initialViewModel);
-
-    const launchedAt = res.launched_at || new Date().toISOString();
-    const allocatedMB = selectedLaunchMaxMemoryMB(res, launchInst, cfg);
-    confirmLaunch(inst.id, {
-      sessionId: res.session_id,
-      versionId: launchInst.version_id,
-      pid: typeof res.pid === 'number' ? res.pid : 0,
-      state: typeof res.state === 'string' ? res.state : 'queued',
-      launchedAt,
-      allocatedMB,
-      viewModel: initialViewModel,
-      benchmark: res.benchmark,
-      healing: res.healing,
-      guardian: res.guardian,
-    });
-    launchCommitted = true;
-    surfaceBackendLaunchNotice(res.notice, inst.id, inst.name);
-
-    Music.suppress();
-    let launchStarted = false;
-    try {
-      await connectLaunchEvents(res.session_id, inst.id, inst.name, () => {
-        if (launchStarted) return;
-        launchStarted = true;
-        Sound.ui('launchSuccess');
-        updateInstanceInList({ ...launchInst, last_played_at: launchedAt });
-      });
-    } catch (err: unknown) {
-      showError(`Launch session started, but live updates failed: ${errMessage(err)}`);
-      appendLog(
-        'system',
-        `Live updates unavailable for ${inst.name}; stop detection may be delayed.`,
-        inst.id,
-        inst.name,
-      );
-    }
-
-    if (config.value) {
-      config.value = {
-        ...config.value,
-        username,
-      };
-    }
+    acceptLaunch(res);
   } catch (err: unknown) {
+    const refused = isApiError(err) && err.status >= 400 && err.status < 500;
+    if (launchRequested && !refused && !launchSessions.value[inst.id]) {
+      showError('The launch response was interrupted. Checking whether the launch was accepted.');
+      updateLaunchPrep(inst.id, 0, 'Checking launch status');
+      void recoverLaunchIntent(intentKey, inst.id, inst.name, noticeTracker, acceptLaunch);
+      return;
+    }
     if (isApiError(err) && err.payload && typeof err.payload === 'object') {
-      const payload = err.payload as {
-        error?: string;
-        notice?: LaunchNotice;
-      };
-      if (!surfaceBackendLaunchNotice(payload.notice, inst.id, inst.name)) showError(payload.error || err.message);
-      if (!launchCommitted) rollbackLaunch(inst.id);
+      const payload = dtoRecord(err.payload, 'Launch error');
+      if (!surfaceBackendLaunchNotice(payload.notice, inst.id, inst.name, noticeTracker)) {
+        showError(dtoError(payload) || err.message);
+      }
+      rollbackLaunch(inst.id);
       return;
     }
     showError(errMessage(err));
-    if (!launchCommitted) rollbackLaunch(inst.id);
+    rollbackLaunch(inst.id);
   }
+}
+
+async function recoverLaunchIntent(
+  intentKey: string,
+  instanceId: string,
+  instanceName: string,
+  noticeTracker: BackendLaunchNoticeTracker,
+  acceptLaunch: (value: unknown) => void,
+): Promise<void> {
+  const current = launchState.value;
+  if (current.status !== 'preparing' || current.instanceId !== instanceId || launchSessions.value[instanceId]) return;
+  try {
+    const result = dtoRecord(await api('GET', `/launch/intents/${encodeURIComponent(intentKey)}`), 'Launch intent');
+    const state = dtoEnum(result.state, 'Launch intent state', ['preparing', 'accepted', 'rejected', 'interrupted']);
+    if (state === 'accepted') {
+      acceptLaunch(result.session);
+      return;
+    }
+    if (state === 'rejected') {
+      if (!surfaceBackendLaunchNotice(result.notice, instanceId, instanceName, noticeTracker)) {
+        showError(dtoError(result) || 'The launch request was rejected.');
+      }
+      rollbackLaunch(instanceId);
+      return;
+    }
+    if (state === 'interrupted') {
+      if (!dtoString(result.session_id, 'Interrupted launch session id').trim()) {
+        throw new Error('Interrupted launch session identity was missing.');
+      }
+      showError(dtoError(result) || 'The launch was interrupted. Its process outcome is unknown.');
+      updateLaunchPrep(instanceId, 0, 'Launch interrupted, outcome unknown');
+      return;
+    }
+  } catch {
+    // A missing/unreachable intent does not prove that the launch was rejected.
+  }
+  window.setTimeout(() => {
+    void recoverLaunchIntent(intentKey, instanceId, instanceName, noticeTracker, acceptLaunch);
+  }, 1000);
 }
 
 function makeLaunchStatusPoller(
   sessionId: string,
   instanceId: string,
-  onStatus: (data: any, handle: { close(): void }) => void,
+  onStatus: (data: unknown, handle: { close(): void }) => void,
 ): { close(): void } {
   let stopped = false;
   let timerId = 0;
+  let inFlight = false;
 
   const handle = {
     close(): void {
@@ -257,15 +224,19 @@ function makeLaunchStatusPoller(
 
   const poll = async (): Promise<void> => {
     if (stopped) return;
-    if (runningSessions.value[instanceId]?.sessionId !== sessionId) {
+    if (inFlight) return;
+    if (launchSessions.value[instanceId]?.sessionId !== sessionId) {
       handle.close();
       return;
     }
+    inFlight = true;
     try {
-      const data = await api('GET', `/launch/${sessionId}/status`);
-      if (!stopped && !data?.error) onStatus(data, handle);
+      const data = await api('GET', `/launch/${encodeURIComponent(sessionId)}/status`);
+      if (!stopped && !dtoError(data)) onStatus(data, handle);
     } catch {
-      // Native events remain primary. Polling is only a convergence fallback.
+      // A failed read never implies process exit. The stream and future reads can converge.
+    } finally {
+      inFlight = false;
     }
   };
 
@@ -276,153 +247,176 @@ function makeLaunchStatusPoller(
   return handle;
 }
 
-async function connectLaunchEvents(
-  sessionId: string,
-  instanceId: string,
-  instanceName: string,
-  onStarted?: () => void,
-): Promise<void> {
-  const onStatus = (data: any, handle: { close(): void }): void => {
-    const session = runningSessions.value[instanceId];
-    const prep = launchState.value;
-    const matchingPrep = prep.status === 'preparing' && prep.instanceId === instanceId;
-    if (session?.sessionId !== sessionId && !matchingPrep) return;
-    const outcome = launchSessionOutcome(data.outcome);
-    const viewModel = launchStatusViewModel(data.view_model);
-    if (viewModel) updateLaunchPrepView(instanceId, viewModel);
-    if (session && (typeof data.pid === 'number' || data.healing || typeof data.state === 'string' || outcome)) {
-      updateRunningSession(instanceId, {
-        pid: typeof data.pid === 'number' ? data.pid : session.pid || 0,
-        state: typeof data.state === 'string' ? data.state : session.state,
-        viewModel: viewModel || session.viewModel,
-        benchmark: data.benchmark || session.benchmark,
-        healing: data.healing || session.healing,
-        guardian: data.guardian || session.guardian,
-        outcome: outcome || session.outcome,
-      });
-    }
-    if (data.state === 'running') onStarted?.();
-    if (data.state === 'exited') onGameExited(data, instanceId, instanceName, sessionId, handle);
-  };
+const launchConnections = new Map<string, { close(): void }>();
+const launchLogSequences = new Map<string, number>();
+const finishingSessions = new Map<string, Promise<void>>();
 
-  const onLog = (data: any): void => {
-    if (runningSessions.value[instanceId]?.sessionId !== sessionId) return;
-    appendLog(data.source, data.text, instanceId, instanceName);
-  };
-
-  if (hasNativeDesktopRuntime()) {
-    let statusSubscription: { close(): void } | null = null;
-    let logSubscription: { close(): void } | null = null;
-    let pollSubscription: { close(): void } | null = null;
-    const streamHandle = {
-      close(): void {
-        statusSubscription?.close();
-        logSubscription?.close();
-        pollSubscription?.close();
-      },
-    };
-    statusSubscription = await onNativeEvent(nativeLaunchStatusEventName(sessionId), (data) => {
-      onStatus(data, streamHandle);
-    });
-    logSubscription = await onNativeEvent(nativeLaunchLogEventName(sessionId), onLog);
-    if (!statusSubscription || !logSubscription) {
-      streamHandle.close();
-      throw new Error(LIVE_LAUNCH_UPDATES_UNAVAILABLE);
-    }
-    pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, (data) => {
-      onStatus(data, streamHandle);
-    });
-    let started = false;
-    try {
-      started = await startNativeLaunchEvents(sessionId);
-    } catch (err: unknown) {
-      streamHandle.close();
-      throw err;
-    }
-    if (!started) {
-      streamHandle.close();
-      throw new Error(LIVE_LAUNCH_UPDATES_UNAVAILABLE);
-    }
-    return;
-  }
-
-  const es = new EventSource(apiUrl(`/launch/${sessionId}/events`));
-  let pollSubscription: { close(): void } | null = null;
-  const streamHandle = {
-    close(): void {
-      es.close();
-      pollSubscription?.close();
-      pollSubscription = null;
-    },
-  };
-  es.addEventListener('status', (e: MessageEvent) => {
-    try {
-      onStatus(JSON.parse(e.data), streamHandle);
-    } catch {
-      // Status polling below remains the convergence path for malformed stream events.
-    }
-  });
-
-  es.addEventListener('log', (e: MessageEvent) => {
-    try {
-      onLog(JSON.parse(e.data));
-    } catch {
-      // Ignore malformed log events; launch status polling owns terminal convergence.
-    }
-  });
-
-  es.onerror = () => {
-    if (es.readyState !== EventSource.CLOSED) return;
-    if (runningSessions.value[instanceId]?.sessionId !== sessionId) return;
+function appendSessionLog(value: unknown, sessionId: string, instanceId: string, instanceName: string): void {
+  if (launchSessions.value[instanceId]?.sessionId !== sessionId) return;
+  const entry = launchLogEntryResponse(value);
+  const previous = launchLogSequences.get(sessionId) ?? 0;
+  if (entry.sequence <= previous) return;
+  if (entry.sequence > previous + 1) {
     appendLog(
       'system',
-      `Lost live updates for ${instanceName || instanceId}. The game may still be running.`,
+      'Earlier launch output is no longer available in the retained log history.',
       instanceId,
       instanceName,
     );
-    streamHandle.close();
+  }
+  appendLog(entry.source, entry.truncated ? `${entry.text} [truncated]` : entry.text, instanceId, instanceName);
+  launchLogSequences.set(sessionId, entry.sequence);
+}
+
+export function reconnectLaunchSession(instanceId: string, instanceName: string): void {
+  const session = launchSessions.value[instanceId];
+  if (!session) return;
+  if (session.viewModel.terminal) return;
+  connectLaunchEvents(session.sessionId, instanceId, instanceName, createBackendLaunchNoticeTracker());
+}
+
+function connectLaunchEvents(
+  sessionId: string,
+  instanceId: string,
+  instanceName: string,
+  noticeTracker: BackendLaunchNoticeTracker,
+  onStarted?: () => void,
+): void {
+  if (launchConnections.has(sessionId)) return;
+  const onStatus = (data: unknown, handle: { close(): void }): void => {
+    const session = launchSessions.value[instanceId];
+    if (session?.sessionId !== sessionId) {
+      handle.close();
+      return;
+    }
+    const update = convergeLaunchStatus(instanceId, sessionId, data);
+    if (!update) return;
+    surfaceBackendLaunchNotice(update.notice, instanceId, instanceName, noticeTracker);
+    if (update.viewModel.playing) onStarted?.();
+    if (update.viewModel.terminal) {
+      onSessionTerminal(update.outcome, instanceId, instanceName, sessionId, handle);
+    }
   };
+
+  const onLog = (data: unknown): void => {
+    appendSessionLog(data, sessionId, instanceId, instanceName);
+  };
+
+  let unsubscribe: (() => void) | null = null;
+  let pollSubscription: { close(): void } | null = null;
+  let closed = false;
+  const streamHandle = {
+    close(): void {
+      closed = true;
+      unsubscribe?.();
+      unsubscribe = null;
+      pollSubscription?.close();
+      pollSubscription = null;
+      launchConnections.delete(sessionId);
+      launchLogSequences.delete(sessionId);
+    },
+  };
+  launchConnections.set(sessionId, streamHandle);
   pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, (data) => {
     onStatus(data, streamHandle);
   });
+  unsubscribe = subscribeApiEvents(`/launch/${encodeURIComponent(sessionId)}/events`, {
+    decode: (value: unknown) => value,
+    events: ['status', 'log'],
+    allowLegacyEvents: true,
+    onValue: (value, eventName) => {
+      if (closed) return;
+      if (eventName === 'status') onStatus(value, streamHandle);
+      if (eventName === 'log') onLog(value);
+    },
+    onError: () => {
+      if (closed || launchSessions.value[instanceId]?.sessionId !== sessionId) return;
+      appendLog(
+        'system',
+        `Live logs are reconnecting for ${instanceName || instanceId}. Checking session status continues.`,
+        instanceId,
+        instanceName,
+      );
+    },
+  });
+  if (closed) unsubscribe();
 }
 
-function onGameExited(
-  data: any,
+function onSessionTerminal(
+  outcome: LaunchSessionOutcome | null,
   instanceId: string,
   instanceName: string,
   sessionId: string,
   eventSource: { close(): void },
 ): void {
-  const session = runningSessions.value[instanceId];
-  if (!session || session.sessionId !== sessionId) return;
-  const outcome = launchSessionOutcome(data.outcome) || session.outcome;
-
-  eventSource.close();
-  endSession(instanceId);
-
-  if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
-  appendLog('system', outcome?.summary || `${instanceName || instanceId} session ended.`, instanceId, instanceName);
-  surfaceBackendLaunchNotice(data.notice, instanceId, instanceName);
+  const session = launchSessions.value[instanceId];
+  if (!session || session.sessionId !== sessionId || finishingSessions.has(sessionId)) return;
+  const finishing = Promise.resolve().then(async (): Promise<void> => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const entries = await Promise.race([
+        api('GET', `/launch/${encodeURIComponent(sessionId)}/logs`).then(launchLogsResponse),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error('Final launch logs timed out.')), 5000);
+        }),
+      ]);
+      for (const entry of entries) appendSessionLog(entry, sessionId, instanceId, instanceName);
+    } catch {
+      if (launchSessions.value[instanceId]?.sessionId === sessionId) {
+        appendLog(
+          'system',
+          'The session ended, but its final log history could not be refreshed.',
+          instanceId,
+          instanceName,
+        );
+      }
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+      eventSource.close();
+      launchLogSequences.delete(sessionId);
+      finishingSessions.delete(sessionId);
+    }
+    if (!endSessionIfCurrent(instanceId, sessionId)) return;
+    if (Object.keys(launchSessions.value).length === 0) Music.unsuppress();
+    appendLog('system', outcome?.summary || `${instanceName || instanceId} session ended.`, instanceId, instanceName);
+    await refreshInstanceReadiness(instanceId);
+  });
+  finishingSessions.set(sessionId, finishing);
 }
 
 export async function killGame(): Promise<void> {
   const inst = selectedInstance.value;
   if (!inst) return;
-  const session = runningSessions.value[inst.id];
+  const session = launchSessions.value[inst.id];
   if (!session) return;
   if (session.stopping) return;
+  if (!session.viewModel.can_stop) return;
 
   try {
-    updateRunningSessionState(inst.id, { stopping: true });
-    const res = await api('POST', `/launch/${session.sessionId}/kill`);
-    if (res?.error) {
-      updateRunningSessionState(inst.id, { stopping: false });
-      showError(`Could not stop the game: ${res.error}`);
+    updateLaunchSessionState(inst.id, { stopping: true });
+    const result = await api('POST', `/launch/${encodeURIComponent(session.sessionId)}/kill`);
+    if (launchSessions.value[inst.id]?.sessionId !== session.sessionId) return;
+    const error = dtoError(result);
+    if (error) {
+      updateLaunchSessionState(inst.id, { stopping: false });
+      showError(`Could not stop the game: ${error}`);
       return;
     }
+    const update = convergeLaunchStatus(inst.id, session.sessionId, result);
+    if (update?.viewModel.terminal) {
+      onSessionTerminal(
+        update.outcome,
+        inst.id,
+        inst.name,
+        session.sessionId,
+        launchConnections.get(session.sessionId) ?? { close() {} },
+      );
+    } else if (update) {
+      updateLaunchSessionState(inst.id, { stopping: false });
+    }
   } catch (err: unknown) {
-    updateRunningSessionState(inst.id, { stopping: false });
+    if (launchSessions.value[inst.id]?.sessionId !== session.sessionId) return;
+    updateLaunchSessionState(inst.id, { stopping: false });
     showError(`Could not stop the game: ${errMessage(err)}`);
   }
 }

@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { Button, IconButton, Pill } from '../../ui/Atoms';
-import { Icon } from '../../ui/Icons';
+import { Icon, type IconName } from '../../ui/Icons';
 import { Modal, ModalContent } from '../../ui/Modal';
 import { SelectField, type SelectFieldOption } from '../../ui/Select';
 import { navigate, route } from '../../ui-state';
@@ -107,13 +107,11 @@ export function ContentDetailView(): JSX.Element {
   const gallery = detail.gallery ?? [];
   const versions = detail.versions ?? [];
   const latest = versions[0];
-  const tabs: Array<{ id: Tab; icon: string; label: string; count?: number }> = [
+  const tabs: Array<{ id: Tab; icon: IconName; label: string; count?: number }> = [
     { id: 'about', icon: 'info', label: 'About' },
-    ...(gallery.length > 0 ? [{ id: 'gallery' as Tab, icon: 'image', label: 'Gallery', count: gallery.length }] : []),
-    ...(versions.length > 0
-      ? [{ id: 'versions' as Tab, icon: 'archive', label: 'Versions', count: versions.length }]
-      : []),
   ];
+  if (gallery.length > 0) tabs.push({ id: 'gallery', icon: 'image', label: 'Gallery', count: gallery.length });
+  if (versions.length > 0) tabs.push({ id: 'versions', icon: 'archive', label: 'Versions', count: versions.length });
   const activeTab = tabs.some((entry) => entry.id === tab) ? tab : 'about';
 
   return (

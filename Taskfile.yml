@@ -1,341 +1,91 @@
-# axial dev cli — the single entrypoint on macOS, Linux, WSL, and Windows.
-#
-# Task runs every recipe through its built-in cross-platform shell, so the
-# commands below behave identically on all three OSes. Desktop dev and
-# bundling are orchestrated by tauri-cli (`cargo tauri`), which spawns the
-# frontend dev server, waits for it, hot-restarts Rust on change, and cleans
-# up on exit.
-#
-# install task: https://taskfile.dev/installation
-#   macOS:   brew install go-task
-#   Windows: winget install Task.Task
-#   Linux:   sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b ~/.local/bin
-
-version: "3"
-
-set: [errexit]
-
-dotenv: [".env.local", ".env"]
-
-vars:
-  WINDOWS_TARGET: x86_64-pc-windows-gnu
-  TAURI_CLI_VERSION_REQ: "^2.9"
-  # override with `DEV_PORT=3001 task dev` or `task dev DEV_PORT=3001`
-  DEV_PORT: '{{.DEV_PORT | default "1420"}}'
-  DEV_TAURI_CONFIG: '{"build":{"beforeDevCommand":{"script":"pnpm run dev:desktop","cwd":"{{toSlash .ROOT_DIR}}/frontend"},"devUrl":"http://localhost:{{.DEV_PORT}}"}}'
-  BUNDLE_TAURI_CONFIG: '{"build":{"beforeBuildCommand":{"script":"pnpm run build","cwd":"{{toSlash .ROOT_DIR}}/frontend"}}}'
+version: '3'
 
 tasks:
-  default:
-    silent: true
-    cmds:
-      - task --list
-
-  setup:
-    desc: one-time setup — frontend deps, Rust deps, tauri-cli, and (Linux/WSL) Windows cross-build prerequisites
-    cmds:
-      - task: ensure:pnpm
-      - pnpm --dir frontend install --frozen-lockfile --ignore-scripts
-      - cargo fetch --locked
-      - task: ensure:tauri-cli
-      - cmd: |
-          if ! rustup target list --installed | grep -Fxq "{{.WINDOWS_TARGET}}"; then
-            rustup target add "{{.WINDOWS_TARGET}}"
-          fi
-          if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
-            exit 0
-          fi
-          if ! command -v apt-get >/dev/null 2>&1; then
-            exit 0
-          fi
-          if [ "${CI:-}" = "true" ]; then
-            echo "skipping apt install for Windows cross-build prerequisites in CI"
-            exit 0
-          fi
-          if [ "$(id -u)" -eq 0 ]; then
-            apt-get install -y gcc-mingw-w64-x86-64
-          elif command -v sudo >/dev/null 2>&1; then
-            sudo apt-get install -y gcc-mingw-w64-x86-64
-          else
-            echo "missing MinGW linker: x86_64-w64-mingw32-gcc" >&2
-            echo "install it with: sudo apt-get install -y gcc-mingw-w64-x86-64" >&2
-            exit 1
-          fi
-        platforms: [linux]
-
-  icons:
-    desc: regenerate desktop app icons
-    cmds:
-      - node scripts/generate-icons.mjs
-
-  dev:
-    desc: run the desktop app in dev mode (frontend dev server + Rust hot-restart)
-    deps: [ensure:tauri-cli]
-    dir: apps/desktop
-    env:
-      PORT: "{{.DEV_PORT}}"
-    cmds:
-      - cmd: |
-          if [ -n "${WSL_DISTRO_NAME:-}" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
-            echo "desktop dev needs WSLg or another Linux GUI session." >&2
-            echo "use 'task dev:web' for frontend-only work, or 'task dev:windows' to run the Windows build from WSL." >&2
-            exit 1
-          fi
-        platforms: [linux]
-      - cargo tauri dev --config '{{.DEV_TAURI_CONFIG}}' -- --locked
-
-  dev:windows:
-    desc: run the desktop app in dev mode as a Windows app from Linux/WSL
-    platforms: [linux]
-    deps: [ensure:tauri-cli, ensure:windows-cross]
-    dir: apps/desktop
-    env:
-      PORT: "{{.DEV_PORT}}"
-    cmds:
-      - cargo tauri dev --target {{.WINDOWS_TARGET}} --config '{{.DEV_TAURI_CONFIG}}' -- --locked
-
-  dev:web:
-    desc: run the frontend-only dev server (browser mode, works headless)
-    aliases: [web]
-    cmds:
-      - pnpm --dir frontend run dev
-
-  dev:web:mock:
-    desc: run the frontend-only dev server with a mocked API (no backend needed)
-    cmds:
-      - pnpm --dir frontend run dev:mock
-
-  watch:
-    desc: rebuild frontend assets to disk on file changes
-    cmds:
-      - pnpm --dir frontend run watch
-
-  api:
-    desc: run the local API server
-    cmds:
-      - cargo run --locked -p axial-api
-
   check:
-    desc: run all static checks (matches CI)
+    desc: Check the replacement workspace and retained interface
     cmds:
-      - pnpm --dir frontend run format:check
-      - pnpm --dir frontend run check
-      - pnpm --dir frontend run test
-      - cargo fmt --all --check
-      - cargo check --workspace --locked
-      - cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
+      - task: frontend:lint:semantic
+      - task: assets:check
+      - task: contracts:check
+      - task: frontend:build
+      - task: frontend:test
+      - node scripts/cargo-target.mjs run -- cargo check --workspace --all-targets
   test:
-    desc: run Rust workspace tests
+    desc: Test the replacement Rust workspace
     cmds:
-      - cargo test --workspace --locked
-
-  verify:
-    desc: run checks, tests, and a release desktop build (full CI parity)
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo test --workspace
+  test:app:
+    desc: Test feature-owned application behavior
     cmds:
-      - task: check
-      - task: test
-      - task: build
-
+      - node scripts/cargo-target.mjs run -- cargo test -p axial-app
+  test:api:
+    desc: Test authenticated loopback API and feature adapters
+    cmds:
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo test -p axial-api
+  test:desktop:
+    desc: Test native shell ownership and command behavior on this host
+    cmds:
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo test -p axial-desktop
+  test:delivery:
+    desc: Test artifact and installed-evidence rejection rules
+    cmds:
+      - node --test scripts/release/*.test.mjs acceptance/native/*.test.mjs
   fmt:
-    desc: format Rust and frontend code
     cmds:
       - cargo fmt --all
-      - pnpm --dir frontend run format
-
-  build:
-    desc: build the release desktop binary
-    deps: [frontend:build]
+  fmt:check:
     cmds:
-      - cargo build --locked -p axial-desktop --release
-      - cmd: echo "artifact → target/release/axial-desktop{{exeExt}}"
-        silent: true
-
-  build:dev:
-    desc: build the debug desktop binary (bundled static assets, no dev server)
-    deps: [frontend:build]
-    cmds:
-      - cargo build --locked -p axial-desktop
-      - cmd: echo "artifact → target/debug/axial-desktop{{exeExt}}"
-        silent: true
-
-  build:windows:
-    desc: cross-build the release Windows desktop binary from Linux/WSL
-    deps: [ensure:windows-cross, frontend:build]
-    cmds:
-      - cargo build --locked -p axial-desktop --release --target {{.WINDOWS_TARGET}}
-      - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/release/axial-desktop.exe"
-        silent: true
-
-  build:windows:dev:
-    desc: cross-build the debug Windows desktop binary from Linux/WSL
-    deps: [ensure:windows-cross, frontend:build]
-    cmds:
-      - cargo build --locked -p axial-desktop --target {{.WINDOWS_TARGET}}
-      - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/debug/axial-desktop.exe"
-        silent: true
-
-  build:api:
-    desc: build the debug API binary
-    deps: [frontend:build]
-    cmds:
-      - cargo build --locked -p axial-api
-
-  build:api:release:
-    desc: build the release API binary
-    deps: [frontend:build]
-    cmds:
-      - cargo build --locked -p axial-api --release
-
-  bundle:
-    desc: build native installers/bundles via tauri (.app/.dmg, .msi/.exe, .deb/.rpm)
-    deps: [ensure:tauri-cli]
-    dir: apps/desktop
-    cmds:
-      - cargo tauri build --config '{{.BUNDLE_TAURI_CONFIG}}' -- --locked
-
-  doctor:
-    desc: show detected tools and platform state
-    silent: true
-    cmds:
-      - cmd: |
-          echo "os       {{OS}}/{{ARCH}}"
-          echo "rustc    $(rustc --version 2>/dev/null || echo missing)"
-          echo "cargo    $(cargo --version 2>/dev/null || echo missing)"
-          echo "rustfmt  $(cargo fmt --version 2>/dev/null || echo missing)"
-          echo "clippy   $(cargo clippy --version 2>/dev/null || echo missing)"
-          echo "tauri    $(cargo tauri --version 2>/dev/null || echo 'missing — run: task setup')"
-          echo "node     $(node --version 2>/dev/null || echo missing)"
-          echo "pnpm     $(pnpm --version 2>/dev/null || echo 'missing — run: task setup')"
-      - cmd: |
-          if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
-            echo "wsl      yes"
-            if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
-              echo "gui      detected"
-            else
-              echo "gui      missing — use 'task dev:web' or run under WSLg"
-            fi
-          else
-            echo "wsl      no"
-          fi
-          if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
-            echo "mingw    present (Windows cross-builds available)"
-          else
-            echo "mingw    missing (run 'task setup' to enable Windows cross-builds)"
-          fi
-        platforms: [linux]
-
-  host:launch-evidence:
-    desc: report Windows host Java and Minecraft/Axial folder evidence (redacted, no paths)
-    silent: true
-    cmds:
-      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/host-launch-evidence.ps1
-        platforms: [windows]
-      - cmd: |
-          if [ -z "${WSL_DISTRO_NAME:-}" ] && ! grep -qi microsoft /proc/version 2>/dev/null; then
-            echo "wsl no"
-            echo "windows_host_evidence skipped"
-            exit 0
-          fi
-          echo "wsl yes"
-          if ! command -v powershell.exe >/dev/null 2>&1; then
-            echo "powershell no"
-            echo "windows_host_evidence unavailable"
-            exit 0
-          fi
-          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(wslpath -w scripts/host-launch-evidence.ps1)"
-        platforms: [linux]
-      - cmd: echo "windows_host_evidence skipped (not applicable on macOS)"
-        platforms: [darwin]
-
-  clean:
-    desc: remove build outputs and caches
-    cmds:
-      - cargo clean
-      - rm -rf dist
-
-  # ── internal helpers ──────────────────────────────────────────────
-
+      - cargo fmt --all --check
   frontend:build:
-    internal: true
     cmds:
       - pnpm --dir frontend run build
-
-  ensure:pnpm:
-    internal: true
+      - node frontend/verify-generation.mjs
+  frontend:lint:semantic:
+    desc: Reject invalid hooks and unhandled promises in the retained interface
     cmds:
-      - cmd: |
-          if command -v pnpm >/dev/null 2>&1; then
-            exit 0
-          fi
-          echo "pnpm not found — enabling via corepack…"
-          if command -v corepack >/dev/null 2>&1 && corepack enable pnpm; then
-            exit 0
-          fi
-          echo "could not enable pnpm automatically." >&2
-          echo "install it manually: https://pnpm.io/installation (or run 'corepack enable pnpm' with sufficient permissions)" >&2
-          exit 1
-
-  ensure:tauri-cli:
-    internal: true
+      - pnpm --dir frontend run lint:semantic
+  assets:check:
+    desc: Verify source assets against their retained rights and provenance records
     cmds:
-      - cmd: |
-          tauri_cli_req='{{.TAURI_CLI_VERSION_REQ}}'
-
-          install_tauri_cli() {
-            if command -v cargo-binstall >/dev/null 2>&1; then
-              cargo binstall -y --force --locked tauri-cli --version "$tauri_cli_req"
-            else
-              echo "(tip: cargo-binstall turns this long compile into a ~15s download: https://github.com/cargo-bins/cargo-binstall)"
-              cargo install tauri-cli --version "$tauri_cli_req" --locked --force
-            fi
-          }
-
-          if command -v cargo-tauri >/dev/null 2>&1; then
-            tauri_version_output="$(cargo tauri --version 2>/dev/null || true)"
-            tauri_version="${tauri_version_output#tauri-cli }"
-            required_min="${tauri_cli_req#^}"
-            required_major="${required_min%%.*}"
-            required_minor="${required_min#*.}"
-
-            if [ "$tauri_version" != "$tauri_version_output" ]; then
-              old_ifs="$IFS"
-              IFS=.
-              set -- $tauri_version
-              IFS="$old_ifs"
-
-              if [ "$#" -eq 3 ]; then
-                case "$1$2$3$required_major$required_minor" in
-                  *[!0-9]*)
-                    ;;
-                  *)
-                    if [ "$1" -eq "$required_major" ] && [ "$2" -ge "$required_minor" ]; then
-                      exit 0
-                    fi
-                    ;;
-                esac
-              fi
-            fi
-
-            echo "${tauri_version_output:-cargo-tauri} does not satisfy tauri-cli $tauri_cli_req — installing compatible version…"
-          else
-            echo "tauri-cli not found — installing $tauri_cli_req…"
-          fi
-
-          install_tauri_cli
-
-  ensure:windows-cross:
-    internal: true
+      - node scripts/verify-assets.mjs
+  dependencies:check:
+    desc: Enforce the Cargo and pnpm advisory, license, and registry policies
+    preconditions:
+      - sh: test "$(cargo deny --version)" = 'cargo-deny 0.20.2'
+        msg: Install cargo-deny 0.20.2 with its locked dependencies before checking policy.
     cmds:
-      - cmd: |
-          if ! rustup target list --installed 2>/dev/null | grep -Fxq "{{.WINDOWS_TARGET}}"; then
-            echo "missing Rust target: {{.WINDOWS_TARGET}}" >&2
-            echo "run 'task setup' or: rustup target add {{.WINDOWS_TARGET}}" >&2
-            exit 1
-          fi
-          if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
-            echo "missing MinGW linker: x86_64-w64-mingw32-gcc" >&2
-            echo "  Ubuntu/WSL: sudo apt-get install -y gcc-mingw-w64-x86-64 (or run 'task setup')" >&2
-            echo "  macOS:      brew install mingw-w64" >&2
-            exit 1
-          fi
+      - node scripts/dependency-policy.mjs check
+  frontend:test:
+    cmds:
+      - node frontend/test/run.mjs
+  contracts:generate:
+    desc: Generate reviewed public Rust wire types for the frontend
+    cmds:
+      - node scripts/cargo-target.mjs run -- cargo run -p axial-app --example export_contracts
+  contracts:check:
+    desc: Reject stale or unexpected generated public wire types
+    cmds:
+      - node scripts/cargo-target.mjs run -- cargo run -p axial-app --example export_contracts -- --check
+  dev:api:
+    desc: Run the replacement API with its independent development profile
+    cmds:
+      - task: frontend:build
+      - node scripts/cargo-target.mjs run -- cargo run -p axial-api
+  dev:desktop:
+    desc: Run the replacement desktop with the development interface and independent profile
+    env:
+      PORT: '1420'
+    cmds:
+      - task: frontend:build
+      - >-
+        node scripts/cargo-target.mjs run -- cargo tauri dev --config
+        '{"build":{"beforeDevCommand":{"script":"pnpm run dev:desktop","cwd":"{{toSlash .ROOT_DIR}}/frontend"},"devUrl":"http://127.0.0.1:1420"}}'
+        -- --locked
+  dev:legacy:
+    desc: Run the preserved application from its independent project root
+    dir: legacy
+    cmds:
+      - task dev

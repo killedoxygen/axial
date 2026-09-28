@@ -1,0 +1,193 @@
+import type { JSX } from 'preact';
+import { useMemo } from 'preact/hooks';
+import { Button, SectionHeading, Card, Pill } from '../../ui/Atoms';
+import { Icon } from '../../ui/Icons';
+import { InstanceCard } from '../../ui/InstanceCard';
+import { InstanceGlyph, guardedInstanceHue } from '../../ui/InstanceVisual';
+import { navigate, openCreate } from '../../ui-state';
+import { config, instances, launchSessions, versionById } from '../../store';
+import { instanceInstallStatus } from '../../instance-install-status';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../../launch-presenters';
+import { openInstanceContextMenu } from '../instance/instance-menu';
+import { useTheme } from '../../hooks/use-theme';
+import type { EnrichedInstance } from '../../types-instance';
+
+function greetingFor(date: Date): string {
+  const h = date.getHours();
+  if (h < 5) return 'Still up';
+  if (h < 12) return 'Good morning';
+  if (h < 18) return 'Good afternoon';
+  return 'Good evening';
+}
+
+function relativeTime(iso?: string): string {
+  if (!iso) return 'never played';
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return 'never played';
+  const diff = Date.now() - then;
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d}d ago`;
+  const w = Math.floor(d / 7);
+  if (w < 5) return `${w}w ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
+const HOME_LIBRARY_CARD_LIMIT = 14;
+
+function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
+  const theme = useTheme();
+  const version = versionById(inst.version_id);
+  const session = launchSessions.value[inst.id];
+  const playing = launchSessionIsPlaying(session);
+  const sessionLabel = launchSessionActivityLabel(session);
+  const install = instanceInstallStatus(inst, version);
+  const installing = install.installing;
+  const installBadge = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
+  const mods = inst.mods_count ?? 0;
+  const showModsCount = inst.version_display.supports_mods;
+  const open = (): void => navigate({ name: 'instance', id: inst.id });
+  const onKeyDown = (e: KeyboardEvent): void => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    open();
+  };
+  return (
+    <div
+      class="cp-feature"
+      role="button"
+      tabIndex={0}
+      aria-label={installing ? `Open ${inst.name}. ${installBadge}` : `Open ${inst.name}`}
+      data-installing={installing}
+      style={{ ['--cp-tile-h' as any]: guardedInstanceHue(inst, theme) }}
+      onClick={open}
+      onKeyDown={onKeyDown}
+      onContextMenu={(e) => openInstanceContextMenu(e, inst)}
+    >
+      <div class="cp-feature-glow" aria-hidden="true" />
+      <InstanceGlyph inst={inst} className="cp-feature-glyph" />
+      <div class="cp-feature-content">
+        <div class="cp-feature-id">
+          <div class="cp-feature-kicker">{session ? sessionLabel : installing ? installBadge : 'Jump back in'}</div>
+          <h2 title={inst.name}>{inst.name}</h2>
+          <div class="cp-meta">
+            <span>{inst.version_display.loader_label}</span>
+            <span class="cp-dot" />
+            <span>MC {inst.version_display.minecraft_label}</span>
+            {showModsCount && (
+              <>
+                <span class="cp-dot" />
+                <span>{mods} mods</span>
+              </>
+            )}
+            <span class="cp-dot" />
+            <span>{relativeTime(inst.last_played_at)}</span>
+          </div>
+        </div>
+        <div class="cp-feature-actions">
+          {session && (
+            <Pill tone={playing ? 'accent' : undefined} icon={playing ? 'play' : 'clock'}>
+              {sessionLabel}
+            </Pill>
+          )}
+          {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installBadge}</Pill>}
+          <Button
+            size="lg"
+            icon={installing ? (install.state === 'queued' ? 'clock' : 'download') : session ? 'chevron-right' : 'play'}
+            title={installing ? installBadge : session ? `Open ${inst.name}` : `Play ${inst.name}`}
+            disabled={installing}
+            onClick={(e) => {
+              e.stopPropagation();
+              open();
+            }}
+            sound="launchPress"
+          >
+            {installing ? installBadge : session ? 'Open' : 'Play'}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EmptyHome(): JSX.Element {
+  return (
+    <Card padding={32}>
+      <div class="cp-empty">
+        <Icon name="stack" size={36} color="var(--text-mute)" />
+        <h2>Create your first instance</h2>
+        <p>
+          Instances are isolated Minecraft setups. Pick a version, bundle mods, and launch without touching your other
+          worlds.
+        </p>
+        <Button icon="plus" onClick={openCreate}>
+          New instance
+        </Button>
+      </div>
+    </Card>
+  );
+}
+
+export function HomeView(): JSX.Element {
+  const cfg = config.value;
+  const all = instances.value;
+  const now = new Date();
+  const recent = useMemo(() => {
+    return [...all]
+      .sort((a, b) => {
+        const ta = a.last_played_at ? new Date(a.last_played_at).getTime() : 0;
+        const tb = b.last_played_at ? new Date(b.last_played_at).getTime() : 0;
+        return tb - ta;
+      })
+      .slice(0, HOME_LIBRARY_CARD_LIMIT + 1);
+  }, [all]);
+  const rest = recent.slice(1);
+
+  return (
+    <div class="cp-view-page">
+      <div class="cp-page-header">
+        <div>
+          <h1>
+            {greetingFor(now)}
+            {cfg?.username ? `, ${cfg.username}` : ''}.
+          </h1>
+          <div class="cp-page-sub">
+            {all.length === 0
+              ? 'Set up your first instance to start playing.'
+              : `${all.length} instance${all.length === 1 ? '' : 's'} in your library`}
+          </div>
+        </div>
+        <div style={{ flex: 1 }} />
+        <Button variant="secondary" icon="plus" onClick={openCreate}>
+          New instance
+        </Button>
+      </div>
+
+      {all.length === 0 ? (
+        <EmptyHome />
+      ) : (
+        <>
+          <FeatureBanner inst={recent[0]} />
+          {rest.length > 0 && (
+            <div>
+              <SectionHeading
+                title="Library"
+                action={{ label: 'See all', onClick: () => navigate({ name: 'instances' }) }}
+              />
+              <div class="cp-cover-grid">
+                {rest.map((inst) => (
+                  <InstanceCard key={inst.id} inst={inst} onContextMenu={(e) => openInstanceContextMenu(e, inst)} />
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

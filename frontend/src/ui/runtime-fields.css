@@ -18,7 +18,7 @@
 .cp-ovr-field .cp-select-trigger {
   height: 34px;
 }
-.cp-ovr-field .cp-field.cp-field--focused {
+.cp-ovr-field .cp-field:focus-within {
   box-shadow: var(--focus-border);
 }
 .cp-ovr-input {

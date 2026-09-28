@@ -1,0 +1,211 @@
+import type { JSX } from 'preact';
+import { useCallback, useState } from 'preact/hooks';
+import { InstanceTile } from '../../ui/InstanceVisual';
+import { Button, IconButton, Input, Pill } from '../../ui/Atoms';
+import { Segmented } from '../../ui/Segmented';
+import { Icon } from '../../ui/Icons';
+import { InstanceCard } from '../../ui/InstanceCard';
+import { openContextMenu } from '../../ui/ContextMenu';
+import { SelectionActionTray, SelectionCheckbox } from '../../ui/SelectionActionTray';
+import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../ui/selection';
+import { useTheme } from '../../hooks/use-theme';
+import { instances, versionById, launchSessions } from '../../store';
+import { instanceInstallStatus } from '../../instance-install-status';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../../launch-presenters';
+import { navigate, openCreate } from '../../ui-state';
+import { instanceMenuItems } from '../instance/instance-menu';
+import { deleteInstancesFlow } from '../instance/instance-actions';
+import { fmtRelativeCompact } from '../../format';
+import type { EnrichedInstance } from '../../types-instance';
+
+const LIST_COLS = '28px 52px 2.4fr 1fr 1fr 1fr 140px';
+
+function ListRow({
+  inst,
+  selected,
+  onToggleSelect,
+  onContextMenu,
+}: {
+  inst: EnrichedInstance;
+  selected: boolean;
+  onToggleSelect: (e: MouseEvent) => void;
+  onContextMenu: (e: MouseEvent) => void;
+}): JSX.Element {
+  const theme = useTheme();
+  const v = versionById(inst.version_id);
+  const session = launchSessions.value[inst.id];
+  const playing = launchSessionIsPlaying(session);
+  const install = instanceInstallStatus(inst, v);
+  const installing = install.installing;
+  const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
+  const launchAction = inst.launch_action;
+  const actionIcon =
+    launchAction.primary_action === 'launch'
+      ? 'play'
+      : launchAction.primary_action === 'install'
+        ? 'download'
+        : 'alert';
+  const actionLabel = launchAction.primary_action === 'launch' ? 'Play' : launchAction.label;
+  const showModsCount = inst.version_display.supports_mods;
+  return (
+    <div
+      class="cp-table-row cp-selection-row"
+      style={{ gridTemplateColumns: LIST_COLS }}
+      data-selected={selected}
+      onClick={() => navigate({ name: 'instance', id: inst.id })}
+      onContextMenu={onContextMenu}
+    >
+      <SelectionCheckbox
+        selected={selected}
+        label={selectionToggleLabel(selected, inst.name)}
+        onToggle={(e) => {
+          e.stopPropagation();
+          onToggleSelect(e);
+        }}
+      />
+      <InstanceTile inst={inst} radius={theme.r.sm} style={{ width: 36, height: 36 }} />
+      <div>
+        <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {inst.name}
+          {session && (
+            <Pill tone={playing ? 'accent' : undefined} icon={playing ? 'play' : 'clock'}>
+              {launchSessionActivityLabel(session)}
+            </Pill>
+          )}
+          {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installLabel}</Pill>}
+        </div>
+        <div class="cp-table-row-sub">{inst.version_display.loader_detail_label}</div>
+      </div>
+      <div class="cp-table-cell">{inst.version_display.minecraft_label}</div>
+      <div class="cp-table-cell">{showModsCount ? `${inst.mods_count ?? 0} mods` : null}</div>
+      <div class="cp-table-cell">{fmtRelativeCompact(inst.last_played_at)}</div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
+        <Button
+          size="sm"
+          variant="secondary"
+          icon={installing ? (install.state === 'queued' ? 'clock' : 'download') : actionIcon}
+          disabled={installing}
+          title={launchAction.primary_action === 'blocked' ? launchAction.disabled_reason : undefined}
+          onClick={(e) => {
+            e.stopPropagation();
+            navigate({ name: 'instance', id: inst.id });
+          }}
+        >
+          {installing ? installLabel : actionLabel}
+        </Button>
+        <IconButton
+          icon="dots"
+          size={28}
+          onClick={(e: any) => {
+            e.stopPropagation();
+            onContextMenu(e);
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+export function InstancesView(): JSX.Element {
+  const [view, setView] = useState<'grid' | 'list'>('grid');
+  const [q, setQ] = useState('');
+  const all = instances.value;
+  const query = q.trim().toLowerCase();
+  const filtered = all.filter((i) => i.name.toLowerCase().includes(query));
+  const selection = useSelection(
+    filtered,
+    useCallback((inst: EnrichedInstance) => inst.id, []),
+  );
+
+  const menuItems = (inst: EnrichedInstance) => [
+    selectionMenuItem(selection, inst.id),
+    { divider: true, label: '', onSelect: () => undefined },
+    ...instanceMenuItems(inst),
+  ];
+
+  const openMenu = (e: MouseEvent, inst: EnrichedInstance): void => {
+    openContextMenu(e, menuItems(inst));
+  };
+
+  const deleteSelected = async (): Promise<void> => {
+    await deleteInstancesFlow(selection.selectedItems, selection.clear);
+  };
+
+  return (
+    <div class="cp-view-page" style={{ gap: 18 }}>
+      <div class="cp-page-header">
+        <div>
+          <h1>Instances</h1>
+          <div class="cp-page-sub">
+            {all.length} total, {all.reduce((s, i) => s + (i.mods_count ?? 0), 0)} mods across all
+          </div>
+        </div>
+        <div style={{ flex: 1 }} />
+        <Input value={q} onChange={setQ} placeholder="Filter instances…" icon="search" style={{ width: 260 }} />
+        <Segmented<'grid' | 'list'>
+          value={view}
+          onChange={setView}
+          ariaLabel="Library view"
+          options={[
+            { value: 'grid', label: 'Grid' },
+            { value: 'list', label: 'List' },
+          ]}
+        />
+        <Button icon="plus" onClick={openCreate}>
+          New
+        </Button>
+      </div>
+
+      {filtered.length === 0 ? (
+        <div class="cp-empty">
+          <Icon name="stack" size={36} color="var(--text-mute)" />
+          <h2>{q ? 'No matches' : 'No instances yet'}</h2>
+          <p>{q ? 'Try a different search term.' : 'Create your first Minecraft instance to get started.'}</p>
+          {!q && (
+            <Button icon="plus" onClick={openCreate}>
+              New instance
+            </Button>
+          )}
+        </div>
+      ) : view === 'grid' ? (
+        <div class="cp-cover-grid">
+          {filtered.map((i) => (
+            <InstanceCard
+              key={i.id}
+              inst={i}
+              selected={selection.isSelected(i.id)}
+              onToggleSelect={() => selection.toggle(i.id)}
+              onContextMenu={(e) => openMenu(e, i)}
+            />
+          ))}
+        </div>
+      ) : (
+        <div class="cp-card cp-table">
+          <div class="cp-table-head" style={{ gridTemplateColumns: LIST_COLS }}>
+            <span />
+            <span />
+            <span>Instance</span>
+            <span>Version</span>
+            <span>Mods</span>
+            <span>Last played</span>
+            <span />
+          </div>
+          {filtered.map((i) => (
+            <ListRow
+              key={i.id}
+              inst={i}
+              selected={selection.isSelected(i.id)}
+              onToggleSelect={() => selection.toggle(i.id)}
+              onContextMenu={(e) => openMenu(e, i)}
+            />
+          ))}
+        </div>
+      )}
+      <SelectionActionTray
+        selection={selection}
+        itemLabel="instance"
+        actions={[{ label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() }]}
+      />
+    </div>
+  );
+}

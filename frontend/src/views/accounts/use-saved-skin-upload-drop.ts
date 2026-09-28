@@ -9,7 +9,7 @@ export function useSavedSkinUploadDrop({
   busy: boolean;
   setUploadDragActive: (active: boolean) => void;
   notifyError: (text: string) => void;
-  stageUploadFile: (file: File, applyAfterSave: boolean) => void;
+  stageUploadFile: (file: File) => void;
 }): {
   onDrop: (event: DragEvent) => void;
   onDragEnter: (event: DragEvent) => void;
@@ -32,7 +32,7 @@ export function useSavedSkinUploadDrop({
         return;
       }
 
-      stageUploadFile(files[0], false);
+      stageUploadFile(files[0]);
     },
     onDragEnter(event) {
       if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;

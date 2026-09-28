@@ -1,0 +1,41 @@
+[package]
+name = "axial-minecraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+axial-fs.workspace = true
+axial-resource.workspace = true
+base64.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+lzma-rs.workspace = true
+md5.workspace = true
+regex.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+unicode-casefold.workspace = true
+unicode-normalization.workspace = true
+uuid.workspace = true
+zip.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+ntapi = "0.4.3"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

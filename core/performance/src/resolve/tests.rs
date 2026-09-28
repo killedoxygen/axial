@@ -4,7 +4,10 @@ use super::hardware::{
     is_drm_card_path, nvidia_arch_from_model, nvidia_model_from_information,
     parse_windows_gpu_names, select_gpu_from_names, select_gpu_vendor_from_vendors,
 };
-use super::{ResolveError, builtin_manifest, parse_mode, resolve_plan, validate_manifest};
+use super::{
+    PERFORMANCE_MANIFEST_SCHEMA_VERSION, ResolveError, builtin_manifest, parse_mode, resolve_plan,
+    validate_manifest,
+};
 use crate::types::{
     CompositionPlan, CompositionTier, EmergencyDisable, EmergencyDisableTarget, HardwareProfile,
     HardwareRequirement, ManagedMod, Manifest, ModCondition, OwnershipClass, PerformanceMode,
@@ -17,6 +20,10 @@ const FAMILY_F_FABRIC_CORE_ADDITIONS: &[&str] = &[
     "particle-core",
     "threadtweak",
     "badoptimizations",
+];
+const MODERNFIX_EXACT_GAME_VERSIONS: &[&str] = &[
+    "1.16.4", "1.16.5", "1.18.2", "1.19.2", "1.19.4", "1.20", "1.20.1", "1.20.2", "1.20.3",
+    "1.20.4", "1.20.5", "1.20.6", "1.21", "1.21.1", "1.21.4", "26.1", "26.1.2",
 ];
 
 #[test]
@@ -69,10 +76,6 @@ fn family_c_forge_1_12_2_resolves_conservative_core_with_vanilla_fallback() {
     assert_eq!(plan.family, VersionFamily::C);
     assert_eq!(plan.loader, "forge");
     assert_eq!(plan.tier, CompositionTier::Core);
-    assert_eq!(
-        plan.fallback_chain,
-        vec!["family-c-vanilla-enhanced".to_string()]
-    );
     assert_eq!(count_mods_with_slug(&plan.mods, "foamfix"), 1);
     assert_eq!(count_mods_with_slug(&plan.mods, "ai-improvements"), 1);
     assert_eq!(count_mods_with_slug(&plan.mods, "clumps"), 1);
@@ -173,13 +176,262 @@ fn fabric_family_e_and_f_managed_plans_resolve_real_mods() {
 }
 
 #[test]
+fn managed_fabric_plans_bound_ebe_and_memory_leak_fix_to_supported_versions() {
+    let manifest = builtin_manifest().expect("manifest");
+
+    for (game_version, expects_ebe, expects_memory_leak_fix) in [
+        ("1.16.1", false, true),
+        ("1.16.2", true, true),
+        ("1.20.4", true, true),
+        ("1.21.4", true, false),
+        ("1.21.5", false, false),
+        ("1.21.11", false, false),
+    ] {
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: game_version.to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            count_mods_with_slug(&plan.mods, "ebe"),
+            usize::from(expects_ebe),
+            "{game_version} EBE"
+        );
+        assert_eq!(
+            count_mods_with_slug(&plan.mods, "memoryleakfix"),
+            usize::from(expects_memory_leak_fix),
+            "{game_version} MemoryLeakFix"
+        );
+    }
+}
+
+#[test]
+fn current_family_f_plans_omit_unsupported_ebe_and_memory_leak_fix() {
+    let manifest = builtin_manifest().expect("manifest");
+
+    for loader in ["fabric", "forge", "neoforge"] {
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: "1.21.11".to_string(),
+                loader: loader.to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert_eq!(count_mods_with_slug(&plan.mods, "ebe"), 0, "{loader}");
+        assert_eq!(
+            count_mods_with_slug(&plan.mods, "memoryleakfix"),
+            0,
+            "{loader}"
+        );
+    }
+}
+
+#[test]
+fn modernfix_uses_exact_supported_roots_once_without_parent_fallback() {
+    let manifest = builtin_manifest().expect("manifest");
+
+    for game_version in MODERNFIX_EXACT_GAME_VERSIONS {
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: (*game_version).to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            count_mods_with_slug(&plan.mods, "modernfix"),
+            1,
+            "{game_version}"
+        );
+    }
+
+    for game_version in ["1.21.11", "26.2"] {
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: game_version.to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert_eq!(count_mods_with_slug(&plan.mods, "modernfix"), 0);
+    }
+}
+
+#[test]
+fn builtin_manifest_binds_all_managed_artifacts_to_immutable_provider_identities() {
+    let manifest = builtin_manifest().expect("manifest");
+    let expected_project_ids = [
+        ("sodium", "AANobbMI"),
+        ("lithium", "gvQqBUqZ"),
+        ("ferrite-core", "uXXizFIs"),
+        ("immediatelyfast", "5ZwdcRci"),
+        ("dynamic-fps", "LQ3K71Q1"),
+        ("modernfix", "nmDcB62a"),
+        ("entityculling", "NNAgCjsB"),
+        ("c2me-fabric", "VSNURh3q"),
+        ("moreculling", "51shyZVL"),
+        ("krypton", "fQEb0iXm"),
+        ("enhancedblockentities", "OVuFYfre"),
+        ("memoryleakfix", "NRjRiSSD"),
+        ("clumps", "Wnxd13zP"),
+        ("foamfix", "jupr7Bf5"),
+        ("ai-improvements", "DSVgwcji"),
+        ("lazydfu", "hvFnDODi"),
+        ("smooth-boot-reloaded", "z53V2L4P"),
+        ("starlight", "H8CaAYZC"),
+        ("nvidium", "SfMw2IZN"),
+        ("embeddium", "sk9rgfiA"),
+        ("scalablelux", "Ps1zyz6x"),
+        ("particle-core", "RSeLon5O"),
+        ("threadtweak", "vSEH1ERy"),
+        ("badoptimizations", "g96Z4WVZ"),
+    ];
+    assert_eq!(manifest.artifacts.len(), expected_project_ids.len());
+    for (artifact_id, project_id) in expected_project_ids {
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.id == artifact_id)
+            .expect("audited artifact authority");
+        assert_eq!(artifact.source.project_id, project_id, "{artifact_id}");
+        assert!(
+            manifest
+                .compositions
+                .iter()
+                .flat_map(|composition| &composition.mods)
+                .filter(|managed_mod| managed_mod.artifact_id == artifact_id)
+                .all(|managed_mod| managed_mod.project_id == project_id),
+            "{artifact_id}"
+        );
+    }
+    let ebe_artifact = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id == "enhancedblockentities")
+        .expect("EBE artifact authority");
+
+    assert_eq!(ebe_artifact.source.project_id, "OVuFYfre");
+    assert_eq!(ebe_artifact.source.slug, "ebe");
+    let ebe_declarations = manifest
+        .compositions
+        .iter()
+        .flat_map(|composition| composition.mods.iter())
+        .filter(|managed_mod| managed_mod.artifact_id == "enhancedblockentities")
+        .collect::<Vec<_>>();
+    assert_eq!(ebe_declarations.len(), 2);
+    assert!(ebe_declarations.iter().all(|managed_mod| {
+        managed_mod.project_id == "OVuFYfre"
+            && managed_mod.slug == "ebe"
+            && managed_mod.version_range == ">=1.16.2 <=1.21.4"
+    }));
+
+    let memory_leak_fix_artifact = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id == "memoryleakfix")
+        .expect("MemoryLeakFix artifact authority");
+    assert_eq!(memory_leak_fix_artifact.source.project_id, "NRjRiSSD");
+    assert_eq!(memory_leak_fix_artifact.source.slug, "memoryleakfix");
+    let memory_leak_fix_declarations = manifest
+        .compositions
+        .iter()
+        .flat_map(|composition| composition.mods.iter())
+        .filter(|managed_mod| managed_mod.artifact_id == "memoryleakfix")
+        .collect::<Vec<_>>();
+    assert_eq!(memory_leak_fix_declarations.len(), 4);
+    assert!(memory_leak_fix_declarations.iter().all(|managed_mod| {
+        managed_mod.project_id == "NRjRiSSD"
+            && managed_mod.slug == "memoryleakfix"
+            && managed_mod.version_range == "<=1.20.4"
+    }));
+
+    let modernfix_artifact = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id == "modernfix")
+        .expect("ModernFix artifact authority");
+    assert_eq!(modernfix_artifact.source.project_id, "nmDcB62a");
+    assert_eq!(modernfix_artifact.source.slug, "modernfix");
+    let modernfix_declarations = manifest
+        .compositions
+        .iter()
+        .flat_map(|composition| composition.mods.iter())
+        .filter(|managed_mod| managed_mod.artifact_id == "modernfix")
+        .collect::<Vec<_>>();
+    assert_eq!(modernfix_declarations.len(), 4);
+    let expected_versions = MODERNFIX_EXACT_GAME_VERSIONS
+        .iter()
+        .map(|version| (*version).to_string())
+        .collect::<Vec<_>>();
+    assert!(modernfix_declarations.iter().all(|managed_mod| {
+        managed_mod.project_id == "nmDcB62a"
+            && managed_mod.slug == "modernfix"
+            && managed_mod.version_range.is_empty()
+            && managed_mod.exact_game_versions == expected_versions
+    }));
+    validate_manifest(&manifest).expect("corrected provider identities should validate");
+
+    let mut stale_ebe = manifest.clone();
+    let declaration = stale_ebe
+        .compositions
+        .iter_mut()
+        .flat_map(|composition| composition.mods.iter_mut())
+        .find(|managed_mod| managed_mod.artifact_id == "enhancedblockentities")
+        .expect("EBE composition declaration");
+    declaration.project_id = "AANobbMI".to_string();
+    assert_error_kind(
+        validate_manifest(&stale_ebe),
+        ResolveError::ManagedModProjectMismatch {
+            artifact_id: "enhancedblockentities".to_string(),
+            expected: "OVuFYfre".to_string(),
+            actual: "AANobbMI".to_string(),
+        },
+    );
+
+    let mut stale_memory_leak_fix = manifest;
+    let declaration = stale_memory_leak_fix
+        .compositions
+        .iter_mut()
+        .flat_map(|composition| composition.mods.iter_mut())
+        .find(|managed_mod| managed_mod.artifact_id == "memoryleakfix")
+        .expect("MemoryLeakFix composition declaration");
+    declaration.project_id = "AANobbMI".to_string();
+    assert_error_kind(
+        validate_manifest(&stale_memory_leak_fix),
+        ResolveError::ManagedModProjectMismatch {
+            artifact_id: "memoryleakfix".to_string(),
+            expected: "NRjRiSSD".to_string(),
+            actual: "AANobbMI".to_string(),
+        },
+    );
+}
+
+#[test]
 fn forge_family_e_and_f_resolve_extended_then_core_when_extended_disabled() {
     for (
         game_version,
         expected_family,
         extended_composition_id,
         core_composition_id,
-        vanilla_composition_id,
+        _vanilla_composition_id,
     ) in [
         (
             "1.20.1",
@@ -213,13 +465,6 @@ fn forge_family_e_and_f_resolve_extended_then_core_when_extended_disabled() {
             assert_eq!(plan.family, expected_family);
             assert_eq!(plan.loader, loader);
             assert_eq!(plan.tier, CompositionTier::Extended);
-            assert_eq!(
-                plan.fallback_chain,
-                vec![
-                    core_composition_id.to_string(),
-                    vanilla_composition_id.to_string()
-                ]
-            );
             assert_eq!(count_mods_with_slug(&plan.mods, "embeddium"), 1);
             assert_eq!(count_mods_with_slug(&plan.mods, "ferrite-core"), 1);
 
@@ -246,10 +491,6 @@ fn forge_family_e_and_f_resolve_extended_then_core_when_extended_disabled() {
             assert_eq!(fallback_plan.family, expected_family);
             assert_eq!(fallback_plan.loader, loader);
             assert_eq!(fallback_plan.tier, CompositionTier::Core);
-            assert_eq!(
-                fallback_plan.fallback_chain,
-                vec![vanilla_composition_id.to_string()]
-            );
             assert_eq!(count_mods_with_slug(&fallback_plan.mods, "embeddium"), 1);
             assert_eq!(count_mods_with_slug(&fallback_plan.mods, "ferrite-core"), 1);
             assert_eq!(
@@ -602,7 +843,7 @@ fn nvidium_is_skipped_when_iris_is_installed() {
 #[test]
 fn manifest_without_emergency_disables_is_not_current_schema() {
     let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 3,
         "generated_at": "2026-04-02T00:00:00Z",
         "minimum_app_version": "0.4.0-alpha",
         "rule_channel": "bundled",
@@ -617,7 +858,7 @@ fn manifest_without_emergency_disables_is_not_current_schema() {
 #[test]
 fn manifest_without_artifacts_is_not_current_schema() {
     let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 3,
         "generated_at": "2026-04-02T00:00:00Z",
         "minimum_app_version": "0.4.0-alpha",
         "rule_channel": "bundled",
@@ -632,7 +873,7 @@ fn manifest_without_artifacts_is_not_current_schema() {
 #[test]
 fn manifest_without_minimum_app_version_is_not_current_schema() {
     let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 3,
         "generated_at": "2026-04-02T00:00:00Z",
         "rule_channel": "bundled",
         "artifacts": [],
@@ -647,7 +888,7 @@ fn manifest_without_minimum_app_version_is_not_current_schema() {
 #[test]
 fn manifest_without_rule_channel_is_not_current_schema() {
     let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 3,
         "generated_at": "2026-04-02T00:00:00Z",
         "minimum_app_version": "0.4.0-alpha",
         "artifacts": [],
@@ -697,6 +938,17 @@ fn validation_rejects_incompatible_or_invalid_manifest_metadata() {
     assert_error_kind(
         validate_manifest(&missing_channel),
         ResolveError::MissingRuleChannel,
+    );
+}
+
+#[test]
+fn validation_rejects_schema_v1_without_compatibility() {
+    let mut manifest = builtin_manifest().expect("manifest");
+    manifest.schema_version = PERFORMANCE_MANIFEST_SCHEMA_VERSION - 1;
+
+    assert_error_kind(
+        validate_manifest(&manifest),
+        ResolveError::UnsupportedSchema,
     );
 }
 
@@ -771,9 +1023,30 @@ fn validation_rejects_invalid_artifact_definitions() {
 }
 
 #[test]
+fn validation_rejects_noncanonical_artifact_provider_identities() {
+    for value in ["AANobbM", "AANobbMI9", "AANobbM-", " AANobbM"] {
+        let mut manifest = builtin_manifest().expect("manifest");
+        manifest.artifacts[0].source.project_id = value.to_string();
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ResolveError::ManifestBound("artifact Modrinth project id"))
+        ));
+    }
+
+    for value in [" sodium", "sodium "] {
+        let mut manifest = builtin_manifest().expect("manifest");
+        manifest.artifacts[0].source.slug = value.to_string();
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ResolveError::ManifestBound("artifact slug padding"))
+        ));
+    }
+}
+
+#[test]
 fn manifest_rejects_unverifiable_artifact_publisher_signature_fields() {
     let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 3,
         "generated_at": "2026-04-02T00:00:00Z",
         "minimum_app_version": "0.4.0-alpha",
         "rule_channel": "bundled",
@@ -817,13 +1090,13 @@ fn validation_rejects_invalid_managed_mod_artifact_references() {
     );
 
     let mut project_mismatch = builtin_manifest().expect("manifest");
-    first_managed_mod_mut(&mut project_mismatch).project_id = "other-project".to_string();
+    first_managed_mod_mut(&mut project_mismatch).project_id = "gvQqBUqZ".to_string();
     assert_error_kind(
         validate_manifest(&project_mismatch),
         ResolveError::ManagedModProjectMismatch {
             artifact_id: "sodium".to_string(),
-            expected: "sodium".to_string(),
-            actual: "other-project".to_string(),
+            expected: "AANobbMI".to_string(),
+            actual: "gvQqBUqZ".to_string(),
         },
     );
 
@@ -837,6 +1110,29 @@ fn validation_rejects_invalid_managed_mod_artifact_references() {
             actual: "other-slug".to_string(),
         },
     );
+}
+
+#[test]
+fn validation_rejects_noncanonical_managed_mod_provider_identities() {
+    for value in ["AANobbM", "AANobbMI9", "AANobbM-", " AANobbM"] {
+        let mut manifest = builtin_manifest().expect("manifest");
+        first_managed_mod_mut(&mut manifest).project_id = value.to_string();
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ResolveError::ManifestBound(
+                "managed mod Modrinth project id"
+            ))
+        ));
+    }
+
+    for value in [" sodium", "sodium "] {
+        let mut manifest = builtin_manifest().expect("manifest");
+        first_managed_mod_mut(&mut manifest).slug = value.to_string();
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ResolveError::ManifestBound("managed mod slug padding"))
+        ));
+    }
 }
 
 #[test]
@@ -870,6 +1166,94 @@ fn validation_rejects_malformed_managed_mod_version_ranges() {
             },
         );
     }
+}
+
+#[test]
+fn validation_accepts_bounded_exact_managed_mod_game_versions() {
+    let mut manifest = builtin_manifest().expect("manifest");
+    first_managed_mod_mut(&mut manifest).exact_game_versions =
+        vec!["1.21.4".to_string(), "26.1.2".to_string()];
+
+    validate_manifest(&manifest).expect("exact game versions should validate");
+}
+
+#[test]
+fn validation_rejects_conflicting_managed_mod_version_selectors() {
+    let mut manifest = builtin_manifest().expect("manifest");
+    let artifact_id = {
+        let managed_mod = first_managed_mod_mut(&mut manifest);
+        managed_mod.version_range = ">=1.20".to_string();
+        managed_mod.exact_game_versions = vec!["1.21.4".to_string()];
+        managed_mod.artifact_id.clone()
+    };
+
+    assert_error_kind(
+        validate_manifest(&manifest),
+        ResolveError::ConflictingManagedModVersionSelectors { artifact_id },
+    );
+}
+
+#[test]
+fn validation_rejects_invalid_exact_managed_mod_game_versions() {
+    for game_version in ["", " 1.21.4", "1.21.4 ", "not-a-version"] {
+        let mut manifest = builtin_manifest().expect("manifest");
+        let artifact_id = {
+            let managed_mod = first_managed_mod_mut(&mut manifest);
+            managed_mod.exact_game_versions = vec![game_version.to_string()];
+            managed_mod.artifact_id.clone()
+        };
+
+        assert_error_kind(
+            validate_manifest(&manifest),
+            ResolveError::InvalidManagedModExactGameVersion {
+                artifact_id,
+                game_version: game_version.to_string(),
+            },
+        );
+    }
+}
+
+#[test]
+fn validation_rejects_control_and_oversized_exact_managed_mod_game_versions() {
+    for (game_version, expected_field) in [
+        ("1.21.4\n".to_string(), "managed mod exact game version"),
+        ("1".repeat(65), "managed mod exact game version"),
+    ] {
+        let mut manifest = builtin_manifest().expect("manifest");
+        first_managed_mod_mut(&mut manifest).exact_game_versions = vec![game_version];
+
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ResolveError::ManifestBound(field)) if field == expected_field
+        ));
+    }
+}
+
+#[test]
+fn validation_rejects_duplicate_and_oversized_exact_game_version_lists() {
+    let mut duplicate = builtin_manifest().expect("manifest");
+    let artifact_id = {
+        let managed_mod = first_managed_mod_mut(&mut duplicate);
+        managed_mod.exact_game_versions = vec!["1.21.4".to_string(), "1.21.4".to_string()];
+        managed_mod.artifact_id.clone()
+    };
+    assert_error_kind(
+        validate_manifest(&duplicate),
+        ResolveError::DuplicateManagedModExactGameVersion {
+            artifact_id,
+            game_version: "1.21.4".to_string(),
+        },
+    );
+
+    let mut oversized = builtin_manifest().expect("manifest");
+    first_managed_mod_mut(&mut oversized).exact_game_versions =
+        (0..65).map(|patch| format!("1.20.{patch}")).collect();
+    assert!(matches!(
+        validate_manifest(&oversized),
+        Err(ResolveError::ManifestBound(
+            "managed mod exact game version count"
+        ))
+    ));
 }
 
 #[test]
@@ -919,6 +1303,22 @@ fn validation_rejects_negative_managed_mod_hardware_requirements() {
             },
         );
     }
+}
+
+#[test]
+fn validation_rejects_oversized_managed_mod_gpu_vendor() {
+    let mut manifest = builtin_manifest().expect("manifest");
+    first_managed_mod_mut(&mut manifest).hardware_req = Some(HardwareRequirement {
+        gpu_vendor: "x".repeat(65),
+        ..HardwareRequirement::default()
+    });
+
+    assert!(matches!(
+        validate_manifest(&manifest),
+        Err(ResolveError::ManifestBound(
+            "managed mod hardware gpu vendor"
+        ))
+    ));
 }
 
 #[test]
@@ -1128,11 +1528,12 @@ fn depleted_higher_bundle_falls_back_with_compatibility_reason() {
     extended.mods = vec![
         ManagedMod {
             artifact_id: "nvidium".to_string(),
-            project_id: "nvidium".to_string(),
+            project_id: "SfMw2IZN".to_string(),
             slug: "nvidium".to_string(),
             name: "Nvidium".to_string(),
             condition: ModCondition::Hardware,
             version_range: ">=1.20.1".to_string(),
+            exact_game_versions: Vec::new(),
             hardware_req: Some(HardwareRequirement {
                 gpu_vendor: "nvidia".to_string(),
                 gpu_arch_min: 2,
@@ -1143,11 +1544,12 @@ fn depleted_higher_bundle_falls_back_with_compatibility_reason() {
         },
         ManagedMod {
             artifact_id: "sodium".to_string(),
-            project_id: "sodium".to_string(),
+            project_id: "AANobbMI".to_string(),
             slug: "sodium".to_string(),
             name: "Sodium".to_string(),
             condition: ModCondition::Recommend,
             version_range: String::new(),
+            exact_game_versions: Vec::new(),
             hardware_req: None,
             mutual_exclusions: Vec::new(),
         },
@@ -1207,7 +1609,7 @@ fn artifact_disable_drops_matching_managed_mod_with_warning() {
 }
 
 #[test]
-fn artifact_disable_targets_declared_artifact_aliases() {
+fn artifact_disable_targets_declared_immutable_project_id() {
     let mut manifest = builtin_manifest().expect("manifest");
     manifest.artifacts[0].id = "sodium-artifact".to_string();
     for composition in &mut manifest.compositions {
@@ -1219,8 +1621,8 @@ fn artifact_disable_targets_declared_artifact_aliases() {
     }
     manifest
         .emergency_disables
-        .push(test_artifact_disable("hold-sodium-alias", "sodium"));
-    validate_manifest(&manifest).expect("declared source alias should validate");
+        .push(test_artifact_disable("hold-sodium-project", "AANobbMI"));
+    validate_manifest(&manifest).expect("declared project identity should validate");
 
     let plan = resolve_plan(
         Some(&manifest),
@@ -1239,8 +1641,29 @@ fn artifact_disable_targets_declared_artifact_aliases() {
             .all(|managed_mod| managed_mod.slug != "sodium")
     );
     assert!(plan.warnings.iter().any(|warning| {
-        warning.contains("sodium skipped by emergency disable hold-sodium-alias")
+        warning.contains("sodium skipped by emergency disable hold-sodium-project")
     }));
+}
+
+#[test]
+fn validation_rejects_emergency_disable_slug_alias() {
+    let mut manifest = builtin_manifest().expect("manifest");
+    manifest.artifacts[0].id = "sodium-artifact".to_string();
+    for composition in &mut manifest.compositions {
+        for managed_mod in &mut composition.mods {
+            if managed_mod.artifact_id == "sodium" {
+                managed_mod.artifact_id = "sodium-artifact".to_string();
+            }
+        }
+    }
+    manifest
+        .emergency_disables
+        .push(test_artifact_disable("hold-sodium-slug", "sodium"));
+
+    assert_error_kind(
+        validate_manifest(&manifest),
+        ResolveError::UnknownEmergencyDisableArtifact("sodium".to_string()),
+    );
 }
 
 fn test_composition_disable(id: &str, target_id: &str) -> EmergencyDisable {

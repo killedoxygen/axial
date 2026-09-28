@@ -16,17 +16,15 @@ export function SettingRow({
   control,
   children,
   aside,
-  disabled,
 }: {
   title: string;
   description?: ComponentChildren;
   control?: ComponentChildren;
   children?: ComponentChildren;
   aside?: ComponentChildren;
-  disabled?: boolean;
 }): JSX.Element {
   return (
-    <div class={`cp-sheet-row${children ? ' cp-sheet-row--stack' : ''}`} data-disabled={disabled ? 'true' : 'false'}>
+    <div class={`cp-sheet-row${children ? ' cp-sheet-row--stack' : ''}`}>
       <div class="cp-sheet-row-copy">
         <div class="cp-sheet-row-head">
           <strong>{title}</strong>

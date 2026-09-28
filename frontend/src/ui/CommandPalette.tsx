@@ -1,23 +1,24 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Icon } from './Icons';
+import { Icon, type IconName } from './Icons';
 import { Kbd } from './Atoms';
 import { commandPaletteOpen, navigate, type Route, openCreate, openAccountSwitcher } from '../ui-state';
-import { instances, runningSessions } from '../store';
+import { instances, launchSessions } from '../store';
 import { Music } from '../music';
-import { local, saveLocalState } from '../state';
+import { local, saveLocalState, canEditPreferences } from '../state';
+import { reloadApplication } from '../preferences/persistence';
 import { Sound } from '../sound';
 import { applyTheme } from '../theme';
-import type { EnrichedInstance } from '../types-instance';
 import { useDraggableOverlay } from '../hooks/use-draggable-overlay';
 import { shortcutHint } from '../shortcuts';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
 
 type Group = 'jump' | 'instance' | 'action';
 
 interface Command {
   id: string;
   group: Group;
-  icon: string;
+  icon: IconName;
   label: string;
   hint?: string;
   keywords?: string;
@@ -81,16 +82,17 @@ function buildCommands(): Command[] {
     },
   );
 
-  const running = runningSessions.value;
-  const list2 = instances.value as EnrichedInstance[];
+  const sessions = launchSessions.value;
+  const list2 = instances.value;
   for (const inst of list2.slice(0, 12)) {
-    const isRunning = !!running[inst.id];
+    const session = sessions[inst.id];
+    const isPlaying = launchSessionIsPlaying(session);
     list.push({
       id: `instance:${inst.id}`,
       group: 'instance',
-      icon: isRunning ? 'play' : 'stack',
-      label: isRunning ? `Jump to ${inst.name}` : `Open ${inst.name}`,
-      hint: isRunning ? 'Playing' : undefined,
+      icon: isPlaying ? 'play' : 'stack',
+      label: session ? `Jump to ${inst.name}` : `Open ${inst.name}`,
+      hint: session ? launchSessionActivityLabel(session) : undefined,
       keywords: inst.name,
       perform: () => {
         navigate({ name: 'instance', id: inst.id });
@@ -127,6 +129,7 @@ function buildCommands(): Command[] {
       icon: 'headphones',
       label: local.sounds ? 'Turn UI sounds off' : 'Turn UI sounds on',
       perform: () => {
+        if (!canEditPreferences()) return;
         local.sounds = !local.sounds;
         Sound.enabled = local.sounds;
         saveLocalState();
@@ -151,7 +154,7 @@ function buildCommands(): Command[] {
       label: 'Reload launcher',
       hint: 'F5',
       perform: () => {
-        location.reload();
+        void reloadApplication();
       },
     },
   );

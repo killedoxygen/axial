@@ -1,7 +1,6 @@
 import type { JSX, ComponentChildren } from 'preact';
-import { useState } from 'preact/hooks';
 import type { SoundKind } from '../sound';
-import { Icon } from './Icons';
+import { Icon, type IconName } from './Icons';
 
 type Tone = 'neutral' | 'accent' | 'ok' | 'warn' | 'err' | 'info';
 type BtnVariant = 'primary' | 'secondary' | 'soft' | 'ghost' | 'danger';
@@ -25,7 +24,7 @@ export function Button({
   children?: ComponentChildren;
   variant?: BtnVariant;
   size?: BtnSize;
-  icon?: string;
+  icon?: IconName;
   trailing?: ComponentChildren;
   onClick?: (e: MouseEvent) => void;
   style?: JSX.CSSProperties;
@@ -67,7 +66,7 @@ export function IconButton({
   danger,
   variant,
 }: {
-  icon: string;
+  icon: IconName;
   onClick?: (e: MouseEvent) => void;
   size?: number;
   active?: boolean;
@@ -101,7 +100,7 @@ export function Pill({
 }: {
   children?: ComponentChildren;
   tone?: Tone;
-  icon?: string;
+  icon?: IconName;
   style?: JSX.CSSProperties;
 }): JSX.Element {
   const cls = `cp-pill${tone !== 'neutral' ? ` cp-pill--${tone}` : ''}`;
@@ -113,26 +112,33 @@ export function Pill({
   );
 }
 
-export function Toggle({ on, onChange }: { on: boolean; onChange: () => void }): JSX.Element {
-  return <button type="button" class="cp-toggle" data-on={on} role="switch" aria-checked={on} onClick={onChange} />;
+export function Toggle({
+  on,
+  onChange,
+  disabled,
+  ariaLabel,
+}: {
+  on: boolean;
+  onChange: () => void;
+  disabled?: boolean;
+  ariaLabel?: string;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      class="cp-toggle"
+      data-on={on}
+      role="switch"
+      aria-checked={on}
+      aria-label={ariaLabel}
+      disabled={disabled}
+      onClick={onChange}
+    />
+  );
 }
 
 export function Kbd({ children }: { children: ComponentChildren }): JSX.Element {
   return <span class="cp-kbd">{children}</span>;
-}
-
-export function Divider({ vertical, style }: { vertical?: boolean; style?: JSX.CSSProperties }): JSX.Element {
-  return (
-    <div
-      style={{
-        background: 'var(--line)',
-        width: vertical ? 1 : '100%',
-        height: vertical ? '100%' : 1,
-        flexShrink: 0,
-        ...style,
-      }}
-    />
-  );
 }
 
 export function Meter({
@@ -183,7 +189,7 @@ export function Input({
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
-  icon?: string;
+  icon?: IconName;
   trailing?: ComponentChildren;
   style?: JSX.CSSProperties;
   type?: string;
@@ -193,9 +199,8 @@ export function Input({
   onBlur?: () => void;
   inputRef?: { current: HTMLInputElement | null };
 }): JSX.Element {
-  const [focus, setFocus] = useState(false);
   return (
-    <div class={`cp-field${focus ? ' cp-field--focused' : ''}`} style={style}>
+    <div class="cp-field" style={style}>
       {icon && <Icon name={icon} size={14} color="var(--text-dim)" />}
       <input
         ref={inputRef}
@@ -206,14 +211,8 @@ export function Input({
         autoFocus={autoFocus}
         onKeyDown={onKeyDown as any}
         onInput={(e: any) => onChange(e.currentTarget.value)}
-        onFocus={() => {
-          setFocus(true);
-          onFocus?.();
-        }}
-        onBlur={() => {
-          setFocus(false);
-          onBlur?.();
-        }}
+        onFocus={onFocus}
+        onBlur={onBlur}
         placeholder={placeholder}
       />
       {trailing}
@@ -225,17 +224,15 @@ export function Card({
   children,
   padding = 18,
   style,
-  onClick,
   class: cls,
 }: {
   children?: ComponentChildren;
   padding?: number;
   style?: JSX.CSSProperties;
-  onClick?: (e: MouseEvent) => void;
   class?: string;
 }): JSX.Element {
   return (
-    <div class={cls ? `cp-card ${cls}` : 'cp-card'} style={{ padding, ...style }} onClick={onClick}>
+    <div class={cls ? `cp-card ${cls}` : 'cp-card'} style={{ padding, ...style }}>
       {children}
     </div>
   );

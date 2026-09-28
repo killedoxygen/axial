@@ -1,266 +1,186 @@
-name: Release
+name: Rewrite candidate artifacts
 
+# This workflow has no publisher, signing secrets, or installed-user mutations.
+# A separately authorized release supplies trust material and real native evidence.
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing candidate tag whose version and changelog match
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: rewrite-candidate-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
-  verify:
+  source:
     runs-on: ubuntu-24.04
-    container:
-      image: ghcr.io/mateoltd/axial-linux-ci:latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.13.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.93.1
+      - name: Enforce dependency and asset policies before candidate admission
+        shell: bash
+        run: |
+          status=0
+          npm install --global pnpm@11.1.3 > "$RUNNER_TEMP/source-policies.log" 2>&1 && pnpm --dir frontend install --frozen-lockfile --ignore-scripts >> "$RUNNER_TEMP/source-policies.log" 2>&1 && cargo install cargo-deny --version '=0.20.2' --locked >> "$RUNNER_TEMP/source-policies.log" 2>&1 && test "$(cargo deny --version)" = 'cargo-deny 0.20.2' && node scripts/dependency-policy.mjs check >> "$RUNNER_TEMP/source-policies.log" 2>&1 && node scripts/verify-assets.mjs >> "$RUNNER_TEMP/source-policies.log" 2>&1 || status=$?
+          tail -n 70 "$RUNNER_TEMP/source-policies.log"
+          exit "$status"
+      - name: Verify exact source, version, identity, and changelog
+        env:
+          CANDIDATE_TAG: ${{ inputs.tag }}
+        run: |
+          cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          source_sha=$(git rev-parse HEAD)
+          node scripts/release/contract.mjs verify-source --tag "$CANDIDATE_TAG" --sha "$source_sha" --metadata "$RUNNER_TEMP/metadata.json" --output "$RUNNER_TEMP/source.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rewrite-source
+          path: ${{ runner.temp }}/source.json
+          if-no-files-found: error
 
-      - name: Trust checkout as a safe git directory
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - uses: pnpm/action-setup@v4
+  package:
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-amd64
+            target: x86_64-unknown-linux-gnu
+            overlay: linux
+            binary: axial-desktop
+          - runner: windows-2025
+            platform: windows-amd64
+            target: x86_64-pc-windows-msvc
+            overlay: windows
+            binary: axial-desktop.exe
+          - runner: macos-15-intel
+            platform: macos-amd64
+            target: x86_64-apple-darwin
+            overlay: macos
+            binary: axial-desktop
+          - runner: macos-15
+            platform: macos-arm64
+            target: aarch64-apple-darwin
+            overlay: macos
+            binary: axial-desktop
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rewrite-source
+          path: ${{ runner.temp }}/rewrite-source
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 11.1.3
           run_install: false
-
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
-
-      - name: Verify release version coherence
+          node-version: 24.13.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.93.1
+          targets: ${{ matrix.target }}
+      - name: Install Linux package prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+      - name: Build embedded frontend
+        shell: bash
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$TAG_VERSION" = "$GITHUB_REF_NAME" ] || [ -z "$TAG_VERSION" ]; then
-            echo "Release tags must be named v<version>; got '$GITHUB_REF_NAME'." >&2
-            exit 1
-          fi
-
-          CARGO_VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)"
-          TAURI_VERSION="$(node -p "require('./apps/desktop/tauri.conf.json').version")"
-
-          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
-            echo "Release tag version '$TAG_VERSION' does not match Cargo workspace version '$CARGO_VERSION'." >&2
-            exit 1
-          fi
-
-          if [ "$TAURI_VERSION" != "$TAG_VERSION" ]; then
-            echo "Release tag version '$TAG_VERSION' does not match Tauri config version '$TAURI_VERSION'." >&2
-            exit 1
-          fi
-
-          node -e "const version = process.argv[1]; if (!/^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$/.test(version)) process.exit(1)" "$TAG_VERSION" || {
-            echo "Release version '$TAG_VERSION' is not valid SemVer." >&2
-            exit 1
-          }
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install frontend dependencies
-        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
-
-      - name: Frontend format check
-        run: pnpm --dir frontend run format:check
-
-      - name: Frontend typecheck
-        run: pnpm --dir frontend run check
-
-      - name: Frontend build
-        run: pnpm --dir frontend run build
-
-      - name: Rust fmt
-        run: cargo fmt --all --check
-
-      - name: Rust check
-        run: cargo check --workspace --locked
-
-      - name: Rust clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-      - name: Rust tests
-        run: cargo test --workspace --locked
-
-      - name: Build linux release desktop binary
-        env:
-          # Telemetry key is a public write-only PostHog project token; keyless builds never upload (docs/TELEMETRY.md).
-          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-        run: cargo build --locked -p axial-desktop --release
-
-      - name: Upload frontend bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-frontend
-          path: |
-            frontend/static/app.css
-            frontend/static/app.js
-            frontend/static/chunks
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Upload linux release desktop binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-linux-amd64
-          path: target/release/axial-desktop
-          if-no-files-found: error
-          retention-days: 1
-
-  linux-desktop:
-    needs: verify
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Download linux release desktop binary
-        uses: actions/download-artifact@v4
-        with:
-          name: release-linux-amd64
-          path: target/release
-
-      - name: Package linux desktop binary
+          status=0
+          pnpm --dir frontend install --frozen-lockfile --ignore-scripts > "$RUNNER_TEMP/frontend.log" 2>&1 && pnpm --dir frontend run build >> "$RUNNER_TEMP/frontend.log" 2>&1 && node frontend/verify-generation.mjs >> "$RUNNER_TEMP/frontend.log" 2>&1 || status=$?
+          tail -n 70 "$RUNNER_TEMP/frontend.log"
+          exit "$status"
+      - name: Install pinned bundler
+        shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p dist/linux
-          cp target/release/axial-desktop dist/linux/axial
-          chmod +x dist/linux/axial
-          cp dist/linux/axial "dist/axial-linux-amd64-${VERSION}"
-          tar -C dist/linux -czf "dist/axial-linux-amd64-${VERSION}.tar.gz" axial
-          (
-            cd dist
-            sha256sum "axial-linux-amd64-${VERSION}" > "axial-linux-amd64-${VERSION}.sha256"
-            sha256sum "axial-linux-amd64-${VERSION}.tar.gz" > "axial-linux-amd64-${VERSION}.tar.gz.sha256"
-          )
-
-      - name: Upload linux release asset
-        uses: softprops/action-gh-release@v2
-        with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            dist/axial-linux-amd64-*
-
-  windows-desktop:
-    needs: verify
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download frontend bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: release-frontend
-          path: frontend/static
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release desktop binary
-        env:
-          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-        run: cargo build --locked -p axial-desktop --release
-
-      - name: Package windows desktop binary
-        shell: pwsh
-        run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart('v')
-          New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
-          Copy-Item target/release/axial-desktop.exe dist/windows/axial.exe
-          $executable = "dist/axial-windows-amd64-$version.exe"
-          Copy-Item dist/windows/axial.exe $executable
-          $archive = "dist/axial-windows-amd64-$version.zip"
-          Compress-Archive -Path dist/windows/axial.exe -DestinationPath $archive -Force
-          $executableHash = Get-FileHash -Algorithm SHA256 -Path $executable
-          "$($executableHash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $executable)" | Set-Content -Path "$executable.sha256" -NoNewline -Encoding ascii
-          $hash = Get-FileHash -Algorithm SHA256 -Path $archive
-          "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $archive)" | Set-Content -Path "$archive.sha256" -NoNewline -Encoding ascii
-
-      - name: Upload windows release asset
-        uses: softprops/action-gh-release@v2
-        with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            dist/axial-windows-amd64-*.exe
-            dist/axial-windows-amd64-*.exe.sha256
-            dist/axial-windows-amd64-*.zip
-            dist/axial-windows-amd64-*.zip.sha256
-
-  macos-desktop:
-    needs: verify
-    strategy:
-      matrix:
-        include:
-          - runner: macos-15-intel
-            arch: amd64
-          - runner: macos-15
-            arch: arm64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download frontend bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: release-frontend
-          path: frontend/static
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2.9" --locked
-
-      - name: Build macOS app and DMG
-        env:
-          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          status=0
+          cargo install tauri-cli --version '=2.11.2' --locked > "$RUNNER_TEMP/bundler.log" 2>&1 || status=$?
+          tail -n 50 "$RUNNER_TEMP/bundler.log"
+          exit "$status"
+      - name: Build native candidate packages
         working-directory: apps/desktop
-        run: cargo tauri build --bundles dmg --config '{"build":{"beforeBuildCommand":""}}' -- --locked
-
-      - name: Package macOS release assets
+        shell: bash
+        env:
+          CANDIDATE_TARGET: ${{ matrix.target }}
+          CANDIDATE_OVERLAY: ${{ matrix.overlay }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p dist/macos
-          cp target/release/axial-desktop dist/macos/axial
-          chmod +x dist/macos/axial
-          tar -C dist/macos -czf "dist/axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" axial
-          set -- target/release/bundle/dmg/*.dmg
-          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
-            echo "Expected exactly one macOS DMG, found $#" >&2
-            exit 1
-          fi
-          cp "$1" "dist/axial-macos-${{ matrix.arch }}-${VERSION}.dmg"
-          (
-            cd dist
-            shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}.dmg" > "axial-macos-${{ matrix.arch }}-${VERSION}.dmg.sha256"
-            shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" > "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz.sha256"
-          )
-
-      - name: Upload macOS release asset
-        uses: softprops/action-gh-release@v2
+          status=0
+          cargo tauri build --target "$CANDIDATE_TARGET" --config "platform/tauri.$CANDIDATE_OVERLAY.json" --config '{"build":{"beforeBuildCommand":""}}' -- --locked > "$RUNNER_TEMP/package.log" 2>&1 || status=$?
+          tail -n 80 "$RUNNER_TEMP/package.log"
+          exit "$status"
+      - name: Collect complete package handoff
+        shell: bash
+        env:
+          CANDIDATE_PLATFORM: ${{ matrix.platform }}
+          CANDIDATE_TARGET: ${{ matrix.target }}
+          CANDIDATE_BINARY: ${{ matrix.binary }}
+        run: |
+          node scripts/release/package.mjs --platform "$CANDIDATE_PLATFORM" --source "$RUNNER_TEMP/rewrite-source/source.json" --binary "target/$CANDIDATE_TARGET/release/$CANDIDATE_BINARY" --bundle-root "target/$CANDIDATE_TARGET/release/bundle" --output "$RUNNER_TEMP/handoff"
+          node scripts/release/contract.mjs verify-artifacts --source "$RUNNER_TEMP/rewrite-source/source.json" --assets "$RUNNER_TEMP/handoff" --platform "$CANDIDATE_PLATFORM"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            dist/axial-macos-${{ matrix.arch }}-*
+          name: rewrite-assets-${{ matrix.platform }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+      - name: Retain build diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rewrite-build-logs-${{ matrix.platform }}
+          path: ${{ runner.temp }}/*.log
+          if-no-files-found: ignore
 
-  verify-release:
-    needs: [linux-desktop, windows-desktop, macos-desktop]
+  readiness:
+    needs: package
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          node-version: 22
-
-      - name: Verify release assets are published and downloadable
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node scripts/verify-release-assets.mjs
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.13.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: rewrite-assets-*
+          path: ${{ runner.temp }}/downloads
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rewrite-source
+          path: ${{ runner.temp }}/rewrite-source
+      - name: Evaluate release readiness
+        shell: bash
+        run: |
+          mkdir "$RUNNER_TEMP/assets"
+          for platform in linux-amd64 windows-amd64 macos-amd64 macos-arm64; do
+            mv "$RUNNER_TEMP/downloads/rewrite-assets-$platform" "$RUNNER_TEMP/assets/$platform"
+          done
+          node acceptance/native/verify.mjs --source "$RUNNER_TEMP/rewrite-source/source.json" --assets "$RUNNER_TEMP/assets" --evidence acceptance/native/evidence > "$RUNNER_TEMP/readiness.json"
+      - name: Retain explicit readiness gaps
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rewrite-readiness
+          path: ${{ runner.temp }}/readiness.json
+          if-no-files-found: error

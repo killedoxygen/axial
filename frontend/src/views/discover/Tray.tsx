@@ -21,7 +21,7 @@ export function Tray(): JSX.Element | null {
 
   const addAll = async (): Promise<void> => {
     const outcome = await flow.add(traySelections(), plural(items.length, 'item', 'items'));
-    if (outcome.status === 'installed') clearTray();
+    if (outcome.status === 'queued') clearTray();
   };
 
   return (
@@ -84,7 +84,7 @@ export function Tray(): JSX.Element | null {
         )}
       </FloatingTray>
 
-      <InstallConflictSheet flow={flow} onInstalled={clearTray} />
+      <InstallConflictSheet flow={flow} onQueued={clearTray} />
     </>
   );
 }

@@ -1,12 +1,13 @@
 use super::model::DownloadProgress;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Shared byte ledger for one install: pipelines register planned bytes as
-/// their manifests resolve and record completed bytes as artifacts finish
-/// (downloaded or verified in place). The installer stamps every outgoing
-/// progress event with the current totals so progress reflects actual planned
-/// work instead of a fixed phase table.
+/// Shared byte ledger for one install: the installer registers every known
+/// byte count and reserves every unknown lane before its first progress event.
+/// Pipelines resolve reservations as their manifests become available and
+/// record completed bytes as artifacts finish (downloaded or verified in
+/// place). The installer stamps outgoing progress only after the complete
+/// denominator is known.
 ///
 /// Phases whose planned bytes are not known upfront (asset objects until the
 /// index is parsed, the managed runtime until its manifest is fetched) reserve
@@ -17,6 +18,13 @@ pub(super) struct TransferPlan {
     done: AtomicU64,
     total: AtomicU64,
     pending_contributions: AtomicU64,
+    invalid: AtomicBool,
+}
+
+#[derive(Debug)]
+pub(super) struct TransferPlanContribution {
+    plan: Arc<TransferPlan>,
+    pending: bool,
 }
 
 impl TransferPlan {
@@ -24,13 +32,12 @@ impl TransferPlan {
         Arc::new(Self::default())
     }
 
-    pub(super) fn expect_contribution(&self) {
+    pub(super) fn reserve_contribution(self: &Arc<Self>) -> TransferPlanContribution {
         self.pending_contributions.fetch_add(1, Ordering::Release);
-    }
-
-    pub(super) fn resolve_contribution(&self, bytes: u64) {
-        self.contribute_total(bytes);
-        self.pending_contributions.fetch_sub(1, Ordering::Release);
+        TransferPlanContribution {
+            plan: Arc::clone(self),
+            pending: true,
+        }
     }
 
     pub(super) fn contribute_total(&self, bytes: u64) {
@@ -46,7 +53,11 @@ impl TransferPlan {
     }
 
     pub(super) fn stamp(&self, progress: &mut DownloadProgress) {
-        if self.pending_contributions.load(Ordering::Acquire) != 0 {
+        progress.bytes_done = None;
+        progress.bytes_total = None;
+        if self.pending_contributions.load(Ordering::Acquire) != 0
+            || self.invalid.load(Ordering::Acquire)
+        {
             return;
         }
         let total = self.total.load(Ordering::Acquire);
@@ -56,6 +67,35 @@ impl TransferPlan {
         let done = self.done.load(Ordering::Acquire).min(total);
         progress.bytes_done = Some(done);
         progress.bytes_total = Some(total);
+    }
+}
+
+impl TransferPlanContribution {
+    pub(super) fn resolve(mut self, bytes: u64) {
+        self.finish(Some(bytes));
+    }
+
+    fn finish(&mut self, bytes: Option<u64>) {
+        if !self.pending {
+            return;
+        }
+        if let Some(bytes) = bytes {
+            self.plan.contribute_total(bytes);
+        } else {
+            self.plan.invalid.store(true, Ordering::Release);
+        }
+        let previous = self
+            .plan
+            .pending_contributions
+            .fetch_sub(1, Ordering::AcqRel);
+        assert!(previous > 0, "transfer-plan contribution underflow");
+        self.pending = false;
+    }
+}
+
+impl Drop for TransferPlanContribution {
+    fn drop(&mut self) {
+        self.finish(None);
     }
 }
 
@@ -78,26 +118,81 @@ mod tests {
 
     #[test]
     fn stamp_stays_disabled_until_reserved_contributions_resolve() {
-        let plan = TransferPlan::default();
+        let plan = TransferPlan::shared();
         plan.contribute_total(100);
         plan.add_done(100);
-        plan.expect_contribution();
+        let contribution = plan.reserve_contribution();
 
-        assert_eq!(stamped(&plan), (None, None));
+        assert_eq!(stamped(plan.as_ref()), (None, None));
 
-        plan.resolve_contribution(300);
-        assert_eq!(stamped(&plan), (Some(100), Some(400)));
+        contribution.resolve(300);
+        assert_eq!(stamped(plan.as_ref()), (Some(100), Some(400)));
     }
 
     #[test]
     fn stamp_supports_zero_byte_resolutions() {
-        let plan = TransferPlan::default();
+        let plan = TransferPlan::shared();
         plan.contribute_total(50);
-        plan.expect_contribution();
-        plan.resolve_contribution(0);
+        plan.reserve_contribution().resolve(0);
         plan.add_done(10);
 
-        assert_eq!(stamped(&plan), (Some(10), Some(50)));
+        assert_eq!(stamped(plan.as_ref()), (Some(10), Some(50)));
+    }
+
+    #[test]
+    fn stamp_waits_for_every_unknown_lane_before_exposing_the_complete_total() {
+        let plan = TransferPlan::shared();
+        plan.contribute_total(200);
+        plan.add_done(20);
+        let assets = plan.reserve_contribution();
+        let runtime = plan.reserve_contribution();
+
+        assets.resolve(300);
+        assert_eq!(stamped(plan.as_ref()), (None, None));
+
+        runtime.resolve(500);
+        assert_eq!(stamped(plan.as_ref()), (Some(20), Some(1_000)));
+    }
+
+    #[test]
+    fn abandoned_contribution_invalidates_progress_stamping() {
+        let plan = TransferPlan::shared();
+        plan.contribute_total(50);
+        drop(plan.reserve_contribution());
+
+        assert_eq!(stamped(plan.as_ref()), (None, None));
+    }
+
+    #[test]
+    fn concurrent_abandonment_never_exposes_a_partial_denominator() {
+        let plan = TransferPlan::shared();
+        plan.contribute_total(100);
+        plan.add_done(100);
+        let resolved = plan.reserve_contribution();
+        let abandoned = plan.reserve_contribution();
+        let worker = std::thread::spawn(move || resolved.resolve(300));
+
+        drop(abandoned);
+        worker.join().expect("resolved transfer contribution");
+
+        assert_eq!(stamped(plan.as_ref()), (None, None));
+    }
+
+    #[test]
+    fn concurrent_contributions_publish_one_complete_denominator() {
+        let plan = TransferPlan::shared();
+        let workers = (1_u64..=8)
+            .map(|bytes| {
+                let contribution = plan.reserve_contribution();
+                std::thread::spawn(move || contribution.resolve(bytes * 10))
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().expect("transfer contribution worker");
+        }
+
+        assert_eq!(stamped(plan.as_ref()), (Some(0), Some(360)));
     }
 
     #[test]

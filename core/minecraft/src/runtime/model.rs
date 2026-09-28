@@ -42,12 +42,72 @@ impl From<&str> for RuntimeId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSourceFailureKind {
+    Unavailable,
+    MetadataInvalid,
+    IntegrityMismatch,
+    PolicyRejected,
+}
+
+impl RuntimeSourceFailureKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::MetadataInvalid => "metadata_invalid",
+            Self::IntegrityMismatch => "integrity_mismatch",
+            Self::PolicyRejected => "policy_rejected",
+        }
+    }
+
+    pub const fn is_retryable(self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSourceFailure {
+    component: RuntimeId,
+    kind: RuntimeSourceFailureKind,
+    detail: String,
+}
+
+impl RuntimeSourceFailure {
+    pub fn new(
+        component: RuntimeId,
+        kind: RuntimeSourceFailureKind,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            component,
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn component(&self) -> &RuntimeId {
+        &self.component
+    }
+
+    pub const fn kind(&self) -> RuntimeSourceFailureKind {
+        self.kind
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for RuntimeSourceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSource {
     Managed,
-    MinecraftBundled,
-    MicrosoftStore,
     ExternalOverride,
 }
 
@@ -55,8 +115,6 @@ impl RuntimeSource {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Managed => "managed",
-            Self::MinecraftBundled => "minecraft-runtime",
-            Self::MicrosoftStore => "ms-store",
             Self::ExternalOverride => "override",
         }
     }
@@ -66,7 +124,6 @@ impl RuntimeSource {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeInstallState {
     Missing,
-    Installing,
     Ready,
     Broken,
 }
@@ -94,21 +151,38 @@ pub enum RuntimeOverride {
     ExecutablePath(PathBuf),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeEnsureAction {
-    UseRequested,
-    UseManaged,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeProbeSource {
+    #[default]
+    None,
+    Fresh,
+    Receipt,
+    FreshAfterReceiptMismatch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl RuntimeProbeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Fresh => "fresh",
+            Self::Receipt => "receipt",
+            Self::FreshAfterReceiptMismatch => "fresh_after_receipt_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeProbeUsage {
+    pub spawn_count: u8,
+    pub source: RuntimeProbeSource,
+}
+
+#[derive(Debug)]
 pub struct RuntimeEnsureResult {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<RuntimeRecord>,
     pub effective: RuntimeRecord,
-    pub bypassed_requested_runtime: bool,
-    pub install_performed: bool,
-    pub action: RuntimeEnsureAction,
+    pub probe_usage: RuntimeProbeUsage,
+    pub managed_launch: Option<super::layout::ManagedRuntimeLaunchReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +207,9 @@ pub enum JavaRuntimeLookupError {
     #[error("java runtime not found: {component} (Java {major}) not installed")]
     NotFound { component: String, major: i32 },
     #[error("failed to install java runtime: {0}")]
-    Download(String),
+    Install(String),
+    #[error("failed to acquire java runtime source: {0}")]
+    RuntimeSource(RuntimeSourceFailure),
     #[error("java runtime {component} is not available for {platform}")]
     UnsupportedPlatform { component: String, platform: String },
     #[error(
@@ -144,4 +220,10 @@ pub enum JavaRuntimeLookupError {
     ProbeTimedOut,
     #[error("failed to probe java runtime: {0}")]
     Probe(String),
+    #[error("managed runtime mutation was refused before effects")]
+    ManagedMutationRefused,
 }
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("managed runtime mutation was refused")]
+pub struct ManagedRuntimeMutationRefused;

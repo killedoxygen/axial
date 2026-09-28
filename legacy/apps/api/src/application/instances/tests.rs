@@ -1,0 +1,6205 @@
+use super::*;
+use crate::state::{
+    AppState, AppStateInit, ContentQueueAction, IdleSweepCancellation, IdleSweepReservation,
+    IdleSweepTerminal, InstallQueuePlacement, InstallQueueSpec, InstallStore, ProducerLease,
+    RequestLease, SessionStore, UpdateApplyAdmissionError,
+};
+use axial_config::{
+    AppConfig, AppPaths, ConfigStore, Instance, InstanceRegistrySnapshot, InstanceStore,
+};
+use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
+use axial_minecraft::{
+    VersionEntry,
+    known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
+    },
+    managed_path::{ManagedTreeCopyFailure, ManagedTreeCopyOutcome},
+    portable_path::PortableFileName,
+};
+use axial_performance::PerformanceManager;
+use axum::http::{HeaderValue, header};
+use sha1::{Digest as _, Sha1};
+use std::{
+    collections::{HashMap, HashSet},
+    fs, io,
+    path::Path as FsPath,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+#[test]
+fn instance_write_error_mapper_preserves_safe_status_messages() {
+    let cases = [
+        (
+            InstanceStoreError::from(InstanceStoreDomainError::NotFound),
+            StatusCode::NOT_FOUND,
+            "instance not found",
+        ),
+        (
+            InstanceStoreError::from(InstanceStoreDomainError::NameConflict),
+            StatusCode::CONFLICT,
+            "an instance with this name already exists",
+        ),
+        (
+            InstanceStoreError::Validation("version_id is required"),
+            StatusCode::BAD_REQUEST,
+            "version_id is required",
+        ),
+    ];
+
+    for (error, expected_status, expected_message) in cases {
+        let (status, Json(body)) =
+            instance_write_error_response(InstanceWriteOperation::Create, error);
+
+        assert_eq!(status, expected_status);
+        assert_bounded_error_body(&body, expected_message);
+    }
+}
+
+#[test]
+fn behavior_contract_instance_failures_preserve_domain_and_persistence_classes() {
+    let cases = [
+        (
+            InstanceStoreError::from(InstanceStoreDomainError::NotFound),
+            InstanceStoreFailureClass::DomainNotFound,
+            StatusCode::NOT_FOUND,
+            "instance not found",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::NotFound)),
+            InstanceStoreFailureClass::PersistenceNotFound,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Instance storage is unavailable. Restart Axial and try again.",
+        ),
+        (
+            InstanceStoreError::from(InstanceStoreDomainError::NameConflict),
+            InstanceStoreFailureClass::Conflict,
+            StatusCode::CONFLICT,
+            "an instance with this name already exists",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::AlreadyExists)),
+            InstanceStoreFailureClass::Other,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not save the instance. Try again.",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::PermissionDenied)),
+            InstanceStoreFailureClass::PermissionDenied,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Instance storage access was denied. Check app data permissions and try again.",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::StorageFull)),
+            InstanceStoreFailureClass::StorageFull,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Instance storage is full. Free disk space and try again.",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::Interrupted)),
+            InstanceStoreFailureClass::Interrupted,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The instance update was interrupted. Try again.",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::from(io::ErrorKind::WouldBlock)),
+            InstanceStoreFailureClass::Unsettled,
+            StatusCode::CONFLICT,
+            "Another instance update is still settling. Try again.",
+        ),
+        (
+            InstanceStoreError::Persistence(io::Error::other(
+                "/private/path must never cross the boundary",
+            )),
+            InstanceStoreFailureClass::Other,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not save the instance. Try again.",
+        ),
+        (
+            InstanceStoreError::Root(io::Error::from(io::ErrorKind::NotFound)),
+            InstanceStoreFailureClass::Other,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not save the instance. Try again.",
+        ),
+    ];
+
+    for (error, expected_class, expected_status, expected_message) in cases {
+        assert_eq!(error.failure_class(), expected_class);
+        let (status, Json(body)) =
+            instance_write_error_response(InstanceWriteOperation::Update, error);
+        assert_eq!(status, expected_status);
+        assert_bounded_error_body(&body, expected_message);
+        assert!(!error_body_text(&body).contains("/private/path"));
+    }
+}
+
+#[test]
+fn active_install_recovery_returns_a_bounded_retry_response() {
+    let (status, Json(body)) = known_good_rebuild_error_response(
+        InstanceWriteOperation::Create,
+        crate::state::KnownGoodRebuildError::InstallRecoveryActive,
+    );
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_bounded_error_body(
+        &body,
+        "Install recovery is still restoring version authority. Try again shortly.",
+    );
+}
+
+#[test]
+fn instance_write_error_mapper_bounds_internal_operation_errors() {
+    let cases = [
+        (
+            InstanceWriteOperation::Create,
+            "failed to initialize instance files: /home/zero/.config/Axial/instances/new/logs",
+            "Could not create the instance. Try again.",
+        ),
+        (
+            InstanceWriteOperation::Update,
+            "failed to persist /home/zero/.config/Axial/instances.json",
+            "Could not save the instance. Try again.",
+        ),
+        (
+            InstanceWriteOperation::Delete,
+            "failed to delete C:\\Users\\Zero\\AppData\\Roaming\\Axial\\instances\\old",
+            "Could not delete the instance. Try again.",
+        ),
+    ];
+
+    for (operation, store_message, expected_message) in cases {
+        let (status, Json(body)) = instance_write_error_response(
+            operation,
+            InstanceStoreError::Read(io::Error::other(store_message)),
+        );
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_bounded_error_body(&body, expected_message);
+        let public_message = error_body_text(&body);
+        assert!(!public_message.contains("/home/zero"));
+        assert!(!public_message.contains("C:\\Users\\Zero"));
+        assert!(!public_message.contains("instances.json"));
+    }
+}
+
+#[test]
+fn instance_root_errors_are_classified_and_redacted() {
+    let error =
+        InstanceStoreError::Root(io::Error::other("failed to open /home/zero/.config/Axial"));
+    assert_eq!(instance_store_error_class(&error), "root");
+
+    let (status, Json(body)) = instance_write_error_response(InstanceWriteOperation::Create, error);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_bounded_error_body(&body, "Could not create the instance. Try again.");
+    assert!(!error_body_text(&body).contains("/home/zero"));
+}
+
+#[test]
+fn duplicate_instance_write_error_hides_layout_and_persist_paths() {
+    let store_message = concat!(
+        "failed to duplicate instance files: ",
+        "/home/zero/.config/Axial/instances/source/mods/example.jar; ",
+        "failed to roll back persisted instance: ",
+        "C:\\Users\\Zero\\AppData\\Roaming\\Axial\\config\\instances.json"
+    );
+
+    let (status, Json(body)) = instance_write_error_response(
+        InstanceWriteOperation::Duplicate,
+        InstanceStoreError::Read(io::Error::other(store_message)),
+    );
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_bounded_error_body(&body, "Could not duplicate the instance. Try again.");
+    let public_message = error_body_text(&body);
+    for hidden_fragment in [
+        "/home/zero",
+        ".config",
+        "C:\\Users\\Zero",
+        "AppData",
+        "example.jar",
+        "instances.json",
+        "failed to duplicate instance files",
+    ] {
+        assert!(
+            !public_message.contains(hidden_fragment),
+            "{hidden_fragment:?} leaked in {public_message:?}"
+        );
+    }
+}
+
+#[test]
+fn instance_folder_prepare_error_response_bounds_public_message() {
+    assert_instance_folder_error_response_is_bounded(
+        instance_folder_prepare_error_response,
+        "Could not prepare the instance folder. Check app data permissions and try again.",
+    );
+}
+
+#[test]
+fn instance_folder_open_error_response_bounds_public_message() {
+    assert_instance_folder_error_response_is_bounded(
+        instance_folder_open_error_response,
+        "Could not open the instance folder. Check desktop permissions and try again.",
+    );
+}
+
+#[test]
+fn instance_log_read_error_response_bounds_public_metadata_open_and_read_messages() {
+    let cases = [
+        "metadata failed for /home/zero/.config/Axial/instances/test/logs/latest.log",
+        "open failed for C:\\Users\\Zero\\AppData\\Roaming\\Axial\\instances\\test\\logs\\debug.log",
+        "Permission denied (os error 13) while reading logs/latest.log",
+    ];
+
+    for internal_message in cases {
+        let (status, Json(body)) =
+            instance_log_read_error_response(io::Error::other(internal_message));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_bounded_error_body(&body, INSTANCE_LOG_READ_ERROR_MESSAGE);
+        let public_message = error_body_text(&body);
+        for hidden_fragment in [
+            "/home/zero",
+            ".config",
+            "C:\\Users\\Zero",
+            "AppData",
+            "Permission denied",
+            "os error 13",
+            "latest.log",
+            "debug.log",
+            "logs/",
+            "\\logs\\",
+        ] {
+            assert!(
+                !public_message.contains(hidden_fragment),
+                "{hidden_fragment:?} leaked in {public_message:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn instance_folder_resolver_returns_root_when_subfolder_is_omitted() {
+    let game_dir = FsPath::new("/tmp/axial-instance");
+
+    assert_eq!(
+        resolve_instance_folder(game_dir, None).expect("resolve root"),
+        game_dir
+    );
+}
+
+#[test]
+fn instance_folder_resolver_accepts_allowed_subfolder() {
+    let game_dir = FsPath::new("/tmp/axial-instance");
+
+    assert_eq!(
+        resolve_instance_folder(game_dir, Some("mods")).expect("resolve mods"),
+        game_dir.join("mods")
+    );
+}
+
+#[test]
+fn instance_folder_resolver_rejects_unknown_subfolder() {
+    let game_dir = FsPath::new("/tmp/axial-instance");
+
+    assert_eq!(
+        resolve_instance_folder(game_dir, Some("versions")),
+        Err("invalid instance folder")
+    );
+}
+
+#[test]
+fn instance_folder_resolver_rejects_traversal_like_subfolders() {
+    let game_dir = FsPath::new("/tmp/axial-instance");
+
+    for subfolder in ["..", "../mods", "mods/..", "mods/../logs", "mods\\..\\logs"] {
+        assert_eq!(
+            resolve_instance_folder(game_dir, Some(subfolder)),
+            Err("invalid instance folder"),
+            "{subfolder:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn resource_names_admit_portable_unicode_and_reject_unsafe_names() {
+    for name in [
+        "latest.log",
+        "2026-05-30-1.log.gz",
+        "debug.log",
+        " World",
+        ".hidden.log",
+        "caf\u{e9}.log",
+    ] {
+        assert!(is_safe_resource_name(name), "{name} should be accepted");
+    }
+
+    for name in [
+        "",
+        "   ",
+        "World ",
+        ".",
+        "..",
+        "CON.log",
+        "COM1 .log",
+        "../latest.log",
+        "nested/latest.log",
+        "nested\\latest.log",
+        "cafe\u{301}.log",
+        "bad\nname.log",
+    ] {
+        assert!(!is_safe_resource_name(name), "{name:?} should be rejected");
+    }
+}
+
+#[test]
+fn log_scanner_returns_only_safe_instance_local_file_names() {
+    let root = std::env::temp_dir().join(format!(
+        "axial-api-instance-logs-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default()
+    ));
+    let logs_dir = root.join("logs");
+    fs::create_dir_all(&logs_dir).expect("create logs dir");
+    fs::write(logs_dir.join("latest.log"), "latest").expect("write latest");
+    fs::write(logs_dir.join("debug.log"), "debug").expect("write debug");
+    fs::write(logs_dir.join(".hidden.log"), "hidden").expect("write hidden");
+    fs::create_dir_all(logs_dir.join("nested")).expect("create nested dir");
+    fs::write(logs_dir.join("nested").join("nested.log"), "nested").expect("write nested");
+
+    let mut budget = FilesystemScanBudget::new(FilesystemScanLimits {
+        max_depth: 4,
+        max_entries: 16,
+        max_bytes: 1024,
+    });
+    let names = scan_instance_logs(&logs_dir, &mut budget)
+        .expect("scan logs")
+        .into_iter()
+        .map(|log| log.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(names.first().map(String::as_str), Some("latest.log"));
+    assert_eq!(
+        names.into_iter().collect::<HashSet<_>>(),
+        HashSet::from([
+            "latest.log".to_string(),
+            "debug.log".to_string(),
+            ".hidden.log".to_string(),
+        ])
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn log_scanner_rejects_portable_name_aliases() {
+    let root = std::env::temp_dir().join(format!(
+        "axial-api-instance-log-aliases-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default()
+    ));
+    fs::create_dir_all(&root).expect("create logs dir");
+    fs::write(root.join("Stra\u{df}e.log"), "first").expect("write first alias");
+    fs::write(root.join("STRASSE.LOG"), "second").expect("write second alias");
+    let mut budget = FilesystemScanBudget::new(FilesystemScanLimits {
+        max_depth: 1,
+        max_entries: 4,
+        max_bytes: 1024,
+    });
+
+    assert!(matches!(
+        scan_instance_logs(&root, &mut budget),
+        Err(FilesystemScanError::UnsupportedEntry)
+    ));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn instance_log_tail_rejects_unsafe_log_name() {
+    let fixture = TestFixture::new("log-tail-invalid-name");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Tail invalid log".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+
+    let (status, Json(body)) =
+        handle_instance_log_tail(&fixture.state, &instance.id, "../latest.log")
+            .await
+            .expect_err("unsafe log name should fail");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_bounded_error_body(&body, "invalid log filename");
+}
+
+#[tokio::test]
+async fn native_filesystem_contract_log_tail_returns_bounded_truncated_held_file_tail() {
+    let fixture = TestFixture::new("log-tail-truncated");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Tail truncated log".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let logs_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("logs");
+    fs::create_dir_all(&logs_dir).expect("create logs dir");
+    let discarded = b"discarded";
+    let mut bytes = discarded.to_vec();
+    bytes.resize(discarded.len() + LOG_TAIL_LIMIT as usize, b't');
+    fs::write(logs_dir.join("latest.log"), &bytes).expect("write log");
+
+    let response = handle_instance_log_tail(&fixture.state, &instance.id, "latest.log")
+        .await
+        .expect("tail log");
+
+    assert_eq!(response.name, "latest.log");
+    assert_eq!(response.size, LOG_TAIL_LIMIT + discarded.len() as u64);
+    assert!(response.truncated);
+    assert_eq!(response.text.len(), LOG_TAIL_LIMIT as usize);
+    assert!(response.text.bytes().all(|byte| byte == b't'));
+}
+
+#[tokio::test]
+async fn instance_log_tail_redacts_sensitive_public_lines() {
+    let fixture = TestFixture::new("log-tail-redacts-sensitive-lines");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Redacted log tail".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let logs_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("logs");
+    fs::create_dir_all(&logs_dir).expect("create logs dir");
+    fs::write(
+        logs_dir.join("latest.log"),
+        "[Render thread/INFO]: Reloading ResourceManager: vanilla\nfailed for /home/alice/.minecraft java.exe --accessToken raw-secret-token -Xmx8192M provider_payload=provider-secret account_id=account-secret username=SecretPlayer\n",
+    )
+    .expect("write log");
+
+    let response = handle_instance_log_tail(&fixture.state, &instance.id, "latest.log")
+        .await
+        .expect("tail log");
+
+    assert!(response.text.contains("[Render thread/INFO]"));
+    assert!(
+        response
+            .text
+            .contains(crate::observability::PUBLIC_LOG_LINE_REDACTED)
+    );
+    for fragment in [
+        "/home/alice",
+        ".minecraft",
+        "java.exe",
+        "--accessToken",
+        "raw-secret-token",
+        "-Xmx8192M",
+        "provider_payload",
+        "provider-secret",
+        "account_id",
+        "account-secret",
+        "username",
+        "SecretPlayer",
+    ] {
+        assert!(
+            !response.text.contains(fragment),
+            "instance log tail leaked fragment {fragment:?}: {}",
+            response.text
+        );
+    }
+}
+
+#[test]
+fn instance_screenshot_names_follow_portable_backend_policy() {
+    for name in [
+        "2026-05-31_12.00.00.png",
+        "castle build.jpg",
+        "base.jpeg",
+        "nether.webp",
+        ".hidden.png",
+        " shot.png",
+        "caf\u{e9}.png",
+    ] {
+        assert!(
+            validate_screenshot_name(name).is_ok(),
+            "{name} should be accepted"
+        );
+    }
+
+    for name in [
+        "",
+        "   ",
+        ".",
+        "..",
+        "../shot.png",
+        "nested/shot.png",
+        "nested\\shot.png",
+        "bad\nshot.png",
+        "cafe\u{301}.png",
+        "shot.png ",
+        "notes.txt",
+    ] {
+        let (status, Json(body)) =
+            validate_screenshot_name(name).expect_err("invalid screenshot name should fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?}");
+        assert_bounded_error_body(&body, "invalid screenshot filename");
+    }
+}
+
+#[test]
+fn instance_screenshot_content_type_maps_supported_extensions() {
+    assert_eq!(screenshot_content_type("shot.png"), Some("image/png"));
+    assert_eq!(screenshot_content_type("shot.JPG"), Some("image/jpeg"));
+    assert_eq!(screenshot_content_type("shot.jpeg"), Some("image/jpeg"));
+    assert_eq!(screenshot_content_type("shot.webp"), Some("image/webp"));
+    assert_eq!(screenshot_content_type("shot.gif"), None);
+}
+
+#[tokio::test]
+async fn native_filesystem_contract_screenshot_file_serves_bounded_held_file_with_nosniff() {
+    let fixture = TestFixture::new("screenshot-file");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Serve screenshots".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let screenshots_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("screenshots");
+    fs::create_dir_all(&screenshots_dir).expect("create screenshots dir");
+    fs::write(screenshots_dir.join("shot.PNG"), [137, 80, 78, 71]).expect("write screenshot");
+
+    let response = handle_instance_screenshot_file(&fixture.state, &instance.id, "shot.PNG")
+        .await
+        .expect("serve screenshot");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("image/png"))
+    );
+    assert_eq!(
+        response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+        Some(&HeaderValue::from_static("nosniff"))
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("read screenshot body");
+    assert_eq!(&body[..], &[137, 80, 78, 71]);
+
+    let (status, Json(body)) =
+        handle_instance_screenshot_file(&fixture.state, &instance.id, "../shot.PNG")
+            .await
+            .expect_err("traversal should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_bounded_error_body(&body, "invalid screenshot filename");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_filesystem_contract_resource_reads_refuse_symlinked_screenshot_and_log_files() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("resource-held-file-symlinks");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Held resource reads".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let screenshots_dir = game_dir.join("screenshots");
+    let logs_dir = game_dir.join("logs");
+    fs::create_dir_all(&screenshots_dir).expect("create screenshots dir");
+    fs::create_dir_all(&logs_dir).expect("create logs dir");
+    let external = game_dir
+        .parent()
+        .expect("instance parent")
+        .join("outside-resource.txt");
+    fs::write(&external, b"outside-secret").expect("write external resource");
+    symlink(&external, screenshots_dir.join("linked.png")).expect("link screenshot");
+    symlink(&external, logs_dir.join("linked.log")).expect("link log");
+
+    assert!(
+        handle_instance_screenshot_file(&fixture.state, &instance.id, "linked.png")
+            .await
+            .is_err()
+    );
+    assert!(
+        handle_instance_log_tail(&fixture.state, &instance.id, "linked.log")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(&external).expect("read external resource"),
+        b"outside-secret"
+    );
+
+    let linked_instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Linked resource roots".to_string(), "1.21.1".to_string())
+        .expect("add linked-root instance");
+    let linked_game_dir = fixture.state.instances().game_dir(&linked_instance.id);
+    fs::create_dir_all(&linked_game_dir).expect("create linked-root instance");
+    let external_directory = linked_game_dir
+        .parent()
+        .expect("linked-root instance parent")
+        .join("outside-resource-directory");
+    fs::create_dir_all(&external_directory).expect("create external resource directory");
+    fs::write(external_directory.join("outside.png"), b"outside-image")
+        .expect("write external image");
+    fs::write(external_directory.join("outside.log"), b"outside-log").expect("write external log");
+    fs::remove_dir(linked_game_dir.join("screenshots")).expect("remove screenshots directory");
+    fs::remove_dir(linked_game_dir.join("logs")).expect("remove logs directory");
+    symlink(&external_directory, linked_game_dir.join("screenshots"))
+        .expect("link screenshots directory");
+    symlink(&external_directory, linked_game_dir.join("logs")).expect("link logs directory");
+
+    assert!(
+        handle_instance_screenshot_file(&fixture.state, &linked_instance.id, "outside.png")
+            .await
+            .is_err()
+    );
+    assert!(
+        handle_instance_log_tail(&fixture.state, &linked_instance.id, "outside.log")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn instance_screenshot_file_rejects_too_large_image() {
+    let fixture = TestFixture::new("screenshot-file-too-large");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Large screenshot".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let screenshots_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("screenshots");
+    fs::create_dir_all(&screenshots_dir).expect("create screenshots dir");
+    let file =
+        fs::File::create(screenshots_dir.join("too-large.png")).expect("create large screenshot");
+    file.set_len(SCREENSHOT_FILE_MAX_BYTES + 1)
+        .expect("size large screenshot");
+
+    let (status, Json(body)) =
+        handle_instance_screenshot_file(&fixture.state, &instance.id, "too-large.png")
+            .await
+            .expect_err("too-large screenshot should fail");
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_bounded_error_body(&body, "screenshot file is too large");
+}
+
+#[tokio::test]
+async fn instance_screenshot_rename_reports_not_found_conflict_and_success() {
+    let fixture = TestFixture::new("screenshot-rename");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Rename screenshots".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let screenshots_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("screenshots");
+    fs::create_dir_all(&screenshots_dir).expect("create screenshots dir");
+
+    let (status, Json(body)) = handle_rename_instance_screenshot(
+        &fixture.state,
+        &instance.id,
+        "missing.png",
+        RenameScreenshotRequest {
+            name: "target.png".to_string(),
+        },
+    )
+    .await
+    .expect_err("missing source should fail");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_bounded_error_body(&body, "screenshot not found");
+
+    fs::write(screenshots_dir.join("source.png"), "source").expect("write source");
+    fs::write(screenshots_dir.join("target.png"), "target").expect("write target");
+    let (status, Json(body)) = handle_rename_instance_screenshot(
+        &fixture.state,
+        &instance.id,
+        "source.png",
+        RenameScreenshotRequest {
+            name: "target.png".to_string(),
+        },
+    )
+    .await
+    .expect_err("existing target should fail");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(&body, "screenshot already exists");
+    assert_eq!(
+        fs::read_to_string(screenshots_dir.join("source.png")).expect("read source"),
+        "source"
+    );
+
+    let (status, Json(body)) = handle_rename_instance_screenshot(
+        &fixture.state,
+        &instance.id,
+        "source.png",
+        RenameScreenshotRequest {
+            name: "renamed.webp".to_string(),
+        },
+    )
+    .await
+    .expect_err("changing screenshot type should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_bounded_error_body(&body, "screenshot file type cannot change");
+    assert_eq!(
+        fs::read_to_string(screenshots_dir.join("source.png")).expect("read source"),
+        "source"
+    );
+
+    let body = handle_rename_instance_screenshot(
+        &fixture.state,
+        &instance.id,
+        "source.png",
+        RenameScreenshotRequest {
+            name: "renamed.png".to_string(),
+        },
+    )
+    .await
+    .expect("rename screenshot");
+    assert_eq!(
+        body,
+        serde_json::json!({ "status": "ok", "name": "renamed.png" })
+    );
+    assert!(!screenshots_dir.join("source.png").exists());
+    assert_eq!(
+        fs::read_to_string(screenshots_dir.join("renamed.png")).expect("read renamed"),
+        "source"
+    );
+}
+
+#[tokio::test]
+async fn instance_screenshot_delete_removes_only_named_file() {
+    let fixture = TestFixture::new("screenshot-delete");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Delete screenshots".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let screenshots_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("screenshots");
+    fs::create_dir_all(&screenshots_dir).expect("create screenshots dir");
+    fs::write(screenshots_dir.join("delete.png"), "deleted").expect("write deleted");
+    fs::write(screenshots_dir.join("keep.png"), "kept").expect("write kept");
+
+    let body = handle_delete_instance_screenshot(&fixture.state, &instance.id, "delete.png")
+        .await
+        .expect("delete screenshot");
+
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert!(!screenshots_dir.join("delete.png").exists());
+    assert_eq!(
+        fs::read_to_string(screenshots_dir.join("keep.png")).expect("read kept"),
+        "kept"
+    );
+}
+
+#[test]
+fn instance_screenshot_error_responses_do_not_leak_paths() {
+    for mapper in [
+        screenshot_file_read_error_response
+            as fn(io::Error) -> (StatusCode, Json<serde_json::Value>),
+        screenshot_file_write_error_response,
+    ] {
+        let (status, Json(body)) = mapper(io::Error::other(
+            "failed for /home/zero/.config/Axial/instances/test/screenshots/shot.png",
+        ));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let public_message = error_body_text(&body);
+        assert!(!public_message.contains("/home/zero"));
+        assert!(!public_message.contains("shot.png"));
+        assert!(public_message.len() <= 180);
+    }
+}
+
+#[test]
+fn instance_mod_names_admit_portable_unicode_and_reject_unsafe_names() {
+    for name in [
+        "sodium.jar",
+        "Sodium.JAR",
+        "sodium.jar.disabled",
+        ".hidden.jar",
+        " caf\u{e9}.jar",
+    ] {
+        assert!(validate_mod_name(name).is_ok(), "{name} should be accepted");
+    }
+
+    for name in [
+        "",
+        "   ",
+        ".",
+        "..",
+        "CON.jar",
+        ".axial-pack-staging.jar",
+        "cafe\u{301}.jar",
+        "../mod.jar",
+        "nested/mod.jar",
+        "nested\\mod.jar",
+        "bad\nmod.jar",
+        "notes.txt",
+        "mod.disabled",
+    ] {
+        let (status, Json(body)) =
+            validate_mod_name(name).expect_err("invalid mod name should fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?}");
+        assert_bounded_error_body(&body, "invalid mod filename");
+    }
+}
+
+fn save_managed_mod_manifest(
+    game_dir: &FsPath,
+    filename: &str,
+    enabled: bool,
+    bytes: &[u8],
+) -> axial_content::ContentManifest {
+    let disk_name = if enabled {
+        filename.to_string()
+    } else {
+        format!("{filename}.disabled")
+    };
+    let path = game_dir.join("mods").join(disk_name);
+    fs::write(&path, bytes).expect("write managed mod");
+    let file = axial_content::FileRef {
+        url: format!("https://example.invalid/{filename}"),
+        filename: filename.to_string(),
+        sha1: None,
+        sha512: Some(axial_content::sha512_file(&path).expect("hash managed mod")),
+        size: Some(bytes.len() as u64),
+        primary: true,
+    };
+    let canonical_id =
+        axial_content::CanonicalId::for_project(axial_content::ProviderId::Modrinth, "managed-mod");
+    let entry = axial_content::ManifestEntry::managed(
+        canonical_id.clone(),
+        axial_content::ProviderId::Modrinth,
+        "managed-mod".to_string(),
+        "managed-version".to_string(),
+        axial_content::ContentKind::Mod,
+        &file,
+        Vec::new(),
+        None,
+    )
+    .expect("valid managed entry");
+    let mut manifest =
+        axial_content::ContentManifest::load(game_dir).expect("load current managed manifest");
+    manifest
+        .try_upsert(entry)
+        .expect("insert managed manifest entry");
+    if !enabled {
+        manifest
+            .try_set_enabled(&canonical_id, false)
+            .expect("disable managed entry");
+    }
+    manifest.save(game_dir).expect("save managed manifest");
+    manifest
+}
+
+fn insert_mod_capable_instance(fixture: &TestFixture, name: &str) -> Instance {
+    let mut instance = fixture
+        .state
+        .instances()
+        .insert_for_test(name.to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    instance.loader_key = "fabric".to_string();
+    instance.minecraft_version = "1.21.1".to_string();
+    fixture
+        .state
+        .instances()
+        .replace_for_test(instance.clone())
+        .expect("store mod-capable instance");
+    instance
+}
+
+#[tokio::test]
+async fn instance_mod_update_reports_not_found_conflict_and_success() {
+    let fixture = TestFixture::new("mod-update");
+    let instance = insert_mod_capable_instance(&fixture, "Update mods");
+    let mods_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+
+    let (status, Json(body)) = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "missing.jar",
+        UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("missing source should fail");
+    assert_eq!(status, StatusCode::NOT_FOUND, "response body: {body}");
+    assert_bounded_error_body(&body, "mod not found");
+
+    fs::write(mods_dir.join("source.jar.disabled"), "source").expect("write disabled mod");
+    fs::write(mods_dir.join("source.jar"), "target").expect("write existing target");
+    let (status, Json(body)) = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "source.jar.disabled",
+        UpdateModRequest { enabled: true },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("existing target should fail");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(&body, "mod already exists");
+    assert_eq!(
+        fs::read(mods_dir.join("source.jar.disabled")).expect("read conflict source"),
+        b"source"
+    );
+    assert_eq!(
+        fs::read(mods_dir.join("source.jar")).expect("read conflict target"),
+        b"target"
+    );
+    fs::remove_file(mods_dir.join("source.jar")).expect("remove conflict target");
+    fs::remove_file(mods_dir.join("source.jar.disabled")).expect("remove conflict source");
+
+    fs::write(mods_dir.join("toggle.jar"), "toggle").expect("write enabled mod");
+    let body = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "toggle.jar",
+        UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("disable mod");
+    assert_eq!(
+        body,
+        serde_json::json!({ "status": "ok", "name": "toggle.jar.disabled", "enabled": false })
+    );
+    assert!(!mods_dir.join("toggle.jar").exists());
+    assert_eq!(
+        fs::read_to_string(mods_dir.join("toggle.jar.disabled")).expect("read disabled mod"),
+        "toggle"
+    );
+
+    let body = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "toggle.jar.disabled",
+        UpdateModRequest { enabled: true },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("enable mod");
+    assert_eq!(
+        body,
+        serde_json::json!({ "status": "ok", "name": "toggle.jar", "enabled": true })
+    );
+    assert!(mods_dir.join("toggle.jar").is_file());
+    assert!(!mods_dir.join("toggle.jar.disabled").exists());
+}
+
+#[tokio::test]
+async fn instance_mod_update_preserves_zero_bytes_and_updates_managed_state() {
+    let fixture = TestFixture::new("mod-update-zero-managed");
+    let instance = insert_mod_capable_instance(&fixture, "Zero and managed mods");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let mods_dir = game_dir.join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+
+    fs::write(mods_dir.join("empty.jar"), []).expect("write empty mod");
+    handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "empty.jar",
+        UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("disable empty mod");
+    assert_eq!(
+        fs::read(mods_dir.join("empty.jar.disabled")).expect("read empty disabled mod"),
+        b""
+    );
+    assert!(!mods_dir.join("empty.jar").exists());
+
+    save_managed_mod_manifest(&game_dir, "managed.jar", true, b"managed bytes");
+    handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "managed.jar",
+        UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("disable managed mod");
+    let manifest = axial_content::ContentManifest::load(&game_dir).expect("load manifest");
+    assert!(!manifest.entries()[0].enabled());
+    assert_eq!(
+        fs::read(mods_dir.join("managed.jar.disabled")).expect("read managed disabled mod"),
+        b"managed bytes"
+    );
+    assert!(!mods_dir.join("managed.jar").exists());
+
+    fs::rename(
+        mods_dir.join("managed.jar.disabled"),
+        mods_dir.join("managed.jar"),
+    )
+    .expect("create managed state drift");
+    let (status, Json(body)) = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "managed.jar",
+        UpdateModRequest { enabled: true },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("unobserved manifest repair must fail closed");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(
+        &body,
+        "mod files changed while they were being updated; refresh and try again",
+    );
+    let manifest = axial_content::ContentManifest::load(&game_dir).expect("load drifted manifest");
+    assert!(!manifest.entries()[0].enabled());
+    assert_eq!(
+        fs::read(mods_dir.join("managed.jar")).expect("read drifted managed mod"),
+        b"managed bytes"
+    );
+}
+
+#[tokio::test]
+async fn instance_mod_mutation_admission_blocks_update_apply_for_its_full_lease() {
+    let fixture = TestFixture::new("mod-update-admission");
+    let lease =
+        super::resources::admit_instance_mod_mutation(&fixture.state).expect("admit mod mutation");
+
+    assert_eq!(
+        fixture.state.try_begin_update_apply().unwrap_err(),
+        UpdateApplyAdmissionError::ActiveOperations
+    );
+
+    drop(lease);
+    fixture
+        .state
+        .try_begin_update_apply()
+        .expect("released mod mutation reopens update apply");
+}
+
+#[tokio::test]
+async fn update_apply_rejects_mod_toggle_and_delete_before_disk_mutation() {
+    let fixture = TestFixture::new("mod-update-apply-rejection");
+    let _apply = fixture
+        .state
+        .try_begin_update_apply()
+        .expect("begin update apply");
+
+    assert_update_admission_rejects_mod_mutations(
+        &fixture,
+        "Content changes are unavailable while an update is being applied.",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn update_restart_pending_rejects_mod_toggle_and_delete_before_disk_mutation() {
+    let fixture = TestFixture::new("mod-update-restart-pending-rejection");
+    fixture
+        .state
+        .try_begin_update_apply()
+        .expect("begin update apply")
+        .mark_restart_pending();
+
+    assert_update_admission_rejects_mod_mutations(
+        &fixture,
+        "Restart Axial to finish the applied update before changing content.",
+    )
+    .await;
+}
+
+async fn assert_update_admission_rejects_mod_mutations(
+    fixture: &TestFixture,
+    expected_message: &str,
+) {
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test(
+            "Update apply mod boundary".to_string(),
+            "1.21.1".to_string(),
+        )
+        .expect("add instance");
+    let mods_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+    fs::write(mods_dir.join("toggle.jar"), b"toggle").expect("write toggle mod");
+    fs::write(mods_dir.join("delete.jar"), b"delete").expect("write delete mod");
+
+    let (toggle_status, Json(toggle_body)) = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "toggle.jar",
+        UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("update apply must reject mod toggle");
+    assert_eq!(toggle_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_bounded_error_body(&toggle_body, expected_message);
+
+    let (delete_status, Json(delete_body)) = handle_delete_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "delete.jar",
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("update apply must reject mod delete");
+    assert_eq!(delete_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_bounded_error_body(&delete_body, expected_message);
+
+    assert_eq!(
+        fs::read(mods_dir.join("toggle.jar")).expect("toggle mod remains"),
+        b"toggle"
+    );
+    assert!(!mods_dir.join("toggle.jar.disabled").exists());
+    assert_eq!(
+        fs::read(mods_dir.join("delete.jar")).expect("delete mod remains"),
+        b"delete"
+    );
+}
+
+#[tokio::test]
+async fn instance_mod_disable_treats_drifted_managed_filename_as_local() {
+    let fixture = TestFixture::new("mod-disable-drift");
+    let instance = insert_mod_capable_instance(&fixture, "Disable drifted mod");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let mods_dir = game_dir.join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+    let manifest = save_managed_mod_manifest(&game_dir, "drift.jar", true, b"managed");
+    let manifest_path = game_dir.join("axial.content.json");
+    let manifest_before = fs::read(&manifest_path).expect("read manifest before disable");
+    fs::write(mods_dir.join("drift.jar"), b"drifted").expect("replace managed mod");
+
+    let body = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "drift.jar",
+        UpdateModRequest { enabled: false },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("disable drifted mod");
+
+    assert_eq!(
+        body,
+        serde_json::json!({ "status": "ok", "name": "drift.jar.disabled", "enabled": false })
+    );
+    assert!(!mods_dir.join("drift.jar").exists());
+    assert_eq!(
+        fs::read(mods_dir.join("drift.jar.disabled")).expect("read disabled replacement"),
+        b"drifted"
+    );
+    assert_eq!(
+        fs::read(&manifest_path).expect("read manifest after disable"),
+        manifest_before
+    );
+    assert_eq!(
+        axial_content::ContentManifest::load(&game_dir).expect("load manifest after disable"),
+        manifest
+    );
+}
+
+#[tokio::test]
+async fn instance_mod_enable_treats_drifted_managed_filename_as_local() {
+    let fixture = TestFixture::new("mod-enable-drift");
+    let instance = insert_mod_capable_instance(&fixture, "Enable drifted mod");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let mods_dir = game_dir.join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+    let manifest = save_managed_mod_manifest(&game_dir, "drift.jar", false, b"managed");
+    let manifest_path = game_dir.join("axial.content.json");
+    let manifest_before = fs::read(&manifest_path).expect("read manifest before enable");
+    fs::write(mods_dir.join("drift.jar.disabled"), b"drifted").expect("replace managed mod");
+
+    let body = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "drift.jar.disabled",
+        UpdateModRequest { enabled: true },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("enable drifted mod");
+
+    assert_eq!(
+        body,
+        serde_json::json!({ "status": "ok", "name": "drift.jar", "enabled": true })
+    );
+    assert!(!mods_dir.join("drift.jar.disabled").exists());
+    assert_eq!(
+        fs::read(mods_dir.join("drift.jar")).expect("read enabled replacement"),
+        b"drifted"
+    );
+    assert_eq!(
+        fs::read(&manifest_path).expect("read manifest after enable"),
+        manifest_before
+    );
+    assert_eq!(
+        axial_content::ContentManifest::load(&game_dir).expect("load manifest after enable"),
+        manifest
+    );
+}
+
+#[tokio::test]
+async fn instance_mod_delete_removes_only_named_mod_file() {
+    let fixture = TestFixture::new("mod-delete");
+    let instance = insert_mod_capable_instance(&fixture, "Delete mods");
+    let mods_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+    fs::write(mods_dir.join("delete.jar"), "deleted").expect("write deleted mod");
+    fs::write(mods_dir.join("keep.jar"), "kept").expect("write kept mod");
+
+    let body = handle_delete_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "delete.jar",
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("delete mod");
+
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert!(!mods_dir.join("delete.jar").exists());
+    assert_eq!(
+        fs::read_to_string(mods_dir.join("keep.jar")).expect("read kept mod"),
+        "kept"
+    );
+}
+
+#[tokio::test]
+async fn instance_mod_delete_treats_drifted_managed_filename_as_local() {
+    let fixture = TestFixture::new("mod-delete-drift");
+    let instance = insert_mod_capable_instance(&fixture, "Delete drifted mod");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let mods_dir = game_dir.join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+    let manifest = save_managed_mod_manifest(&game_dir, "drift.jar", true, b"managed");
+    let manifest_path = game_dir.join("axial.content.json");
+    let manifest_before = fs::read(&manifest_path).expect("read manifest before delete");
+    fs::write(mods_dir.join("drift.jar"), b"drifted").expect("replace managed mod");
+
+    let body = handle_delete_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "drift.jar",
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("delete drifted mod");
+
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert!(!mods_dir.join("drift.jar").exists());
+    assert_eq!(
+        fs::read(&manifest_path).expect("read manifest after delete"),
+        manifest_before
+    );
+    assert_eq!(
+        axial_content::ContentManifest::load(&game_dir).expect("load manifest after delete"),
+        manifest
+    );
+}
+
+#[tokio::test]
+async fn instance_mod_delete_refuses_exact_managed_file() {
+    let fixture = TestFixture::new("mod-delete-managed");
+    let instance = insert_mod_capable_instance(&fixture, "Keep managed mod");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let manifest = save_managed_mod_manifest(&game_dir, "managed.jar", true, b"managed");
+
+    let (status, Json(body)) = handle_delete_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "managed.jar",
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("managed mod must not be deleted manually");
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(
+        &body,
+        "managed mods must be removed through content operations",
+    );
+    assert_eq!(
+        fs::read(game_dir.join("mods/managed.jar")).expect("managed file retained"),
+        b"managed"
+    );
+    assert_eq!(
+        axial_content::ContentManifest::load(&game_dir).expect("load retained manifest"),
+        manifest
+    );
+}
+
+#[test]
+fn instance_world_names_follow_portable_backend_policy() {
+    for name in [
+        "World",
+        "My World",
+        "World-2026_05_31",
+        ".hidden",
+        " World",
+        "caf\u{e9}",
+    ] {
+        assert!(
+            validate_world_name(name).is_ok(),
+            "{name} should be accepted"
+        );
+    }
+
+    for name in [
+        "",
+        "   ",
+        ".",
+        "..",
+        "../World",
+        "nested/World",
+        "nested\\World",
+        "cafe\u{301}",
+        "World ",
+        "CON",
+        "bad\nworld",
+    ] {
+        let (status, Json(body)) =
+            validate_world_name(name).expect_err("invalid world name should fail");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?}");
+        assert_bounded_error_body(&body, "invalid world name");
+    }
+}
+
+#[tokio::test]
+async fn instance_world_rename_reports_not_found_conflict_and_success() {
+    let fixture = TestFixture::new("world-rename");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Rename worlds".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let saves_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("saves");
+
+    let (status, Json(body)) = handle_rename_instance_world(
+        &fixture.state,
+        &instance.id,
+        "Missing",
+        RenameWorldRequest {
+            name: "Target".to_string(),
+        },
+    )
+    .await
+    .expect_err("missing source should fail");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_bounded_error_body(&body, "world not found");
+
+    fs::create_dir_all(saves_dir.join("World A")).expect("create source world");
+    fs::create_dir_all(saves_dir.join("Existing")).expect("create existing world");
+    let (status, Json(body)) = handle_rename_instance_world(
+        &fixture.state,
+        &instance.id,
+        "World A",
+        RenameWorldRequest {
+            name: "Existing".to_string(),
+        },
+    )
+    .await
+    .expect_err("existing target should fail");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(&body, "world already exists");
+    assert!(saves_dir.join("World A").is_dir());
+
+    let body = handle_rename_instance_world(
+        &fixture.state,
+        &instance.id,
+        "World A",
+        RenameWorldRequest {
+            name: "Renamed".to_string(),
+        },
+    )
+    .await
+    .expect("rename world");
+    assert_eq!(
+        body,
+        serde_json::json!({ "status": "ok", "name": "Renamed" })
+    );
+    assert!(!saves_dir.join("World A").exists());
+    assert!(saves_dir.join("Renamed").is_dir());
+}
+
+#[tokio::test]
+async fn instance_world_delete_removes_only_named_world_directory() {
+    let fixture = TestFixture::new("world-delete");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Delete worlds".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let saves_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("saves");
+    fs::create_dir_all(saves_dir.join("Delete Me")).expect("create deleted world");
+    fs::write(saves_dir.join("Delete Me").join("level.dat"), "deleted").expect("write level");
+    fs::create_dir_all(saves_dir.join("Keep Me")).expect("create kept world");
+    fs::write(saves_dir.join("Keep Me").join("level.dat"), "kept").expect("write kept");
+
+    let body = handle_delete_instance_world(&fixture.state, &instance.id, "Delete Me")
+        .await
+        .expect("delete world");
+
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert!(!saves_dir.join("Delete Me").exists());
+    assert_eq!(
+        fs::read_to_string(saves_dir.join("Keep Me").join("level.dat")).expect("read kept"),
+        "kept"
+    );
+}
+
+#[tokio::test]
+async fn native_filesystem_contract_world_backup_copies_directory_to_instance_local_label() {
+    let fixture = TestFixture::new("world-backup");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Backup worlds".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let world_dir = game_dir.join("saves").join("Backup Me");
+    fs::create_dir_all(world_dir.join("data")).expect("create world data");
+    fs::write(world_dir.join("level.dat"), "level").expect("write level");
+    fs::write(world_dir.join("data").join("map.dat"), "map").expect("write map");
+
+    let body = handle_backup_instance_world(
+        &fixture.state,
+        &instance.id,
+        "Backup Me",
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("backup world");
+
+    assert_eq!(body.status, "ok");
+    assert!(body.backup.starts_with("Backup Me-"));
+    assert_eq!(body.location, format!("backups/worlds/{}", body.backup));
+    assert!(
+        !body
+            .location
+            .contains(&game_dir.to_string_lossy().to_string())
+    );
+
+    let backup_dir = game_dir.join("backups").join("worlds").join(&body.backup);
+    assert_eq!(
+        fs::read_to_string(backup_dir.join("level.dat")).expect("read backup level"),
+        "level"
+    );
+    assert_eq!(
+        fs::read_to_string(backup_dir.join("data").join("map.dat")).expect("read backup map"),
+        "map"
+    );
+    assert_eq!(
+        fs::read_to_string(world_dir.join("level.dat")).expect("read original level"),
+        "level"
+    );
+}
+
+#[test]
+fn native_filesystem_contract_world_backup_preserves_established_capacity_envelope() {
+    assert_eq!(WORLD_BACKUP_MAX_DEPTH, 64);
+    assert_eq!(WORLD_BACKUP_MAX_ENTRIES, 100_000);
+    assert_eq!(WORLD_BACKUP_MAX_BYTES, 50 * 1024 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn native_filesystem_contract_world_backup_cleans_admitted_temp_after_copy_failure() {
+    const COPY_FAILURE_DEPTH_LIMIT: usize = 2;
+
+    let fixture = TestFixture::new("world-backup-copy-failure");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Deep world", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source = game_dir.join("saves").join("Source World");
+    let backup_root = game_dir.join("backups").join("worlds");
+    fs::create_dir_all(&source).expect("create source");
+    fs::create_dir_all(&backup_root).expect("create backup root");
+
+    let mut nested = source.clone();
+    for index in 0..=COPY_FAILURE_DEPTH_LIMIT + 1 {
+        nested = nested.join(format!("d{index}"));
+        fs::create_dir_all(&nested).expect("create nested source");
+    }
+
+    let lifecycle = fixture.state.acquire_instance_lifecycle(&instance.id).await;
+    let admission = fixture
+        .state
+        .admit_instance_content_authority(lifecycle)
+        .await
+        .expect("admit content authority");
+    let authority = tokio::task::spawn_blocking(move || admission.activate())
+        .await
+        .expect("content authority activation worker")
+        .expect("activate content authority");
+    let saves = authority
+        .directory()
+        .open_child("saves")
+        .expect("open saves")
+        .expect("saves directory");
+    let source = saves
+        .open_child("Source World")
+        .expect("open source world")
+        .expect("source world directory");
+    let backups = authority
+        .directory()
+        .open_child("backups")
+        .expect("open backups")
+        .expect("backups directory");
+    let backup_root = backups
+        .open_child("worlds")
+        .expect("open world backups")
+        .expect("world backups directory");
+    let world = PortableFileName::new_exact("Source World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "copy-failure")
+        .expect("backup name plan");
+    let outcome = copy_world_backup_staged_outcome_with_depth_limit(
+        &source,
+        &backup_root,
+        &plan,
+        COPY_FAILURE_DEPTH_LIMIT,
+    );
+    settle_test_managed_directory(&backup_root);
+    assert!(matches!(
+        outcome,
+        ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::DepthLimit)
+            | ManagedTreeCopyOutcome::CleanupRetained {
+                cause: ManagedTreeCopyFailure::DepthLimit,
+                ..
+            }
+    ));
+    let leftovers = fs::read_dir(game_dir.join("backups").join("worlds"))
+        .expect("read backup root")
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    assert!(
+        leftovers.is_empty(),
+        "identity-bound backup staging should be removed after certain failure"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_filesystem_world_scan_rejects_symlink_cycle_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("world-scan-symlink-cycle");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Linked world".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let world_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("saves")
+        .join("World");
+    fs::create_dir_all(world_dir.join("nested")).expect("create world");
+    symlink(&world_dir, world_dir.join("nested").join("cycle")).expect("create cycle link");
+
+    let (status, Json(body)) = handle_instance_worlds(&fixture.state, &instance.id)
+        .await
+        .expect_err("linked world should be rejected");
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_bounded_error_body(
+        &body,
+        "instance resources contain unsupported filesystem entries",
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_filesystem_contract_world_backup_rejects_links_and_cleans_staging() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("world-backup-link");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Linked backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source = game_dir.join("saves").join("Linked World");
+    let backup_root = game_dir.join("backups").join("worlds");
+    fs::create_dir_all(&source).expect("create source");
+    fs::create_dir_all(&backup_root).expect("create backup root");
+    symlink(&game_dir, source.join("outside")).expect("create source link");
+
+    let lifecycle = fixture.state.acquire_instance_lifecycle(&instance.id).await;
+    let admission = fixture
+        .state
+        .admit_instance_content_authority(lifecycle)
+        .await
+        .expect("admit content authority");
+    let authority = tokio::task::spawn_blocking(move || admission.activate())
+        .await
+        .expect("content authority activation worker")
+        .expect("activate content authority");
+    let saves = authority
+        .directory()
+        .open_child("saves")
+        .expect("open saves")
+        .expect("saves directory");
+    let source = saves
+        .open_child("Linked World")
+        .expect("open linked world")
+        .expect("linked world directory");
+    let backups = authority
+        .directory()
+        .open_child("backups")
+        .expect("open backups")
+        .expect("backups directory");
+    let backup_root = backups
+        .open_child("worlds")
+        .expect("open world backups")
+        .expect("world backups directory");
+    let world = PortableFileName::new_exact("Linked World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "linked-source")
+        .expect("backup name plan");
+    let outcome = copy_world_backup_staged_outcome(&source, &backup_root, &plan);
+    settle_test_managed_directory(&backup_root);
+    assert!(matches!(
+        outcome,
+        ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::UnsupportedEntry)
+            | ManagedTreeCopyOutcome::CleanupRetained {
+                cause: ManagedTreeCopyFailure::UnsupportedEntry,
+                ..
+            }
+    ));
+    assert_eq!(
+        fs::read_dir(game_dir.join("backups").join("worlds"))
+            .expect("read backup root")
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn native_filesystem_contract_world_backup_rejects_source_mutation_without_publication() {
+    let fixture = TestFixture::new("world-backup-source-mutation");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Mutating backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source_path = game_dir.join("saves").join("Mutable World");
+    let backup_path = game_dir.join("backups").join("worlds");
+    fs::create_dir_all(&source_path).expect("create source world");
+    fs::create_dir_all(&backup_path).expect("create backup root");
+    fs::write(source_path.join("level.dat"), b"before").expect("write source level");
+    let (source, backup_root) =
+        admitted_world_backup_directories(&fixture.state, &instance.id, "Mutable World").await;
+    let world = PortableFileName::new_exact("Mutable World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "source-mutation")
+        .expect("backup name plan");
+    let mutation_path = source_path.clone();
+
+    let outcome =
+        copy_world_backup_staged_outcome_with_hook(&source, &backup_root, &plan, move || {
+            fs::write(mutation_path.join("late.dat"), b"late mutation")
+                .expect("mutate source after revision capture");
+            Ok(())
+        });
+    settle_test_managed_directory(&backup_root);
+    assert!(matches!(
+        outcome,
+        ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::Io(ref error))
+            | ManagedTreeCopyOutcome::CleanupRetained {
+                cause: ManagedTreeCopyFailure::Io(ref error),
+                ..
+            } if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert_eq!(
+        fs::read_dir(&backup_path)
+            .expect("read backup root")
+            .count(),
+        0,
+        "source drift must clean its private stage and publish no backup"
+    );
+}
+
+#[tokio::test]
+async fn native_filesystem_contract_world_backup_cleans_stage_after_storage_exhaustion() {
+    let fixture = TestFixture::new("world-backup-storage-full");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Storage full backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source_path = game_dir.join("saves").join("Storage World");
+    let backup_path = game_dir.join("backups").join("worlds");
+    fs::create_dir_all(&source_path).expect("create source world");
+    fs::create_dir_all(&backup_path).expect("create backup root");
+    fs::write(source_path.join("level.dat"), b"level").expect("write source level");
+    let (source, backup_root) =
+        admitted_world_backup_directories(&fixture.state, &instance.id, "Storage World").await;
+    let world = PortableFileName::new_exact("Storage World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "storage-full")
+        .expect("backup name plan");
+
+    let outcome = copy_world_backup_staged_outcome_with_hook(&source, &backup_root, &plan, || {
+        Err(io::Error::from(io::ErrorKind::StorageFull))
+    });
+    settle_test_managed_directory(&backup_root);
+    assert!(matches!(
+        outcome,
+        ManagedTreeCopyOutcome::RefusedBeforeMove(ManagedTreeCopyFailure::Io(ref error))
+            | ManagedTreeCopyOutcome::CleanupRetained {
+                cause: ManagedTreeCopyFailure::Io(ref error),
+                ..
+            } if error.kind() == io::ErrorKind::StorageFull
+    ));
+    assert_eq!(
+        fs::read_dir(&backup_path)
+            .expect("read backup root")
+            .count(),
+        0,
+        "storage exhaustion must clean the private stage and publish no backup"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_filesystem_contract_world_backup_refuses_source_binding_replacement() {
+    let fixture = TestFixture::new("world-backup-source-replacement");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Replaced source backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source_path = game_dir.join("saves").join("Bound World");
+    let moved_path = game_dir.join("saves").join("Moved Bound World");
+    let backup_path = game_dir.join("backups").join("worlds");
+    fs::create_dir_all(&source_path).expect("create source world");
+    fs::create_dir_all(&backup_path).expect("create backup root");
+    fs::write(source_path.join("level.dat"), b"bound source").expect("write source level");
+    let (source, backup_root) =
+        admitted_world_backup_directories(&fixture.state, &instance.id, "Bound World").await;
+    fs::rename(&source_path, &moved_path).expect("move bound source");
+    fs::create_dir_all(&source_path).expect("create replacement source");
+    fs::write(source_path.join("level.dat"), b"replacement source")
+        .expect("write replacement source");
+    let world = PortableFileName::new_exact("Bound World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "source-replacement")
+        .expect("backup name plan");
+
+    copy_world_backup_staged(&source, &backup_root, &plan)
+        .expect_err("replaced source binding must be refused");
+
+    assert_eq!(
+        fs::read_dir(&backup_path)
+            .expect("read backup root")
+            .count(),
+        0
+    );
+    assert_eq!(
+        fs::read(moved_path.join("level.dat")).expect("read retained source"),
+        b"bound source"
+    );
+    assert_eq!(
+        fs::read(source_path.join("level.dat")).expect("read replacement source"),
+        b"replacement source"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_filesystem_contract_world_backup_refuses_destination_binding_replacement() {
+    let fixture = TestFixture::new("world-backup-destination-replacement");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Replaced destination backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source_path = game_dir.join("saves").join("Destination World");
+    let backup_path = game_dir.join("backups").join("worlds");
+    let moved_path = game_dir.join("backups").join("moved-worlds");
+    fs::create_dir_all(&source_path).expect("create source world");
+    fs::create_dir_all(&backup_path).expect("create backup root");
+    fs::write(source_path.join("level.dat"), b"source").expect("write source level");
+    let (source, backup_root) =
+        admitted_world_backup_directories(&fixture.state, &instance.id, "Destination World").await;
+    fs::rename(&backup_path, &moved_path).expect("move bound backup root");
+    fs::create_dir_all(&backup_path).expect("create replacement backup root");
+    let world = PortableFileName::new_exact("Destination World").expect("world name");
+    let plan = WorldBackupNamePlan::new(&world, "20260721T010203Z", "target-replacement")
+        .expect("backup name plan");
+
+    copy_world_backup_staged(&source, &backup_root, &plan)
+        .expect_err("replaced destination binding must be refused");
+
+    assert_eq!(
+        fs::read_dir(&backup_path)
+            .expect("read replacement root")
+            .count(),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(&moved_path)
+            .expect("read retained root")
+            .count(),
+        0
+    );
+    assert_eq!(
+        fs::read(source_path.join("level.dat")).expect("read source"),
+        b"source"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_filesystem_contract_cross_owner_world_backup_survives_request_cancellation() {
+    let fixture = TestFixture::new("world-backup-request-cancellation");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Cancelled backup", "1.21.1")
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let source_path = game_dir.join("saves").join("Cancellation World");
+    let backup_path = game_dir.join("backups").join("worlds");
+    fs::create_dir_all(&source_path).expect("create source world");
+    fs::write(source_path.join("level.dat"), b"retained copy").expect("write source level");
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let gate_work = Arc::clone(&gate);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let state = fixture.state.clone();
+    let instance_id = instance.id.clone();
+    let handoff = fixture._request.producer_handoff();
+    let request = tokio::spawn(async move {
+        handle_backup_instance_world_with_hook(
+            &state,
+            &instance_id,
+            "Cancellation World",
+            handoff,
+            Box::new(move || {
+                let _ = started_tx.send(());
+                let (lock, wake) = &*gate_work;
+                let released = lock.lock().expect("lock backup cancellation gate");
+                drop(
+                    wake.wait_while(released, |released| !*released)
+                        .expect("wait for backup release"),
+                );
+            }),
+        )
+        .await
+    });
+    started_rx.await.expect("backup worker reached copy gate");
+    request.abort();
+    assert!(
+        request
+            .await
+            .expect_err("request is cancelled")
+            .is_cancelled()
+    );
+    let (lock, wake) = &*gate;
+    *lock.lock().expect("release backup worker") = true;
+    wake.notify_all();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let settled = backup_path
+                .read_dir()
+                .ok()
+                .and_then(|mut entries| entries.next())
+                .transpose()
+                .ok()
+                .flatten()
+                .is_some()
+                && !fixture.state.instance_lifecycle_is_held(&instance.id).await;
+            if settled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("producer-owned backup settles after request cancellation");
+
+    let entries = fs::read_dir(&backup_path)
+        .expect("read settled backup root")
+        .map(|entry| entry.expect("backup entry"))
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1);
+    assert!(
+        !entries[0]
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".axial-")
+    );
+    assert_eq!(
+        fs::read(entries[0].path().join("level.dat")).expect("read completed backup"),
+        b"retained copy"
+    );
+}
+
+async fn admitted_world_backup_directories(
+    state: &AppState,
+    instance_id: &str,
+    world: &str,
+) -> (
+    crate::state::ManagedInstanceContentDirectory,
+    crate::state::ManagedInstanceContentDirectory,
+) {
+    let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
+    let admission = state
+        .admit_instance_content_authority(lifecycle)
+        .await
+        .expect("admit content authority");
+    let world = world.to_string();
+    tokio::task::spawn_blocking(move || {
+        let authority = admission.activate().expect("activate content authority");
+        let saves = authority
+            .directory()
+            .open_child("saves")
+            .expect("open saves")
+            .expect("saves directory");
+        let source = saves
+            .open_child(&world)
+            .expect("open source world")
+            .expect("source world directory");
+        let backups = authority
+            .directory()
+            .open_or_create_child("backups")
+            .expect("open backups");
+        let backup_root = backups
+            .open_or_create_child("worlds")
+            .expect("open world backups");
+        (source, backup_root)
+    })
+    .await
+    .expect("join content authority worker")
+}
+
+fn settle_test_managed_directory(directory: &crate::state::ManagedInstanceContentDirectory) {
+    let attempt_limit = 8;
+    let mut last_error = None;
+    for _ in 0..attempt_limit {
+        match directory.settle() {
+            Ok(()) => return,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                last_error = Some(error);
+            }
+            Err(error) => panic!("settle retained cleanup: {error}"),
+        }
+    }
+    panic!(
+        "retained cleanup remained unsettled after {attempt_limit} attempts: {}",
+        last_error.expect("a bounded settlement retry failed")
+    );
+}
+
+#[tokio::test]
+async fn instance_world_mutations_reject_active_instance() {
+    let fixture = TestFixture::new("world-running-conflict");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Running worlds".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    fs::create_dir_all(game_dir.join("saves").join("World")).expect("create world");
+    fixture
+        .state
+        .sessions()
+        .insert(test_launch_record("active-world-session", &instance.id))
+        .await
+        .expect("insert session");
+
+    let (status, Json(body)) = handle_delete_instance_world(&fixture.state, &instance.id, "World")
+        .await
+        .expect_err("running instance should reject world mutation");
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(
+        &body,
+        "cannot change worlds while the instance is running; stop the game first",
+    );
+    assert!(game_dir.join("saves").join("World").is_dir());
+}
+
+#[tokio::test]
+async fn update_instance_allows_unchanged_name_and_maps_name_collision_to_conflict() {
+    let fixture = TestFixture::new("update-name-collision");
+    let alpha = fixture
+        .state
+        .instances()
+        .insert_for_test("Alpha".to_string(), "1.21.1".to_string())
+        .expect("add alpha");
+    let beta = fixture
+        .state
+        .instances()
+        .insert_for_test("Beta".to_string(), "1.21.1".to_string())
+        .expect("add beta");
+
+    let updated = handle_update_instance_owned(
+        &fixture.state,
+        &alpha.id,
+        InstancePatch {
+            name: Some(alpha.name.clone()),
+            max_memory_mb: Some(3072),
+            ..InstancePatch::default()
+        },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("unchanged name update should succeed");
+    assert_eq!(updated.name, "Alpha");
+    assert_eq!(updated.version_id, "1.21.1");
+    assert_eq!(updated.max_memory_mb, 3072);
+
+    let (status, Json(body)) = handle_update_instance_owned(
+        &fixture.state,
+        &alpha.id,
+        InstancePatch {
+            name: Some(beta.name.clone()),
+            ..InstancePatch::default()
+        },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("duplicate name update should fail");
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": "an instance with this name already exists" })
+    );
+    assert_eq!(
+        fixture
+            .state
+            .instances()
+            .get(&alpha.id)
+            .expect("alpha remains")
+            .name,
+        "Alpha"
+    );
+}
+
+#[tokio::test]
+async fn update_instance_unknown_jvm_preset_resets_to_auto_without_echoing_raw_value() {
+    let fixture = TestFixture::new("update-unknown-jvm-preset");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Preset tamper".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+
+    let updated = handle_update_instance_owned(
+        &fixture.state,
+        &instance.id,
+        InstancePatch {
+            jvm_preset: Some(r"C:\Users\Alice\java.exe --accessToken raw-secret-token".to_string()),
+            ..InstancePatch::default()
+        },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("unknown preset update should normalize");
+
+    assert_eq!(updated.jvm_preset, "");
+    assert_eq!(
+        fixture
+            .state
+            .instances()
+            .get(&instance.id)
+            .expect("stored instance")
+            .jvm_preset,
+        ""
+    );
+    let public = serde_json::to_string(&updated).expect("serialize updated instance");
+    for leaked in ["Alice", "java.exe", "accessToken", "raw-secret-token"] {
+        assert!(
+            !public.contains(leaked),
+            "{leaked:?} leaked in update response: {public}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_instance_response_redacts_java_path_and_jvm_args() {
+    let fixture = TestFixture::new("update-runtime-overrides-redacted");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Runtime override".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+
+    let raw_java = r"C:\Users\Alice\.jdks\bad\bin\java.exe";
+    let raw_args = "-Dtoken=raw-secret-token -javaagent:C:\\Users\\Alice\\agent.jar";
+    let updated = handle_update_instance_owned(
+        &fixture.state,
+        &instance.id,
+        InstancePatch {
+            java_path: Some(raw_java.to_string()),
+            extra_jvm_args: Some(raw_args.to_string()),
+            ..InstancePatch::default()
+        },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("update runtime overrides");
+
+    assert_eq!(updated.java_path, "");
+    assert_eq!(updated.extra_jvm_args, "");
+    let stored = fixture
+        .state
+        .instances()
+        .get(&instance.id)
+        .expect("stored instance");
+    assert_eq!(stored.java_path, raw_java);
+    assert_eq!(stored.extra_jvm_args, raw_args);
+
+    let public = serde_json::to_string(&updated).expect("serialize updated instance");
+    for leaked in [
+        "Alice",
+        "java.exe",
+        "raw-secret-token",
+        "javaagent",
+        "agent.jar",
+        "C:\\Users",
+    ] {
+        assert!(
+            !public.contains(leaked),
+            "{leaked:?} leaked in update response: {public}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_waits_for_cancelled_sweep_settlement_before_registry_effect() {
+    let fixture = TestFixture::new("update-sweep-settlement");
+    let instance = add_test_instance(&fixture, "Before sweep", "1.21.1");
+    let (reservation, cancellation) = reserve_instance_sweep(&fixture.state);
+    let state = fixture.state.clone();
+    let instance_id = instance.id.clone();
+    let handoff = fixture._request.producer_handoff();
+    let update = tokio::spawn(async move {
+        handle_update_instance_owned(
+            &state,
+            &instance_id,
+            InstancePatch {
+                name: Some("After sweep".to_string()),
+                ..InstancePatch::default()
+            },
+            handoff,
+        )
+        .await
+    });
+
+    wait_for_sweep_cancellation(&cancellation).await;
+    assert_eq!(
+        fixture
+            .state
+            .instances()
+            .get(&instance.id)
+            .expect("instance remains before settlement")
+            .name,
+        "Before sweep"
+    );
+    assert!(!update.is_finished());
+
+    reservation.settle(IdleSweepTerminal::Cancelled);
+    let updated = tokio::time::timeout(std::time::Duration::from_secs(5), update)
+        .await
+        .expect("update settles after sweep")
+        .expect("update task")
+        .expect("update succeeds");
+    assert_eq!(updated.name, "After sweep");
+    assert_eq!(
+        fixture
+            .state
+            .instances()
+            .get(&instance.id)
+            .expect("updated instance")
+            .name,
+        "After sweep"
+    );
+}
+
+#[tokio::test]
+async fn public_instance_responses_redact_stored_runtime_overrides() {
+    let fixture = TestFixture::new("instance-runtime-overrides-redacted");
+    let mut instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Runtime override".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let raw_java = r"C:\Users\Alice\.jdks\bad\bin\java.exe";
+    let raw_args = "-Dtoken=raw-secret-token -javaagent:C:\\Users\\Alice\\agent.jar";
+    instance.java_path = raw_java.to_string();
+    instance.extra_jvm_args = raw_args.to_string();
+    fixture
+        .state
+        .instances()
+        .replace_for_test(instance.clone())
+        .expect("store runtime overrides");
+
+    let listed = handle_list_instances(&fixture.state, &fixture.producer).await;
+    let fetched = handle_get_instance(&fixture.state, &fixture.producer, &instance.id)
+        .await
+        .expect("get instance");
+    let duplicated = handle_duplicate_instance(&fixture.state, &instance.id, None)
+        .await
+        .expect("duplicate instance");
+
+    assert_eq!(listed.instances[0].instance.java_path, "");
+    assert_eq!(listed.instances[0].instance.extra_jvm_args, "");
+    assert_eq!(fetched.instance.java_path, "");
+    assert_eq!(fetched.instance.extra_jvm_args, "");
+    assert_eq!(duplicated.instance.java_path, "");
+    assert_eq!(duplicated.instance.extra_jvm_args, "");
+
+    let stored_duplicate = fixture
+        .state
+        .instances()
+        .get(&duplicated.id)
+        .expect("stored duplicate");
+    assert_eq!(stored_duplicate.java_path, raw_java);
+    assert_eq!(stored_duplicate.extra_jvm_args, raw_args);
+
+    for public in [
+        serde_json::to_string(&listed).expect("serialize list"),
+        serde_json::to_string(&fetched).expect("serialize get"),
+        serde_json::to_string(&duplicated).expect("serialize duplicate"),
+    ] {
+        for leaked in [
+            "Alice",
+            "java.exe",
+            "raw-secret-token",
+            "javaagent",
+            "agent.jar",
+            "C:\\Users",
+        ] {
+            assert!(
+                !public.contains(leaked),
+                "{leaked:?} leaked in instance response: {public}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn instance_crud_handlers_create_list_get_update_and_delete() {
+    let fixture = TestFixture::new("crud-happy-path");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1", "1.21.2"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Survival".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            icon: "grass".to_string(),
+            accent: "#5aa469".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create instance");
+    assert_eq!(created.instance.name, "Survival");
+    assert_eq!(created.instance.version_id, "1.21.1");
+    assert_eq!(created.instance.icon, "grass");
+    assert_eq!(created.instance.accent, "#5aa469");
+
+    let listed = handle_list_instances(&fixture.state, &fixture.producer).await;
+    assert_eq!(listed.last_instance_id, None);
+    assert_eq!(listed.instances.len(), 1);
+    assert_eq!(listed.instances[0].instance.id, created.instance.id);
+    assert_eq!(listed.instances[0].instance.name, "Survival");
+    assert!(listed.instances[0].launchable);
+
+    let fetched = handle_get_instance(&fixture.state, &fixture.producer, &created.instance.id)
+        .await
+        .expect("get instance");
+    assert_eq!(fetched.instance, created.instance.instance);
+
+    let updated = handle_update_instance_owned(
+        &fixture.state,
+        &created.instance.id,
+        InstancePatch {
+            name: Some("Skyblock".to_string()),
+            max_memory_mb: Some(4096),
+            icon: Some("cloud".to_string()),
+            ..InstancePatch::default()
+        },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect("update instance");
+    assert_eq!(updated.id, created.instance.id);
+    assert_eq!(updated.name, "Skyblock");
+    assert_eq!(updated.version_id, "1.21.1");
+    assert_eq!(updated.max_memory_mb, 4096);
+    assert_eq!(updated.icon, "cloud");
+
+    let game_dir = fixture.state.instances().game_dir(&created.instance.id);
+    fs::write(game_dir.join("logs").join("latest.log"), "started").expect("write log");
+
+    let body = handle_delete_instance(&fixture.state, &created.instance.id, HashMap::new())
+        .await
+        .expect("delete instance");
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert!(
+        fixture
+            .state
+            .instances()
+            .get(&created.instance.id)
+            .is_none()
+    );
+    assert!(!game_dir.exists());
+}
+
+#[tokio::test]
+async fn list_instances_summary_reports_missing_libraries() {
+    let fixture = TestFixture::new("list-summary-missing-libraries");
+    let library_dir = fixture.root.join("library");
+    write_version_with_missing_library(&library_dir, "1.21.1");
+    let instance = add_test_instance(&fixture, "Missing library", "1.21.1");
+
+    let listed = listed_instance(&fixture, &instance.id).await;
+
+    assert_not_launch_action(&listed);
+    assert_eq!(listed.launch_action.state_id, "install_required");
+    assert_eq!(
+        listed.launch_action.primary_action,
+        axial_config::LaunchPrimaryAction::Install
+    );
+    assert_eq!(
+        listed.status_detail,
+        "Required libraries are missing. Install this version before launching."
+    );
+}
+
+#[tokio::test]
+async fn list_instances_summary_does_not_walk_asset_objects() {
+    let fixture = TestFixture::new("list-summary-skips-asset-objects");
+    let library_dir = fixture.root.join("library");
+    write_version_with_missing_asset_object(&library_dir, "1.21.1");
+    let instance = add_test_instance(&fixture, "Missing asset", "1.21.1");
+
+    let listed = listed_instance(&fixture, &instance.id).await;
+
+    assert!(listed.launchable);
+    assert_eq!(listed.launch_action.state_id, "launch_ready");
+    assert_eq!(
+        listed.launch_action.primary_action,
+        axial_config::LaunchPrimaryAction::Launch
+    );
+}
+
+#[tokio::test]
+async fn list_instances_summary_does_not_hash_client_jar() {
+    let fixture = TestFixture::new("list-summary-skips-client-hash");
+    let library_dir = fixture.root.join("library");
+    write_version_with_corrupt_client_jar(&library_dir, "1.21.1");
+    let instance = add_test_instance(&fixture, "Corrupt client", "1.21.1");
+
+    let listed = listed_instance(&fixture, &instance.id).await;
+
+    assert!(listed.launchable);
+    assert_eq!(listed.launch_action.state_id, "launch_ready");
+    assert_eq!(
+        listed.launch_action.primary_action,
+        axial_config::LaunchPrimaryAction::Launch
+    );
+}
+
+#[tokio::test]
+async fn list_instances_missing_parent_client_does_not_show_launch_action() {
+    let fixture = TestFixture::new("list-readiness-missing-parent-client");
+    let library_dir = fixture.root.join("library");
+    write_child_version_with_missing_parent_client(
+        &library_dir,
+        "fabric-loader-0.16.14-1.21.1",
+        "1.21.1",
+    );
+    let instance = add_test_instance(
+        &fixture,
+        "Missing parent client",
+        "fabric-loader-0.16.14-1.21.1",
+    );
+
+    let listed = listed_instance(&fixture, &instance.id).await;
+
+    assert_not_launch_action(&listed);
+    assert_eq!(
+        listed.launch_action.primary_action,
+        axial_config::LaunchPrimaryAction::Install
+    );
+    assert_eq!(
+        listed.status_detail,
+        "Client game files are missing. Install this version before launching."
+    );
+}
+
+#[tokio::test]
+async fn list_instances_installed_ready_version_transitions_to_launch_action() {
+    let fixture = TestFixture::new("list-readiness-ready-launch");
+    let library_dir = fixture.root.join("library");
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let instance = add_test_instance(&fixture, "Ready", "1.21.1");
+
+    let listed = listed_instance(&fixture, &instance.id).await;
+
+    assert!(listed.launchable);
+    assert_eq!(listed.launch_action.state_id, "launch_ready");
+    assert_eq!(
+        listed.launch_action.primary_action,
+        axial_config::LaunchPrimaryAction::Launch
+    );
+}
+
+#[test]
+fn bounded_filesystem_list_enrichment_reuses_exact_readiness_inspection_within_one_response() {
+    let fixture = TestFixture::new("list-readiness-deduplicated");
+    let first = add_test_instance(&fixture, "First", "1.21.1");
+    let second = add_test_instance(&fixture, "Second", "1.21.1");
+    let scan = InstalledVersionsScan {
+        versions: Vec::new(),
+        view_model: VersionScanViewModel {
+            state_id: "ready".to_string(),
+            label: "Installed versions ready".to_string(),
+            degraded: false,
+            detail: None,
+        },
+    };
+    let config = fixture.state.config().current();
+    let mut inspections = 0_usize;
+    let library_operation = fixture
+        .state
+        .try_acquire_managed_library()
+        .expect("acquire readiness library");
+    let readiness_authority = ReadinessLibraryAuthority {
+        library_dir: library_operation.configured_path().to_path_buf(),
+        library_operation: library_operation.retained_core(),
+    };
+
+    let enriched = enrich_instances_for_scan_with_inspector(
+        vec![first, second],
+        &scan,
+        Some(&readiness_authority),
+        &config,
+        |_, _| {
+            inspections += 1;
+            LaunchReadiness {
+                launchable: true,
+                reasons: Vec::new(),
+            }
+        },
+    );
+
+    assert_eq!(inspections, 1);
+    assert_eq!(enriched.len(), 2);
+    assert!(enriched.iter().all(|instance| instance.launchable));
+}
+
+#[tokio::test]
+async fn degraded_version_scan_blocks_instances_and_create_queue_checks() {
+    let fixture = TestFixture::new("degraded-version-scan");
+    let library_dir = fixture.root.join("library");
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
+    let bad_version_dir = library_dir.join("versions").join("1.21.1");
+    fs::create_dir_all(&bad_version_dir).expect("create bad version dir");
+    fs::write(bad_version_dir.join("1.21.1.json"), "{not valid json")
+        .expect("write malformed version json");
+    add_test_instance(&fixture, "Malformed", "1.21.1");
+
+    let listed = handle_list_instances(&fixture.state, &fixture.producer).await;
+
+    assert!(listed.scan_state.degraded);
+    assert_eq!(listed.scan_state.state_id, "degraded");
+    assert_eq!(listed.instances.len(), 1);
+    assert_eq!(
+        listed.instances[0].launch_action.primary_action,
+        axial_config::LaunchPrimaryAction::Blocked
+    );
+    assert_eq!(
+        listed.instances[0].status_detail,
+        crate::application::version::VERSION_SCAN_DEGRADED_MESSAGE
+    );
+
+    let create_view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
+    assert!(create_view.versions.is_empty());
+    assert!(create_view.notices.iter().any(|notice| {
+        notice.state_id == "library_scan_degraded"
+            && notice.detail.as_deref()
+                == Some(crate::application::version::VERSION_SCAN_DEGRADED_MESSAGE)
+    }));
+
+    let (status, Json(body)) = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Blocked create".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect_err("degraded scan should block create queue checks");
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    assert_bounded_error_body(
+        &body,
+        crate::application::version::VERSION_SCAN_DEGRADED_MESSAGE,
+    );
+    assert_eq!(fixture.state.instances().list().len(), 1);
+}
+
+#[tokio::test]
+async fn update_instance_rejects_raw_bad_version_id_change() {
+    let fixture = TestFixture::new("update-rejects-raw-version");
+    let instance = add_test_instance(&fixture, "Stable", "1.21.1");
+
+    let (status, Json(body)) = handle_update_instance_owned(
+        &fixture.state,
+        &instance.id,
+        InstancePatch {
+            version_id: Some("bad-version".to_string()),
+            ..InstancePatch::default()
+        },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("raw version retarget should fail");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_bounded_error_body(&body, "direct version changes are not supported");
+    assert_eq!(
+        fixture
+            .state
+            .instances()
+            .get(&instance.id)
+            .expect("instance remains")
+            .version_id,
+        "1.21.1"
+    );
+}
+
+#[tokio::test]
+async fn create_ready_instance_rebuilds_known_good_once() {
+    let fixture = TestFixture::new("create-ready-known-good");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let rebuilds = Arc::new(AtomicUsize::new(0));
+    let observed_rebuilds = rebuilds.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let create_state = fixture.state.clone();
+    let create = tokio::spawn(async move {
+        super::create::handle_create_instance_with_rebuild(
+            &create_state,
+            CreateInstanceRequest {
+                name: "Ready".to_string(),
+                selection_id: "vanilla|1.21.1".to_string(),
+                ..CreateInstanceRequest::default()
+            },
+            move |_, _, _, _| async move {
+                observed_rebuilds.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).expect("signal rebuild entry");
+                release_rx.await.expect("release rebuild");
+                Ok(())
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .expect("rebuild enters")
+        .expect("rebuild entry signal");
+    assert!(!create.is_finished(), "create must wait for rebuild");
+    release_tx.send(()).expect("release rebuild");
+    let created = tokio::time::timeout(std::time::Duration::from_secs(5), create)
+        .await
+        .expect("create completes")
+        .expect("create task")
+        .expect("create ready instance");
+
+    assert!(created.install_queue.is_none());
+    assert_eq!(rebuilds.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn create_waits_for_cancelled_sweep_settlement_before_registry_and_filesystem_effects() {
+    let fixture = TestFixture::new("create-sweep-settlement");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let directories_before = instance_directory_names(&fixture.root);
+    let (reservation, cancellation) = reserve_instance_sweep(&fixture.state);
+    let state = fixture.state.clone();
+    let create = tokio::spawn(async move {
+        super::create::handle_create_instance_with_rebuild(
+            &state,
+            CreateInstanceRequest {
+                name: "Sweep create".to_string(),
+                selection_id: "vanilla|1.21.1".to_string(),
+                ..CreateInstanceRequest::default()
+            },
+            |_, _, _, _| async { Ok(()) },
+        )
+        .await
+    });
+
+    wait_for_sweep_cancellation(&cancellation).await;
+    assert!(fixture.state.instances().list().is_empty());
+    assert_eq!(instance_directory_names(&fixture.root), directories_before);
+    assert!(!create.is_finished());
+
+    reservation.settle(IdleSweepTerminal::Cancelled);
+    let created = tokio::time::timeout(std::time::Duration::from_secs(5), create)
+        .await
+        .expect("create settles after sweep")
+        .expect("create task")
+        .expect("create succeeds");
+    assert!(
+        fixture
+            .state
+            .instances()
+            .get(&created.instance.id)
+            .is_some()
+    );
+    assert!(
+        fixture
+            .state
+            .instances()
+            .game_dir(&created.instance.id)
+            .is_dir()
+    );
+}
+
+async fn seed_committed_busy_install(state: &AppState, queue_id: &str) {
+    let install_id = format!("{queue_id}-install");
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
+            crate::state::InstallQueuePlacement::Back,
+        )
+        .await;
+    let reserved = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .reserved()
+        .expect("reserve committed busy install");
+    assert_eq!(reserved.queue_id, queue_id);
+    state.installs().insert(install_id.clone()).await;
+    assert!(
+        state
+            .installs()
+            .mark_queued_install_started(queue_id, install_id)
+            .await
+    );
+}
+
+#[tokio::test]
+async fn create_queued_instance_does_not_rebuild_known_good() {
+    let fixture = TestFixture::new("create-queued-no-known-good");
+    fixture.configure_create_manifest(&["1.21.2"]);
+    seed_committed_busy_install(&fixture.state, "busy-create-queue").await;
+    let rebuilds = Arc::new(AtomicUsize::new(0));
+    let observed_rebuilds = rebuilds.clone();
+
+    let created = super::create::handle_create_instance_with_rebuild(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Queued".to_string(),
+            selection_id: "vanilla|1.21.2".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+        move |_, _, _, _| async move {
+            observed_rebuilds.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await
+    .expect("create queued instance");
+
+    assert!(created.install_queue.is_some());
+    assert_eq!(created.view_model.state_id, "created_install_queued");
+    assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn create_missed_active_install_receipt_rolls_back_new_instance() {
+    let fixture = TestFixture::new("create-missed-active-receipt");
+    fixture.configure_create_manifest(&["1.21.2"]);
+    fixture
+        .state
+        .installs()
+        .enqueue_queued_install(
+            "active-selected-install".to_string(),
+            crate::state::InstallQueueSpec::vanilla("1.21.2".to_string()),
+            crate::state::InstallQueuePlacement::Back,
+        )
+        .await;
+    let active = fixture
+        .state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .reserved()
+        .expect("reserve selected active install");
+    assert_eq!(active.queue_id, "active-selected-install");
+
+    let (status, Json(body)) = super::create::handle_create_instance_with_rebuild(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Missed active receipt".to_string(),
+            selection_id: "vanilla|1.21.2".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+        |_, _, _, _| async { panic!("queued create must not reconstruct") },
+    )
+    .await
+    .expect_err("instance absent from active receipt fanout must roll back");
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(
+        &body,
+        "The active version install did not include this instance. Try again after it finishes.",
+    );
+    assert!(fixture.state.instances().list().is_empty());
+    let queue = fixture.state.installs().queue_snapshot().await;
+    assert_eq!(
+        queue.active.as_ref().map(|entry| entry.queue_id.as_str()),
+        Some("active-selected-install")
+    );
+}
+
+#[tokio::test]
+async fn create_rebuild_failure_rolls_back_the_new_instance() {
+    let fixture = TestFixture::new("create-known-good-rollback");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let created_id = Arc::new(Mutex::new(None::<String>));
+    let observed_id = created_id.clone();
+
+    let (status, Json(body)) = super::create::handle_create_instance_with_rebuild(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Rollback".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+        move |_, _, _, instance_id| async move {
+            *observed_id.lock().expect("capture created id") = Some(instance_id);
+            Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
+        },
+    )
+    .await
+    .expect_err("failed rebuild rolls back create");
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_bounded_error_body(
+        &body,
+        "Could not verify the selected version. Check your connection and try again.",
+    );
+    let created_id = created_id
+        .lock()
+        .expect("read created id")
+        .clone()
+        .expect("rebuild observed created id");
+    assert!(fixture.state.instances().get(&created_id).is_none());
+    assert!(!fixture.state.instances().game_dir(&created_id).exists());
+}
+
+#[tokio::test]
+async fn duplicate_instance_rebuilds_known_good_once() {
+    let fixture = TestFixture::new("duplicate-known-good");
+    let source = add_test_instance(&fixture, "Source", "1.21.1");
+    let rebuilds = Arc::new(AtomicUsize::new(0));
+    let observed_rebuilds = rebuilds.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let duplicate_state = fixture.state.clone();
+    let source_id = source.id.clone();
+    let request = duplicate_state
+        .try_admit_request()
+        .expect("admit duplicate request");
+    let handoff = request.producer_handoff();
+    let duplicate = tokio::spawn(async move {
+        let _request = request;
+        handle_duplicate_instance_with_rebuild(
+            &duplicate_state,
+            &source_id,
+            None,
+            handoff,
+            move |_, _, _, _| async move {
+                observed_rebuilds.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).expect("signal rebuild entry");
+                release_rx.await.expect("release rebuild");
+                Ok(())
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .expect("rebuild enters")
+        .expect("rebuild entry signal");
+    assert!(!duplicate.is_finished(), "duplicate must wait for rebuild");
+    release_tx.send(()).expect("release rebuild");
+    let duplicate = tokio::time::timeout(std::time::Duration::from_secs(5), duplicate)
+        .await
+        .expect("duplicate completes")
+        .expect("duplicate task")
+        .expect("duplicate instance");
+
+    assert_ne!(duplicate.id, source.id);
+    assert!(fixture.state.instances().get(&source.id).is_some());
+    assert!(fixture.state.instances().get(&duplicate.id).is_some());
+    assert_eq!(rebuilds.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn duplicate_waits_for_cancelled_sweep_settlement_before_registry_and_filesystem_effects() {
+    let fixture = TestFixture::new("duplicate-sweep-settlement");
+    let source = add_test_instance(&fixture, "Sweep source", "1.21.1");
+    let marker = fixture
+        .state
+        .instances()
+        .game_dir(&source.id)
+        .join("mods/source.jar");
+    fs::write(&marker, "source").expect("write source marker");
+    let directories_before = instance_directory_names(&fixture.root);
+    let (reservation, cancellation) = reserve_instance_sweep(&fixture.state);
+    let state = fixture.state.clone();
+    let source_id = source.id.clone();
+    let duplicate = tokio::spawn(async move {
+        let request = state.try_admit_request().expect("admit duplicate request");
+        let handoff = request.producer_handoff();
+        handle_duplicate_instance_with_rebuild(
+            &state,
+            &source_id,
+            None,
+            handoff,
+            |_, _, _, _| async { Ok(()) },
+        )
+        .await
+    });
+
+    wait_for_sweep_cancellation(&cancellation).await;
+    assert_eq!(fixture.state.instances().list(), vec![source.clone()]);
+    assert_eq!(instance_directory_names(&fixture.root), directories_before);
+    assert_eq!(
+        fs::read_to_string(&marker).expect("read source marker"),
+        "source"
+    );
+    assert!(!duplicate.is_finished());
+
+    reservation.settle(IdleSweepTerminal::Cancelled);
+    let duplicate = tokio::time::timeout(std::time::Duration::from_secs(5), duplicate)
+        .await
+        .expect("duplicate settles after sweep")
+        .expect("duplicate task")
+        .expect("duplicate succeeds");
+    assert_ne!(duplicate.id, source.id);
+    assert!(fixture.state.instances().get(&duplicate.id).is_some());
+    assert!(
+        fixture
+            .state
+            .instances()
+            .game_dir(&duplicate.id)
+            .join("mods/source.jar")
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn duplicate_rebuild_failure_rolls_back_only_the_copy() {
+    let fixture = TestFixture::new("duplicate-known-good-rollback");
+    let source = add_test_instance(&fixture, "Source", "1.21.1");
+    let duplicate_id = Arc::new(Mutex::new(None::<String>));
+    let observed_id = duplicate_id.clone();
+    let request = fixture
+        .state
+        .try_admit_request()
+        .expect("admit duplicate request");
+
+    let (status, Json(body)) = handle_duplicate_instance_with_rebuild(
+        &fixture.state,
+        &source.id,
+        None,
+        request.producer_handoff(),
+        move |_, _, _, instance_id| async move {
+            *observed_id.lock().expect("capture duplicate id") = Some(instance_id);
+            Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
+        },
+    )
+    .await
+    .expect_err("failed rebuild rolls back duplicate");
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_bounded_error_body(
+        &body,
+        "Could not verify the selected version. Check your connection and try again.",
+    );
+    let duplicate_id = duplicate_id
+        .lock()
+        .expect("read duplicate id")
+        .clone()
+        .expect("rebuild observed duplicate id");
+    assert!(fixture.state.instances().get(&source.id).is_some());
+    assert!(fixture.state.instances().get(&duplicate_id).is_none());
+    assert!(!fixture.state.instances().game_dir(&duplicate_id).exists());
+}
+
+#[tokio::test]
+async fn dropped_create_caller_keeps_rebuild_rollback_owned_until_quiescence() {
+    let (state, root) = test_state_with_library("create-known-good-caller-drop");
+    let library_dir = root.join("library");
+    write_version_manifest_cache(&state, &["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let created_id = Arc::new(Mutex::new(None::<String>));
+    let observed_id = created_id.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let create_state = state.clone();
+    let caller = tokio::spawn(async move {
+        super::create::handle_create_instance_with_rebuild(
+            &create_state,
+            CreateInstanceRequest {
+                name: "Owned rollback".to_string(),
+                selection_id: "vanilla|1.21.1".to_string(),
+                ..CreateInstanceRequest::default()
+            },
+            move |_, _, _, instance_id| async move {
+                *observed_id.lock().expect("capture created id") = Some(instance_id);
+                entered_tx.send(()).expect("signal rebuild entry");
+                release_rx.await.expect("release rebuild");
+                Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .expect("rebuild enters")
+        .expect("rebuild entry signal");
+    let created_id = created_id
+        .lock()
+        .expect("read created id")
+        .clone()
+        .expect("rebuild observed created id");
+    assert!(state.instances().get(&created_id).is_some());
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("caller cancellation")
+            .is_cancelled()
+    );
+
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while state.lifecycle_phase() != crate::state::AppLifecyclePhase::QuiescingProducers {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("quiescence waits on accepted create");
+    assert!(!quiesce.is_finished());
+    release_tx.send(()).expect("release failed rebuild");
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("rollback drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+
+    assert!(state.instances().get(&created_id).is_none());
+    assert!(!state.instances().game_dir(&created_id).exists());
+    shutdown_test_state(state, root).await;
+}
+
+#[tokio::test]
+async fn cancelled_setup_after_creation_still_hands_the_instance_to_the_content_queue() {
+    let (state, root) = test_state("setup-create-cancellation");
+    let producer = state.try_claim_producer().expect("claim setup producer");
+    let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let setup_state = state.clone();
+    let caller = tokio::spawn(async move {
+        super::setup::execute_setup_mutation_owned(
+            &setup_state,
+            producer,
+            move |state, _, _, update_admission| async move {
+                let instance = state
+                    .instances()
+                    .insert_for_test("Cancelled setup", "1.21.1")
+                    .expect("create setup instance");
+                created_tx
+                    .send(instance.id.clone())
+                    .expect("signal durable creation");
+                release_rx.await.expect("release queue handoff");
+                enqueue_test_setup_content(&state, &instance, "setup-create-cancelled").await;
+                drop(update_admission);
+                Ok(instance.id)
+            },
+        )
+        .await
+    });
+
+    let instance_id = tokio::time::timeout(std::time::Duration::from_secs(5), created_rx)
+        .await
+        .expect("setup reaches durable creation")
+        .expect("durable creation signal");
+    assert_eq!(
+        state.try_begin_update_apply().unwrap_err(),
+        UpdateApplyAdmissionError::ActiveOperations
+    );
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("setup caller cancellation")
+            .is_cancelled()
+    );
+    release_tx.send(()).expect("release queue handoff");
+    wait_for_setup_queue(&state, "setup-create-cancelled").await;
+
+    assert!(state.instances().get(&instance_id).is_some());
+    remove_test_setup(&state, "setup-create-cancelled", &instance_id).await;
+    shutdown_test_state(state, root).await;
+}
+
+#[tokio::test]
+async fn cancelled_modpack_setup_during_post_create_resolution_still_hands_off_the_queue() {
+    let (state, root) = test_state("modpack-setup-resolution-cancellation");
+    let producer = state.try_claim_producer().expect("claim setup producer");
+    let (resolving_tx, resolving_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let setup_state = state.clone();
+    let caller = tokio::spawn(async move {
+        super::setup::execute_setup_mutation_owned(
+            &setup_state,
+            producer,
+            move |state, _, _, update_admission| async move {
+                let instance = state
+                    .instances()
+                    .insert_for_test("Resolving modpack", "1.21.1")
+                    .expect("create modpack setup instance");
+                resolving_tx
+                    .send(instance.id.clone())
+                    .expect("signal post-create resolution");
+                release_rx.await.expect("release modpack resolution");
+                enqueue_test_setup_content(&state, &instance, "setup-modpack-resolved").await;
+                drop(update_admission);
+                Ok(instance.id)
+            },
+        )
+        .await
+    });
+
+    let instance_id = tokio::time::timeout(std::time::Duration::from_secs(5), resolving_rx)
+        .await
+        .expect("setup reaches post-create resolution")
+        .expect("post-create resolution signal");
+    assert_eq!(
+        state.try_begin_update_apply().unwrap_err(),
+        UpdateApplyAdmissionError::ActiveOperations
+    );
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("modpack setup caller cancellation")
+            .is_cancelled()
+    );
+    release_tx
+        .send(())
+        .expect("release modpack post-create resolution");
+    wait_for_setup_queue(&state, "setup-modpack-resolved").await;
+
+    assert!(state.instances().get(&instance_id).is_some());
+    remove_test_setup(&state, "setup-modpack-resolved", &instance_id).await;
+    shutdown_test_state(state, root).await;
+}
+
+#[tokio::test]
+async fn failed_setup_queue_cleanup_survives_quiescence_after_admission() {
+    let (state, root) = test_state("setup-queue-failure-cleanup");
+    let producer = state.try_claim_producer().expect("claim setup producer");
+    let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let setup_state = state.clone();
+    let caller = tokio::spawn(async move {
+        super::setup::execute_setup_mutation_owned(
+            &setup_state,
+            producer,
+            move |state, producer, cleanup_foreground, update_admission| async move {
+                let cleanup_owner = producer.claim_child();
+                let instance = state
+                    .instances()
+                    .insert_for_test("Failed setup", "1.21.1")
+                    .expect("create failed setup instance");
+                let cleanup =
+                    crate::application::install::setup_instance_cleanup(&state, &instance, false);
+                cleanup_tx
+                    .send(instance.id.clone())
+                    .expect("signal compensation cleanup");
+                release_rx.await.expect("release compensation cleanup");
+                assert!(
+                    crate::application::install::remove_pristine_setup_instance_admitted(
+                        &state,
+                        cleanup_owner,
+                        cleanup_foreground,
+                        &instance.id,
+                        &cleanup,
+                        &update_admission,
+                    )
+                    .await
+                );
+                Err::<String, _>((
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": "queue admission failed" })),
+                ))
+            },
+        )
+        .await
+    });
+
+    let instance_id = tokio::time::timeout(std::time::Duration::from_secs(5), cleanup_rx)
+        .await
+        .expect("setup reaches compensation")
+        .expect("compensation signal");
+    assert!(state.instances().get(&instance_id).is_some());
+    assert_eq!(
+        state.try_begin_update_apply().unwrap_err(),
+        UpdateApplyAdmissionError::ActiveOperations
+    );
+    let quiesce_state = state.clone();
+    let quiesce = tokio::spawn(async move { quiesce_state.quiesce().await });
+    tokio::task::yield_now().await;
+    assert!(!quiesce.is_finished());
+    release_tx.send(()).expect("release compensation cleanup");
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), caller)
+        .await
+        .expect("setup compensation settles")
+        .expect("setup caller")
+        .expect_err("queue failure remains visible");
+    assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+    assert!(state.instances().get(&instance_id).is_none());
+    assert!(!state.instances().game_dir(&instance_id).exists());
+    quiesce
+        .await
+        .expect("join quiescence")
+        .expect("cleanup producer releases quiescence");
+    shutdown_test_state(state, root).await;
+}
+
+#[tokio::test]
+async fn normal_setup_transaction_creates_and_queues_once() {
+    let (state, root) = test_state("setup-normal-transaction");
+    let producer = state.try_claim_producer().expect("claim setup producer");
+    let instance_id = super::setup::execute_setup_mutation_owned(
+        &state,
+        producer,
+        move |state, _, _, _update_admission| async move {
+            let instance = state
+                .instances()
+                .insert_for_test("Normal setup", "1.21.1")
+                .expect("create setup instance");
+            enqueue_test_setup_content(&state, &instance, "setup-normal").await;
+            Ok(instance.id)
+        },
+    )
+    .await
+    .expect("complete setup transaction");
+
+    assert!(state.instances().get(&instance_id).is_some());
+    wait_for_setup_queue(&state, "setup-normal").await;
+    remove_test_setup(&state, "setup-normal", &instance_id).await;
+    shutdown_test_state(state, root).await;
+}
+
+#[tokio::test]
+async fn behavior_contract_cross_owner_setup_uses_exact_create_prerequisite() {
+    let fixture = TestFixture::new("setup-exact-create-prerequisite");
+    fixture.configure_create_manifest(&["1.21.2"]);
+    seed_committed_busy_install(&fixture.state, "busy-setup-prerequisite").await;
+    fixture
+        .state
+        .installs()
+        .enqueue_queued_install(
+            "older-setup-prerequisite".to_string(),
+            InstallQueueSpec::vanilla("1.20.1".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+
+    let producer = fixture.producer.claim_child();
+    let (instance_id, selected_queue_id) = super::setup::execute_setup_mutation_owned(
+        &fixture.state,
+        producer,
+        move |state, producer, _, update_admission| async move {
+            let created = super::create::handle_create_instance_from_continuation(
+                &state,
+                CreateInstanceRequest {
+                    name: "Exact setup prerequisite".to_string(),
+                    selection_id: "vanilla|1.21.2".to_string(),
+                    ..CreateInstanceRequest::default()
+                },
+                true,
+                producer.claim_child(),
+                update_admission.clone(),
+            )
+            .await?;
+            let selected_queue_id = created
+                .prerequisite_queue_id
+                .expect("create selected install identity");
+            let instance_id = created.response.instance.id.clone();
+            let cleanup = crate::application::install::setup_instance_cleanup(
+                &state,
+                &created.response.instance,
+                true,
+            );
+            crate::application::content::queue_content_install_with_cleanup_after_admitted(
+                &state,
+                crate::application::ContentInstallRequest {
+                    instance_id: instance_id.clone(),
+                    selections: vec![crate::application::content::ContentSelection {
+                        canonical_id: "modrinth:exact-setup-prerequisite".to_string(),
+                        kind: axial_content::ContentKind::Mod,
+                        version_id: Some("exact-setup-prerequisite-v1".to_string()),
+                    }],
+                    allow_incompatible: false,
+                },
+                Some(cleanup),
+                Some(selected_queue_id.clone()),
+                producer,
+                update_admission,
+            )
+            .await?;
+            Ok((instance_id, selected_queue_id))
+        },
+    )
+    .await
+    .expect("create setup queue dependency");
+
+    let snapshot = fixture.state.installs().queue_snapshot().await;
+    let selected_base = snapshot
+        .pending
+        .iter()
+        .find(|entry| {
+            matches!(
+                &entry.spec,
+                InstallQueueSpec::Vanilla { version_id } if version_id == "1.21.2"
+            )
+        })
+        .expect("selected base install remains queued");
+    assert_eq!(selected_base.queue_id, selected_queue_id);
+    assert_ne!(selected_base.queue_id, "older-setup-prerequisite");
+
+    let content_prerequisite = snapshot
+        .pending
+        .iter()
+        .find_map(|entry| match &entry.spec {
+            InstallQueueSpec::Content {
+                instance_id: queued_instance_id,
+                prerequisite_queue_id,
+                ..
+            } if queued_instance_id == &instance_id => prerequisite_queue_id.as_deref(),
+            _ => None,
+        })
+        .expect("dependent setup content remains queued");
+    assert_eq!(content_prerequisite, selected_queue_id);
+    assert_ne!(content_prerequisite, "older-setup-prerequisite");
+}
+
+async fn enqueue_test_setup_content(
+    state: &AppState,
+    instance: &axial_config::Instance,
+    queue_id: &str,
+) {
+    let cleanup = crate::application::install::setup_instance_cleanup(state, instance, false);
+    let outcome = state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::Content {
+                instance_id: instance.id.clone(),
+                label: "Setup content".to_string(),
+                action: ContentQueueAction::Install {
+                    selections: Vec::new(),
+                    allow_incompatible: false,
+                    setup_cleanup: Some(cleanup),
+                },
+                prerequisite_queue_id: None,
+            },
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    assert!(matches!(
+        outcome,
+        crate::state::InstallQueueEnqueueOutcome::Enqueued { .. }
+    ));
+}
+
+async fn wait_for_setup_queue(state: &AppState, queue_id: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let queue = state.installs().queue_snapshot().await;
+            if queue.pending.iter().any(|entry| entry.queue_id == queue_id) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("setup queue handoff completes");
+}
+
+async fn remove_test_setup(state: &AppState, queue_id: &str, instance_id: &str) {
+    let cleanup_owner = state
+        .try_claim_producer()
+        .expect("claim test cleanup owner");
+    let cleanup_foreground = state
+        .register_integrity_foreground()
+        .expect("register test cleanup foreground")
+        .wait_for_settlement()
+        .await;
+    let removed = state
+        .installs()
+        .remove_queued_install(queue_id)
+        .await
+        .expect("remove test setup queue");
+    let cleanup = match removed.spec {
+        InstallQueueSpec::Content {
+            action:
+                ContentQueueAction::Install {
+                    setup_cleanup: Some(cleanup),
+                    ..
+                },
+            ..
+        } => cleanup,
+        _ => panic!("test setup queue retains cleanup"),
+    };
+    assert!(
+        crate::application::install::remove_pristine_setup_instance(
+            state,
+            cleanup_owner,
+            cleanup_foreground,
+            instance_id,
+            &cleanup,
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn dropped_duplicate_caller_keeps_rebuild_rollback_owned_until_quiescence() {
+    let (state, root) = test_state("duplicate-known-good-caller-drop");
+    let source = state
+        .instances()
+        .insert_for_test("Source", "1.21.1")
+        .expect("register source");
+    let duplicate_id = Arc::new(Mutex::new(None::<String>));
+    let observed_id = duplicate_id.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let duplicate_state = state.clone();
+    let source_id = source.id.clone();
+    let caller = tokio::spawn(async move {
+        let request = duplicate_state
+            .try_admit_request()
+            .expect("admit duplicate request");
+        let handoff = request.producer_handoff();
+        handle_duplicate_instance_with_rebuild(
+            &duplicate_state,
+            &source_id,
+            None,
+            handoff,
+            move |_, _, _, instance_id| async move {
+                *observed_id.lock().expect("capture duplicate id") = Some(instance_id);
+                entered_tx.send(()).expect("signal rebuild entry");
+                release_rx.await.expect("release rebuild");
+                Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .expect("duplicate rebuild enters")
+        .expect("duplicate rebuild signal");
+    let duplicate_id = duplicate_id
+        .lock()
+        .expect("read duplicate id")
+        .clone()
+        .expect("rebuild observed duplicate id");
+    assert!(state.instances().get(&duplicate_id).is_some());
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("caller cancellation")
+            .is_cancelled()
+    );
+
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while state.lifecycle_phase() != crate::state::AppLifecyclePhase::QuiescingProducers {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("quiescence waits on accepted duplicate");
+    assert!(!quiesce.is_finished());
+
+    release_tx.send(()).expect("release failed rebuild");
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("duplicate rollback drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+    assert!(state.instances().get(&source.id).is_some());
+    assert!(state.instances().get(&duplicate_id).is_none());
+    assert!(!state.instances().game_dir(&duplicate_id).exists());
+    shutdown_test_state(state, root).await;
+}
+
+#[tokio::test]
+async fn state_create_instance_seeds_user_files_from_configured_library() {
+    let fixture = TestFixture::new("create-seeds-user-files");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    let options_seed = b"configured-options-seed";
+    let servers_seed = b"configured-servers-seed";
+    fs::write(library_dir.join("options.txt"), options_seed).expect("write options seed");
+    fs::write(library_dir.join("servers.dat"), servers_seed).expect("write servers seed");
+    let instance_id = axial_config::generate_instance_id();
+    let instance = crate::state::new_instance(
+        instance_id.clone(),
+        "Seeded create".to_string(),
+        "1.21.1".to_string(),
+        String::new(),
+        String::new(),
+    );
+    let foreground = instance_foreground(&fixture.state).await;
+
+    fixture
+        .state
+        .create_instance(&foreground, instance, Some(library_dir))
+        .await
+        .expect("create seeded instance");
+
+    let game_dir = fixture.state.instances().game_dir(&instance_id);
+    assert_eq!(
+        fs::read(game_dir.join("options.txt")).expect("read seeded options"),
+        options_seed
+    );
+    assert_eq!(
+        fs::read(game_dir.join("servers.dat")).expect("read seeded servers"),
+        servers_seed
+    );
+}
+
+#[tokio::test]
+async fn state_duplicate_copies_only_present_source_user_files() {
+    let fixture = TestFixture::new("duplicate-preserves-user-file-absence");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    fs::write(
+        library_dir.join("options.txt"),
+        b"configured-options-fallback",
+    )
+    .expect("write library options");
+    fs::write(
+        library_dir.join("servers.dat"),
+        b"configured-servers-fallback",
+    )
+    .expect("write library servers");
+    let source = add_test_instance(&fixture, "Source", "1.21.1");
+    let source_dir = fixture.state.instances().game_dir(&source.id);
+    let source_options = b"source-owned-options";
+    fs::write(source_dir.join("options.txt"), source_options).expect("write source options");
+    assert!(!source_dir.join("servers.dat").exists());
+    let foreground = instance_foreground(&fixture.state).await;
+
+    let duplicate = fixture
+        .state
+        .duplicate_instance(&foreground, source.id, None)
+        .await
+        .expect("duplicate instance");
+
+    let duplicate_dir = fixture.state.instances().game_dir(&duplicate.id);
+    assert_eq!(
+        fs::read(duplicate_dir.join("options.txt")).expect("read duplicated options"),
+        source_options
+    );
+    assert!(!duplicate_dir.join("servers.dat").exists());
+}
+
+#[tokio::test]
+async fn create_instance_duplicate_name_gets_backend_owned_suffix() {
+    let fixture = TestFixture::new("create-name-conflict");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1", "1.21.2"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    write_installed_vanilla_version(&library_dir, "1.21.2");
+    let original = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Survival".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            icon: String::new(),
+            accent: String::new(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create original instance");
+    assert_eq!(original.instance.name, "Survival");
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Survival".to_string(),
+            selection_id: "vanilla|1.21.2".to_string(),
+            icon: String::new(),
+            accent: String::new(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("duplicate name should be resolved by Application");
+
+    assert_eq!(created.instance.name, "Survival (1)");
+    assert_eq!(created.instance.version_id, "1.21.2");
+    assert_eq!(fixture.state.instances().list().len(), 2);
+}
+
+#[tokio::test]
+async fn create_instance_applies_initial_settings_and_supported_preset_in_backend() {
+    let fixture = TestFixture::new("create-initial-settings");
+    fixture.configure_create_manifest(&["1.21.1"]);
+    seed_committed_busy_install(&fixture.state, "busy-create-initial-settings").await;
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Tuned".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            max_memory_mb: Some(6144),
+            min_memory_mb: Some(1024),
+            window_width: Some(1280),
+            window_height: Some(720),
+            art_seed: Some(42),
+            jvm_preset_id: Some("performance".to_string()),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create tuned instance");
+
+    assert_eq!(created.view_model.state_id, "created_install_queued");
+    assert_eq!(created.instance.max_memory_mb, 6144);
+    assert_eq!(created.instance.min_memory_mb, 1024);
+    assert_eq!(created.instance.window_width, 1280);
+    assert_eq!(created.instance.window_height, 720);
+    assert_eq!(created.instance.art_seed, 42);
+    assert_eq!(created.instance.jvm_preset, "performance");
+    assert!(created.guardian_notice.is_none());
+    assert_eq!(
+        fixture
+            .state
+            .instances()
+            .get(&created.instance.id)
+            .expect("stored instance")
+            .jvm_preset,
+        "performance"
+    );
+}
+
+#[tokio::test]
+async fn create_instance_unknown_preset_resets_to_auto_without_echoing_raw_value() {
+    let fixture = TestFixture::new("create-unknown-preset");
+    fixture.configure_create_manifest(&["1.21.1"]);
+    seed_committed_busy_install(&fixture.state, "busy-create-unknown-preset").await;
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Unknown preset".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            jvm_preset_id: Some(
+                r"C:\Users\Alice\java.exe --accessToken raw-secret-token".to_string(),
+            ),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create instance with unknown preset");
+
+    assert_eq!(created.instance.jvm_preset, "");
+    assert_eq!(
+        created
+            .guardian_notice
+            .as_ref()
+            .expect("guardian notice")
+            .state_id(),
+        "unknown_reset_to_auto"
+    );
+    let public = serde_json::to_string(&created).expect("serialize create response");
+    for leaked in ["Alice", "java.exe", "accessToken", "raw-secret-token"] {
+        assert!(
+            !public.contains(leaked),
+            "{leaked:?} leaked in create response: {public}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_instance_blank_preset_remains_auto_without_warning() {
+    let fixture = TestFixture::new("create-blank-preset");
+    fixture.configure_create_manifest(&["1.21.1"]);
+    seed_committed_busy_install(&fixture.state, "busy-create-blank-preset").await;
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Blank preset".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            jvm_preset_id: Some("   ".to_string()),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create instance with blank preset");
+
+    assert_eq!(created.instance.jvm_preset, "");
+    assert!(created.guardian_notice.is_none());
+    assert_eq!(created.view_model.tone, "success");
+}
+
+#[tokio::test]
+async fn create_instance_requires_backend_selection_id() {
+    let fixture = TestFixture::new("create-selection-required");
+    fixture.configure_create_manifest(&["1.21.1"]);
+
+    let (status, Json(body)) = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "No selection".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect_err("missing selection should fail");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": "selection_id is required" })
+    );
+    assert!(fixture.state.instances().list().is_empty());
+}
+
+#[tokio::test]
+async fn create_instance_rejects_unknown_vanilla_selection_without_echoing_raw_value() {
+    let fixture = TestFixture::new("create-unknown-vanilla-selection");
+    fixture.configure_create_manifest(&["1.21.1"]);
+
+    let (status, Json(body)) = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Bad selector".to_string(),
+            selection_id: r"vanilla|C:\Users\Alice\java.exe --accessToken raw-secret-token"
+                .to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect_err("unknown vanilla selection should fail");
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": "Minecraft version is unavailable" })
+    );
+    let public = body.to_string();
+    for leaked in [
+        "Alice",
+        "java.exe",
+        "accessToken",
+        "raw-secret-token",
+        "C:\\Users",
+    ] {
+        assert!(
+            !public.contains(leaked),
+            "{leaked:?} leaked in create selection response: {public}"
+        );
+    }
+    assert!(fixture.state.instances().list().is_empty());
+}
+
+#[tokio::test]
+async fn create_instance_rejects_direct_loader_build_selection_without_echoing_raw_value() {
+    let fixture = TestFixture::new("create-direct-loader-selection");
+    fixture.configure_create_manifest(&["1.21.1"]);
+
+    let (status, Json(body)) = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Direct loader".to_string(),
+            selection_id:
+                r"loader|net.fabricmc.fabric-loader|C:\Users\Alice\loader.jar --accessToken raw-secret-token"
+                    .to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect_err("direct loader build selection should fail");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": "invalid create selection" })
+    );
+    let public = body.to_string();
+    for leaked in [
+        "Alice",
+        "loader.jar",
+        "accessToken",
+        "raw-secret-token",
+        "C:\\Users",
+    ] {
+        assert!(
+            !public.contains(leaked),
+            "{leaked:?} leaked in create loader selection response: {public}"
+        );
+    }
+    assert!(fixture.state.instances().list().is_empty());
+}
+
+#[tokio::test]
+async fn create_instance_rejects_unknown_exact_loader_selection() {
+    let fixture = TestFixture::new("create-unknown-loader-build-selection");
+    fixture.configure_create_manifest(&["1.21.1"]);
+    write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
+    let unknown_build_id = axial_minecraft::build_id_for(
+        axial_minecraft::LoaderComponentId::Fabric,
+        "1.21.1",
+        "0.16.99",
+    );
+
+    let (status, Json(body)) = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Unknown loader".to_string(),
+            selection_id: format!(
+                "loader_build|{}|{unknown_build_id}",
+                axial_minecraft::LoaderComponentId::Fabric.as_str()
+            ),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect_err("unknown exact loader build should fail");
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_bounded_error_body(&body, "Selected loader build is not available.");
+    assert!(fixture.state.instances().list().is_empty());
+}
+
+#[test]
+fn loader_create_selection_rejects_stale_uninstalled_exact_build() {
+    let component_id = axial_minecraft::LoaderComponentId::Fabric;
+    let build = fabric_build_record(component_id, "1.21.1", "0.16.14", 900);
+    let build_id = build.build_id.clone();
+
+    let (status, Json(body)) = resolve_loader_create_selection_from_build_catalog(
+        component_id,
+        &build_id,
+        vec![build],
+        &loader_catalog_state(false, true),
+        &[],
+    )
+    .expect_err("stale uninstalled exact selection should fail");
+
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    assert_bounded_error_body(
+        &body,
+        "Loader catalog needs a fresh provider check before this build can be installed.",
+    );
+}
+
+#[test]
+fn loader_create_selection_rejects_provider_filtered_fabric_build() {
+    let component_id = axial_minecraft::LoaderComponentId::Fabric;
+    let build_id = axial_minecraft::build_id_for(component_id, "26.2", "0.19.3");
+
+    let (status, Json(body)) = resolve_loader_create_selection_from_build_catalog(
+        component_id,
+        &build_id,
+        Vec::new(),
+        &loader_catalog_state(true, false),
+        &[],
+    )
+    .expect_err("provider-filtered build should not create an instance");
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_bounded_error_body(&body, "Selected loader build is not available.");
+}
+
+#[test]
+fn loader_create_selection_allows_stale_exact_build_when_already_installed() {
+    let component_id = axial_minecraft::LoaderComponentId::Fabric;
+    let build = fabric_build_record(component_id, "1.21.1", "0.16.14", 900);
+    let installed_version = installed_loader_entry(&build);
+
+    let selection = resolve_loader_create_selection_from_build_catalog(
+        component_id,
+        &build.build_id,
+        vec![build.clone()],
+        &loader_catalog_state(false, true),
+        &[installed_version],
+    )
+    .expect("stale exact installed selection can be reused");
+
+    assert_eq!(
+        selection,
+        CreateSelection::Loader {
+            component_id,
+            build_id: build.build_id,
+            target_version_id: build.version_id,
+            minecraft_version: build.minecraft_version,
+        }
+    );
+}
+
+#[tokio::test]
+async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_exist() {
+    let fixture = TestFixture::new("create-loader-version-beta-only");
+    fixture.configure_create_manifest(&["26.2"]);
+    let component_id = axial_minecraft::LoaderComponentId::NeoForge;
+    let mut beta = fabric_build_record(component_id, "26.2", "26.2.0.3-beta", 600);
+    beta.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unstable;
+    beta.build_meta.selection.source = axial_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
+    let beta_version_id = beta.version_id.clone();
+    write_loader_build_cache_records(&fixture.state, component_id, "26.2", vec![beta]);
+    seed_committed_busy_install(&fixture.state, "busy-beta-queue").await;
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "NeoForge beta default".to_string(),
+            selection_id: "loader_version|net.neoforged|26.2".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("beta-only loader version should create");
+
+    assert_eq!(created.instance.version_id, beta_version_id);
+    let install_queue = created.install_queue.expect("install queue");
+    let queued = install_queue
+        .items
+        .iter()
+        .find(|item| {
+            item.install_item.loader.as_ref().is_some_and(|loader| {
+                loader.component_id == axial_minecraft::LoaderComponentId::NeoForge.as_str()
+            })
+        })
+        .expect("queued NeoForge install");
+    assert_eq!(queued.kind, "loader");
+    assert_eq!(queued.label, "NeoForge 26.2.0.3-beta for Minecraft 26.2");
+}
+
+#[tokio::test]
+async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
+    let fixture = TestFixture::new("create-quilt-java25-beta-fallback");
+    fixture.configure_create_manifest(&["26.1.2"]);
+    let component_id = axial_minecraft::LoaderComponentId::Quilt;
+    let mut stable_build = fabric_build_record(component_id, "26.1.2", "0.29.2", 700);
+    stable_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unlabeled;
+    stable_build.build_meta.selection.source = axial_minecraft::LoaderSelectionSource::None;
+    let mut beta_build = fabric_build_record(component_id, "26.1.2", "0.30.0-beta.8", 600);
+    beta_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unstable;
+    beta_build.build_meta.selection.source =
+        axial_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
+    write_loader_build_cache_records(
+        &fixture.state,
+        component_id,
+        "26.1.2",
+        vec![stable_build, beta_build],
+    );
+    seed_committed_busy_install(&fixture.state, "busy-quilt-beta-queue").await;
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Quilt 26".to_string(),
+            selection_id: "loader_version|org.quiltmc.quilt-loader|26.1.2".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("compatible Quilt beta fallback should create");
+
+    assert_eq!(
+        created.instance.version_id,
+        axial_minecraft::installed_version_id_for(
+            axial_minecraft::LoaderComponentId::Quilt,
+            "26.1.2",
+            "0.30.0-beta.8",
+        )
+        .expect("valid Quilt identity")
+    );
+    let install_queue = created.install_queue.expect("install queue");
+    let queued = install_queue
+        .items
+        .iter()
+        .find(|item| {
+            item.install_item.loader.as_ref().is_some_and(|loader| {
+                loader.component_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
+            })
+        })
+        .expect("queued Quilt install");
+    assert_eq!(queued.kind, "loader");
+    assert_eq!(queued.label, "Quilt 0.30.0-beta.8 for Minecraft 26.1.2");
+}
+
+#[tokio::test]
+async fn create_instance_view_returns_backend_authored_version_rows() {
+    let fixture = TestFixture::new("create-view-version-rows");
+    let library_dir = fixture.root.join("library");
+    write_version_manifest_cache(&fixture.state, &["1.21.1", "1.21.2"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    for component in axial_minecraft::fetch_components() {
+        let versions = if component.id == axial_minecraft::LoaderComponentId::Fabric {
+            vec!["1.21.1"]
+        } else {
+            Vec::new()
+        };
+        write_supported_versions_cache(&fixture.state, component.id, &versions);
+    }
+    write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
+
+    let view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
+
+    let vanilla = view
+        .versions
+        .iter()
+        .find(|row| row.source_id == "vanilla" && row.minecraft_version_id == "1.21.1")
+        .expect("vanilla row");
+    assert_eq!(vanilla.selection_id, "vanilla|1.21.1");
+    assert_eq!(vanilla.download_state, "full");
+    assert_eq!(vanilla.channel, "release");
+    assert!(
+        view.versions.iter().all(|row| row.source_id == "vanilla"),
+        "default create-view should stay vanilla-only"
+    );
+
+    let view = handle_create_instance_view(
+        &fixture.state,
+        &fixture.producer,
+        Some(axial_minecraft::LoaderComponentId::Fabric.as_str()),
+    )
+    .await;
+    let fabric = view
+        .versions
+        .iter()
+        .find(|row| {
+            row.source_id == axial_minecraft::LoaderComponentId::Fabric.as_str()
+                && row.minecraft_version_id == "1.21.1"
+        })
+        .expect("fabric row");
+    assert_eq!(
+        fabric.selection_id,
+        "loader_version|net.fabricmc.fabric-loader|1.21.1"
+    );
+    assert!(fabric.loader_build.is_none());
+    assert_eq!(fabric.download_state, "base");
+    assert!(
+        view.notices.is_empty(),
+        "unexpected notices: {:?}",
+        view.notices
+    );
+}
+
+#[tokio::test]
+async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is_installed() {
+    let fixture = TestFixture::new("create-view-exact-loader-installed");
+    let library_dir = fixture.root.join("library");
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    for component in axial_minecraft::fetch_components() {
+        let versions = if component.id == axial_minecraft::LoaderComponentId::Fabric {
+            vec!["1.21.1"]
+        } else {
+            Vec::new()
+        };
+        write_supported_versions_cache(&fixture.state, component.id, &versions);
+    }
+    write_fabric_loader_build_cache_with_builds(
+        &fixture.state,
+        "1.21.1",
+        &[("0.16.15", 900), ("0.16.14", 900)],
+        chrono::Utc::now().timestamp_millis(),
+    );
+    write_installed_loader_version(
+        &library_dir,
+        axial_minecraft::LoaderComponentId::Fabric,
+        "1.21.1",
+        "0.16.14",
+    );
+
+    let view = handle_create_instance_view(
+        &fixture.state,
+        &fixture.producer,
+        Some(axial_minecraft::LoaderComponentId::Fabric.as_str()),
+    )
+    .await;
+
+    let fabric = view
+        .versions
+        .iter()
+        .find(|row| {
+            row.source_id == axial_minecraft::LoaderComponentId::Fabric.as_str()
+                && row.minecraft_version_id == "1.21.1"
+        })
+        .expect("fabric row");
+    assert_eq!(
+        fabric.selection_id,
+        "loader_version|net.fabricmc.fabric-loader|1.21.1"
+    );
+    assert_eq!(fabric.download_state, "full");
+}
+
+#[tokio::test]
+async fn create_instance_view_refreshes_when_versions_root_metadata_changes() {
+    let fixture = TestFixture::new("create-view-installed-scan-cache");
+    let library_dir = fixture.root.join("library");
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
+
+    let view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
+    let row = view
+        .versions
+        .iter()
+        .find(|row| row.source_id == "vanilla" && row.minecraft_version_id == "1.21.1")
+        .expect("vanilla row");
+    assert_eq!(row.download_state, "none");
+    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
+
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let refreshed_view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
+    let refreshed_row = refreshed_view
+        .versions
+        .iter()
+        .find(|row| row.source_id == "vanilla" && row.minecraft_version_id == "1.21.1")
+        .expect("refreshed vanilla row");
+    assert_eq!(refreshed_row.download_state, "full");
+    assert_eq!(fixture.state.installed_versions_walk_count(), 2);
+
+    let cached_view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
+    let cached_row = cached_view
+        .versions
+        .iter()
+        .find(|row| row.source_id == "vanilla" && row.minecraft_version_id == "1.21.1")
+        .expect("cached vanilla row");
+    assert_eq!(cached_row.download_state, "full");
+    assert_eq!(fixture.state.installed_versions_walk_count(), 2);
+}
+
+#[tokio::test]
+async fn create_instance_view_tags_beta_only_loader_version_rows_without_blocking_selection() {
+    let fixture = TestFixture::new("create-view-beta-only-loader-version");
+    let library_dir = fixture.root.join("library");
+    write_version_manifest_cache(&fixture.state, &["26.2", "1.7.10_pre4"]);
+    for component in axial_minecraft::fetch_components() {
+        let versions = match component.id {
+            axial_minecraft::LoaderComponentId::Forge => {
+                vec![("1.7.10_pre4", Some(false))]
+            }
+            axial_minecraft::LoaderComponentId::NeoForge => vec![("26.2", Some(false))],
+            _ => Vec::new(),
+        };
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
+    }
+    write_installed_vanilla_version(&library_dir, "26.2");
+    write_installed_loader_version(
+        &library_dir,
+        axial_minecraft::LoaderComponentId::NeoForge,
+        "26.2",
+        "26.2.0.6-beta",
+    );
+
+    for (component_id, minecraft_version) in [
+        (axial_minecraft::LoaderComponentId::Forge, "1.7.10_pre4"),
+        (axial_minecraft::LoaderComponentId::NeoForge, "26.2"),
+    ] {
+        let view = handle_create_instance_view(
+            &fixture.state,
+            &fixture.producer,
+            Some(component_id.as_str()),
+        )
+        .await;
+
+        let row = view
+            .versions
+            .iter()
+            .find(|row| {
+                row.source_id == component_id.as_str()
+                    && row.minecraft_version_id == minecraft_version
+            })
+            .expect("beta-only loader row");
+        assert_eq!(row.channel, "snapshot");
+        if component_id == axial_minecraft::LoaderComponentId::NeoForge {
+            assert_eq!(row.download_state, "full");
+        }
+        assert!(row.create_enabled);
+        assert_eq!(row.disabled_reason, None);
+        assert!(
+            row.tags
+                .iter()
+                .any(|tag| tag.id == "beta" && tag.label == "Beta")
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
+    let fixture = TestFixture::new("create-view-loader-snapshot-stable-hint");
+    write_version_manifest_cache(&fixture.state, &["26.2"]);
+    for component in axial_minecraft::fetch_components() {
+        let versions = if matches!(
+            component.id,
+            axial_minecraft::LoaderComponentId::Fabric | axial_minecraft::LoaderComponentId::Quilt
+        ) {
+            vec![("26.2", Some(false))]
+        } else {
+            Vec::new()
+        };
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
+    }
+    write_loader_build_cache_records(
+        &fixture.state,
+        axial_minecraft::LoaderComponentId::Quilt,
+        "26.2",
+        vec![fabric_build_record(
+            axial_minecraft::LoaderComponentId::Quilt,
+            "26.2",
+            "0.30.0",
+            700,
+        )],
+    );
+
+    for component_id in [
+        axial_minecraft::LoaderComponentId::Fabric,
+        axial_minecraft::LoaderComponentId::Quilt,
+    ] {
+        let view = handle_create_instance_view(
+            &fixture.state,
+            &fixture.producer,
+            Some(component_id.as_str()),
+        )
+        .await;
+        let row = view
+            .versions
+            .iter()
+            .find(|row| {
+                row.source_id == component_id.as_str() && row.minecraft_version_id == "26.2"
+            })
+            .expect("snapshot loader row");
+        assert_eq!(row.channel, "snapshot");
+        assert!(row.create_enabled);
+        assert_eq!(row.disabled_reason, None);
+        assert!(row.tags.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn create_instance_view_disables_known_incompatible_quilt_java25_default() {
+    let fixture = TestFixture::new("create-view-quilt-java25-guard");
+    write_version_manifest_cache(&fixture.state, &["26.1.3", "26.1.2", "1.21.10"]);
+    for component in axial_minecraft::fetch_components() {
+        let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
+            vec![
+                ("26.1.3", Some(true)),
+                ("26.1.2", Some(true)),
+                ("1.21.10", Some(true)),
+            ]
+        } else {
+            Vec::new()
+        };
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
+    }
+    let component_id = axial_minecraft::LoaderComponentId::Quilt;
+    write_loader_build_cache_records(
+        &fixture.state,
+        component_id,
+        "26.1.2",
+        vec![fabric_build_record(component_id, "26.1.2", "0.29.2", 700)],
+    );
+    write_loader_build_cache_records(
+        &fixture.state,
+        component_id,
+        "26.1.3",
+        vec![fabric_build_record(component_id, "26.1.3", "0.30.0", 700)],
+    );
+
+    let view = handle_create_instance_view(
+        &fixture.state,
+        &fixture.producer,
+        Some(axial_minecraft::LoaderComponentId::Quilt.as_str()),
+    )
+    .await;
+
+    let quilt_26 = view
+        .versions
+        .iter()
+        .find(|row| {
+            row.source_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
+                && row.minecraft_version_id == "26.1.2"
+        })
+        .expect("quilt 26 row");
+    assert!(!quilt_26.create_enabled);
+    assert_eq!(
+        quilt_26.disabled_reason.as_deref(),
+        Some("No stable compatible Quilt loader is available for this Minecraft version.")
+    );
+    let quilt_26_compatible = view
+        .versions
+        .iter()
+        .find(|row| {
+            row.source_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
+                && row.minecraft_version_id == "26.1.3"
+        })
+        .expect("quilt compatible 26 row");
+    assert!(quilt_26_compatible.create_enabled);
+
+    let quilt_1_21 = view
+        .versions
+        .iter()
+        .find(|row| {
+            row.source_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
+                && row.minecraft_version_id == "1.21.10"
+        })
+        .expect("quilt 1.21 row");
+    assert!(quilt_1_21.create_enabled);
+}
+
+#[tokio::test]
+async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
+    let fixture = TestFixture::new("create-view-quilt-java25-no-build-cache");
+    write_version_manifest_cache(&fixture.state, &["26.1.2"]);
+    for component in axial_minecraft::fetch_components() {
+        let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
+            vec![("26.1.2", Some(true))]
+        } else {
+            Vec::new()
+        };
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
+    }
+
+    let view = handle_create_instance_view(
+        &fixture.state,
+        &fixture.producer,
+        Some(axial_minecraft::LoaderComponentId::Quilt.as_str()),
+    )
+    .await;
+
+    let row = view
+        .versions
+        .iter()
+        .find(|row| {
+            row.source_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
+                && row.minecraft_version_id == "26.1.2"
+        })
+        .expect("quilt 26 row");
+    assert!(row.create_enabled);
+    assert_eq!(row.disabled_reason, None);
+    assert!(row.tags.iter().any(|tag| tag.id == "beta"));
+}
+
+#[tokio::test]
+async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_default_fallback() {
+    let fixture = TestFixture::new("create-view-quilt-java25-beta-fallback");
+    write_version_manifest_cache(&fixture.state, &["26.1.2"]);
+    for component in axial_minecraft::fetch_components() {
+        let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
+            vec![("26.1.2", Some(true))]
+        } else {
+            Vec::new()
+        };
+        write_supported_versions_cache_with_stable_hints(&fixture.state, component.id, &versions);
+    }
+    let component_id = axial_minecraft::LoaderComponentId::Quilt;
+    let mut stable_build = fabric_build_record(component_id, "26.1.2", "0.29.2", 700);
+    stable_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unlabeled;
+    let mut beta_build = fabric_build_record(component_id, "26.1.2", "0.30.0-beta.8", 600);
+    beta_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unstable;
+    write_loader_build_cache_records(
+        &fixture.state,
+        component_id,
+        "26.1.2",
+        vec![stable_build, beta_build],
+    );
+
+    let view = handle_create_instance_view(
+        &fixture.state,
+        &fixture.producer,
+        Some(axial_minecraft::LoaderComponentId::Quilt.as_str()),
+    )
+    .await;
+
+    let row = view
+        .versions
+        .iter()
+        .find(|row| {
+            row.source_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
+                && row.minecraft_version_id == "26.1.2"
+        })
+        .expect("quilt 26 row");
+    assert!(row.create_enabled);
+    assert_eq!(row.disabled_reason, None);
+    assert!(row.tags.iter().any(|tag| tag.id == "beta"));
+}
+
+#[tokio::test]
+async fn behavior_contract_cross_owner_create_response_uses_one_exact_queue_projection() {
+    let fixture = TestFixture::new("create-vanilla-queue");
+    write_version_manifest_cache(&fixture.state, &["1.21.2"]);
+    seed_committed_busy_install(&fixture.state, "busy-queue").await;
+    fixture
+        .state
+        .installs()
+        .enqueue_queued_install(
+            "older-pending-queue".to_string(),
+            crate::state::InstallQueueSpec::vanilla("1.20.1".to_string()),
+            crate::state::InstallQueuePlacement::Back,
+        )
+        .await;
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Queued".to_string(),
+            selection_id: "vanilla|1.21.2".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create and queue install");
+
+    let serialized = serde_json::to_value(&created).expect("serialize create response");
+    assert!(serialized.get("install_queue").is_some());
+    assert!(serialized.get("result").is_none());
+    assert!(serialized.get("queued_install").is_none());
+    assert_eq!(
+        serialized["view_model"]["state_id"],
+        "created_install_queued"
+    );
+    assert_eq!(
+        serialized["view_model"]["summary"],
+        "Created Queued; Minecraft 1.21.2 queued."
+    );
+
+    assert_eq!(created.instance.version_id, "1.21.2");
+    let install_queue = created.install_queue.expect("install queue");
+    assert_eq!(
+        install_queue.items.first().map(|item| item.label.as_str()),
+        Some("Minecraft 1.20.1")
+    );
+    let queued = install_queue
+        .items
+        .iter()
+        .find(|item| item.install_item.loader.is_none() && item.install_item.version_id == "1.21.2")
+        .expect("selected 1.21.2 queue item");
+    assert_eq!(queued.kind, "vanilla");
+    assert_eq!(queued.label, "Minecraft 1.21.2");
+}
+
+#[tokio::test]
+async fn create_instance_installed_vanilla_selection_does_not_queue_install() {
+    let fixture = TestFixture::new("create-installed-vanilla");
+    let library_dir = fixture.root.join("library");
+    write_version_manifest_cache(&fixture.state, &["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Installed".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create installed vanilla instance");
+
+    assert_eq!(created.instance.version_id, "1.21.1");
+    assert!(created.instance.launchable);
+    assert!(created.install_queue.is_none());
+    assert_eq!(created.view_model.state_id, "created");
+}
+
+#[tokio::test]
+async fn create_instance_missing_library_queues_install() {
+    let fixture = TestFixture::new("create-missing-library");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_version_with_missing_library(&library_dir, "1.21.1");
+    seed_committed_busy_install(&fixture.state, "busy-missing-library").await;
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Missing library".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create instance and queue repair install");
+
+    assert!(!created.instance.launchable);
+    assert!(created.install_queue.is_some());
+}
+
+#[tokio::test]
+async fn create_instance_missing_asset_object_does_not_queue_install() {
+    let fixture = TestFixture::new("create-missing-asset-object");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_version_with_missing_asset_object(&library_dir, "1.21.1");
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Missing asset object".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create instance without asset object walk");
+
+    assert!(created.instance.launchable);
+    assert!(created.install_queue.is_none());
+}
+
+#[tokio::test]
+async fn create_instance_same_size_client_drift_does_not_queue_install() {
+    let fixture = TestFixture::new("create-same-size-client-drift");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_version_with_corrupt_client_jar(&library_dir, "1.21.1");
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Client drift".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create instance without client hash scan");
+
+    assert!(created.instance.launchable);
+    assert!(created.install_queue.is_none());
+}
+
+#[tokio::test]
+async fn create_instance_vanilla_reuses_one_request_snapshot_without_warm_walks() {
+    let fixture = TestFixture::new("create-vanilla-shared-version-snapshot");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+
+    for name in ["Cold vanilla", "Warm vanilla"] {
+        let created = handle_create_instance(
+            &fixture.state,
+            CreateInstanceRequest {
+                name: name.to_string(),
+                selection_id: "vanilla|1.21.1".to_string(),
+                ..CreateInstanceRequest::default()
+            },
+        )
+        .await
+        .expect("create installed vanilla instance");
+
+        assert!(created.instance.launchable);
+        assert!(created.install_queue.is_none());
+        assert_eq!(fixture.state.installed_versions_walk_count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn create_instance_loader_reuses_one_request_snapshot_without_warm_walks() {
+    let fixture = TestFixture::new("create-loader-shared-version-snapshot");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    write_installed_loader_version(
+        &library_dir,
+        axial_minecraft::LoaderComponentId::Fabric,
+        "1.21.1",
+        "0.16.14",
+    );
+    let build_id = write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
+
+    for name in ["Cold loader", "Warm loader"] {
+        let created = handle_create_instance(
+            &fixture.state,
+            CreateInstanceRequest {
+                name: name.to_string(),
+                selection_id: format!(
+                    "loader_build|{}|{build_id}",
+                    axial_minecraft::LoaderComponentId::Fabric.as_str()
+                ),
+                ..CreateInstanceRequest::default()
+            },
+        )
+        .await
+        .expect("create installed loader instance");
+
+        assert!(created.instance.launchable);
+        assert!(created.install_queue.is_none());
+        assert_eq!(fixture.state.installed_versions_walk_count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn create_instance_checksumless_loader_probe_stays_strict_without_instance_authority() {
+    let fixture = TestFixture::new("create-checksumless-loader-strict");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    write_installed_checksumless_loader_version(
+        &library_dir,
+        axial_minecraft::LoaderComponentId::Fabric,
+        "1.21.1",
+        "0.16.14",
+    );
+    let build_id = write_fabric_loader_build_cache(&fixture.state, "1.21.1", "0.16.14");
+    seed_committed_busy_install(&fixture.state, "busy-checksumless-probe").await;
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Strict checksumless loader".to_string(),
+            selection_id: format!(
+                "loader_build|{}|{build_id}",
+                axial_minecraft::LoaderComponentId::Fabric.as_str()
+            ),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create checksumless loader instance");
+
+    assert!(!created.instance.launchable);
+    assert!(created.install_queue.is_some());
+}
+
+#[tokio::test]
+async fn cached_loader_build_cannot_authorize_backend_install() {
+    let fixture = TestFixture::new("create-loader-queue");
+    fixture
+        .state
+        .installs()
+        .enqueue_queued_install(
+            "busy-loader-queue".to_string(),
+            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
+            crate::state::InstallQueuePlacement::Back,
+        )
+        .await;
+    fixture
+        .state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .reserved()
+        .expect("reserve active queue slot");
+    let build_id = write_fabric_loader_build_cache(&fixture.state, "1.21.99", "0.16.14");
+
+    let (status, Json(body)) = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Fabric queued".to_string(),
+            selection_id: "loader_version|net.fabricmc.fabric-loader|1.21.99".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect_err("cached build must not authorize a loader install");
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["failure_kind"], "catalog_unavailable");
+    assert_eq!(
+        body["error"],
+        "Loader catalog is unavailable. Check your connection and try again."
+    );
+    assert_eq!(
+        build_id,
+        axial_minecraft::build_id_for(
+            axial_minecraft::LoaderComponentId::Fabric,
+            "1.21.99",
+            "0.16.14"
+        )
+    );
+    assert!(fixture.state.instances().list().is_empty());
+    let queue = fixture.state.installs().queue_snapshot().await;
+    assert_eq!(
+        queue.active.as_ref().map(|entry| entry.queue_id.as_str()),
+        Some("busy-loader-queue")
+    );
+    assert!(queue.pending.is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_instance_existing_name_maps_to_conflict_json_error() {
+    let fixture = TestFixture::new("duplicate-name-conflict");
+    let source = fixture
+        .state
+        .instances()
+        .insert_for_test("Source".to_string(), "1.21.1".to_string())
+        .expect("add source instance");
+    fixture
+        .state
+        .instances()
+        .insert_for_test("Existing".to_string(), "1.21.1".to_string())
+        .expect("add existing instance");
+
+    let (status, Json(body)) = handle_duplicate_instance(
+        &fixture.state,
+        &source.id,
+        Some(DuplicateInstanceRequest {
+            name: Some("Existing".to_string()),
+        }),
+    )
+    .await
+    .expect_err("duplicate name should fail");
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": "an instance with this name already exists" })
+    );
+    assert_eq!(fixture.state.instances().list().len(), 2);
+}
+
+#[tokio::test]
+async fn open_instance_folder_missing_instance_returns_not_found_json_error() {
+    let fixture = TestFixture::new("open-folder-missing");
+
+    let (status, Json(body)) = handle_open_instance_folder(
+        &fixture.state,
+        "missing",
+        OpenFolderQuery { sub: None },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("missing open-folder should fail");
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_bounded_error_body(&body, "instance not found");
+}
+
+#[tokio::test]
+async fn open_instance_folder_rejects_traversal_subfolder_without_creating_escape_path() {
+    let fixture = TestFixture::new("open-folder-traversal");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Traversal".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let escaped_dir = game_dir
+        .parent()
+        .expect("game dir parent")
+        .join("escaped-open-folder");
+    assert!(!escaped_dir.exists());
+
+    let (status, Json(body)) = handle_open_instance_folder(
+        &fixture.state,
+        &instance.id,
+        OpenFolderQuery {
+            sub: Some("../escaped-open-folder".to_string()),
+        },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("traversal open-folder should fail");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_bounded_error_body(&body, "invalid instance folder");
+    assert!(!escaped_dir.exists());
+}
+
+#[tokio::test]
+async fn missing_instance_crud_handlers_return_not_found_json_error() {
+    let fixture = TestFixture::new("missing-crud");
+
+    let (status, Json(body)) = handle_get_instance(&fixture.state, &fixture.producer, "missing")
+        .await
+        .expect_err("missing get should fail");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_bounded_error_body(&body, "instance not found");
+
+    let (status, Json(body)) = handle_update_instance_owned(
+        &fixture.state,
+        "missing",
+        InstancePatch {
+            name: Some("Nope".to_string()),
+            ..InstancePatch::default()
+        },
+        fixture._request.producer_handoff(),
+    )
+    .await
+    .expect_err("missing update should fail");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_bounded_error_body(&body, "instance not found");
+
+    let (status, Json(body)) = handle_delete_instance(&fixture.state, "missing", HashMap::new())
+        .await
+        .expect_err("missing delete should fail");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_bounded_error_body(&body, "instance not found");
+}
+
+#[tokio::test]
+async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
+    let fixture = TestFixture::new("delete-files");
+    let remove_files = fixture
+        .state
+        .instances()
+        .insert_for_test("Remove files".to_string(), "1.21.1".to_string())
+        .expect("add remove-files instance");
+    let remove_game_dir = fixture.state.instances().game_dir(&remove_files.id);
+    fs::write(remove_game_dir.join("mods").join("example.jar"), "mod").expect("write mod");
+    let remove_known_good =
+        persist_known_good(&fixture.state, &fixture.root, &remove_files.id).await;
+
+    let body = handle_delete_instance(&fixture.state, &remove_files.id, HashMap::new())
+        .await
+        .expect("delete with default file removal");
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert!(!remove_game_dir.exists());
+    assert!(!remove_known_good.exists());
+
+    let keep_files = fixture
+        .state
+        .instances()
+        .insert_for_test("Keep files".to_string(), "1.21.1".to_string())
+        .expect("add keep-files instance");
+    let keep_game_dir = fixture.state.instances().game_dir(&keep_files.id);
+    let keep_marker = keep_game_dir.join("saves").join("world").join("level.dat");
+    fs::create_dir_all(keep_marker.parent().expect("marker parent")).expect("create world");
+    fs::write(&keep_marker, "level").expect("write level");
+    let keep_known_good = persist_known_good(&fixture.state, &fixture.root, &keep_files.id).await;
+
+    let body = handle_delete_instance(
+        &fixture.state,
+        &keep_files.id,
+        HashMap::from([("keep_files".to_string(), "true".to_string())]),
+    )
+    .await
+    .expect("delete while keeping files");
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+
+    assert!(fixture.state.instances().get(&keep_files.id).is_none());
+    assert!(keep_marker.exists());
+    assert!(!keep_known_good.exists());
+}
+
+#[tokio::test]
+async fn delete_waits_for_cancelled_sweep_settlement_before_registry_and_filesystem_effects() {
+    let fixture = TestFixture::new("delete-sweep-settlement");
+    let instance = add_test_instance(&fixture, "Sweep delete", "1.21.1");
+    let marker = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("saves/world/level.dat");
+    fs::create_dir_all(marker.parent().expect("marker parent")).expect("create marker parent");
+    fs::write(&marker, "world").expect("write marker");
+    let directories_before = instance_directory_names(&fixture.root);
+    let (reservation, cancellation) = reserve_instance_sweep(&fixture.state);
+    let state = fixture.state.clone();
+    let instance_id = instance.id.clone();
+    let delete =
+        tokio::spawn(
+            async move { handle_delete_instance(&state, &instance_id, HashMap::new()).await },
+        );
+
+    wait_for_sweep_cancellation(&cancellation).await;
+    assert_eq!(
+        fixture.state.instances().get(&instance.id),
+        Some(instance.clone())
+    );
+    assert_eq!(instance_directory_names(&fixture.root), directories_before);
+    assert_eq!(fs::read_to_string(&marker).expect("read marker"), "world");
+    assert!(!delete.is_finished());
+
+    reservation.settle(IdleSweepTerminal::Cancelled);
+    let body = tokio::time::timeout(std::time::Duration::from_secs(5), delete)
+        .await
+        .expect("delete settles after sweep")
+        .expect("delete task")
+        .expect("delete succeeds");
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert!(fixture.state.instances().get(&instance.id).is_none());
+    assert!(!fixture.state.instances().game_dir(&instance.id).exists());
+}
+
+#[tokio::test]
+async fn state_instance_transactions_reject_foreign_foreground_before_effects() {
+    let owner = TestFixture::new("foreign-foreground-owner");
+    let target = TestFixture::new("foreign-foreground-target");
+    let foreground = instance_foreground(&owner.state).await;
+
+    let create_id = axial_config::generate_instance_id();
+    let create = crate::state::new_instance(
+        create_id.clone(),
+        "Foreign create".to_string(),
+        "1.21.1".to_string(),
+        String::new(),
+        String::new(),
+    );
+    let error = target
+        .state
+        .create_instance(&foreground, create, None)
+        .await
+        .expect_err("foreign create foreground rejected");
+    assert_foreign_foreground_error(error);
+    assert!(target.state.instances().get(&create_id).is_none());
+    assert!(!target.state.instances().game_dir(&create_id).exists());
+
+    let source = add_test_instance(&target, "Foreign source", "1.21.1");
+    let source_marker = target
+        .state
+        .instances()
+        .game_dir(&source.id)
+        .join("mods/source.jar");
+    fs::write(&source_marker, "source").expect("write source marker");
+    let directories_before = instance_directory_names(&target.root);
+    let error = target
+        .state
+        .duplicate_instance(&foreground, source.id.clone(), None)
+        .await
+        .expect_err("foreign duplicate foreground rejected");
+    assert_foreign_foreground_error(error);
+    assert_eq!(target.state.instances().list(), vec![source.clone()]);
+    assert_eq!(instance_directory_names(&target.root), directories_before);
+    assert!(source_marker.is_file());
+
+    let error = target
+        .state
+        .delete_instance(&foreground, source.id.clone(), true)
+        .await
+        .expect_err("foreign delete foreground rejected");
+    assert_foreign_foreground_error(error);
+    assert_eq!(
+        target.state.instances().get(&source.id),
+        Some(source.clone())
+    );
+    assert!(source_marker.is_file());
+
+    let error = target
+        .state
+        .update_instance(
+            &foreground,
+            source.id.clone(),
+            crate::state::InstanceUpdate {
+                name: Some("Foreign update".to_string()),
+                ..crate::state::InstanceUpdate::default()
+            },
+        )
+        .await
+        .expect_err("foreign update foreground rejected");
+    assert_foreign_foreground_error(error);
+    assert_eq!(
+        target.state.instances().get(&source.id),
+        Some(source.clone())
+    );
+
+    let error = target
+        .state
+        .record_successful_launch_metadata(
+            &foreground,
+            source.id.clone(),
+            "2026-01-01T00:00:00Z".to_string(),
+        )
+        .await
+        .expect_err("foreign launch metadata foreground rejected");
+    assert_foreign_foreground_error(error);
+    assert_eq!(target.state.instances().get(&source.id), Some(source));
+    assert_eq!(target.state.instances().last_instance_id(), None);
+}
+
+#[tokio::test]
+async fn update_and_duplicate_serialize_on_the_source_lifecycle() {
+    let fixture = TestFixture::new("update-duplicate-lifecycle");
+    let source = add_test_instance(&fixture, "Lifecycle source", "1.21.1");
+    let registry = fixture
+        .state
+        .instances()
+        .acquire_mutation()
+        .await
+        .expect("hold registry mutation");
+    let update_state = fixture.state.clone();
+    let update_id = source.id.clone();
+    let update_foreground = instance_foreground(&fixture.state).await;
+    let update = tokio::spawn(async move {
+        update_state
+            .update_instance(
+                &update_foreground,
+                update_id,
+                crate::state::InstanceUpdate {
+                    max_memory_mb: Some(8192),
+                    ..crate::state::InstanceUpdate::default()
+                },
+            )
+            .await
+    });
+    wait_for_instance_lifecycle(&fixture.state, &source.id).await;
+
+    let duplicate_foreground = instance_foreground(&fixture.state).await;
+    let mut duplicate = Box::pin(fixture.state.duplicate_instance(
+        &duplicate_foreground,
+        source.id.clone(),
+        Some("Lifecycle copy".to_string()),
+    ));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(duplicate.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+
+    drop(registry);
+    let updated = update.await.expect("update task").expect("update succeeds");
+    assert_eq!(updated.max_memory_mb, 8192);
+    let duplicated = duplicate.await.expect("duplicate succeeds after update");
+    assert_eq!(duplicated.max_memory_mb, 8192);
+}
+
+#[tokio::test]
+async fn cancelled_update_caller_cannot_cancel_lifecycle_waiting_owner() {
+    let (state, root) = test_state("update-cancel-lifecycle");
+    let instance = state
+        .instances()
+        .insert_for_test("Cancel update lifecycle".to_string(), "1.21.1".to_string())
+        .expect("register instance");
+    let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+    let request = state.try_admit_request().expect("admit update request");
+    let mut update = Box::pin(handle_update_instance_owned(
+        &state,
+        &instance.id,
+        InstancePatch {
+            name: Some("Lifecycle update completed".to_string()),
+            ..InstancePatch::default()
+        },
+        request.producer_handoff(),
+    ));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(update.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+    drop(update);
+    drop(request);
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    wait_for_producer_quiescence(&state).await;
+    assert!(!quiesce.is_finished());
+    assert_eq!(
+        state.instances().get(&instance.id).expect("instance").name,
+        "Cancel update lifecycle"
+    );
+    drop(lifecycle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("update lifecycle owner drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+    assert_eq!(
+        state.instances().get(&instance.id).expect("instance").name,
+        "Lifecycle update completed"
+    );
+    shutdown_test_state(state, root).await;
+}
+
+#[tokio::test]
+async fn cancelled_update_caller_cannot_cancel_registry_waiting_owner() {
+    let (state, root) = test_state("update-cancel-registry");
+    let instance = state
+        .instances()
+        .insert_for_test("Cancel update registry".to_string(), "1.21.1".to_string())
+        .expect("register instance");
+    let registry = state
+        .instances()
+        .acquire_mutation()
+        .await
+        .expect("hold registry mutation");
+    let request = state.try_admit_request().expect("admit update request");
+    let mut update = Box::pin(handle_update_instance_owned(
+        &state,
+        &instance.id,
+        InstancePatch {
+            name: Some("Registry update completed".to_string()),
+            ..InstancePatch::default()
+        },
+        request.producer_handoff(),
+    ));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(update.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+    drop(update);
+    wait_for_instance_lifecycle(&state, &instance.id).await;
+    drop(request);
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    wait_for_producer_quiescence(&state).await;
+    assert!(!quiesce.is_finished());
+    assert_eq!(
+        state.instances().get(&instance.id).expect("instance").name,
+        "Cancel update registry"
+    );
+    drop(registry);
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("update registry owner drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+    assert_eq!(
+        state.instances().get(&instance.id).expect("instance").name,
+        "Registry update completed"
+    );
+    shutdown_test_state(state, root).await;
+}
+
+#[tokio::test]
+async fn delete_waits_for_launch_admission_and_rejects_newly_queued_session() {
+    let fixture = TestFixture::new("delete-launch-admission");
+    let instance = add_test_instance(&fixture, "Launch admission", "1.21.1");
+    let lifecycle = fixture.state.acquire_instance_lifecycle(&instance.id).await;
+    let deleting_state = fixture.state.clone();
+    let deleting_id = instance.id.clone();
+    let mut delete = Box::pin(handle_delete_instance(
+        &deleting_state,
+        &deleting_id,
+        HashMap::new(),
+    ));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(delete.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+
+    fixture
+        .state
+        .sessions()
+        .insert(test_launch_record("delete-launch-session", &instance.id))
+        .await
+        .expect("queue session while launch owns lifecycle admission");
+    drop(lifecycle);
+
+    let (status, Json(body)) = delete.await.expect_err("queued launch must block deletion");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(
+        &body,
+        "cannot delete a running instance; stop the game first",
+    );
+    assert!(fixture.state.instances().get(&instance.id).is_some());
+    assert!(fixture.state.instances().game_dir(&instance.id).is_dir());
+}
+
+#[tokio::test]
+async fn cancelled_delete_caller_cannot_cancel_lifecycle_waiting_owner() {
+    let (state, root) = test_state_with_library("delete-cancel-lifecycle");
+    let instance = state
+        .instances()
+        .insert_for_test("Cancel lifecycle", "1.21.1")
+        .expect("register instance");
+    let known_good = root
+        .join("state/known-good")
+        .join(format!("{}.json", instance.id));
+    persist_known_good(&state, &root, &instance.id).await;
+    let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+    let instance_id = instance.id.clone();
+    let request = state.try_admit_request().expect("admit delete request");
+    let mut delete = Box::pin(handle_delete_instance_owned(
+        &state,
+        &instance_id,
+        HashMap::from([("keep_files".to_string(), "true".to_string())]),
+        request.producer_handoff(),
+    ));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(delete.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+    drop(delete);
+    drop(request);
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    wait_for_producer_quiescence(&state).await;
+    assert!(!quiesce.is_finished());
+    drop(lifecycle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("delete lifecycle owner drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+    assert!(state.instances().get(&instance_id).is_none());
+    assert!(!known_good.exists());
+    shutdown_test_state(state, root).await;
+}
+
+#[tokio::test]
+async fn cancelled_delete_caller_cannot_cancel_registry_waiting_owner() {
+    let (state, root) = test_state("delete-cancel-registry");
+    let instance = state
+        .instances()
+        .insert_for_test("Cancel registry", "1.21.1")
+        .expect("register instance");
+    let registry = state
+        .instances()
+        .acquire_mutation()
+        .await
+        .expect("hold registry mutation");
+    let instance_id = instance.id.clone();
+    let request = state.try_admit_request().expect("admit delete request");
+    let mut delete = Box::pin(handle_delete_instance_owned(
+        &state,
+        &instance_id,
+        HashMap::from([("keep_files".to_string(), "true".to_string())]),
+        request.producer_handoff(),
+    ));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(delete.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+    drop(delete);
+    drop(request);
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    wait_for_producer_quiescence(&state).await;
+    assert!(!quiesce.is_finished());
+    drop(registry);
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("delete registry owner drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+    assert!(state.instances().get(&instance_id).is_none());
+    shutdown_test_state(state, root).await;
+}
+
+#[tokio::test]
+async fn deletion_recovers_latched_managed_state_before_registry_absence() {
+    let fixture = TestFixture::new("delete-recover-latched");
+    let instance = add_test_instance(&fixture, "Recover latch", "1.21.1");
+    let known_good = fixture
+        .root
+        .join("state/known-good")
+        .join(format!("{}.json", instance.id));
+    persist_known_good(&fixture.state, &fixture.root, &instance.id).await;
+    let parked = latch_managed_instance(&fixture, &instance.id).await;
+    fs::remove_file(parked).expect("make exact managed recovery possible");
+
+    fixture
+        .state
+        .delete_instance(
+            &instance_foreground(&fixture.state).await,
+            instance.id.clone(),
+            true,
+        )
+        .await
+        .expect("recovered latch permits deletion");
+
+    assert!(fixture.state.instances().get(&instance.id).is_none());
+    assert!(!known_good.exists());
+}
+
+#[tokio::test]
+async fn unrecoverable_latched_managed_state_preserves_present_instance_authorities() {
+    let fixture = TestFixture::new("delete-unrecoverable-latch");
+    let instance = add_test_instance(&fixture, "Retain latch", "1.21.1");
+    let known_good = fixture
+        .root
+        .join("state/known-good")
+        .join(format!("{}.json", instance.id));
+    persist_known_good(&fixture.state, &fixture.root, &instance.id).await;
+    let parked = latch_managed_instance(&fixture, &instance.id).await;
+
+    fixture
+        .state
+        .delete_instance(
+            &instance_foreground(&fixture.state).await,
+            instance.id.clone(),
+            true,
+        )
+        .await
+        .expect_err("unrecoverable latch must block deletion");
+
+    assert!(fixture.state.instances().get(&instance.id).is_some());
+    assert!(known_good.is_file());
+    let error = fixture
+        .state
+        .admit_managed_instance(&instance.id, false)
+        .await
+        .err()
+        .expect("managed identity remains latched");
+    assert!(
+        error
+            .to_string()
+            .contains("exact recovery could not prove a clean state")
+    );
+    fs::remove_file(parked).expect("repair managed deletion park");
+    drop(
+        fixture
+            .state
+            .admit_managed_instance(&instance.id, false)
+            .await
+            .expect("retained latch remains recoverable later"),
+    );
+}
+
+#[tokio::test]
+async fn keep_files_unregisters_latched_instance_without_claiming_its_bytes() {
+    let fixture = TestFixture::new("keep-files-latched");
+    let instance = add_test_instance(&fixture, "Keep latched files", "1.21.1");
+    let known_good = persist_known_good(&fixture.state, &fixture.root, &instance.id).await;
+    let parked = latch_managed_instance(&fixture, &instance.id).await;
+
+    fixture
+        .state
+        .delete_instance(
+            &instance_foreground(&fixture.state).await,
+            instance.id.clone(),
+            false,
+        )
+        .await
+        .expect("keep-files unregisters without recovering persisted bytes");
+
+    assert!(fixture.state.instances().get(&instance.id).is_none());
+    assert!(!known_good.exists());
+    assert_eq!(
+        fs::read(&parked).expect("preserved parked bytes"),
+        b"orphan"
+    );
+    fs::remove_file(parked).expect("repair managed state for fixture shutdown");
+}
+
+#[tokio::test]
+async fn admitted_delete_claims_its_request_handoff_during_drain() {
+    let fixture = TestFixture::new("delete-request-drain");
+    let instance = add_test_instance(&fixture, "Delete during drain", "1.21.1");
+    let request = fixture
+        .state
+        .try_admit_request()
+        .expect("admit delete request before drain");
+    let handoff = request.producer_handoff();
+    let shutdown_state = fixture.state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while fixture.state.lifecycle_phase() != crate::state::AppLifecyclePhase::DrainingRequests {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request drain begins");
+    assert!(fixture.state.try_claim_producer().is_err());
+
+    let body = handle_delete_instance_owned(&fixture.state, &instance.id, HashMap::new(), handoff)
+        .await
+        .expect("admitted delete completes during request drain");
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert!(fixture.state.instances().get(&instance.id).is_none());
+
+    drop(request);
+    quiesce.abort();
+    let _ = quiesce.await;
+}
+
+fn reserve_instance_sweep(state: &AppState) -> (IdleSweepReservation, IdleSweepCancellation) {
+    let epoch = state.subscribe_integrity_idle().borrow().epoch();
+    let reservation = state
+        .try_reserve_idle_sweep(
+            epoch,
+            state.try_claim_producer().expect("claim sweep producer"),
+        )
+        .expect("reserve instance sweep");
+    let cancellation = reservation.cancellation();
+    (reservation, cancellation)
+}
+
+async fn wait_for_sweep_cancellation(cancellation: &IdleSweepCancellation) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !cancellation.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("foreground registration cancels sweep");
+}
+
+async fn wait_for_producer_quiescence(state: &AppState) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while state.lifecycle_phase() != crate::state::AppLifecyclePhase::QuiescingProducers {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request drain reaches producer quiescence");
+}
+
+async fn wait_for_instance_lifecycle(state: &AppState, instance_id: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !state.instance_lifecycle_is_held(instance_id).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("instance lifecycle becomes held");
+}
+
+fn instance_directory_names(root: &FsPath) -> Vec<String> {
+    let mut names = fs::read_dir(root.join("instances"))
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            entry
+                .expect("read instance directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn assert_foreign_foreground_error(error: InstanceStoreError) {
+    let InstanceStoreError::Persistence(error) = error else {
+        panic!("foreign foreground must fail as persistence permission denial");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+}
+
+async fn instance_foreground(state: &AppState) -> IntegrityForegroundLease {
+    state
+        .register_integrity_foreground()
+        .expect("register instance foreground")
+        .wait_for_settlement()
+        .await
+}
+
+async fn persist_known_good(state: &AppState, root: &FsPath, instance_id: &str) -> PathBuf {
+    fs::create_dir_all(root.join("state/known-good")).expect("create known-good fixture directory");
+    let version_id = state
+        .instances()
+        .get(instance_id)
+        .expect("known-good fixture instance")
+        .version_id;
+    let foreground = instance_foreground(state).await;
+    state
+        .persist_known_good_inventory_for_test(
+            &foreground,
+            instance_id,
+            KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.jar"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::File { size: 1 },
+            }])
+            .expect("known-good inventory"),
+        )
+        .await;
+    drop(foreground);
+    let snapshot = root
+        .join("state/known-good")
+        .join(format!("{instance_id}.json"));
+    assert!(snapshot.is_file());
+    snapshot
+}
+
+async fn latch_managed_instance(fixture: &TestFixture, instance_id: &str) -> PathBuf {
+    let parked = fixture
+        .state
+        .instances()
+        .game_dir(instance_id)
+        .join("mods/.axial-lock.json.delete.park");
+    fs::create_dir_all(parked.parent().expect("managed state parent"))
+        .expect("create managed state directory");
+    fs::write(&parked, b"orphan").expect("seed orphaned managed deletion park");
+    let admitted = fixture
+        .state
+        .admit_managed_instance(instance_id, false)
+        .await
+        .expect("admit managed inspection");
+    admitted
+        .inspect(None)
+        .await
+        .expect_err("ambiguous publication must latch managed identity");
+    parked
+}
+
+fn assert_bounded_error_body(body: &serde_json::Value, expected: &str) {
+    let object = body.as_object().expect("error body should be an object");
+    assert_eq!(object.len(), 1);
+    assert_eq!(
+        body.get("error").and_then(serde_json::Value::as_str),
+        Some(expected)
+    );
+}
+
+fn error_body_text(body: &serde_json::Value) -> &str {
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .expect("error message should be a string")
+}
+
+fn assert_instance_folder_error_response_is_bounded(
+    mapper: fn(io::Error) -> (StatusCode, Json<serde_json::Value>),
+    expected_message: &str,
+) {
+    for internal_message in [
+        "failed for /home/zero/.config/Axial/instances/test/mods",
+        "failed for C:\\Users\\Zero\\AppData\\Roaming\\Axial\\instances\\test\\logs",
+        "Permission denied (os error 13)",
+    ] {
+        let (status, Json(body)) = mapper(io::Error::other(internal_message));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_bounded_error_body(&body, expected_message);
+        let public_message = error_body_text(&body);
+        for hidden_fragment in [
+            "/home/zero",
+            ".config",
+            "C:\\Users\\Zero",
+            "AppData",
+            "Permission denied",
+            "os error 13",
+        ] {
+            assert!(
+                !public_message.contains(hidden_fragment),
+                "{hidden_fragment:?} leaked in {public_message:?}"
+            );
+        }
+    }
+}
+
+struct TestFixture {
+    state: AppState,
+    _request: RequestLease,
+    producer: ProducerLease,
+    root: PathBuf,
+}
+
+fn write_fabric_loader_build_cache(
+    state: &AppState,
+    minecraft_version: &str,
+    loader_version: &str,
+) -> String {
+    let component_id = axial_minecraft::LoaderComponentId::Fabric;
+    let build_id = axial_minecraft::build_id_for(component_id, minecraft_version, loader_version);
+    write_fabric_loader_build_cache_with_builds(
+        state,
+        minecraft_version,
+        &[(loader_version, 100)],
+        chrono::Utc::now().timestamp_millis(),
+    );
+    build_id
+}
+
+fn write_fabric_loader_build_cache_with_builds(
+    state: &AppState,
+    minecraft_version: &str,
+    loader_versions: &[(&str, i32)],
+    fetched_at_ms: i64,
+) {
+    let component_id = axial_minecraft::LoaderComponentId::Fabric;
+    let index = axial_minecraft::LoaderVersionIndex {
+        component_id,
+        builds: loader_versions
+            .iter()
+            .map(|(loader_version, rank)| {
+                fabric_build_record(component_id, minecraft_version, loader_version, *rank)
+            })
+            .collect(),
+    };
+    write_loader_build_cache_index(state, minecraft_version, index, fetched_at_ms);
+}
+
+fn write_loader_build_cache_records(
+    state: &AppState,
+    component_id: axial_minecraft::LoaderComponentId,
+    minecraft_version: &str,
+    builds: Vec<axial_minecraft::LoaderBuildRecord>,
+) {
+    write_loader_build_cache_index(
+        state,
+        minecraft_version,
+        axial_minecraft::LoaderVersionIndex {
+            component_id,
+            builds,
+        },
+        chrono::Utc::now().timestamp_millis(),
+    );
+}
+
+fn write_loader_build_cache_index(
+    state: &AppState,
+    minecraft_version: &str,
+    index: axial_minecraft::LoaderVersionIndex,
+    fetched_at_ms: i64,
+) {
+    let operation = state
+        .try_acquire_managed_library()
+        .expect("acquire managed library for loader build fixture");
+    axial_minecraft::persist_loader_build_cache_fixture_for_test(
+        operation.core(),
+        minecraft_version,
+        &index,
+        fetched_at_ms,
+    )
+    .expect("write loader build cache");
+}
+
+fn fabric_build_record(
+    component_id: axial_minecraft::LoaderComponentId,
+    minecraft_version: &str,
+    loader_version: &str,
+    default_rank: i32,
+) -> axial_minecraft::LoaderBuildRecord {
+    let version_id =
+        axial_minecraft::installed_version_id_for(component_id, minecraft_version, loader_version)
+            .expect("valid loader identity");
+    let build_id = axial_minecraft::build_id_for(component_id, minecraft_version, loader_version);
+    axial_minecraft::LoaderBuildRecord {
+        subject_kind: axial_minecraft::loaders::types::LoaderBuildSubjectKind::LoaderBuild,
+        component_id,
+        component_name: component_id.display_name().to_string(),
+        build_id,
+        minecraft_version: minecraft_version.to_string(),
+        loader_version: loader_version.to_string(),
+        version_id,
+        build_meta: axial_minecraft::LoaderBuildMetadata {
+            selection: axial_minecraft::LoaderSelectionMeta {
+                default_rank,
+                reason: axial_minecraft::LoaderSelectionReason::Recommended,
+                source: axial_minecraft::LoaderSelectionSource::ExplicitApiFlag,
+            },
+            ..axial_minecraft::LoaderBuildMetadata::default()
+        },
+        strategy: axial_minecraft::LoaderInstallStrategy::FabricProfile,
+        artifact_kind: axial_minecraft::LoaderArtifactKind::ProfileJson,
+        installability: axial_minecraft::LoaderInstallability::Installable,
+        install_source: axial_minecraft::loaders::LoaderInstallSource::ProfileJson {
+            url: "https://example.invalid/fabric-profile.json".to_string(),
+        },
+    }
+}
+
+fn loader_catalog_state(fresh: bool, stale: bool) -> axial_minecraft::LoaderCatalogState {
+    axial_minecraft::LoaderCatalogState {
+        availability: axial_minecraft::LoaderAvailability {
+            fresh,
+            stale,
+            cache_hit: stale,
+            checked_at_ms: 1,
+            last_success_at_ms: Some(1),
+            last_error: None,
+            last_failure_kind: None,
+        },
+    }
+}
+
+fn installed_loader_entry(build: &axial_minecraft::LoaderBuildRecord) -> VersionEntry {
+    VersionEntry {
+        subject_kind: axial_minecraft::VersionSubjectKind::InstalledVersion,
+        id: build.version_id.clone(),
+        raw_kind: "release".to_string(),
+        release_time: String::new(),
+        minecraft_meta: axial_minecraft::MinecraftVersionMeta::default(),
+        lifecycle: axial_minecraft::LifecycleMeta::default(),
+        inherits_from: build.minecraft_version.clone(),
+        launchable: true,
+        installed: true,
+        status: "ready".to_string(),
+        status_detail: String::new(),
+        needs_install: String::new(),
+        java_component: String::new(),
+        java_major: 0,
+        loader: Some(axial_minecraft::VersionLoaderAttachment {
+            component_id: build.component_id,
+            component_name: build.component_name.clone(),
+            build_id: build.build_id.clone(),
+            loader_version: build.loader_version.clone(),
+            build_meta: build.build_meta.clone(),
+        }),
+    }
+}
+
+fn write_version_manifest_cache(state: &AppState, version_ids: &[&str]) {
+    let versions = version_ids
+        .iter()
+        .enumerate()
+        .map(|(index, version_id)| {
+            serde_json::json!({
+                "id": version_id,
+                "type": "release",
+                "url": format!("https://example.invalid/{version_id}.json"),
+                "time": format!("2026-01-{:02}T00:00:00+00:00", index + 1),
+                "releaseTime": format!("2026-01-{:02}T00:00:00+00:00", index + 1),
+                "sha1": "",
+                "complianceLevel": 1
+            })
+        })
+        .collect::<Vec<_>>();
+    let data = serde_json::to_vec_pretty(&serde_json::json!({
+        "latest": {
+            "release": version_ids.first().copied().unwrap_or("1.21.99"),
+            "snapshot": version_ids.last().copied().unwrap_or("1.21.99")
+        },
+        "versions": versions
+    }))
+    .expect("serialize version manifest cache");
+    let operation = state
+        .try_acquire_managed_library()
+        .expect("acquire managed library for manifest fixture");
+    axial_minecraft::persist_version_manifest_cache_fixture_for_test(operation.core(), &data)
+        .expect("write version manifest cache");
+}
+
+fn write_supported_versions_cache(
+    state: &AppState,
+    component_id: axial_minecraft::LoaderComponentId,
+    version_ids: &[&str],
+) {
+    let versions = version_ids
+        .iter()
+        .map(|version_id| (*version_id, Some(true)))
+        .collect::<Vec<_>>();
+    write_supported_versions_cache_with_stable_hints(state, component_id, &versions);
+}
+
+fn write_supported_versions_cache_with_stable_hints(
+    state: &AppState,
+    component_id: axial_minecraft::LoaderComponentId,
+    version_ids: &[(&str, Option<bool>)],
+) {
+    let versions = version_ids
+        .iter()
+        .map(|(version_id, stable_hint)| {
+            let analysis = axial_minecraft::analyze_minecraft_version(
+                version_id,
+                "release",
+                "",
+                *stable_hint,
+                &[],
+            );
+            axial_minecraft::LoaderGameVersion {
+                subject_kind: axial_minecraft::VersionSubjectKind::MinecraftVersion,
+                id: (*version_id).to_string(),
+                release_time: String::new(),
+                minecraft_meta: analysis.minecraft_meta,
+                lifecycle: analysis.lifecycle,
+                stable_hint: *stable_hint,
+            }
+        })
+        .collect::<Vec<_>>();
+    let operation = state
+        .try_acquire_managed_library()
+        .expect("acquire managed library for supported versions fixture");
+    axial_minecraft::persist_loader_supported_versions_cache_fixture_for_test(
+        operation.core(),
+        component_id,
+        &versions,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .expect("write supported versions cache");
+}
+
+fn write_installed_vanilla_version(library_dir: &FsPath, version_id: &str) {
+    let version_dir = library_dir.join("versions").join(version_id);
+    fs::create_dir_all(&version_dir).expect("create version dir");
+    fs::write(
+        version_dir.join(format!("{version_id}.json")),
+        format!(
+            r#"{{
+                "id": "{version_id}",
+                "type": "release",
+                "releaseTime": "2026-01-01T00:00:00+00:00",
+                "javaVersion": {{"component": "java-runtime-gamma", "majorVersion": 17}}
+            }}"#
+        ),
+    )
+    .expect("write version json");
+    fs::write(version_dir.join(format!("{version_id}.jar")), "client jar").expect("write jar");
+}
+
+fn write_version_with_missing_library(library_dir: &FsPath, version_id: &str) {
+    let client = b"client";
+    let library = b"library";
+    write_version_json_value(
+        library_dir,
+        version_id,
+        serde_json::json!({
+            "id": version_id,
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "assetIndex": {},
+            "downloads": {
+                "client": {
+                    "sha1": sha1_hex(client),
+                    "size": client.len()
+                }
+            },
+            "javaVersion": { "component": "java-runtime-gamma", "majorVersion": 17 },
+            "libraries": [{
+                "name": "com.example:demo:1.0.0",
+                "downloads": {
+                    "artifact": {
+                        "path": "com/example/demo/1.0.0/demo-1.0.0.jar",
+                        "url": "https://example.invalid/demo-1.0.0.jar",
+                        "sha1": sha1_hex(library),
+                        "size": library.len()
+                    }
+                }
+            }]
+        }),
+    );
+    fs::write(
+        library_dir
+            .join("versions")
+            .join(version_id)
+            .join(format!("{version_id}.jar")),
+        client,
+    )
+    .expect("write client jar");
+}
+
+fn write_version_with_missing_asset_object(library_dir: &FsPath, version_id: &str) {
+    let client = b"client";
+    let asset = b"asset";
+    let asset_hash = sha1_hex(asset);
+    let asset_index = serde_json::json!({
+        "objects": {
+            "sounds/step.ogg": { "hash": asset_hash, "size": asset.len() }
+        }
+    });
+    let asset_index_bytes = serde_json::to_vec_pretty(&asset_index).expect("serialize asset index");
+    let asset_index_path = library_dir
+        .join("assets")
+        .join("indexes")
+        .join("test-assets.json");
+    fs::create_dir_all(asset_index_path.parent().expect("asset index parent"))
+        .expect("create asset index dir");
+    fs::write(&asset_index_path, &asset_index_bytes).expect("write asset index");
+    write_version_json_value(
+        library_dir,
+        version_id,
+        serde_json::json!({
+            "id": version_id,
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "assetIndex": {
+                "id": "test-assets",
+                "sha1": sha1_hex(&asset_index_bytes),
+                "size": asset_index_bytes.len()
+            },
+            "downloads": {
+                "client": {
+                    "sha1": sha1_hex(client),
+                    "size": client.len()
+                }
+            },
+            "javaVersion": { "component": "java-runtime-gamma", "majorVersion": 17 },
+            "libraries": []
+        }),
+    );
+    fs::write(
+        library_dir
+            .join("versions")
+            .join(version_id)
+            .join(format!("{version_id}.jar")),
+        client,
+    )
+    .expect("write client jar");
+}
+
+fn write_version_with_corrupt_client_jar(library_dir: &FsPath, version_id: &str) {
+    let expected_client = b"fresh-client";
+    write_version_json_value(
+        library_dir,
+        version_id,
+        serde_json::json!({
+            "id": version_id,
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "assetIndex": {},
+            "downloads": {
+                "client": {
+                    "sha1": sha1_hex(expected_client),
+                    "size": expected_client.len()
+                }
+            },
+            "javaVersion": { "component": "java-runtime-gamma", "majorVersion": 17 },
+            "libraries": []
+        }),
+    );
+    fs::write(
+        library_dir
+            .join("versions")
+            .join(version_id)
+            .join(format!("{version_id}.jar")),
+        b"wrong-client",
+    )
+    .expect("write corrupt client jar");
+}
+
+fn write_child_version_with_missing_parent_client(
+    library_dir: &FsPath,
+    child_version_id: &str,
+    parent_version_id: &str,
+) {
+    write_version_json_value(
+        library_dir,
+        parent_version_id,
+        serde_json::json!({
+            "id": parent_version_id,
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "assetIndex": {},
+            "javaVersion": { "component": "java-runtime-gamma", "majorVersion": 17 },
+            "libraries": []
+        }),
+    );
+    write_version_json_value(
+        library_dir,
+        child_version_id,
+        serde_json::json!({
+            "id": child_version_id,
+            "type": "release",
+            "inheritsFrom": parent_version_id,
+            "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+            "libraries": []
+        }),
+    );
+}
+
+fn write_version_json_value(library_dir: &FsPath, version_id: &str, value: serde_json::Value) {
+    let version_dir = library_dir.join("versions").join(version_id);
+    fs::create_dir_all(&version_dir).expect("create version dir");
+    fs::write(
+        version_dir.join(format!("{version_id}.json")),
+        serde_json::to_vec_pretty(&value).expect("serialize version json"),
+    )
+    .expect("write version json");
+}
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn add_test_instance(
+    fixture: &TestFixture,
+    name: &str,
+    version_id: &str,
+) -> axial_config::Instance {
+    fixture
+        .state
+        .instances()
+        .insert_for_test(name.to_string(), version_id.to_string())
+        .expect("add test instance")
+}
+
+async fn listed_instance(fixture: &TestFixture, instance_id: &str) -> EnrichedInstance {
+    handle_list_instances(&fixture.state, &fixture.producer)
+        .await
+        .instances
+        .into_iter()
+        .find(|instance| instance.id == instance_id)
+        .expect("listed instance")
+}
+
+fn assert_not_launch_action(instance: &EnrichedInstance) {
+    assert!(!instance.launchable);
+    assert_ne!(instance.launch_action.label, "Launch");
+    assert_ne!(
+        instance.launch_action.primary_action,
+        axial_config::LaunchPrimaryAction::Launch
+    );
+}
+
+fn write_installed_loader_version(
+    library_dir: &FsPath,
+    component_id: axial_minecraft::LoaderComponentId,
+    minecraft_version: &str,
+    loader_version: &str,
+) {
+    let version_id =
+        axial_minecraft::installed_version_id_for(component_id, minecraft_version, loader_version)
+            .expect("valid loader identity");
+    let version_dir = library_dir.join("versions").join(&version_id);
+    fs::create_dir_all(&version_dir).expect("create loader version dir");
+    fs::write(
+        version_dir.join(format!("{version_id}.json")),
+        format!(
+            r#"{{
+                "id": "{version_id}",
+                "type": "release",
+                "inheritsFrom": "{minecraft_version}",
+                "axialMaterialized": true,
+                "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+                "libraries": []
+            }}"#
+        ),
+    )
+    .expect("write loader version json");
+}
+
+fn write_installed_checksumless_loader_version(
+    library_dir: &FsPath,
+    component_id: axial_minecraft::LoaderComponentId,
+    minecraft_version: &str,
+    loader_version: &str,
+) {
+    write_installed_loader_version(library_dir, component_id, minecraft_version, loader_version);
+    let version_id =
+        axial_minecraft::installed_version_id_for(component_id, minecraft_version, loader_version)
+            .expect("valid loader identity");
+    let version_path = library_dir
+        .join("versions")
+        .join(&version_id)
+        .join(format!("{version_id}.json"));
+    let mut version: serde_json::Value =
+        serde_json::from_slice(&fs::read(&version_path).expect("read installed loader version"))
+            .expect("parse installed loader version");
+    version["libraries"] = serde_json::json!([{
+        "name": "com.example:checksumless:1.0.0",
+        "url": "https://example.invalid/"
+    }]);
+    fs::write(
+        version_path,
+        serde_json::to_vec_pretty(&version).expect("serialize checksumless loader version"),
+    )
+    .expect("write checksumless loader version");
+    let library_path = library_dir
+        .join("libraries")
+        .join("com/example/checksumless/1.0.0/checksumless-1.0.0.jar");
+    fs::create_dir_all(library_path.parent().expect("library parent"))
+        .expect("create library directory");
+    fs::write(library_path, b"present but unauthoritative").expect("write checksumless library");
+}
+
+impl TestFixture {
+    fn new(name: &str) -> Self {
+        let (state, root) = test_state_with_library(name);
+
+        let request = state.try_admit_request().expect("admit fixture request");
+        let producer = request
+            .producer_handoff()
+            .try_claim()
+            .expect("claim fixture producer");
+
+        Self {
+            state,
+            _request: request,
+            producer,
+            root,
+        }
+    }
+
+    fn configure_create_manifest(&self, version_ids: &[&str]) -> PathBuf {
+        let library_dir = self.root.join("library");
+        write_version_manifest_cache(&self.state, version_ids);
+        library_dir
+    }
+}
+
+fn test_state(name: &str) -> (AppState, PathBuf) {
+    test_state_inner(name, false)
+}
+
+fn test_state_with_library(name: &str) -> (AppState, PathBuf) {
+    test_state_inner(name, true)
+}
+
+async fn shutdown_test_state(state: AppState, root: PathBuf) {
+    state.shutdown().await.expect("shut down test state");
+    drop(state);
+    fs::remove_dir_all(root).expect("remove instance test root after application shutdown");
+}
+
+fn test_state_inner(name: &str, configure_library: bool) -> (AppState, PathBuf) {
+    let root = test_root(name);
+    let paths = test_paths(&root);
+    let root_session = crate::state::test_root_session(&paths);
+    let config = if configure_library {
+        let library_dir = root.join("library");
+        fs::create_dir_all(&library_dir).expect("create managed library fixture");
+        ConfigStore::from_config(
+            paths.clone(),
+            Arc::clone(&root_session),
+            AppConfig {
+                library_dir: library_dir.to_string_lossy().into_owned(),
+                ..AppConfig::default()
+            },
+        )
+        .expect("configure managed library fixture")
+    } else {
+        ConfigStore::load_from(paths.clone(), Arc::clone(&root_session)).expect("load config")
+    };
+    let config = Arc::new(config);
+    let instances = Arc::new(
+        InstanceStore::from_snapshot(
+            paths.clone(),
+            root_session,
+            InstanceRegistrySnapshot::default(),
+        )
+        .expect("load instances"),
+    );
+    let state = AppState::new(AppStateInit {
+        app_name: "Axial".to_string(),
+        version: "test".to_string(),
+        config,
+        instances,
+        installs: Arc::new(InstallStore::new()),
+        sessions: Arc::new(SessionStore::new()),
+        performance: Arc::new(
+            PerformanceManager::load_for_startup(paths.performance_dir())
+                .expect("performance manager"),
+        ),
+        startup_warnings: Vec::new(),
+    });
+    (state, root)
+}
+
+impl Drop for TestFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn test_root(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "axial-api-instances-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default()
+    ));
+    fs::create_dir_all(&path).expect("create test root");
+    path
+}
+
+fn test_paths(root: &FsPath) -> AppPaths {
+    AppPaths::from_root(root.to_path_buf()).expect("absolute test app root")
+}
+
+fn test_launch_record(session_id: &str, instance_id: &str) -> LaunchSessionRecord {
+    LaunchSessionRecord {
+        session_id: SessionId(session_id.to_string()),
+        instance_id: instance_id.to_string(),
+        version_id: "1.21.1".to_string(),
+        launched_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+        benchmark: None,
+        state: LaunchState::Queued,
+        pid: None,
+        process_started_at_ms: None,
+        boot_completed_at_ms: None,
+        boot_duration_ms: None,
+        priority: None,
+        exit_code: None,
+        command: Vec::new(),
+        java_path: None,
+        natives_dir: None,
+        failure: None,
+        crash_evidence: None,
+        healing: None,
+        guardian: None,
+        outcome: None,
+        stages: Vec::new(),
+    }
+}

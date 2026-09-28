@@ -1,31 +1,17 @@
-import { apiUrl } from '../api';
+import { subscribeApiEvents } from '../backend/events';
+import { installQueueStateResponse } from '../dto-install';
+import type { InstallQueueStateResponse } from '../types-install';
 
-export function connectLoaderInstallSSE(
-  installId: string,
-  onProgress: (data: any) => void,
-  onError: (message: string) => void,
-): EventSource {
-  const es = new EventSource(apiUrl(`/loaders/install/${installId}/events`));
-
-  es.addEventListener('progress', (e: MessageEvent) => {
-    let data: any;
-    try {
-      data = JSON.parse(e.data);
-    } catch {
-      onError('Loader install progress data was invalid.');
-      es.close();
-      return;
-    }
-    onProgress(data);
-    if (data.done || data.view_model?.terminal) {
-      es.close();
-    }
+export function connectInstallQueueSSE(
+  onSnapshot: (snapshot: InstallQueueStateResponse) => void,
+  onError: (error: unknown) => void,
+): () => void {
+  return subscribeApiEvents('/install/queue/events', {
+    decode: installQueueStateResponse,
+    onValue(snapshot, _event, revision) {
+      if (snapshot.revision !== revision) throw new Error('Install queue snapshot revision does not match its event.');
+      onSnapshot(snapshot);
+    },
+    onError,
   });
-
-  es.onerror = (): void => {
-    if (es.readyState !== EventSource.CLOSED) return;
-    onError('Loader install progress stopped unexpectedly.');
-  };
-
-  return es;
 }

@@ -6,6 +6,8 @@ import { formatBytes, fmtRelative } from '../../../format';
 import type { EnrichedInstance, InstanceScreenshot } from '../../../types-instance';
 import { openInstanceFolder } from '../instance-actions';
 import { deleteScreenshots, renameScreenshot, screenshotFileUrl } from '../screenshot-actions';
+import { resourceMutationState } from '../bulk-actions';
+import { ResourceMutationStatus } from './resource-bits';
 
 export function ScreenshotLightbox({
   inst,
@@ -25,6 +27,7 @@ export function ScreenshotLightbox({
   onRefresh: () => void;
 }): JSX.Element | null {
   const index = shots.findIndex((shot) => shot.name === name);
+  const busy = resourceMutationState(inst.id).status === 'pending';
   const shot = index >= 0 ? shots[index] : undefined;
   const prev = index > 0 ? shots[index - 1] : undefined;
   const next = index >= 0 && index < shots.length - 1 ? shots[index + 1] : undefined;
@@ -45,11 +48,16 @@ export function ScreenshotLightbox({
   };
   const remove = (): void => {
     const fallback = next?.name ?? prev?.name ?? '';
-    void deleteScreenshots(inst, [shot], () => {
-      onRefresh();
-      if (fallback) onSelect(fallback);
-      else onClose();
-    });
+    void deleteScreenshots(
+      inst,
+      [shot],
+      () => {
+        onRefresh();
+        if (fallback) onSelect(fallback);
+        else onClose();
+      },
+      onRefresh,
+    );
   };
 
   return (
@@ -75,18 +83,19 @@ export function ScreenshotLightbox({
             <span class="cp-shot-lightbox-count">
               {index + 1} of {shots.length}
             </span>
-            <IconButton icon="edit" size={30} tooltip="Rename" onClick={rename} />
+            <IconButton icon="edit" size={30} tooltip="Rename" disabled={busy} onClick={rename} />
             <IconButton
               icon="folder"
               size={30}
               tooltip="Open screenshots folder"
               onClick={() => void openInstanceFolder(inst.id, 'screenshots')}
             />
-            <IconButton icon="trash" size={30} danger tooltip="Delete" onClick={remove} />
+            <IconButton icon="trash" size={30} danger tooltip="Delete" disabled={busy} onClick={remove} />
             <span class="cp-shot-lightbox-sep" aria-hidden="true" />
             <IconButton icon="x" size={30} tooltip="Close" onClick={onClose} />
           </div>
         </div>
+        <ResourceMutationStatus instanceId={inst.id} />
         <div class="cp-shot-lightbox-stage">
           <img src={screenshotFileUrl(inst, shot.name)} alt={shot.name} />
           {prev ? (

@@ -1,53 +1,39 @@
 import type { JSX } from 'preact';
 import { Button } from './Atoms';
 import { FloatingTray, FloatingTrayDivider, FloatingTrayLabel } from './FloatingTray';
-import { Icon } from './Icons';
+import { Icon, type IconName } from './Icons';
 import type { SelectionState } from './selection';
 
 export interface SelectionAction {
   label: string;
-  icon?: string;
+  icon?: IconName;
   danger?: boolean;
   disabled?: boolean;
   onClick: () => void;
 }
 
 export function SelectionActionTray({
-  shown,
-  count,
   itemLabel = 'item',
   actions,
-  onClear,
-  onSelectAll,
-  allSelected,
   ariaLabel,
   selection,
 }: {
-  shown?: boolean;
-  count?: number;
   itemLabel?: string;
   actions: SelectionAction[];
-  onClear?: () => void;
-  onSelectAll?: () => void;
-  allSelected?: boolean;
   ariaLabel?: string;
-  selection?: Pick<SelectionState<any>, 'selectedCount' | 'allSelected' | 'selectAll' | 'clear'>;
+  selection: Pick<SelectionState<unknown>, 'selectedCount' | 'allSelected' | 'selectAll' | 'clear'>;
 }): JSX.Element | null {
-  const effectiveCount = selection?.selectedCount ?? count ?? 0;
-  const effectiveAllSelected = selection?.allSelected ?? allSelected;
-  const clear = selection?.clear ?? onClear;
-  const selectAll = selection?.selectAll ?? onSelectAll;
-  if (!(shown ?? effectiveCount > 0) || effectiveCount <= 0) return null;
-  if (!clear) return null;
-  const noun = effectiveCount === 1 ? itemLabel : `${itemLabel}s`;
+  const { selectedCount, allSelected, selectAll, clear } = selection;
+  if (selectedCount <= 0) return null;
+  const noun = selectedCount === 1 ? itemLabel : `${itemLabel}s`;
 
   return (
-    <FloatingTray ariaLabel={ariaLabel ?? `${effectiveCount} selected ${noun}`} reserveSpace>
+    <FloatingTray ariaLabel={ariaLabel ?? `${selectedCount} selected ${noun}`} reserveSpace>
       <FloatingTrayLabel>
-        {effectiveCount} {noun} selected
+        {selectedCount} {noun} selected
       </FloatingTrayLabel>
       <FloatingTrayDivider />
-      {selectAll && !effectiveAllSelected && (
+      {!allSelected && (
         <Button variant="ghost" size="sm" onClick={selectAll}>
           Select all
         </Button>

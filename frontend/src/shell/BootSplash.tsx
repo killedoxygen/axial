@@ -1,5 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { startApplicationBootstrap } from '../bootstrap';
 import { bootstrapError, bootstrapState } from '../store';
 import { hasCustomDragRegion, windowStartDragging } from '../native';
 import { Logo } from '../ui/Logo';
@@ -43,6 +44,9 @@ export function BootSplash(): JSX.Element | null {
 
   useEffect(() => {
     if (state !== 'loading') return;
+    mountedAt.current = Date.now();
+    setProgress(4);
+    setLeaving(false);
     const tick = setInterval(() => {
       setProgress((p) => Math.min(90, p + Math.max(0.4, (90 - p) * 0.045)));
     }, 90);
@@ -71,7 +75,13 @@ export function BootSplash(): JSX.Element | null {
   };
 
   return (
-    <div class="cp-boot" data-leaving={leaving || undefined} role="status" aria-live="polite" onMouseDown={onMouseDown}>
+    <div
+      class="cp-boot"
+      data-leaving={leaving || undefined}
+      role={state === 'error' ? 'alert' : 'status'}
+      aria-live={state === 'error' ? 'assertive' : 'polite'}
+      onMouseDown={onMouseDown}
+    >
       <div class="cp-boot-stack">
         <Logo className="cp-boot-logo" motion="assembly" size={64} style={bootLogoStyle(progress)} />
         {state === 'error' ? (
@@ -80,6 +90,9 @@ export function BootSplash(): JSX.Element | null {
             <div class="cp-boot-error-msg">
               {bootstrapError.value || 'The launcher could not load its initial state.'}
             </div>
+            <button class="cp-btn cp-btn--primary cp-btn--sm" type="button" onClick={startApplicationBootstrap}>
+              Retry
+            </button>
           </>
         ) : (
           <>

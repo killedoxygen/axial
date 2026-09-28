@@ -28,11 +28,6 @@
   color: color-mix(in oklab, var(--text-mute) 52%, oklch(0.62 0.13 var(--cp-tile-h)));
 }
 
-.cp-tile-glyph svg {
-  width: 100%;
-  height: 100%;
-}
-
 .cp-tile-glyph--mask {
   background-color: currentColor;
   -webkit-mask-image: var(--cp-loader-src);
@@ -43,12 +38,4 @@
   mask-repeat: no-repeat;
   -webkit-mask-size: contain;
   mask-size: contain;
-}
-
-.cp-tile-glyph--mask[data-loader='quilt'] {
-  translate: 2.1cqmin 2.1cqmin;
-}
-
-.cp-tile-glyph--mask[data-loader='forge'] {
-  translate: 0 2.1cqmin;
 }

@@ -1,99 +1,52 @@
-mod accounts;
-mod auth;
-mod catalog;
-mod config;
-mod content;
-mod dev;
-mod flags;
-mod install;
-mod instances;
-mod java;
-mod launch;
-mod loaders;
-mod music;
-mod performance;
-mod setup;
-mod skin;
-mod status;
-mod system;
-mod telemetry;
-mod update;
-mod version_info;
-mod versions;
+pub mod accounts;
+pub mod auth;
+pub mod benchmarks;
+pub mod config;
+pub mod content;
+pub mod flags;
+pub mod import;
+pub mod install;
+pub mod instances;
+pub mod java;
+pub mod launch;
+pub mod loaders;
+pub mod music;
+pub mod performance;
+pub mod resources;
+pub mod setup;
+pub mod skin;
+pub mod system;
+pub mod telemetry;
+pub mod update;
+pub mod versions;
 
-use crate::state::AppState;
-use axum::{
-    Router,
-    http::{HeaderValue, Method, header},
-};
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use axial_app::settings::SettingsStore;
+use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use std::sync::Arc;
 
-pub use crate::application::flush_pending_saved_skin_applies_for_shutdown;
-pub(crate) use performance::spawn_pending_performance_operations;
-
-pub fn router(state: AppState) -> Router {
+pub(crate) fn status_router(settings: Arc<SettingsStore>) -> Router {
     Router::new()
-        .merge(status::router())
-        .merge(accounts::router())
-        .merge(auth::router())
-        .merge(system::router())
-        .merge(telemetry::router())
-        .merge(config::router())
-        .merge(dev::router())
-        .merge(flags::router())
-        .merge(setup::router())
-        .merge(catalog::router())
-        .merge(content::router())
-        .merge(instances::router())
-        .merge(install::router())
-        .merge(music::router())
-        .merge(performance::router())
-        .merge(skin::router())
-        .merge(update::router())
-        .merge(launch::router())
-        .merge(loaders::router())
-        .merge(versions::router())
-        .merge(version_info::router())
-        .merge(java::router())
-        .with_state(state)
-        .layer(local_cors_layer())
+        .route("/api/v1/status", get(status))
+        .with_state(settings)
 }
 
-fn local_cors_layer() -> CorsLayer {
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin, _| {
-            is_allowed_local_origin(origin)
-        }))
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::PATCH,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([header::CONTENT_TYPE])
+async fn status(
+    State(settings): State<Arc<SettingsStore>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let config = tokio::task::spawn_blocking(move || settings.current())
+        .await
+        .map_err(|_| status_unavailable())?
+        .map_err(|_| status_unavailable())?;
+    Ok(Json(serde_json::json!({
+        "dev_mode": cfg!(debug_assertions),
+        "setup_required": !config.onboarding_done,
+        "warnings": ["This isolated rewrite is under development. Some retained features are still being integrated."],
+    })))
 }
 
-fn is_allowed_local_origin(origin: &HeaderValue) -> bool {
-    let Ok(origin) = origin.to_str() else {
-        return false;
-    };
-
-    origin == "tauri://localhost"
-        || origin == "http://tauri.localhost"
-        || origin == "https://tauri.localhost"
-        || origin
-            .strip_prefix("http://127.0.0.1:")
-            .is_some_and(is_port_suffix)
-        || origin
-            .strip_prefix("http://localhost:")
-            .is_some_and(is_port_suffix)
-        || origin
-            .strip_prefix("http://[::1]:")
-            .is_some_and(is_port_suffix)
-}
-
-fn is_port_suffix(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+fn status_unavailable() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": "Application status is unavailable." })),
+    )
 }

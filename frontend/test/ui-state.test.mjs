@@ -3,6 +3,7 @@ import test from 'node:test';
 import * as ui from '../src/ui-state';
 
 class FakeView {
+  /** @type {Map<string, Set<() => void>>} */
   #listeners = new Map();
   #scrollTop = 0;
 
@@ -14,25 +15,30 @@ class FakeView {
     return this.#scrollTop;
   }
 
+  /** @param {number} top */
   set scrollTop(top) {
     this.#scrollTop = Math.max(0, Math.min(top, this.scrollHeight - this.clientHeight));
   }
 
+  /** @param {string} type @param {() => void} listener */
   addEventListener(type, listener) {
     const listeners = this.#listeners.get(type) ?? new Set();
     listeners.add(listener);
     this.#listeners.set(type, listeners);
   }
 
+  /** @param {string} type @param {() => void} listener */
   removeEventListener(type, listener) {
     this.#listeners.get(type)?.delete(listener);
   }
 
+  /** @param {string} type */
   emit(type) {
     for (const listener of this.#listeners.get(type) ?? []) listener();
   }
 }
 
+/** @param {FakeView} view */
 function installDom(view) {
   const original = {
     cancelAnimationFrame: globalThis.cancelAnimationFrame,
@@ -41,40 +47,57 @@ function installDom(view) {
     requestAnimationFrame: globalThis.requestAnimationFrame,
     ResizeObserver: globalThis.ResizeObserver,
   };
+  /** @type {Map<number, FrameRequestCallback>} */
   const animationFrames = new Map();
+  /** @type {Array<{ callback: (entries: never[]) => void, disconnected: boolean }>} */
   const mutationObservers = [];
+  /** @type {Array<{ callback: (entries: never[]) => void, disconnected: boolean }>} */
   const resizeObservers = [];
   let nextFrame = 1;
 
-  globalThis.document = { querySelector: () => view };
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: { querySelector: () => view },
+    writable: true,
+  });
   globalThis.requestAnimationFrame = (callback) => {
     const id = nextFrame++;
     animationFrames.set(id, callback);
     return id;
   };
   globalThis.cancelAnimationFrame = (id) => animationFrames.delete(id);
-  globalThis.MutationObserver = class {
-    constructor(callback) {
-      this.callback = callback;
-      this.disconnected = false;
-      mutationObservers.push(this);
-    }
-    disconnect() {
-      this.disconnected = true;
-    }
-    observe() {}
-  };
-  globalThis.ResizeObserver = class {
-    constructor(callback) {
-      this.callback = callback;
-      this.disconnected = false;
-      resizeObservers.push(this);
-    }
-    disconnect() {
-      this.disconnected = true;
-    }
-    observe() {}
-  };
+  Object.defineProperty(globalThis, 'MutationObserver', {
+    configurable: true,
+    value: class {
+      /** @param {(entries: never[]) => void} callback */
+      constructor(callback) {
+        this.callback = callback;
+        this.disconnected = false;
+        mutationObservers.push(this);
+      }
+      disconnect() {
+        this.disconnected = true;
+      }
+      observe() {}
+    },
+    writable: true,
+  });
+  Object.defineProperty(globalThis, 'ResizeObserver', {
+    configurable: true,
+    value: class {
+      /** @param {(entries: never[]) => void} callback */
+      constructor(callback) {
+        this.callback = callback;
+        this.disconnected = false;
+        resizeObservers.push(this);
+      }
+      disconnect() {
+        this.disconnected = true;
+      }
+      observe() {}
+    },
+    writable: true,
+  });
 
   return {
     activeObserverCount() {
@@ -127,6 +150,7 @@ test('restoration retries after mounted async content becomes tall enough', () =
   const view = new FakeView();
   view.scrollHeight = 1_400;
   const dom = installDom(view);
+  /** @type {ui.Route} */
   const savedRoute = { name: 'discover', target: 'restore-after-load' };
 
   try {
@@ -154,6 +178,7 @@ test('explicit reset cancels a pending restore and forgets its position', () => 
   const view = new FakeView();
   view.scrollHeight = 1_400;
   const dom = installDom(view);
+  /** @type {ui.Route} */
   const savedRoute = { name: 'discover', target: 'reset-instance' };
 
   try {
@@ -182,6 +207,7 @@ test('manual scrolling cancels a pending async restore', () => {
   const view = new FakeView();
   view.scrollHeight = 1_400;
   const dom = installDom(view);
+  /** @type {ui.Route} */
   const savedRoute = { name: 'discover', target: 'manual-scroll' };
 
   try {
@@ -205,6 +231,7 @@ test('focus movement cancels a pending async restore', () => {
   const view = new FakeView();
   view.scrollHeight = 1_400;
   const dom = installDom(view);
+  /** @type {ui.Route} */
   const savedRoute = { name: 'discover', target: 'keyboard-focus' };
 
   try {
@@ -229,6 +256,7 @@ test('restoration deadline releases observers for permanently short content', as
   const view = new FakeView();
   view.scrollHeight = 1_400;
   const dom = installDom(view);
+  /** @type {ui.Route} */
   const savedRoute = { name: 'discover', target: 'short-content' };
 
   try {
@@ -253,6 +281,7 @@ test('views with remount-local tabs and filters do not retain scroll', () => {
   const view = new FakeView();
   view.scrollHeight = 1_400;
   const dom = installDom(view);
+  /** @type {ui.Route} */
   const settingsRoute = { name: 'settings' };
 
   try {

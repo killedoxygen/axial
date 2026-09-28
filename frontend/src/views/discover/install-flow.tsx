@@ -1,11 +1,12 @@
 import type { JSX } from 'preact';
-import { useRef, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Button } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Modal, ModalContent } from '../../ui/Modal';
 import { formatBytes, plural } from '../../format';
 import type { ContentSelection, ResolutionPlan } from '../../types-content';
 import { addToInstance, commitInstall, type AddOutcome } from './actions';
+import { createInstallWorkflow } from './install-workflow';
 
 export interface InstallFlow {
   busy: boolean;
@@ -20,53 +21,22 @@ export interface InstallFlow {
  * until the person decides. Every add button shares this so none of them can
  * silently drop a conflict outcome. */
 export function useInstallFlow(instanceId: string | undefined): InstallFlow {
-  const [busy, setBusy] = useState(false);
-  const [plan, setPlan] = useState<ResolutionPlan | null>(null);
-  const pending = useRef<{ selections: ContentSelection[]; label: string } | null>(null);
+  const [, redraw] = useState(0);
+  const workflow = useRef<ReturnType<typeof createInstallWorkflow> | null>(null);
+  workflow.current ??= createInstallWorkflow({ addToInstance, commitInstall }, () => redraw((value) => value + 1));
+  const active = workflow.current;
+  active.setTarget(instanceId);
+  useEffect(() => () => active.dispose(), [active]);
 
-  const add = async (selections: ContentSelection[], label: string): Promise<AddOutcome> => {
-    if (!instanceId || busy) return { status: 'failed' };
-    setBusy(true);
-    try {
-      const outcome = await addToInstance(instanceId, selections, label);
-      if (outcome.status === 'needs-confirmation' && outcome.plan) {
-        pending.current = { selections, label };
-        setPlan(outcome.plan);
-      }
-      return outcome;
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const confirm = async (): Promise<AddOutcome> => {
-    const staged = pending.current;
-    if (!instanceId || !staged) return { status: 'failed' };
-    setBusy(true);
-    try {
-      const outcome = await commitInstall(instanceId, staged.selections, staged.label, plan ?? undefined, true);
-      pending.current = null;
-      setPlan(null);
-      return outcome;
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const cancel = (): void => {
-    pending.current = null;
-    setPlan(null);
-  };
-
-  return { busy, plan, add, confirm, cancel };
+  return { ...active.snapshot(), add: active.add, confirm: active.confirm, cancel: active.cancel };
 }
 
 export function InstallConflictSheet({
   flow,
-  onInstalled,
+  onQueued,
 }: {
   flow: InstallFlow;
-  onInstalled?: () => void;
+  onQueued?: () => void;
 }): JSX.Element | null {
   if (!flow.plan) return null;
   return (
@@ -76,7 +46,7 @@ export function InstallConflictSheet({
       onCancel={flow.cancel}
       onConfirm={() =>
         void flow.confirm().then((outcome) => {
-          if (outcome.status === 'installed') onInstalled?.();
+          if (outcome.status === 'queued') onQueued?.();
         })
       }
     />

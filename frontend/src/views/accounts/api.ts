@@ -1,5 +1,6 @@
-import { api, apiResourceUrl, apiUrl, isApiError } from '../../api';
+import { api, apiFetch, apiResourceUrl, apiUrl, isApiError } from '../../api';
 import { DEFAULT_SKINS, type DefaultSkin } from '../../default-skins';
+import type { PendingSkinStatus } from '../../generated/PendingSkinStatus';
 import type { NativeDragDropPayload } from '../../native';
 import type {
   AccountActionState,
@@ -25,7 +26,11 @@ import type {
 export const DEFAULT_SKIN_SOURCE = 'minecraft_default_skin';
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isRevision(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 export function maybeNumber(value: unknown): number | undefined {
@@ -68,6 +73,7 @@ export function savedSkinRecord(value: unknown): SavedSkinRecord | null {
   if (!isRecord(value)) return null;
   if (
     typeof value.texture_key !== 'string' ||
+    !value.texture_key.trim() ||
     typeof value.name !== 'string' ||
     (value.variant !== 'classic' && value.variant !== 'slim') ||
     typeof value.source !== 'string' ||
@@ -75,7 +81,7 @@ export function savedSkinRecord(value: unknown): SavedSkinRecord | null {
     typeof value.created_at !== 'string' ||
     typeof value.updated_at !== 'string' ||
     (value.applied_at !== undefined && value.applied_at !== null && typeof value.applied_at !== 'string') ||
-    typeof value.byte_size !== 'number'
+    !isRevision(value.byte_size)
   ) {
     return null;
   }
@@ -102,9 +108,42 @@ export function savedSkinsResponse(value: unknown): SavedSkinsData | null {
   ) {
     return null;
   }
+  const skins = value.skins.map(savedSkinRecord);
+  if (skins.some((skin) => skin === null)) return null;
+  if (new Set(skins.map((skin) => skin!.texture_key)).size !== skins.length) return null;
   return {
-    skins: value.skins.map(savedSkinRecord).filter((skin): skin is SavedSkinRecord => Boolean(skin)),
+    skins: skins as SavedSkinRecord[],
     pendingApplyKey: typeof value.pending_apply_texture_key === 'string' ? value.pending_apply_texture_key : null,
+  };
+}
+
+export function pendingSkinStatus(value: unknown): PendingSkinStatus | null | undefined {
+  if (value === null) return null;
+  if (
+    !isRecord(value) ||
+    typeof value.account_id !== 'string' ||
+    !value.account_id.trim() ||
+    !isRevision(value.generation) ||
+    value.generation === 0 ||
+    (value.phase !== 'queued' && value.phase !== 'applying' && value.phase !== 'failed' && value.phase !== 'idle') ||
+    (value.error !== null && typeof value.error !== 'string')
+  ) {
+    return undefined;
+  }
+  const active = value.phase === 'queued' || value.phase === 'applying';
+  if (
+    (value.texture_key !== null && (typeof value.texture_key !== 'string' || !value.texture_key.trim())) ||
+    (active && value.texture_key === null)
+  ) {
+    return undefined;
+  }
+  if (value.phase === 'failed' && (typeof value.error !== 'string' || !value.error.trim())) return undefined;
+  return {
+    account_id: value.account_id,
+    texture_key: typeof value.texture_key === 'string' ? value.texture_key : null,
+    generation: value.generation,
+    phase: value.phase,
+    error: value.error,
   };
 }
 
@@ -129,9 +168,6 @@ function skinNormalizeMetadata(value: unknown): SkinNormalizeMetadata | null {
   if (
     typeof value.texture_key !== 'string' ||
     (value.variant_suggestion !== 'classic' && value.variant_suggestion !== 'slim') ||
-    typeof value.original_width !== 'number' ||
-    typeof value.original_height !== 'number' ||
-    typeof value.normalized_byte_size !== 'number' ||
     (value.normalized_data_url !== undefined && typeof value.normalized_data_url !== 'string')
   ) {
     return null;
@@ -140,9 +176,6 @@ function skinNormalizeMetadata(value: unknown): SkinNormalizeMetadata | null {
   return {
     textureKey: value.texture_key,
     variantSuggestion: value.variant_suggestion,
-    originalWidth: value.original_width,
-    originalHeight: value.original_height,
-    normalizedByteSize: value.normalized_byte_size,
     normalizedDataUrl:
       typeof value.normalized_data_url === 'string' && value.normalized_data_url.startsWith('data:image/png;base64,')
         ? value.normalized_data_url
@@ -194,17 +227,13 @@ export function lookupCapeFileUrl(profile: MinecraftSkinLookup): string | undefi
 }
 
 export function lookupSkinFileUrl(profile: MinecraftSkinLookup): string {
-  return apiResourceUrl(profile.texture_file_url);
+  return apiResourceUrl(`/skin/lookup/file?${new URLSearchParams({ username: profile.username })}`);
 }
 
 export function isPngFile(file: File): boolean {
   const type = file.type.trim().toLowerCase();
   if (type) return type === 'image/png';
   return file.name.toLowerCase().endsWith('.png');
-}
-
-export function isPngPath(path: string): boolean {
-  return path.toLowerCase().endsWith('.png');
 }
 
 function cssPointFromNativeDrag(position: NativeDragDropPayload['position']): { x: number; y: number } | null {
@@ -290,7 +319,7 @@ async function detectSkinVariantFromPng(file: File): Promise<SkinVariant> {
 }
 
 export async function detectSkinVariantFromSavedSkin(skin: SavedSkinRecord): Promise<SkinVariant> {
-  const response = await fetch(savedSkinFileUrl(skin));
+  const response = await apiFetch(savedSkinFileUrl(skin));
   if (!response.ok) {
     throw new Error(`Could not load saved skin PNG (${response.status}).`);
   }
@@ -305,7 +334,7 @@ export async function detectSkinVariantFromSavedSkin(skin: SavedSkinRecord): Pro
 }
 
 export async function fetchSavedSkinPng(skin: SavedSkinRecord): Promise<Blob> {
-  const response = await fetch(savedSkinFileUrl(skin), { cache: 'no-store' });
+  const response = await apiFetch(savedSkinFileUrl(skin), { cache: 'no-store' });
   if (!response.ok) {
     throw new Error(`Saved skin PNG download failed with HTTP ${response.status}.`);
   }
@@ -329,12 +358,12 @@ export function downloadBlob(blob: Blob, filename: string): void {
 }
 
 export async function normalizeSkinUpload(file: File): Promise<SkinNormalizeMetadata> {
-  const response = await fetch(apiUrl('/skins/normalize'), {
+  const response = await apiFetch(apiUrl('/skins/normalize'), {
     method: 'POST',
     headers: { 'Content-Type': 'image/png' },
     body: file,
   });
-  const payload = await response.json().catch(() => undefined);
+  const payload: unknown = await response.json().catch(() => undefined);
   if (!response.ok) {
     throw apiResponseError(response, payload, `Skin validation failed with HTTP ${response.status}`);
   }
@@ -359,12 +388,12 @@ export async function replaceSavedSkinTexture(
       params.set('clear_cape', 'true');
     }
   }
-  const response = await fetch(apiUrl(`/skins/${textureKey}/texture?${params.toString()}`), {
+  const response = await apiFetch(apiUrl(`/skins/${encodeURIComponent(textureKey)}/texture?${params.toString()}`), {
     method: 'PUT',
     headers: { 'Content-Type': 'image/png' },
     body: file,
   });
-  const payload = await response.json().catch(() => undefined);
+  const payload: unknown = await response.json().catch(() => undefined);
   if (!response.ok) {
     throw apiResponseError(response, payload, `Texture replacement failed with HTTP ${response.status}`);
   }
@@ -383,17 +412,24 @@ export function uploadSkinName(file: File): string {
 
 function minecraftProfile(value: unknown): MinecraftProfile | undefined {
   if (!isRecord(value)) return undefined;
-  if (typeof value.id !== 'string' || typeof value.name !== 'string') return undefined;
+  if (
+    typeof value.id !== 'string' ||
+    typeof value.name !== 'string' ||
+    !Array.isArray(value.skins) ||
+    !Array.isArray(value.capes)
+  ) {
+    return undefined;
+  }
+
+  const skins = value.skins.map(minecraftSkin);
+  const capes = value.capes.map(minecraftCape);
+  if (skins.some((skin) => skin === null) || capes.some((cape) => cape === null)) return undefined;
 
   return {
     id: value.id,
     name: value.name,
-    skins: Array.isArray(value.skins)
-      ? value.skins.map(minecraftSkin).filter((skin): skin is MinecraftSkin => Boolean(skin))
-      : [],
-    capes: Array.isArray(value.capes)
-      ? value.capes.map(minecraftCape).filter((cape): cape is MinecraftCape => Boolean(cape))
-      : [],
+    skins: skins as MinecraftSkin[],
+    capes: capes as MinecraftCape[],
   };
 }
 
@@ -432,13 +468,51 @@ export async function lookupMinecraftSkin(username: string): Promise<MinecraftSk
   return parsed;
 }
 
-export function minecraftReadiness(record: Record<string, unknown>): MinecraftAuthReadiness {
+function accountReadiness(
+  record: Record<string, unknown>,
+):
+  | (MinecraftAuthReadiness &
+      Pick<
+        LauncherAccount,
+        | 'msa_authenticated'
+        | 'msa_refresh_available'
+        | 'msa_token_expires_in'
+        | 'online_action'
+        | 'refresh_action'
+        | 'profile_sync_action'
+      >)
+  | null {
+  if (
+    typeof record.msa_authenticated !== 'boolean' ||
+    typeof record.msa_refresh_available !== 'boolean' ||
+    (record.msa_token_expires_in !== undefined &&
+      record.msa_token_expires_in !== null &&
+      maybeNumber(record.msa_token_expires_in) === undefined) ||
+    typeof record.minecraft_profile_ready !== 'boolean' ||
+    typeof record.minecraft_ownership_verified !== 'boolean' ||
+    (record.minecraft_token_expires_in !== undefined &&
+      record.minecraft_token_expires_in !== null &&
+      maybeNumber(record.minecraft_token_expires_in) === undefined)
+  ) {
+    return null;
+  }
+  const profile = record.minecraft_profile == null ? undefined : minecraftProfile(record.minecraft_profile);
+  if ((record.minecraft_profile != null && !profile) || record.minecraft_profile_ready !== Boolean(profile))
+    return null;
+  const onlineAction = accountActionState(record.online_action);
+  const refreshAction = accountActionState(record.refresh_action);
+  const profileSyncAction = accountActionState(record.profile_sync_action);
+  if (!onlineAction || !refreshAction || !profileSyncAction) return null;
   return {
-    minecraft_profile_ready:
-      typeof record.minecraft_profile_ready === 'boolean' ? record.minecraft_profile_ready : undefined,
-    minecraft_ownership_verified:
-      typeof record.minecraft_ownership_verified === 'boolean' ? record.minecraft_ownership_verified : undefined,
-    minecraft_profile: minecraftProfile(record.minecraft_profile),
+    msa_authenticated: record.msa_authenticated,
+    msa_refresh_available: record.msa_refresh_available,
+    msa_token_expires_in: record.msa_token_expires_in === null ? null : maybeNumber(record.msa_token_expires_in),
+    online_action: onlineAction,
+    refresh_action: refreshAction,
+    profile_sync_action: profileSyncAction,
+    minecraft_profile_ready: record.minecraft_profile_ready,
+    minecraft_ownership_verified: record.minecraft_ownership_verified,
+    minecraft_profile: profile,
     minecraft_token_expires_in:
       record.minecraft_token_expires_in === null ? null : maybeNumber(record.minecraft_token_expires_in),
   };
@@ -470,48 +544,69 @@ function launcherAccount(value: unknown): LauncherAccount | null {
   if (
     !isRecord(value) ||
     typeof value.account_id !== 'string' ||
+    !value.account_id.trim() ||
+    !isRevision(value.account_revision) ||
+    !isRevision(value.profile_revision) ||
+    !isRevision(value.credential_revision) ||
     (value.kind !== 'microsoft' && value.kind !== 'offline') ||
     typeof value.display_name !== 'string' ||
     typeof value.active !== 'boolean' ||
-    typeof value.msa_authenticated !== 'boolean' ||
-    typeof value.msa_refresh_available !== 'boolean'
+    (value.login_id !== undefined && typeof value.login_id !== 'string') ||
+    (value.minecraft_profile_id !== undefined && typeof value.minecraft_profile_id !== 'string') ||
+    (value.offline_uuid !== undefined && typeof value.offline_uuid !== 'string')
   ) {
+    return null;
+  }
+  const readiness = accountReadiness(value);
+  if (!readiness || !isRecord(value.view_model) || typeof value.view_model.detail !== 'string') {
     return null;
   }
 
   return {
     account_id: value.account_id,
+    account_revision: value.account_revision,
+    profile_revision: value.profile_revision,
+    credential_revision: value.credential_revision,
     kind: value.kind,
     display_name: value.display_name,
     active: value.active,
     login_id: typeof value.login_id === 'string' ? value.login_id : undefined,
     minecraft_profile_id: typeof value.minecraft_profile_id === 'string' ? value.minecraft_profile_id : undefined,
     offline_uuid: typeof value.offline_uuid === 'string' ? value.offline_uuid : undefined,
-    msa_authenticated: value.msa_authenticated,
-    msa_token_expires_in: value.msa_token_expires_in === null ? null : maybeNumber(value.msa_token_expires_in),
-    msa_refresh_available: value.msa_refresh_available,
-    online_action: accountActionState(value.online_action),
-    refresh_action: accountActionState(value.refresh_action),
-    profile_sync_action: accountActionState(value.profile_sync_action),
-    view_model: isRecord(value.view_model)
-      ? { detail: typeof value.view_model.detail === 'string' ? value.view_model.detail : undefined }
-      : undefined,
-    ...minecraftReadiness(value),
+    view_model: { detail: value.view_model.detail },
+    ...readiness,
   };
 }
 
 export function launcherAccountsResponse(value: unknown): LauncherAccountsData | null {
   if (!isRecord(value) || !Array.isArray(value.accounts)) return null;
+  if (!isRevision(value.revision) || !isRevision(value.selection_revision)) return null;
+  if (value.launch_auth_mode !== 'offline' && value.launch_auth_mode !== 'online') return null;
   if (value.active_account_id !== null && typeof value.active_account_id !== 'string') return null;
+  const accounts = value.accounts.map(launcherAccount);
+  if (accounts.some((account) => account === null)) return null;
+  const parsedAccounts = accounts as LauncherAccount[];
+  if (new Set(parsedAccounts.map((account) => account.account_id)).size !== parsedAccounts.length) return null;
+  const active = parsedAccounts.filter((account) => account.active);
+  if (
+    value.active_account_id === null
+      ? active.length !== 0
+      : active.length !== 1 || active[0].account_id !== value.active_account_id
+  )
+    return null;
   return {
+    revision: value.revision,
+    selection_revision: value.selection_revision,
+    launch_auth_mode: value.launch_auth_mode,
     active_account_id: value.active_account_id,
-    accounts: value.accounts.map(launcherAccount).filter((account): account is LauncherAccount => account !== null),
+    accounts: parsedAccounts,
   };
 }
 
 export function authStatusResponse(value: unknown): AuthStatusRecord | null {
   if (!isRecord(value)) return null;
   if (
+    !isRevision(value.selection_revision) ||
     (value.launch_auth_mode !== 'offline' && value.launch_auth_mode !== 'online') ||
     typeof value.mode !== 'string' ||
     typeof value.username !== 'string' ||
@@ -521,12 +616,16 @@ export function authStatusResponse(value: unknown): AuthStatusRecord | null {
     typeof value.skin_source !== 'string' ||
     typeof value.login_available !== 'boolean' ||
     typeof value.login_reason !== 'string' ||
-    typeof value.msa_refresh_available !== 'boolean'
+    (value.msa_provider !== undefined && typeof value.msa_provider !== 'string')
   ) {
     return null;
   }
+  const readiness = accountReadiness(value);
+  const skinAction = accountActionState(value.skin_action);
+  if (!readiness || !skinAction) return null;
 
   return {
+    selection_revision: value.selection_revision,
     launch_auth_mode: value.launch_auth_mode,
     mode: value.mode,
     username: value.username,
@@ -536,16 +635,9 @@ export function authStatusResponse(value: unknown): AuthStatusRecord | null {
     skin_source: value.skin_source,
     login_available: value.login_available,
     login_reason: value.login_reason,
-    msa_authenticated: typeof value.msa_authenticated === 'boolean' ? value.msa_authenticated : undefined,
-    msa_provider:
-      typeof value.msa_provider === 'string' ? value.msa_provider : value.msa_provider === null ? null : undefined,
-    msa_token_expires_in: value.msa_token_expires_in === null ? null : maybeNumber(value.msa_token_expires_in),
-    msa_refresh_available: value.msa_refresh_available,
-    online_action: accountActionState(value.online_action),
-    refresh_action: accountActionState(value.refresh_action),
-    profile_sync_action: accountActionState(value.profile_sync_action),
-    skin_action: accountActionState(value.skin_action),
-    ...minecraftReadiness(value),
+    msa_provider: value.msa_provider,
+    skin_action: skinAction,
+    ...readiness,
   };
 }
 
@@ -638,10 +730,11 @@ export function skinActionErrorMessage(error: unknown, fallback: string): string
   if (isApiError(error) && isRecord(error.payload)) {
     return boundedMessage(typeof error.payload.error === 'string' ? error.payload.error : undefined, fallback);
   }
+  if (error instanceof Error) return boundedMessage(error.message, fallback);
   if (isRecord(error)) {
     return boundedMessage(typeof error.error === 'string' ? error.error : undefined, fallback);
   }
-  return boundedMessage(error instanceof Error ? error.message : undefined, fallback);
+  return fallback;
 }
 
 export function savedSkinApplyErrorMessage(error: unknown): string {
@@ -649,7 +742,7 @@ export function savedSkinApplyErrorMessage(error: unknown): string {
 }
 
 export function savedSkinFileUrl(skin: SavedSkinRecord): string {
-  return apiResourceUrl(`/skins/${skin.texture_key}/file`);
+  return apiResourceUrl(`/skins/${encodeURIComponent(skin.texture_key)}/file`);
 }
 
 export async function defaultSkinFile(skin: DefaultSkin): Promise<File> {

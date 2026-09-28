@@ -1,0 +1,2938 @@
+use crate::application::registered_artifact_recovery::{
+    RegisteredArtifactComponentRebuildSource, prepare_tier2_registered_artifact_recovery,
+};
+#[cfg(all(test, target_os = "linux"))]
+use crate::execution::integrity::IntegrityTier2ProgressObserver;
+use crate::execution::integrity::{
+    IntegrityTier2OwnedWork, IntegrityTier2OwnedWorkRejection, IntegrityTier2Report,
+    IntegrityTier2Status,
+};
+use crate::guardian::{Tier2IntegrityGuardianEvidence, try_tier2_integrity_guardian_evidence};
+use crate::state::contracts::{
+    CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
+    OperationOutcome, OperationPhase, OperationStatus, OperationStepMetrics, OperationStepResult,
+    OwnershipClass, RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
+    Tier2IntegrityMetrics,
+};
+use crate::state::{
+    AppState, IdleSweepCancellation, IdleSweepReserveError, IdleSweepSettlement,
+    IdleSweepSettlementOwner, IdleSweepTerminal, IntegrityIdleEpoch, KnownGoodTier2CleanReceipt,
+    KnownGoodTier2CleanSeal, KnownGoodVerificationUnavailable, OperationJournalReconciliation,
+    OperationJournalStore, OperationJournalStoreError, ProducerLease,
+    operation_journal_terminal_is_visible,
+};
+use axial_config::is_canonical_instance_id;
+use std::time::Duration;
+
+const TIER2_INTEGRITY_STEP: &str = "tier2_integrity_sweep";
+const TIER2_INTEGRITY_FAILURE: &str = "tier2_integrity_refused";
+const JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
+const JOURNAL_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IdleIntegrityTerminal {
+    Succeeded,
+    Cancelled,
+    Refused,
+}
+
+pub(super) struct IdleIntegrityCompletion {
+    terminal: IdleIntegrityTerminal,
+    clean_receipt: Option<KnownGoodTier2CleanReceipt>,
+}
+
+impl IdleIntegrityCompletion {
+    fn without_receipt(terminal: IdleIntegrityTerminal) -> Self {
+        Self {
+            terminal,
+            clean_receipt: None,
+        }
+    }
+
+    pub(super) fn into_parts(self) -> (IdleIntegrityTerminal, Option<KnownGoodTier2CleanReceipt>) {
+        (self.terminal, self.clean_receipt)
+    }
+}
+
+#[must_use = "a planned integrity sweep must execute or be cancelled"]
+pub(super) struct PlannedIntegritySweep {
+    state: AppState,
+    producer: ProducerLease,
+    instance_id: String,
+    journal: OperationJournalEntry,
+}
+
+#[must_use = "a reserved integrity sweep must execute or be cancelled"]
+pub(super) struct ReservedIntegritySweep {
+    planned: PlannedIntegritySweep,
+    settlement: IdleSweepSettlementOwner,
+}
+
+#[must_use = "a started integrity sweep must be awaited or deliberately detached"]
+pub(super) struct IntegritySweepExecution {
+    completion: tokio::task::JoinHandle<Result<IdleIntegrityCompletion, Tier2IntegritySweepError>>,
+}
+
+#[must_use = "a failed integrity reservation must cancel its durable plan"]
+pub(super) struct IntegritySweepReservationFailure {
+    planned: Box<PlannedIntegritySweep>,
+    error: IdleSweepReserveError,
+}
+
+struct ReservedIntegrityExecutionContext {
+    state: AppState,
+    recovery_producer: ProducerLease,
+    instance_id: String,
+    journal: OperationJournalEntry,
+    settlement: IdleSweepSettlementOwner,
+    rebuild_source: RegisteredArtifactComponentRebuildSource,
+    #[cfg(all(test, target_os = "linux"))]
+    progress_observer: Option<IntegrityTier2ProgressObserver>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum Tier2IntegritySweepError {
+    #[error("Tier 2 integrity target is not a canonical instance")]
+    InvalidInstanceId,
+    #[error("Tier 2 integrity target is not registered")]
+    InstanceNotRegistered,
+    #[error(transparent)]
+    Journal(#[from] OperationJournalStoreError),
+}
+
+impl Tier2IntegritySweepError {
+    pub(super) const fn class(&self) -> &'static str {
+        match self {
+            Self::InvalidInstanceId => "invalid_instance_id",
+            Self::InstanceNotRegistered => "instance_not_registered",
+            Self::Journal(error) => error.class(),
+        }
+    }
+}
+
+pub(super) async fn plan_tier2_integrity_sweep(
+    state: AppState,
+    producer: ProducerLease,
+    instance_id: String,
+) -> Result<PlannedIntegritySweep, Tier2IntegritySweepError> {
+    plan_tier2_integrity_sweep_with_mint(state, producer, instance_id, OperationId::mint).await
+}
+
+const INTEGRITY_OPERATION_ID_MINT_ATTEMPTS: usize = 8;
+
+async fn plan_tier2_integrity_sweep_with_mint<Mint>(
+    state: AppState,
+    producer: ProducerLease,
+    instance_id: String,
+    mut mint: Mint,
+) -> Result<PlannedIntegritySweep, Tier2IntegritySweepError>
+where
+    Mint: FnMut() -> OperationId,
+{
+    if !is_canonical_instance_id(&instance_id) {
+        return Err(Tier2IntegritySweepError::InvalidInstanceId);
+    }
+    if state.instances().get(&instance_id).is_none() {
+        return Err(Tier2IntegritySweepError::InstanceNotRegistered);
+    }
+    for _ in 0..INTEGRITY_OPERATION_ID_MINT_ATTEMPTS {
+        let journal = planned_tier2_integrity_journal(mint(), &instance_id);
+        if create_fresh_plan_reconciled(state.journals(), &journal).await? {
+            return Ok(PlannedIntegritySweep {
+                state,
+                producer,
+                instance_id,
+                journal,
+            });
+        }
+    }
+    Err(OperationJournalStoreError::AlreadyExists.into())
+}
+
+#[cfg(test)]
+async fn plan_tier2_integrity_sweep_with_id(
+    state: AppState,
+    producer: ProducerLease,
+    instance_id: String,
+    operation_id: OperationId,
+) -> Result<PlannedIntegritySweep, Tier2IntegritySweepError> {
+    if !is_canonical_instance_id(&instance_id) {
+        return Err(Tier2IntegritySweepError::InvalidInstanceId);
+    }
+    if state.instances().get(&instance_id).is_none() {
+        return Err(Tier2IntegritySweepError::InstanceNotRegistered);
+    }
+    let journal = planned_tier2_integrity_journal(operation_id, &instance_id);
+    create_plan_reconciled(state.journals(), &journal).await?;
+    Ok(PlannedIntegritySweep {
+        state,
+        producer,
+        instance_id,
+        journal,
+    })
+}
+
+impl PlannedIntegritySweep {
+    #[cfg(test)]
+    fn operation_id(&self) -> &OperationId {
+        &self.journal.operation_id
+    }
+
+    pub(super) fn reserve(
+        self,
+        expected_epoch: IntegrityIdleEpoch,
+    ) -> Result<ReservedIntegritySweep, IntegritySweepReservationFailure> {
+        match self
+            .state
+            .try_reserve_idle_sweep(expected_epoch, self.producer.claim_child())
+        {
+            Ok(reservation) => Ok(ReservedIntegritySweep {
+                planned: self,
+                settlement: IdleSweepSettlementOwner::new(reservation),
+            }),
+            Err(error) => Err(IntegritySweepReservationFailure {
+                planned: Box::new(self),
+                error,
+            }),
+        }
+    }
+
+    pub(super) async fn cancel(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+        let transition = Tier2TerminalTransition::cancelled(Tier2IntegrityCounters::default());
+        self.record_terminal(&transition).await?;
+        Ok(IdleIntegrityTerminal::Cancelled)
+    }
+
+    fn start_execute_reserved(
+        self,
+        settlement: IdleSweepSettlementOwner,
+    ) -> IntegritySweepExecution {
+        let Self {
+            state,
+            producer,
+            instance_id,
+            journal,
+        } = self;
+        let recovery_producer = producer.claim_child();
+        IntegritySweepExecution {
+            completion: producer.spawn_joinable(execute_reserved_owned(
+                state,
+                recovery_producer,
+                instance_id,
+                journal,
+                settlement,
+                |_| {},
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn start_execute_reserved_with<AfterSpawn>(
+        self,
+        settlement: IdleSweepSettlementOwner,
+        after_spawn: AfterSpawn,
+    ) -> IntegritySweepExecution
+    where
+        AfterSpawn: FnOnce(IdleSweepCancellation) + Send + 'static,
+    {
+        let Self {
+            state,
+            producer,
+            instance_id,
+            journal,
+        } = self;
+        let recovery_producer = producer.claim_child();
+        IntegritySweepExecution {
+            completion: producer.spawn_joinable(execute_reserved_owned(
+                state,
+                recovery_producer,
+                instance_id,
+                journal,
+                settlement,
+                after_spawn,
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn start_execute_reserved_with_source<AfterSpawn>(
+        self,
+        settlement: IdleSweepSettlementOwner,
+        after_spawn: AfterSpawn,
+        rebuild_source: RegisteredArtifactComponentRebuildSource,
+    ) -> IntegritySweepExecution
+    where
+        AfterSpawn: FnOnce(IdleSweepCancellation) + Send + 'static,
+    {
+        let Self {
+            state,
+            producer,
+            instance_id,
+            journal,
+        } = self;
+        let recovery_producer = producer.claim_child();
+        IntegritySweepExecution {
+            completion: producer.spawn_joinable(execute_reserved_owned_with_source(
+                ReservedIntegrityExecutionContext {
+                    state,
+                    recovery_producer,
+                    instance_id,
+                    journal,
+                    settlement,
+                    rebuild_source,
+                    #[cfg(target_os = "linux")]
+                    progress_observer: None,
+                },
+                after_spawn,
+            )),
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn start_execute_reserved_with_progress_observer(
+        self,
+        settlement: IdleSweepSettlementOwner,
+        progress_observer: IntegrityTier2ProgressObserver,
+    ) -> IntegritySweepExecution {
+        let Self {
+            state,
+            producer,
+            instance_id,
+            journal,
+        } = self;
+        let recovery_producer = producer.claim_child();
+        IntegritySweepExecution {
+            completion: producer.spawn_joinable(execute_reserved_owned_with_source(
+                ReservedIntegrityExecutionContext {
+                    state,
+                    recovery_producer,
+                    instance_id,
+                    journal,
+                    settlement,
+                    rebuild_source: RegisteredArtifactComponentRebuildSource::Production,
+                    progress_observer: Some(progress_observer),
+                },
+                |_| {},
+            )),
+        }
+    }
+
+    async fn record_terminal(
+        &self,
+        transition: &Tier2TerminalTransition,
+    ) -> Result<(), OperationJournalStoreError> {
+        record_terminal_reconciled(self.state.journals(), &self.journal, transition).await
+    }
+}
+
+async fn execute_reserved_owned<AfterSpawn>(
+    state: AppState,
+    recovery_producer: ProducerLease,
+    instance_id: String,
+    journal: OperationJournalEntry,
+    settlement: IdleSweepSettlementOwner,
+    after_spawn: AfterSpawn,
+) -> Result<IdleIntegrityCompletion, Tier2IntegritySweepError>
+where
+    AfterSpawn: FnOnce(IdleSweepCancellation),
+{
+    execute_reserved_owned_with_source(
+        ReservedIntegrityExecutionContext {
+            state,
+            recovery_producer,
+            instance_id,
+            journal,
+            settlement,
+            rebuild_source: RegisteredArtifactComponentRebuildSource::Production,
+            #[cfg(all(test, target_os = "linux"))]
+            progress_observer: None,
+        },
+        after_spawn,
+    )
+    .await
+}
+
+async fn execute_reserved_owned_with_source<AfterSpawn>(
+    context: ReservedIntegrityExecutionContext,
+    after_spawn: AfterSpawn,
+) -> Result<IdleIntegrityCompletion, Tier2IntegritySweepError>
+where
+    AfterSpawn: FnOnce(IdleSweepCancellation),
+{
+    let ReservedIntegrityExecutionContext {
+        state,
+        recovery_producer,
+        instance_id,
+        journal,
+        settlement,
+        rebuild_source,
+        #[cfg(all(test, target_os = "linux"))]
+        progress_observer,
+    } = context;
+    let authority = settlement.authority();
+    let ticket = match state
+        .mint_known_good_tier2_ticket(&authority, &instance_id)
+        .await
+    {
+        Ok(ticket) => ticket,
+        Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable) => {
+            settlement.settle(IdleSweepTerminal::Cancelled);
+            let transition = Tier2TerminalTransition::cancelled(Tier2IntegrityCounters::default());
+            record_terminal_reconciled(state.journals(), &journal, &transition).await?;
+            return Ok(IdleIntegrityCompletion::without_receipt(
+                IdleIntegrityTerminal::Cancelled,
+            ));
+        }
+        Err(
+            KnownGoodVerificationUnavailable::InstanceNotRegistered
+            | KnownGoodVerificationUnavailable::LibraryRootUnavailable
+            | KnownGoodVerificationUnavailable::LiveAuthorityUnavailable,
+        ) => {
+            settlement.settle(IdleSweepTerminal::Refused);
+            let transition = Tier2TerminalTransition::failed(
+                Tier2IntegrityCounters::default(),
+                Tier2IntegrityGuardianEvidence::empty(),
+            );
+            record_terminal_reconciled(state.journals(), &journal, &transition).await?;
+            return Ok(IdleIntegrityCompletion::without_receipt(
+                IdleIntegrityTerminal::Refused,
+            ));
+        }
+    };
+
+    let cancellation = settlement.cancellation();
+    let work = match IntegrityTier2OwnedWork::new(state.clone(), ticket, settlement) {
+        Ok(work) => work,
+        Err(mismatch) => {
+            let (transition, terminal) = match mismatch.settle() {
+                IntegrityTier2OwnedWorkRejection::Cancelled => (
+                    Tier2TerminalTransition::cancelled(Tier2IntegrityCounters::default()),
+                    IdleIntegrityTerminal::Cancelled,
+                ),
+                IntegrityTier2OwnedWorkRejection::Refused => (
+                    Tier2TerminalTransition::failed(
+                        Tier2IntegrityCounters::default(),
+                        Tier2IntegrityGuardianEvidence::empty(),
+                    ),
+                    IdleIntegrityTerminal::Refused,
+                ),
+            };
+            record_terminal_reconciled(state.journals(), &journal, &transition).await?;
+            return Ok(IdleIntegrityCompletion::without_receipt(terminal));
+        }
+    };
+    #[cfg(all(test, target_os = "linux"))]
+    let work = match &progress_observer {
+        Some(observer) => work.observe_progress_for_test(observer.clone()),
+        None => work,
+    };
+    let worker = work.spawn();
+    after_spawn(cancellation);
+    let result = worker.join().await;
+    let (transition, terminal, clean_seal) = match result {
+        Ok(result) => {
+            let recovery_state = state.clone();
+            let recovery_operation_id = journal.operation_id.clone();
+            let (report, settlement, recovery_error, clean_seal) = result
+                .settle_after_registered_artifact_recovery(move |report, findings| {
+                    let client = reqwest::Client::new();
+                    let recovery = prepare_tier2_registered_artifact_recovery(
+                        recovery_state,
+                        recovery_producer,
+                        &recovery_operation_id,
+                        report,
+                        findings,
+                        client,
+                        rebuild_source,
+                    );
+                    async move { recovery.execute().await.map(drop) }
+                })
+                .await;
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some(observer) = &progress_observer {
+                observer.settlement_finished();
+            }
+            if let Some(error) = recovery_error {
+                tracing::warn!(
+                    operation_id = %journal.operation_id,
+                    error_kind = error.class(),
+                    "Tier 2 registered artifact recovery failed"
+                );
+            }
+            match report.status {
+                IntegrityTier2Status::Complete => {
+                    debug_assert_eq!(settlement, IdleSweepSettlement::Authoritative);
+                    let counters = Tier2IntegrityCounters::from(&report);
+                    let evidence = tier2_guardian_evidence(&journal.operation_id, &report.facts)?;
+                    (
+                        Tier2TerminalTransition::succeeded(counters, evidence),
+                        IdleIntegrityTerminal::Succeeded,
+                        clean_seal,
+                    )
+                }
+                IntegrityTier2Status::Cancelled => (
+                    Tier2TerminalTransition::cancelled(Tier2IntegrityCounters::from(&report)),
+                    IdleIntegrityTerminal::Cancelled,
+                    None,
+                ),
+                IntegrityTier2Status::Refused => {
+                    debug_assert_eq!(settlement, IdleSweepSettlement::Superseded);
+                    let counters = Tier2IntegrityCounters::from(&report);
+                    let evidence = tier2_guardian_evidence(&journal.operation_id, &report.facts)?;
+                    (
+                        Tier2TerminalTransition::failed(counters, evidence),
+                        IdleIntegrityTerminal::Refused,
+                        None,
+                    )
+                }
+            }
+        }
+        Err(_) => (
+            Tier2TerminalTransition::failed(
+                Tier2IntegrityCounters::default(),
+                Tier2IntegrityGuardianEvidence::empty(),
+            ),
+            IdleIntegrityTerminal::Refused,
+            None,
+        ),
+    };
+    let verified_at = clean_seal.as_ref().map(|_| tokio::time::Instant::now());
+    record_terminal_reconciled(state.journals(), &journal, &transition).await?;
+    let clean_receipt = clean_seal.and_then(|seal: KnownGoodTier2CleanSeal| {
+        state.accept_known_good_tier2_clean_seal(
+            seal,
+            verified_at.expect("clean Tier 2 seal must retain verification time"),
+        )
+    });
+    Ok(IdleIntegrityCompletion {
+        terminal,
+        clean_receipt,
+    })
+}
+
+impl ReservedIntegritySweep {
+    pub(super) fn is_current(&self) -> bool {
+        self.settlement.is_current()
+    }
+
+    pub(super) fn start(self) -> IntegritySweepExecution {
+        self.planned.start_execute_reserved(self.settlement)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn execute(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+        self.start()
+            .wait()
+            .await
+            .map(|completion| completion.terminal)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn start_with_progress_observer(
+        self,
+        progress_observer: IntegrityTier2ProgressObserver,
+    ) -> IntegritySweepExecution {
+        self.planned
+            .start_execute_reserved_with_progress_observer(self.settlement, progress_observer)
+    }
+
+    #[cfg(test)]
+    async fn execute_with_rebuild_source(
+        self,
+        rebuild_source: RegisteredArtifactComponentRebuildSource,
+    ) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+        self.execute_completion_with_rebuild_source(rebuild_source)
+            .await
+            .map(|completion| completion.terminal)
+    }
+
+    #[cfg(test)]
+    async fn execute_completion_with_rebuild_source(
+        self,
+        rebuild_source: RegisteredArtifactComponentRebuildSource,
+    ) -> Result<IdleIntegrityCompletion, Tier2IntegritySweepError> {
+        self.planned
+            .start_execute_reserved_with_source(self.settlement, |_| {}, rebuild_source)
+            .wait()
+            .await
+    }
+
+    pub(super) async fn cancel(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+        self.settlement.settle(IdleSweepTerminal::Cancelled);
+        self.planned.cancel().await
+    }
+
+    #[cfg(test)]
+    async fn execute_cancelling_after_spawn(
+        self,
+    ) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+        self.planned
+            .start_execute_reserved_with(self.settlement, |cancellation| cancellation.cancel())
+            .wait()
+            .await
+            .map(|completion| completion.terminal)
+    }
+}
+
+impl IntegritySweepExecution {
+    pub(super) async fn wait(self) -> Result<IdleIntegrityCompletion, Tier2IntegritySweepError> {
+        self.completion
+            .await
+            .expect("owned Tier 2 sweep task must return its terminal result")
+    }
+}
+
+impl IntegritySweepReservationFailure {
+    pub(super) const fn class(&self) -> &'static str {
+        match self.error {
+            IdleSweepReserveError::Closing => "closing",
+            IdleSweepReserveError::EpochChanged => "epoch_changed",
+            IdleSweepReserveError::ForegroundActive => "foreground_active",
+            IdleSweepReserveError::SweepActive => "sweep_active",
+        }
+    }
+
+    pub(super) async fn cancel(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+        self.planned.cancel().await
+    }
+}
+
+pub(super) async fn reconcile_interrupted_tier2_integrity_sweeps(
+    state: &AppState,
+    producer: ProducerLease,
+) -> Result<(), OperationJournalStoreError> {
+    let _producer = producer;
+    let interrupted = state
+        .journals()
+        .matching_entries(tier2_restart_journal_is_exact);
+    for journal in interrupted {
+        record_terminal_reconciled(
+            state.journals(),
+            &journal,
+            &Tier2TerminalTransition::cancelled(Tier2IntegrityCounters::default()),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn planned_tier2_integrity_journal(
+    operation_id: OperationId,
+    instance_id: &str,
+) -> OperationJournalEntry {
+    let mut journal = OperationJournalEntry::new(
+        JournalId::new(format!("journal-{operation_id}")),
+        operation_id,
+        CommandKind::ValidateInstance,
+        StabilizationSystem::Application,
+        OwnershipClass::LauncherManaged,
+        RollbackState::NotApplicable,
+    );
+    journal.targets.push(TargetDescriptor::new(
+        StabilizationSystem::Application,
+        TargetKind::Instance,
+        instance_id,
+        OwnershipClass::LauncherManaged,
+    ));
+    journal.planned_steps.push(
+        tier2_integrity_step(OperationStepResult::Planned, Tier2IntegrityCounters::none())
+            .expect("a planned Tier 2 step has no metrics"),
+    );
+    journal
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Tier2IntegrityCounters {
+    selected_entry_count: usize,
+    verified_entry_count: usize,
+    processed_entry_count: usize,
+    hashed_entry_count: usize,
+    expected_content_byte_count: u64,
+    content_read_byte_count: u64,
+    metadata_lookup_count: usize,
+    link_lookup_count: usize,
+    suppressed_fact_count: usize,
+}
+
+impl Tier2IntegrityCounters {
+    const fn none() -> Option<Self> {
+        None
+    }
+
+    fn metrics(self) -> Result<Tier2IntegrityMetrics, OperationJournalStoreError> {
+        Tier2IntegrityMetrics::new(
+            u64::try_from(self.selected_entry_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            u64::try_from(self.verified_entry_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            u64::try_from(self.processed_entry_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            u64::try_from(self.hashed_entry_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            self.expected_content_byte_count,
+            self.content_read_byte_count,
+            u64::try_from(self.metadata_lookup_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            u64::try_from(self.link_lookup_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+            u64::try_from(self.suppressed_fact_count)
+                .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)?,
+        )
+        .map_err(|_| OperationJournalStoreError::InvalidOperationMetrics)
+    }
+}
+
+impl From<&IntegrityTier2Report> for Tier2IntegrityCounters {
+    fn from(report: &IntegrityTier2Report) -> Self {
+        Self {
+            selected_entry_count: report.selected_entry_count,
+            verified_entry_count: report.verified_entry_count,
+            processed_entry_count: report.processed_entry_count,
+            hashed_entry_count: report.hashed_entry_count,
+            expected_content_byte_count: report.expected_content_byte_count,
+            content_read_byte_count: report.content_read_byte_count,
+            metadata_lookup_count: report.metadata_lookup_count,
+            link_lookup_count: report.link_lookup_count,
+            suppressed_fact_count: report.suppressed_fact_count,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Tier2TerminalTransition {
+    Succeeded {
+        step: OperationJournalStep,
+        evidence: Option<crate::state::contracts::DurableGuardianEvidence>,
+    },
+    Failed {
+        step: OperationJournalStep,
+        evidence: Option<crate::state::contracts::DurableGuardianEvidence>,
+    },
+    Cancelled {
+        step: OperationJournalStep,
+    },
+}
+
+impl Tier2TerminalTransition {
+    fn succeeded(
+        counters: Tier2IntegrityCounters,
+        evidence: Tier2IntegrityGuardianEvidence,
+    ) -> Self {
+        Self::Succeeded {
+            step: tier2_integrity_step(OperationStepResult::Completed, Some(counters))
+                .expect("validated Tier 2 completion metrics"),
+            evidence: evidence.durable().cloned(),
+        }
+    }
+
+    fn failed(counters: Tier2IntegrityCounters, evidence: Tier2IntegrityGuardianEvidence) -> Self {
+        Self::Failed {
+            step: tier2_integrity_step(OperationStepResult::Failed, Some(counters))
+                .expect("validated Tier 2 failure metrics"),
+            evidence: evidence.durable().cloned(),
+        }
+    }
+
+    fn cancelled(counters: Tier2IntegrityCounters) -> Self {
+        Self::Cancelled {
+            step: tier2_integrity_step(OperationStepResult::Skipped, Some(counters))
+                .expect("validated Tier 2 cancellation metrics"),
+        }
+    }
+
+    async fn apply(
+        &self,
+        journals: &OperationJournalStore,
+        operation_id: &OperationId,
+    ) -> Result<(), OperationJournalStoreError> {
+        match self {
+            Self::Succeeded { step, evidence } => {
+                if let Some(evidence) = evidence {
+                    journals
+                        .record_success_with_guardian_evidence(step.clone(), evidence.clone())
+                        .await
+                } else {
+                    journals
+                        .record_success_with_metrics(operation_id, step.clone())
+                        .await
+                }
+            }
+            Self::Failed { step, evidence } => {
+                if let Some(evidence) = evidence {
+                    journals
+                        .record_failure_with_guardian_evidence(
+                            step.clone(),
+                            TIER2_INTEGRITY_FAILURE,
+                            OperationOutcome::Failed,
+                            evidence.clone(),
+                        )
+                        .await
+                } else {
+                    journals
+                        .record_failure_with_metrics(
+                            operation_id,
+                            step.clone(),
+                            TIER2_INTEGRITY_FAILURE,
+                        )
+                        .await
+                }
+            }
+            Self::Cancelled { step } => {
+                journals
+                    .record_cancellation_with_metrics(operation_id, step.clone())
+                    .await
+            }
+        }
+    }
+
+    fn expected(&self, planned: &OperationJournalEntry) -> OperationJournalEntry {
+        let mut expected = planned.clone();
+        match self {
+            Self::Succeeded { step, evidence } => {
+                expected.status = OperationStatus::Succeeded;
+                expected.completed_steps.push(step.clone());
+                expected.guardian_diagnosis_ids = evidence
+                    .as_ref()
+                    .map(|evidence| evidence.diagnosis_ids().to_vec())
+                    .unwrap_or_default();
+                expected.outcome = Some(OperationOutcome::Succeeded);
+            }
+            Self::Failed { step, evidence } => {
+                expected.status = OperationStatus::Failed;
+                expected.completed_steps.push(step.clone());
+                expected.failure_point = Some(TIER2_INTEGRITY_FAILURE.to_string());
+                expected.guardian_diagnosis_ids = evidence
+                    .as_ref()
+                    .map(|evidence| evidence.diagnosis_ids().to_vec())
+                    .unwrap_or_default();
+                expected.outcome = Some(OperationOutcome::Failed);
+            }
+            Self::Cancelled { step } => {
+                expected.status = OperationStatus::Cancelled;
+                expected.completed_steps = vec![step.clone()];
+                expected.failure_point = None;
+                expected.guardian_diagnosis_ids.clear();
+                expected.outcome = Some(OperationOutcome::Cancelled);
+            }
+        }
+        expected
+    }
+
+    fn is_visible(&self, entry: &OperationJournalEntry, expected: &OperationJournalEntry) -> bool {
+        let expected_fact_ids = match self {
+            Self::Succeeded { evidence, .. } | Self::Failed { evidence, .. } => evidence
+                .as_ref()
+                .map(|evidence| evidence.fact_ids())
+                .unwrap_or_default(),
+            Self::Cancelled { .. } => &[],
+        };
+        operation_journal_terminal_is_visible(entry, expected)
+            && expected_fact_ids.iter().all(|fact_id| {
+                entry
+                    .completed_steps
+                    .iter()
+                    .any(|step| step.guardian_fact_ids().contains(fact_id))
+            })
+    }
+}
+
+fn tier2_integrity_step(
+    result: OperationStepResult,
+    counters: Option<Tier2IntegrityCounters>,
+) -> Result<OperationJournalStep, OperationJournalStoreError> {
+    let mut step = OperationJournalStep::new(TIER2_INTEGRITY_STEP, OperationPhase::Validating);
+    step.result = result;
+    if let Some(counters) = counters {
+        step.set_metrics(OperationStepMetrics::Tier2Integrity(counters.metrics()?));
+    }
+    Ok(step)
+}
+
+fn tier2_guardian_evidence(
+    operation_id: &OperationId,
+    facts: &[crate::execution::ExecutionFact],
+) -> Result<Tier2IntegrityGuardianEvidence, OperationJournalStoreError> {
+    let mut bound = Vec::with_capacity(facts.len());
+    for fact in facts {
+        if fact
+            .operation_id
+            .as_ref()
+            .is_some_and(|fact_operation_id| fact_operation_id != operation_id)
+        {
+            return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+        }
+        let mut fact = fact.clone();
+        fact.operation_id = Some(operation_id.clone());
+        bound.push(fact);
+    }
+    try_tier2_integrity_guardian_evidence(operation_id, &bound)
+        .map_err(|_| OperationJournalStoreError::InvalidGuardianOutcome)
+}
+
+#[cfg(test)]
+async fn create_plan_reconciled(
+    journals: &OperationJournalStore,
+    expected: &OperationJournalEntry,
+) -> Result<(), OperationJournalStoreError> {
+    loop {
+        match journals.create(expected.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(OperationJournalStoreError::AlreadyExists)
+                if journals
+                    .get(&expected.operation_id)
+                    .is_some_and(|entry| entry.matches_store_entry(expected)) =>
+            {
+                return Ok(());
+            }
+            Err(error) => match journals
+                .reconcile_transition(
+                    &expected.operation_id,
+                    error,
+                    JOURNAL_RETRY_INITIAL_DELAY,
+                    JOURNAL_RETRY_MAX_DELAY,
+                    |entry| entry.matches_store_entry(expected),
+                )
+                .await?
+            {
+                OperationJournalReconciliation::CommittedAfterPersistenceFailure(_)
+                | OperationJournalReconciliation::RequestedTransitionAlreadyCommitted => {
+                    return Ok(());
+                }
+                OperationJournalReconciliation::RetryRequestedTransition => {}
+            },
+        }
+    }
+}
+
+async fn create_fresh_plan_reconciled(
+    journals: &OperationJournalStore,
+    expected: &OperationJournalEntry,
+) -> Result<bool, OperationJournalStoreError> {
+    loop {
+        match journals.create_fresh(expected.clone()).await {
+            Ok(()) => return Ok(true),
+            Err(OperationJournalStoreError::AlreadyExists) => return Ok(false),
+            Err(OperationJournalStoreError::RetryRequired) => {
+                journals.retry().await?;
+            }
+            Err(error) => match journals
+                .reconcile_transition(
+                    &expected.operation_id,
+                    error,
+                    JOURNAL_RETRY_INITIAL_DELAY,
+                    JOURNAL_RETRY_MAX_DELAY,
+                    |entry| entry.matches_store_entry(expected),
+                )
+                .await?
+            {
+                OperationJournalReconciliation::CommittedAfterPersistenceFailure(_)
+                | OperationJournalReconciliation::RequestedTransitionAlreadyCommitted => {
+                    return Ok(true);
+                }
+                OperationJournalReconciliation::RetryRequestedTransition => {}
+            },
+        }
+    }
+}
+
+async fn record_terminal_reconciled(
+    journals: &OperationJournalStore,
+    planned: &OperationJournalEntry,
+    transition: &Tier2TerminalTransition,
+) -> Result<(), OperationJournalStoreError> {
+    let expected = transition.expected(planned);
+    loop {
+        match transition.apply(journals, &planned.operation_id).await {
+            Ok(()) => {
+                assert!(
+                    journals
+                        .get(&planned.operation_id)
+                        .is_some_and(|entry| transition.is_visible(&entry, &expected)),
+                    "successful Tier 2 terminal journal write must be immediately visible"
+                );
+                return Ok(());
+            }
+            Err(OperationJournalStoreError::AlreadyTerminal)
+                if journals
+                    .get(&planned.operation_id)
+                    .is_some_and(|entry| transition.is_visible(&entry, &expected)) =>
+            {
+                return Ok(());
+            }
+            Err(error) => match journals
+                .reconcile_transition(
+                    &planned.operation_id,
+                    error,
+                    JOURNAL_RETRY_INITIAL_DELAY,
+                    JOURNAL_RETRY_MAX_DELAY,
+                    |entry| transition.is_visible(entry, &expected),
+                )
+                .await?
+            {
+                OperationJournalReconciliation::CommittedAfterPersistenceFailure(_)
+                | OperationJournalReconciliation::RequestedTransitionAlreadyCommitted => {
+                    return Ok(());
+                }
+                OperationJournalReconciliation::RetryRequestedTransition => {}
+            },
+        }
+    }
+}
+
+fn tier2_restart_journal_is_exact(entry: &OperationJournalEntry) -> bool {
+    entry.command == CommandKind::ValidateInstance
+        && entry.journal_id.as_str() == format!("journal-{}", entry.operation_id)
+        && entry.status == OperationStatus::Planned
+        && entry.owner == StabilizationSystem::Application
+        && entry.ownership == OwnershipClass::LauncherManaged
+        && entry.targets.len() == 1
+        && entry.targets[0].system == StabilizationSystem::Application
+        && entry.targets[0].kind == TargetKind::Instance
+        && is_canonical_instance_id(&entry.targets[0].id)
+        && entry.targets[0].ownership == OwnershipClass::LauncherManaged
+        && entry.planned_steps
+            == vec![
+                tier2_integrity_step(OperationStepResult::Planned, Tier2IntegrityCounters::none())
+                    .expect("a planned Tier 2 step has no metrics"),
+            ]
+        && entry.completed_steps.is_empty()
+        && entry.failure_point.is_none()
+        && entry.rollback == RollbackState::NotApplicable
+        && entry.guardian_diagnosis_ids.is_empty()
+        && entry.outcome.is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
+    use crate::guardian::GuardianFactId;
+    use crate::state::contracts::{ReconciliationComponent, ReconciliationRung};
+    use crate::state::{AppStateInit, InstallStore, SessionStore, reconciliation_attempt_key};
+    use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
+    use axial_minecraft::known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
+    };
+    use axial_performance::PerformanceManager;
+    use sha1::{Digest as _, Sha1};
+    use std::fs;
+    use std::io;
+    #[cfg(target_os = "linux")]
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    #[cfg(target_os = "linux")]
+    use std::time::Instant;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::Notify;
+
+    const FIRST_OPERATION_ID: &str = "integrity-sweep-00000000-0000-4000-8000-000000000001";
+    const SECOND_OPERATION_ID: &str = "integrity-sweep-00000000-0000-4000-8000-000000000002";
+    #[cfg(target_os = "linux")]
+    const REPRESENTATIVE_ENTRY_COUNT: usize = 442;
+    #[cfg(target_os = "linux")]
+    const REPRESENTATIVE_CONTENT_BYTES: u64 = 344_363_465;
+    #[cfg(target_os = "linux")]
+    const REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT: usize = 21;
+    #[cfg(target_os = "linux")]
+    const REPRESENTATIVE_SWEEP_LAUNCH_IMPACT_CEILING: Duration = Duration::from_millis(10);
+
+    #[cfg(target_os = "linux")]
+    struct RepresentativeSweepMeasurementRoot(PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for RepresentativeSweepMeasurementRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct GatedJournalBackend {
+        attempts: AtomicUsize,
+        started: Notify,
+        gate: Mutex<Option<Arc<JournalWriteGate>>>,
+    }
+
+    struct JournalWriteGate {
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    struct JournalWriteGateHandle(Arc<JournalWriteGate>);
+
+    impl GatedJournalBackend {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                started: Notify::new(),
+                gate: Mutex::new(None),
+            }
+        }
+
+        fn gate_next(&self) -> JournalWriteGateHandle {
+            let gate = Arc::new(JournalWriteGate {
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+            });
+            *self.gate.lock().expect("journal gate") = Some(gate.clone());
+            JournalWriteGateHandle(gate)
+        }
+
+        async fn wait_for_attempt(&self, expected: usize) {
+            loop {
+                let started = self.started.notified();
+                if self.attempts.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                started.await;
+            }
+        }
+    }
+
+    impl JournalWriteGate {
+        fn release(&self) {
+            *self.released.lock().expect("journal gate") = true;
+            self.changed.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut released = self.released.lock().expect("journal gate");
+            while !*released {
+                released = self.changed.wait(released).expect("journal gate wait");
+            }
+        }
+    }
+
+    impl JournalWriteGateHandle {
+        fn release(&self) {
+            self.0.release();
+        }
+    }
+
+    impl Drop for JournalWriteGateHandle {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    impl AtomicWriteBackend for GatedJournalBackend {
+        fn write(
+            &self,
+            destination: &crate::execution::anchored_record::AnchoredRecordTarget,
+            effects: &axial_fs::EffectOwner,
+            contents: &[u8],
+        ) -> io::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            if let Some(gate) = self.gate.lock().expect("journal gate").take() {
+                gate.wait();
+            }
+            destination.write(effects, contents)
+        }
+    }
+
+    fn state_fixture(label: &str) -> (AppState, PathBuf, AppPaths) {
+        let root = std::env::temp_dir().join(format!(
+            "axial-application-integrity-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        state_fixture_at(root)
+    }
+
+    fn state_fixture_at(root: PathBuf) -> (AppState, PathBuf, AppPaths) {
+        let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
+        fs::create_dir_all(paths.library_dir()).expect("create library root");
+        let root_session = crate::state::test_root_session(&paths);
+        let mut configured = ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+            .expect("load config")
+            .current();
+        configured.library_dir = paths.library_dir().to_string_lossy().into_owned();
+        let config = Arc::new(
+            ConfigStore::from_config(paths.clone(), Arc::clone(&root_session), configured)
+                .expect("configure test managed library"),
+        );
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
+        );
+        let state = AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(paths.performance_dir())
+                    .expect("performance manager"),
+            ),
+            startup_warnings: Vec::new(),
+        });
+        (state, root, paths)
+    }
+
+    fn gated_state_fixture(label: &str) -> (AppState, PathBuf, AppPaths, Arc<GatedJournalBackend>) {
+        let (state, root, paths) = state_fixture(label);
+        let backend = Arc::new(GatedJournalBackend::new());
+        let coordinator = PersistenceCoordinator::for_test(
+            backend.clone(),
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        );
+        let journal_paths =
+            AppPaths::from_root(root.join("journal-config")).expect("absolute journal app root");
+        let journals = Arc::new(
+            OperationJournalStore::try_load_from_paths_with_coordinator(
+                &journal_paths,
+                coordinator,
+            )
+            .expect("claim gated journal store"),
+        );
+        let state = state.with_journals(journals);
+        (state, root, paths, backend)
+    }
+
+    async fn close_fixture(state: AppState, root: &Path) {
+        state.shutdown().await.expect("shut down integrity fixture");
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn activate_empty_inventory(state: &AppState, instance_id: &str) {
+        let inventory = KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+            .expect("empty healthy inventory");
+        state.activate_known_good_inventory_for_test(instance_id, inventory);
+    }
+
+    fn activate_corrupt_inventory(
+        state: &AppState,
+        instance_id: &str,
+        version_id: &str,
+        paths: &AppPaths,
+    ) -> (Vec<u8>, String, String) {
+        const OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
+        let object_digest = format!("{:x}", Sha1::digest(OBJECT_BYTES));
+        let empty_digest = format!("{:x}", Sha1::digest([]));
+        let index_bytes = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "fixture/object": {
+                    "hash": object_digest.as_str(),
+                    "size": OBJECT_BYTES.len()
+                },
+                "fixture/empty": {
+                    "hash": empty_digest.as_str(),
+                    "size": 0
+                }
+            }
+        }))
+        .expect("Assets fixture index");
+        let version_json = serde_json::to_vec(&serde_json::json!({
+            "id": version_id,
+            "type": "release",
+            "mainClass": "org.axial.GuardianFixture",
+            "assetIndex": { "id": "fixture-assets" },
+            "libraries": []
+        }))
+        .expect("Assets launch version metadata");
+        let version_dir = paths.library_dir().join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("create Assets launch version directory");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            &version_json,
+        )
+        .expect("write Assets launch version metadata");
+        fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+            .expect("write Assets launch client");
+        let parent = paths.library_dir().join("assets/indexes");
+        fs::create_dir_all(&parent).expect("create corrupt Assets parent");
+        fs::write(
+            parent.join("fixture-assets.json"),
+            vec![7_u8; index_bytes.len()],
+        )
+        .expect("write corrupt Assets index");
+        let inventory = KnownGoodInventory::from_test_entries([
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.json"),
+                kind: KnownGoodArtifactKind::VersionMetadata,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(&version_json)),
+                    size: version_json.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.jar"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(b"client jar")),
+                    size: b"client jar".len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: "indexes/fixture-assets.json".to_string(),
+                kind: KnownGoodArtifactKind::AssetIndex,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(&index_bytes)),
+                    size: index_bytes.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("objects/{}/{}", &object_digest[..2], object_digest),
+                kind: KnownGoodArtifactKind::AssetObject,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: object_digest.clone(),
+                    size: OBJECT_BYTES.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("objects/{}/{}", &empty_digest[..2], empty_digest),
+                kind: KnownGoodArtifactKind::AssetObject,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: empty_digest.clone(),
+                    size: 0,
+                },
+            },
+        ])
+        .expect("corrupt Assets inventory");
+        let index_ordinal = inventory
+            .entries()
+            .iter()
+            .position(|entry| entry.kind() == KnownGoodArtifactKind::AssetIndex)
+            .expect("Assets index inventory ordinal");
+        let object_ordinal = inventory
+            .entries()
+            .iter()
+            .position(|entry| {
+                entry.kind() == KnownGoodArtifactKind::AssetObject
+                    && entry.path().as_str().ends_with(&object_digest)
+            })
+            .expect("Assets object inventory ordinal");
+        let inventory = inventory
+            .with_test_standalone_leaf_repair_source(
+                index_ordinal,
+                "https://example.invalid/fixture-assets.json",
+            )
+            .expect("Assets index fixture source")
+            .with_test_standalone_leaf_repair_source(
+                object_ordinal,
+                &format!(
+                    "https://resources.download.minecraft.net/{}/{}",
+                    &object_digest[..2],
+                    object_digest
+                ),
+            )
+            .expect("Assets object fixture source");
+        state.activate_known_good_inventory_for_test(instance_id, inventory);
+        (index_bytes, object_digest, empty_digest)
+    }
+
+    fn activate_corrupt_version_bundle_inventory(
+        state: &AppState,
+        instance_id: &str,
+        version_id: &str,
+        paths: &AppPaths,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        const CLIENT_BYTES: &[u8] = b"axial managed VersionBundle client fixture";
+        const LOG_ID: &str = "guardian-version-bundle.xml";
+        const LOG_BYTES: &[u8] = b"<Configuration/>";
+
+        let client_sha1 = format!("{:x}", Sha1::digest(CLIENT_BYTES));
+        let version_json = serde_json::to_vec(&serde_json::json!({
+            "id": version_id,
+            "type": "release",
+            "mainClass": "org.axial.GuardianFixture",
+            "downloads": {
+                "client": {
+                    "sha1": client_sha1,
+                    "size": CLIENT_BYTES.len(),
+                    "url": "https://example.invalid/managed-version-bundle-client"
+                }
+            }
+        }))
+        .expect("VersionBundle fixture metadata");
+        let version_dir = paths.library_dir().join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("create VersionBundle fixture directory");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            &version_json,
+        )
+        .expect("write exact VersionBundle metadata");
+        fs::write(
+            version_dir.join(format!("{version_id}.jar")),
+            &CLIENT_BYTES[..CLIENT_BYTES.len() / 2],
+        )
+        .expect("write truncated VersionBundle client");
+        let log_dir = paths.library_dir().join("assets/log_configs");
+        fs::create_dir_all(&log_dir).expect("create VersionBundle log directory");
+        fs::write(log_dir.join(LOG_ID), LOG_BYTES).expect("write exact VersionBundle log config");
+
+        let inventory = KnownGoodInventory::from_test_entries([
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.json"),
+                kind: KnownGoodArtifactKind::VersionMetadata,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(&version_json)),
+                    size: version_json.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.jar"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(CLIENT_BYTES)),
+                    size: CLIENT_BYTES.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("log_configs/{LOG_ID}"),
+                kind: KnownGoodArtifactKind::LogConfig,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(LOG_BYTES)),
+                    size: LOG_BYTES.len() as u64,
+                },
+            },
+        ])
+        .expect("corrupt VersionBundle inventory");
+        state.activate_known_good_inventory_for_test(instance_id, inventory);
+
+        (version_json, CLIENT_BYTES.to_vec(), LOG_BYTES.to_vec())
+    }
+
+    fn activate_large_corrupt_inventory(state: &AppState, instance_id: &str, paths: &AppPaths) {
+        let parent = paths.library_dir().join("libraries/cancel");
+        fs::create_dir_all(&parent).expect("create cancellation parent");
+        fs::write(parent.join("large.jar"), vec![7_u8; 2 * 64 * 1024])
+            .expect("write cancellation artifact");
+        let inventory = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+            root: TestKnownGoodRoot::Libraries,
+            path: "cancel/large.jar".to_string(),
+            kind: KnownGoodArtifactKind::Library,
+            integrity: TestKnownGoodIntegrity::File {
+                size: 2 * 64 * 1024,
+            },
+        }])
+        .expect("cancellation inventory");
+        state.activate_known_good_inventory_for_test(instance_id, inventory);
+    }
+
+    async fn fixed_plan(
+        state: &AppState,
+        instance_id: &str,
+        operation_id: &str,
+    ) -> PlannedIntegritySweep {
+        plan_tier2_integrity_sweep_with_id(
+            state.clone(),
+            state.try_claim_producer().expect("claim sweep owner"),
+            instance_id.to_string(),
+            OperationId::deterministic_test(operation_id),
+        )
+        .await
+        .expect("plan Tier 2 sweep")
+    }
+
+    fn reserve(plan: PlannedIntegritySweep, epoch: IntegrityIdleEpoch) -> ReservedIntegritySweep {
+        match plan.reserve(epoch) {
+            Ok(reserved) => reserved,
+            Err(failure) => panic!("reserve Tier 2 sweep: {}", failure.class()),
+        }
+    }
+
+    fn idle_epoch(state: &AppState) -> IntegrityIdleEpoch {
+        let snapshot = *state.subscribe_integrity_idle().borrow();
+        snapshot.epoch()
+    }
+
+    fn journal_fact_ids(entry: &OperationJournalEntry) -> Vec<GuardianFactId> {
+        entry
+            .completed_steps
+            .iter()
+            .flat_map(|step| step.guardian_fact_ids().iter().copied())
+            .collect()
+    }
+
+    fn tier2_metrics(entry: &OperationJournalEntry) -> &Tier2IntegrityMetrics {
+        match entry.completed_steps[0].metrics() {
+            Some(OperationStepMetrics::Tier2Integrity(metrics)) => metrics,
+            _ => panic!("Tier 2 terminal step must carry typed metrics"),
+        }
+    }
+
+    fn write_user_owned_sentinels(paths: &AppPaths, instance_id: &str) -> Vec<(PathBuf, Vec<u8>)> {
+        [
+            ("saves/world/level.dat", b"world".as_slice()),
+            ("mods/user.jar", b"mod".as_slice()),
+            ("config/user.toml", b"config".as_slice()),
+            ("resourcepacks/user.zip", b"resourcepack".as_slice()),
+        ]
+        .into_iter()
+        .map(|(relative, contents)| {
+            let path = paths.instances_dir().join(instance_id).join(relative);
+            fs::create_dir_all(path.parent().expect("user-owned sentinel parent"))
+                .expect("create user-owned sentinel parent");
+            fs::write(&path, contents).expect("write user-owned sentinel");
+            (path, contents.to_vec())
+        })
+        .collect()
+    }
+
+    async fn assert_clean_tier1(state: &AppState, instance_id: &str, library_root: &Path) {
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register repaired component postcheck")
+            .wait_for_settlement()
+            .await;
+        let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
+        let postcheck = crate::execution::integrity::sense_integrity_tier1(
+            state,
+            &foreground,
+            &lifecycle,
+            library_root,
+        )
+        .await
+        .expect("repaired component Tier1 postcheck");
+        assert!(postcheck.facts.is_empty());
+        drop((postcheck, lifecycle, foreground));
+    }
+
+    #[cfg(unix)]
+    async fn assert_repaired_instance_launches_once(
+        state: &AppState,
+        root: &Path,
+        instance_id: &str,
+        label: &str,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let java_dir = root.join(format!("{label}-java/bin"));
+        fs::create_dir_all(&java_dir).expect("booting Java fixture directory");
+        let java_path = java_dir.join("java");
+        fs::write(
+            &java_path,
+            r#"#!/bin/sh
+if [ "$1" = "-XshowSettings:property" ]; then
+  echo 'openjdk version "21.0.3"' >&2
+  exit 0
+fi
+count=0
+if [ -f guardian-component-process-count ]; then
+  count=$(cat guardian-component-process-count)
+fi
+count=$((count + 1))
+printf '%s' "$count" > guardian-component-process-count
+printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2
+sleep 1
+exit 0
+"#,
+        )
+        .expect("booting Java fixture");
+        let mut permissions = fs::metadata(&java_path)
+            .expect("booting Java metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&java_path, permissions).expect("booting Java executable");
+        let mut instance = state.instances().get(instance_id).expect("launch instance");
+        instance.java_path = java_path.to_string_lossy().into_owned();
+        state
+            .instances()
+            .replace_for_test(instance)
+            .expect("set booting Java override");
+        let producer = state
+            .try_claim_producer()
+            .expect("claim repaired component launch owner");
+        let prepared = crate::application::launch::prepare_launch_session_owned(
+            state,
+            crate::application::launch::LaunchRequest {
+                instance_id: instance_id.to_string(),
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+            &producer,
+        )
+        .await
+        .unwrap_or_else(|(_, payload)| panic!("prepare repaired component launch: {payload:?}"));
+        let session_id = prepared.task.session_id.0.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::application::launch::launch_session(state.clone(), prepared.task, producer),
+        )
+        .await
+        .expect("repaired component launch deadline")
+        .unwrap_or_else(|error| panic!("repaired component launch: {}", error.message));
+        let game_dir = state.instances().game_dir(instance_id);
+        assert_eq!(
+            fs::read_to_string(game_dir.join("guardian-component-process-count"))
+                .expect("repaired component process count"),
+            "1"
+        );
+        let running = state
+            .sessions()
+            .get(&session_id)
+            .await
+            .expect("repaired component running session");
+        assert_eq!(running.instance_id, instance_id);
+        assert_eq!(running.state, axial_launcher::LaunchState::Running);
+        assert!(running.boot_completed_at_ms.is_some());
+        let _ = state.sessions().kill(&session_id).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn representative_sweep_measurement_root() -> RepresentativeSweepMeasurementRoot {
+        let supplied_parent = PathBuf::from(
+            std::env::var_os("AXIAL_REPRESENTATIVE_SWEEP_MEASUREMENT_ROOT")
+                .expect("AXIAL_REPRESENTATIVE_SWEEP_MEASUREMENT_ROOT is required"),
+        );
+        let metadata = fs::symlink_metadata(&supplied_parent)
+            .expect("representative integrity sweep measurement root metadata");
+        assert!(
+            metadata.is_dir(),
+            "representative integrity sweep measurement root must be a directory"
+        );
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "representative integrity sweep measurement root must not be a symlink"
+        );
+        let parent = fs::canonicalize(supplied_parent)
+            .expect("canonical representative integrity sweep measurement root");
+        let root = parent.join(format!(
+            "axial-representative-sweep-launch-impact-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&root)
+            .expect("create isolated representative integrity sweep measurement fixture");
+        RepresentativeSweepMeasurementRoot(root)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn representative_sweep_entry_size(index: usize) -> u64 {
+        let base = REPRESENTATIVE_CONTENT_BYTES / REPRESENTATIVE_ENTRY_COUNT as u64;
+        let remainder = REPRESENTATIVE_CONTENT_BYTES % REPRESENTATIVE_ENTRY_COUNT as u64;
+        base + u64::from(index < remainder as usize)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn representative_sweep_write_patterned_file(path: &Path, size: u64, pattern: u8) -> String {
+        fs::create_dir_all(
+            path.parent()
+                .expect("representative integrity sweep fixture parent"),
+        )
+        .expect("create representative integrity sweep fixture parent");
+        let mut file =
+            fs::File::create(path).expect("create representative integrity sweep fixture file");
+        let chunk = vec![pattern; 64 * 1024];
+        let mut remaining = size;
+        let mut hasher = Sha1::new();
+        while remaining > 0 {
+            let count = remaining.min(chunk.len() as u64) as usize;
+            file.write_all(&chunk[..count])
+                .expect("write representative integrity sweep fixture file");
+            hasher.update(&chunk[..count]);
+            remaining -= count as u64;
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn representative_sweep_write_version_json(path: &Path, version_id: &str, size: u64) -> String {
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "id": version_id,
+            "type": "release",
+            "mainClass": "org.axial.GuardianRepresentativeSweepFixture",
+            "assetIndex": {},
+            "libraries": []
+        }))
+        .expect("encode representative integrity sweep version metadata");
+        assert!(bytes.len() < size as usize);
+        bytes.resize(size as usize, b' ');
+        fs::create_dir_all(
+            path.parent()
+                .expect("representative integrity sweep version parent"),
+        )
+        .expect("create representative integrity sweep version parent");
+        fs::write(path, &bytes).expect("write representative integrity sweep version metadata");
+        format!("{:x}", Sha1::digest(&bytes))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn representative_sweep_activate_representative_inventory(
+        state: &AppState,
+        paths: &AppPaths,
+        instance_id: &str,
+        version_id: &str,
+    ) {
+        let version_dir = paths.library_dir().join("versions").join(version_id);
+        let version_path = version_dir.join(format!("{version_id}.json"));
+        let version_digest = representative_sweep_write_version_json(
+            &version_path,
+            version_id,
+            representative_sweep_entry_size(0),
+        );
+        let client_path = version_dir.join(format!("{version_id}.jar"));
+        let client_digest = representative_sweep_write_patterned_file(
+            &client_path,
+            representative_sweep_entry_size(1),
+            0x51,
+        );
+        let mut entries = vec![
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.json"),
+                kind: KnownGoodArtifactKind::VersionMetadata,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: version_digest,
+                    size: representative_sweep_entry_size(0),
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.jar"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: client_digest,
+                    size: representative_sweep_entry_size(1),
+                },
+            },
+        ];
+        for index in 2..REPRESENTATIVE_ENTRY_COUNT {
+            let relative = format!("guardian-representative-sweep/{index:04}.jar");
+            let size = representative_sweep_entry_size(index);
+            let digest = representative_sweep_write_patterned_file(
+                &paths.library_dir().join("libraries").join(&relative),
+                size,
+                (index % 251) as u8,
+            );
+            entries.push(TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Libraries,
+                path: relative,
+                kind: KnownGoodArtifactKind::Library,
+                integrity: TestKnownGoodIntegrity::Sha1 { digest, size },
+            });
+        }
+        let inventory = KnownGoodInventory::from_test_entries(entries)
+            .expect("synthetic representative representative integrity sweep inventory");
+        assert_eq!(inventory.entries().len(), REPRESENTATIVE_ENTRY_COUNT);
+        state.activate_known_good_inventory_for_test(instance_id, inventory);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn representative_sweep_install_booting_java(state: &AppState, root: &Path, instance_id: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let java_dir = root.join("guardian-representative-sweep-java/bin");
+        fs::create_dir_all(&java_dir)
+            .expect("create representative integrity sweep Java fixture directory");
+        let java_path = java_dir.join("java");
+        fs::write(
+            &java_path,
+            r#"#!/bin/sh
+if [ "$1" = "-XshowSettings:property" ]; then
+  echo 'openjdk version "21.0.3"' >&2
+  exit 0
+fi
+count=0
+if [ -f guardian-representative-sweep-process-count ]; then
+  count=$(cat guardian-representative-sweep-process-count)
+fi
+count=$((count + 1))
+printf '%s' "$count" > guardian-representative-sweep-process-count
+printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2
+exec sleep 30
+"#,
+        )
+        .expect("write representative integrity sweep Java fixture");
+        let mut permissions = fs::metadata(&java_path)
+            .expect("representative integrity sweep Java fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&java_path, permissions)
+            .expect("make representative integrity sweep Java fixture executable");
+        let mut instance = state
+            .instances()
+            .get(instance_id)
+            .expect("representative integrity sweep instance");
+        instance.java_path = java_path.to_string_lossy().into_owned();
+        state
+            .instances()
+            .replace_for_test(instance)
+            .expect("set representative integrity sweep Java fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn representative_sweep_process_count(path: &Path) -> usize {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default()
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn representative_sweep_wait_until_stably_idle(state: &AppState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.subscribe_integrity_idle().borrow().is_stably_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("representative integrity sweep fixture returns to stable idle");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn representative_sweep_launch_once(state: &AppState, instance_id: &str) -> Duration {
+        let started_at = Instant::now();
+        let producer = state
+            .try_claim_producer()
+            .expect("claim representative integrity sweep launch owner");
+        let prepared = crate::application::launch::prepare_launch_session_owned(
+            state,
+            crate::application::launch::LaunchRequest {
+                instance_id: instance_id.to_string(),
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+            &producer,
+        )
+        .await
+        .unwrap_or_else(|(_, payload)| {
+            panic!("prepare representative integrity sweep launch: {payload:?}")
+        });
+        let session_id = prepared.task.session_id.0.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::application::launch::launch_session(state.clone(), prepared.task, producer),
+        )
+        .await
+        .expect("representative integrity sweep launch deadline")
+        .unwrap_or_else(|error| panic!("representative integrity sweep launch: {}", error.message));
+        let elapsed = started_at.elapsed();
+        let running = state
+            .sessions()
+            .get(&session_id)
+            .await
+            .expect("representative integrity sweep running session");
+        assert!(running.boot_completed_at_ms.is_some());
+        state
+            .sessions()
+            .kill(&session_id)
+            .await
+            .expect("stop representative integrity sweep launch");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.sessions().has_active_instance(instance_id).await {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("representative integrity sweep launch session becomes terminal");
+        representative_sweep_wait_until_stably_idle(state).await;
+        elapsed
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn representative_sweep_wait_for_content_read(observer: &IntegrityTier2ProgressObserver) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observer.content_read_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("representative integrity sweep Tier 2 worker enters physical content sensing");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn representative_sweep_assert_process_effect_after_settlement(
+        process_count_path: &Path,
+        expected_count: usize,
+        observer: &IntegrityTier2ProgressObserver,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while representative_sweep_process_count(process_count_path) < expected_count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("representative integrity sweep launch reaches its process effect");
+        assert!(
+            observer.settled_at().is_some(),
+            "Tier 2 physical ownership must settle before the launch process effect"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn representative_sweep_timing_summary(samples: &[Duration]) -> (Duration, Duration, Duration) {
+        assert_eq!(samples.len(), REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT);
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let p50 = sorted[sorted.len() / 2];
+        let p95_index = (sorted.len() * 95).div_ceil(100) - 1;
+        (
+            p50,
+            sorted[p95_index],
+            *sorted
+                .last()
+                .expect("representative integrity sweep samples"),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn representative_sweep_timing_json(
+        summary: (Duration, Duration, Duration),
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "p50_micros": summary.0.as_micros(),
+            "p95_micros": summary.1.as_micros(),
+            "max_micros": summary.2.as_micros()
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires a release build and explicit AXIAL_REPRESENTATIVE_SWEEP_* physical evidence bindings"]
+    async fn representative_idle_sweep_launch_preemption_measurement() {
+        #[cfg(debug_assertions)]
+        panic!("representative integrity sweep physical evidence must use cargo test --release");
+        #[cfg_attr(
+            debug_assertions,
+            expect(
+                unreachable_code,
+                reason = "representative integrity sweep physical evidence is release-only by contract"
+            )
+        )]
+        let device_evidence = std::env::var("AXIAL_REPRESENTATIVE_SWEEP_DEVICE_EVIDENCE")
+            .expect("AXIAL_REPRESENTATIVE_SWEEP_DEVICE_EVIDENCE is required");
+        let filesystem_evidence = std::env::var("AXIAL_REPRESENTATIVE_SWEEP_FILESYSTEM_EVIDENCE")
+            .expect("AXIAL_REPRESENTATIVE_SWEEP_FILESYSTEM_EVIDENCE is required");
+        let source_binding = std::env::var("AXIAL_REPRESENTATIVE_SWEEP_SOURCE_BINDING")
+            .expect("AXIAL_REPRESENTATIVE_SWEEP_SOURCE_BINDING is required");
+        assert!(
+            !device_evidence.trim().is_empty(),
+            "device evidence is empty"
+        );
+        assert!(
+            !filesystem_evidence.trim().is_empty(),
+            "filesystem evidence is empty"
+        );
+        assert!(!source_binding.trim().is_empty(), "source binding is empty");
+        let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("read Linux kernel release")
+            .trim()
+            .to_string();
+        assert!(
+            kernel_release.to_ascii_lowercase().contains("microsoft"),
+            "this evidence contract is scoped to the current WSL2 host"
+        );
+
+        let measurement_root = representative_sweep_measurement_root();
+        let (state, root, paths) = state_fixture_at(measurement_root.0.clone());
+        let version_id = "guardian-representative-sweep";
+        let instance = state
+            .instances()
+            .insert_for_test(
+                "representative integrity sweep synthetic representative",
+                version_id,
+            )
+            .expect("register representative integrity sweep representative instance");
+        representative_sweep_activate_representative_inventory(
+            &state,
+            &paths,
+            &instance.id,
+            version_id,
+        );
+        representative_sweep_install_booting_java(&state, &root, &instance.id);
+        let process_count_path = state
+            .instances()
+            .game_dir(&instance.id)
+            .join("guardian-representative-sweep-process-count");
+
+        let full_sweep_started = Instant::now();
+        let full_sweep = reserve(
+            fixed_plan(
+                &state,
+                &instance.id,
+                "integrity-sweep-00000000-0000-4000-8000-000000000500",
+            )
+            .await,
+            idle_epoch(&state),
+        )
+        .execute()
+        .await
+        .expect("execute full representative representative integrity sweep sweep");
+        let full_sweep_elapsed = full_sweep_started.elapsed();
+        assert_eq!(full_sweep, IdleIntegrityTerminal::Succeeded);
+        let full_journal = state
+            .journals()
+            .get(&OperationId::deterministic_test(
+                "integrity-sweep-00000000-0000-4000-8000-000000000500",
+            ))
+            .expect("full representative representative integrity sweep terminal journal");
+        assert_eq!(full_journal.status, OperationStatus::Succeeded);
+        assert_eq!(full_journal.outcome, Some(OperationOutcome::Succeeded));
+        let metrics = tier2_metrics(&full_journal);
+        assert_eq!(
+            metrics.selected_entry_count(),
+            REPRESENTATIVE_ENTRY_COUNT as u64
+        );
+        assert_eq!(
+            metrics.verified_entry_count(),
+            REPRESENTATIVE_ENTRY_COUNT as u64
+        );
+        assert_eq!(
+            metrics.processed_entry_count(),
+            REPRESENTATIVE_ENTRY_COUNT as u64
+        );
+        assert_eq!(
+            metrics.hashed_entry_count(),
+            REPRESENTATIVE_ENTRY_COUNT as u64
+        );
+        assert_eq!(
+            metrics.expected_content_byte_count(),
+            REPRESENTATIVE_CONTENT_BYTES
+        );
+        assert_eq!(
+            metrics.content_read_byte_count(),
+            REPRESENTATIVE_CONTENT_BYTES
+        );
+
+        representative_sweep_launch_once(&state, &instance.id).await;
+        let mut baseline = Vec::with_capacity(REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT);
+        let mut concurrent = Vec::with_capacity(REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT);
+        let mut paired_impact = Vec::with_capacity(REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT);
+        let mut preemption = Vec::with_capacity(REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT);
+        for sample_index in 0..REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT {
+            let baseline_elapsed = representative_sweep_launch_once(&state, &instance.id).await;
+            baseline.push(baseline_elapsed);
+
+            let operation_id = format!(
+                "integrity-sweep-00000000-0000-4000-8000-{:012x}",
+                0x600 + sample_index
+            );
+            let observer = IntegrityTier2ProgressObserver::default();
+            let execution = reserve(
+                fixed_plan(&state, &instance.id, &operation_id).await,
+                idle_epoch(&state),
+            )
+            .start_with_progress_observer(observer.clone());
+            representative_sweep_wait_for_content_read(&observer).await;
+            assert!(observer.settled_at().is_none());
+
+            let expected_process_count =
+                representative_sweep_process_count(&process_count_path) + 1;
+            let preemption_started = Instant::now();
+            let (concurrent_elapsed, ()) = tokio::join!(
+                representative_sweep_launch_once(&state, &instance.id),
+                representative_sweep_assert_process_effect_after_settlement(
+                    &process_count_path,
+                    expected_process_count,
+                    &observer,
+                )
+            );
+            let settled_at = observer
+                .settled_at()
+                .expect("representative integrity sweep sweep settles before launch effect");
+            preemption.push(settled_at.saturating_duration_since(preemption_started));
+            paired_impact.push(concurrent_elapsed.saturating_sub(baseline_elapsed));
+            concurrent.push(concurrent_elapsed);
+            assert_eq!(
+                execution
+                    .wait()
+                    .await
+                    .expect("representative integrity sweep cancelled sweep terminal")
+                    .terminal,
+                IdleIntegrityTerminal::Cancelled
+            );
+            let journal = state
+                .journals()
+                .get(&OperationId::deterministic_test(operation_id))
+                .expect("representative integrity sweep cancelled sweep journal");
+            assert_eq!(journal.status, OperationStatus::Cancelled);
+            assert_eq!(journal.outcome, Some(OperationOutcome::Cancelled));
+        }
+
+        let baseline_summary = representative_sweep_timing_summary(&baseline);
+        let concurrent_summary = representative_sweep_timing_summary(&concurrent);
+        let paired_impact_summary = representative_sweep_timing_summary(&paired_impact);
+        let preemption_summary = representative_sweep_timing_summary(&preemption);
+        let launch_impact_within_ceiling =
+            paired_impact_summary.1 <= REPRESENTATIVE_SWEEP_LAUNCH_IMPACT_CEILING;
+        let preemption_within_ceiling =
+            preemption_summary.1 <= REPRESENTATIVE_SWEEP_LAUNCH_IMPACT_CEILING;
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "axial.guardian.representative-sweep.launch-impact.v1",
+                "source_binding": source_binding,
+                "host_scope": "linux_wsl2_virtual_disk_only",
+                "kernel_release": kernel_release,
+                "device_evidence": device_evidence,
+                "filesystem_evidence": filesystem_evidence,
+                "fixture_root_supplied": true,
+                "fixture_kind": "synthetic_representative",
+                "fixture_basis": "current_local_axial_runtime_footprint",
+                "entry_count": REPRESENTATIVE_ENTRY_COUNT,
+                "content_bytes": REPRESENTATIVE_CONTENT_BYTES,
+                "full_sweep_elapsed_micros": full_sweep_elapsed.as_micros(),
+                "full_sweep_status": "succeeded",
+                "warmup_launch_samples": 1,
+                "paired_launch_samples": REPRESENTATIVE_SWEEP_LAUNCH_SAMPLE_COUNT,
+                "baseline_launch": representative_sweep_timing_json(baseline_summary),
+                "concurrent_launch": representative_sweep_timing_json(concurrent_summary),
+                "paired_launch_impact": representative_sweep_timing_json(paired_impact_summary),
+                "physical_preemption_settlement": representative_sweep_timing_json(preemption_summary),
+                "ceiling_ms": REPRESENTATIVE_SWEEP_LAUNCH_IMPACT_CEILING.as_millis(),
+                "launch_impact_within_ceiling": launch_impact_within_ceiling,
+                "preemption_within_ceiling": preemption_within_ceiling,
+                "cache_condition": "warm_without_cache_flush",
+                "limitations": [
+                    "synthetic fixture, not a real installed Minecraft instance",
+                    "WSL2 virtual disk, not native bare-metal or physical-HDD evidence",
+                    "warm page-cache condition; cold cache was not measured"
+                ],
+                "measurement_status": "candidate_only_pending_review"
+            })
+        );
+        assert!(
+            launch_impact_within_ceiling,
+            "representative integrity sweep paired p95 launch impact exceeded the predeclared 10 ms ceiling"
+        );
+        assert!(
+            preemption_within_ceiling,
+            "representative integrity sweep p95 physical sweep settlement exceeded the predeclared 10 ms ceiling"
+        );
+
+        close_fixture(state, &root).await;
+        drop(measurement_root);
+    }
+
+    #[test]
+    fn tier_two_plan_has_exact_durable_identity_and_target() {
+        let operation_id = OperationId::deterministic_test(FIRST_OPERATION_ID);
+        let journal = planned_tier2_integrity_journal(operation_id.clone(), "0123456789abcdef");
+
+        assert_eq!(
+            journal.journal_id,
+            JournalId::new(format!("journal-{operation_id}"))
+        );
+        assert_eq!(journal.operation_id, operation_id);
+        assert_eq!(journal.command, CommandKind::ValidateInstance);
+        assert_eq!(journal.status, OperationStatus::Planned);
+        assert_eq!(journal.owner, StabilizationSystem::Application);
+        assert_eq!(journal.ownership, OwnershipClass::LauncherManaged);
+        assert_eq!(journal.rollback, RollbackState::NotApplicable);
+        assert_eq!(journal.targets.len(), 1);
+        assert_eq!(journal.targets[0].system, StabilizationSystem::Application);
+        assert_eq!(journal.targets[0].kind, TargetKind::Instance);
+        assert_eq!(journal.targets[0].id, "0123456789abcdef");
+        assert_eq!(
+            journal.targets[0].ownership,
+            OwnershipClass::LauncherManaged
+        );
+        assert_eq!(journal.planned_steps.len(), 1);
+        assert_eq!(journal.planned_steps[0].step_id, TIER2_INTEGRITY_STEP);
+        assert_eq!(journal.planned_steps[0].phase, OperationPhase::Validating);
+        assert_eq!(
+            journal.planned_steps[0].result,
+            OperationStepResult::Planned
+        );
+        assert_eq!(
+            journal.planned_steps[0].rollback,
+            RollbackState::NotApplicable
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_tier_two_plan_remints_matching_identity_collision() {
+        let (state, root, _paths) = state_fixture("fresh-plan-operation-id-collision");
+        let instance = state
+            .instances()
+            .insert_for_test("Fresh identity collision", "1.21.5")
+            .expect("register instance");
+        let colliding_id = OperationId::try_from("op-ffffffff-ffff-4fff-8fff-ffffffffffff")
+            .expect("valid collision id");
+        let fresh_id = OperationId::try_from("op-00000000-0000-4000-8000-000000000000")
+            .expect("valid fresh id");
+        state
+            .journals()
+            .create(planned_tier2_integrity_journal(
+                colliding_id.clone(),
+                &instance.id,
+            ))
+            .await
+            .expect("seed matching collision");
+        let mut candidates = [colliding_id.clone(), fresh_id.clone()].into_iter();
+
+        let planned = plan_tier2_integrity_sweep_with_mint(
+            state.clone(),
+            state.try_claim_producer().expect("claim plan owner"),
+            instance.id,
+            || candidates.next().expect("bounded mint candidate"),
+        )
+        .await
+        .expect("fresh plan remints collision");
+
+        assert_eq!(planned.journal.operation_id, fresh_id);
+        assert!(state.journals().get(&colliding_id).is_some());
+        assert!(state.journals().get(&fresh_id).is_some());
+        drop(planned);
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn journal_plan_failure_creates_no_sweep_or_work() {
+        let (state, root, _paths) = state_fixture("plan-gate");
+        let instance = state
+            .instances()
+            .insert_for_test("Plan gate", "1.21.5")
+            .expect("register instance");
+        let journals = Arc::new(OperationJournalStore::with_max_entries(1));
+        let blocker_id = OperationId::deterministic_test("active-capacity-blocker");
+        journals
+            .create(OperationJournalEntry::new(
+                JournalId::new("journal-active-capacity-blocker"),
+                blocker_id,
+                CommandKind::InstallVersion,
+                StabilizationSystem::Application,
+                OwnershipClass::LauncherManaged,
+                RollbackState::NotApplicable,
+            ))
+            .await
+            .expect("fill active journal capacity");
+        let state = state.with_journals(journals);
+        let idle_before = *state.subscribe_integrity_idle().borrow();
+
+        let result = plan_tier2_integrity_sweep_with_id(
+            state.clone(),
+            state.try_claim_producer().expect("claim plan owner"),
+            instance.id,
+            OperationId::deterministic_test(FIRST_OPERATION_ID),
+        )
+        .await;
+
+        let Err(error) = result else {
+            panic!("capacity failure must reject the plan")
+        };
+        assert_eq!(error.class(), "capacity_exhausted");
+        assert_eq!(*state.subscribe_integrity_idle().borrow(), idle_before);
+        assert!(
+            state
+                .journals()
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+                .is_none()
+        );
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn unregistered_target_is_rejected_before_journaling() {
+        let (state, root, _paths) = state_fixture("unregistered-plan");
+        let idle_before = *state.subscribe_integrity_idle().borrow();
+
+        let result = plan_tier2_integrity_sweep_with_id(
+            state.clone(),
+            state.try_claim_producer().expect("claim plan owner"),
+            "0123456789abcdef".to_string(),
+            OperationId::deterministic_test(FIRST_OPERATION_ID),
+        )
+        .await;
+
+        let Err(error) = result else {
+            panic!("unregistered target must reject the plan")
+        };
+        assert_eq!(error.class(), "instance_not_registered");
+        assert_eq!(*state.subscribe_integrity_idle().borrow(), idle_before);
+        assert!(
+            state
+                .journals()
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+                .is_none()
+        );
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn healthy_sweep_records_counters_without_unknown_diagnosis() {
+        let (state, root, _paths) = state_fixture("healthy");
+        let instance = state
+            .instances()
+            .insert_for_test("Healthy", "1.21.5")
+            .expect("register instance");
+        activate_empty_inventory(&state, &instance.id);
+        let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
+        assert_eq!(
+            plan.operation_id(),
+            &OperationId::deterministic_test(FIRST_OPERATION_ID)
+        );
+        let reserved = reserve(plan, idle_epoch(&state));
+
+        let completion = reserved
+            .start()
+            .wait()
+            .await
+            .expect("execute healthy sweep");
+        let (terminal, clean_receipt) = completion.into_parts();
+
+        assert_eq!(terminal, IdleIntegrityTerminal::Succeeded);
+        assert!(state.known_good_tier2_clean_receipt_is_current(
+            clean_receipt.as_ref().expect("healthy clean receipt")
+        ));
+        let journal = state
+            .journals()
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+            .expect("healthy terminal journal");
+        assert_eq!(journal.status, OperationStatus::Succeeded);
+        assert_eq!(journal.outcome, Some(OperationOutcome::Succeeded));
+        assert!(journal_fact_ids(&journal).is_empty());
+        assert!(journal.guardian_diagnosis_ids.is_empty());
+        assert!(journal.completed_steps[0].generated_facts.is_empty());
+        assert!(journal.completed_steps[0].metrics().is_some());
+        drop(clean_receipt);
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_journal_io_starts_after_settlement_and_retains_the_producer() {
+        let (state, root, _paths, backend) = gated_state_fixture("terminal-order");
+        let instance = state
+            .instances()
+            .insert_for_test("Terminal order", "1.21.5")
+            .expect("register instance");
+        activate_empty_inventory(&state, &instance.id);
+        let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
+        let reserved = reserve(plan, idle_epoch(&state));
+        let gate = backend.gate_next();
+        let terminal_attempt = backend.attempts.load(Ordering::SeqCst) + 1;
+        let execution = tokio::spawn(reserved.start().wait());
+
+        backend.wait_for_attempt(terminal_attempt).await;
+        assert!(!execution.is_finished());
+        assert_eq!(
+            state
+                .journals()
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+                .expect("planned journal remains visible")
+                .status,
+            OperationStatus::Planned
+        );
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                state
+                    .register_integrity_foreground()
+                    .expect("foreground admission after sweep settlement")
+                    .wait_for_settlement(),
+            )
+            .await
+            .expect("foreground does not wait on terminal journal I/O"),
+        );
+
+        let quiesce_state = state.clone();
+        let quiesce = tokio::spawn(async move { quiesce_state.quiesce().await });
+        tokio::task::yield_now().await;
+        assert!(!quiesce.is_finished());
+
+        drop(
+            state
+                .admit_managed_artifact_mutation()
+                .expect("mutation during terminal journal persistence"),
+        );
+
+        gate.release();
+        let completion = execution
+            .await
+            .expect("execution waiter")
+            .expect("terminal journal commit");
+        let (terminal, clean_receipt) = completion.into_parts();
+        assert_eq!(terminal, IdleIntegrityTerminal::Succeeded);
+        assert!(
+            clean_receipt.is_none(),
+            "mutation during terminal persistence must invalidate the clean seal"
+        );
+        quiesce
+            .await
+            .expect("quiesce waiter")
+            .expect("producer releases after terminal journal commit");
+        assert_eq!(
+            state
+                .journals()
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+                .expect("terminal journal")
+                .status,
+            OperationStatus::Succeeded
+        );
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_assets_rebuilds_minimal_component_and_launches_once() {
+        let (state, root, paths) = state_fixture("corrupt");
+        let instance = state
+            .instances()
+            .insert_for_test("Corrupt", "1.21.5")
+            .expect("register instance");
+        let (index_bytes, object_digest, empty_digest) =
+            activate_corrupt_inventory(&state, &instance.id, &instance.version_id, &paths);
+        let user_owned = write_user_owned_sentinels(&paths, &instance.id);
+        let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
+        let reserved = reserve(plan, idle_epoch(&state));
+
+        let completion = reserved
+            .execute_completion_with_rebuild_source(
+                RegisteredArtifactComponentRebuildSource::Fixture,
+            )
+            .await
+            .expect("execute corrupt sweep");
+        let (terminal, clean_receipt) = completion.into_parts();
+
+        assert_eq!(terminal, IdleIntegrityTerminal::Succeeded);
+        assert!(clean_receipt.is_none(), "repaired sweep must not receipt");
+        let journal = state
+            .journals()
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+            .expect("corrupt terminal journal");
+        assert_eq!(journal.status, OperationStatus::Succeeded);
+        assert!(journal_fact_ids(&journal).contains(&GuardianFactId::ArtifactHashMismatch));
+        assert_eq!(
+            journal.guardian_diagnosis_ids,
+            vec![crate::guardian::DiagnosisId::LauncherManagedArtifactCorrupt]
+        );
+        assert!(
+            journal.completed_steps[0].generated_facts.len()
+                <= crate::state::MAX_OPERATION_JOURNAL_STEP_FACTS
+        );
+        let child_journals = state
+            .journals()
+            .list()
+            .into_iter()
+            .filter(|entry| entry.operation_id != journal.operation_id)
+            .filter_map(|entry| {
+                entry
+                    .reconciliation_attempt()
+                    .cloned()
+                    .map(|attempt| (entry, attempt))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(child_journals.len(), 2);
+        let leaf = child_journals
+            .iter()
+            .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RepairArtifact)
+            .expect("Assets leaf child journal");
+        assert_eq!(leaf.0.status, OperationStatus::Failed);
+        assert_eq!(leaf.1.component(), ReconciliationComponent::Assets);
+        assert_eq!(
+            leaf.0.failure_point.as_deref(),
+            Some(crate::state::REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT)
+        );
+        assert!(leaf.0.planned_steps.iter().all(|step| {
+            step.step_id != "download_artifact_to_temp"
+                && step.step_id != "quarantine_launcher_managed_target"
+        }));
+        let component = child_journals
+            .iter()
+            .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RebuildComponent)
+            .expect("Assets component child journal");
+        assert_eq!(
+            component.0.status,
+            OperationStatus::Succeeded,
+            "Assets component journal: {:#?}",
+            component.0,
+        );
+        assert_eq!(component.1.component(), ReconciliationComponent::Assets);
+        assert!(
+            component
+                .0
+                .planned_steps
+                .iter()
+                .any(|step| { step.step_id == crate::state::ASSETS_COMPONENT_REBUILD_STEP })
+        );
+        assert_ne!(leaf.0.operation_id, component.0.operation_id);
+        assert_ne!(leaf.0.operation_id, journal.operation_id);
+        assert_ne!(component.0.operation_id, journal.operation_id);
+        for (entry, attempt) in [leaf, component] {
+            let terminal = entry
+                .reconciliation_terminal()
+                .expect("child reconciliation terminal");
+            assert!(terminal.quarantine_checkpoint().is_empty());
+            assert_eq!(
+                state
+                    .failure_memory()
+                    .get(&reconciliation_attempt_key(attempt))
+                    .and_then(|memory| memory.reconciliation_terminal().cloned()),
+                Some(terminal.clone()),
+                "each child terminal must reach memory before parent success",
+            );
+        }
+        assert_eq!(
+            fs::read(
+                paths
+                    .library_dir()
+                    .join("assets/indexes/fixture-assets.json")
+            )
+            .expect("rebuilt Assets index"),
+            index_bytes
+        );
+        assert_eq!(
+            fs::read(paths.library_dir().join(format!(
+                "assets/objects/{}/{object_digest}",
+                &object_digest[..2]
+            )))
+            .expect("rebuilt nonempty Assets object"),
+            b"axial managed Assets fixture"
+        );
+        assert_eq!(
+            fs::read(paths.library_dir().join(format!(
+                "assets/objects/{}/{empty_digest}",
+                &empty_digest[..2]
+            )))
+            .expect("rebuilt empty Assets object"),
+            Vec::<u8>::new()
+        );
+        assert_clean_tier1(&state, &instance.id, paths.library_dir()).await;
+        #[cfg(unix)]
+        assert_repaired_instance_launches_once(&state, &root, &instance.id, "assets").await;
+        for (path, contents) in &user_owned {
+            assert_eq!(
+                fs::read(path).expect("user-owned Assets sentinel"),
+                contents.as_slice()
+            );
+        }
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn truncated_client_rebuilds_minimal_version_bundle_and_launches_once() {
+        let (state, root, paths) = state_fixture("corrupt-version-bundle");
+        let instance = state
+            .instances()
+            .insert_for_test("Corrupt VersionBundle", "1.21.5")
+            .expect("register VersionBundle instance");
+        let (version_json, client_jar, log_config) = activate_corrupt_version_bundle_inventory(
+            &state,
+            &instance.id,
+            &instance.version_id,
+            &paths,
+        );
+        let version_dir = paths
+            .library_dir()
+            .join("versions")
+            .join(&instance.version_id);
+        let truncated = fs::read(version_dir.join(format!("{}.jar", instance.version_id)))
+            .expect("truncated VersionBundle client");
+        assert!(truncated.len() < client_jar.len());
+        let user_owned = write_user_owned_sentinels(&paths, &instance.id);
+        let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
+        let reserved = reserve(plan, idle_epoch(&state));
+
+        let terminal = reserved
+            .execute_with_rebuild_source(RegisteredArtifactComponentRebuildSource::Fixture)
+            .await
+            .expect("execute VersionBundle sweep");
+
+        assert_eq!(terminal, IdleIntegrityTerminal::Succeeded);
+        let parent = state
+            .journals()
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+            .expect("VersionBundle parent journal");
+        assert_eq!(parent.status, OperationStatus::Succeeded);
+        assert!(journal_fact_ids(&parent).contains(&GuardianFactId::ArtifactSizeDrift));
+        assert_eq!(
+            parent.guardian_diagnosis_ids,
+            vec![crate::guardian::DiagnosisId::LauncherManagedArtifactCorrupt]
+        );
+        let child_journals = state
+            .journals()
+            .list()
+            .into_iter()
+            .filter(|entry| entry.operation_id != parent.operation_id)
+            .filter_map(|entry| {
+                entry
+                    .reconciliation_attempt()
+                    .cloned()
+                    .map(|attempt| (entry, attempt))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(child_journals.len(), 2);
+        let leaf = child_journals
+            .iter()
+            .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RepairArtifact)
+            .expect("VersionBundle leaf child journal");
+        assert_eq!(leaf.0.status, OperationStatus::Failed);
+        assert_eq!(leaf.1.component(), ReconciliationComponent::VersionBundle);
+        assert_eq!(
+            leaf.0.failure_point.as_deref(),
+            Some(crate::state::REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT)
+        );
+        assert!(
+            leaf.0
+                .planned_steps
+                .iter()
+                .all(|step| step.step_id != "download_artifact_to_temp"
+                    && step.step_id != "quarantine_launcher_managed_target")
+        );
+        let component = child_journals
+            .iter()
+            .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RebuildComponent)
+            .expect("VersionBundle component child journal");
+        assert_eq!(component.0.status, OperationStatus::Succeeded);
+        assert_eq!(
+            component.1.component(),
+            ReconciliationComponent::VersionBundle
+        );
+        assert!(
+            component.0.planned_steps.iter().any(|step| {
+                step.step_id == crate::state::VERSION_BUNDLE_COMPONENT_REBUILD_STEP
+            })
+        );
+        assert_ne!(leaf.0.operation_id, component.0.operation_id);
+        assert_ne!(leaf.0.operation_id, parent.operation_id);
+        assert_ne!(component.0.operation_id, parent.operation_id);
+        for (entry, attempt) in [leaf, component] {
+            let child_terminal = entry
+                .reconciliation_terminal()
+                .expect("VersionBundle child reconciliation terminal");
+            assert!(child_terminal.quarantine_checkpoint().is_empty());
+            assert_eq!(
+                state
+                    .failure_memory()
+                    .get(&reconciliation_attempt_key(attempt))
+                    .and_then(|memory| memory.reconciliation_terminal().cloned()),
+                Some(child_terminal.clone()),
+                "each VersionBundle child terminal must reach memory before parent success",
+            );
+        }
+
+        assert_eq!(
+            fs::read(version_dir.join(format!("{}.json", instance.version_id)))
+                .expect("rebuilt VersionBundle metadata"),
+            version_json
+        );
+        assert_eq!(
+            fs::read(version_dir.join(format!("{}.jar", instance.version_id)))
+                .expect("rebuilt VersionBundle client"),
+            client_jar
+        );
+        assert_eq!(
+            fs::read(
+                paths
+                    .library_dir()
+                    .join("assets/log_configs/guardian-version-bundle.xml")
+            )
+            .expect("rebuilt VersionBundle log config"),
+            log_config
+        );
+        assert_clean_tier1(&state, &instance.id, paths.library_dir()).await;
+        let scan_producer = state
+            .try_claim_producer()
+            .expect("claim repaired VersionBundle scan owner");
+        let scan = state
+            .installed_versions_snapshot(&scan_producer)
+            .await
+            .expect("scan repaired VersionBundle");
+        assert_ne!(
+            scan.snapshot.report().state,
+            axial_minecraft::VersionScanState::Degraded
+        );
+        assert!(
+            scan.snapshot
+                .report()
+                .versions
+                .iter()
+                .any(|version| version.id == instance.version_id),
+            "repaired VersionBundle must be launch-ready in the installed-version index",
+        );
+        drop(scan);
+        drop(scan_producer);
+        #[cfg(unix)]
+        assert_repaired_instance_launches_once(&state, &root, &instance.id, "version-bundle").await;
+        for (path, contents) in &user_owned {
+            assert_eq!(
+                fs::read(path).expect("user-owned sentinel remains readable"),
+                contents.as_slice(),
+                "VersionBundle rebuild and launch must not mutate user-owned instance files",
+            );
+        }
+
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn superseded_ticket_cancels_atomically_without_findings() {
+        let (state, root, paths) = state_fixture("superseded");
+        let instance = state
+            .instances()
+            .insert_for_test("Superseded", "1.21.5")
+            .expect("register instance");
+        let _ = activate_corrupt_inventory(&state, &instance.id, &instance.version_id, &paths);
+        let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
+        let reserved = reserve(plan, idle_epoch(&state));
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("supersede sweep before ticket mint");
+
+        let terminal = reserved.execute().await.expect("cancel superseded sweep");
+        drop(foreground.wait_for_settlement().await);
+
+        assert_eq!(terminal, IdleIntegrityTerminal::Cancelled);
+        let journal = state
+            .journals()
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+            .expect("cancelled terminal journal");
+        assert_eq!(journal.status, OperationStatus::Cancelled);
+        assert_eq!(journal.outcome, Some(OperationOutcome::Cancelled));
+        assert!(journal_fact_ids(&journal).is_empty());
+        assert!(journal.guardian_diagnosis_ids.is_empty());
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn spawned_worker_cancellation_settles_before_cancelled_journal_visibility() {
+        let (state, root, paths, backend) = gated_state_fixture("worker-cancellation-order");
+        let instance = state
+            .instances()
+            .insert_for_test("Worker cancellation", "1.21.5")
+            .expect("register instance");
+        activate_large_corrupt_inventory(&state, &instance.id, &paths);
+        let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
+        let reserved = reserve(plan, idle_epoch(&state));
+        let gate = backend.gate_next();
+        let terminal_attempt = backend.attempts.load(Ordering::SeqCst) + 1;
+        let execution = tokio::spawn(reserved.execute_cancelling_after_spawn());
+
+        backend.wait_for_attempt(terminal_attempt).await;
+        assert!(!execution.is_finished());
+        assert_eq!(
+            state
+                .journals()
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+                .expect("planned journal remains atomically visible")
+                .status,
+            OperationStatus::Planned
+        );
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                state
+                    .register_integrity_foreground()
+                    .expect("foreground after cancelled sweep settlement")
+                    .wait_for_settlement(),
+            )
+            .await
+            .expect("sweep settlement precedes journal visibility"),
+        );
+
+        gate.release();
+        assert_eq!(
+            execution
+                .await
+                .expect("execution waiter")
+                .expect("cancelled journal commit"),
+            IdleIntegrityTerminal::Cancelled
+        );
+        let journal = state
+            .journals()
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+            .expect("cancelled terminal journal");
+        assert_eq!(journal.status, OperationStatus::Cancelled);
+        assert!(journal.completed_steps[0].generated_facts.is_empty());
+        assert!(journal.completed_steps[0].metrics().is_some());
+        assert!(journal_fact_ids(&journal).is_empty());
+        assert!(journal.guardian_diagnosis_ids.is_empty());
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn unavailable_ticket_refuses_without_spawning_or_artifact_findings() {
+        let (state, root, _paths) = state_fixture("ticket-unavailable");
+        let instance = state
+            .instances()
+            .insert_for_test("No inventory", "1.21.5")
+            .expect("register instance");
+        let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
+        let reserved = reserve(plan, idle_epoch(&state));
+
+        let completion = reserved
+            .start()
+            .wait()
+            .await
+            .expect("record ticket refusal");
+        let (terminal, clean_receipt) = completion.into_parts();
+
+        assert_eq!(terminal, IdleIntegrityTerminal::Refused);
+        assert!(clean_receipt.is_none(), "refused sweep must not receipt");
+        let journal = state
+            .journals()
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+            .expect("refused terminal journal");
+        assert_eq!(journal.status, OperationStatus::Failed);
+        assert_eq!(
+            journal.failure_point.as_deref(),
+            Some(TIER2_INTEGRITY_FAILURE)
+        );
+        assert!(journal_fact_ids(&journal).is_empty());
+        assert!(journal.guardian_diagnosis_ids.is_empty());
+        let metrics = tier2_metrics(&journal);
+        assert_eq!(metrics.selected_entry_count(), 0);
+        assert_eq!(metrics.processed_entry_count(), 0);
+        assert_eq!(metrics.content_read_byte_count(), 0);
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn reserve_race_uses_the_planned_cancellation_transition() {
+        let (state, root, _paths) = state_fixture("reserve-race");
+        let instance = state
+            .instances()
+            .insert_for_test("Reserve race", "1.21.5")
+            .expect("register instance");
+        let stale_epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("advance idle epoch");
+
+        let failure = match plan.reserve(stale_epoch) {
+            Ok(_) => panic!("stale epoch must not reserve"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.class(), "epoch_changed");
+        drop(foreground);
+        assert_eq!(
+            failure.cancel().await.expect("cancel planned race"),
+            IdleIntegrityTerminal::Cancelled
+        );
+        let journal = state
+            .journals()
+            .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+            .expect("race cancellation journal");
+        assert_eq!(journal.status, OperationStatus::Cancelled);
+        assert!(journal_fact_ids(&journal).is_empty());
+        assert!(journal.guardian_diagnosis_ids.is_empty());
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_is_scoped_and_idempotent() {
+        let (state, root, _paths) = state_fixture("restart-scope");
+        let journals = Arc::new(OperationJournalStore::new());
+        let interrupted = planned_tier2_integrity_journal(
+            OperationId::deterministic_test(FIRST_OPERATION_ID),
+            "0123456789abcdef",
+        );
+        let terminal = planned_tier2_integrity_journal(
+            OperationId::deterministic_test(SECOND_OPERATION_ID),
+            "0123456789abcdef",
+        );
+        let unrelated_id = OperationId::deterministic_test("manual-validate-instance");
+        let mut unrelated =
+            planned_tier2_integrity_journal(unrelated_id.clone(), "0123456789abcdef");
+        unrelated.planned_steps = vec![OperationJournalStep::new(
+            "manual_validate_instance",
+            OperationPhase::Validating,
+        )];
+        let foreign_id =
+            OperationId::deterministic_test("integrity-sweep-00000000-0000-4000-8000-000000000003");
+        let foreign = OperationJournalEntry::new(
+            JournalId::new("journal-foreign"),
+            foreign_id.clone(),
+            CommandKind::InstallVersion,
+            StabilizationSystem::Application,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        );
+        let mismatched_id =
+            OperationId::deterministic_test("integrity-sweep-00000000-0000-4000-8000-000000000004");
+        let mut mismatched =
+            planned_tier2_integrity_journal(mismatched_id.clone(), "0123456789abcdef");
+        mismatched.owner = StabilizationSystem::Guardian;
+        for entry in [interrupted, terminal, unrelated, foreign, mismatched] {
+            journals
+                .create(entry)
+                .await
+                .expect("create restart fixture");
+        }
+        journals
+            .record_success_with_metrics(
+                &OperationId::deterministic_test(SECOND_OPERATION_ID),
+                tier2_integrity_step(
+                    OperationStepResult::Completed,
+                    Some(Tier2IntegrityCounters::default()),
+                )
+                .expect("valid terminal Tier 2 metrics"),
+            )
+            .await
+            .expect("terminalize completed fixture");
+        let state = state.with_journals(journals);
+
+        for _ in 0..2 {
+            reconcile_interrupted_tier2_integrity_sweeps(
+                &state,
+                state.try_claim_producer().expect("claim restart owner"),
+            )
+            .await
+            .expect("reconcile interrupted sweep");
+        }
+
+        assert_eq!(
+            state
+                .journals()
+                .get(&OperationId::deterministic_test(FIRST_OPERATION_ID))
+                .expect("reconciled journal")
+                .status,
+            OperationStatus::Cancelled
+        );
+        assert_eq!(
+            state
+                .journals()
+                .get(&OperationId::deterministic_test(SECOND_OPERATION_ID))
+                .expect("terminal journal")
+                .status,
+            OperationStatus::Succeeded
+        );
+        assert_eq!(
+            state
+                .journals()
+                .get(&unrelated_id)
+                .expect("unrelated validate journal")
+                .status,
+            OperationStatus::Planned
+        );
+        assert_eq!(
+            state
+                .journals()
+                .get(&foreign_id)
+                .expect("foreign command journal")
+                .status,
+            OperationStatus::Planned
+        );
+        assert_eq!(
+            state
+                .journals()
+                .get(&mismatched_id)
+                .expect("shape-mismatched journal")
+                .status,
+            OperationStatus::Planned
+        );
+        close_fixture(state, &root).await;
+    }
+}

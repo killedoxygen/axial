@@ -1,0 +1,998 @@
+mod create;
+mod create_cache;
+mod create_policy;
+mod resources;
+mod setup;
+
+#[cfg(test)]
+pub(crate) use create::handle_create_instance;
+pub(crate) use create::{
+    CreateInstanceRequest, CreateInstanceResponse, CreateInstanceViewResponse,
+    CreateLoaderBuildsViewResponse, handle_create_instance_owned, handle_create_instance_view,
+    handle_create_loader_builds_view,
+};
+pub(crate) use create_cache::invalidate_create_view_root;
+#[cfg(test)]
+pub(crate) use create_cache::{
+    create_view_cache_contains_root_for_tests, seed_create_view_cache_for_tests,
+};
+pub(crate) use setup::{
+    InstanceSetupExecuteRequest, InstanceSetupPlanRequest, InstanceSetupPlanResponse,
+    ModpackInstanceSetupRequest, execute_instance_setup, execute_modpack_instance_setup,
+    plan_instance_setup,
+};
+
+#[cfg(test)]
+use create::{CreateSelection, resolve_loader_create_selection_from_build_catalog};
+
+pub(crate) use resources::{
+    InstanceLogInfo, InstanceLogTailResponse, InstanceModInfo, InstanceResourcesResponse,
+    InstanceScreenshotInfo, InstanceWorldInfo, OpenFolderQuery, RenameScreenshotRequest,
+    RenameWorldRequest, UpdateModRequest, WorldBackupResponse, handle_backup_instance_world,
+    handle_delete_instance_mod, handle_delete_instance_screenshot, handle_delete_instance_world,
+    handle_instance_log_tail, handle_instance_logs, handle_instance_mods,
+    handle_instance_resources, handle_instance_screenshot_file, handle_instance_screenshots,
+    handle_instance_worlds, handle_open_instance_folder, handle_rename_instance_screenshot,
+    handle_rename_instance_world, handle_update_instance_mod,
+};
+
+#[cfg(test)]
+use resources::{
+    INSTANCE_LOG_READ_ERROR_MESSAGE, LOG_TAIL_LIMIT, SCREENSHOT_FILE_MAX_BYTES,
+    WORLD_BACKUP_MAX_BYTES, WORLD_BACKUP_MAX_DEPTH, WORLD_BACKUP_MAX_ENTRIES, WorldBackupNamePlan,
+    copy_world_backup_staged_outcome, copy_world_backup_staged_outcome_with_depth_limit,
+    copy_world_backup_staged_outcome_with_hook, handle_backup_instance_world_with_hook,
+    instance_folder_open_error_response, instance_folder_prepare_error_response,
+    instance_log_read_error_response, is_safe_resource_name, resolve_instance_folder,
+    scan_instance_logs, screenshot_content_type, screenshot_file_read_error_response,
+    screenshot_file_write_error_response, validate_mod_name, validate_screenshot_name,
+    validate_world_name,
+};
+
+#[cfg(all(test, unix))]
+use resources::copy_world_backup_staged;
+
+#[cfg(test)]
+use crate::application::filesystem::{FilesystemScanBudget, FilesystemScanLimits};
+
+#[cfg(all(test, target_os = "linux"))]
+use crate::application::filesystem::FilesystemScanError;
+
+use crate::application::filesystem::run_blocking_filesystem;
+use crate::application::timing::{
+    InstancesListTiming, trace_instances_list, trace_slow_instance_readiness,
+};
+use crate::application::version::{
+    InstalledVersionsScan, VERSION_SCAN_DEGRADED_MESSAGE, VersionScanViewModel,
+    installed_versions_scan,
+};
+use crate::guardian::normalize_create_jvm_preset;
+use crate::state::{
+    AppState, InstalledVersionsLookup, InstanceUpdate, IntegrityForegroundLease,
+    KnownGoodRebuildError, ProducerLease, RequestProducerHandoff,
+};
+use axial_config::{
+    EnrichedInstance, InstanceStoreDomainError, InstanceStoreError, InstanceStoreFailureClass,
+    LaunchActionState,
+};
+use axial_launcher::{
+    GuardianMode, LaunchReadiness, LaunchReadinessReasonId, LaunchReadinessRequest,
+    LaunchReadinessSeverity, inspect_launch_readiness_summary,
+};
+use axial_minecraft::managed_path::ManagedLibraryOperation;
+use axum::{Json, http::StatusCode};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    future::Future,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+use tracing::error;
+
+const INSTANCE_READINESS_SLOW_SPAN: Duration = Duration::from_millis(25);
+
+#[derive(Clone)]
+pub(super) struct ReadinessLibraryAuthority {
+    library_dir: PathBuf,
+    library_operation: ManagedLibraryOperation,
+}
+
+impl ReadinessLibraryAuthority {
+    pub(super) fn from_lookup(lookup: &InstalledVersionsLookup) -> Self {
+        Self {
+            library_dir: lookup.library_dir().to_path_buf(),
+            library_operation: lookup.managed_library_operation().clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InstanceWriteOperation {
+    Create,
+    Duplicate,
+    Update,
+    Delete,
+}
+
+impl InstanceWriteOperation {
+    fn internal_error_message(self) -> &'static str {
+        match self {
+            Self::Create => "Could not create the instance. Try again.",
+            Self::Duplicate => "Could not duplicate the instance. Try again.",
+            Self::Update => "Could not save the instance. Try again.",
+            Self::Delete => "Could not delete the instance. Try again.",
+        }
+    }
+}
+
+fn instance_write_error_response(
+    operation: InstanceWriteOperation,
+    error: InstanceStoreError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match &error {
+        InstanceStoreError::Domain(domain) => {
+            let (status, message) = match domain {
+                InstanceStoreDomainError::NotFound => (StatusCode::NOT_FOUND, "instance not found"),
+                InstanceStoreDomainError::NameConflict => (
+                    StatusCode::CONFLICT,
+                    "an instance with this name already exists",
+                ),
+                InstanceStoreDomainError::RunningInstance => (
+                    StatusCode::CONFLICT,
+                    "cannot delete a running instance; stop the game first",
+                ),
+                InstanceStoreDomainError::DirectVersionChangeUnsupported => (
+                    StatusCode::BAD_REQUEST,
+                    "direct version changes are not supported",
+                ),
+            };
+            return (status, Json(serde_json::json!({ "error": message })));
+        }
+        InstanceStoreError::Validation(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            );
+        }
+        _ => {}
+    }
+    let class = error.failure_class();
+    let (status, message) = match class {
+        InstanceStoreFailureClass::DomainNotFound => (StatusCode::NOT_FOUND, "instance not found"),
+        InstanceStoreFailureClass::Conflict => (
+            StatusCode::CONFLICT,
+            "an instance with this name already exists",
+        ),
+        InstanceStoreFailureClass::InvalidInput => {
+            (StatusCode::BAD_REQUEST, "instance data is invalid")
+        }
+        InstanceStoreFailureClass::PermissionDenied => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Instance storage access was denied. Check app data permissions and try again.",
+        ),
+        InstanceStoreFailureClass::StorageFull => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Instance storage is full. Free disk space and try again.",
+        ),
+        InstanceStoreFailureClass::PersistenceNotFound => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Instance storage is unavailable. Restart Axial and try again.",
+        ),
+        InstanceStoreFailureClass::Interrupted => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The instance update was interrupted. Try again.",
+        ),
+        InstanceStoreFailureClass::Unsettled => (
+            StatusCode::CONFLICT,
+            "Another instance update is still settling. Try again.",
+        ),
+        InstanceStoreFailureClass::InvalidData | InstanceStoreFailureClass::Other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            operation.internal_error_message(),
+        ),
+    };
+
+    (status, Json(serde_json::json!({ "error": message })))
+}
+
+fn instance_internal_error_response(
+    operation: InstanceWriteOperation,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": operation.internal_error_message() })),
+    )
+}
+
+fn instance_shutdown_error_response<Error>(_error: Error) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": "application shutdown is in progress" })),
+    )
+}
+
+fn known_good_rebuild_error_response(
+    operation: InstanceWriteOperation,
+    error: KnownGoodRebuildError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, message) = match error {
+        KnownGoodRebuildError::LibraryRootUnavailable => (
+            StatusCode::PRECONDITION_FAILED,
+            "Axial library is not configured",
+        ),
+        KnownGoodRebuildError::CapacityExhausted => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Version verification is busy. Try again.",
+        ),
+        KnownGoodRebuildError::ReconstructionFailed => (
+            StatusCode::BAD_GATEWAY,
+            "Could not verify the selected version. Check your connection and try again.",
+        ),
+        KnownGoodRebuildError::InstallRecoveryActive => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Install recovery is still restoring version authority. Try again shortly.",
+        ),
+        KnownGoodRebuildError::InstanceNotRegistered | KnownGoodRebuildError::TargetChanged => (
+            StatusCode::CONFLICT,
+            "The instance changed before version verification completed. Try again.",
+        ),
+        KnownGoodRebuildError::InvalidInstanceIdentity
+        | KnownGoodRebuildError::ReceiptIdentityMismatch
+        | KnownGoodRebuildError::PersistedAuthorityInvalid
+        | KnownGoodRebuildError::VerificationFailed
+        | KnownGoodRebuildError::ActivationRejected
+        | KnownGoodRebuildError::LiveAuthorityMissing
+        | KnownGoodRebuildError::OwnerStopped => {
+            return instance_internal_error_response(operation);
+        }
+    };
+    (status, Json(serde_json::json!({ "error": message })))
+}
+
+async fn rollback_new_instance(
+    state: &AppState,
+    foreground: &IntegrityForegroundLease,
+    owner: ProducerLease,
+    instance_id: &str,
+) -> Result<(), InstanceStoreError> {
+    match state
+        .delete_instance_with_owner(owner, foreground.retained(), instance_id.to_string(), true)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(_) if state.instances().get(instance_id).is_none() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn instance_store_error_class(error: &InstanceStoreError) -> &'static str {
+    match error {
+        InstanceStoreError::Domain(_) => "domain",
+        InstanceStoreError::Root(_) => "root",
+        InstanceStoreError::Read(_) => "read",
+        InstanceStoreError::Parse(_) => "parse",
+        InstanceStoreError::Validation(_) => "validation",
+        InstanceStoreError::TooLarge { .. } => "too_large",
+        InstanceStoreError::Persistence(_) => "persistence",
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct InstancesResponse {
+    pub instances: Vec<EnrichedInstance>,
+    pub last_instance_id: Option<String>,
+    pub scan_state: VersionScanViewModel,
+}
+
+pub(crate) async fn handle_list_instances(
+    state: &AppState,
+    producer: &ProducerLease,
+) -> InstancesResponse {
+    let started_at = Instant::now();
+    let scan_started_at = Instant::now();
+    let indexed = indexed_current_versions(state, producer).await;
+    let scan_elapsed = scan_started_at.elapsed();
+
+    let version_count = indexed.scan.versions.len();
+    let degraded = indexed.scan.is_degraded();
+    let scan_state = indexed.scan.view_model.clone();
+    let scan_source = indexed.source;
+    let refresh_count = indexed.refresh_count;
+    let enrich_started_at = Instant::now();
+    let instances = enrich_instances_for_state(state, indexed.scan, indexed.authority).await;
+    let enrich_elapsed = enrich_started_at.elapsed();
+
+    trace_instances_list(InstancesListTiming {
+        total: started_at.elapsed(),
+        scan: scan_elapsed,
+        enrich: enrich_elapsed,
+        version_count,
+        instance_count: instances.len(),
+        degraded,
+        scan_source,
+        refresh_count,
+    });
+
+    InstancesResponse {
+        instances,
+        last_instance_id: state.instances().last_instance_id(),
+        scan_state,
+    }
+}
+
+struct IndexedCurrentVersions {
+    scan: InstalledVersionsScan,
+    source: &'static str,
+    refresh_count: u32,
+    authority: Option<InstalledVersionsLookup>,
+}
+
+async fn indexed_current_versions(
+    state: &AppState,
+    producer: &ProducerLease,
+) -> IndexedCurrentVersions {
+    let Some(lookup) = state.installed_versions_snapshot(producer).await else {
+        return IndexedCurrentVersions {
+            scan: unconfigured_versions_scan(),
+            source: "unconfigured",
+            refresh_count: 0,
+            authority: None,
+        };
+    };
+    let source = lookup.source.as_str();
+    let refresh_count = lookup.refresh_count;
+    IndexedCurrentVersions {
+        scan: installed_versions_scan(&lookup.snapshot),
+        source,
+        refresh_count,
+        authority: Some(lookup),
+    }
+}
+
+fn unconfigured_versions_scan() -> InstalledVersionsScan {
+    InstalledVersionsScan {
+        versions: Vec::new(),
+        view_model: VersionScanViewModel {
+            state_id: "library_unconfigured".to_string(),
+            label: "Library is not configured".to_string(),
+            degraded: false,
+            detail: None,
+        },
+    }
+}
+
+pub(crate) async fn instance_version_is_installed_and_launchable(
+    state: &AppState,
+    producer: &ProducerLease,
+    instance_id: &str,
+) -> bool {
+    let Some(instance) = state.instances().get(instance_id) else {
+        return false;
+    };
+    let indexed = indexed_current_versions(state, producer).await;
+    !indexed.scan.is_degraded()
+        && indexed.scan.versions.iter().any(|version| {
+            version.id == instance.version_id && version.installed && version.launchable
+        })
+}
+
+async fn enrich_instance_for_state_indexed(
+    state: &AppState,
+    producer: &ProducerLease,
+    instance: axial_config::Instance,
+) -> EnrichedInstance {
+    let indexed = indexed_current_versions(state, producer).await;
+    enrich_instance_for_indexed_scan(state, instance, indexed.scan, indexed.authority).await
+}
+
+async fn enrich_instance_for_state_with_foreground(
+    state: &AppState,
+    foreground: &IntegrityForegroundLease,
+    producer: &ProducerLease,
+    instance: axial_config::Instance,
+) -> EnrichedInstance {
+    let Some(lookup) = state
+        .installed_versions_snapshot_with_foreground(producer, foreground.retained())
+        .await
+    else {
+        return enrich_instance_for_scan(state, instance, unconfigured_versions_scan(), None).await;
+    };
+    let scan = installed_versions_scan(&lookup.snapshot);
+    enrich_instance_for_indexed_scan(state, instance, scan, Some(lookup)).await
+}
+
+async fn enrich_instances_for_state(
+    state: &AppState,
+    scan: InstalledVersionsScan,
+    authority: Option<InstalledVersionsLookup>,
+) -> Vec<EnrichedInstance> {
+    let instances = state.instances().list();
+    let fallback_instances = instances.clone();
+    let worker_state = state.clone();
+    let readiness_authority = authority
+        .as_ref()
+        .map(ReadinessLibraryAuthority::from_lookup);
+    match run_blocking_filesystem(move || {
+        enrich_instances_for_scan_blocking(
+            &worker_state,
+            instances,
+            &scan,
+            readiness_authority.as_ref(),
+        )
+    })
+    .await
+    {
+        Ok(instances) => instances,
+        Err(_) => fallback_instances
+            .into_iter()
+            .map(failed_readiness_enrichment)
+            .collect(),
+    }
+}
+
+async fn enrich_instance_for_indexed_scan(
+    state: &AppState,
+    instance: axial_config::Instance,
+    scan: InstalledVersionsScan,
+    authority: Option<InstalledVersionsLookup>,
+) -> EnrichedInstance {
+    let fallback_instance = instance.clone();
+    let worker_state = state.clone();
+    let readiness_authority = authority
+        .as_ref()
+        .map(ReadinessLibraryAuthority::from_lookup);
+    match run_blocking_filesystem(move || {
+        enrich_instance_for_scan_blocking(
+            &worker_state,
+            instance,
+            &scan,
+            readiness_authority.as_ref(),
+        )
+    })
+    .await
+    {
+        Ok(enriched) => enriched,
+        Err(_) => failed_readiness_enrichment(fallback_instance),
+    }
+}
+
+pub(super) async fn enrich_instance_for_scan(
+    state: &AppState,
+    instance: axial_config::Instance,
+    scan: InstalledVersionsScan,
+    readiness_authority: Option<ReadinessLibraryAuthority>,
+) -> EnrichedInstance {
+    let fallback_instance = instance.clone();
+    let worker_state = state.clone();
+    match run_blocking_filesystem(move || {
+        enrich_instance_for_scan_blocking(
+            &worker_state,
+            instance,
+            &scan,
+            readiness_authority.as_ref(),
+        )
+    })
+    .await
+    {
+        Ok(enriched) => enriched,
+        Err(_) => failed_readiness_enrichment(fallback_instance),
+    }
+}
+
+fn failed_readiness_enrichment(instance: axial_config::Instance) -> EnrichedInstance {
+    let mut enriched = redact_runtime_overrides(
+        EnrichedInstance::from_instance_without_resource_counts(instance, None),
+    );
+    apply_blocked_launch_action(
+        &mut enriched,
+        "Version readiness could not be inspected. Refresh and try again.",
+    );
+    enriched
+}
+
+fn enrich_instance_for_scan_blocking(
+    state: &AppState,
+    instance: axial_config::Instance,
+    scan: &InstalledVersionsScan,
+    readiness_authority: Option<&ReadinessLibraryAuthority>,
+) -> EnrichedInstance {
+    let version = scan
+        .versions
+        .iter()
+        .find(|version| version.id == instance.version_id);
+    let mut enriched = redact_runtime_overrides(
+        EnrichedInstance::from_instance_without_resource_counts(instance.clone(), version),
+    );
+    if scan.is_degraded() {
+        apply_blocked_launch_action(&mut enriched, VERSION_SCAN_DEGRADED_MESSAGE);
+        return enriched;
+    }
+
+    let Some(readiness_authority) = readiness_authority else {
+        return enriched;
+    };
+    let config = state.config().current();
+    let readiness_started_at = Instant::now();
+    let readiness = inspect_launch_readiness_summary(
+        state.managed_runtime_cache(),
+        &LaunchReadinessRequest {
+            library_operation: readiness_authority.library_operation.clone(),
+            library_dir: readiness_authority.library_dir.clone(),
+            requested_java: selected_java_override(&instance, &config),
+            version_id: instance.version_id.clone(),
+            guardian_mode: GuardianMode::from_config(&config.guardian_mode),
+        },
+    );
+    let readiness_elapsed = readiness_started_at.elapsed();
+    if readiness_elapsed >= INSTANCE_READINESS_SLOW_SPAN {
+        trace_slow_instance_readiness(
+            &instance.id,
+            &instance.version_id,
+            readiness_elapsed,
+            readiness.launchable,
+            readiness.reasons.len(),
+        );
+    }
+    apply_launch_readiness(&mut enriched, &readiness);
+    enriched
+}
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct ReadinessInspectionKey {
+    version_id: String,
+    requested_java: String,
+    guardian_mode: &'static str,
+}
+
+fn enrich_instances_for_scan_blocking(
+    state: &AppState,
+    instances: Vec<axial_config::Instance>,
+    scan: &InstalledVersionsScan,
+    readiness_authority: Option<&ReadinessLibraryAuthority>,
+) -> Vec<EnrichedInstance> {
+    let config = state.config().current();
+    enrich_instances_for_scan_with_inspector(
+        instances,
+        scan,
+        readiness_authority,
+        &config,
+        |instance, request| {
+            let started_at = Instant::now();
+            let readiness =
+                inspect_launch_readiness_summary(state.managed_runtime_cache(), request);
+            let elapsed = started_at.elapsed();
+            if elapsed >= INSTANCE_READINESS_SLOW_SPAN {
+                trace_slow_instance_readiness(
+                    &instance.id,
+                    &instance.version_id,
+                    elapsed,
+                    readiness.launchable,
+                    readiness.reasons.len(),
+                );
+            }
+            readiness
+        },
+    )
+}
+
+fn enrich_instances_for_scan_with_inspector<Inspect>(
+    instances: Vec<axial_config::Instance>,
+    scan: &InstalledVersionsScan,
+    readiness_authority: Option<&ReadinessLibraryAuthority>,
+    config: &axial_config::AppConfig,
+    mut inspect: Inspect,
+) -> Vec<EnrichedInstance>
+where
+    Inspect: FnMut(&axial_config::Instance, &LaunchReadinessRequest) -> LaunchReadiness,
+{
+    let mut readiness = HashMap::<ReadinessInspectionKey, LaunchReadiness>::new();
+    instances
+        .into_iter()
+        .map(|instance| {
+            let version = scan
+                .versions
+                .iter()
+                .find(|version| version.id == instance.version_id);
+            let mut enriched = redact_runtime_overrides(
+                EnrichedInstance::from_instance_without_resource_counts(instance.clone(), version),
+            );
+            if scan.is_degraded() {
+                apply_blocked_launch_action(&mut enriched, VERSION_SCAN_DEGRADED_MESSAGE);
+                return enriched;
+            }
+            let Some(readiness_authority) = readiness_authority else {
+                return enriched;
+            };
+            let requested_java = selected_java_override(&instance, config);
+            let guardian_mode = GuardianMode::from_config(&config.guardian_mode);
+            let key = ReadinessInspectionKey {
+                version_id: instance.version_id.clone(),
+                requested_java: requested_java.clone(),
+                guardian_mode: guardian_mode.as_str(),
+            };
+            let readiness = readiness.entry(key).or_insert_with(|| {
+                inspect(
+                    &instance,
+                    &LaunchReadinessRequest {
+                        library_operation: readiness_authority.library_operation.clone(),
+                        library_dir: readiness_authority.library_dir.clone(),
+                        requested_java,
+                        version_id: instance.version_id.clone(),
+                        guardian_mode,
+                    },
+                )
+            });
+            apply_launch_readiness(&mut enriched, readiness);
+            enriched
+        })
+        .collect()
+}
+
+fn selected_java_override(
+    instance: &axial_config::Instance,
+    config: &axial_config::AppConfig,
+) -> String {
+    if !instance.java_path.trim().is_empty() {
+        instance.java_path.trim().to_string()
+    } else {
+        config.java_path_override.trim().to_string()
+    }
+}
+
+fn apply_launch_readiness(instance: &mut EnrichedInstance, readiness: &LaunchReadiness) {
+    if readiness.launchable {
+        instance.launchable = true;
+        instance.launch_action = LaunchActionState::launch_ready();
+        return;
+    }
+
+    let detail = readiness_blocking_message(readiness);
+    instance.launchable = false;
+    instance.status_detail = detail.clone();
+    if instance.needs_install.trim().is_empty() {
+        instance.needs_install = instance.version_id.clone();
+    }
+    instance.launch_action = if readiness_has_corrupt_managed_artifact(readiness) {
+        LaunchActionState::repair_required(detail)
+    } else if readiness_requires_launcher_install(readiness) {
+        LaunchActionState::install_required(detail)
+    } else if readiness_is_user_blocked(readiness) {
+        instance.needs_install.clear();
+        LaunchActionState::blocked(detail)
+    } else {
+        LaunchActionState::install_required(detail)
+    };
+}
+
+fn apply_blocked_launch_action(instance: &mut EnrichedInstance, detail: &str) {
+    instance.launchable = false;
+    instance.status_detail = detail.to_string();
+    instance.needs_install.clear();
+    instance.launch_action = LaunchActionState::blocked(detail.to_string());
+}
+
+fn readiness_blocking_message(readiness: &LaunchReadiness) -> String {
+    readiness
+        .reasons
+        .iter()
+        .find(|reason| reason.severity == LaunchReadinessSeverity::Blocking)
+        .or_else(|| readiness.reasons.first())
+        .map(|reason| reason.message.to_string())
+        .unwrap_or_else(|| "Version files are not ready.".to_string())
+}
+
+fn readiness_has_corrupt_managed_artifact(readiness: &LaunchReadiness) -> bool {
+    readiness.reasons.iter().any(|reason| {
+        matches!(
+            reason.id,
+            LaunchReadinessReasonId::ClientJarCorrupt
+                | LaunchReadinessReasonId::LibrariesCorrupt
+                | LaunchReadinessReasonId::AssetIndexCorrupt
+        )
+    })
+}
+
+fn readiness_requires_launcher_install(readiness: &LaunchReadiness) -> bool {
+    readiness.reasons.iter().any(|reason| {
+        matches!(
+            reason.id,
+            LaunchReadinessReasonId::VersionJsonMissing
+                | LaunchReadinessReasonId::ParentVersionMissing
+                | LaunchReadinessReasonId::IncompleteInstall
+                | LaunchReadinessReasonId::ClientJarMissing
+                | LaunchReadinessReasonId::LibrariesMissing
+                | LaunchReadinessReasonId::AssetIndexMissing
+                | LaunchReadinessReasonId::ManagedRuntimeMissing
+        )
+    })
+}
+
+fn readiness_is_user_blocked(readiness: &LaunchReadiness) -> bool {
+    readiness
+        .reasons
+        .iter()
+        .any(|reason| reason.id == LaunchReadinessReasonId::JavaOverrideMissing)
+}
+
+pub(crate) async fn handle_get_instance(
+    state: &AppState,
+    producer: &ProducerLease,
+    id: &str,
+) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
+    let instance = state.instances().get(id);
+
+    match instance {
+        Some(instance) => Ok(enrich_instance_for_state_indexed(state, producer, instance).await),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "instance not found" })),
+        )),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct DuplicateInstanceRequest {
+    pub name: Option<String>,
+}
+
+pub(crate) async fn handle_duplicate_instance_owned(
+    state: &AppState,
+    id: &str,
+    payload: Option<DuplicateInstanceRequest>,
+    handoff: RequestProducerHandoff,
+) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
+    handle_duplicate_instance_owned_with_rebuild(
+        state,
+        id,
+        payload,
+        handoff,
+        |state, foreground, producer, instance_id| async move {
+            crate::application::rebuild_registered_known_good(
+                &state,
+                &foreground,
+                &producer,
+                &instance_id,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+async fn handle_duplicate_instance_owned_with_rebuild<Rebuild, RebuildFuture>(
+    state: &AppState,
+    id: &str,
+    payload: Option<DuplicateInstanceRequest>,
+    handoff: RequestProducerHandoff,
+    rebuild: Rebuild,
+) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)>
+where
+    Rebuild: FnOnce(AppState, IntegrityForegroundLease, ProducerLease, String) -> RebuildFuture
+        + Send
+        + 'static,
+    RebuildFuture: Future<Output = Result<(), KnownGoodRebuildError>> + Send + 'static,
+{
+    let producer = state
+        .try_claim_request_producer(&handoff)
+        .map_err(instance_shutdown_error_response)?;
+    let foreground = state
+        .register_integrity_foreground()
+        .map_err(instance_shutdown_error_response)?;
+    let transaction = producer.claim_child();
+    let rebuild_owner = producer.claim_child();
+    let enrich_owner = producer.claim_child();
+    let rollback_owner = producer.claim_child();
+    let transaction_state = state.clone();
+    let source_id = id.to_string();
+    let completed = transaction.spawn_joinable(async move {
+        let foreground = foreground.wait_for_settlement().await;
+        let payload = payload.unwrap_or_default();
+        let instance = transaction_state
+            .duplicate_instance(&foreground, source_id, payload.name)
+            .await
+            .map_err(|error| {
+                instance_write_error_response(InstanceWriteOperation::Duplicate, error)
+            })?;
+        let instance_id = instance.id.clone();
+        match rebuild(
+            transaction_state.clone(),
+            foreground.retained(),
+            rebuild_owner,
+            instance_id.clone(),
+        )
+        .await
+        {
+            Ok(()) => Ok(enrich_instance_for_state_with_foreground(
+                &transaction_state,
+                &foreground,
+                &enrich_owner,
+                instance,
+            )
+            .await),
+            Err(error) => {
+                if let Err(rollback_error) = rollback_new_instance(
+                    &transaction_state,
+                    &foreground,
+                    rollback_owner,
+                    &instance_id,
+                )
+                .await
+                {
+                    error!(
+                        failure_class = instance_store_error_class(&rollback_error),
+                        "duplicate compensation rollback persistence failed"
+                    );
+                    return Err(instance_write_error_response(
+                        InstanceWriteOperation::Duplicate,
+                        rollback_error,
+                    ));
+                }
+                Err(known_good_rebuild_error_response(
+                    InstanceWriteOperation::Duplicate,
+                    error,
+                ))
+            }
+        }
+    });
+    completed
+        .await
+        .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Duplicate))?
+}
+
+#[cfg(test)]
+pub(crate) async fn handle_duplicate_instance(
+    state: &AppState,
+    id: &str,
+    payload: Option<DuplicateInstanceRequest>,
+) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
+    let request = state
+        .try_admit_request()
+        .expect("admit test duplicate request");
+    handle_duplicate_instance_owned_with_rebuild(
+        state,
+        id,
+        payload,
+        request.producer_handoff(),
+        |_, _, _, _| async { Ok(()) },
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn handle_duplicate_instance_with_rebuild<Rebuild, RebuildFuture>(
+    state: &AppState,
+    id: &str,
+    payload: Option<DuplicateInstanceRequest>,
+    handoff: RequestProducerHandoff,
+    rebuild: Rebuild,
+) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)>
+where
+    Rebuild: FnOnce(AppState, IntegrityForegroundLease, ProducerLease, String) -> RebuildFuture
+        + Send
+        + 'static,
+    RebuildFuture: Future<Output = Result<(), KnownGoodRebuildError>> + Send + 'static,
+{
+    handle_duplicate_instance_owned_with_rebuild(state, id, payload, handoff, rebuild).await
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct InstancePatch {
+    pub name: Option<String>,
+    pub version_id: Option<String>,
+    pub art_seed: Option<u32>,
+    pub max_memory_mb: Option<i32>,
+    pub min_memory_mb: Option<i32>,
+    pub java_path: Option<String>,
+    pub window_width: Option<i32>,
+    pub window_height: Option<i32>,
+    pub jvm_preset: Option<String>,
+    pub performance_mode: Option<String>,
+    pub extra_jvm_args: Option<String>,
+    pub icon: Option<String>,
+    pub accent: Option<String>,
+}
+
+pub(crate) async fn handle_update_instance_owned(
+    state: &AppState,
+    id: &str,
+    patch: InstancePatch,
+    handoff: RequestProducerHandoff,
+) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
+    let producer = state
+        .try_claim_request_producer(&handoff)
+        .map_err(instance_shutdown_error_response)?;
+    let foreground = state
+        .register_integrity_foreground()
+        .map_err(instance_shutdown_error_response)?;
+    let update = InstanceUpdate {
+        name: patch.name,
+        expected_version_id: patch.version_id,
+        art_seed: patch.art_seed,
+        max_memory_mb: patch.max_memory_mb,
+        min_memory_mb: patch.min_memory_mb,
+        java_path: patch.java_path,
+        window_width: patch.window_width,
+        window_height: patch.window_height,
+        jvm_preset: patch.jvm_preset.map(|value| {
+            normalize_create_jvm_preset(Some(&value))
+                .stored_preset()
+                .to_string()
+        }),
+        performance_mode: patch.performance_mode,
+        extra_jvm_args: patch.extra_jvm_args,
+        icon: patch.icon,
+        accent: patch.accent,
+    };
+    let transaction = producer.claim_child();
+    let enrich_owner = producer.claim_child();
+    let transaction_state = state.clone();
+    let instance_id = id.to_string();
+    transaction
+        .spawn_joinable(async move {
+            let foreground = foreground.wait_for_settlement().await;
+            let instance = transaction_state
+                .update_instance(&foreground, instance_id, update)
+                .await
+                .map_err(|error| {
+                    instance_write_error_response(InstanceWriteOperation::Update, error)
+                })?;
+            let enriched = enrich_instance_for_state_with_foreground(
+                &transaction_state,
+                &foreground,
+                &enrich_owner,
+                instance,
+            )
+            .await;
+            drop(foreground);
+            Ok(enriched)
+        })
+        .await
+        .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Update))?
+}
+
+fn redact_runtime_overrides(mut instance: EnrichedInstance) -> EnrichedInstance {
+    instance.instance.java_path.clear();
+    instance.instance.extra_jvm_args.clear();
+    instance
+}
+
+pub(crate) async fn handle_delete_instance_owned(
+    state: &AppState,
+    id: &str,
+    query: std::collections::HashMap<String, String>,
+    handoff: RequestProducerHandoff,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let producer = state
+        .try_claim_request_producer(&handoff)
+        .map_err(instance_shutdown_error_response)?;
+    let foreground = state
+        .register_integrity_foreground()
+        .map_err(instance_shutdown_error_response)?;
+    let keep_files = query.get("keep_files").is_some_and(|value| value == "true");
+    state
+        .delete_instance_owned(
+            producer.claim_child(),
+            foreground,
+            id.to_string(),
+            !keep_files,
+        )
+        .await
+        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Delete, error))?;
+    Ok(serde_json::json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
+pub(crate) async fn handle_delete_instance(
+    state: &AppState,
+    id: &str,
+    query: std::collections::HashMap<String, String>,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let request = state
+        .try_admit_request()
+        .expect("admit test delete request");
+    handle_delete_instance_owned(state, id, query, request.producer_handoff()).await
+}
+
+#[cfg(test)]
+mod tests;

@@ -72,11 +72,11 @@ export const targetInstance = computed<EnrichedInstance | null>(() => {
   const r = route.value;
   const id = r.name === 'discover' || r.name === 'content' ? r.target : undefined;
   if (!id) return null;
-  return (instances.value as EnrichedInstance[]).find((instance) => instance.id === id) ?? null;
+  return instances.value.find((instance) => instance.id === id) ?? null;
 });
 
 export const contentTargets = computed<EnrichedInstance[]>(() =>
-  (instances.value as EnrichedInstance[]).filter((instance) => instance.version_display.minecraft_label !== 'Unknown'),
+  instances.value.filter((instance) => instance.version_display.minecraft_label !== 'Unknown'),
 );
 
 export function isStaged(canonicalId: string): boolean {
@@ -120,11 +120,4 @@ export function traySelections(): ContentSelection[] {
     kind: item.kind,
     ...(item.version_id ? { version_id: item.version_id } : {}),
   }));
-}
-
-export function markInstalled(canonicalIds: string[]): void {
-  const installed = new Set(canonicalIds);
-  results.value = results.value.map((hit) =>
-    installed.has(hit.canonical_id) ? { ...hit, install_state: 'installed' } : hit,
-  );
 }

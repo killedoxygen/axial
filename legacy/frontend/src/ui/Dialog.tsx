@@ -1,0 +1,264 @@
+import type { JSX } from 'preact';
+import { signal } from '@preact/signals';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { Button, Input } from './Atoms';
+
+type DialogResult = boolean | string | null;
+type DialogButtonVariant = 'primary' | 'secondary' | 'soft' | 'ghost' | 'danger';
+
+interface DialogChoice<T extends string = string> {
+  value: T;
+  label: string;
+  variant?: DialogButtonVariant;
+}
+
+interface PromptOptions {
+  title?: string;
+  placeholder?: string;
+  confirmText?: string;
+  destructive?: boolean;
+  validate?: (value: string) => string | null;
+  normalizeInput?: (value: string) => string;
+  normalizeValue?: (value: string) => string;
+}
+
+interface DialogSpec {
+  kind: 'confirm' | 'prompt' | 'choice';
+  title?: string;
+  message: string;
+  initialValue?: string;
+  placeholder?: string;
+  confirmText?: string;
+  cancelText?: string | null;
+  destructive?: boolean;
+  choices?: DialogChoice[];
+  validate?: (value: string) => string | null;
+  normalizeInput?: (value: string) => string;
+  normalizeValue?: (value: string) => string;
+  resolve: (v: DialogResult) => void;
+}
+
+const current = signal<DialogSpec | null>(null);
+
+function cancelCurrent(): void {
+  const spec = current.value;
+  if (!spec) return;
+  spec.resolve(spec.kind === 'prompt' || spec.kind === 'choice' ? null : false);
+  current.value = null;
+}
+
+export function showConfirm(
+  message: string,
+  opts: { title?: string; confirmText?: string; cancelText?: string | null; destructive?: boolean } = {},
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    cancelCurrent();
+    current.value = {
+      kind: 'confirm',
+      title: opts.title,
+      message,
+      confirmText: opts.confirmText || 'Confirm',
+      cancelText: opts.cancelText === null ? null : opts.cancelText || 'Cancel',
+      destructive: opts.destructive,
+      resolve: (v) => resolve(v === true),
+    };
+  });
+}
+
+export function showChoice<T extends string>(
+  message: string,
+  choices: Array<DialogChoice<T>>,
+  opts: { title?: string; cancelText?: string | null } = {},
+): Promise<T | null> {
+  return new Promise((resolve) => {
+    cancelCurrent();
+    current.value = {
+      kind: 'choice',
+      title: opts.title,
+      message,
+      cancelText: opts.cancelText === null ? null : opts.cancelText || 'Cancel',
+      choices,
+      resolve: (v) => resolve(typeof v === 'string' ? (v as T) : null),
+    };
+  });
+}
+
+export function prompt(message: string, initial = '', opts: PromptOptions = {}): Promise<string | null> {
+  return new Promise((resolve) => {
+    cancelCurrent();
+    current.value = {
+      kind: 'prompt',
+      title: opts.title || message,
+      message: opts.title ? message : '',
+      initialValue: initial,
+      placeholder: opts.placeholder,
+      confirmText: opts.confirmText || 'Confirm',
+      cancelText: 'Cancel',
+      destructive: opts.destructive,
+      validate: opts.validate,
+      normalizeInput: opts.normalizeInput,
+      normalizeValue: opts.normalizeValue,
+      resolve: (v) => resolve(typeof v === 'string' ? v : null),
+    };
+  });
+}
+
+export function DialogHost(): JSX.Element | null {
+  const spec = current.value;
+  const [draft, setDraft] = useState('');
+  const [touched, setTouched] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const primaryRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const choicePrimaryRef = useRef<HTMLButtonElement>(null);
+
+  const promptError = spec?.kind === 'prompt' ? (spec.validate?.(draft) ?? null) : null;
+  const showPromptError = spec?.kind === 'prompt' && promptError !== null && (touched || draft.length > 0);
+
+  const resolveAs = (ok: boolean): void => {
+    if (!spec) return;
+    let payload: DialogResult = ok;
+    if (spec.kind === 'prompt') {
+      if (!ok) {
+        payload = null;
+      } else {
+        if (promptError) {
+          setTouched(true);
+          return;
+        }
+        payload = spec.normalizeValue ? spec.normalizeValue(draft) : draft.trim();
+      }
+    }
+    spec.resolve(payload);
+    current.value = null;
+  };
+
+  const resolveChoice = (value: string): void => {
+    if (!spec || spec.kind !== 'choice') return;
+    spec.resolve(value);
+    current.value = null;
+  };
+
+  useEffect(() => {
+    if (!spec) return;
+    if (spec.kind === 'prompt') {
+      setDraft(spec.initialValue || '');
+      setTouched(false);
+    }
+  }, [spec]);
+
+  useEffect(() => {
+    if (!spec) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (spec.kind === 'choice') {
+      window.requestAnimationFrame(() => {
+        (choicePrimaryRef.current || dialogRef.current?.querySelector<HTMLButtonElement>('button'))?.focus();
+      });
+    } else if (spec.kind !== 'prompt') {
+      window.requestAnimationFrame(() => primaryRef.current?.focus());
+    }
+    const dialog = dialogRef.current;
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        resolveAs(false);
+        return;
+      }
+      if (e.key !== 'Tab' || !dialog) return;
+      const focusable = Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+      if (focusable.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable[focusable.length - 1]!;
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    dialog?.addEventListener('keydown', onKey);
+    return () => {
+      dialog?.removeEventListener('keydown', onKey);
+      previousFocus?.focus();
+    };
+  }, [spec]);
+
+  if (!spec) return null;
+
+  return (
+    <div
+      class="cp-dialog-overlay"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) resolveAs(false);
+      }}
+    >
+      <div
+        ref={dialogRef}
+        class={`cp-dialog${spec.kind === 'choice' ? ' cp-dialog--choice' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={spec.title ? 'cp-dlg-title' : undefined}
+      >
+        {spec.title && (
+          <h2 id="cp-dlg-title" class="cp-dialog-title">
+            {spec.title}
+          </h2>
+        )}
+        {spec.message && <p class="cp-dialog-body">{spec.message}</p>}
+        {spec.kind === 'prompt' && (
+          <>
+            <Input
+              value={draft}
+              onChange={(value) => {
+                setTouched(true);
+                setDraft(spec.normalizeInput ? spec.normalizeInput(value) : value);
+              }}
+              placeholder={spec.placeholder}
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') resolveAs(true);
+              }}
+            />
+            {showPromptError && <div class="cp-dialog-error">{promptError}</div>}
+          </>
+        )}
+        <div class={`cp-dialog-actions${spec.kind === 'choice' ? ' cp-dialog-actions--choice' : ''}`}>
+          {spec.cancelText && (
+            <Button buttonRef={cancelRef} variant="ghost" onClick={() => resolveAs(false)}>
+              {spec.cancelText}
+            </Button>
+          )}
+          {spec.kind === 'choice' ? (
+            spec.choices?.map((choice, index) => (
+              <Button
+                key={choice.value}
+                buttonRef={index === 0 ? choicePrimaryRef : undefined}
+                variant={choice.variant || 'secondary'}
+                onClick={() => resolveChoice(choice.value)}
+              >
+                {choice.label}
+              </Button>
+            ))
+          ) : (
+            <Button
+              buttonRef={primaryRef}
+              variant={spec.destructive ? 'danger' : 'primary'}
+              disabled={spec.kind === 'prompt' && promptError !== null}
+              onClick={() => resolveAs(true)}
+            >
+              {spec.confirmText}
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

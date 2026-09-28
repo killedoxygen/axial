@@ -53,6 +53,7 @@ export interface CommandViewModel {
 }
 
 export interface AuthStatus {
+  selection_revision: number;
   launch_auth_mode: LaunchAuthMode;
   mode: string;
   username: string;
@@ -100,6 +101,9 @@ export interface SavedSkinsData {
 
 export interface LauncherAccount extends MinecraftAuthReadiness {
   account_id: string;
+  account_revision: number;
+  profile_revision: number;
+  credential_revision: number;
   kind: LauncherAccountKind;
   display_name: string;
   active: boolean;
@@ -118,6 +122,9 @@ export interface LauncherAccount extends MinecraftAuthReadiness {
 }
 
 export interface LauncherAccountsData {
+  revision: number;
+  selection_revision: number;
+  launch_auth_mode: LaunchAuthMode;
   active_account_id: string | null;
   accounts: LauncherAccount[];
 }
@@ -136,18 +143,10 @@ export interface StagedSkinUpload {
   detectingVariant: boolean;
   normalizeStatus: 'checking' | 'ready' | 'error';
   normalizeError?: string;
-  textureKey?: string;
-  originalWidth?: number;
-  originalHeight?: number;
-  normalizedByteSize?: number;
-  applyAfterSave: boolean;
 }
 
 export interface SkinNormalizeMetadata {
   textureKey: string;
   variantSuggestion: SkinVariant;
-  originalWidth: number;
-  originalHeight: number;
-  normalizedByteSize: number;
   normalizedDataUrl?: string;
 }

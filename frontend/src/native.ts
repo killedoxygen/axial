@@ -1,14 +1,11 @@
+import { dtoRecord, dtoString, isDtoRecord } from './dto-contract';
+
 interface TauriInvokeBinding {
-  invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T>;
+  invoke(cmd: string, args?: Record<string, unknown>): Promise<unknown>;
 }
 
 interface TauriEventBinding {
-  listen(eventName: string, callback: (event: { payload: any }) => void): Promise<() => void>;
-}
-
-interface TauriDialogBinding {
-  open(options?: Record<string, unknown>): Promise<string | string[] | null>;
-  message(message: string, options?: Record<string, unknown>): Promise<void>;
+  listen(eventName: string, callback: (event: { payload: unknown }) => void): Promise<() => void>;
 }
 
 interface TauriOpenerBinding {
@@ -18,7 +15,6 @@ interface TauriOpenerBinding {
 interface TauriBinding {
   core?: TauriInvokeBinding;
   event?: TauriEventBinding;
-  dialog?: TauriDialogBinding;
   opener?: TauriOpenerBinding;
 }
 
@@ -29,6 +25,7 @@ declare global {
 }
 
 function getTauriBinding(): TauriBinding | null {
+  if (typeof window === 'undefined') return null;
   return window.__TAURI__ ?? null;
 }
 
@@ -36,8 +33,10 @@ export type NativeDragDropType = 'enter' | 'over' | 'drop' | 'leave';
 
 export interface NativeDragDropPayload {
   type: NativeDragDropType;
-  paths: string[];
+  eligible: boolean;
+  token: string | null;
   position: { x: number; y: number } | null;
+  error: string | null;
 }
 
 export interface NativeMicrosoftSignInResult {
@@ -53,6 +52,24 @@ export function isTauriRuntime(): boolean {
 
 export function hasNativeDesktopRuntime(): boolean {
   return isTauriRuntime();
+}
+
+export async function pickNativeImportProfile(): Promise<unknown> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) throw new Error('Instance import is available in the desktop app.');
+  return tauri.core.invoke('pick_import_profile');
+}
+
+export async function pickNativeImportInstanceSource(fingerprint: string, legacyId: string): Promise<unknown> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) throw new Error('Instance import is available in the desktop app.');
+  return tauri.core.invoke('pick_import_instance_source', { fingerprint, legacyId });
+}
+
+export async function forgetNativeImportProfile(): Promise<void> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return;
+  await tauri.core.invoke('forget_import_profile');
 }
 
 export type DesktopPlatform = 'browser' | 'linux' | 'macos' | 'unknown' | 'windows';
@@ -79,23 +96,18 @@ function desktopChromeModeFromPayload(value: unknown): DesktopChromeMode {
 }
 
 function desktopChromeFromPayload(payload: unknown): NativeDesktopChrome {
-  if (!payload || typeof payload !== 'object') return browserDesktopChrome;
-  const record = payload as { platform?: unknown; chrome_mode?: unknown };
+  if (!isDtoRecord(payload)) return browserDesktopChrome;
   return {
-    platform: desktopPlatformFromPayload(record.platform),
-    chrome_mode: desktopChromeModeFromPayload(record.chrome_mode),
+    platform: desktopPlatformFromPayload(payload.platform),
+    chrome_mode: desktopChromeModeFromPayload(payload.chrome_mode),
   };
 }
 
 async function getNativeDesktopChrome(): Promise<NativeDesktopChrome> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return browserDesktopChrome;
-  const payload = await tauri.core.invoke<unknown>('desktop_chrome');
+  const payload = await tauri.core.invoke('desktop_chrome');
   return desktopChromeFromPayload(payload);
-}
-
-export function currentDesktopChrome(): NativeDesktopChrome {
-  return desktopChrome;
 }
 
 export function hasCustomWindowControls(): boolean {
@@ -132,10 +144,38 @@ export function nativeLaunchLogEventName(sessionId: string): string {
 }
 
 export const nativeDesktopCloseBlockedEventName = 'axial:desktop:close-blocked';
+export const nativePreferencesEventName = 'axial:desktop:preferences';
+
+export interface NativePreferencesRequest {
+  request_id: string;
+  phase: 'flush' | 'discard' | 'release';
+}
+
+export function nativePreferencesRequest(value: unknown): NativePreferencesRequest {
+  const record = dtoRecord(value, 'Desktop preference request');
+  const request_id = dtoString(record.request_id, 'Desktop preference request id');
+  if (!request_id || !['flush', 'discard', 'release'].includes(String(record.phase))) {
+    throw new Error('Invalid desktop preference request.');
+  }
+  return { request_id, phase: record.phase as NativePreferencesRequest['phase'] };
+}
+
+export async function pendingNativePreferences(): Promise<NativePreferencesRequest | null> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) throw new Error('Desktop preference coordination is unavailable.');
+  const value = await tauri.core.invoke('pending_interface_preferences');
+  return value === null ? null : nativePreferencesRequest(value);
+}
+
+export async function completeNativePreferences(requestId: string, saved: boolean): Promise<void> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) throw new Error('Desktop preference coordination is unavailable.');
+  await tauri.core.invoke('complete_interface_preferences', { requestId, saved });
+}
 
 export async function onNativeEvent(
   eventName: string,
-  callback: (data: any) => void,
+  callback: (data: unknown) => void,
 ): Promise<{ close(): void } | null> {
   const tauri = getTauriBinding();
   if (!tauri?.event) return null;
@@ -151,15 +191,24 @@ export async function onNativeEvent(
   };
 }
 
-function nativeDragDropPayload(type: NativeDragDropType, payload: any): NativeDragDropPayload {
-  const paths = Array.isArray(payload?.paths)
-    ? payload.paths.filter((path: unknown): path is string => typeof path === 'string')
-    : [];
-  const x = payload?.position?.x;
-  const y = payload?.position?.y;
+function nativeDragDropPayload(payload: unknown): NativeDragDropPayload | null {
+  if (!isDtoRecord(payload)) return null;
+  const record = payload;
+  const type = record.type;
+  if (type !== 'enter' && type !== 'over' && type !== 'drop' && type !== 'leave') return null;
+  const rawPosition = record.position;
+  const positionRecord = isDtoRecord(rawPosition) ? rawPosition : null;
+  const x = positionRecord?.x;
+  const y = positionRecord?.y;
   const position =
     typeof x === 'number' && typeof y === 'number' && Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
-  return { type, paths, position };
+  return {
+    type,
+    eligible: record.eligible === true,
+    token: typeof record.token === 'string' && record.token ? record.token : null,
+    position,
+    error: typeof record.error === 'string' && record.error ? record.error : null,
+  };
 }
 
 export async function onNativeDragDrop(
@@ -168,16 +217,14 @@ export async function onNativeDragDrop(
   const tauri = getTauriBinding();
   if (!tauri?.event) return null;
 
-  const unsubscribe = await Promise.all([
-    tauri.event.listen('tauri://drag-enter', (event) => callback(nativeDragDropPayload('enter', event.payload))),
-    tauri.event.listen('tauri://drag-over', (event) => callback(nativeDragDropPayload('over', event.payload))),
-    tauri.event.listen('tauri://drag-drop', (event) => callback(nativeDragDropPayload('drop', event.payload))),
-    tauri.event.listen('tauri://drag-leave', (event) => callback(nativeDragDropPayload('leave', event.payload))),
-  ]);
+  const unsubscribe = await tauri.event.listen('axial:desktop:skin-drag', (event) => {
+    const payload = nativeDragDropPayload(event.payload);
+    if (payload) callback(payload);
+  });
 
   return {
     close(): void {
-      unsubscribe.forEach((close) => close());
+      unsubscribe();
     },
   };
 }
@@ -185,19 +232,69 @@ export async function onNativeDragDrop(
 export async function getNativeAppVersion(): Promise<string | null> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return null;
-  return tauri.core.invoke<string>('app_version');
+  const value = await tauri.core.invoke('app_version');
+  if (typeof value !== 'string' || !value.trim()) throw new Error('Native app version response was invalid.');
+  return value;
 }
 
-export async function getNativeApiBaseUrl(): Promise<string | null> {
+export interface NativeApiTransportBootstrap {
+  base_url: string;
+  capability: string;
+}
+
+export async function getNativeApiTransportBootstrap(): Promise<NativeApiTransportBootstrap | null> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return null;
-  return tauri.core.invoke<string>('api_base_url');
+  const value = await tauri.core.invoke('api_transport_bootstrap');
+  const record = dtoRecord(value, 'Native API transport bootstrap');
+  const baseUrl = dtoString(record.base_url, 'Native API transport base URL');
+  const capability = dtoString(record.capability, 'Native API transport capability');
+  if (!baseUrl || !capability) {
+    throw new Error('Native API transport bootstrap was invalid.');
+  }
+  return { base_url: baseUrl, capability };
 }
 
 export async function signInWithMicrosoft(): Promise<NativeMicrosoftSignInResult | undefined> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return undefined;
-  return tauri.core.invoke<NativeMicrosoftSignInResult>('microsoft_sign_in');
+  const value = await tauri.core.invoke('microsoft_sign_in');
+  const record = dtoRecord(value, 'Native Microsoft sign-in');
+  if (record.status !== 'authenticated' && record.status !== 'cancelled') {
+    throw new Error('Native Microsoft sign-in response was invalid.');
+  }
+  for (const key of ['login_id', 'profile_name'] as const) {
+    if (record[key] !== undefined && record[key] !== null && typeof record[key] !== 'string') {
+      throw new Error('Native Microsoft sign-in response was invalid.');
+    }
+  }
+  if (
+    record.owns_minecraft_java !== undefined &&
+    record.owns_minecraft_java !== null &&
+    typeof record.owns_minecraft_java !== 'boolean'
+  ) {
+    throw new Error('Native Microsoft sign-in response was invalid.');
+  }
+  const loginId =
+    record.login_id == null ? (record.login_id === null ? null : undefined) : dtoString(record.login_id, 'Login id');
+  const profileName =
+    record.profile_name == null
+      ? record.profile_name === null
+        ? null
+        : undefined
+      : dtoString(record.profile_name, 'Profile name');
+  const ownsMinecraftJava =
+    record.owns_minecraft_java == null
+      ? record.owns_minecraft_java === null
+        ? null
+        : undefined
+      : record.owns_minecraft_java;
+  return {
+    status: record.status,
+    login_id: loginId,
+    profile_name: profileName,
+    owns_minecraft_java: ownsMinecraftJava,
+  };
 }
 
 export async function requestNativeAppRestart(): Promise<boolean> {
@@ -207,25 +304,15 @@ export async function requestNativeAppRestart(): Promise<boolean> {
   return true;
 }
 
-export async function browseDirectory(defaultPath = ''): Promise<string | null> {
+export async function requestNativeAppReset(): Promise<boolean> {
   const tauri = getTauriBinding();
-  if (!tauri?.dialog) return null;
-  const result = await tauri.dialog.open({
-    directory: true,
-    defaultPath,
-    multiple: false,
-  });
-
-  if (Array.isArray(result)) return result[0] ?? null;
-  return result;
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('app_reset');
+  return true;
 }
 
 function nativeSkinFileFromPayload(payload: unknown): File {
-  if (!payload || typeof payload !== 'object') {
-    throw new Error('Native skin picker returned an invalid file.');
-  }
-
-  const record = payload as { name?: unknown; bytes?: unknown };
+  const record = dtoRecord(payload, 'Native skin picker');
   if (!Array.isArray(record.bytes)) {
     throw new Error('Native skin picker returned an invalid file.');
   }
@@ -245,25 +332,16 @@ function nativeSkinFileFromPayload(payload: unknown): File {
 
 export async function pickNativeSkinFile(): Promise<File | null | undefined> {
   const tauri = getTauriBinding();
-  if (!tauri?.dialog || !tauri.core) return undefined;
-
-  const result = await tauri.dialog.open({
-    directory: false,
-    multiple: false,
-    filters: [{ name: 'PNG skin', extensions: ['png'] }],
-  });
-
-  const path = Array.isArray(result) ? result[0] : result;
-  if (!path) return null;
-
-  return readNativeSkinFile(path);
+  if (!tauri?.core) return undefined;
+  const payload = await tauri.core.invoke('pick_skin_file');
+  return payload === null ? null : nativeSkinFileFromPayload(payload);
 }
 
-export async function readNativeSkinFile(path: string): Promise<File | undefined> {
+export async function consumeNativeSkinDrop(token: string): Promise<File | undefined> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return undefined;
 
-  const payload = await tauri.core.invoke<unknown>('read_skin_file', { path });
+  const payload = await tauri.core.invoke('consume_skin_drop', { token });
   return nativeSkinFileFromPayload(payload);
 }
 
@@ -286,13 +364,6 @@ export async function openExternalURL(url: string): Promise<void> {
   }
 
   window.open(externalUrl.href, '_blank', 'noopener,noreferrer');
-}
-
-export async function showNativeNotice(title: string, message: string): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.dialog) return false;
-  await tauri.dialog.message(message, { title, kind: 'info' });
-  return true;
 }
 
 export async function startNativeInstallEvents(installId: string): Promise<boolean> {
@@ -326,7 +397,9 @@ export async function windowMinimize(): Promise<boolean> {
 export async function windowToggleMaximize(): Promise<boolean | null> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return null;
-  return tauri.core.invoke<boolean>('window_toggle_maximize');
+  const value = await tauri.core.invoke('window_toggle_maximize');
+  if (typeof value !== 'boolean') throw new Error('Native maximize response was invalid.');
+  return value;
 }
 
 export async function windowClose(): Promise<boolean> {
@@ -339,7 +412,9 @@ export async function windowClose(): Promise<boolean> {
 export async function windowIsMaximized(): Promise<boolean> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return false;
-  return tauri.core.invoke<boolean>('window_is_maximized');
+  const value = await tauri.core.invoke('window_is_maximized');
+  if (typeof value !== 'boolean') throw new Error('Native maximize state was invalid.');
+  return value;
 }
 
 export async function windowStartDragging(): Promise<boolean> {

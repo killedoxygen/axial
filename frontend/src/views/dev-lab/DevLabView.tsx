@@ -7,10 +7,11 @@ import { PRESET_HUES } from '../../state';
 import {
   bootstrapState,
   config,
+  devMode,
   featureFlags,
   featureFlagsLoadState,
   launchState,
-  runningSessions,
+  launchSessions,
   systemInfo,
   updateInfo,
 } from '../../store';
@@ -132,7 +133,7 @@ function InspectorPanel(): JSX.Element {
     { key: 'activeDownload', title: 'activeDownload', value: activeDownload.value },
     { key: 'downloadQueue', title: 'downloadQueue', value: downloadQueue.value },
     { key: 'launchState', title: 'launchState', value: launchState.value },
-    { key: 'runningSessions', title: 'runningSessions', value: runningSessions.value },
+    { key: 'launchSessions', title: 'launchSessions', value: launchSessions.value },
     { key: 'updateInfo', title: 'updateInfo', value: updateInfo.value },
     { key: 'route', title: 'route', value: route.value, open: true },
   ];
@@ -224,8 +225,9 @@ function PlaygroundPanel(): JSX.Element {
   );
 }
 
-export function DevLabView(): JSX.Element {
+export function DevLabView(): JSX.Element | null {
   const [tab, setTab] = useState<LabTab>('flags');
+  const available = __AXIAL_ENABLE_DEV_LAB__ && devMode.value;
   const inspectorAvailable = flagEnabled('dev.state-inspector');
   const activeTab = tab === 'inspector' && !inspectorAvailable ? 'flags' : tab;
 
@@ -235,12 +237,14 @@ export function DevLabView(): JSX.Element {
   };
 
   useEffect(() => {
-    loadFlags();
-  }, []);
+    if (available) loadFlags();
+  }, [available]);
 
   useEffect(() => {
     if (tab === 'inspector' && !inspectorAvailable) setTab('flags');
   }, [tab, inspectorAvailable]);
+
+  if (!available) return null;
 
   return (
     <div class="cp-view-page cp-dev-lab">

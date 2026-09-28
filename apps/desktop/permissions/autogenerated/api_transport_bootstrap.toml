@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-api-transport-bootstrap"
+description = "Enables the api_transport_bootstrap command without any pre-configured scope."
+commands.allow = ["api_transport_bootstrap"]
+
+[[permission]]
+identifier = "deny-api-transport-bootstrap"
+description = "Denies the api_transport_bootstrap command without any pre-configured scope."
+commands.deny = ["api_transport_bootstrap"]

@@ -1,31 +1,13 @@
 import { batch } from '@preact/signals';
-import {
-  instances,
-  versions,
-  config,
-  systemInfo,
-  devMode,
-  catalog,
-  selectedInstanceId,
-  lastInstanceId,
-  launchState,
-  runningSessions,
-  launchNotices,
-  currentPage,
-  searchQuery,
-  sidebarFilter,
-  logLines,
-} from './store';
-import type { RunningSession, LaunchNotice } from './types-launch';
-import type { Version, Catalog } from './types-version';
-import type { Instance } from './types-instance';
-import type { Config, SystemInfo } from './types-settings';
-import type { Page } from './types-ui';
+import { instances, config, selectedInstanceId, launchState, launchSessions, launchNotices } from './store';
+import type { LaunchSession, LaunchNotice, LaunchStatusUpdate } from './types-launch';
+import type { EnrichedInstance } from './types-instance';
+import type { Config } from './types-settings';
 import type { LaunchStatusViewModel } from './types-launch';
+import { launchStatusUpdate } from './launch-response-adapters';
 
 export function selectInstance(id: string | null): void {
   selectedInstanceId.value = id;
-  currentPage.value = 'launcher';
 }
 
 export function startLaunch(instanceId: string): void {
@@ -61,10 +43,10 @@ export function updateLaunchPrepView(instanceId: string, viewModel: LaunchStatus
   };
 }
 
-export function confirmLaunch(instanceId: string, session: RunningSession): void {
+export function confirmLaunch(instanceId: string, session: LaunchSession): void {
   batch(() => {
     launchState.value = { status: 'idle' };
-    runningSessions.value = { ...runningSessions.value, [instanceId]: session };
+    launchSessions.value = { ...launchSessions.value, [instanceId]: session };
   });
 }
 
@@ -73,18 +55,44 @@ export function endLaunchPrep(): void {
 }
 
 export function endSession(instanceId: string): void {
-  const next = { ...runningSessions.value };
+  const next = { ...launchSessions.value };
   delete next[instanceId];
-  runningSessions.value = next;
+  launchSessions.value = next;
 }
 
-export function updateRunningSessionState(instanceId: string, patch: Partial<RunningSession>): void {
-  const current = runningSessions.value[instanceId];
+export function endSessionIfCurrent(instanceId: string, sessionId: string): boolean {
+  if (launchSessions.value[instanceId]?.sessionId !== sessionId) return false;
+  endSession(instanceId);
+  return true;
+}
+
+export function updateLaunchSessionState(instanceId: string, patch: Partial<LaunchSession>): void {
+  const current = launchSessions.value[instanceId];
   if (!current) return;
-  runningSessions.value = {
-    ...runningSessions.value,
+  launchSessions.value = {
+    ...launchSessions.value,
     [instanceId]: { ...current, ...patch },
   };
+}
+
+function applyLaunchStatusUpdate(instanceId: string, sessionId: string, update: LaunchStatusUpdate): boolean {
+  const current = launchSessions.value[instanceId];
+  if (!current || current.sessionId !== sessionId || update.revision <= current.statusRevision) return false;
+  launchSessions.value = {
+    ...launchSessions.value,
+    [instanceId]: {
+      ...current,
+      viewModel: update.viewModel,
+      statusRevision: update.revision,
+    },
+  };
+  return true;
+}
+
+export function convergeLaunchStatus(instanceId: string, sessionId: string, value: unknown): LaunchStatusUpdate | null {
+  const update = launchStatusUpdate(value, sessionId);
+  if (!update || !applyLaunchStatusUpdate(instanceId, sessionId, update)) return null;
+  return update;
 }
 
 export function setLaunchNotice(instanceId: string, notice: LaunchNotice): void {
@@ -98,42 +106,19 @@ export function clearLaunchNotice(instanceId: string): void {
   launchNotices.value = next;
 }
 
-export function setVersions(v: Version[]): void {
-  versions.value = v;
-}
-export function setInstances(i: Instance[]): void {
-  instances.value = i;
-}
-export function setConfig(c: Config): void {
+export function setConfig(c: Config): boolean {
+  const current = config.value;
+  if (
+    current &&
+    (c.revision < current.revision || c.account_selection_revision < current.account_selection_revision)
+  ) {
+    return false;
+  }
   config.value = c;
-}
-export function setSystemInfo(s: SystemInfo): void {
-  systemInfo.value = s;
-}
-export function setDevMode(d: boolean): void {
-  devMode.value = d;
-}
-export function setCatalog(c: Catalog | null): void {
-  catalog.value = c;
-}
-export function setLastInstanceId(id: string | null): void {
-  lastInstanceId.value = id;
+  return true;
 }
 
-export function navigate(page: Page): void {
-  currentPage.value = page;
-}
-export function setSearch(q: string): void {
-  searchQuery.value = q;
-}
-export function setFilter(f: string): void {
-  sidebarFilter.value = f;
-}
-export function setLogLines(n: number): void {
-  logLines.value = n;
-}
-
-export function addInstance(inst: Instance): void {
+export function addInstance(inst: EnrichedInstance): void {
   instances.value = [...instances.value, inst];
 }
 
@@ -144,6 +129,6 @@ export function removeInstance(id: string): void {
   });
 }
 
-export function updateInstanceInList(updated: Instance): void {
+export function updateInstanceInList(updated: EnrichedInstance): void {
   instances.value = instances.value.map((i) => (i.id === updated.id ? updated : i));
 }

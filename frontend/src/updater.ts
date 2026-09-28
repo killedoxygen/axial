@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { local, saveLocalState } from './state';
+import { local, saveLocalState, canEditPreferences } from './state';
 import { api } from './api';
 import { toast } from './toast';
 import { hasNativeDesktopRuntime, openExternalURL, requestNativeAppRestart } from './native';
@@ -8,6 +8,7 @@ import { activeDownload, downloadQueue } from './machines/downloads';
 import { Sound } from './sound';
 import { idleUpdateFlow, type UpdateFlowPhase, type UpdateFlowState, type UpdateInfo } from './types-update';
 import { errMessage } from './utils';
+import { dtoEnum, dtoNumber, dtoRecord, dtoString } from './dto-contract';
 
 const AUTO_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const AUTO_CHECK_DELAY_MS = 1600;
@@ -35,6 +36,7 @@ function updaterSurfaceAvailable(): boolean {
 }
 
 function stampUpdateCheck(): void {
+  if (!canEditPreferences()) return;
   local.lastUpdateCheckAt = new Date().toISOString();
   saveLocalState();
 }
@@ -64,6 +66,7 @@ export function canInstallUpdateInApp(): boolean {
 }
 
 export function dismissAvailableUpdate(): void {
+  if (!canEditPreferences()) return;
   const info = updateInfo.value;
   if (!info?.available) return;
   local.dismissedUpdateVersion = info.latest_version;
@@ -137,18 +140,45 @@ export async function restartDesktopApp(): Promise<void> {
   }
 }
 
-function updateFlowFromResponse(res: unknown): UpdateFlowState {
-  const record = (res ?? {}) as Partial<Record<keyof UpdateFlowState, unknown>>;
-  const phases: UpdateFlowPhase[] = ['idle', 'downloading', 'ready', 'applying', 'restart-pending', 'failed'];
-  const phase = phases.includes(record.phase as UpdateFlowPhase) ? (record.phase as UpdateFlowPhase) : 'idle';
+export function updateFlowFromResponse(res: unknown): UpdateFlowState {
+  const record = dtoRecord(res, 'Update flow');
   return {
-    phase,
-    version: typeof record.version === 'string' ? record.version : '',
-    received_bytes: typeof record.received_bytes === 'number' ? record.received_bytes : 0,
-    total_bytes: typeof record.total_bytes === 'number' ? record.total_bytes : null,
-    percent: typeof record.percent === 'number' ? record.percent : null,
-    message: typeof record.message === 'string' ? record.message : '',
+    phase: dtoEnum(record.phase, 'Update flow phase', [
+      'idle',
+      'downloading',
+      'ready',
+      'applying',
+      'restart-pending',
+      'failed',
+    ] as const),
+    version: dtoString(record.version, 'Update flow version'),
+    received_bytes: dtoNumber(record.received_bytes, 'Update received bytes'),
+    total_bytes: record.total_bytes == null ? null : dtoNumber(record.total_bytes, 'Update total bytes'),
+    percent: record.percent == null ? null : dtoNumber(record.percent, 'Update percent'),
+    message: dtoString(record.message, 'Update message'),
   };
+}
+
+export function updateInfoResponse(value: unknown): UpdateInfo {
+  const record = dtoRecord(value, 'Update check');
+  return {
+    current_version: dtoString(record.current_version, 'Current version'),
+    latest_version: dtoString(record.latest_version, 'Latest version'),
+    available: typeof record.available === 'boolean' ? record.available : invalidUpdateInfo(),
+    platform: dtoString(record.platform, 'Update platform'),
+    arch: dtoString(record.arch, 'Update architecture'),
+    kind: dtoEnum(record.kind, 'Update kind', ['none', 'release-page', 'release-asset'] as const),
+    install_mode: dtoEnum(record.install_mode, 'Update install mode', ['in-app', 'external'] as const),
+    notes_url: dtoString(record.notes_url, 'Update notes URL'),
+    action_url: dtoString(record.action_url, 'Update action URL'),
+    checksum_url: record.checksum_url == null ? null : dtoString(record.checksum_url, 'Update checksum URL'),
+    action_label: dtoString(record.action_label, 'Update action label'),
+    checked_at: dtoString(record.checked_at, 'Update check time'),
+  };
+}
+
+function invalidUpdateInfo(): never {
+  throw new Error('Update check response was invalid.');
 }
 
 function announceUpdateFlowTransition(previous: UpdateFlowState, next: UpdateFlowState): void {
@@ -194,6 +224,7 @@ async function pollUpdateFlow(): Promise<void> {
   try {
     const res = await api('GET', '/update/flow');
     setUpdateFlow(updateFlowFromResponse(res));
+    await restartInstalledUpdate();
   } catch {}
   if (updateFlowPollActive(updateFlow.value.phase)) scheduleUpdateFlowPoll();
 }
@@ -244,6 +275,15 @@ export async function applyUpdateAndRestart(): Promise<void> {
     void pollUpdateFlow();
     return;
   }
+  if (updateFlowPollActive(updateFlow.value.phase)) {
+    scheduleUpdateFlowPoll();
+    return;
+  }
+  await restartInstalledUpdate();
+}
+
+async function restartInstalledUpdate(): Promise<void> {
+  if (updateFlow.value.phase !== 'restart-pending' || updateRestartRequested.value) return;
   if (!hasNativeDesktopRuntime()) {
     toast('Update applied. Restart Axial to finish.');
     return;
@@ -261,11 +301,10 @@ export async function checkForUpdates(options: { force?: boolean; silent?: boole
   updateCheckState.value = 'checking';
   const request = (async () => {
     try {
-      const res = await api('GET', force ? '/update?force=1' : '/update');
-      if (res.error) throw new Error(res.error);
+      const res = updateInfoResponse(await api('GET', force ? '/update?force=1' : '/update'));
       if (checkSeq === pendingCheckSeq) {
         updateInfo.value = res;
-        if (res.available && local.dismissedUpdateVersion && local.dismissedUpdateVersion !== res.latest_version) {
+        if (canEditPreferences() && res.available && local.dismissedUpdateVersion && local.dismissedUpdateVersion !== res.latest_version) {
           local.dismissedUpdateVersion = '';
         }
         updateCheckState.value = 'ready';

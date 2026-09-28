@@ -411,17 +411,34 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   min-width: 0;
 }
 
-.cp-worlds-empty-svg {
+.cp-worlds-empty-art {
+  position: relative;
   display: block;
   width: 132px;
-  height: auto;
+  aspect-ratio: 180 / 172.3;
   margin-bottom: 4px;
-  color: var(--text-mute);
   user-select: none;
   pointer-events: none;
 }
-.cp-worlds-empty-accent {
-  stroke: var(--accent);
+.cp-worlds-empty-art::before,
+.cp-worlds-empty-art::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--text-mute);
+  -webkit-mask-image: url('worlds-empty-base.svg');
+  mask-image: url('worlds-empty-base.svg');
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+.cp-worlds-empty-art::after {
+  background: var(--accent);
+  -webkit-mask-image: url('worlds-empty-accent.svg');
+  mask-image: url('worlds-empty-accent.svg');
 }
 .cp-worlds-empty-actions {
   margin-top: 14px;
@@ -501,13 +518,6 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.55;
-}
-.cp-log-line--compact {
-  grid-template-columns: 38px minmax(0, 1fr);
-  min-height: 17px;
-  color: var(--text-dim);
-  font-size: 11.5px;
-  line-height: 1.35;
 }
 .cp-log-line-label {
   display: inline-flex;

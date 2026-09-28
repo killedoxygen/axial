@@ -1,5 +1,6 @@
 import type { LaunchActionState } from './types-launch';
 import type { InstancePerformanceMode } from './types-performance';
+import type { InstallQueueInstallItemViewModel } from './types-install';
 
 export interface Instance {
   id: string;
@@ -37,72 +38,18 @@ export interface EnrichedInstance extends Instance {
   launch_action: LaunchActionState;
   status_detail?: string;
   needs_install?: string;
+  install_target?: InstallQueueInstallItemViewModel | null;
   java_major?: number;
   saves_count: number;
   mods_count: number;
   resource_count: number;
   shader_count: number;
+  counts_available?: boolean;
 }
 
-export interface WorldInfo {
-  name: string;
-  size: number;
-  last_played?: string;
-}
-
-export interface SharedDataInfo {
-  name: string;
-  count: number;
-  size: number;
-}
-
-export interface VersionInfo {
-  id: string;
-  folder_size: number;
-  dependents: string[];
-  worlds: WorldInfo[];
-  shared_data: SharedDataInfo[];
-}
-
-export interface InstanceWorld {
-  name: string;
-  size: number;
-  modified_at: string;
-}
-
-export interface InstanceMod {
-  name: string;
-  size: number;
-  modified_at: string;
-  enabled: boolean;
-}
-
-export interface InstanceScreenshot {
-  name: string;
-  size: number;
-  modified_at: string;
-}
-
-export interface InstanceLogFile {
-  name: string;
-  size: number;
-  modified_at: string;
-}
-
-export interface InstanceResourceSummary {
-  worlds: InstanceWorld[];
-  mods: InstanceMod[];
-  screenshots: InstanceScreenshot[];
-  logs: InstanceLogFile[];
-  worlds_count: number;
-  mods_count: number;
-  screenshots_count: number;
-  logs_count: number;
-}
-
-export interface InstanceLogTail {
-  name: string;
-  size: number;
-  truncated: boolean;
-  text: string;
-}
+export type { InstanceWorldInfo as InstanceWorld } from './generated/InstanceWorldInfo';
+export type { InstanceModInfo as InstanceMod } from './generated/InstanceModInfo';
+export type { InstanceScreenshotInfo as InstanceScreenshot } from './generated/InstanceScreenshotInfo';
+export type { InstanceLogInfo as InstanceLogFile } from './generated/InstanceLogInfo';
+export type { InstanceResourcesResponse as InstanceResourceSummary } from './generated/InstanceResourcesResponse';
+export type { InstanceLogTailResponse as InstanceLogTail } from './generated/InstanceLogTailResponse';

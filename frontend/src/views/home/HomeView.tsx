@@ -5,8 +5,9 @@ import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
 import { InstanceGlyph, guardedInstanceHue } from '../../ui/InstanceVisual';
 import { navigate, openCreate } from '../../ui-state';
-import { config, instances, runningSessions, versionById } from '../../store';
+import { config, instances, launchSessions, versionById } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../../launch-presenters';
 import { openInstanceContextMenu } from '../instance/instance-menu';
 import { useTheme } from '../../hooks/use-theme';
 import type { EnrichedInstance } from '../../types-instance';
@@ -41,12 +42,22 @@ const HOME_LIBRARY_CARD_LIMIT = 14;
 function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const theme = useTheme();
   const version = versionById(inst.version_id);
-  const running = !!runningSessions.value[inst.id];
+  const session = launchSessions.value[inst.id];
+  const playing = launchSessionIsPlaying(session);
+  const sessionLabel = launchSessionActivityLabel(session);
   const install = instanceInstallStatus(inst, version);
   const installing = install.installing;
   const installBadge = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
+  const launchAction = inst.launch_action;
+  const actionIcon =
+    launchAction.primary_action === 'launch'
+      ? 'play'
+      : launchAction.primary_action === 'install'
+        ? 'download'
+        : 'alert';
+  const actionLabel = launchAction.primary_action === 'launch' ? 'Play' : launchAction.label;
   const mods = inst.mods_count ?? 0;
-  const showModsCount = inst.version_display.supports_mods;
+  const showModsCount = inst.version_display.supports_mods && inst.counts_available === true;
   const open = (): void => navigate({ name: 'instance', id: inst.id });
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.target !== e.currentTarget) return;
@@ -70,7 +81,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
       <InstanceGlyph inst={inst} className="cp-feature-glyph" />
       <div class="cp-feature-content">
         <div class="cp-feature-id">
-          <div class="cp-feature-kicker">{running ? 'Now playing' : installing ? installBadge : 'Jump back in'}</div>
+          <div class="cp-feature-kicker">{session ? sessionLabel : installing ? installBadge : 'Jump back in'}</div>
           <h2 title={inst.name}>{inst.name}</h2>
           <div class="cp-meta">
             <span>{inst.version_display.loader_label}</span>
@@ -87,16 +98,26 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
           </div>
         </div>
         <div class="cp-feature-actions">
-          {running && (
-            <Pill tone="accent" icon="play">
-              Playing
+          {session && (
+            <Pill tone={playing ? 'accent' : undefined} icon={playing ? 'play' : 'clock'}>
+              {sessionLabel}
             </Pill>
           )}
           {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installBadge}</Pill>}
           <Button
             size="lg"
-            icon={installing ? (install.state === 'queued' ? 'clock' : 'download') : 'play'}
-            title={installing ? installBadge : `Play ${inst.name}`}
+            icon={
+              installing ? (install.state === 'queued' ? 'clock' : 'download') : session ? 'chevron-right' : actionIcon
+            }
+            title={
+              installing
+                ? installBadge
+                : session
+                  ? `Open ${inst.name}`
+                  : launchAction.primary_action === 'blocked'
+                    ? launchAction.disabled_reason
+                    : `${actionLabel} ${inst.name}`
+            }
             disabled={installing}
             onClick={(e) => {
               e.stopPropagation();
@@ -104,7 +125,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
             }}
             sound="launchPress"
           >
-            {installing ? installBadge : 'Play'}
+            {installing ? installBadge : session ? 'Open' : actionLabel}
           </Button>
         </div>
       </div>
@@ -132,7 +153,7 @@ function EmptyHome(): JSX.Element {
 
 export function HomeView(): JSX.Element {
   const cfg = config.value;
-  const all = instances.value as EnrichedInstance[];
+  const all = instances.value;
   const now = new Date();
   const recent = useMemo(() => {
     return [...all]

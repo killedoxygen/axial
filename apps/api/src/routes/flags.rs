@@ -1,169 +1,72 @@
-use crate::{
-    application::{self, FlagOverridePatch},
-    state::AppState,
+use std::sync::Arc;
+
+use axial_app::{
+    settings::{FlagOverridePatch, FlagsResponse, SettingsError, SettingsStore},
+    tasks::TaskOwner,
+    telemetry::Telemetry,
 };
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
     routing::{get, put},
 };
 
-pub fn router() -> Router<AppState> {
+use super::config::{ApiError, json_error, report_save_failure, settings_error};
+
+#[derive(Clone)]
+struct FlagRouteState {
+    settings: Arc<SettingsStore>,
+    telemetry: Arc<Telemetry>,
+    tasks: TaskOwner,
+}
+
+pub fn router(settings: Arc<SettingsStore>, telemetry: Arc<Telemetry>, tasks: TaskOwner) -> Router {
     Router::new()
-        .route("/api/v1/flags", get(handle_list_flags))
-        .route("/api/v1/flags/{key}", put(handle_update_flag))
+        .route("/api/v1/flags", get(list_flags))
+        .route("/api/v1/flags/{key}", put(update_flag))
+        .layer(DefaultBodyLimit::max(4096))
+        .with_state(FlagRouteState {
+            settings,
+            telemetry,
+            tasks,
+        })
 }
 
-async fn handle_list_flags(State(state): State<AppState>) -> Json<application::FlagsResponse> {
-    Json(application::list_flags(&state))
-}
-
-async fn handle_update_flag(
-    State(state): State<AppState>,
-    Path(key): Path<String>,
-    Json(patch): Json<FlagOverridePatch>,
-) -> Result<Json<application::FlagsResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::update_flag(&state, &key, patch)
+async fn list_flags(State(state): State<FlagRouteState>) -> Result<Json<FlagsResponse>, ApiError> {
+    tokio::task::spawn_blocking(move || state.settings.list_flags())
         .await
+        .map_err(|_| settings_error(SettingsError::Unavailable))?
         .map(Json)
+        .map_err(settings_error)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
-    use axial_config::{AppConfig, AppPaths, ConfigStore, FEATURE_FLAGS, InstanceStore};
-    use axial_performance::PerformanceManager;
-    use axum::{
-        body::{Body, to_bytes},
-        http::{Method, Request, StatusCode, header},
-    };
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-    use tower::ServiceExt;
-
-    #[tokio::test]
-    async fn flags_api_is_mounted_on_top_level_router() {
-        let fixture = TestFixture::new("mounted");
-        let app = crate::routes::router(fixture.state.clone());
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/v1/flags")
-                    .body(Body::empty())
-                    .expect("flags list request"),
-            )
+async fn update_flag(
+    State(state): State<FlagRouteState>,
+    Path(key): Path<String>,
+    request: Result<Json<FlagOverridePatch>, JsonRejection>,
+) -> Result<Json<FlagsResponse>, ApiError> {
+    let Json(patch) = request.map_err(json_error)?;
+    let tasks = state.tasks.clone();
+    let handle = tasks
+        .try_spawn((), move |cancellation| async move {
+            if cancellation.is_cancelled() {
+                return Err(SettingsError::Unavailable);
+            }
+            tokio::task::spawn_blocking(move || {
+                let result = state.settings.update_flag(&key, patch);
+                if let Err(error) = &result {
+                    report_save_failure(&state.telemetry, error);
+                }
+                result
+            })
             .await
-            .expect("flags list route should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_json(response.into_body()).await;
-        assert!(
-            body["flags"]
-                .as_array()
-                .expect("flags should be an array")
-                .iter()
-                .any(|flag| flag["key"] == seed_key())
-        );
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::PUT)
-                    .uri(format!("/api/v1/flags/{}", seed_key()))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"enabled":true}"#))
-                    .expect("flags update request"),
-            )
-            .await
-            .expect("flags update route should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            fixture
-                .state
-                .config()
-                .current()
-                .feature_overrides
-                .get(seed_key()),
-            Some(&true)
-        );
-    }
-
-    async fn response_json(body: Body) -> serde_json::Value {
-        let body = to_bytes(body, usize::MAX)
-            .await
-            .expect("response body should read");
-        serde_json::from_slice(&body).expect("response body should be json")
-    }
-
-    fn seed_key() -> &'static str {
-        FEATURE_FLAGS[0].key
-    }
-
-    struct TestFixture {
-        state: AppState,
-        root: PathBuf,
-    }
-
-    impl TestFixture {
-        fn new(name: &str) -> Self {
-            let root = test_root(name);
-            let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            config
-                .replace_in_memory(AppConfig::default())
-                .expect("set config");
-            let instances = Arc::new(InstanceStore::load_from(paths).expect("load instances"));
-            let state = AppState::new(AppStateInit {
-                app_name: "Axial".to_string(),
-                version: "test".to_string(),
-                config,
-                instances,
-                installs: Arc::new(InstallStore::new()),
-                sessions: Arc::new(SessionStore::new()),
-                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
-                startup_warnings: Vec::new(),
-                frontend_dir: root.join("frontend"),
-            });
-
-            Self { state, root }
-        }
-    }
-
-    impl Drop for TestFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn test_paths(root: &Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
-    }
-
-    fn test_root(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "axial-flags-routes-{name}-{}-{nonce}",
-            std::process::id()
-        ))
-    }
+            .expect("feature flag persistence task panicked")
+        })
+        .map_err(|_| settings_error(SettingsError::Unavailable))?;
+    handle
+        .join()
+        .await
+        .map_err(|_| settings_error(SettingsError::Unavailable))?
+        .map(Json)
+        .map_err(settings_error)
 }

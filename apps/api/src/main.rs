@@ -1,93 +1,45 @@
-use axial_api::app::{
-    DEFAULT_API_PORT, build_router, default_frontend_dir, spawn_benchmark_suite_drivers_resume,
-    spawn_performance_operations_resume, spawn_performance_rules_refresh,
-    spawn_remote_flags_refresh, spawn_telemetry_export, spawn_update_staging_cleanup,
-};
-use axial_api::observability::telemetry::{
-    TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
-};
-use axial_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
-use axial_config::{AppPaths, ConfigStore, InstanceStore};
-use axial_performance::PerformanceManager;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::runtime::Builder as TokioRuntimeBuilder;
-use tracing::info;
-
-const TOKIO_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    TokioRuntimeBuilder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(TOKIO_WORKER_STACK_BYTES)
-        .build()?
-        .block_on(run())
-}
-
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
-
-    let paths = AppPaths::detect();
-    let config_startup = ConfigStore::load_for_startup(paths.clone())?;
-    let instance_startup = InstanceStore::load_for_startup(paths.clone());
-    let mut startup_warnings = config_startup.warnings;
-    startup_warnings.extend(instance_startup.warnings);
-    let config = Arc::new(config_startup.store);
-    let instances = Arc::new(instance_startup.store);
-    let installs = Arc::new(InstallStore::new());
-    let sessions = Arc::new(SessionStore::new());
-    let performance = Arc::new(PerformanceManager::new_with_config_dir(&paths.config_dir)?);
-    let state = AppState::new(AppStateInit {
-        app_name: "Axial".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        config,
-        instances,
-        installs,
-        sessions,
-        performance,
-        startup_warnings,
-        frontend_dir: default_frontend_dir(),
-    });
-    spawn_performance_operations_resume(&state);
-    spawn_benchmark_suite_drivers_resume(&state);
-    spawn_performance_rules_refresh(&state);
-    spawn_telemetry_export(&state);
-    spawn_remote_flags_refresh(&state);
-    spawn_update_staging_cleanup(&state);
-
-    let addr = std::env::var("AXIAL_API_ADDR")
-        .ok()
-        .and_then(|value| value.parse::<SocketAddr>().ok())
-        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], DEFAULT_API_PORT)));
-
-    let telemetry = state.telemetry().clone();
-    let result = serve_api(state, addr).await;
-    if result.is_err() {
-        emit_startup_failed(&telemetry);
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "axial_api=info".into()),
+        )
+        .init();
+    let origin = std::env::var("AXIAL_WEB_ORIGIN").ok();
+    let services = match axial_api::start_browser(origin.as_deref()).await {
+        Ok(services) => services,
+        Err(mut failure) => loop {
+            tracing::error!(error = %failure, "startup blocked; preserving profile ownership");
+            match failure.try_preserve() {
+                Ok(message) => return Err(std::io::Error::other(message).into()),
+                Err(retained) => {
+                    failure = retained;
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        },
+    };
+    // The secret capability is available only through native IPC or an exact
+    // admitted browser origin; it must never enter logs or command output.
+    tracing::info!(base_url = %services.server.bootstrap().base_url, "replacement local API listening");
+    let outcome = tokio::select! {
+        result = services.server.wait() => result.map_err(std::io::Error::other),
+        result = tokio::signal::ctrl_c() => result,
+    };
+    // Even a listener or signal error must settle owned application effects.
+    loop {
+        match services.server.shutdown().await {
+            Ok(()) => break,
+            Err(error) if services.server.is_shutdown_settled() => {
+                return Err(std::io::Error::other(error).into());
+            }
+            Err(error) => {
+                tracing::error!(%error, "shutdown remains incomplete; preserving owned work");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
     }
-    result
-}
-
-async fn serve_api(state: AppState, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(addr).await?;
-    let addr = listener.local_addr()?;
-    info!("axial api listening on http://{addr}");
-
-    axum::serve(listener, build_router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
-
+    outcome?;
     Ok(())
-}
-
-fn emit_startup_failed(telemetry: &Arc<TelemetryHub>) {
-    telemetry.emit_sync_best_effort(TelemetryEvent::error_captured(
-        TelemetryErrorKind::StartupFailed,
-        TelemetryErrorArea::Startup,
-        TelemetryErrorLevel::Error,
-        "Backend startup failed.",
-    ));
 }

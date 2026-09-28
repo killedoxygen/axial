@@ -1,99 +1,89 @@
-name: CI
+name: Rewrite verification
 
 on:
   pull_request:
   push:
-    branches:
-      - main
-      - rewrite-in-rust
-      - wip-*
+    branches: [main, feat/clean-rewrite]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: rewrite-verification-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  frontend:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-          run_install: false
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
-
-      - name: Install frontend dependencies
-        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
-
-      - name: Frontend format check
-        run: pnpm --dir frontend run format:check
-
-      - name: Frontend typecheck
-        run: pnpm --dir frontend run check
-
-      - name: Frontend tests
-        run: pnpm --dir frontend run test
-
-      - name: Frontend build
-        run: pnpm --dir frontend run build
-
-  desktop-linux:
+  delivery-contracts:
     runs-on: ubuntu-24.04
-    container:
-      image: ghcr.io/mateoltd/axial-linux-ci:latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Trust checkout as a safe git directory
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          version: 11.1.3
-          run_install: false
-
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
-
-      - uses: dtolnay/rust-toolchain@stable
+          node-version: 24.13.1
+      - name: Test release rejection and evidence behavior
+        shell: bash
+        run: |
+          status=0
+          node --test scripts/release/*.test.mjs acceptance/native/*.test.mjs > "$RUNNER_TEMP/delivery-tests.log" 2>&1 || status=$?
+          tail -n 70 "$RUNNER_TEMP/delivery-tests.log"
+          exit "$status"
+  application:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install frontend dependencies
-        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
-
-      - name: Frontend typecheck
-        run: pnpm --dir frontend run check
-
-      - name: Frontend build
-        run: pnpm --dir frontend run build
-
-      - name: Rust fmt
-        run: cargo fmt --all --check
-
-      - name: Rust check
-        run: cargo check --workspace --locked
-
-      - name: Rust clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-      - name: Rust tests
-        run: cargo test --workspace --locked
-
-      - name: Release desktop build
-        run: cargo build --locked -p axial-desktop --release
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.13.1
+      - name: Prepare pinned tools and native keyring build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev
+          rustup toolchain install 1.93.1 --profile minimal
+          npm install --global pnpm@11.1.3
+          pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+      - name: Check semantic and asset policies
+        shell: bash
+        run: |
+          status=0
+          pnpm --dir frontend run lint:semantic > "$RUNNER_TEMP/source-policies.log" 2>&1 && node scripts/verify-assets.mjs >> "$RUNNER_TEMP/source-policies.log" 2>&1 || status=$?
+          tail -n 70 "$RUNNER_TEMP/source-policies.log"
+          exit "$status"
+      - name: Check dependency policy with the pinned auditor
+        shell: bash
+        run: |
+          status=0
+          cargo install cargo-deny --version '=0.20.2' --locked > "$RUNNER_TEMP/dependencies.log" 2>&1 && test "$(cargo deny --version)" = 'cargo-deny 0.20.2' && node scripts/dependency-policy.mjs check >> "$RUNNER_TEMP/dependencies.log" 2>&1 || status=$?
+          tail -n 70 "$RUNNER_TEMP/dependencies.log"
+          exit "$status"
+      - name: Build retained interface
+        shell: bash
+        run: |
+          status=0
+          pnpm --dir frontend run build > "$RUNNER_TEMP/frontend-build.log" 2>&1 && node frontend/verify-generation.mjs >> "$RUNNER_TEMP/frontend-build.log" 2>&1 || status=$?
+          tail -n 70 "$RUNNER_TEMP/frontend-build.log"
+          exit "$status"
+      - name: Verify generated public wire types
+        shell: bash
+        run: |
+          status=0
+          node scripts/cargo-target.mjs run -- cargo run -p axial-app --example export_contracts -- --check > "$RUNNER_TEMP/wire-contracts.log" 2>&1 || status=$?
+          tail -n 70 "$RUNNER_TEMP/wire-contracts.log"
+          exit "$status"
+      - name: Test application and local API
+        shell: bash
+        run: |
+          status=0
+          node scripts/cargo-target.mjs run -- cargo test -p axial-app -p axial-api --lib > "$RUNNER_TEMP/application-tests.log" 2>&1 || status=$?
+          tail -n 70 "$RUNNER_TEMP/application-tests.log"
+          exit "$status"
+      - name: Typecheck and test retained interface
+        shell: bash
+        run: |
+          status=0
+          node frontend/test/run.mjs > "$RUNNER_TEMP/frontend-tests.log" 2>&1 || status=$?
+          tail -n 70 "$RUNNER_TEMP/frontend-tests.log"
+          exit "$status"

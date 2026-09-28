@@ -3,17 +3,19 @@ import type { ContentUpdate, InstanceContentEntry } from '../../types-content';
 export interface ModProvenance {
   entries: Map<string, InstanceContentEntry>;
   updates: Map<string, ContentUpdate>;
+  updateError?: string;
 }
 
 const provenanceCache = new Map<string, ModProvenance>();
 const provenanceGenerations = new Map<string, number>();
+let nextGeneration = 0;
 
 export function cachedModProvenance(instanceId: string): ModProvenance | null {
   return provenanceCache.get(instanceId) ?? null;
 }
 
 export function beginModProvenanceRefresh(instanceId: string): number {
-  const generation = (provenanceGenerations.get(instanceId) ?? 0) + 1;
+  const generation = ++nextGeneration;
   provenanceGenerations.set(instanceId, generation);
   return generation;
 }

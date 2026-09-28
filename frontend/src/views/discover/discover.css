@@ -479,12 +479,6 @@
   border-top-color: var(--accent);
   animation: cp-spin 620ms linear infinite;
 }
-@keyframes cp-spin {
-  to {
-    rotate: 360deg;
-  }
-}
-
 .cp-skeleton {
   position: relative;
   overflow: hidden;

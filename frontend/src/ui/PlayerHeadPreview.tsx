@@ -11,7 +11,6 @@ export function PlayerHeadPreview({
   class: className,
   style,
 }: {
-  username?: string;
   textureSrc?: string;
   size?: number | string;
   radius?: number;

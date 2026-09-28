@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Button } from '../ui/Atoms';
-import { Icon } from '../ui/Icons';
+import { Icon, type IconName } from '../ui/Icons';
 import { updateInfo } from '../store';
 import type { UpdateFlowState } from '../types-update';
 import {
@@ -24,7 +24,7 @@ function displayVersion(version: string): string {
   return version.startsWith('v') || version.startsWith('V') ? version : `v${version}`;
 }
 
-function triggerIcon(phase: UpdateFlowState['phase']): string {
+function triggerIcon(phase: UpdateFlowState['phase']): IconName {
   if (phase === 'downloading' || phase === 'applying') return 'download';
   if (phase === 'ready' || phase === 'restart-pending') return 'refresh';
   return 'arrow-up';
@@ -61,7 +61,7 @@ function triggerLabel(flow: UpdateFlowState, latest: string): string {
   }
 }
 
-function cardHeadIcon(phase: UpdateFlowState['phase']): string {
+function cardHeadIcon(phase: UpdateFlowState['phase']): IconName {
   if (phase === 'downloading' || phase === 'applying') return 'download';
   if (phase === 'ready' || phase === 'restart-pending') return 'refresh';
   if (phase === 'failed') return 'alert';

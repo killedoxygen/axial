@@ -32,7 +32,6 @@ function hit(id: string): SearchHit {
     categories: [],
     game_versions: [],
     loaders: [],
-    sources: [],
   };
 }
 

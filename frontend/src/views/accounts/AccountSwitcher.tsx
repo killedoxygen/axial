@@ -51,7 +51,7 @@ function accountDetailLabel(account: LauncherAccount): string {
   if (account.kind === 'microsoft') {
     return account.view_model?.detail ?? account.online_action?.detail ?? 'Microsoft account';
   }
-  return 'Offline identity';
+  return account.view_model?.detail ?? 'Offline identity';
 }
 
 function offlineAccountMenuItems(account: LauncherAccount): ContextMenuItem[] {
@@ -65,41 +65,39 @@ function activeAccountMenuItems(account: LauncherAccount): ContextMenuItem[] {
   if (account.kind === 'offline') return offlineAccountMenuItems(account);
   const syncAction = activeMicrosoftProfileSyncAction();
   const refreshAction = activeMicrosoftRefreshAction();
-  return [
-    ...(actionEnabled(syncAction)
-      ? [
-          {
-            icon: 'refresh',
-            label: syncAction?.label ?? 'Sync Minecraft profile',
-            onSelect: () => void syncMinecraftProfile(),
-          },
-        ]
-      : []),
-    ...(actionEnabled(refreshAction)
-      ? [
-          {
-            icon: 'refresh',
-            label: refreshAction?.label ?? 'Refresh Microsoft sign-in',
-            onSelect: () => void refreshMicrosoftAuth(),
-          },
-        ]
-      : []),
-    ...(microsoftSignInAvailable()
-      ? [{ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void signInWithMicrosoftAccount() }]
-      : []),
+  const items: ContextMenuItem[] = [];
+  if (actionEnabled(syncAction)) {
+    items.push({
+      icon: 'refresh',
+      label: syncAction?.label ?? 'Sync Minecraft profile',
+      onSelect: () => void syncMinecraftProfile(),
+    });
+  }
+  if (actionEnabled(refreshAction)) {
+    items.push({
+      icon: 'refresh',
+      label: refreshAction?.label ?? 'Refresh Microsoft sign-in',
+      onSelect: () => void refreshMicrosoftAuth(),
+    });
+  }
+  if (microsoftSignInAvailable()) {
+    items.push({ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void signInWithMicrosoftAccount() });
+  }
+  items.push(
     { label: '', onSelect: () => {}, divider: true },
     { icon: 'x', label: 'Sign out', onSelect: () => void removeAccount(account), danger: true },
-  ];
+  );
+  return items;
 }
 
 function idleAccountMenuItems(account: LauncherAccount): ContextMenuItem[] {
   if (account.kind === 'offline') return offlineAccountMenuItems(account);
-  return [
-    ...(microsoftSignInAvailable()
-      ? [{ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void signInWithMicrosoftAccount() }]
-      : []),
-    { icon: 'x', label: 'Remove account', onSelect: () => void removeAccount(account), danger: true },
-  ];
+  const items: ContextMenuItem[] = [];
+  if (microsoftSignInAvailable()) {
+    items.push({ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void signInWithMicrosoftAccount() });
+  }
+  items.push({ icon: 'x', label: 'Remove account', onSelect: () => void removeAccount(account), danger: true });
+  return items;
 }
 
 function SwitchRow({ account, busy }: { account: LauncherAccount; busy: boolean }): JSX.Element {
@@ -122,7 +120,6 @@ function SwitchRow({ account, busy }: { account: LauncherAccount; busy: boolean 
         }}
       >
         <PlayerHeadPreview
-          username={name || 'Player'}
           textureSrc={accountTextureSrc(account, false)}
           size={34}
           radius={9}
@@ -138,6 +135,7 @@ function SwitchRow({ account, busy }: { account: LauncherAccount; busy: boolean 
           icon="dots"
           size={26}
           tooltip="Account actions"
+          disabled={busy}
           onClick={(event) => {
             event.stopPropagation();
             openContextMenu(event, menuItems);
@@ -150,7 +148,7 @@ function SwitchRow({ account, busy }: { account: LauncherAccount; busy: boolean 
 
 export function AccountSwitcherPanel(): JSX.Element {
   const snapshot = accountsSnapshot.value;
-  const busy = accountsOp.value !== null;
+  const busy = accountsOp.value !== null || snapshot.state !== 'ready';
   const signingIn = accountsOp.value === 'sign-in';
   const active = activeAccount(snapshot);
   const others = snapshot.accounts.filter((account) => !account.active);
@@ -163,7 +161,6 @@ export function AccountSwitcherPanel(): JSX.Element {
       {active ? (
         <div class="cp-acct__me">
           <PlayerHeadPreview
-            username={accountDisplayLabel(active) || 'Player'}
             textureSrc={accountTextureSrc(active, true)}
             size={44}
             radius={11}
@@ -276,7 +273,6 @@ export function AccountSwitcherChip(): JSX.Element {
       }}
     >
       <PlayerHeadPreview
-        username={active ? name : 'Player'}
         textureSrc={active ? (accountSkinSrc.value ?? accountTextureSrc(active, true)) : undefined}
         size={30}
         radius={7}

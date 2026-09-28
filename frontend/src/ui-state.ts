@@ -1,20 +1,24 @@
 import { signal } from '@preact/signals';
 import type { ContentKind } from './types-content';
+import { ROUTE_PREFERENCES_KEY, parseRoutePreference } from './preferences/local';
+import { hasNativeDesktopRuntime } from './native';
+import { canEditPreferences, saveNativeRoute } from './preferences/persistence';
 
-export type Route =
-  | { name: 'home' }
-  | { name: 'instances' }
-  | { name: 'instance'; id: string }
-  | { name: 'discover'; target?: string }
-  | { name: 'content'; id: string; target?: string }
-  | { name: 'dev-lab' }
-  | { name: 'downloads' }
-  | { name: 'accounts' }
-  | { name: 'settings' };
+export type { InterfaceRoute as Route } from './generated/InterfaceRoute';
+import type { InterfaceRoute as Route } from './generated/InterfaceRoute';
 
-export const ROUTE_STORAGE_KEY = 'axial:route';
+export const ROUTE_STORAGE_KEY = ROUTE_PREFERENCES_KEY;
 
 export const route = signal<Route>({ name: 'home' });
+let routePersistenceSuspended = false;
+
+export function suspendRoutePersistence(): () => void {
+  const previous = routePersistenceSuspended;
+  routePersistenceSuspended = true;
+  return () => {
+    routePersistenceSuspended = previous;
+  };
+}
 
 const routeBackStack: Route[] = [];
 const routeForwardStack: Route[] = [];
@@ -202,14 +206,18 @@ export function resetViewScroll(): void {
 }
 
 function setRoute(r: Route): void {
+  if (!canEditPreferences()) return;
   cancelViewScrollRestore();
   route.value = r;
+  if (routePersistenceSuspended) return;
+  if (hasNativeDesktopRuntime()) { saveNativeRoute(r); return; }
   try {
     localStorage.setItem(ROUTE_STORAGE_KEY, JSON.stringify(r));
   } catch {}
 }
 
 export function navigate(r: Route): void {
+  if (!canEditPreferences()) return;
   if (sameRoute(route.value, r)) return;
   rememberViewScroll();
   routeBackStack.push(route.value);
@@ -218,6 +226,7 @@ export function navigate(r: Route): void {
 }
 
 export function goBack(): void {
+  if (!canEditPreferences()) return;
   const previous = routeBackStack.pop();
   if (!previous) return;
   rememberViewScroll();
@@ -226,6 +235,7 @@ export function goBack(): void {
 }
 
 export function goForward(): void {
+  if (!canEditPreferences()) return;
   const next = routeForwardStack.pop();
   if (!next) return;
   rememberViewScroll();
@@ -233,36 +243,12 @@ export function goForward(): void {
   setRoute(next);
 }
 
-function isRoute(value: unknown): value is Route {
-  if (!value || typeof value !== 'object') return false;
-  const candidate = value as Partial<Route>;
-  const target = (candidate as { target?: unknown }).target;
-  const targetOk = target === undefined || typeof target === 'string';
-  switch (candidate.name) {
-    case 'home':
-    case 'instances':
-    case 'dev-lab':
-    case 'downloads':
-    case 'accounts':
-    case 'settings':
-      return true;
-    case 'discover':
-      return targetOk;
-    case 'content':
-      return typeof (candidate as { id?: unknown }).id === 'string' && targetOk;
-    case 'instance':
-      return typeof (candidate as { id?: unknown }).id === 'string';
-    default:
-      return false;
-  }
-}
-
 export function restoreRoute(): void {
+  if (hasNativeDesktopRuntime()) return;
   try {
     const raw = localStorage.getItem(ROUTE_STORAGE_KEY);
     if (!raw) return;
-    const parsed = JSON.parse(raw) as unknown;
-    if (isRoute(parsed)) setRoute(parsed);
+    setRoute(parseRoutePreference(JSON.parse(raw) as unknown));
   } catch {}
 }
 

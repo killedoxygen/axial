@@ -1,501 +1,395 @@
-use crate::application::{
-    InstallQueueRequest, InstallQueueStateResponse, InstallStatusResponse, enqueue_install,
-    install_events_stream, install_queue_status, install_status, remove_queued_install,
-    retry_install,
+use axial_app::{
+    install::{
+        model::{
+            InstallEvent, InstallQueueRequest, InstallQueueStateResponse, InstallStatusResponse,
+        },
+        queue::{InstallError, InstallQueue},
+    },
+    instances::setup::SetupService,
 };
-use crate::state::AppState;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{
+        DefaultBodyLimit, Path, Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::StatusCode,
+    response::sse::{Event, KeepAlive, Sse},
     routing::{delete, get, post},
 };
-use serde::Deserialize;
+use futures_util::{Stream, stream};
+use serde_json::{Value, json};
+use std::{convert::Infallible, sync::Arc};
 
-#[derive(Debug, Deserialize)]
-struct InstallRequest {
-    version_id: String,
-    #[serde(default)]
-    manifest_url: String,
+type ApiError = (StatusCode, Json<Value>);
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetryQuery {
+    expected_install_id: Option<String>,
 }
 
-pub fn router() -> Router<AppState> {
+/// Mount beneath the composition owner's capability and stream-ticket checks.
+pub fn router(queue: Arc<InstallQueue>, setup: Arc<SetupService>) -> Router {
     Router::new()
-        .route("/api/v1/install", post(handle_install))
-        .route(
-            "/api/v1/install/queue",
-            get(handle_install_queue_status).post(handle_install_queue_enqueue),
+        .route("/api/v1/install/queue", get(snapshot).post(enqueue))
+        .route("/api/v1/install/queue/events", get(queue_events))
+        .route("/api/v1/install/queue/{id}", delete(remove))
+        .route("/api/v1/install/{id}/status", get(status))
+        .route("/api/v1/install/{id}/events", get(install_events))
+        .route("/api/v1/install/{id}/cancel", post(cancel))
+        .route("/api/v1/loaders/install/{id}/events", get(install_events))
+        .with_state(queue.clone())
+        .merge(
+            Router::new()
+                .route("/api/v1/install/queue/retry", post(retry))
+                .with_state((queue, setup)),
         )
-        .route(
-            "/api/v1/install/queue/retry",
-            post(handle_install_queue_retry),
-        )
-        .route(
-            "/api/v1/install/queue/{id}",
-            delete(handle_install_queue_remove),
-        )
-        .route("/api/v1/install/{id}/status", get(handle_install_status))
-        .route("/api/v1/install/{id}/events", get(handle_install_events))
+        .layer(DefaultBodyLimit::max(64 << 10))
+}
+async fn snapshot(State(queue): State<Arc<InstallQueue>>) -> Json<InstallQueueStateResponse> {
+    Json(queue.snapshot())
+}
+async fn enqueue(
+    State(queue): State<Arc<InstallQueue>>,
+    request: Result<Json<InstallQueueRequest>, JsonRejection>,
+) -> Result<Json<InstallQueueStateResponse>, ApiError> {
+    let Json(request) = request.map_err(|_| failure(InstallError::InvalidRequest))?;
+    queue.enqueue(request).await.map(Json).map_err(failure)
+}
+async fn retry(
+    State((queue, setup)): State<(Arc<InstallQueue>, Arc<SetupService>)>,
+    query: Result<Query<RetryQuery>, QueryRejection>,
+    request: Result<Json<InstallQueueRequest>, JsonRejection>,
+) -> Result<Json<InstallQueueStateResponse>, ApiError> {
+    let Query(query) = query.map_err(|_| failure(InstallError::InvalidRequest))?;
+    let Json(request) = request.map_err(|_| failure(InstallError::InvalidRequest))?;
+    if let Some(id) = query.expected_install_id {
+        if !uuid::Uuid::parse_str(&id).is_ok_and(|parsed| parsed.to_string() == id) {
+            return Err(failure(InstallError::InvalidRequest));
+        }
+        return queue
+            .retry_retained(&id, &request)
+            .await
+            .map(Json)
+            .map_err(failure);
+    }
+    if let Some(response) = setup
+        .retry_queued_setup(&request)
+        .await
+        .map_err(super::instances::error)?
+    {
+        return Ok(Json(response));
+    }
+    queue.retry(request).await.map(Json).map_err(failure)
+}
+async fn remove(
+    State(queue): State<Arc<InstallQueue>>,
+    Path(id): Path<String>,
+) -> Result<Json<InstallQueueStateResponse>, ApiError> {
+    queue.remove(&id).await.map(Json).map_err(failure)
+}
+async fn status(
+    State(queue): State<Arc<InstallQueue>>,
+    Path(id): Path<String>,
+) -> Result<Json<InstallStatusResponse>, ApiError> {
+    queue.status(&id).map(Json).map_err(failure)
+}
+async fn cancel(
+    State(queue): State<Arc<InstallQueue>>,
+    Path(id): Path<String>,
+) -> Result<Json<InstallStatusResponse>, ApiError> {
+    queue.cancel(&id).map(Json).map_err(failure)
 }
 
-async fn handle_install(
-    State(state): State<AppState>,
-    Json(payload): Json<InstallRequest>,
-) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    enqueue_install(
-        &state,
-        InstallQueueRequest {
-            kind: "vanilla".to_string(),
-            version_id: payload.version_id,
-            manifest_url: payload.manifest_url,
-            component_id: String::new(),
-            build_id: String::new(),
-            ..InstallQueueRequest::default()
+async fn queue_events(
+    State(queue): State<Arc<InstallQueue>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let (snapshot, receiver) = queue.subscribe();
+    Sse::new(stream::unfold(
+        (Some(snapshot), receiver, queue),
+        |(initial, mut receiver, queue)| async move {
+            if queue.events_closed() {
+                return None;
+            }
+            let value = match initial {
+                Some(value) => value,
+                None => {
+                    receiver.changed().await.ok()?;
+                    receiver.borrow_and_update().clone()
+                }
+            };
+            if queue.events_closed() {
+                return None;
+            }
+            let event = Event::default()
+                .id(value.revision.to_string())
+                .json_data(InstallEvent {
+                    revision: value.revision,
+                    value,
+                })
+                .ok()?;
+            Some((Ok(event), (None, receiver, queue)))
         },
-    )
-    .await
-    .map(Json)
+    ))
+    .keep_alive(KeepAlive::default())
 }
-
-async fn handle_install_status(
-    State(state): State<AppState>,
+async fn install_events(
+    State(queue): State<Arc<InstallQueue>>,
     Path(id): Path<String>,
-) -> Result<Json<InstallStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
-    install_status(&state, &id).await.map(Json)
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    // Subscribe before reading status so the current snapshot and later events
+    // cannot have a gap. Slow clients rebase to the queue's latest projection.
+    let (_, receiver) = queue.subscribe();
+    let initial = queue.status(&id).map_err(failure)?;
+    Ok(Sse::new(stream::unfold(
+        (Some(initial), receiver, queue, id, false),
+        |(initial, mut receiver, queue, id, finished)| async move {
+            if finished || queue.events_closed() {
+                return None;
+            }
+            let value = match initial {
+                Some(value) => value,
+                None => {
+                    receiver.changed().await.ok()?;
+                    queue.status(&id).ok()?
+                }
+            };
+            let finished = value.done;
+            let event = Event::default()
+                .id(value.revision.to_string())
+                .json_data(InstallEvent {
+                    revision: value.revision,
+                    value,
+                })
+                .ok()?;
+            Some((Ok(event), (None, receiver, queue, id, finished)))
+        },
+    ))
+    .keep_alive(KeepAlive::default()))
 }
-
-async fn handle_install_queue_status(
-    State(state): State<AppState>,
-) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    install_queue_status(&state).await.map(Json)
-}
-
-async fn handle_install_queue_enqueue(
-    State(state): State<AppState>,
-    Json(payload): Json<InstallQueueRequest>,
-) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    enqueue_install(&state, payload).await.map(Json)
-}
-
-async fn handle_install_queue_retry(
-    State(state): State<AppState>,
-    Json(payload): Json<InstallQueueRequest>,
-) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    retry_install(&state, payload).await.map(Json)
-}
-
-async fn handle_install_queue_remove(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    remove_queued_install(&state, &id).await.map(Json)
-}
-
-async fn handle_install_events(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    install_events_stream(&state, &id).await
+pub(crate) fn failure(error: InstallError) -> ApiError {
+    let status = match error {
+        InstallError::InvalidRequest => StatusCode::BAD_REQUEST,
+        InstallError::NotFound => StatusCode::NOT_FOUND,
+        InstallError::Busy | InstallError::SettlementRequired | InstallError::NotReady => {
+            StatusCode::CONFLICT
+        }
+        InstallError::AtCapacity => StatusCode::TOO_MANY_REQUESTS,
+        InstallError::ContentUnavailable
+        | InstallError::LoaderUnavailable
+        | InstallError::Closed => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(json!({"error":error.to_string()})))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        application::{
-            begin_install_operation_journal, install::INSTALL_FAILURE_MESSAGE,
-            install_operation_id, record_install_operation_guardian_repair_outcome,
-            record_install_operation_progress,
-        },
-        guardian::{
-            DiagnosisId, GuardianActionKind, GuardianArtifactRepairOutcome,
-            GuardianArtifactRepairStatus,
-        },
-        state::{AppStateInit, InstallStore, SessionStore},
+    use axial_app::{
+        instances::model::{Instance, InstanceError, InstanceId},
+        settings::InstanceSettings,
+        storage::rusqlite::params,
     };
-    use axial_config::{AppPaths, ConfigStore, InstanceStore};
-    use axial_minecraft::DownloadProgress;
-    use axial_performance::PerformanceManager;
-    use axum::{
-        body::{Body, to_bytes},
-        http::{Method, Request},
-    };
-    use serde_json::Value;
-    use std::{fs, path::PathBuf, sync::Arc};
-    use tower::ServiceExt;
+    use std::time::Duration;
+    use tokio::{net::TcpListener, sync::Semaphore};
+
+    async fn post(
+        services: &crate::DesktopServices,
+        path: &str,
+        request: Value,
+    ) -> (StatusCode, Value) {
+        let bootstrap = services.server.bootstrap();
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .post(format!("{}{path}", bootstrap.base_url))
+            .header(crate::transport::CAPABILITY_HEADER, bootstrap.capability)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        (response.status(), response.json().await.unwrap())
+    }
 
     #[tokio::test]
-    async fn install_status_route_serializes_guardian_repair_status_payload() {
-        let fixture = RouteInstallFixture::new("install-status-guardian-repair-route");
-        let install_id = "repair-status-route-install";
-        let operation_id = install_operation_id(install_id);
-        let failed_progress = DownloadProgress {
-            phase: "error".to_string(),
-            current: 0,
-            total: 0,
-            file: Some("/Users/alice/.axial/libraries/secret-client.jar".to_string()),
-            error: Some(
-                "checksum failed in /Users/alice/.axial with token secret provider_payload"
-                    .to_string(),
+    async fn retained_retry_selector_refuses_stale_or_malformed_identity_without_enqueuing() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let services = crate::start_in_profile(root.path().join("profile"), None)
+            .await
+            .unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        for (query, expected) in [
+            (
+                "expected_install_id=../path".to_owned(),
+                StatusCode::BAD_REQUEST,
             ),
-            done: true,
-            bytes_done: None,
-            bytes_total: None,
-        };
-
-        fixture
-            .state
-            .installs()
-            .insert(install_id.to_string())
-            .await;
-        fixture
-            .state
-            .installs()
-            .emit(install_id, failed_progress.clone())
-            .await;
-        begin_install_operation_journal(fixture.state.journals(), &operation_id, "1.21.5");
-        let mut last_phase = None;
-        record_install_operation_progress(
-            fixture.state.journals(),
-            &operation_id,
-            &failed_progress,
-            &mut last_phase,
-        );
-        record_install_operation_guardian_repair_outcome(
-            fixture.state.journals(),
-            &operation_id,
-            &GuardianArtifactRepairOutcome {
-                operation_id: crate::state::contracts::OperationId::new(
-                    "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174002",
-                ),
-                diagnosis_id: DiagnosisId::new("launcher_managed_artifact_corrupt"),
-                action: GuardianActionKind::Repair,
-                status: GuardianArtifactRepairStatus::Repaired,
-                facts: vec![
-                    "https://example.invalid/client.jar?token=secret".to_string(),
-                    "/Users/alice/.axial/libraries/secret-client.jar".to_string(),
-                ],
-                summary: "guardian_artifact_repaired".to_string(),
-            },
-        );
-
-        let (status, payload) = fixture
-            .request_json(
-                Method::GET,
-                "/api/v1/install/repair-status-route-install/status",
-            )
-            .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["install_id"], install_id);
-        assert_eq!(payload["operation_id"], operation_id.as_str());
-        assert_eq!(payload["done"], true);
-        assert_eq!(payload["progress"][0]["phase"], "error");
-        assert_eq!(payload["progress"][0]["error"], INSTALL_FAILURE_MESSAGE);
-        assert_eq!(
-            payload["guardian_repair"]["diagnosis_id"],
-            "launcher_managed_artifact_corrupt"
-        );
-        assert_eq!(payload["guardian_repair"]["status"], "repaired");
-        assert_eq!(
-            payload["guardian_repair"]["repair_operation_id"],
-            "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174002"
-        );
-        assert!(
-            payload["guardian_repair"]["label"]
-                .as_str()
-                .is_some_and(|label| label.contains("repaired"))
-        );
-        assert_eq!(
-            payload["failure_view_model"]["state_id"],
-            "failed_repair_applied"
-        );
-        assert_eq!(payload["failure_view_model"]["title"], "Install failed");
-        assert_eq!(
-            payload["failure_view_model"]["retry_action"]["action"],
-            "retry"
-        );
-        assert_eq!(
-            payload["failure_view_model"]["retry_action"]["enabled"],
-            true
-        );
-        assert_eq!(
-            payload["failure_view_model"]["repair_action"]["action"],
-            "repair"
-        );
-        assert_eq!(
-            payload["failure_view_model"]["repair_action"]["enabled"],
-            false
-        );
-        assert!(
-            payload["proof"]["guardian_diagnosis_ids"]
-                .as_array()
-                .expect("proof diagnosis ids")
-                .iter()
-                .any(|id| id == "launcher_managed_artifact_corrupt")
-        );
-        assert_no_install_status_route_sensitive_fragments(&payload);
-    }
-
-    #[tokio::test]
-    async fn public_install_route_enqueues_behind_active_lane() {
-        let fixture = RouteInstallFixture::new("public-install-route-queue-lane");
-        let library_dir = fixture.root.join("library");
-        fs::create_dir_all(&library_dir).expect("library dir");
-        fixture
-            .state
-            .set_library_dir(library_dir.to_string_lossy().to_string());
-        fixture
-            .state
-            .installs()
-            .insert_or_existing_active(
-                "active-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
-            .await;
-        let install_started_at_ms = fixture
-            .state
-            .installs()
-            .install_started_at_ms("active-install")
-            .await
-            .expect("active install start time");
-        fixture
-            .state
-            .installs()
-            .enqueue_queued_install(
-                "queue-active".to_string(),
-                crate::state::InstallQueueSpec::vanilla("1.21.5".to_string(), String::new()),
-                crate::state::InstallQueuePlacement::Back,
-            )
-            .await;
-        fixture
-            .state
-            .installs()
-            .reserve_next_queued_install()
-            .await
-            .expect("active queue item");
-        assert!(
-            fixture
-                .state
-                .installs()
-                .mark_queued_install_started("queue-active", "active-install".to_string())
-                .await
-        );
-
-        let (status, payload) = fixture
-            .request_json_body(
-                Method::POST,
-                "/api/v1/install",
-                serde_json::json!({
-                    "version_id": "1.21.6",
-                    "manifest_url": ""
-                }),
-            )
-            .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["active"]["queue_id"], "queue-active");
-        assert_eq!(payload["active"]["install_id"], "active-install");
-        assert_eq!(
-            payload["active"]["install_started_at_ms"].as_u64(),
-            Some(install_started_at_ms)
-        );
-        assert_eq!(payload["items"].as_array().expect("queue items").len(), 1);
-        assert_eq!(payload["items"][0]["label"], "Minecraft 1.21.6");
-        assert!(payload["started_install"].is_null());
-        let snapshot = fixture.state.installs().queue_snapshot().await;
-        assert_eq!(
-            snapshot
-                .active
-                .as_ref()
-                .map(|active| active.queue_id.as_str()),
-            Some("queue-active")
-        );
-        assert_eq!(snapshot.pending.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn install_queue_enqueue_response_contains_started_active_item() {
-        let fixture = RouteInstallFixture::new("install-queue-enqueue-started-active");
-        let library_dir = fixture.root.join("library");
-        fs::create_dir_all(&library_dir).expect("library dir");
-        fixture
-            .state
-            .set_library_dir(library_dir.to_string_lossy().to_string());
-
-        let (status, payload) = fixture
-            .request_json_body(
-                Method::POST,
-                "/api/v1/install/queue",
-                serde_json::json!({
-                    "kind": "vanilla",
-                    "version_id": "1.21.6",
-                    "manifest_url": "http://127.0.0.1:9/version.json"
-                }),
-            )
-            .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["items"].as_array().expect("queue items").len(), 0);
-        assert_eq!(payload["active"]["kind"], "vanilla");
-        assert_eq!(payload["active"]["label"], "Minecraft 1.21.6");
-        assert_eq!(payload["active"]["install_item"]["version_id"], "1.21.6");
-        let active_install_id = payload["active"]["install_id"]
-            .as_str()
-            .expect("active install id");
-        assert!(!active_install_id.is_empty());
-        assert_eq!(
-            payload["started_install"]["install_id"].as_str(),
-            Some(active_install_id)
-        );
-        assert!(
-            payload["active"]["install_started_at_ms"]
-                .as_u64()
-                .is_some_and(|started_at| started_at > 0)
-        );
-        fixture
-            .state
-            .installs()
-            .finish_if_active(active_install_id, done_progress())
-            .await;
-    }
-
-    struct RouteInstallFixture {
-        state: AppState,
-        root: PathBuf,
-    }
-
-    impl RouteInstallFixture {
-        fn new(name: &str) -> Self {
-            let root = test_root(name);
-            let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            let instances =
-                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
-            let state = AppState::new(AppStateInit {
-                app_name: "Axial".to_string(),
-                version: "test".to_string(),
-                config,
-                instances,
-                installs: Arc::new(InstallStore::new()),
-                sessions: Arc::new(SessionStore::new()),
-                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
-                startup_warnings: Vec::new(),
-                frontend_dir: root.join("frontend"),
-            });
-
-            Self { state, root }
-        }
-
-        async fn request_json(&self, method: Method, uri: &str) -> (StatusCode, Value) {
-            let response = router()
-                .with_state(self.state.clone())
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("route response");
-            let status = response.status();
-            let body = to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("read body");
-            let payload = serde_json::from_slice(&body).expect("json response");
-            (status, payload)
-        }
-
-        async fn request_json_body(
-            &self,
-            method: Method,
-            uri: &str,
-            payload: Value,
-        ) -> (StatusCode, Value) {
-            let response = router()
-                .with_state(self.state.clone())
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .header("content-type", "application/json")
-                        .body(Body::from(payload.to_string()))
-                        .expect("request"),
-                )
-                .await
-                .expect("route response");
-            let status = response.status();
-            let body = to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("read body");
-            let payload = serde_json::from_slice(&body).expect("json response");
-            (status, payload)
-        }
-    }
-
-    impl Drop for RouteInstallFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn test_root(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "axial-api-install-route-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|value| value.as_nanos())
-                .unwrap_or_default()
-        ));
-        fs::create_dir_all(&path).expect("create test root");
-        path
-    }
-
-    fn test_paths(root: &std::path::Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
-    }
-
-    fn done_progress() -> DownloadProgress {
-        DownloadProgress {
-            phase: "done".to_string(),
-            current: 1,
-            total: 1,
-            file: None,
-            error: None,
-            done: true,
-            bytes_done: None,
-            bytes_total: None,
-        }
-    }
-
-    fn assert_no_install_status_route_sensitive_fragments(value: &Value) {
-        let text = value.to_string();
-        for material in [
-            "/Users/alice",
-            ".axial",
-            ".minecraft",
-            "secret-client.jar",
-            "provider_payload",
-            "accessToken",
-            "token=secret",
-            "https://example.invalid",
-            "client.jar?token",
+            ("expected_install_id=".to_owned(), StatusCode::BAD_REQUEST),
+            (
+                format!("expected_install_id={id}&expected_install_id={id}"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("expected_install_id={id}&unknown=true"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (format!("expected_install_id={id}"), StatusCode::NOT_FOUND),
         ] {
-            assert!(
-                !text.contains(material),
-                "public install status JSON exposed sensitive material {material}: {text}"
-            );
+            let (status, _) = post(
+                &services,
+                &format!("/api/v1/install/queue/retry?{query}"),
+                json!({"kind":"vanilla","version_id":"must-not-enqueue"}),
+            )
+            .await;
+            assert_eq!(status, expected, "{query}");
+            let snapshot = services.installs.snapshot();
+            assert!(snapshot.active.is_none());
+            assert!(snapshot.items.is_empty());
         }
+        services.server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn composed_retry_route_prioritizes_an_ordinary_intent() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requested = Arc::new(Semaphore::new(0));
+        let gate = Arc::new(Semaphore::new(0));
+        let provider = tokio::spawn({
+            let requested = requested.clone();
+            let gate = gate.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new().fallback(move || {
+                        let requested = requested.clone();
+                        let gate = gate.clone();
+                        async move {
+                            requested.add_permits(1);
+                            gate.acquire().await.unwrap().forget();
+                            StatusCode::BAD_GATEWAY
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let services = crate::start_profile_with_test_endpoints(
+            root.path().join("profile"),
+            axial_minecraft::download::InstallTestEndpoints::from_loopback_base_url(&base).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (status, response) = post(
+            &services,
+            "/api/v1/install/queue",
+            json!({
+                "kind":"vanilla", "version_id":"blocked"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        tokio::time::timeout(Duration::from_secs(5), requested.acquire())
+            .await
+            .expect("accepted installer reaches loopback provider")
+            .unwrap()
+            .forget();
+        let (status, response) = post(
+            &services,
+            "/api/v1/install/queue",
+            json!({
+                "kind":"vanilla", "version_id":"pending"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let (status, response) = post(
+            &services,
+            "/api/v1/install/queue/retry",
+            json!({
+                "kind":"vanilla", "version_id":"retry"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["items"][0]["install_item"]["version_id"], "retry");
+        assert_eq!(
+            response["items"][1]["install_item"]["version_id"],
+            "pending"
+        );
+        for item in response["items"].as_array().unwrap() {
+            services
+                .installs
+                .remove(item["queue_id"].as_str().unwrap())
+                .await
+                .unwrap();
+        }
+        gate.add_permits(32);
+        services.server.shutdown().await.unwrap();
+        provider.abort();
+    }
+
+    #[tokio::test]
+    async fn composed_retry_route_rejects_a_changed_pending_setup_before_queue_admission() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let services = crate::start_in_profile(root.path().join("profile"), None)
+            .await
+            .unwrap();
+        let id = InstanceId::new();
+        let library_id = services.library.admit().unwrap().library_id().to_string();
+        let registry = services.instances.registry();
+        let stored = json!({
+            "selection_id":"vanilla|1.21.4", "version_id":"1.21.4",
+            "target":{"loader":"vanilla", "game_version":"1.21.4", "supports_mods":false},
+            "selections":[{"canonical_id":"modrinth:accepted", "kind":"resource_pack", "version_id":"v1"}],
+            "install":{"kind":"vanilla", "version_id":"1.21.4"},
+            "fingerprint":"fixture", "expires_at_ms":0, "create":null
+        });
+        registry.storage().transaction(|tx| {
+            let reserved = registry.reserve(tx, Instance {
+                id: id.clone(), name:"Pending fixture".into(), version_id:"1.21.4".into(),
+                created_at:"2026-01-01T00:00:00Z".into(), last_played_at:String::new(),
+                art_seed:0, settings:InstanceSettings::default(), icon:String::new(),
+                accent:String::new(), loader_key:"vanilla".into(), minecraft_version:"1.21.4".into(), revision:1,
+            }, &library_id)?;
+            // This rejection fixture intentionally has no filesystem authority.
+            // Changed retry intent must fail before directory admission.
+            registry.commit_reserved(tx, &reserved, "unadmitted-retry-fixture")?;
+            tx.execute("INSERT INTO instance_setups(instance_id,plan_id,request_json,phase) VALUES(?1,?2,?3,'pending')", params![
+                id.as_str(), uuid::Uuid::new_v4().to_string(), stored.to_string(),
+            ])?;
+            Ok::<_, InstanceError>(())
+        }).unwrap();
+        let before = services.installs.snapshot();
+        let (status, response) = post(
+            &services,
+            "/api/v1/install/queue/retry",
+            json!({
+                "kind":"content", "instance_id":id, "label":"Setting up Pending fixture",
+                "action":{"kind":"install", "selections":[{
+                    "canonical_id":"modrinth:changed", "kind":"resource_pack", "version_id":"v2"
+                }], "allow_incompatible":false}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response}");
+        assert_eq!(
+            response,
+            json!({"error":InstanceError::Conflict.to_string()})
+        );
+        assert_eq!(services.installs.snapshot(), before);
+        assert!(
+            !services
+                .profile_root
+                .join("instances")
+                .join(id.as_str())
+                .exists()
+        );
+        services.server.shutdown().await.unwrap();
     }
 }

@@ -1,87 +1,47 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
-import { api } from '../../api';
-import { ensureFlags, refreshFlags, setFlagOverride } from '../../flags';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { saveConfigPatch } from '../../hooks/use-autosave';
+import { hasNativeDesktopRuntime, requestNativeAppReset } from '../../native';
 import { Button, Toggle } from '../../ui/Atoms';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
-import { navigate, ROUTE_STORAGE_KEY } from '../../ui-state';
-import { STORAGE_KEY } from '../../state';
-import { config, devMode, featureFlags, featureFlagsLoadState } from '../../store';
+import { navigate } from '../../ui-state';
+import { config, devMode } from '../../store';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
+import { InstanceImportRow } from './InstanceImportRow';
+import { reloadApplication } from '../../preferences/persistence';
 
 type PerformanceLabCardComponent = (typeof import('./PerformanceLabCard'))['PerformanceLabCard'];
+
+const loadPerformanceLabCard = __AXIAL_ENABLE_DEV_LAB__
+  ? async (): Promise<PerformanceLabCardComponent> => (await import('./PerformanceLabCard')).PerformanceLabCard
+  : null;
 
 function PerformanceLabSlot(): JSX.Element | null {
   const isDev = devMode.value;
   const [Lab, setLab] = useState<PerformanceLabCardComponent | null>(null);
 
   useEffect(() => {
-    if (!isDev) {
+    if (!isDev || !loadPerformanceLabCard) {
       setLab(null);
       return;
     }
 
     let alive = true;
-    void import('./PerformanceLabCard').then((module) => {
-      if (alive) setLab(() => module.PerformanceLabCard);
-    });
+    void loadPerformanceLabCard()
+      .then((component) => {
+        if (alive) setLab(() => component);
+      })
+      .catch((err: unknown) => {
+        if (alive) toast(`Could not load Performance Lab: ${errMessage(err)}`, 'error');
+      });
     return () => {
       alive = false;
     };
   }, [isDev]);
 
-  if (!isDev || !Lab) return null;
+  if (!loadPerformanceLabCard || !isDev || !Lab) return null;
   return <Lab />;
-}
-
-const FLAG_STAGE_NOTES = {
-  experimental: 'Experimental. May change or break.',
-  beta: 'Beta. May still change.',
-} as const;
-
-export function ExperimentalFlagRows(): JSX.Element | null {
-  const allFlags = featureFlags.value;
-  const loadState = featureFlagsLoadState.value;
-
-  useEffect(() => {
-    if (!featureFlags.value) void ensureFlags().catch(() => undefined);
-  }, []);
-
-  if (!allFlags) {
-    const failed = loadState.status === 'error';
-    return (
-      <SettingRow
-        title="Experimental flags"
-        description={
-          failed ? `Could not load feature flags: ${loadState.error || 'Unknown error'}` : 'Feature flags are loading.'
-        }
-        control={
-          failed ? (
-            <Button variant="secondary" icon="refresh" onClick={() => void refreshFlags().catch(() => undefined)}>
-              Retry
-            </Button>
-          ) : undefined
-        }
-      />
-    );
-  }
-
-  const flags = allFlags.filter((flag) => !flag.dev_only);
-  if (flags.length === 0) return null;
-
-  return (
-    <>
-      {flags.map((flag) => (
-        <SettingRow
-          key={flag.key}
-          title={flag.title}
-          description={`${flag.description} ${FLAG_STAGE_NOTES[flag.stage]}`}
-          control={<Toggle on={flag.enabled} onChange={() => void setFlagOverride(flag.key, !flag.enabled)} />}
-        />
-      ))}
-    </>
-  );
 }
 
 export function AdvancedSettingsSection(): JSX.Element {
@@ -90,7 +50,8 @@ export function AdvancedSettingsSection(): JSX.Element {
   const savedTelemetry = cfg?.telemetry_enabled === true;
   const [telemetryEnabled, setTelemetryEnabled] = useState(savedTelemetry);
   const [savingTelemetry, setSavingTelemetry] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const resetInFlight = useRef(false);
 
   useEffect(() => {
     setTelemetryEnabled(savedTelemetry);
@@ -102,9 +63,7 @@ export function AdvancedSettingsSection(): JSX.Element {
     setTelemetryEnabled(next);
     setSavingTelemetry(true);
     try {
-      const res: any = await api('PUT', '/config', { telemetry_enabled: next });
-      if (res?.error) throw new Error(res.error);
-      config.value = res;
+      await saveConfigPatch({ telemetry_enabled: next });
       toast('Saved');
     } catch (err) {
       setTelemetryEnabled(savedTelemetry);
@@ -114,24 +73,32 @@ export function AdvancedSettingsSection(): JSX.Element {
     }
   };
 
-  const flush = async (): Promise<void> => {
-    const { showConfirm } = await import('../../ui/Dialog');
-    const ok = await showConfirm('Delete all Axial-owned data and reset the launcher to first run?', {
-      destructive: true,
-      confirmText: 'Reset',
-    });
-    if (!ok) return;
-    setBusy(true);
+  const resetLauncher = async (): Promise<void> => {
+    if (!devMode.value || !hasNativeDesktopRuntime()) return;
+    if (resetInFlight.current) return;
+    resetInFlight.current = true;
     try {
-      await api('POST', '/dev/flush');
-      for (const key of [STORAGE_KEY, ROUTE_STORAGE_KEY]) {
-        localStorage.removeItem(key);
+      const { showConfirm } = await import('../../ui/Dialog');
+      const confirmed = await showConfirm(
+        'Stop active work, delete this isolated Axial rewrite development profile and its managed library, then restart? The window will close while cleanup finishes. If cleanup is delayed, Axial will keep retrying before restarting. If the process stops before cleanup finishes, Axial will ask before continuing at the next startup. Other Axial profiles, external libraries and saved Microsoft system credentials are preserved.',
+        {
+          destructive: true,
+          confirmText: 'Reset',
+        },
+      );
+      if (!confirmed) {
+        resetInFlight.current = false;
+        return;
       }
-      location.reload();
+
+      setResetting(true);
+      const requested = await requestNativeAppReset();
+      if (!requested) throw new Error('desktop runtime unavailable');
+      toast('Reset requested. Axial will close, finish cleanup, then restart.');
     } catch (err) {
-      toast(`Failed: ${errMessage(err)}`);
-    } finally {
-      setBusy(false);
+      resetInFlight.current = false;
+      setResetting(false);
+      toast(`Reset could not complete: ${errMessage(err)}`, 'error');
     }
   };
 
@@ -146,12 +113,12 @@ export function AdvancedSettingsSection(): JSX.Element {
         title="Reload launcher"
         description="Restarts the interface if something looks stuck or out of date."
         control={
-          <Button variant="secondary" icon="refresh" onClick={() => location.reload()}>
+          <Button variant="secondary" icon="refresh" onClick={reloadApplication}>
             Reload
           </Button>
         }
       />
-      <ExperimentalFlagRows />
+      <InstanceImportRow />
       {__AXIAL_ENABLE_DEV_LAB__ && isDev && (
         <SettingRow
           title="Dev lab"
@@ -163,14 +130,14 @@ export function AdvancedSettingsSection(): JSX.Element {
           }
         />
       )}
-      {isDev && <PerformanceLabSlot />}
-      {isDev && (
+      {__AXIAL_ENABLE_DEV_LAB__ && isDev && <PerformanceLabSlot />}
+      {isDev && hasNativeDesktopRuntime() && (
         <SettingRow
-          title="Flush all data"
-          description="Deletes every Axial-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
+          title="Reset launcher"
+          description="Stops active work and deletes this isolated rewrite development profile and its managed library. Other profiles, external libraries and saved Microsoft system credentials are preserved."
           control={
-            <Button variant="danger" icon="trash" disabled={busy} onClick={flush}>
-              {busy ? 'Flushing…' : 'Flush'}
+            <Button variant="danger" icon="trash" disabled={resetting} onClick={() => void resetLauncher()}>
+              {resetting ? 'Resetting…' : 'Reset'}
             </Button>
           }
         />

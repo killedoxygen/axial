@@ -1,0 +1,345 @@
+import type { JSX } from 'preact';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { Icon, type IconName } from './Icons';
+import { Kbd } from './Atoms';
+import { commandPaletteOpen, navigate, type Route, openCreate, openAccountSwitcher } from '../ui-state';
+import { instances, launchSessions } from '../store';
+import { Music } from '../music';
+import { local, saveLocalState } from '../state';
+import { Sound } from '../sound';
+import { applyTheme } from '../theme';
+import { useDraggableOverlay } from '../hooks/use-draggable-overlay';
+import { shortcutHint } from '../shortcuts';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
+
+type Group = 'jump' | 'instance' | 'action';
+
+interface Command {
+  id: string;
+  group: Group;
+  icon: IconName;
+  label: string;
+  hint?: string;
+  keywords?: string;
+  perform: () => void | Promise<void>;
+}
+
+const GROUP_LABELS: Record<Group, string> = {
+  jump: 'Jump to',
+  instance: 'Instances',
+  action: 'Actions',
+};
+
+function buildCommands(): Command[] {
+  const list: Command[] = [];
+  const close = (): void => {
+    commandPaletteOpen.value = false;
+  };
+  const goto =
+    (r: Route): Command['perform'] =>
+    () => {
+      navigate(r);
+      close();
+    };
+
+  list.push(
+    { id: 'jump:home', group: 'jump', icon: 'home', label: 'Home', perform: goto({ name: 'home' }) },
+    { id: 'jump:instances', group: 'jump', icon: 'stack', label: 'Instances', perform: goto({ name: 'instances' }) },
+    {
+      id: 'jump:discover',
+      group: 'jump',
+      icon: 'compass',
+      label: 'Discover mods and packs',
+      perform: goto({ name: 'discover' }),
+    },
+    {
+      id: 'jump:create',
+      group: 'jump',
+      icon: 'plus',
+      label: 'New instance',
+      hint: shortcutHint('new-instance'),
+      perform: () => {
+        openCreate();
+        close();
+      },
+    },
+    { id: 'jump:downloads', group: 'jump', icon: 'download', label: 'Downloads', perform: goto({ name: 'downloads' }) },
+    {
+      id: 'jump:accounts',
+      group: 'jump',
+      icon: 'user',
+      label: 'Accounts and skins',
+      perform: goto({ name: 'accounts' }),
+    },
+    {
+      id: 'jump:settings',
+      group: 'jump',
+      icon: 'settings',
+      label: 'Settings',
+      hint: shortcutHint('open-settings'),
+      perform: goto({ name: 'settings' }),
+    },
+  );
+
+  const sessions = launchSessions.value;
+  const list2 = instances.value;
+  for (const inst of list2.slice(0, 12)) {
+    const session = sessions[inst.id];
+    const isPlaying = launchSessionIsPlaying(session);
+    list.push({
+      id: `instance:${inst.id}`,
+      group: 'instance',
+      icon: isPlaying ? 'play' : 'stack',
+      label: session ? `Jump to ${inst.name}` : `Open ${inst.name}`,
+      hint: session ? launchSessionActivityLabel(session) : undefined,
+      keywords: inst.name,
+      perform: () => {
+        navigate({ name: 'instance', id: inst.id });
+        close();
+      },
+    });
+  }
+
+  const dark = local.lightness < 50;
+  list.push(
+    {
+      id: 'action:mode',
+      group: 'action',
+      icon: 'palette',
+      label: dark ? 'Switch to light mode' : 'Switch to dark mode',
+      perform: () => {
+        applyTheme(local.theme || 'custom', null, { lightness: dark ? 60 : 0 });
+        close();
+      },
+    },
+    {
+      id: 'action:music',
+      group: 'action',
+      icon: Music.enabled ? 'music-off' : 'music',
+      label: Music.enabled ? 'Mute background music' : 'Play background music',
+      perform: () => {
+        Music.toggle();
+        close();
+      },
+    },
+    {
+      id: 'action:sounds',
+      group: 'action',
+      icon: 'headphones',
+      label: local.sounds ? 'Turn UI sounds off' : 'Turn UI sounds on',
+      perform: () => {
+        local.sounds = !local.sounds;
+        Sound.enabled = local.sounds;
+        saveLocalState();
+        if (local.sounds) Sound.ui('affirm');
+        close();
+      },
+    },
+    {
+      id: 'action:account',
+      group: 'action',
+      icon: 'refresh',
+      label: 'Switch account',
+      perform: () => {
+        openAccountSwitcher();
+        close();
+      },
+    },
+    {
+      id: 'action:reload',
+      group: 'action',
+      icon: 'refresh',
+      label: 'Reload launcher',
+      hint: 'F5',
+      perform: () => {
+        location.reload();
+      },
+    },
+  );
+
+  return list;
+}
+
+function score(cmd: Command, q: string): number {
+  if (!q) return 1;
+  const hay = `${cmd.label} ${cmd.keywords || ''}`.toLowerCase();
+  const nq = q.toLowerCase();
+  if (hay.startsWith(nq)) return 4;
+  if (hay.includes(` ${nq}`)) return 3;
+  if (hay.includes(nq)) return 2;
+  let i = 0;
+  for (const ch of nq) {
+    i = hay.indexOf(ch, i);
+    if (i === -1) return 0;
+    i += 1;
+  }
+  return 1;
+}
+
+export function CommandPalette(): JSX.Element | null {
+  const open = commandPaletteOpen.value;
+  const [query, setQuery] = useState('');
+  const [active, setActive] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const commandCenterDrag = useDraggableOverlay<HTMLDivElement>({
+    id: 'command-center',
+    enabled: open,
+  });
+
+  const commands = open ? buildCommands() : [];
+
+  const filtered = useMemo(() => {
+    const scored = commands.map((c) => ({ cmd: c, s: score(c, query) })).filter((x) => x.s > 0);
+    scored.sort((a, b) => {
+      if (b.s !== a.s) return b.s - a.s;
+      const ga = a.cmd.group === 'instance' ? 0 : a.cmd.group === 'jump' ? 1 : 2;
+      const gb = b.cmd.group === 'instance' ? 0 : b.cmd.group === 'jump' ? 1 : 2;
+      return ga - gb;
+    });
+    return scored.map((x) => x.cmd);
+  }, [commands, query]);
+
+  useEffect(() => {
+    if (open) {
+      setQuery('');
+      setActive(0);
+    }
+  }, [open]);
+  useEffect(() => {
+    setActive((a) => Math.min(a, Math.max(0, filtered.length - 1)));
+  }, [filtered.length]);
+  useEffect(() => {
+    if (!open) return;
+    const frame = window.requestAnimationFrame(() => {
+      inputRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        commandPaletteOpen.value = false;
+        return;
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setActive((a) => Math.max(0, Math.min(filtered.length - 1, a + 1)));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setActive((a) => Math.max(0, a - 1));
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const cmd = filtered[active];
+        if (cmd) void cmd.perform();
+        return;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, active, filtered]);
+
+  useEffect(() => {
+    const el = listRef.current?.querySelector<HTMLElement>(`[data-idx="${active}"]`);
+    if (el) el.scrollIntoView({ block: 'nearest' });
+  }, [active]);
+
+  if (!open) return null;
+
+  const grouped: Array<{ group: Group; items: Array<{ cmd: Command; idx: number }> }> = [];
+  const bucket = new Map<Group, Array<{ cmd: Command; idx: number }>>();
+  filtered.forEach((cmd, idx) => {
+    const arr = bucket.get(cmd.group) || [];
+    arr.push({ cmd, idx });
+    bucket.set(cmd.group, arr);
+  });
+  (['instance', 'jump', 'action'] as Group[]).forEach((g) => {
+    const items = bucket.get(g);
+    if (items && items.length > 0) grouped.push({ group: g, items });
+  });
+
+  return (
+    <div
+      class="cp-cmd-overlay"
+      data-dragging={commandCenterDrag.isDragging}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) commandPaletteOpen.value = false;
+      }}
+    >
+      <div
+        class="cp-cmd"
+        ref={commandCenterDrag.surfaceRef}
+        style={commandCenterDrag.style}
+        data-dragging={commandCenterDrag.isDragging}
+        data-positioned={commandCenterDrag.isPositioned}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
+      >
+        <div class="cp-cmd-head" {...commandCenterDrag.dragHandleProps}>
+          <Icon name="search" size={15} color="var(--text-dim)" />
+          <input
+            class="cp-cmd-input"
+            autoFocus
+            ref={inputRef}
+            placeholder="Jump to…"
+            value={query}
+            onInput={(e: any) => setQuery(e.currentTarget.value)}
+          />
+          <span class="cp-cmd-drag-handle" aria-hidden="true" />
+          <Kbd>esc</Kbd>
+        </div>
+        <div class="cp-cmd-list" ref={listRef}>
+          {filtered.length === 0 ? (
+            <div class="cp-cmd-empty">
+              <Icon name="search" size={20} color="var(--text-mute)" />
+              <span>No matches</span>
+            </div>
+          ) : (
+            grouped.map((section) => (
+              <div key={section.group} class="cp-cmd-section">
+                <div class="cp-cmd-section-title">{GROUP_LABELS[section.group]}</div>
+                {section.items.map(({ cmd, idx }) => (
+                  <button
+                    key={cmd.id}
+                    class="cp-cmd-item"
+                    data-idx={idx}
+                    data-active={idx === active}
+                    onMouseMove={() => setActive(idx)}
+                    onClick={() => {
+                      void cmd.perform();
+                    }}
+                    data-sound-silent="true"
+                  >
+                    <Icon name={cmd.icon} size={15} stroke={1.8} />
+                    <span class="cp-cmd-label">{cmd.label}</span>
+                    {cmd.hint && <span class="cp-cmd-hint">{cmd.hint}</span>}
+                  </button>
+                ))}
+              </div>
+            ))
+          )}
+        </div>
+        <div class="cp-cmd-foot">
+          <span class="cp-cmd-foot-hint">
+            <Kbd>↑</Kbd>
+            <Kbd>↓</Kbd> move
+          </span>
+          <span class="cp-cmd-foot-hint">
+            <Kbd>↵</Kbd> select
+          </span>
+          <span class="cp-cmd-foot-hint">
+            <Kbd>esc</Kbd> close
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}

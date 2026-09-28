@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "maximum_bytes": {
+    "initial_javascript": 224726,
+    "initial_css": 191681,
+    "lazy_total": 1200989,
+    "public_assets": 1124651,
+    "largest_public_asset": 929167,
+    "largest_generated_output": 728258,
+    "generated_total": 1617396,
+    "packaged_payload": 2742047
+  }
+}

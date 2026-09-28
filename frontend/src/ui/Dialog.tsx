@@ -23,7 +23,7 @@ interface PromptOptions {
 }
 
 interface DialogSpec {
-  kind: 'confirm' | 'prompt' | 'alert' | 'choice';
+  kind: 'confirm' | 'prompt' | 'choice';
   title?: string;
   message: string;
   initialValue?: string;
@@ -61,20 +61,6 @@ export function showConfirm(
       cancelText: opts.cancelText === null ? null : opts.cancelText || 'Cancel',
       destructive: opts.destructive,
       resolve: (v) => resolve(v === true),
-    };
-  });
-}
-
-export function showAlert(message: string, title?: string): Promise<void> {
-  return new Promise((resolve) => {
-    cancelCurrent();
-    current.value = {
-      kind: 'alert',
-      title,
-      message,
-      confirmText: 'OK',
-      cancelText: null,
-      resolve: () => resolve(),
     };
   });
 }

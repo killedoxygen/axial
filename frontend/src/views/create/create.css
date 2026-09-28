@@ -134,13 +134,6 @@ html[data-color-mode='light'] .cp-cr-card {
   -webkit-mask-size: contain;
   mask-size: contain;
 }
-.cp-cr-loader-mark[data-loader='quilt'] {
-  translate: 2.1% 2.1%;
-}
-.cp-cr-loader-mark[data-loader='forge'] {
-  translate: 0 2.1%;
-}
-
 .cp-cr-notices {
   display: flex;
   flex-direction: column;

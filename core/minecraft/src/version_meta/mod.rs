@@ -142,30 +142,6 @@ pub fn enrich_version_entries(entries: &mut [VersionEntry], releases: &[ReleaseR
     }
 }
 
-pub fn apply_version_analysis(entry: &mut VersionEntry, releases: &[ReleaseReference]) {
-    let analysis_id = version_entry_analysis_id(entry).to_string();
-    let release_reference = releases.iter().find(|release| release.id == analysis_id);
-    let raw_kind = if release_reference.is_some() && entry.raw_kind.trim().is_empty() {
-        "release"
-    } else {
-        entry.raw_kind.as_str()
-    };
-    let release_time = release_reference
-        .map(|release| release.release_time.as_str())
-        .unwrap_or(entry.release_time.as_str());
-    let analysis = analyze_minecraft_version(&analysis_id, raw_kind, release_time, None, releases);
-    entry.lifecycle = analysis.lifecycle;
-    entry.minecraft_meta = analysis.minecraft_meta;
-    if let Some(release) = release_reference {
-        if entry.raw_kind.trim().is_empty() {
-            entry.raw_kind = "release".to_string();
-        }
-        if entry.release_time.trim().is_empty() {
-            entry.release_time = release.release_time.clone();
-        }
-    }
-}
-
 fn version_entry_analysis_id(entry: &VersionEntry) -> &str {
     if entry.inherits_from.trim().is_empty() {
         entry.id.as_str()

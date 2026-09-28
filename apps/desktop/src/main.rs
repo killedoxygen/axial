@@ -1,156 +1,338 @@
-mod commands;
+mod auth;
+mod bootstrap;
 mod discord_presence;
-mod events;
-mod state;
+mod import;
+mod lifecycle;
+mod native_skin;
+#[cfg(debug_assertions)]
+mod reset;
+mod startup;
+mod update;
+mod window;
 
-use axial_api::app::{
-    spawn_background, spawn_benchmark_suite_drivers_resume, spawn_performance_operations_resume,
-    spawn_performance_rules_refresh, spawn_remote_flags_refresh, spawn_telemetry_export,
-    spawn_update_staging_cleanup,
-};
-use axial_api::observability::telemetry::{
-    TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
-};
-use axial_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
-use axial_config::{AppPaths, ConfigStore, InstanceStore};
-use axial_performance::PerformanceManager;
-use std::sync::Arc;
-use tauri::{Emitter, Manager, WindowEvent};
-use tokio::runtime::Builder as TokioRuntimeBuilder;
-use tracing::info;
+use bootstrap::DesktopBootstrap;
+use lifecycle::DesktopLifecycle;
+use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
-const TOKIO_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+const CLOSE_BLOCKED_EVENT: &str = "axial:desktop:close-blocked";
+const API_STOPPED_EVENT: &str = "axial:desktop:api-stopped";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    TokioRuntimeBuilder::new_multi_thread()
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(TOKIO_WORKER_STACK_BYTES)
+        .thread_stack_size(8 * 1024 * 1024)
         .build()?
         .block_on(run())
 }
 
+fn app_context() -> tauri::Context<tauri::Wry> {
+    // The macro embeds platform symbols, so keep a single expansion.
+    tauri::generate_context!()
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
+    tauri::async_runtime::set(tokio::runtime::Handle::current());
+    let mut context = app_context();
+    if context.config().identifier != bootstrap::APPLICATION_ID {
+        return Err(std::io::Error::other(
+            "The desktop rewrite must use its independent application identity.",
+        )
+        .into());
+    }
+    let dev_origin = context
+        .config()
+        .build
+        .dev_url
+        .as_ref()
+        .map(|url| url.origin().ascii_serialization());
+    let mut window_configs = context
+        .config()
+        .app
+        .windows
+        .iter()
+        .filter(|config| config.label == window::MAIN_WINDOW);
+    let window_config = window_configs
+        .next()
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("The main desktop window is missing."))?;
+    if window_configs.next().is_some()
+        || window_config.create
+        || context.config().app.windows.len() != 1
+    {
+        return Err(std::io::Error::other(
+            "The main desktop window must have one manually created configuration.",
+        )
+        .into());
+    }
 
-    let paths = AppPaths::detect();
-    let config_startup = ConfigStore::load_for_startup(paths.clone())?;
-    let instance_startup = InstanceStore::load_for_startup(paths.clone());
-    let mut startup_warnings = config_startup.warnings;
-    startup_warnings.extend(instance_startup.warnings);
-    let config = Arc::new(config_startup.store);
-    let instances = Arc::new(instance_startup.store);
-    let installs = Arc::new(InstallStore::new());
-    let sessions = Arc::new(SessionStore::new());
-    let performance = Arc::new(PerformanceManager::new_with_config_dir(&paths.config_dir)?);
-    let state = AppState::new(AppStateInit {
-        app_name: "Axial".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        config,
-        instances,
-        installs,
-        sessions,
-        performance,
-        startup_warnings,
-        frontend_dir: axial_api::app::default_frontend_dir(),
-    });
-    let telemetry = state.telemetry().clone();
-    let discord_presence = discord_presence::spawn(state.clone());
-    spawn_performance_operations_resume(&state);
-    spawn_benchmark_suite_drivers_resume(&state);
-    spawn_performance_rules_refresh(&state);
-    spawn_telemetry_export(&state);
-    spawn_remote_flags_refresh(&state);
-    spawn_update_staging_cleanup(&state);
-    let close_event_state = state.clone();
-    let close_event_presence = discord_presence.clone();
-    let desktop_state = state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string());
-
-    let api = match spawn_background(state.clone()).await {
-        Ok(api) => api,
+    let services = match axial_api::start_desktop(dev_origin.as_deref()).await {
+        Ok(services) => services,
         Err(error) => {
-            emit_startup_failed(&telemetry);
-            discord_presence.shutdown_blocking();
-            return Err(Box::new(error));
+            let message = startup::report(context, error).await;
+            return Err(std::io::Error::other(message).into());
         }
     };
+    let presence = match discord_presence::PresenceObserver::start(
+        services.settings.clone(),
+        services.instances.clone(),
+        services.sessions.clone(),
+    ) {
+        Ok(presence) => presence,
+        Err(error) => {
+            tracing::error!(%error, "Could not start desktop presence; settling application services");
+            lifecycle::shutdown_server_after_failure(&services.server).await;
+            let message = startup::report(context, error.into()).await;
+            return Err(std::io::Error::other(message).into());
+        }
+    };
+    let skin_files =
+        native_skin::NativeSkinFiles::new(services.library.clone(), services.tasks.clone());
+    let imports = import::NativeImports::new(
+        services.library.clone(),
+        services.tasks.clone(),
+        services.imports.clone(),
+        services.catalog.clone(),
+        services.performance.rules().clone(),
+    );
+    let lifecycle = DesktopLifecycle::new(
+        services.tasks.clone(),
+        services.server.clone(),
+        presence,
+        skin_files.clone(),
+        services.skins.clone(),
+    )
+    .with_imports(imports.clone());
+    #[cfg(debug_assertions)]
+    let reset = match reset::NativeReset::new(services.library.clone(), services.tasks.clone()) {
+        Ok(reset) => reset,
+        Err(error) => {
+            lifecycle.shutdown_after_event_loop().await;
+            let message = startup::report(context, error.into()).await;
+            return Err(std::io::Error::other(message).into());
+        }
+    };
+    let transport = services.server.bootstrap();
+    if let Err(error) = bootstrap::confine_content_policy(context.config_mut(), &transport.base_url)
+    {
+        tracing::error!(%error, "Desktop transport policy failed; settling application services");
+        lifecycle.shutdown_after_event_loop().await;
+        return Err(error.into());
+    }
+    let bootstrap = match DesktopBootstrap::new(transport, dev_origin.as_deref()) {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            tracing::error!(%error, "Desktop bootstrap failed; settling application services");
+            lifecycle.shutdown_after_event_loop().await;
+            return Err(std::io::Error::other(error).into());
+        }
+    };
+    let webview_directory = services.profile_root.join("webview");
+    if let Err(error) = tokio::fs::create_dir_all(&webview_directory).await {
+        tracing::error!(%error, "Could not prepare desktop storage; settling application services");
+        lifecycle.shutdown_after_event_loop().await;
+        return Err(error.into());
+    }
 
-    info!("desktop shell connected to {}", api.addr);
-
-    let run_result = tauri::Builder::default()
-        .manage(desktop_state)
-        .manage(state)
+    let setup_bootstrap = bootstrap.clone();
+    let setup_server = services.server.clone();
+    let setup_lifecycle = lifecycle.clone();
+    let setup_updates = services.updates.clone();
+    let setup_tasks = services.tasks.clone();
+    let event_lifecycle = lifecycle.clone();
+    let event_bootstrap = bootstrap.clone();
+    let event_skin_files = skin_files.clone();
+    let api_observer = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let setup_api_observer = api_observer.clone();
+    let builder = tauri::Builder::default()
+        .manage(auth::NativeSignIn::new(
+            services.auth.clone(),
+            services.profile_root.join("oauth-webview"),
+        ))
+        .manage(bootstrap)
+        .manage(lifecycle.clone())
+        .manage(skin_files)
+        .manage(imports)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            commands::app_version,
-            commands::app_restart,
-            commands::api_base_url,
-            commands::desktop_chrome,
-            commands::microsoft_sign_in,
-            commands::read_skin_file,
-            commands::start_install_events,
-            commands::start_loader_install_events,
-            commands::start_launch_events,
-            commands::window_minimize,
-            commands::window_toggle_maximize,
-            commands::window_close,
-            commands::window_is_maximized,
-            commands::window_start_dragging,
-            commands::window_set_resize_background
-        ])
+            bootstrap::app_version,
+            auth::microsoft_sign_in,
+            native_skin::pick_skin_file,
+            native_skin::consume_skin_drop,
+            import::pick_import_profile,
+            import::pick_import_instance_source,
+            import::forget_import_profile,
+            bootstrap::api_transport_bootstrap,
+            window::desktop_chrome,
+            window::window_minimize,
+            window::window_toggle_maximize,
+            window::window_is_maximized,
+            window::window_start_dragging,
+            window::window_set_resize_background,
+            lifecycle::window_close,
+            lifecycle::app_restart,
+            lifecycle::pending_interface_preferences,
+            lifecycle::complete_interface_preferences,
+            #[cfg(debug_assertions)]
+            reset::app_reset,
+        ]);
+    #[cfg(debug_assertions)]
+    let builder = builder.manage(reset.clone());
+    let app = builder
         .on_window_event(move |window, event| {
+            if window.label() != crate::window::MAIN_WINDOW || event_lifecycle.exit_allowed() {
+                return;
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let window = window.clone();
-                let state = close_event_state.clone();
-                let discord_presence = close_event_presence.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Some(error) = commands::close_blocking_error(&state).await {
-                        let _ = window.emit(
-                            events::DESKTOP_CLOSE_BLOCKED,
-                            serde_json::json!({ "error": error }),
-                        );
-                        return;
-                    }
-                    commands::flush_pending_saved_skin_applies("window close request", &state)
-                        .await;
-                    let _ = tokio::task::spawn_blocking(move || {
-                        discord_presence.shutdown_blocking();
+                request_close(window.app_handle().clone(), event_lifecycle.clone());
+            } else if let WindowEvent::DragDrop(event) = event {
+                if window
+                    .app_handle()
+                    .get_webview_window(crate::window::MAIN_WINDOW)
+                    .is_some_and(|webview| {
+                        crate::window::require_main_window(&webview, &event_bootstrap).is_ok()
                     })
-                    .await;
-                    if let Err(error) = window.destroy() {
-                        tracing::warn!("failed to destroy window after close request: {error}");
-                    }
-                });
+                {
+                    event_skin_files.handle_drag(window, event);
+                }
             }
         })
         .setup(move |app| {
-            app.manage(state::ApiRuntimeState::new(api.addr));
+            #[cfg(debug_assertions)]
+            if app
+                .add_capability(
+                    tauri::ipc::CapabilityBuilder::new("development-reset")
+                        .window(window::MAIN_WINDOW)
+                        .permission("allow-app-reset"),
+                )
+                .is_err()
+            {
+                lifecycle::report_window_startup_failure(app.handle().clone(), setup_lifecycle);
+                return Ok(());
+            }
+            update::configure(
+                app.handle(),
+                setup_updates,
+                setup_tasks,
+                setup_lifecycle.clone(),
+            );
+            if window::build_main_window(
+                app.handle(),
+                &window_config,
+                webview_directory,
+                setup_bootstrap,
+            )
+            .is_err()
+            {
+                // Tauri panics if setup returns Err. Preserve application work
+                // in this event loop while native error UI reports the failure.
+                lifecycle::report_window_startup_failure(app.handle().clone(), setup_lifecycle);
+                return Ok(());
+            }
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = api.task.await;
-                let _ = handle.emit(events::DESKTOP_API_STOPPED, serde_json::json!({}));
+            let mut preferences = setup_lifecycle.interface_preferences_events();
+            let observer = tokio::spawn(async move {
+                let waiting = setup_server.wait();
+                tokio::pin!(waiting);
+                loop {
+                    let event = preferences.borrow_and_update().clone();
+                    if let Some(event) = event {
+                        if handle.emit_to(window::MAIN_WINDOW, lifecycle::PREFERENCES_EVENT, &event).is_err() {
+                            setup_lifecycle.interface_preferences_delivery_failed(&event);
+                        }
+                    }
+                    tokio::select! {
+                        result = &mut waiting => {
+                            if result.is_err() { tracing::error!("The embedded API stopped unexpectedly."); }
+                            break;
+                        }
+                        changed = preferences.changed() => {
+                            if changed.is_err() { break; }
+                        }
+                    }
+                }
+                let _ = handle.emit_to(
+                    window::MAIN_WINDOW,
+                    API_STOPPED_EVENT,
+                    serde_json::json!({}),
+                );
             });
+            *setup_api_observer
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(observer);
             Ok(())
         })
-        .run(tauri::generate_context!());
-
-    if let Err(error) = run_result {
-        emit_startup_failed(&telemetry);
-        discord_presence.shutdown_blocking();
-        return Err(Box::new(error));
+        .build(context);
+    let app = match app {
+        Ok(app) => app,
+        Err(error) => {
+            tracing::error!(%error, "Could not build the desktop shell; settling application services");
+            lifecycle.shutdown_after_event_loop().await;
+            return Err(error.into());
+        }
+    };
+    let restart_environment = app.env();
+    let exit_lifecycle = lifecycle.clone();
+    let exit_code = app.run_return(move |app, event| {
+        // Menu Quit, operating-system close and custom chrome use the same fence.
+        if let RunEvent::ExitRequested { api, .. } = event {
+            if !exit_lifecycle.exit_allowed() {
+                api.prevent_exit();
+                request_close(app.clone(), exit_lifecycle.clone());
+            }
+        }
+    });
+    lifecycle.shutdown_after_event_loop().await;
+    #[cfg(debug_assertions)]
+    reset.quiesce_after_exit().await;
+    let observer = api_observer
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if let Some(observer) = observer {
+        let _ = observer.await;
     }
-
-    discord_presence.shutdown_blocking();
-
+    while let Err(error) = lifecycle.release_services_after_exit() {
+        tracing::warn!(%error, "Native services remain retained after event-loop shutdown");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    #[cfg(debug_assertions)]
+    let pending_reset = reset.take_after_exit();
+    let restart_after_exit = lifecycle.restart_after_exit();
+    // Managed native facades may outlive the event loop. Their shared service
+    // references are now released; drop main's remaining owners before reset.
+    drop(lifecycle);
+    drop(services);
+    #[cfg(debug_assertions)]
+    {
+        drop(reset);
+        if let Some(pending) = pending_reset {
+            startup::complete_reset(pending).await;
+            tauri::process::restart(&restart_environment);
+        }
+    }
+    if exit_code != 0 {
+        return Err(std::io::Error::other(
+            "The desktop shell could not start. Application work has settled.",
+        )
+        .into());
+    }
+    if restart_after_exit {
+        tauri::process::restart(&restart_environment);
+    }
     Ok(())
 }
 
-fn emit_startup_failed(telemetry: &Arc<TelemetryHub>) {
-    telemetry.emit_sync_best_effort(TelemetryEvent::error_captured(
-        TelemetryErrorKind::StartupFailed,
-        TelemetryErrorArea::Startup,
-        TelemetryErrorLevel::Error,
-        "Backend startup failed.",
-    ));
+fn request_close(app: tauri::AppHandle, lifecycle: DesktopLifecycle) {
+    tokio::spawn(async move {
+        if let Err(error) = lifecycle::request_window_close(app.clone(), lifecycle).await {
+            let _ = app.emit_to(
+                window::MAIN_WINDOW,
+                CLOSE_BLOCKED_EVENT,
+                serde_json::json!({ "error": error }),
+            );
+        }
+    });
 }

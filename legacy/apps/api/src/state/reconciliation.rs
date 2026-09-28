@@ -1,0 +1,8115 @@
+use super::contracts::{
+    CommandKind, OperationId, OperationJournalEntry, OperationJournalStep, OperationOutcome,
+    OperationPhase, OperationStatus, OperationStepResult, OwnershipClass, ReconciliationAttempt,
+    ReconciliationComponent, ReconciliationIncarnationFingerprint,
+    ReconciliationInventoryFingerprint, ReconciliationLineage, ReconciliationQuarantineCheckpoint,
+    ReconciliationQuarantineRecord, ReconciliationRung, ReconciliationScope,
+    ReconciliationTerminal, ReconciliationTerminalOutcome, ReconciliationVersionBundleOutcome,
+    RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
+};
+use super::failure_memory::{
+    FailureMemoryActionOutcome, FailureMemoryKey, FailureMemoryStoreError,
+    GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
+    ReconciliationAttemptReservation as StoreReconciliationAttemptReservation,
+    ReconciliationAttemptReserveError,
+};
+use super::registered_artifact_findings::{
+    RegisteredArtifactProvenance, RegisteredArtifactProvenanceContext,
+    RegisteredArtifactRepairAuthorization, RegisteredArtifactRepairEffect,
+    recorded_artifact_provenance_matches, registered_artifact_target,
+    resolve_recorded_artifact_provenance,
+};
+use super::sessions::{RecoveringSessionMutationScope, SharedComponentMutationLease};
+use super::{
+    AppState, InstanceLifecycleLease, KnownGoodVerificationLease, KnownGoodVerificationOwner,
+    LibraryOperation, OperationJournalStore, OperationJournalStoreError,
+};
+use crate::execution::registered_artifact::{
+    RegisteredArtifactExactProof, RegisteredArtifactExactVerification,
+    RegisteredArtifactExactVerifier,
+};
+use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
+use axial_config::is_canonical_instance_id;
+use axial_minecraft::known_good::{KnownGoodIntegrity, known_good_entry_path};
+use axial_minecraft::runtime::{
+    ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
+    ManagedRuntimeQuarantineObservation, RuntimeId, is_known_runtime_component,
+};
+use axial_minecraft::{
+    ManagedAssetsCommitReceipt, ManagedAssetsRollbackEffect, ManagedAssetsRollbackReceipt,
+    ManagedLibrariesCommitReceipt, ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt,
+    ManagedRuntimeCache, ManagedVersionBundleAcknowledgementOutcome,
+    ManagedVersionBundleCommitReceipt, ManagedVersionBundleExpectedSettlement,
+    ManagedVersionBundleOrphanOutcome, ManagedVersionBundleRollbackReceipt,
+    ManagedVersionBundleSettlementOutcome, recover_guardian_version_bundle_orphan,
+    recover_managed_version_bundle_acknowledgement,
+};
+use sha2::{Digest, Sha256};
+use std::io;
+use std::path::{Path, PathBuf};
+
+const RECONCILIATION_FINGERPRINT_DOMAIN: &[u8] = b"axial.guardian.reconciliation.incarnation.v1";
+const RECONCILIATION_INVENTORY_FINGERPRINT_DOMAIN: &[u8] =
+    b"axial.guardian.reconciliation.inventory.v1";
+const RECONCILIATION_INVENTORY_ENTRY_DOMAIN: &[u8] =
+    b"axial.guardian.reconciliation.inventory-entry.v1";
+pub(crate) const REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT: &str =
+    "require_registered_artifact_component_rebuild";
+pub(crate) const COMPONENT_REBUILD_START_STEP: &str = "journal_component_rebuild_start";
+pub(crate) const COMPONENT_QUARANTINE_STEP: &str = "quarantine_launcher_managed_target";
+pub(crate) const RUNTIME_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_runtime_component";
+pub(crate) const VERSION_BUNDLE_COMPONENT_REBUILD_STEP: &str =
+    "rebuild_managed_version_bundle_component";
+pub(crate) const LIBRARIES_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_libraries_component";
+pub(crate) const ASSETS_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_assets_component";
+
+pub(crate) struct RecordedRuntimeArtifactRepairFailure {
+    evidence: RecordedReconciliationFailure,
+}
+
+#[must_use]
+pub(crate) struct RegisteredArtifactFailedRepair {
+    evidence: RecordedReconciliationFailure,
+    verification: KnownGoodVerificationLease,
+    recovery_scope: Option<RecoveringSessionMutationScope>,
+    resume_attempt: Option<ReconciliationAttempt>,
+}
+
+#[must_use]
+pub(crate) enum RegisteredArtifactRecoveryEntry {
+    Fresh(RegisteredArtifactRepairAuthorization),
+    Resume(RegisteredArtifactFailedRepair),
+}
+
+pub(crate) struct RegisteredComponentRebuildAdmission {
+    authority: RegisteredReconciliationAuthority,
+    attempt: ReconciliationAttempt,
+    resumed: bool,
+    failed_terminal: ReconciliationTerminal,
+    known_good: RegisteredKnownGoodAuthority,
+    artifact_provenance: Option<RegisteredArtifactProvenance>,
+    component_state: RegisteredComponentRebuildState,
+    _component_mutation: SharedComponentMutationLease,
+    _config_mutation: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[cfg(test)]
+pub(crate) struct ReconciliationHandCoverage {
+    pub(crate) admission_type: &'static str,
+    pub(crate) rung: ReconciliationRung,
+    pub(crate) max_attempts_per_suppression_window: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn reconciliation_hand_coverage() -> Vec<ReconciliationHandCoverage> {
+    ReconciliationRung::ALL
+        .iter()
+        .copied()
+        .map(|rung| match rung {
+            ReconciliationRung::RepairArtifact => reconciliation_hand::<
+                super::registered_artifact_findings::RegisteredArtifactRepairAdmission,
+            >(rung),
+            ReconciliationRung::RebuildComponent => {
+                reconciliation_hand::<RegisteredComponentRebuildAdmission>(rung)
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn reconciliation_hand<Admission>(rung: ReconciliationRung) -> ReconciliationHandCoverage {
+    ReconciliationHandCoverage {
+        admission_type: std::any::type_name::<Admission>()
+            .rsplit("::")
+            .next()
+            .expect("admission type name"),
+        rung,
+        max_attempts_per_suppression_window: rung.max_attempts_per_suppression_window(),
+    }
+}
+
+enum RegisteredComponentRebuildState {
+    Runtime {
+        runtime_cache: ManagedRuntimeCache,
+        postcondition_failure_source: std::sync::OnceLock<
+            std::sync::Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
+        >,
+    },
+    VersionBundle,
+    Libraries,
+    Assets,
+}
+
+pub(crate) struct RegisteredVersionBundleComponentRebuildEffect {
+    library_operation: LibraryOperation,
+    source: std::sync::Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
+}
+
+pub(crate) struct RegisteredLibrariesComponentRebuildEffect {
+    library_operation: LibraryOperation,
+    version_id: String,
+}
+
+pub(crate) struct RegisteredAssetsComponentRebuildEffect {
+    library_operation: LibraryOperation,
+    version_id: String,
+}
+
+struct ManagedArtifactCoreRequest {
+    version_id: String,
+    source: std::sync::Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
+}
+
+pub(crate) enum RegisteredManagedArtifactComponentEffectAdmission<Request> {
+    Admitted {
+        request: Request,
+        completion: Box<RegisteredManagedArtifactComponentCompletion>,
+    },
+    Refused(Box<RegisteredManagedArtifactComponentSettlement>),
+}
+
+pub(crate) struct RegisteredManagedArtifactComponentCompletion {
+    authority: ManagedArtifactCompletionAuthority,
+}
+
+pub(crate) enum RegisteredManagedArtifactCommitPostcheck {
+    Verify {
+        pending: RegisteredManagedArtifactPendingPostcheck,
+        verifier: RegisteredArtifactExactVerifier,
+    },
+    Failed(RegisteredManagedArtifactComponentSettlement),
+}
+
+pub(crate) struct RegisteredManagedArtifactPendingPostcheck {
+    authority: ManagedArtifactCompletionAuthority,
+    verification: RegisteredArtifactExactVerification,
+    publication: ManagedArtifactPublicationLease,
+}
+
+pub(crate) struct RegisteredManagedArtifactComponentSettlement {
+    durable: ManagedArtifactDurableAuthority,
+    terminal: ReconciliationTerminal,
+    _lifecycle: Option<InstanceLifecycleLease>,
+    // Drop exact proof authority before releasing publication exclusion.
+    _proof: Option<RegisteredArtifactExactProof>,
+    _publication: Option<ManagedArtifactPublicationLease>,
+}
+
+#[derive(Clone)]
+struct StartupVersionBundlePublicationRequirement {
+    journal_terminal: ReconciliationTerminal,
+    memory_terminal: ReconciliationTerminal,
+}
+
+#[derive(Clone)]
+struct StartupVersionBundleOrphanRequirement {
+    attempt: ReconciliationAttempt,
+}
+
+pub(crate) enum RegisteredVersionBundlePublication {
+    Committed(ManagedVersionBundleCommitReceipt),
+    RolledBack(ManagedVersionBundleRollbackReceipt),
+}
+
+pub(crate) struct RegisteredVersionBundlePublicationAcknowledgement {
+    state: AppState,
+    terminal: ReconciliationTerminal,
+}
+
+struct ManagedArtifactCompletionAuthority {
+    durable: ManagedArtifactDurableAuthority,
+    library_operation: Option<LibraryOperation>,
+    owner: KnownGoodVerificationOwner,
+    known_good: RegisteredKnownGoodAuthority,
+    runtime_cache: ManagedRuntimeCache,
+    provenance: RegisteredArtifactProvenance,
+    component: ManagedArtifactRebuildComponent,
+    managed_artifact_epoch: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+}
+
+struct ManagedArtifactDurableAuthority {
+    state: AppState,
+    attempt: ReconciliationAttempt,
+    failed_terminal: ReconciliationTerminal,
+    _component_mutation: SharedComponentMutationLease,
+    _config_mutation: tokio::sync::OwnedMutexGuard<()>,
+}
+
+enum ManagedArtifactPublicationLease {
+    VersionBundleCommit {
+        _receipt: ManagedVersionBundleCommitReceipt,
+    },
+    VersionBundleRollback {
+        _receipt: ManagedVersionBundleRollbackReceipt,
+    },
+    LibrariesCommit(ManagedLibrariesCommitReceipt),
+    LibrariesRollback(ManagedLibrariesRollbackReceipt),
+    AssetsCommit(ManagedAssetsCommitReceipt),
+    AssetsRollback(ManagedAssetsRollbackReceipt),
+}
+
+impl ManagedArtifactPublicationLease {
+    fn version_bundle_publication(
+        &self,
+    ) -> Option<(
+        axial_minecraft::ManagedInstallPublicationEvidenceId,
+        ReconciliationVersionBundleOutcome,
+    )> {
+        match self {
+            Self::VersionBundleCommit { _receipt } => Some((
+                _receipt.evidence_id().clone(),
+                ReconciliationVersionBundleOutcome::Committed,
+            )),
+            Self::VersionBundleRollback { _receipt } => Some((
+                _receipt.evidence_id().clone(),
+                ReconciliationVersionBundleOutcome::RolledBack,
+            )),
+            Self::LibrariesCommit(_)
+            | Self::LibrariesRollback(_)
+            | Self::AssetsCommit(_)
+            | Self::AssetsRollback(_) => None,
+        }
+    }
+}
+
+impl RegisteredVersionBundleComponentRebuildEffect {
+    pub(crate) fn core_request(
+        &self,
+    ) -> (
+        &LibraryOperation,
+        &axial_minecraft::known_good::KnownGoodActivationSource,
+    ) {
+        (&self.library_operation, self.source.as_ref())
+    }
+}
+
+impl RegisteredLibrariesComponentRebuildEffect {
+    pub(crate) fn core_request(&self) -> (&LibraryOperation, &str) {
+        (&self.library_operation, &self.version_id)
+    }
+}
+
+impl RegisteredAssetsComponentRebuildEffect {
+    pub(crate) fn core_request(&self) -> (&LibraryOperation, &str) {
+        (&self.library_operation, &self.version_id)
+    }
+}
+
+impl RegisteredManagedArtifactComponentCompletion {
+    #[cfg(test)]
+    pub(crate) fn operation_id_for_test(&self) -> &OperationId {
+        self.authority.durable.attempt.operation_id()
+    }
+
+    pub(crate) fn into_failed_settlement(self) -> RegisteredManagedArtifactComponentSettlement {
+        self.authority.durable.failed(None)
+    }
+
+    pub(crate) async fn begin_libraries_commit(
+        self,
+        receipt: ManagedLibrariesCommitReceipt,
+    ) -> RegisteredManagedArtifactCommitPostcheck {
+        let epoch_is_current = self.authority.managed_artifact_epoch_is_current();
+        let publication = ManagedArtifactPublicationLease::LibrariesCommit(receipt);
+        let valid = match &publication {
+            ManagedArtifactPublicationLease::LibrariesCommit(receipt) => {
+                epoch_is_current
+                    && self.authority.library_operation_is_current()
+                    && self.authority.component == ManagedArtifactRebuildComponent::Libraries
+                    && receipt.version_id() == self.authority.known_good.version_id
+                    && self
+                        .authority
+                        .library_operation
+                        .as_ref()
+                        .is_some_and(|operation| receipt.matches_managed_library(operation.core()))
+                    && receipt.matches_known_good_inventory(self.authority.known_good.inventory())
+                    && receipt.revalidate().await
+            }
+            _ => unreachable!(),
+        };
+        self.begin_commit_postcheck(publication, valid).await
+    }
+
+    pub(crate) async fn begin_version_bundle_commit(
+        self,
+        receipt: ManagedVersionBundleCommitReceipt,
+    ) -> RegisteredManagedArtifactCommitPostcheck {
+        let valid = self.authority.managed_artifact_epoch_is_current()
+            && self.authority.library_operation_is_current()
+            && self.authority.component == ManagedArtifactRebuildComponent::VersionBundle
+            && receipt.version_id() == self.authority.known_good.version_id
+            && receipt
+                .matches_activation_contract(self.authority.known_good.activation_contract_id())
+            && self
+                .authority
+                .library_operation
+                .as_ref()
+                .is_some_and(|operation| receipt.matches_managed_library(operation.core()))
+            && receipt.matches_known_good_inventory(self.authority.known_good.inventory())
+            && receipt.revalidate().await;
+        let publication =
+            ManagedArtifactPublicationLease::VersionBundleCommit { _receipt: receipt };
+        self.begin_commit_postcheck(publication, valid).await
+    }
+
+    pub(crate) async fn begin_assets_commit(
+        self,
+        receipt: ManagedAssetsCommitReceipt,
+    ) -> RegisteredManagedArtifactCommitPostcheck {
+        let epoch_is_current = self.authority.managed_artifact_epoch_is_current();
+        let publication = ManagedArtifactPublicationLease::AssetsCommit(receipt);
+        let valid = match &publication {
+            ManagedArtifactPublicationLease::AssetsCommit(receipt) => {
+                epoch_is_current
+                    && self.authority.library_operation_is_current()
+                    && self.authority.component == ManagedArtifactRebuildComponent::Assets
+                    && receipt.version_id() == self.authority.known_good.version_id
+                    && self
+                        .authority
+                        .library_operation
+                        .as_ref()
+                        .is_some_and(|operation| receipt.matches_managed_library(operation.core()))
+                    && receipt.matches_known_good_inventory(self.authority.known_good.inventory())
+                    && receipt.revalidate().await
+            }
+            _ => unreachable!(),
+        };
+        self.begin_commit_postcheck(publication, valid).await
+    }
+
+    pub(crate) async fn settle_libraries_rollback(
+        self,
+        receipt: ManagedLibrariesRollbackReceipt,
+    ) -> (RegisteredManagedArtifactComponentSettlement, bool) {
+        let publication = ManagedArtifactPublicationLease::LibrariesRollback(receipt);
+        let valid = match &publication {
+            ManagedArtifactPublicationLease::LibrariesRollback(receipt) => {
+                self.authority.library_operation_is_current()
+                    && self.authority.component == ManagedArtifactRebuildComponent::Libraries
+                    && receipt.version_id() == self.authority.known_good.version_id
+                    && libraries_rollback_has_effect(receipt.effect())
+                    && self
+                        .authority
+                        .library_operation
+                        .as_ref()
+                        .is_some_and(|operation| receipt.matches_managed_library(operation.core()))
+                    && receipt.matches_known_good_inventory(self.authority.known_good.inventory())
+            }
+            _ => unreachable!(),
+        };
+        (self.authority.durable.failed(Some(publication)), valid)
+    }
+
+    pub(crate) async fn settle_version_bundle_rollback(
+        self,
+        receipt: ManagedVersionBundleRollbackReceipt,
+    ) -> (RegisteredManagedArtifactComponentSettlement, bool) {
+        let valid = self.authority.component == ManagedArtifactRebuildComponent::VersionBundle
+            && self.authority.library_operation_is_current()
+            && receipt.version_id() == self.authority.known_good.version_id
+            && receipt
+                .matches_activation_contract(self.authority.known_good.activation_contract_id())
+            && self
+                .authority
+                .library_operation
+                .as_ref()
+                .is_some_and(|operation| receipt.matches_managed_library(operation.core()))
+            && receipt.matches_known_good_inventory(self.authority.known_good.inventory());
+        let publication =
+            ManagedArtifactPublicationLease::VersionBundleRollback { _receipt: receipt };
+        (self.authority.durable.failed(Some(publication)), valid)
+    }
+
+    pub(crate) async fn settle_assets_rollback(
+        self,
+        receipt: ManagedAssetsRollbackReceipt,
+    ) -> (RegisteredManagedArtifactComponentSettlement, bool) {
+        let publication = ManagedArtifactPublicationLease::AssetsRollback(receipt);
+        let valid = match &publication {
+            ManagedArtifactPublicationLease::AssetsRollback(receipt) => {
+                self.authority.library_operation_is_current()
+                    && self.authority.component == ManagedArtifactRebuildComponent::Assets
+                    && receipt.version_id() == self.authority.known_good.version_id
+                    && assets_rollback_has_effect(receipt.effect())
+                    && self
+                        .authority
+                        .library_operation
+                        .as_ref()
+                        .is_some_and(|operation| receipt.matches_managed_library(operation.core()))
+                    && receipt.matches_known_good_inventory(self.authority.known_good.inventory())
+            }
+            _ => unreachable!(),
+        };
+        (self.authority.durable.failed(Some(publication)), valid)
+    }
+
+    async fn begin_commit_postcheck(
+        self,
+        publication: ManagedArtifactPublicationLease,
+        receipt_is_valid: bool,
+    ) -> RegisteredManagedArtifactCommitPostcheck {
+        if !receipt_is_valid || !self.authority.managed_artifact_epoch_is_current() {
+            return RegisteredManagedArtifactCommitPostcheck::Failed(
+                self.authority.durable.failed(Some(publication)),
+            );
+        }
+        let Some(entry) = self
+            .authority
+            .known_good
+            .inventory()
+            .entries()
+            .get(self.authority.provenance.inventory_ordinal())
+        else {
+            return RegisteredManagedArtifactCommitPostcheck::Failed(
+                self.authority.durable.failed(Some(publication)),
+            );
+        };
+        let (expected_sha1, expected_size) = match entry.integrity() {
+            KnownGoodIntegrity::Sha1 { digest, size }
+            | KnownGoodIntegrity::ExactBytes { digest, size } => {
+                (digest.as_str().to_string(), *size)
+            }
+            KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => {
+                return RegisteredManagedArtifactCommitPostcheck::Failed(
+                    self.authority.durable.failed(Some(publication)),
+                );
+            }
+        };
+        let path = known_good_entry_path(
+            &self.authority.known_good.library_root,
+            &self.authority.runtime_cache,
+            entry,
+        );
+        let Ok((verifier, verification)) = RegisteredArtifactExactVerifier::mint(
+            std::sync::Arc::clone(self.authority.durable.state.root_session()),
+            path,
+            expected_sha1,
+            expected_size,
+        )
+        .await
+        else {
+            return RegisteredManagedArtifactCommitPostcheck::Failed(
+                self.authority.durable.failed(Some(publication)),
+            );
+        };
+        RegisteredManagedArtifactCommitPostcheck::Verify {
+            pending: RegisteredManagedArtifactPendingPostcheck {
+                authority: self.authority,
+                verification,
+                publication,
+            },
+            verifier,
+        }
+    }
+}
+
+impl RegisteredManagedArtifactPendingPostcheck {
+    pub(crate) async fn settle(
+        self,
+        proof: Option<RegisteredArtifactExactProof>,
+    ) -> RegisteredManagedArtifactComponentSettlement {
+        let Some(proof) = proof else {
+            return self.authority.durable.failed(Some(self.publication));
+        };
+        let instance_id = self.authority.known_good.instance_id.as_str();
+        let Some(lifecycle) = self
+            .authority
+            .durable
+            .state
+            .try_acquire_instance_lifecycle(instance_id)
+            .await
+        else {
+            return self.authority.durable.failed(Some(self.publication));
+        };
+        let Ok(proof) = self.verification.validate(proof).await else {
+            return self.authority.durable.failed(Some(self.publication));
+        };
+        if !self.authority.is_live_with(&lifecycle) {
+            return self.authority.durable.failed(Some(self.publication));
+        }
+        self.authority.succeeded(lifecycle, self.publication, proof)
+    }
+}
+
+impl ManagedArtifactCompletionAuthority {
+    fn managed_artifact_epoch_is_current(&self) -> bool {
+        self.durable
+            .state
+            .managed_artifact_mutation_epoch_is_current(self.managed_artifact_epoch.as_ref())
+    }
+
+    fn library_operation_is_current(&self) -> bool {
+        self.library_operation.as_ref().is_some_and(|operation| {
+            self.durable
+                .state
+                .validate_managed_library_operation(operation)
+                .is_ok()
+        })
+    }
+
+    fn is_live_with(&self, lifecycle: &InstanceLifecycleLease) -> bool {
+        if !lifecycle.matches(&self.known_good.instance_id)
+            || !self.managed_artifact_epoch_is_current()
+            || !self.library_operation_is_current()
+            || !self.owner_is_live()
+            || !self.durable.state.known_good_authority_is_current(
+                &self.known_good.instance_id,
+                &self.known_good.version_id,
+                &self.known_good.created_at,
+                &self.known_good.library_root,
+                &self.runtime_cache,
+                &self.known_good.source,
+            )
+        {
+            return false;
+        }
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+            inventory_fingerprint,
+            activation_contract_id,
+        } = self.durable.attempt.scope();
+        let Ok(current) = self
+            .durable
+            .state
+            .current_reconciliation_incarnation(instance_id)
+        else {
+            return false;
+        };
+        if instance_id != &self.known_good.instance_id
+            || fingerprint != &current.fingerprint
+            || inventory_fingerprint != &current.inventory_fingerprint
+            || activation_contract_id != current.source.activation_contract_id()
+            || current.roots.library != self.known_good.library_root
+        {
+            return false;
+        }
+        recorded_artifact_provenance_matches(
+            RegisteredArtifactProvenanceContext::new(
+                &self.known_good.instance_id,
+                &self.known_good.version_id,
+                &self.known_good.created_at,
+                &self.known_good.library_root,
+                &current.roots.runtime,
+                self.known_good.inventory(),
+            ),
+            &self.durable.attempt,
+            self.provenance,
+        ) && self.owner_is_live()
+    }
+
+    fn owner_is_live(&self) -> bool {
+        match &self.owner {
+            KnownGoodVerificationOwner::Foreground(foreground) => self
+                .durable
+                .state
+                .validate_integrity_foreground(foreground)
+                .is_ok(),
+            KnownGoodVerificationOwner::IdleSweep(authority) => {
+                self.durable.state.idle_sweep_authority_is_active(authority)
+            }
+        }
+    }
+
+    fn succeeded(
+        self,
+        lifecycle: InstanceLifecycleLease,
+        publication: ManagedArtifactPublicationLease,
+        proof: RegisteredArtifactExactProof,
+    ) -> RegisteredManagedArtifactComponentSettlement {
+        let mut terminal = ReconciliationTerminal::from_attempt(
+            self.durable.attempt.clone(),
+            ReconciliationTerminalOutcome::Succeeded,
+            ReconciliationQuarantineCheckpoint::default(),
+        );
+        if let Some((evidence, outcome)) = publication.version_bundle_publication() {
+            terminal = terminal.with_version_bundle_publication(evidence, outcome);
+        }
+        RegisteredManagedArtifactComponentSettlement {
+            durable: self.durable,
+            terminal,
+            _lifecycle: Some(lifecycle),
+            _publication: Some(publication),
+            _proof: Some(proof),
+        }
+    }
+}
+
+impl ManagedArtifactDurableAuthority {
+    fn failed(
+        self,
+        publication: Option<ManagedArtifactPublicationLease>,
+    ) -> RegisteredManagedArtifactComponentSettlement {
+        let mut terminal = self.failed_terminal.clone();
+        if let Some((evidence, outcome)) = publication
+            .as_ref()
+            .and_then(ManagedArtifactPublicationLease::version_bundle_publication)
+        {
+            terminal = terminal.with_version_bundle_publication(evidence, outcome);
+        }
+        RegisteredManagedArtifactComponentSettlement {
+            durable: self,
+            terminal,
+            _lifecycle: None,
+            _publication: publication,
+            _proof: None,
+        }
+    }
+}
+
+impl RegisteredManagedArtifactComponentSettlement {
+    pub(crate) fn journals(&self) -> &OperationJournalStore {
+        &self.durable.state.journals
+    }
+
+    pub(crate) fn failure_memory(&self) -> &GuardianFailureMemoryStore {
+        &self.durable.state.failure_memory
+    }
+
+    pub(crate) fn attempt(&self) -> &ReconciliationAttempt {
+        &self.durable.attempt
+    }
+
+    pub(crate) fn terminal(&self) -> &ReconciliationTerminal {
+        &self.terminal
+    }
+
+    pub(crate) fn succeeded(&self) -> bool {
+        self.terminal.outcome() == ReconciliationTerminalOutcome::Succeeded
+    }
+
+    pub(crate) fn version_bundle_publication_acknowledgement(
+        &self,
+    ) -> Option<RegisteredVersionBundlePublicationAcknowledgement> {
+        self.terminal
+            .version_bundle_publication()
+            .is_some_and(|publication| publication.is_pending())
+            .then(|| RegisteredVersionBundlePublicationAcknowledgement {
+                state: self.durable.state.clone(),
+                terminal: self.terminal.clone(),
+            })
+    }
+
+    pub(crate) fn into_version_bundle_publication(
+        self,
+    ) -> Option<RegisteredVersionBundlePublication> {
+        match self._publication {
+            Some(ManagedArtifactPublicationLease::VersionBundleCommit { _receipt }) => {
+                Some(RegisteredVersionBundlePublication::Committed(_receipt))
+            }
+            Some(ManagedArtifactPublicationLease::VersionBundleRollback { _receipt }) => {
+                Some(RegisteredVersionBundlePublication::RolledBack(_receipt))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl RegisteredVersionBundlePublicationAcknowledgement {
+    pub(crate) async fn record(self) -> Result<(), OperationJournalStoreError> {
+        self.state
+            .acknowledge_reconciliation_version_bundle_publication(&self.terminal)
+            .await
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ManagedArtifactRebuildComponent {
+    VersionBundle,
+    Libraries,
+    Assets,
+}
+
+impl ManagedArtifactRebuildComponent {
+    fn from_artifact_attempt(
+        attempt: &ReconciliationAttempt,
+    ) -> Result<Self, ReconciliationEvidenceRejection> {
+        let component = match (attempt.component(), attempt.domain()) {
+            (ReconciliationComponent::VersionBundle, GuardianDomain::Launch) => Self::VersionBundle,
+            (ReconciliationComponent::Libraries, GuardianDomain::Library) => Self::Libraries,
+            (ReconciliationComponent::Assets, GuardianDomain::Download) => Self::Assets,
+            _ => return Err(ReconciliationEvidenceRejection::ScopeMismatch),
+        };
+        if attempt.rung() != ReconciliationRung::RepairArtifact
+            || attempt.diagnosis_id() != DiagnosisId::LauncherManagedArtifactCorrupt
+            || attempt.mode() != GuardianMode::Managed
+            || attempt.ownership() != OwnershipClass::LauncherManaged
+            || attempt.target().system != StabilizationSystem::Execution
+            || attempt.target().kind != TargetKind::Artifact
+            || attempt.target().ownership != OwnershipClass::LauncherManaged
+        {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        Ok(component)
+    }
+
+    fn reconciliation_component(self) -> ReconciliationComponent {
+        match self {
+            Self::VersionBundle => ReconciliationComponent::VersionBundle,
+            Self::Libraries => ReconciliationComponent::Libraries,
+            Self::Assets => ReconciliationComponent::Assets,
+        }
+    }
+
+    fn domain(self) -> GuardianDomain {
+        match self {
+            Self::VersionBundle => GuardianDomain::Launch,
+            Self::Libraries => GuardianDomain::Library,
+            Self::Assets => GuardianDomain::Download,
+        }
+    }
+
+    fn matches_state(self, state: &RegisteredComponentRebuildState) -> bool {
+        matches!(
+            (self, state),
+            (
+                Self::VersionBundle,
+                RegisteredComponentRebuildState::VersionBundle
+            ) | (Self::Libraries, RegisteredComponentRebuildState::Libraries)
+                | (Self::Assets, RegisteredComponentRebuildState::Assets)
+        )
+    }
+}
+
+fn validate_registered_artifact_provenance(
+    verification: Option<&KnownGoodVerificationLease>,
+    provenance: Option<RegisteredArtifactProvenance>,
+    terminal: &ReconciliationTerminal,
+) -> Result<(), ReconciliationEvidenceRejection> {
+    match (verification, provenance) {
+        (None, None) if terminal.component() == ReconciliationComponent::Runtime => Ok(()),
+        (Some(verification), Some(provenance)) => {
+            let component =
+                ManagedArtifactRebuildComponent::from_artifact_attempt(terminal.attempt())?;
+            if provenance.component() != component.reconciliation_component()
+                || registered_artifact_target(verification, provenance.inventory_ordinal()).as_ref()
+                    != Some(terminal.target())
+            {
+                return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+            }
+            Ok(())
+        }
+        _ => Err(ReconciliationEvidenceRejection::ScopeMismatch),
+    }
+}
+
+fn libraries_rollback_has_effect(effect: ManagedLibrariesRollbackEffect) -> bool {
+    effect != ManagedLibrariesRollbackEffect::None
+}
+
+fn assets_rollback_has_effect(effect: ManagedAssetsRollbackEffect) -> bool {
+    effect != ManagedAssetsRollbackEffect::None
+}
+
+fn validated_runtime_quarantine_checkpoint(
+    runtime_cache: &ManagedRuntimeCache,
+    component: &RuntimeId,
+    quarantine: Option<&ManagedRuntimeQuarantineObligation>,
+) -> Result<ReconciliationQuarantineCheckpoint, ReconciliationEvidenceRejection> {
+    let Some(quarantine) = quarantine else {
+        return Ok(ReconciliationQuarantineCheckpoint::default());
+    };
+    if quarantine.component() != component || !quarantine.matches_cache(runtime_cache) {
+        return Err(ReconciliationEvidenceRejection::JournalMismatch);
+    }
+    if quarantine.observation() == ManagedRuntimeQuarantineObservation::Absent {
+        return Ok(ReconciliationQuarantineCheckpoint::default());
+    }
+    Ok(ReconciliationQuarantineCheckpoint::new(vec![
+        ReconciliationQuarantineRecord::runtime(component.as_str()),
+    ]))
+}
+
+struct RegisteredKnownGoodAuthority {
+    instance_id: String,
+    version_id: String,
+    created_at: String,
+    library_root: PathBuf,
+    source: std::sync::Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
+}
+
+impl RegisteredKnownGoodAuthority {
+    fn inventory(&self) -> &std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory> {
+        self.source.inventory()
+    }
+
+    fn activation_contract_id(&self) -> &axial_minecraft::ManagedInstallActivationContractId {
+        self.source.activation_contract_id()
+    }
+}
+
+pub(crate) struct ReconciliationAttemptReservation {
+    reservation: StoreReconciliationAttemptReservation,
+}
+
+pub(crate) struct RegisteredReconciliationAuthority {
+    state: AppState,
+    lifecycle: InstanceLifecycleLease,
+    verification: Option<KnownGoodVerificationLease>,
+    managed_artifact_epoch: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReconciliationAttemptRejection {
+    PersistencePending,
+    AlreadyReserved,
+    CapacityExhausted,
+    AmbiguousPriorAttempt,
+}
+
+struct RecordedReconciliationFailure {
+    terminal: ReconciliationTerminal,
+    lifecycle: InstanceLifecycleLease,
+    roots: ReconciliationRoots,
+    source: std::sync::Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
+    artifact_provenance: Option<RegisteredArtifactProvenance>,
+}
+
+#[derive(Eq, PartialEq)]
+struct ReconciliationRoots {
+    instance: PathBuf,
+    library: PathBuf,
+    runtime: PathBuf,
+}
+
+struct CurrentReconciliationIncarnation {
+    fingerprint: ReconciliationIncarnationFingerprint,
+    inventory_fingerprint: ReconciliationInventoryFingerprint,
+    roots: ReconciliationRoots,
+    source: std::sync::Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
+}
+
+struct CurrentReconciliationIdentity {
+    instance_id: String,
+    version_id: String,
+    created_at: String,
+    fingerprint: ReconciliationIncarnationFingerprint,
+    roots: ReconciliationRoots,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReconciliationEvidenceRejection {
+    InvalidInstanceIdentity,
+    InstanceNotRegistered,
+    RootAuthorityUnavailable,
+    MemoryMissing,
+    MemoryNotFailed,
+    MemoryWindowInactive,
+    JournalMissing,
+    JournalMismatch,
+    NonAdjacentRung,
+    ScopeMismatch,
+    IncarnationMismatch,
+    OwnershipMismatch,
+    ActiveSession,
+    SuppressedPriorAttempt,
+}
+
+impl RecordedRuntimeArtifactRepairFailure {
+    pub(crate) fn diagnosis_id(&self) -> DiagnosisId {
+        self.evidence.terminal.diagnosis_id()
+    }
+}
+
+impl RegisteredComponentRebuildAdmission {
+    pub(crate) fn journals(&self) -> &OperationJournalStore {
+        self.authority.journals()
+    }
+
+    pub(crate) fn failure_memory(&self) -> &GuardianFailureMemoryStore {
+        self.authority.failure_memory()
+    }
+
+    pub(crate) fn attempt(&self) -> &ReconciliationAttempt {
+        &self.attempt
+    }
+
+    pub(crate) fn is_resumed(&self) -> bool {
+        self.resumed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_managed_artifact_epoch_for_test(&mut self) {
+        let epoch = self
+            .authority
+            .state
+            .managed_artifact_mutation_epoch()
+            .expect("test managed artifact epoch");
+        let expected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(epoch.value()));
+        self.authority.managed_artifact_epoch = Some(expected.clone());
+        if let Some(verification) = &mut self.authority.verification {
+            verification.managed_artifact_epoch = Some(expected);
+        }
+    }
+
+    pub(crate) fn admit_managed_artifact_mutation(
+        &self,
+    ) -> Result<
+        super::ManagedArtifactMutationAdmission,
+        super::ManagedArtifactMutationEpochUnavailable,
+    > {
+        self.authority.admit_managed_artifact_mutation()
+    }
+
+    pub(crate) fn runtime_core_request(
+        &self,
+    ) -> Result<(ManagedRuntimeCache, RuntimeId), ReconciliationEvidenceRejection> {
+        let RegisteredComponentRebuildState::Runtime { runtime_cache, .. } = &self.component_state
+        else {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        };
+        if !runtime_cache.shares_identity_with(&self.authority.state.managed_runtime_cache) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        Ok((
+            runtime_cache.clone(),
+            RuntimeId::from(self.attempt.target().id.clone()),
+        ))
+    }
+
+    pub(crate) fn failed_terminal(
+        &self,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        self.authority
+            .terminal(self.attempt.clone(), ReconciliationTerminalOutcome::Failed)
+    }
+
+    pub(crate) fn into_libraries_effect(
+        self,
+    ) -> RegisteredManagedArtifactComponentEffectAdmission<RegisteredLibrariesComponentRebuildEffect>
+    {
+        let library_operation = self.current_library_operation();
+        match (
+            library_operation,
+            self.into_managed_artifact_completion(ManagedArtifactRebuildComponent::Libraries),
+        ) {
+            (Some(library_operation), Ok((request, mut completion))) => {
+                completion.authority.library_operation = Some(library_operation.clone());
+                RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                    request: RegisteredLibrariesComponentRebuildEffect {
+                        library_operation,
+                        version_id: request.version_id,
+                    },
+                    completion: Box::new(completion),
+                }
+            }
+            (None, Ok((_, completion))) => {
+                RegisteredManagedArtifactComponentEffectAdmission::Refused(Box::new(
+                    completion.into_failed_settlement(),
+                ))
+            }
+            (_, Err(settlement)) => {
+                RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement)
+            }
+        }
+    }
+
+    pub(crate) fn into_version_bundle_effect(
+        self,
+    ) -> RegisteredManagedArtifactComponentEffectAdmission<
+        RegisteredVersionBundleComponentRebuildEffect,
+    > {
+        let library_operation = self.current_library_operation();
+        match (
+            library_operation,
+            self.into_managed_artifact_completion(ManagedArtifactRebuildComponent::VersionBundle),
+        ) {
+            (Some(library_operation), Ok((request, mut completion))) => {
+                completion.authority.library_operation = Some(library_operation.clone());
+                RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                    request: RegisteredVersionBundleComponentRebuildEffect {
+                        library_operation,
+                        source: request.source,
+                    },
+                    completion: Box::new(completion),
+                }
+            }
+            (None, Ok((_, completion))) => {
+                RegisteredManagedArtifactComponentEffectAdmission::Refused(Box::new(
+                    completion.into_failed_settlement(),
+                ))
+            }
+            (_, Err(settlement)) => {
+                RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement)
+            }
+        }
+    }
+
+    pub(crate) fn into_assets_effect(
+        self,
+    ) -> RegisteredManagedArtifactComponentEffectAdmission<RegisteredAssetsComponentRebuildEffect>
+    {
+        let library_operation = self.current_library_operation();
+        match (
+            library_operation,
+            self.into_managed_artifact_completion(ManagedArtifactRebuildComponent::Assets),
+        ) {
+            (Some(library_operation), Ok((request, mut completion))) => {
+                completion.authority.library_operation = Some(library_operation.clone());
+                RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                    request: RegisteredAssetsComponentRebuildEffect {
+                        library_operation,
+                        version_id: request.version_id,
+                    },
+                    completion: Box::new(completion),
+                }
+            }
+            (None, Ok((_, completion))) => {
+                RegisteredManagedArtifactComponentEffectAdmission::Refused(Box::new(
+                    completion.into_failed_settlement(),
+                ))
+            }
+            (_, Err(settlement)) => {
+                RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement)
+            }
+        }
+    }
+
+    fn current_library_operation(&self) -> Option<LibraryOperation> {
+        self.authority
+            .state
+            .try_acquire_managed_library()
+            .ok()
+            .filter(|operation| {
+                operation.configured_path() == self.known_good.library_root
+                    && self
+                        .authority
+                        .state
+                        .validate_managed_library_operation(operation)
+                        .is_ok()
+            })
+    }
+
+    fn into_managed_artifact_completion(
+        self,
+        component: ManagedArtifactRebuildComponent,
+    ) -> Result<
+        (
+            ManagedArtifactCoreRequest,
+            RegisteredManagedArtifactComponentCompletion,
+        ),
+        Box<RegisteredManagedArtifactComponentSettlement>,
+    > {
+        let structurally_valid = self.validate_managed_artifact_admission(component).is_ok()
+            && self.artifact_provenance.is_some_and(|provenance| {
+                provenance.component() == component.reconciliation_component()
+            })
+            && self
+                .authority
+                .verification
+                .as_ref()
+                .is_some_and(|verification| {
+                    self.authority
+                        .state
+                        .known_good_verification_lease_is_live(verification)
+                        && verification.instance_id == self.known_good.instance_id
+                        && verification.version_id == self.known_good.version_id
+                        && verification.created_at == self.known_good.created_at
+                        && verification.library_root == self.known_good.library_root
+                        && std::sync::Arc::ptr_eq(&verification.source, &self.known_good.source)
+                });
+        let request = ManagedArtifactCoreRequest {
+            version_id: self.known_good.version_id.clone(),
+            source: self.known_good.source.clone(),
+        };
+        let RegisteredComponentRebuildAdmission {
+            authority,
+            attempt,
+            resumed: _,
+            failed_terminal,
+            known_good,
+            artifact_provenance,
+            component_state: _,
+            _component_mutation,
+            _config_mutation,
+        } = self;
+        let RegisteredReconciliationAuthority {
+            state,
+            lifecycle,
+            verification,
+            managed_artifact_epoch,
+        } = authority;
+        let durable = ManagedArtifactDurableAuthority {
+            state,
+            attempt,
+            failed_terminal,
+            _component_mutation,
+            _config_mutation,
+        };
+        drop(lifecycle);
+        let (Some(verification), Some(provenance)) = (verification, artifact_provenance) else {
+            return Err(Box::new(durable.failed(None)));
+        };
+        let KnownGoodVerificationLease {
+            owner,
+            _lifecycle,
+            instance_id: _,
+            version_id: _,
+            created_at: _,
+            library_root: _,
+            managed_runtime_cache,
+            source: _,
+            managed_artifact_epoch: _,
+        } = verification;
+        drop(_lifecycle);
+        if !structurally_valid {
+            return Err(Box::new(durable.failed(None)));
+        }
+        Ok((
+            request,
+            RegisteredManagedArtifactComponentCompletion {
+                authority: ManagedArtifactCompletionAuthority {
+                    durable,
+                    library_operation: None,
+                    owner,
+                    known_good,
+                    runtime_cache: managed_runtime_cache,
+                    provenance,
+                    component,
+                    managed_artifact_epoch,
+                },
+            },
+        ))
+    }
+
+    pub(crate) async fn succeeded_terminal(
+        &self,
+        receipt: &ManagedRuntimeCommitReceipt,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        self.succeeded_terminal_with_activation_observer(receipt, || {})
+            .await
+    }
+
+    async fn succeeded_terminal_with_activation_observer<AfterActivation>(
+        &self,
+        receipt: &ManagedRuntimeCommitReceipt,
+        after_activation: AfterActivation,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection>
+    where
+        AfterActivation: FnOnce(),
+    {
+        self.require_managed_artifact_epoch_current()?;
+        self.validate_runtime_receipt_identity(receipt)?;
+        if !receipt
+            .revalidate(
+                &self.authority.state.managed_runtime_cache,
+                receipt.component(),
+            )
+            .await
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        self.require_managed_artifact_epoch_current()?;
+        self.validate_runtime_receipt_identity(receipt)?;
+        let refreshed_inventory = receipt
+            .replace_known_good_runtime_projection(self.known_good.inventory())
+            .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+        if &refreshed_inventory != self.known_good.inventory().as_ref()
+            || !receipt.matches_known_good_inventory(self.known_good.inventory())
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let quarantine_checkpoint = self.validated_runtime_quarantine_checkpoint(
+            receipt.component(),
+            receipt.quarantine_obligation(),
+        )?;
+        self.require_managed_artifact_epoch_current()?;
+        after_activation();
+        let activated_inventory = match self.validate_runtime_identity_against(
+            receipt.component(),
+            receipt.matches_cache(&self.authority.state.managed_runtime_cache),
+            self.known_good.inventory(),
+        ) {
+            Ok(inventory) => inventory,
+            Err(rejection) => {
+                self.seal_failed_runtime_projection()?;
+                return Err(rejection);
+            }
+        };
+        if !std::sync::Arc::ptr_eq(self.known_good.inventory(), &activated_inventory)
+            || !receipt.matches_known_good_inventory(&activated_inventory)
+        {
+            self.seal_failed_runtime_projection()?;
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let receipt_is_current = receipt
+            .revalidate(
+                &self.authority.state.managed_runtime_cache,
+                receipt.component(),
+            )
+            .await;
+        let active_after_postcheck = self.validate_runtime_identity_against(
+            receipt.component(),
+            receipt.matches_cache(&self.authority.state.managed_runtime_cache),
+            self.known_good.inventory(),
+        );
+        if let Err(rejection) = active_after_postcheck {
+            self.seal_failed_runtime_projection()?;
+            return Err(rejection);
+        }
+        if !receipt_is_current {
+            self.seal_failed_runtime_projection()?;
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        self.require_managed_artifact_epoch_current()?;
+        Ok(ReconciliationTerminal::from_attempt(
+            self.attempt.clone(),
+            ReconciliationTerminalOutcome::Succeeded,
+            quarantine_checkpoint,
+        ))
+    }
+
+    pub(crate) fn failed_postcondition_terminal(
+        &self,
+        receipt: &ManagedRuntimeCommitReceipt,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        let postcondition_failure_source = self.runtime_postcondition_failure_source()?;
+        if let Some(source) = postcondition_failure_source.get() {
+            self.validate_runtime_receipt_capability(
+                receipt.component(),
+                receipt.matches_cache(&self.authority.state.managed_runtime_cache),
+            )?;
+            if !receipt.matches_known_good_inventory(source.inventory()) {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+        } else {
+            self.validate_runtime_receipt_identity(receipt)?;
+        }
+        let quarantine_checkpoint = self.validated_runtime_quarantine_checkpoint(
+            receipt.component(),
+            receipt.quarantine_obligation(),
+        )?;
+        Ok(ReconciliationTerminal::from_attempt(
+            self.attempt.clone(),
+            ReconciliationTerminalOutcome::Failed,
+            quarantine_checkpoint,
+        ))
+    }
+
+    pub(crate) fn failed_effect_terminal(
+        &self,
+        receipt: &ManagedRuntimeFailureReceipt,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        let inventory = self.validate_runtime_identity(
+            receipt.component(),
+            receipt.matches_cache(&self.authority.state.managed_runtime_cache),
+        )?;
+        if !receipt.matches_known_good_inventory(&inventory) {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        Ok(ReconciliationTerminal::from_attempt(
+            self.attempt.clone(),
+            ReconciliationTerminalOutcome::Failed,
+            self.validated_runtime_quarantine_checkpoint(
+                receipt.component(),
+                receipt.quarantine_obligation(),
+            )?,
+        ))
+    }
+
+    fn validate_runtime_receipt_identity(
+        &self,
+        receipt: &ManagedRuntimeCommitReceipt,
+    ) -> Result<
+        std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+        ReconciliationEvidenceRejection,
+    > {
+        self.validate_runtime_identity(
+            receipt.component(),
+            receipt.matches_cache(&self.authority.state.managed_runtime_cache),
+        )
+    }
+
+    fn require_managed_artifact_epoch_current(
+        &self,
+    ) -> Result<(), ReconciliationEvidenceRejection> {
+        self.authority
+            .state
+            .managed_artifact_mutation_epoch_is_current(
+                self.authority.managed_artifact_epoch.as_ref(),
+            )
+            .then_some(())
+            .ok_or(ReconciliationEvidenceRejection::IncarnationMismatch)
+    }
+
+    fn validate_managed_artifact_admission(
+        &self,
+        component: ManagedArtifactRebuildComponent,
+    ) -> Result<(), ReconciliationEvidenceRejection> {
+        if self.attempt.rung() != ReconciliationRung::RebuildComponent
+            || self.attempt.component() != component.reconciliation_component()
+            || self.attempt.domain() != component.domain()
+            || self.attempt.mode() != GuardianMode::Managed
+            || self.attempt.ownership() != OwnershipClass::LauncherManaged
+            || self.attempt.target().system != StabilizationSystem::Execution
+            || self.attempt.target().kind != TargetKind::Artifact
+            || self.attempt.target().ownership != OwnershipClass::LauncherManaged
+            || !component.matches_state(&self.component_state)
+        {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_identity(
+        &self,
+        component: &RuntimeId,
+        matches_cache: bool,
+    ) -> Result<
+        std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+        ReconciliationEvidenceRejection,
+    > {
+        let ReconciliationScope::RegisteredInstance {
+            inventory_fingerprint,
+            activation_contract_id,
+            ..
+        } = self.attempt.scope();
+        if &reconciliation_inventory_fingerprint(self.known_good.inventory())
+            != inventory_fingerprint
+            || activation_contract_id != self.known_good.activation_contract_id()
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        self.validate_runtime_identity_against(
+            component,
+            matches_cache,
+            self.known_good.inventory(),
+        )
+    }
+
+    fn validate_runtime_identity_against(
+        &self,
+        component: &RuntimeId,
+        matches_cache: bool,
+        expected_inventory: &std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+    ) -> Result<
+        std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+        ReconciliationEvidenceRejection,
+    > {
+        let inventory =
+            self.current_runtime_inventory(component, matches_cache, expected_inventory)?;
+        if !std::sync::Arc::ptr_eq(&inventory, expected_inventory) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        Ok(inventory)
+    }
+
+    fn current_runtime_inventory(
+        &self,
+        component: &RuntimeId,
+        matches_cache: bool,
+        expected_inventory: &std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+    ) -> Result<
+        std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+        ReconciliationEvidenceRejection,
+    > {
+        self.validate_runtime_receipt_capability(component, matches_cache)?;
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+            activation_contract_id,
+            ..
+        } = self.attempt.scope();
+        let identity = self
+            .authority
+            .state
+            .current_reconciliation_identity(instance_id)?;
+        if &identity.fingerprint != fingerprint
+            || activation_contract_id != self.known_good.activation_contract_id()
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let current = self
+            .authority
+            .state
+            .reconciliation_incarnation_from_identity(identity)?;
+        let expected_inventory_fingerprint =
+            reconciliation_inventory_fingerprint(expected_inventory);
+        if current.inventory_fingerprint != expected_inventory_fingerprint {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        if current.source.activation_contract_id() != activation_contract_id {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        Ok(current.source.inventory().clone())
+    }
+
+    fn validate_runtime_receipt_capability(
+        &self,
+        component: &RuntimeId,
+        matches_cache: bool,
+    ) -> Result<(), ReconciliationEvidenceRejection> {
+        if self.attempt.component() != ReconciliationComponent::Runtime
+            || self.attempt.target().kind != TargetKind::Runtime
+            || self.attempt.target().id != component.as_str()
+            || !matches_cache
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let ReconciliationScope::RegisteredInstance { instance_id, .. } = self.attempt.scope();
+        if instance_id != &self.known_good.instance_id {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        Ok(())
+    }
+
+    fn seal_failed_runtime_projection(&self) -> Result<(), ReconciliationEvidenceRejection> {
+        let _removed = self.authority.state.known_good.deactivate_exact_source(
+            &self.known_good.instance_id,
+            &self.known_good.version_id,
+            &self.known_good.created_at,
+            &self.known_good.source,
+        );
+        self.runtime_postcondition_failure_source()?
+            .set(self.known_good.source.clone())
+            .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)
+    }
+
+    fn runtime_postcondition_failure_source(
+        &self,
+    ) -> Result<
+        &std::sync::OnceLock<
+            std::sync::Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
+        >,
+        ReconciliationEvidenceRejection,
+    > {
+        match &self.component_state {
+            RegisteredComponentRebuildState::Runtime {
+                postcondition_failure_source,
+                ..
+            } => Ok(postcondition_failure_source),
+            RegisteredComponentRebuildState::VersionBundle
+            | RegisteredComponentRebuildState::Libraries => {
+                Err(ReconciliationEvidenceRejection::ScopeMismatch)
+            }
+            RegisteredComponentRebuildState::Assets => {
+                Err(ReconciliationEvidenceRejection::ScopeMismatch)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn runtime_postcondition_failure_source_for_test(
+        &self,
+    ) -> &std::sync::OnceLock<std::sync::Arc<axial_minecraft::known_good::KnownGoodActivationSource>>
+    {
+        self.runtime_postcondition_failure_source()
+            .expect("Runtime admission state")
+    }
+
+    fn validated_runtime_quarantine_checkpoint(
+        &self,
+        component: &RuntimeId,
+        quarantine: Option<&ManagedRuntimeQuarantineObligation>,
+    ) -> Result<ReconciliationQuarantineCheckpoint, ReconciliationEvidenceRejection> {
+        validated_runtime_quarantine_checkpoint(
+            &self.authority.state.managed_runtime_cache,
+            component,
+            quarantine,
+        )
+    }
+
+    #[cfg(test)]
+    fn admitted_inventory(
+        &self,
+    ) -> &std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory> {
+        self.known_good.inventory()
+    }
+}
+
+impl RegisteredReconciliationAuthority {
+    pub(crate) fn journals(&self) -> &OperationJournalStore {
+        self.state.journals.as_ref()
+    }
+
+    pub(crate) fn failure_memory(&self) -> &GuardianFailureMemoryStore {
+        self.state.failure_memory.as_ref()
+    }
+
+    pub(crate) fn admit_managed_artifact_mutation(
+        &self,
+    ) -> Result<
+        super::ManagedArtifactMutationAdmission,
+        super::ManagedArtifactMutationEpochUnavailable,
+    > {
+        if let Some(expected) = &self.managed_artifact_epoch {
+            self.state
+                .managed_artifact_epoch
+                .admit_from_expected(expected)
+        } else {
+            self.state
+                .admit_managed_artifact_mutation()
+                .map_err(super::ManagedArtifactMutationEpochUnavailable::from)
+        }
+    }
+
+    pub(crate) fn registered_artifact_findings_are_live(
+        &self,
+        findings: &super::RegisteredArtifactFindings,
+    ) -> bool {
+        self.state.registered_artifact_findings_are_live(findings)
+    }
+
+    pub(crate) fn attempt_is_current(&self, attempt: &ReconciliationAttempt) -> bool {
+        self.state
+            .managed_artifact_mutation_epoch_is_current(self.managed_artifact_epoch.as_ref())
+            && self.verification.as_ref().is_none_or(|verification| {
+                self.state
+                    .known_good_verification_lease_is_live(verification)
+            })
+            && self
+                .state
+                .current_reconciliation_incarnation(&self.lifecycle.instance_id)
+                .is_ok_and(|current| {
+                    matches!(
+                        attempt.scope(),
+                        ReconciliationScope::RegisteredInstance {
+                            instance_id,
+                            fingerprint,
+                            inventory_fingerprint,
+                            activation_contract_id,
+                        } if instance_id == &self.lifecycle.instance_id
+                            && fingerprint == &current.fingerprint
+                            && inventory_fingerprint == &current.inventory_fingerprint
+                            && activation_contract_id == current.source.activation_contract_id()
+                    )
+                })
+    }
+
+    pub(super) fn into_registered_artifact_failed_repair(
+        self,
+        attempt: &ReconciliationAttempt,
+        recovery_scope: Option<RecoveringSessionMutationScope>,
+    ) -> Result<RegisteredArtifactFailedRepair, ReconciliationEvidenceRejection> {
+        self.into_registered_artifact_failed_repair_inner(attempt, None, recovery_scope)
+    }
+
+    fn into_registered_artifact_failed_repair_resume(
+        self,
+        component_attempt: &ReconciliationAttempt,
+        recovery_scope: Option<RecoveringSessionMutationScope>,
+    ) -> Result<RegisteredArtifactFailedRepair, ReconciliationEvidenceRejection> {
+        let ReconciliationLineage::Predecessor { operation_id } = component_attempt.lineage()
+        else {
+            return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+        };
+        self.into_registered_artifact_failed_repair_inner(
+            component_attempt,
+            Some(operation_id),
+            recovery_scope,
+        )
+    }
+
+    fn into_registered_artifact_failed_repair_inner(
+        self,
+        attempt: &ReconciliationAttempt,
+        predecessor_operation_id: Option<&OperationId>,
+        recovery_scope: Option<RecoveringSessionMutationScope>,
+    ) -> Result<RegisteredArtifactFailedRepair, ReconciliationEvidenceRejection> {
+        let Self {
+            state,
+            lifecycle,
+            verification,
+            managed_artifact_epoch,
+        } = self;
+        let verification =
+            verification.ok_or(ReconciliationEvidenceRejection::IncarnationMismatch)?;
+        if !match (
+            managed_artifact_epoch.as_ref(),
+            verification.managed_artifact_epoch.as_ref(),
+        ) {
+            (Some(authority), Some(verification)) => {
+                std::sync::Arc::ptr_eq(authority, verification)
+            }
+            (None, None) => true,
+            _ => false,
+        } {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&state.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+        let (evidence, expected_attempt) =
+            if let Some(predecessor_operation_id) = predecessor_operation_id {
+                if attempt.rung() != ReconciliationRung::RebuildComponent {
+                    return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+                }
+                let evidence = state.recorded_reconciliation_failure_at_with_window(
+                    &lifecycle,
+                    predecessor_operation_id,
+                    ReconciliationRung::RepairArtifact,
+                    observed_at,
+                    Some(&verification),
+                    false,
+                )?;
+                if !adjacent_reconciliation_attempts_match(evidence.terminal.attempt(), attempt) {
+                    return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+                }
+                let expected_attempt = evidence.terminal.attempt().clone();
+                (evidence, expected_attempt)
+            } else {
+                let evidence = state.recorded_reconciliation_failure_at(
+                    &lifecycle,
+                    attempt.operation_id(),
+                    ReconciliationRung::RepairArtifact,
+                    observed_at,
+                    Some(&verification),
+                )?;
+                (evidence, attempt.clone())
+            };
+        if evidence.terminal.attempt() != &expected_attempt
+            || evidence.terminal.outcome() != ReconciliationTerminalOutcome::Failed
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let (_, _, _, library_root, runtime_cache, _) = verification.execution_parts();
+        if !std::sync::Arc::ptr_eq(&evidence.source, &verification.source)
+            || evidence.roots.library != library_root
+            || evidence.roots.runtime != runtime_cache.root()
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        validate_registered_artifact_provenance(
+            Some(&verification),
+            evidence.artifact_provenance,
+            &evidence.terminal,
+        )?;
+        Ok(RegisteredArtifactFailedRepair {
+            evidence,
+            verification,
+            recovery_scope,
+            resume_attempt: predecessor_operation_id.map(|_| attempt.clone()),
+        })
+    }
+
+    pub(crate) fn owns_runtime_root(
+        &self,
+        runtime_root: &crate::execution::runtime::ManagedRuntimeRoot,
+    ) -> bool {
+        runtime_root.belongs_to(&self.state.managed_runtime_cache)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn repair_artifact_attempt(
+        &self,
+        operation_id: OperationId,
+        diagnosis_id: DiagnosisId,
+        domain: GuardianDomain,
+        component: ReconciliationComponent,
+        target: TargetDescriptor,
+        suppression_for: chrono::Duration,
+    ) -> Result<ReconciliationAttempt, ReconciliationEvidenceRejection> {
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.state.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+        let suppression_until = observed_at
+            .checked_add_signed(suppression_for)
+            .filter(|until| *until > observed_at)
+            .ok_or(ReconciliationEvidenceRejection::JournalMismatch)?;
+        self.state.registered_reconciliation_attempt_at(
+            &self.lifecycle,
+            operation_id,
+            diagnosis_id,
+            domain,
+            ReconciliationRung::RepairArtifact,
+            component,
+            target,
+            observed_at,
+            suppression_until,
+            ReconciliationLineage::Initial,
+        )
+    }
+
+    pub(crate) fn terminal(
+        &self,
+        attempt: ReconciliationAttempt,
+        outcome: ReconciliationTerminalOutcome,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        self.terminal_with_quarantine(
+            attempt,
+            outcome,
+            ReconciliationQuarantineCheckpoint::default(),
+        )
+    }
+
+    pub(crate) fn artifact_terminal(
+        &self,
+        attempt: ReconciliationAttempt,
+        outcome: ReconciliationTerminalOutcome,
+        quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        ManagedArtifactRebuildComponent::from_artifact_attempt(&attempt)?;
+        self.terminal_with_quarantine(attempt, outcome, quarantine_checkpoint)
+    }
+
+    fn terminal_with_quarantine(
+        &self,
+        attempt: ReconciliationAttempt,
+        outcome: ReconciliationTerminalOutcome,
+        quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        if !self.attempt_is_current(&attempt) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let current = self
+            .state
+            .current_reconciliation_incarnation(&self.lifecycle.instance_id)?;
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+            inventory_fingerprint,
+            activation_contract_id,
+        } = attempt.scope();
+        if instance_id != &self.lifecycle.instance_id
+            || fingerprint != &current.fingerprint
+            || inventory_fingerprint != &current.inventory_fingerprint
+            || activation_contract_id != current.source.activation_contract_id()
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let terminal =
+            ReconciliationTerminal::from_attempt(attempt, outcome, quarantine_checkpoint);
+        terminal
+            .validate()
+            .map_err(|_| ReconciliationEvidenceRejection::OwnershipMismatch)?;
+        Ok(terminal)
+    }
+}
+
+pub(crate) fn reconciliation_journal_attempt(
+    mut entry: OperationJournalEntry,
+    attempt: ReconciliationAttempt,
+) -> OperationJournalEntry {
+    entry.reconciliation_attempt = Some(attempt);
+    entry
+}
+
+pub(crate) fn component_rebuild_journal(
+    admission: &RegisteredComponentRebuildAdmission,
+) -> OperationJournalEntry {
+    component_rebuild_journal_for_attempt(admission.attempt())
+}
+
+pub(crate) fn component_rebuild_plan_is_resumable(
+    admission: &RegisteredComponentRebuildAdmission,
+    entry: &OperationJournalEntry,
+) -> bool {
+    admission.is_resumed()
+        && source_component_rebuild_journal_is_resumable(entry, admission.attempt())
+}
+
+fn component_rebuild_journal_for_attempt(attempt: &ReconciliationAttempt) -> OperationJournalEntry {
+    let target = attempt.target();
+    let mut entry = OperationJournalEntry::new(
+        super::contracts::JournalId::new(format!("journal-{}", attempt.operation_id())),
+        attempt.operation_id().clone(),
+        CommandKind::RepairInstance,
+        StabilizationSystem::Guardian,
+        OwnershipClass::LauncherManaged,
+        RollbackState::NotApplicable,
+    );
+    entry.targets.push(target.clone());
+    let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();
+    entry
+        .targets
+        .push(reconciliation_instance_target(instance_id));
+    entry.planned_steps.push(component_rebuild_step(
+        COMPONENT_REBUILD_START_STEP,
+        target,
+        RollbackState::NotApplicable,
+    ));
+    match attempt.component() {
+        ReconciliationComponent::Runtime => {
+            entry.planned_steps.push(component_rebuild_step(
+                COMPONENT_QUARANTINE_STEP,
+                target,
+                RollbackState::Available,
+            ));
+            entry.planned_steps.push(component_rebuild_step(
+                RUNTIME_COMPONENT_REBUILD_STEP,
+                target,
+                RollbackState::NotApplicable,
+            ));
+        }
+        ReconciliationComponent::VersionBundle
+        | ReconciliationComponent::Libraries
+        | ReconciliationComponent::Assets => {
+            let step_id = match attempt.component() {
+                ReconciliationComponent::VersionBundle => VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+                ReconciliationComponent::Libraries => LIBRARIES_COMPONENT_REBUILD_STEP,
+                ReconciliationComponent::Assets => ASSETS_COMPONENT_REBUILD_STEP,
+                _ => unreachable!(),
+            };
+            entry.planned_steps.push(component_rebuild_step(
+                step_id,
+                target,
+                RollbackState::NotApplicable,
+            ));
+        }
+    }
+    entry.guardian_diagnosis_ids.push(attempt.diagnosis_id());
+    reconciliation_journal_attempt(entry, attempt.clone())
+}
+
+fn source_component_rebuild_journal_is_resumable(
+    entry: &OperationJournalEntry,
+    attempt: &ReconciliationAttempt,
+) -> bool {
+    if !matches!(
+        attempt.component(),
+        ReconciliationComponent::VersionBundle
+            | ReconciliationComponent::Libraries
+            | ReconciliationComponent::Assets
+    ) {
+        return false;
+    }
+    if !entry.completed_steps.is_empty() {
+        return false;
+    }
+    let mut expected = component_rebuild_journal_for_attempt(attempt);
+    expected.status = entry.status;
+    entry.status == OperationStatus::Planned && entry.matches_store_entry(&expected)
+}
+
+fn component_rebuild_step(
+    step_id: &'static str,
+    target: &TargetDescriptor,
+    rollback: RollbackState,
+) -> OperationJournalStep {
+    let mut step = OperationJournalStep::new(step_id, OperationPhase::Repairing);
+    step.changed_target = Some(target.clone());
+    step.rollback = rollback;
+    step
+}
+
+pub(crate) fn reconciliation_attempt_key(attempt: &ReconciliationAttempt) -> FailureMemoryKey {
+    FailureMemoryKey::for_reconciliation_parts(
+        attempt.domain(),
+        &attempt.diagnosis_id(),
+        attempt.target(),
+        attempt.mode(),
+        attempt.rung(),
+        attempt.component(),
+        attempt.scope(),
+    )
+}
+
+pub(crate) fn reconciliation_memory_entry(
+    terminal: ReconciliationTerminal,
+) -> Result<GuardianFailureMemoryEntry, ReconciliationEvidenceRejection> {
+    let outcome = match terminal.outcome() {
+        ReconciliationTerminalOutcome::Succeeded => FailureMemoryActionOutcome::Repaired,
+        ReconciliationTerminalOutcome::Failed => FailureMemoryActionOutcome::Failed,
+    };
+    let quarantine_checkpoint = terminal.quarantine_checkpoint().clone();
+    let entry = GuardianFailureMemoryEntry::observed(
+        terminal.diagnosis_id(),
+        terminal.domain(),
+        terminal.target().clone(),
+        terminal.mode(),
+        None,
+        terminal.observed_at(),
+    )
+    .with_action(GuardianActionKind::Repair, outcome)
+    .with_repair_attempt()
+    .with_suppression_until(terminal.suppression_until())
+    .with_reconciliation_terminal(terminal)
+    .with_quarantine_checkpoint(quarantine_checkpoint);
+    entry
+        .validate()
+        .map_err(|_| ReconciliationEvidenceRejection::MemoryNotFailed)?;
+    Ok(entry)
+}
+
+fn version_bundle_publication_transition_matches(
+    left: &ReconciliationTerminal,
+    right: &ReconciliationTerminal,
+) -> bool {
+    if left == right {
+        return true;
+    }
+    for (pending, acknowledged) in [(left, right), (right, left)] {
+        let Some(publication) = pending
+            .version_bundle_publication()
+            .filter(|publication| publication.is_pending())
+        else {
+            continue;
+        };
+        if pending
+            .clone()
+            .with_acknowledged_version_bundle_publication(publication.evidence())
+            .is_ok_and(|expected| &expected == acknowledged)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) async fn record_reconciliation_journal_success(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    completed_step: OperationJournalStep,
+    terminal: ReconciliationTerminal,
+) -> Result<(), OperationJournalStoreError> {
+    journals
+        .record_reconciliation_success(operation_id, completed_step, terminal)
+        .await
+}
+
+pub(crate) async fn record_reconciliation_journal_failure(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    failure_step: OperationJournalStep,
+    failure_point: &str,
+    terminal: ReconciliationTerminal,
+) -> Result<(), OperationJournalStoreError> {
+    journals
+        .record_reconciliation_failure(operation_id, failure_step, failure_point, terminal)
+        .await
+}
+
+pub(crate) async fn commit_reconciliation_memory(
+    failure_memory: &GuardianFailureMemoryStore,
+    entry: GuardianFailureMemoryEntry,
+    reservation: &ReconciliationAttemptReservation,
+) -> Result<(), FailureMemoryStoreError> {
+    failure_memory
+        .record_reconciliation_terminal(entry, &reservation.reservation)
+        .await
+}
+
+pub(crate) fn validate_reconciliation_memory(
+    failure_memory: &GuardianFailureMemoryStore,
+    entry: &GuardianFailureMemoryEntry,
+    reservation: &ReconciliationAttemptReservation,
+) -> Result<(), FailureMemoryStoreError> {
+    failure_memory.validate_reconciliation_terminal(entry, &reservation.reservation)
+}
+
+pub(crate) async fn settle_reconciliation_memory(
+    failure_memory: &GuardianFailureMemoryStore,
+) -> Result<(), FailureMemoryStoreError> {
+    failure_memory.settle_reconciliation_pending().await
+}
+
+pub(crate) fn reserve_reconciliation_attempt(
+    failure_memory: &GuardianFailureMemoryStore,
+    journals: &OperationJournalStore,
+    key: FailureMemoryKey,
+) -> Result<ReconciliationAttemptReservation, ReconciliationAttemptRejection> {
+    if journals.any_matching(|journal| {
+        matches!(
+            journal.status,
+            OperationStatus::Planned | OperationStatus::Running
+        ) && journal.reconciliation_terminal().is_none()
+            && journal
+                .reconciliation_attempt()
+                .is_some_and(|attempt| reconciliation_attempt_key(attempt) == key)
+    }) {
+        return Err(ReconciliationAttemptRejection::AmbiguousPriorAttempt);
+    }
+    reserve_reconciliation_memory(failure_memory, key)
+}
+
+pub(crate) fn reserve_reconciliation_attempt_resume(
+    failure_memory: &GuardianFailureMemoryStore,
+    journals: &OperationJournalStore,
+    attempt: &ReconciliationAttempt,
+) -> Result<ReconciliationAttemptReservation, ReconciliationAttemptRejection> {
+    let key = reconciliation_attempt_key(attempt);
+    let mut exact = 0usize;
+    for journal in journals.matching_entries(|journal| {
+        journal
+            .reconciliation_attempt()
+            .is_some_and(|candidate| reconciliation_attempt_key(candidate) == key)
+    }) {
+        let candidate = journal
+            .reconciliation_attempt()
+            .expect("reconciliation attempt was filtered");
+        if source_component_rebuild_journal_is_resumable(&journal, attempt) && candidate == attempt
+        {
+            exact = exact.saturating_add(1);
+        } else if matches!(
+            journal.status,
+            OperationStatus::Planned | OperationStatus::Running
+        ) && journal.reconciliation_terminal().is_none()
+        {
+            return Err(ReconciliationAttemptRejection::AmbiguousPriorAttempt);
+        }
+    }
+    if exact != 1 {
+        return Err(ReconciliationAttemptRejection::AmbiguousPriorAttempt);
+    }
+    reserve_reconciliation_memory(failure_memory, key)
+}
+
+fn reserve_reconciliation_memory(
+    failure_memory: &GuardianFailureMemoryStore,
+    key: FailureMemoryKey,
+) -> Result<ReconciliationAttemptReservation, ReconciliationAttemptRejection> {
+    failure_memory
+        .reserve_reconciliation_attempt(key)
+        .map(|reservation| ReconciliationAttemptReservation { reservation })
+        .map_err(|error| match error {
+            ReconciliationAttemptReserveError::PersistencePending => {
+                ReconciliationAttemptRejection::PersistencePending
+            }
+            ReconciliationAttemptReserveError::AlreadyReserved => {
+                ReconciliationAttemptRejection::AlreadyReserved
+            }
+            ReconciliationAttemptReserveError::CapacityExhausted => {
+                ReconciliationAttemptRejection::CapacityExhausted
+            }
+        })
+}
+
+pub(crate) async fn record_guardian_repair_refusal(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    skipped_step: OperationJournalStep,
+) -> Result<(), OperationJournalStoreError> {
+    journals
+        .record_guardian_repair_refusal(operation_id, skipped_step)
+        .await
+}
+
+impl AppState {
+    fn startup_version_bundle_orphan_requirements(
+        &self,
+    ) -> io::Result<Vec<StartupVersionBundleOrphanRequirement>> {
+        let journals = self.journals.matching_entries(|journal| {
+            journal.reconciliation_attempt().is_some_and(|attempt| {
+                (attempt.rung() == ReconciliationRung::RebuildComponent
+                    && attempt.component() == ReconciliationComponent::VersionBundle
+                    && journal.reconciliation_terminal().is_none())
+                    || journal.reconciliation_terminal().is_some()
+            })
+        });
+        let memories = self.failure_memory.list();
+        let mut requirements = Vec::new();
+        for journal in &journals {
+            let Some(attempt) = journal.reconciliation_attempt() else {
+                continue;
+            };
+            if attempt.rung() != ReconciliationRung::RebuildComponent
+                || attempt.component() != ReconciliationComponent::VersionBundle
+                || journal.reconciliation_terminal().is_some()
+            {
+                continue;
+            }
+            attempt.validate().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "planned VersionBundle recovery attempt is invalid",
+                )
+            })?;
+            if attempt.domain() != GuardianDomain::Launch
+                || attempt.diagnosis_id() != DiagnosisId::LauncherManagedArtifactCorrupt
+                || attempt.mode() != GuardianMode::Managed
+                || attempt.ownership() != OwnershipClass::LauncherManaged
+                || attempt.target().system != StabilizationSystem::Execution
+                || attempt.target().kind != TargetKind::Artifact
+                || attempt.target().ownership != OwnershipClass::LauncherManaged
+                || !source_component_rebuild_journal_is_resumable(journal, attempt)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "planned VersionBundle recovery journal is not resumable",
+                ));
+            }
+            let ReconciliationLineage::Predecessor {
+                operation_id: predecessor_id,
+            } = attempt.lineage()
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "planned VersionBundle recovery has no predecessor",
+                ));
+            };
+            let predecessor = journals
+                .iter()
+                .find(|candidate| &candidate.operation_id == predecessor_id)
+                .and_then(OperationJournalEntry::reconciliation_terminal)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "planned VersionBundle recovery predecessor is missing",
+                    )
+                })?;
+            if predecessor.outcome() != ReconciliationTerminalOutcome::Failed
+                || ManagedArtifactRebuildComponent::from_artifact_attempt(predecessor.attempt())
+                    .ok()
+                    != Some(ManagedArtifactRebuildComponent::VersionBundle)
+                || predecessor.diagnosis_id() != attempt.diagnosis_id()
+                || predecessor.domain() != attempt.domain()
+                || predecessor.scope() != attempt.scope()
+                || predecessor.target() != attempt.target()
+                || predecessor.mode() != attempt.mode()
+                || predecessor.ownership() != attempt.ownership()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "planned VersionBundle recovery predecessor does not match",
+                ));
+            }
+            let predecessor_key = reconciliation_attempt_key(predecessor.attempt());
+            let predecessor_memory = memories
+                .iter()
+                .find(|memory| memory.key == predecessor_key)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "planned VersionBundle recovery predecessor memory is missing",
+                    )
+                })?;
+            if predecessor_memory
+                != &reconciliation_memory_entry(predecessor.clone()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "planned VersionBundle recovery predecessor memory is invalid",
+                    )
+                })?
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "planned VersionBundle recovery predecessor memory is ambiguous",
+                ));
+            }
+            if let Some(prior) = memories
+                .iter()
+                .find(|memory| memory.key == reconciliation_attempt_key(attempt))
+            {
+                let Some(prior_terminal) = prior.reconciliation_terminal() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "planned VersionBundle recovery prior memory is untyped",
+                    ));
+                };
+                if prior
+                    != &reconciliation_memory_entry(prior_terminal.clone()).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "planned VersionBundle recovery prior memory is invalid",
+                        )
+                    })?
+                    || prior_terminal
+                        .version_bundle_publication()
+                        .is_some_and(|publication| publication.is_pending())
+                    || self.failure_memory.suppression_active(prior)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "planned VersionBundle recovery prior memory cannot be superseded",
+                    ));
+                }
+            }
+            requirements.push(StartupVersionBundleOrphanRequirement {
+                attempt: attempt.clone(),
+            });
+        }
+        if requirements.len() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "multiple planned VersionBundle recoveries share the managed root",
+            ));
+        }
+        Ok(requirements)
+    }
+
+    fn startup_version_bundle_publication_requirements(
+        &self,
+    ) -> io::Result<Vec<StartupVersionBundlePublicationRequirement>> {
+        let journals = self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_terminal()
+                .is_some_and(|terminal| terminal.version_bundle_publication().is_some())
+        });
+        let memories = self.failure_memory.list();
+        let mut evidence_owners = std::collections::BTreeMap::new();
+        let mut requirements = Vec::new();
+        for terminal in journals
+            .iter()
+            .filter_map(OperationJournalEntry::reconciliation_terminal)
+            .chain(
+                memories
+                    .iter()
+                    .filter_map(GuardianFailureMemoryEntry::reconciliation_terminal),
+            )
+        {
+            let Some(publication) = terminal.version_bundle_publication() else {
+                continue;
+            };
+            let evidence = publication.evidence().as_str().to_string();
+            if evidence_owners
+                .insert(evidence.clone(), terminal.operation_id().clone())
+                .is_some_and(|owner| owner != *terminal.operation_id())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "VersionBundle publication evidence {evidence} has multiple operation owners"
+                    ),
+                ));
+            }
+        }
+        for journal in &journals {
+            let Some(journal_terminal) = journal
+                .reconciliation_terminal()
+                .filter(|terminal| terminal.version_bundle_publication().is_some())
+            else {
+                continue;
+            };
+            let journal_publication = journal_terminal
+                .version_bundle_publication()
+                .expect("publication was filtered");
+            let key = reconciliation_attempt_key(journal_terminal.attempt());
+            let Some(memory) = memories.iter().find(|memory| memory.key == key) else {
+                if journal_publication.is_pending() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "pending VersionBundle publication journal has no durable failure memory",
+                    ));
+                }
+                continue;
+            };
+            let memory_terminal = memory
+                .reconciliation_terminal()
+                .filter(|terminal| terminal.operation_id() == journal_terminal.operation_id());
+            let Some(memory_terminal) = memory_terminal else {
+                if journal_publication.is_pending() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "pending VersionBundle publication memory has no exact journal operation",
+                    ));
+                }
+                continue;
+            };
+            let memory_pending = memory_terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| publication.is_pending());
+            if !journal_publication.is_pending() && !memory_pending {
+                continue;
+            }
+            let canonical_memory =
+                reconciliation_memory_entry(memory_terminal.clone()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "VersionBundle publication memory is not canonical",
+                    )
+                })?;
+            if memory != &canonical_memory
+                || !version_bundle_publication_transition_matches(journal_terminal, memory_terminal)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle publication journal and memory disagree",
+                ));
+            }
+            requirements.push(StartupVersionBundlePublicationRequirement {
+                journal_terminal: journal_terminal.clone(),
+                memory_terminal: memory_terminal.clone(),
+            });
+        }
+        for memory in &memories {
+            let Some(memory_terminal) = memory.reconciliation_terminal().filter(|terminal| {
+                terminal
+                    .version_bundle_publication()
+                    .is_some_and(|publication| publication.is_pending())
+            }) else {
+                continue;
+            };
+            if !requirements.iter().any(|requirement| {
+                requirement.journal_terminal.operation_id() == memory_terminal.operation_id()
+                    && version_bundle_publication_transition_matches(
+                        &requirement.journal_terminal,
+                        memory_terminal,
+                    )
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle publication memory has no durable journal",
+                ));
+            }
+        }
+        Ok(requirements)
+    }
+
+    async fn converge_existing_version_bundle_publication_acknowledgements(
+        &self,
+    ) -> io::Result<()> {
+        let journals = self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_terminal()
+                .is_some_and(|terminal| terminal.version_bundle_publication().is_some())
+        });
+        let memories = self.failure_memory.list();
+        for journal in journals {
+            let Some(journal_terminal) = journal
+                .reconciliation_terminal()
+                .filter(|terminal| terminal.version_bundle_publication().is_some())
+            else {
+                continue;
+            };
+            let key = reconciliation_attempt_key(journal_terminal.attempt());
+            let Some(memory) = memories.iter().find(|memory| memory.key == key) else {
+                continue;
+            };
+            let Some(memory_terminal) = memory
+                .reconciliation_terminal()
+                .filter(|terminal| terminal.operation_id() == journal_terminal.operation_id())
+            else {
+                continue;
+            };
+            let journal_pending = journal_terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| publication.is_pending());
+            let memory_pending = memory_terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| publication.is_pending());
+            if !journal_pending && !memory_pending {
+                continue;
+            }
+            let canonical_memory =
+                reconciliation_memory_entry(memory_terminal.clone()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "VersionBundle publication memory is not canonical",
+                    )
+                })?;
+            if memory != &canonical_memory
+                || !version_bundle_publication_transition_matches(journal_terminal, memory_terminal)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle publication journal and memory disagree",
+                ));
+            }
+            self.converge_version_bundle_publication_acknowledgement(
+                StartupVersionBundlePublicationRequirement {
+                    journal_terminal: journal_terminal.clone(),
+                    memory_terminal: memory_terminal.clone(),
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn converge_acknowledged_version_bundle_publications(&self) -> io::Result<()> {
+        for requirement in self.startup_version_bundle_publication_requirements()? {
+            self.converge_version_bundle_publication_acknowledgement(requirement)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn converge_version_bundle_publication_acknowledgement(
+        &self,
+        requirement: StartupVersionBundlePublicationRequirement,
+    ) -> io::Result<()> {
+        let journal_pending = requirement
+            .journal_terminal
+            .version_bundle_publication()
+            .is_some_and(|publication| publication.is_pending());
+        let memory_pending = requirement
+            .memory_terminal
+            .version_bundle_publication()
+            .is_some_and(|publication| publication.is_pending());
+        match (journal_pending, memory_pending) {
+            (true, false) => {
+                self.journals
+                    .acknowledge_reconciliation_version_bundle_publication(
+                        &requirement.journal_terminal,
+                    )
+                    .await
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "VersionBundle journal acknowledgement convergence failed: {}",
+                            error.class()
+                        ))
+                    })?;
+            }
+            (false, true) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle journal was acknowledged before its failure memory",
+                ));
+            }
+            (true, true) | (false, false) => {}
+        }
+        Ok(())
+    }
+
+    async fn acknowledge_reconciliation_version_bundle_publication(
+        &self,
+        expected: &ReconciliationTerminal,
+    ) -> Result<(), OperationJournalStoreError> {
+        let expected_memory = reconciliation_memory_entry(expected.clone())
+            .map_err(|_| OperationJournalStoreError::InvalidGuardianOutcome)?;
+        let publication = expected
+            .version_bundle_publication()
+            .filter(|publication| publication.is_pending())
+            .ok_or(OperationJournalStoreError::InvalidGuardianOutcome)?;
+        let acknowledged_terminal = expected
+            .clone()
+            .with_acknowledged_version_bundle_publication(publication.evidence())
+            .map_err(|_| OperationJournalStoreError::InvalidGuardianOutcome)?;
+        let acknowledged_memory = reconciliation_memory_entry(acknowledged_terminal)
+            .map_err(|_| OperationJournalStoreError::InvalidGuardianOutcome)?;
+        self.failure_memory
+            .acknowledge_reconciliation_version_bundle_publication(
+                &expected_memory,
+                acknowledged_memory,
+            )
+            .await
+            .map_err(|_| OperationJournalStoreError::GuardianFailureMemoryUnavailable)?;
+        self.journals
+            .acknowledge_reconciliation_version_bundle_publication(expected)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) fn pending_startup_version_bundle_publication_instances(
+        &self,
+    ) -> io::Result<Vec<String>> {
+        let mut instances = Vec::new();
+        let mut pending_publications = 0usize;
+        for requirement in self.startup_version_bundle_publication_requirements()? {
+            let journal_pending = requirement
+                .journal_terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| publication.is_pending());
+            let memory_pending = requirement
+                .memory_terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| publication.is_pending());
+            match (journal_pending, memory_pending) {
+                (false, false) => continue,
+                (true, true) => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "VersionBundle publication acknowledgement is only partially durable",
+                    ));
+                }
+            }
+            pending_publications = pending_publications.saturating_add(1);
+            if pending_publications > 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "multiple pending VersionBundle publications share the managed root",
+                ));
+            }
+            let ReconciliationScope::RegisteredInstance { instance_id, .. } =
+                requirement.journal_terminal.scope();
+            instances.push(instance_id.clone());
+        }
+        for requirement in self.startup_version_bundle_orphan_requirements()? {
+            pending_publications = pending_publications.saturating_add(1);
+            if pending_publications > 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "multiple pending VersionBundle publications share the managed root",
+                ));
+            }
+            let ReconciliationScope::RegisteredInstance { instance_id, .. } =
+                requirement.attempt.scope();
+            instances.push(instance_id.clone());
+        }
+        instances.sort();
+        instances.dedup();
+        Ok(instances)
+    }
+
+    pub(crate) fn has_live_startup_version_bundle_source(&self, instance_id: &str) -> bool {
+        self.current_reconciliation_incarnation(instance_id).is_ok()
+    }
+
+    pub(crate) async fn settle_startup_version_bundle_publications(&self) -> io::Result<()> {
+        self.settle_startup_version_bundle_orphan().await?;
+        self.converge_acknowledged_version_bundle_publications()
+            .await?;
+        let requirements = self
+            .startup_version_bundle_publication_requirements()?
+            .into_iter()
+            .filter(|requirement| {
+                requirement
+                    .journal_terminal
+                    .version_bundle_publication()
+                    .is_some_and(|publication| publication.is_pending())
+            })
+            .collect::<Vec<_>>();
+        if requirements.len() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "multiple pending VersionBundle publications share the managed root",
+            ));
+        }
+        for requirement in requirements {
+            self.settle_startup_version_bundle_publication(requirement)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn settle_startup_version_bundle_orphan(&self) -> io::Result<()> {
+        let Some(requirement) = self
+            .startup_version_bundle_orphan_requirements()?
+            .into_iter()
+            .next()
+        else {
+            return Ok(());
+        };
+        let ReconciliationScope::RegisteredInstance { instance_id, .. } =
+            requirement.attempt.scope();
+        let instance_id = instance_id.clone();
+        let _lifecycle = self.acquire_instance_lifecycle(&instance_id).await;
+        let _config_mutation = self.config.acquire_mutation().await.map_err(|_| {
+            io::Error::other("VersionBundle orphan config authority is unavailable")
+        })?;
+        let _component_mutation = self
+            .sessions
+            .acquire_shared_component_mutation()
+            .await
+            .ok_or_else(|| {
+                io::Error::other("VersionBundle orphan component authority is unavailable")
+            })?;
+        let _artifact_mutation = self
+            .admit_managed_artifact_mutation()
+            .map_err(|_| io::Error::other("VersionBundle orphan mutation was refused"))?;
+        let (library_operation, source) =
+            self.validate_startup_version_bundle_orphan(&requirement.attempt)?;
+        let mut outcome = Some(
+            recover_guardian_version_bundle_orphan(
+                library_operation.retained_core(),
+                source.as_ref(),
+            )
+            .await,
+        );
+        let mut delay = std::time::Duration::from_millis(20);
+        for _ in 0..4 {
+            match outcome.take().expect("startup orphan outcome") {
+                ManagedVersionBundleOrphanOutcome::Indeterminate(recovery) => {
+                    tokio::time::sleep(delay).await;
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(1));
+                    outcome = Some(recovery.retry().await);
+                }
+                terminal => {
+                    outcome = Some(terminal);
+                    break;
+                }
+            }
+        }
+        let settlement = match outcome.expect("startup orphan outcome") {
+            ManagedVersionBundleOrphanOutcome::NoSettlement => return Ok(()),
+            ManagedVersionBundleOrphanOutcome::Settled(settlement) => settlement,
+            ManagedVersionBundleOrphanOutcome::Mismatch => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle orphan does not match its durable plan",
+                ));
+            }
+            ManagedVersionBundleOrphanOutcome::Indeterminate(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "VersionBundle orphan remains indeterminate",
+                ));
+            }
+        };
+        let evidence = settlement.evidence_id();
+        // Receipt loss also loses the exact failed-artifact postcheck authority, so
+        // recovery records the durable effect without claiming repair success.
+        let (publication_outcome, rollback) = match settlement.outcome() {
+            ManagedVersionBundleSettlementOutcome::Committed => (
+                ReconciliationVersionBundleOutcome::Committed,
+                RollbackState::NotApplicable,
+            ),
+            ManagedVersionBundleSettlementOutcome::RolledBack { .. } => (
+                ReconciliationVersionBundleOutcome::RolledBack,
+                RollbackState::Applied,
+            ),
+        };
+        self.validate_startup_version_bundle_orphan(&requirement.attempt)?;
+        let terminal = ReconciliationTerminal::from_attempt(
+            requirement.attempt.clone(),
+            ReconciliationTerminalOutcome::Failed,
+            ReconciliationQuarantineCheckpoint::default(),
+        )
+        .with_version_bundle_publication(evidence, publication_outcome);
+        terminal.validate().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VersionBundle orphan terminal is invalid",
+            )
+        })?;
+        let reservation = reserve_reconciliation_attempt_resume(
+            self.failure_memory.as_ref(),
+            self.journals.as_ref(),
+            &requirement.attempt,
+        )
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "VersionBundle orphan attempt is no longer resumable",
+            )
+        })?;
+        let mut step = component_rebuild_step(
+            VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+            requirement.attempt.target(),
+            rollback,
+        );
+        step.result = OperationStepResult::Failed;
+        record_reconciliation_journal_failure(
+            self.journals.as_ref(),
+            requirement.attempt.operation_id(),
+            step,
+            VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+            terminal.clone(),
+        )
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "VersionBundle orphan journal persistence failed: {}",
+                error.class()
+            ))
+        })?;
+        commit_reconciliation_memory(
+            self.failure_memory.as_ref(),
+            reconciliation_memory_entry(terminal.clone()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle orphan memory is invalid",
+                )
+            })?,
+            &reservation,
+        )
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "VersionBundle orphan memory persistence failed: {}",
+                error.class()
+            ))
+        })?;
+        drop(reservation);
+        self.validate_startup_version_bundle_publication(&terminal)?;
+        let mut acknowledgement = Some(settlement.acknowledge().await);
+        let mut delay = std::time::Duration::from_millis(20);
+        for _ in 0..4 {
+            match acknowledgement
+                .take()
+                .expect("orphan acknowledgement outcome")
+            {
+                ManagedVersionBundleAcknowledgementOutcome::Indeterminate(recovery) => {
+                    tokio::time::sleep(delay).await;
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(1));
+                    acknowledgement = Some(recovery.retry().await);
+                }
+                terminal => {
+                    acknowledgement = Some(terminal);
+                    break;
+                }
+            }
+        }
+        match acknowledgement.expect("orphan acknowledgement outcome") {
+            ManagedVersionBundleAcknowledgementOutcome::Acknowledged => {}
+            ManagedVersionBundleAcknowledgementOutcome::NoSettlement
+            | ManagedVersionBundleAcknowledgementOutcome::Mismatch => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle orphan acknowledgement lost its exact settlement",
+                ));
+            }
+            ManagedVersionBundleAcknowledgementOutcome::Indeterminate(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "VersionBundle orphan acknowledgement remains indeterminate",
+                ));
+            }
+        }
+        self.acknowledge_reconciliation_version_bundle_publication(&terminal)
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "VersionBundle orphan acknowledgement persistence failed: {}",
+                    error.class()
+                ))
+            })
+    }
+
+    fn validate_startup_version_bundle_orphan(
+        &self,
+        attempt: &ReconciliationAttempt,
+    ) -> io::Result<(
+        LibraryOperation,
+        std::sync::Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
+    )> {
+        if !self
+            .startup_version_bundle_orphan_requirements()?
+            .iter()
+            .any(|requirement| &requirement.attempt == attempt)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VersionBundle orphan plan changed during recovery",
+            ));
+        }
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+            inventory_fingerprint,
+            activation_contract_id,
+        } = attempt.scope();
+        let current = self
+            .current_reconciliation_incarnation(instance_id)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle orphan incarnation is unavailable",
+                )
+            })?;
+        if fingerprint != &current.fingerprint
+            || inventory_fingerprint != &current.inventory_fingerprint
+            || activation_contract_id != current.source.activation_contract_id()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VersionBundle orphan authority changed",
+            ));
+        }
+        let operation = self.try_acquire_managed_library()?;
+        if operation.configured_path() != current.roots.library {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VersionBundle orphan managed-library generation changed",
+            ));
+        }
+        self.validate_managed_library_operation(&operation)?;
+        Ok((operation, current.source))
+    }
+
+    async fn settle_startup_version_bundle_publication(
+        &self,
+        requirement: StartupVersionBundlePublicationRequirement,
+    ) -> io::Result<()> {
+        let ReconciliationScope::RegisteredInstance { instance_id, .. } =
+            requirement.journal_terminal.scope();
+        let instance_id = instance_id.clone();
+        let _lifecycle = self.acquire_instance_lifecycle(&instance_id).await;
+        let _config_mutation = self.config.acquire_mutation().await.map_err(|_| {
+            io::Error::other("VersionBundle startup config authority is unavailable")
+        })?;
+        let _component_mutation = self
+            .sessions
+            .acquire_shared_component_mutation()
+            .await
+            .ok_or_else(|| {
+                io::Error::other("VersionBundle startup component authority is unavailable")
+            })?;
+        let _artifact_mutation = self
+            .admit_managed_artifact_mutation()
+            .map_err(|_| io::Error::other("VersionBundle startup mutation was refused"))?;
+        let (library_operation, source) =
+            self.validate_startup_version_bundle_publication(&requirement.journal_terminal)?;
+        let current = self
+            .startup_version_bundle_publication_requirements()?
+            .into_iter()
+            .find(|current| {
+                current.journal_terminal == requirement.journal_terminal
+                    && current.memory_terminal == requirement.memory_terminal
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle publication evidence changed before recovery",
+                )
+            })?;
+        let publication = current
+            .journal_terminal
+            .version_bundle_publication()
+            .filter(|publication| publication.is_pending())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle publication is not pending",
+                )
+            })?;
+        let expected_settlement = match publication.outcome() {
+            ReconciliationVersionBundleOutcome::Committed => {
+                ManagedVersionBundleExpectedSettlement::Committed
+            }
+            ReconciliationVersionBundleOutcome::RolledBack => {
+                ManagedVersionBundleExpectedSettlement::RolledBack
+            }
+        };
+        let mut outcome = Some(
+            recover_managed_version_bundle_acknowledgement(
+                library_operation.retained_core(),
+                source.as_ref(),
+                expected_settlement,
+                publication.evidence(),
+            )
+            .await,
+        );
+        let mut delay = std::time::Duration::from_millis(20);
+        for _ in 0..4 {
+            match outcome.take().expect("startup acknowledgement outcome") {
+                ManagedVersionBundleAcknowledgementOutcome::Indeterminate(recovery) => {
+                    tokio::time::sleep(delay).await;
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(1));
+                    outcome = Some(recovery.retry().await);
+                }
+                terminal => {
+                    outcome = Some(terminal);
+                    break;
+                }
+            }
+        }
+        match outcome.expect("startup acknowledgement outcome") {
+            ManagedVersionBundleAcknowledgementOutcome::Acknowledged
+            | ManagedVersionBundleAcknowledgementOutcome::NoSettlement => {}
+            ManagedVersionBundleAcknowledgementOutcome::Mismatch => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle startup publication does not match persisted evidence",
+                ));
+            }
+            ManagedVersionBundleAcknowledgementOutcome::Indeterminate(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "VersionBundle startup publication remains indeterminate",
+                ));
+            }
+        }
+        self.validate_startup_version_bundle_publication(&requirement.journal_terminal)?;
+        let exact = self
+            .startup_version_bundle_publication_requirements()?
+            .into_iter()
+            .any(|current| {
+                current.journal_terminal == requirement.journal_terminal
+                    && current.memory_terminal == requirement.memory_terminal
+            });
+        if !exact {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VersionBundle publication evidence changed during recovery",
+            ));
+        }
+        self.acknowledge_reconciliation_version_bundle_publication(&requirement.journal_terminal)
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "VersionBundle publication acknowledgement persistence failed: {}",
+                    error.class()
+                ))
+            })
+    }
+
+    fn validate_startup_version_bundle_publication(
+        &self,
+        terminal: &ReconciliationTerminal,
+    ) -> io::Result<(
+        LibraryOperation,
+        std::sync::Arc<axial_minecraft::known_good::KnownGoodActivationSource>,
+    )> {
+        let publication = terminal
+            .version_bundle_publication()
+            .filter(|publication| publication.is_pending())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle startup publication is not pending",
+                )
+            })?;
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+            inventory_fingerprint,
+            activation_contract_id,
+        } = terminal.scope();
+        let current = self
+            .current_reconciliation_incarnation(instance_id)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VersionBundle startup incarnation is unavailable",
+                )
+            })?;
+        if fingerprint != &current.fingerprint
+            || inventory_fingerprint != &current.inventory_fingerprint
+            || activation_contract_id != current.source.activation_contract_id()
+            || !publication
+                .evidence()
+                .matches_version_id(current.source.version_id())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VersionBundle startup publication authority changed",
+            ));
+        }
+        let operation = self.try_acquire_managed_library()?;
+        if operation.configured_path() != current.roots.library {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VersionBundle startup managed-library generation changed",
+            ));
+        }
+        self.validate_managed_library_operation(&operation)?;
+        Ok((operation, current.source))
+    }
+
+    pub(crate) async fn reconcile_reconciliation_startup(&self) -> io::Result<()> {
+        self.failure_memory
+            .settle_reconciliation_pending()
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "Guardian reconciliation memory settlement failed: {}",
+                    error.class()
+                ))
+            })?;
+        self.converge_existing_version_bundle_publication_acknowledgements()
+            .await?;
+        let mut newest = std::collections::BTreeMap::new();
+        let journals = self
+            .journals
+            .matching_entries(|journal| journal.reconciliation_attempt().is_some());
+        let referenced_predecessors = journals
+            .iter()
+            .filter(|journal| {
+                matches!(
+                    journal.status,
+                    OperationStatus::Planned | OperationStatus::Running
+                ) && journal.reconciliation_terminal().is_none()
+            })
+            .filter_map(OperationJournalEntry::reconciliation_attempt)
+            .filter_map(|attempt| match attempt.lineage() {
+                ReconciliationLineage::Predecessor { operation_id } => Some(operation_id.clone()),
+                ReconciliationLineage::Initial => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for journal in &journals {
+            let Some(terminal) = journal.reconciliation_terminal().cloned() else {
+                continue;
+            };
+            let publication_pending = terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| publication.is_pending());
+            let memory = reconciliation_memory_entry(terminal.clone()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active reconciliation journal cannot derive failure memory",
+                )
+            })?;
+            if !publication_pending
+                && !referenced_predecessors.contains(terminal.operation_id())
+                && !self.failure_memory.suppression_active(&memory)
+            {
+                continue;
+            }
+            let key = reconciliation_attempt_key(terminal.attempt());
+            if newest
+                .insert(key.as_str().to_string(), (key, terminal))
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "overlapping active reconciliation terminals share one memory key",
+                ));
+            }
+        }
+        for memory in self.failure_memory.list() {
+            let Some(terminal) = memory.reconciliation_terminal() else {
+                continue;
+            };
+            let publication_pending = terminal
+                .version_bundle_publication()
+                .is_some_and(|publication| publication.is_pending());
+            if !publication_pending
+                && !referenced_predecessors.contains(terminal.operation_id())
+                && !self.failure_memory.suppression_active(&memory)
+            {
+                continue;
+            }
+            let exact_journal = journals.iter().any(|journal| {
+                &journal.operation_id == terminal.operation_id()
+                    && journal.reconciliation_terminal() == Some(terminal)
+            });
+            let canonical = reconciliation_memory_entry(terminal.clone()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active reconciliation memory cannot be derived from its terminal",
+                )
+            })?;
+            if !exact_journal || canonical != memory {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active reconciliation memory has no exact journal terminal",
+                ));
+            }
+        }
+        for (_, (key, terminal)) in newest {
+            let memory = reconciliation_memory_entry(terminal).map_err(|_| {
+                io::Error::other("typed reconciliation journal cannot rebuild failure memory")
+            })?;
+            if self.failure_memory.get(&memory.key).as_ref() == Some(&memory) {
+                continue;
+            }
+            if let Some(existing) = self.failure_memory.get(&memory.key)
+                && self.failure_memory.suppression_active(&existing)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "overlapping reconciliation memory cannot be superseded",
+                ));
+            }
+            let reservation = reserve_reconciliation_attempt(
+                self.failure_memory.as_ref(),
+                self.journals.as_ref(),
+                key,
+            )
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "typed reconciliation startup attempt is already reserved",
+                )
+            })?;
+            commit_reconciliation_memory(self.failure_memory.as_ref(), memory, &reservation)
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "typed reconciliation startup memory commit failed: {}",
+                        error.class()
+                    ))
+                })?;
+        }
+        self.converge_acknowledged_version_bundle_publications()
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) fn registered_reconciliation_authority(
+        &self,
+        lifecycle: &InstanceLifecycleLease,
+    ) -> Result<RegisteredReconciliationAuthority, ReconciliationEvidenceRejection> {
+        if !self.instance_lifecycle_gates.owns(&lifecycle.owner) {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        self.current_reconciliation_incarnation(&lifecycle.instance_id)?;
+        Ok(RegisteredReconciliationAuthority {
+            state: self.clone(),
+            lifecycle: lifecycle.retained(),
+            verification: None,
+            managed_artifact_epoch: None,
+        })
+    }
+
+    pub(super) fn registered_reconciliation_authority_for_verification(
+        &self,
+        verification: &KnownGoodVerificationLease,
+    ) -> Result<RegisteredReconciliationAuthority, ReconciliationEvidenceRejection> {
+        if !self.known_good_verification_lease_can_admit(verification) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        self.current_reconciliation_incarnation(&verification._lifecycle.instance_id)?;
+        Ok(RegisteredReconciliationAuthority {
+            state: self.clone(),
+            lifecycle: verification._lifecycle.retained(),
+            managed_artifact_epoch: verification.managed_artifact_epoch.clone(),
+            verification: Some(verification.retained()),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn registered_reconciliation_attempt_at(
+        &self,
+        lifecycle: &InstanceLifecycleLease,
+        operation_id: OperationId,
+        diagnosis_id: DiagnosisId,
+        domain: GuardianDomain,
+        rung: ReconciliationRung,
+        component: ReconciliationComponent,
+        target: TargetDescriptor,
+        observed_at: chrono::DateTime<chrono::FixedOffset>,
+        suppression_until: chrono::DateTime<chrono::FixedOffset>,
+        lineage: ReconciliationLineage,
+    ) -> Result<ReconciliationAttempt, ReconciliationEvidenceRejection> {
+        if !self.instance_lifecycle_gates.owns(&lifecycle.owner) {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        let incarnation = self.current_reconciliation_incarnation(&lifecycle.instance_id)?;
+        let attempt = ReconciliationAttempt::new(
+            operation_id,
+            diagnosis_id,
+            domain,
+            rung,
+            ReconciliationScope::RegisteredInstance {
+                instance_id: lifecycle.instance_id.clone(),
+                fingerprint: incarnation.fingerprint,
+                inventory_fingerprint: incarnation.inventory_fingerprint,
+                activation_contract_id: incarnation.source.activation_contract_id().clone(),
+            },
+            component,
+            target,
+            GuardianMode::Managed,
+            OwnershipClass::LauncherManaged,
+            observed_at.to_rfc3339(),
+            suppression_until.to_rfc3339(),
+            lineage,
+        );
+        attempt
+            .validate()
+            .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+        Ok(attempt)
+    }
+
+    pub(crate) fn recorded_runtime_artifact_repair_failure(
+        &self,
+        lifecycle: &InstanceLifecycleLease,
+        operation_id: &OperationId,
+    ) -> Result<RecordedRuntimeArtifactRepairFailure, ReconciliationEvidenceRejection> {
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+        let evidence = self.recorded_reconciliation_failure_at(
+            lifecycle,
+            operation_id,
+            ReconciliationRung::RepairArtifact,
+            observed_at,
+            None,
+        )?;
+        let attempt = evidence.terminal.attempt();
+        if attempt.rung() != ReconciliationRung::RepairArtifact
+            || attempt.component() != ReconciliationComponent::Runtime
+            || attempt.domain() != GuardianDomain::Runtime
+            || attempt.mode() != GuardianMode::Managed
+            || attempt.ownership() != OwnershipClass::LauncherManaged
+            || attempt.target().system != StabilizationSystem::Execution
+            || attempt.target().kind != TargetKind::Runtime
+            || attempt.target().ownership != OwnershipClass::LauncherManaged
+            || !is_known_runtime_component(&attempt.target().id)
+        {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        Ok(RecordedRuntimeArtifactRepairFailure { evidence })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded_verified_registered_artifact_failure_for_test(
+        &self,
+        verification: KnownGoodVerificationLease,
+        attempt: &ReconciliationAttempt,
+    ) -> Result<RegisteredArtifactFailedRepair, ReconciliationEvidenceRejection> {
+        self.registered_reconciliation_authority_for_verification(&verification)?
+            .into_registered_artifact_failed_repair(attempt, None)
+    }
+
+    pub(crate) fn registered_artifact_recovery_entry(
+        &self,
+        authorization: RegisteredArtifactRepairAuthorization,
+    ) -> Result<RegisteredArtifactRecoveryEntry, ReconciliationEvidenceRejection> {
+        let (verification, inventory_ordinal, component, effect) =
+            authorization.exact_recovery_identity(self)?;
+        if effect != RegisteredArtifactRepairEffect::ComponentRebuildRequired {
+            return Ok(RegisteredArtifactRecoveryEntry::Fresh(authorization));
+        }
+        let resume = self.recorded_registered_artifact_failure_for_authorization(
+            verification,
+            inventory_ordinal,
+            component,
+        )?;
+        Ok(match resume {
+            Some(continuation) => RegisteredArtifactRecoveryEntry::Resume(continuation),
+            None => RegisteredArtifactRecoveryEntry::Fresh(authorization),
+        })
+    }
+
+    fn recorded_registered_artifact_failure_for_authorization(
+        &self,
+        verification: &KnownGoodVerificationLease,
+        inventory_ordinal: usize,
+        component: ReconciliationComponent,
+    ) -> Result<Option<RegisteredArtifactFailedRepair>, ReconciliationEvidenceRejection> {
+        if !self.known_good_verification_lease_can_admit(verification) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let (instance_id, version_id, created_at, library_root, runtime_cache, inventory) =
+            verification.execution_parts();
+        let expected_target = registered_artifact_target(verification, inventory_ordinal)
+            .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?;
+        let current = self.current_reconciliation_incarnation(instance_id)?;
+        if current.roots.library != library_root || current.roots.runtime != runtime_cache.root() {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        if let Some(resume_attempt) = self.resumable_source_component_attempt_for_authorization(
+            instance_id,
+            &current,
+            &expected_target,
+            component,
+        )? {
+            let authority =
+                self.registered_reconciliation_authority_for_verification(verification)?;
+            let continuation =
+                authority.into_registered_artifact_failed_repair_resume(&resume_attempt, None)?;
+            let provenance = continuation
+                .evidence
+                .artifact_provenance
+                .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?;
+            if continuation.evidence.terminal.target() != &expected_target
+                || provenance.component() != component
+                || provenance.inventory_ordinal() != inventory_ordinal
+                || !std::sync::Arc::ptr_eq(&continuation.evidence.source, &verification.source)
+            {
+                return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+            }
+            return Ok(Some(continuation));
+        }
+        let matches_exact_candidate = |attempt: &ReconciliationAttempt| {
+            attempt.rung() == ReconciliationRung::RepairArtifact
+                && attempt.target() == &expected_target
+                && matches!(
+                    attempt.scope(),
+                    ReconciliationScope::RegisteredInstance {
+                        instance_id: attempted_instance_id,
+                        fingerprint,
+                        inventory_fingerprint,
+                        activation_contract_id,
+                    } if attempted_instance_id == instance_id
+                        && fingerprint == &current.fingerprint
+                        && inventory_fingerprint == &current.inventory_fingerprint
+                        && activation_contract_id == current.source.activation_contract_id()
+                )
+        };
+
+        let journals = self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_attempt()
+                .is_some_and(&matches_exact_candidate)
+        });
+        let mut active_journals = Vec::new();
+        for journal in &journals {
+            let Some(attempt) = journal.reconciliation_attempt() else {
+                continue;
+            };
+            if !matches_exact_candidate(attempt) {
+                continue;
+            }
+            let Some(terminal) = journal.reconciliation_terminal() else {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            };
+            if !active_reconciliation_terminal_at(self.failure_memory.as_ref(), terminal)? {
+                continue;
+            }
+            if terminal.outcome() != ReconciliationTerminalOutcome::Failed {
+                return Err(ReconciliationEvidenceRejection::MemoryNotFailed);
+            }
+            if journal.failure_point.as_deref()
+                != Some(REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT)
+                || !registered_component_required_terminal_matches(journal, terminal, instance_id)
+            {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+            active_journals.push(terminal.clone());
+        }
+
+        let mut active_memories = Vec::new();
+        for memory in self.failure_memory.list_current() {
+            let Some(terminal) = memory.reconciliation_terminal().cloned() else {
+                continue;
+            };
+            if !matches_exact_candidate(terminal.attempt())
+                || !active_reconciliation_terminal_at(self.failure_memory.as_ref(), &terminal)?
+            {
+                continue;
+            }
+            if terminal.outcome() != ReconciliationTerminalOutcome::Failed {
+                return Err(ReconciliationEvidenceRejection::MemoryNotFailed);
+            }
+            if memory != reconciliation_memory_entry(terminal.clone())? {
+                return Err(ReconciliationEvidenceRejection::MemoryNotFailed);
+            }
+            active_memories.push(terminal);
+        }
+
+        let terminal = match (active_journals.as_slice(), active_memories.as_slice()) {
+            ([], []) => return Ok(None),
+            ([_], []) => return Err(ReconciliationEvidenceRejection::MemoryMissing),
+            ([], [_]) => return Err(ReconciliationEvidenceRejection::JournalMissing),
+            ([journal], [memory]) if journal == memory => journal,
+            _ => return Err(ReconciliationEvidenceRejection::JournalMismatch),
+        };
+        let provenance = resolve_recorded_artifact_provenance(
+            instance_id,
+            version_id,
+            created_at,
+            library_root,
+            runtime_cache.root(),
+            inventory,
+            terminal.attempt(),
+        )
+        .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?;
+        if ManagedArtifactRebuildComponent::from_artifact_attempt(terminal.attempt())?
+            .reconciliation_component()
+            != component
+            || terminal.target() != &expected_target
+            || provenance.component() != component
+            || provenance.inventory_ordinal() != inventory_ordinal
+        {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+        let evidence = self.recorded_reconciliation_failure_at(
+            &verification._lifecycle,
+            terminal.operation_id(),
+            ReconciliationRung::RepairArtifact,
+            observed_at,
+            Some(verification),
+        )?;
+        if &evidence.terminal != terminal
+            || evidence.artifact_provenance != Some(provenance)
+            || !std::sync::Arc::ptr_eq(&evidence.source, &verification.source)
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let authority = self.registered_reconciliation_authority_for_verification(verification)?;
+        let continuation =
+            authority.into_registered_artifact_failed_repair(terminal.attempt(), None)?;
+        if continuation.evidence.artifact_provenance != Some(provenance) {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        Ok(Some(continuation))
+    }
+
+    fn resumable_source_component_attempt_for_authorization(
+        &self,
+        instance_id: &str,
+        current: &CurrentReconciliationIncarnation,
+        expected_target: &TargetDescriptor,
+        component: ReconciliationComponent,
+    ) -> Result<Option<ReconciliationAttempt>, ReconciliationEvidenceRejection> {
+        let expected_domain = match component {
+            ReconciliationComponent::VersionBundle => GuardianDomain::Launch,
+            ReconciliationComponent::Libraries => GuardianDomain::Library,
+            ReconciliationComponent::Assets => GuardianDomain::Download,
+            ReconciliationComponent::Runtime => return Ok(None),
+        };
+        let matches_attempt = |attempt: &ReconciliationAttempt| {
+            attempt.rung() == ReconciliationRung::RebuildComponent
+                && attempt.component() == component
+                && attempt.domain() == expected_domain
+                && attempt.diagnosis_id() == DiagnosisId::LauncherManagedArtifactCorrupt
+                && attempt.mode() == GuardianMode::Managed
+                && attempt.ownership() == OwnershipClass::LauncherManaged
+                && attempt.target() == expected_target
+                && matches!(attempt.lineage(), ReconciliationLineage::Predecessor { .. })
+                && matches!(
+                    attempt.scope(),
+                    ReconciliationScope::RegisteredInstance {
+                        instance_id: attempted_instance_id,
+                        fingerprint,
+                        inventory_fingerprint,
+                        activation_contract_id,
+                    } if attempted_instance_id == instance_id
+                        && fingerprint == &current.fingerprint
+                        && inventory_fingerprint == &current.inventory_fingerprint
+                        && activation_contract_id == current.source.activation_contract_id()
+                )
+        };
+        let mut matched = None;
+        for journal in self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_attempt()
+                .is_some_and(&matches_attempt)
+        }) {
+            let attempt = journal
+                .reconciliation_attempt()
+                .expect("reconciliation attempt was filtered");
+            attempt
+                .validate()
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+            if !source_component_rebuild_journal_is_resumable(&journal, attempt)
+                || matched.replace(attempt.clone()).is_some()
+            {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+        }
+        if self.failure_memory.list_current().iter().any(|memory| {
+            memory
+                .reconciliation_terminal()
+                .is_some_and(|terminal| matches_attempt(terminal.attempt()))
+        }) {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        Ok(matched)
+    }
+
+    pub(crate) fn active_recorded_runtime_artifact_failure(
+        &self,
+        lifecycle: &InstanceLifecycleLease,
+    ) -> Result<RecordedRuntimeArtifactRepairFailure, ReconciliationEvidenceRejection> {
+        if !self.instance_lifecycle_gates.owns(&lifecycle.owner) {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        let current = self.current_reconciliation_incarnation(&lifecycle.instance_id)?;
+        let matches_current_runtime = |attempt: &ReconciliationAttempt| {
+            attempt.rung() == ReconciliationRung::RepairArtifact
+                && attempt.component() == ReconciliationComponent::Runtime
+                && attempt.domain() == GuardianDomain::Runtime
+                && attempt.mode() == GuardianMode::Managed
+                && attempt.ownership() == OwnershipClass::LauncherManaged
+                && attempt.target().system == StabilizationSystem::Execution
+                && attempt.target().kind == TargetKind::Runtime
+                && attempt.target().ownership == OwnershipClass::LauncherManaged
+                && is_known_runtime_component(&attempt.target().id)
+                && matches!(
+                    attempt.scope(),
+                    ReconciliationScope::RegisteredInstance {
+                        instance_id,
+                        fingerprint,
+                        inventory_fingerprint,
+                        activation_contract_id,
+                    } if instance_id == &lifecycle.instance_id
+                        && fingerprint == &current.fingerprint
+                        && inventory_fingerprint == &current.inventory_fingerprint
+                        && activation_contract_id == current.source.activation_contract_id()
+                )
+        };
+
+        let journals = self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_attempt()
+                .is_some_and(&matches_current_runtime)
+        });
+        for journal in &journals {
+            let Some(attempt) = journal.reconciliation_attempt() else {
+                continue;
+            };
+            if matches!(
+                journal.status,
+                OperationStatus::Planned | OperationStatus::Running
+            ) && journal.reconciliation_terminal().is_none()
+                && matches_current_runtime(attempt)
+            {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+        }
+
+        let active_journals = journals
+            .iter()
+            .filter_map(|journal| journal.reconciliation_terminal())
+            .filter(|terminal| {
+                terminal.outcome() == ReconciliationTerminalOutcome::Failed
+                    && matches_current_runtime(terminal.attempt())
+            })
+            .map(|terminal| {
+                active_reconciliation_terminal_at(self.failure_memory.as_ref(), terminal)
+                    .map(|active| active.then_some(terminal.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let mut active_memories = Vec::new();
+        for memory in self.failure_memory.list_current() {
+            let Some(terminal) = memory.reconciliation_terminal().cloned() else {
+                continue;
+            };
+            if terminal.outcome() != ReconciliationTerminalOutcome::Failed
+                || !matches_current_runtime(terminal.attempt())
+                || !active_reconciliation_terminal_at(self.failure_memory.as_ref(), &terminal)?
+            {
+                continue;
+            }
+            if memory != reconciliation_memory_entry(terminal.clone())? {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+            active_memories.push(terminal);
+        }
+        if active_journals.is_empty() && active_memories.is_empty() {
+            return Err(ReconciliationEvidenceRejection::MemoryMissing);
+        }
+        if active_journals.len() != 1
+            || active_memories.len() != 1
+            || active_journals[0] != active_memories[0]
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+        let evidence = self.recorded_reconciliation_failure_at(
+            lifecycle,
+            active_journals[0].operation_id(),
+            ReconciliationRung::RepairArtifact,
+            observed_at,
+            None,
+        )?;
+        Ok(RecordedRuntimeArtifactRepairFailure { evidence })
+    }
+
+    pub(crate) async fn admit_runtime_component_rebuild(
+        &self,
+        evidence: RecordedRuntimeArtifactRepairFailure,
+        operation_id: OperationId,
+        suppression_for: chrono::Duration,
+    ) -> Result<RegisteredComponentRebuildAdmission, ReconciliationEvidenceRejection> {
+        let attempt = evidence.evidence.terminal.attempt();
+        if attempt.component() != ReconciliationComponent::Runtime
+            || attempt.domain() != GuardianDomain::Runtime
+            || attempt.mode() != GuardianMode::Managed
+            || attempt.ownership() != OwnershipClass::LauncherManaged
+            || attempt.target().system != StabilizationSystem::Execution
+            || attempt.target().kind != TargetKind::Runtime
+            || attempt.target().ownership != OwnershipClass::LauncherManaged
+            || !is_known_runtime_component(&attempt.target().id)
+        {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        self.admit_component_rebuild_with_config_observer(
+            evidence,
+            None,
+            None,
+            None,
+            operation_id,
+            suppression_for,
+            || {},
+        )
+        .await
+    }
+
+    pub(crate) async fn admit_registered_artifact_component_rebuild(
+        &self,
+        continuation: RegisteredArtifactFailedRepair,
+        operation_id: OperationId,
+        suppression_for: chrono::Duration,
+    ) -> Result<RegisteredComponentRebuildAdmission, ReconciliationEvidenceRejection> {
+        let RegisteredArtifactFailedRepair {
+            evidence,
+            verification,
+            recovery_scope,
+            resume_attempt,
+        } = continuation;
+        self.admit_component_rebuild_with_config_observer(
+            RecordedRuntimeArtifactRepairFailure { evidence },
+            Some(verification),
+            recovery_scope.as_ref(),
+            resume_attempt.as_ref(),
+            operation_id,
+            suppression_for,
+            || {},
+        )
+        .await
+    }
+
+    async fn admit_component_rebuild_with_config_observer<AfterConfig>(
+        &self,
+        evidence: RecordedRuntimeArtifactRepairFailure,
+        verification: Option<KnownGoodVerificationLease>,
+        recovery_scope: Option<&RecoveringSessionMutationScope>,
+        resume_attempt: Option<&ReconciliationAttempt>,
+        operation_id: OperationId,
+        suppression_for: chrono::Duration,
+        after_config: AfterConfig,
+    ) -> Result<RegisteredComponentRebuildAdmission, ReconciliationEvidenceRejection>
+    where
+        AfterConfig: FnOnce(),
+    {
+        if &operation_id == evidence.evidence.terminal.operation_id() {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        if verification
+            .as_ref()
+            .is_some_and(|verification| !self.known_good_verification_lease_can_admit(verification))
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        validate_registered_artifact_provenance(
+            verification.as_ref(),
+            evidence.evidence.artifact_provenance,
+            &evidence.evidence.terminal,
+        )?;
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+        let predecessor_before_wait = self.recorded_reconciliation_failure_at_with_window(
+            &evidence.evidence.lifecycle,
+            evidence.evidence.terminal.operation_id(),
+            ReconciliationRung::RepairArtifact,
+            observed_at,
+            verification.as_ref(),
+            resume_attempt.is_none(),
+        )?;
+        if predecessor_before_wait.terminal != evidence.evidence.terminal
+            || predecessor_before_wait.roots != evidence.evidence.roots
+            || predecessor_before_wait.artifact_provenance != evidence.evidence.artifact_provenance
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        if !std::sync::Arc::ptr_eq(&predecessor_before_wait.source, &evidence.evidence.source) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        validate_registered_artifact_provenance(
+            verification.as_ref(),
+            predecessor_before_wait.artifact_provenance,
+            &predecessor_before_wait.terminal,
+        )?;
+        // Config precedes the shared-component writer: config mutations never acquire
+        // session admission, while session admission owns only the component reader.
+        let config_mutation = self
+            .config
+            .acquire_mutation()
+            .await
+            .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        after_config();
+        if verification
+            .as_ref()
+            .is_some_and(|verification| !self.known_good_verification_lease_can_admit(verification))
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let component_mutation = match recovery_scope {
+            Some(scope) => {
+                self.sessions
+                    .acquire_recovering_component_mutation(scope)
+                    .await
+            }
+            None => self.sessions.acquire_shared_component_mutation().await,
+        }
+        .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+        let predecessor = self.recorded_reconciliation_failure_at_with_window(
+            &predecessor_before_wait.lifecycle,
+            predecessor_before_wait.terminal.operation_id(),
+            ReconciliationRung::RepairArtifact,
+            observed_at,
+            verification.as_ref(),
+            resume_attempt.is_none(),
+        )?;
+        if predecessor.terminal != predecessor_before_wait.terminal
+            || predecessor.roots != predecessor_before_wait.roots
+            || predecessor.artifact_provenance != predecessor_before_wait.artifact_provenance
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        if !std::sync::Arc::ptr_eq(&predecessor.source, &predecessor_before_wait.source) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        validate_registered_artifact_provenance(
+            verification.as_ref(),
+            predecessor.artifact_provenance,
+            &predecessor.terminal,
+        )?;
+        if verification
+            .as_ref()
+            .is_some_and(|verification| !self.known_good_verification_lease_can_admit(verification))
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let instance = self
+            .instances
+            .get(&predecessor.lifecycle.instance_id)
+            .filter(|instance| instance.id == predecessor.lifecycle.instance_id.as_str())
+            .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
+        let known_good = RegisteredKnownGoodAuthority {
+            instance_id: instance.id,
+            version_id: instance.version_id,
+            created_at: instance.created_at,
+            library_root: predecessor.roots.library.clone(),
+            source: predecessor.source.clone(),
+        };
+        let authority = match verification.as_ref() {
+            Some(verification) => {
+                self.registered_reconciliation_authority_for_verification(verification)?
+            }
+            None => self.registered_reconciliation_authority(&predecessor.lifecycle)?,
+        };
+        let artifact_provenance = predecessor.artifact_provenance;
+        let prior = predecessor.terminal;
+        let component_state = match prior.component() {
+            ReconciliationComponent::Runtime => RegisteredComponentRebuildState::Runtime {
+                runtime_cache: self.managed_runtime_cache.clone(),
+                postcondition_failure_source: std::sync::OnceLock::new(),
+            },
+            ReconciliationComponent::VersionBundle
+            | ReconciliationComponent::Libraries
+            | ReconciliationComponent::Assets => {
+                let component =
+                    ManagedArtifactRebuildComponent::from_artifact_attempt(prior.attempt())?;
+                if artifact_provenance.is_none_or(|provenance| {
+                    provenance.component() != component.reconciliation_component()
+                }) {
+                    return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+                }
+                match component {
+                    ManagedArtifactRebuildComponent::VersionBundle => {
+                        RegisteredComponentRebuildState::VersionBundle
+                    }
+                    ManagedArtifactRebuildComponent::Libraries => {
+                        RegisteredComponentRebuildState::Libraries
+                    }
+                    ManagedArtifactRebuildComponent::Assets => {
+                        RegisteredComponentRebuildState::Assets
+                    }
+                }
+            }
+        };
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339(&self.failure_memory.now_timestamp())
+                .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+        let resumable = self.resumable_source_component_attempt(&prior)?;
+        if resume_attempt.is_some_and(|expected| resumable.as_ref() != Some(expected)) {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let (attempt, resumed) = match resumable {
+            Some(attempt) => (attempt, true),
+            None => {
+                let suppression_until = observed_at
+                    .checked_add_signed(suppression_for)
+                    .filter(|until| *until > observed_at)
+                    .ok_or(ReconciliationEvidenceRejection::JournalMismatch)?;
+                let attempt = self.registered_reconciliation_attempt_at(
+                    &predecessor.lifecycle,
+                    operation_id,
+                    prior.diagnosis_id(),
+                    prior.domain(),
+                    ReconciliationRung::RebuildComponent,
+                    prior.component(),
+                    prior.target().clone(),
+                    observed_at,
+                    suppression_until,
+                    ReconciliationLineage::Predecessor {
+                        operation_id: prior.operation_id().clone(),
+                    },
+                )?;
+                self.refuse_active_component_rebuild_window(&attempt)?;
+                (attempt, false)
+            }
+        };
+        let failed_terminal =
+            authority.terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed)?;
+        Ok(RegisteredComponentRebuildAdmission {
+            authority,
+            attempt,
+            resumed,
+            failed_terminal,
+            known_good,
+            artifact_provenance,
+            component_state,
+            _component_mutation: component_mutation,
+            _config_mutation: config_mutation,
+        })
+    }
+
+    fn resumable_source_component_attempt(
+        &self,
+        predecessor: &ReconciliationTerminal,
+    ) -> Result<Option<ReconciliationAttempt>, ReconciliationEvidenceRejection> {
+        if !matches!(
+            predecessor.component(),
+            ReconciliationComponent::VersionBundle
+                | ReconciliationComponent::Libraries
+                | ReconciliationComponent::Assets
+        ) {
+            return Ok(None);
+        }
+        let matches_attempt = |attempt: &ReconciliationAttempt| {
+            attempt.rung() == ReconciliationRung::RebuildComponent
+                && attempt.component() == predecessor.component()
+                && attempt.domain() == predecessor.domain()
+                && attempt.diagnosis_id() == predecessor.diagnosis_id()
+                && attempt.mode() == predecessor.mode()
+                && attempt.ownership() == predecessor.ownership()
+                && attempt.target() == predecessor.target()
+                && attempt.lineage()
+                    == &ReconciliationLineage::Predecessor {
+                        operation_id: predecessor.operation_id().clone(),
+                    }
+        };
+        let mut matched = None;
+        for journal in self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_attempt()
+                .is_some_and(&matches_attempt)
+        }) {
+            let attempt = journal
+                .reconciliation_attempt()
+                .expect("reconciliation attempt was filtered");
+            if !source_component_rebuild_journal_is_resumable(&journal, attempt)
+                || matched.replace(attempt.clone()).is_some()
+            {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+        }
+        if self.failure_memory.list_current().iter().any(|memory| {
+            memory
+                .reconciliation_terminal()
+                .is_some_and(|terminal| matches_attempt(terminal.attempt()))
+        }) {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        Ok(matched)
+    }
+
+    fn refuse_active_component_rebuild_window(
+        &self,
+        attempt: &ReconciliationAttempt,
+    ) -> Result<(), ReconciliationEvidenceRejection> {
+        let matches_suppression = |candidate: &ReconciliationAttempt| {
+            if attempt.component() == ReconciliationComponent::Runtime {
+                candidate.component() == ReconciliationComponent::Runtime
+                    && candidate.target() == attempt.target()
+            } else {
+                reconciliation_attempt_key(candidate) == reconciliation_attempt_key(attempt)
+            }
+        };
+        self.refuse_active_reconciliation_window(
+            ReconciliationRung::RebuildComponent,
+            matches_suppression,
+        )
+    }
+
+    pub(crate) fn refuse_active_artifact_repair_window(
+        &self,
+        attempt: &ReconciliationAttempt,
+    ) -> Result<(), ReconciliationEvidenceRejection> {
+        let key = reconciliation_attempt_key(attempt);
+        self.refuse_active_reconciliation_window(
+            ReconciliationRung::RepairArtifact,
+            move |candidate| reconciliation_attempt_key(candidate) == key,
+        )
+    }
+
+    fn refuse_active_reconciliation_window<Matches>(
+        &self,
+        rung: ReconciliationRung,
+        matches_suppression: Matches,
+    ) -> Result<(), ReconciliationEvidenceRejection>
+    where
+        Matches: Fn(&ReconciliationAttempt) -> bool,
+    {
+        let matches_window = |attempt: &ReconciliationAttempt| {
+            attempt.rung() == rung && matches_suppression(attempt)
+        };
+        let journals = self.journals.matching_entries(|journal| {
+            journal
+                .reconciliation_attempt()
+                .is_some_and(&matches_window)
+        });
+        if journals.iter().any(|journal| {
+            matches!(
+                journal.status,
+                OperationStatus::Planned | OperationStatus::Running
+            ) && journal.reconciliation_terminal().is_none()
+                && journal
+                    .reconciliation_attempt()
+                    .is_some_and(&matches_window)
+        }) {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let mut active_journals = Vec::new();
+        for journal in journals {
+            let Some(terminal) = journal.reconciliation_terminal().cloned() else {
+                continue;
+            };
+            if !matches_window(terminal.attempt())
+                || !active_reconciliation_terminal_at(self.failure_memory.as_ref(), &terminal)?
+            {
+                continue;
+            }
+            active_journals.push(terminal);
+        }
+
+        let mut active_memories = Vec::new();
+        for memory in self.failure_memory.list_current() {
+            let Some(terminal) = memory.reconciliation_terminal().cloned() else {
+                continue;
+            };
+            if !matches_window(terminal.attempt())
+                || !active_reconciliation_terminal_at(self.failure_memory.as_ref(), &terminal)?
+            {
+                continue;
+            }
+            let canonical = reconciliation_memory_entry(terminal.clone())?;
+            if memory != canonical {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+            active_memories.push(terminal);
+        }
+
+        if active_journals.len() != active_memories.len()
+            || active_journals.iter().any(|journal| {
+                active_memories
+                    .iter()
+                    .filter(|memory| *memory == journal)
+                    .count()
+                    != 1
+            })
+            || active_memories.iter().any(|memory| {
+                active_journals
+                    .iter()
+                    .filter(|journal| *journal == memory)
+                    .count()
+                    != 1
+            })
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let max_attempts = rung.max_attempts_per_suppression_window();
+        if active_journals.len() > max_attempts {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        if active_journals.len() == max_attempts {
+            return Err(ReconciliationEvidenceRejection::SuppressedPriorAttempt);
+        }
+        Ok(())
+    }
+
+    fn recorded_reconciliation_failure_at(
+        &self,
+        lifecycle: &InstanceLifecycleLease,
+        operation_id: &OperationId,
+        expected_rung: ReconciliationRung,
+        observed_at: chrono::DateTime<chrono::FixedOffset>,
+        verification: Option<&KnownGoodVerificationLease>,
+    ) -> Result<RecordedReconciliationFailure, ReconciliationEvidenceRejection> {
+        self.recorded_reconciliation_failure_at_with_window(
+            lifecycle,
+            operation_id,
+            expected_rung,
+            observed_at,
+            verification,
+            true,
+        )
+    }
+
+    fn recorded_reconciliation_failure_at_with_window(
+        &self,
+        lifecycle: &InstanceLifecycleLease,
+        operation_id: &OperationId,
+        expected_rung: ReconciliationRung,
+        observed_at: chrono::DateTime<chrono::FixedOffset>,
+        verification: Option<&KnownGoodVerificationLease>,
+        require_active_window: bool,
+    ) -> Result<RecordedReconciliationFailure, ReconciliationEvidenceRejection> {
+        if !self.instance_lifecycle_gates.owns(&lifecycle.owner) {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        let instance_id = lifecycle.instance_id.as_str();
+        if verification.is_some_and(|verification| {
+            !verification._lifecycle.matches(instance_id)
+                || !self.known_good_verification_lease_is_live(verification)
+        }) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        if !is_canonical_instance_id(instance_id) {
+            return Err(ReconciliationEvidenceRejection::InvalidInstanceIdentity);
+        }
+        let before_identity = self.current_reconciliation_identity(instance_id)?;
+        let journal = self
+            .journals
+            .get(operation_id)
+            .ok_or(ReconciliationEvidenceRejection::JournalMissing)?;
+        let terminal = journal
+            .reconciliation_terminal()
+            .cloned()
+            .filter(|terminal| terminal.operation_id() == operation_id)
+            .ok_or(ReconciliationEvidenceRejection::JournalMismatch)?;
+        let key = reconciliation_attempt_key(terminal.attempt());
+        let memory = self
+            .failure_memory
+            .get(&key)
+            .ok_or(ReconciliationEvidenceRejection::MemoryMissing)?;
+        if memory.reconciliation_terminal() != Some(&terminal)
+            || memory != reconciliation_memory_entry(terminal.clone())?
+        {
+            return Err(ReconciliationEvidenceRejection::MemoryNotFailed);
+        }
+        if terminal.rung() != expected_rung {
+            return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+        }
+        if terminal.outcome() != ReconciliationTerminalOutcome::Failed {
+            return Err(ReconciliationEvidenceRejection::MemoryNotFailed);
+        }
+        if terminal.ownership() != OwnershipClass::LauncherManaged {
+            return Err(ReconciliationEvidenceRejection::OwnershipMismatch);
+        }
+        let last_observed_at = chrono::DateTime::parse_from_rfc3339(&memory.last_observed_at)
+            .map_err(|_| ReconciliationEvidenceRejection::MemoryWindowInactive)?;
+        if observed_at < last_observed_at
+            || (require_active_window && !self.failure_memory.suppression_active(&memory))
+        {
+            return Err(ReconciliationEvidenceRejection::MemoryWindowInactive);
+        }
+        let ReconciliationScope::RegisteredInstance {
+            instance_id: terminal_instance_id,
+            fingerprint,
+            inventory_fingerprint,
+            activation_contract_id,
+        } = terminal.scope();
+        if terminal_instance_id != instance_id || fingerprint != &before_identity.fingerprint {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let before = self.reconciliation_incarnation_from_identity(before_identity)?;
+        if inventory_fingerprint != &before.inventory_fingerprint {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        if activation_contract_id != before.source.activation_contract_id() {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        if &journal.operation_id != terminal.operation_id()
+            || journal.command != CommandKind::RepairInstance
+            || journal.owner != StabilizationSystem::Guardian
+            || journal.ownership != OwnershipClass::LauncherManaged
+            || journal.status != OperationStatus::Failed
+            || journal.outcome != Some(OperationOutcome::Failed)
+            || journal.failure_point.is_none()
+            || journal.reconciliation_terminal() != Some(&terminal)
+            || !journal.targets.contains(terminal.target())
+            || !journal
+                .targets
+                .contains(&reconciliation_instance_target(instance_id))
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let after_identity = self.current_reconciliation_identity(instance_id)?;
+        if before.fingerprint != after_identity.fingerprint || before.roots != after_identity.roots
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let after = self.reconciliation_incarnation_from_identity(after_identity)?;
+        if before.inventory_fingerprint != after.inventory_fingerprint
+            || !std::sync::Arc::ptr_eq(&before.source, &after.source)
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let instance = self
+            .instances
+            .get(instance_id)
+            .filter(|instance| instance.id == instance_id)
+            .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
+        let source = after.source.clone();
+        let inventory = source.inventory().clone();
+        if verification.is_some_and(|verification| {
+            !std::sync::Arc::ptr_eq(&source, &verification.source)
+                || verification.version_id != instance.version_id
+                || verification.created_at != instance.created_at
+                || verification.library_root != after.roots.library
+                || !self.known_good_verification_lease_is_live(verification)
+        }) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let artifact_provenance = if expected_rung == ReconciliationRung::RepairArtifact
+            && matches!(
+                terminal.component(),
+                ReconciliationComponent::VersionBundle
+                    | ReconciliationComponent::Libraries
+                    | ReconciliationComponent::Assets
+            ) {
+            Some(
+                resolve_recorded_artifact_provenance(
+                    &instance.id,
+                    &instance.version_id,
+                    &instance.created_at,
+                    &after.roots.library,
+                    &after.roots.runtime,
+                    &inventory,
+                    terminal.attempt(),
+                )
+                .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?,
+            )
+        } else {
+            None
+        };
+        if expected_rung == ReconciliationRung::RebuildComponent {
+            if !component_rebuild_terminal_matches(&journal, &terminal, instance_id) {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+            let ReconciliationLineage::Predecessor {
+                operation_id: predecessor_operation_id,
+            } = terminal.attempt().lineage()
+            else {
+                return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+            };
+            let predecessor = self.recorded_reconciliation_failure_at_with_window(
+                lifecycle,
+                predecessor_operation_id,
+                ReconciliationRung::RepairArtifact,
+                observed_at,
+                verification,
+                require_active_window,
+            )?;
+            if !adjacent_reconciliation_attempts_match(
+                predecessor.terminal.attempt(),
+                terminal.attempt(),
+            ) {
+                return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+            }
+        }
+        Ok(RecordedReconciliationFailure {
+            terminal,
+            lifecycle: lifecycle.retained(),
+            roots: after.roots,
+            source,
+            artifact_provenance,
+        })
+    }
+
+    fn current_reconciliation_incarnation(
+        &self,
+        instance_id: &str,
+    ) -> Result<CurrentReconciliationIncarnation, ReconciliationEvidenceRejection> {
+        let identity = self.current_reconciliation_identity(instance_id)?;
+        self.reconciliation_incarnation_from_identity(identity)
+    }
+
+    fn current_reconciliation_identity(
+        &self,
+        instance_id: &str,
+    ) -> Result<CurrentReconciliationIdentity, ReconciliationEvidenceRejection> {
+        let instance = self
+            .instances
+            .get(instance_id)
+            .filter(|instance| instance.id == instance_id && is_canonical_instance_id(&instance.id))
+            .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
+        let instance_root = canonical_directory(&self.instances.game_dir(instance_id))
+            .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        let library_root = self
+            .library_dir()
+            .map(PathBuf::from)
+            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)
+            .and_then(|root| {
+                canonical_directory(&root)
+                    .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)
+            })?;
+        let runtime_root = canonical_directory(self.managed_runtime_cache.root())
+            .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        let roots = ReconciliationRoots {
+            instance: instance_root,
+            library: library_root,
+            runtime: runtime_root,
+        };
+        let fingerprint = reconciliation_fingerprint(
+            &instance.id,
+            &instance.version_id,
+            &instance.created_at,
+            &roots,
+        );
+        Ok(CurrentReconciliationIdentity {
+            instance_id: instance.id,
+            version_id: instance.version_id,
+            created_at: instance.created_at,
+            fingerprint,
+            roots,
+        })
+    }
+
+    fn reconciliation_incarnation_from_identity(
+        &self,
+        identity: CurrentReconciliationIdentity,
+    ) -> Result<CurrentReconciliationIncarnation, ReconciliationEvidenceRejection> {
+        let source = self
+            .known_good
+            .active_source(
+                &identity.instance_id,
+                &identity.version_id,
+                &identity.created_at,
+                &identity.roots.library,
+            )
+            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        let inventory_fingerprint = reconciliation_inventory_fingerprint(source.inventory());
+        Ok(CurrentReconciliationIncarnation {
+            fingerprint: identity.fingerprint,
+            inventory_fingerprint,
+            roots: identity.roots,
+            source,
+        })
+    }
+}
+
+fn registered_component_required_terminal_matches(
+    journal: &OperationJournalEntry,
+    terminal: &ReconciliationTerminal,
+    instance_id: &str,
+) -> bool {
+    const PLAN: [(&str, RollbackState); 4] = [
+        ("journal_repair_start", RollbackState::NotApplicable),
+        (
+            "registered_artifact_already_exact",
+            RollbackState::NotApplicable,
+        ),
+        (
+            REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
+            RollbackState::NotApplicable,
+        ),
+        ("record_repair_outcome", RollbackState::NotApplicable),
+    ];
+    let target = terminal.target();
+    let exact_plan = journal.planned_steps.len() == PLAN.len()
+        && journal
+            .planned_steps
+            .iter()
+            .zip(PLAN)
+            .all(|(step, (step_id, rollback))| {
+                step.step_id == step_id
+                    && step.phase == OperationPhase::Repairing
+                    && step.result == OperationStepResult::Planned
+                    && step.changed_target.as_ref() == Some(target)
+                    && step.generated_facts.is_empty()
+                    && step.rollback == rollback
+            });
+    let exact_failure = matches!(
+        journal.completed_steps.as_slice(),
+        [step]
+            if step.step_id == REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT
+                && step.phase == OperationPhase::Repairing
+                && step.result == OperationStepResult::Failed
+                && step.changed_target.as_ref() == Some(target)
+                && step.generated_facts.is_empty()
+                && step.rollback == RollbackState::NotApplicable
+    );
+    exact_plan
+        && exact_failure
+        && terminal.quarantine_checkpoint().is_empty()
+        && journal.rollback == RollbackState::NotApplicable
+        && journal.targets == [target.clone(), reconciliation_instance_target(instance_id)]
+        && journal.guardian_diagnosis_ids == [terminal.diagnosis_id()]
+}
+
+fn adjacent_reconciliation_attempts_match(
+    predecessor: &ReconciliationAttempt,
+    successor: &ReconciliationAttempt,
+) -> bool {
+    matches!(predecessor.lineage(), ReconciliationLineage::Initial)
+        && matches!(
+            successor.lineage(),
+            ReconciliationLineage::Predecessor { operation_id }
+                if operation_id == predecessor.operation_id()
+        )
+        && predecessor.rung() == ReconciliationRung::RepairArtifact
+        && successor.rung() == ReconciliationRung::RebuildComponent
+        && predecessor.diagnosis_id() == successor.diagnosis_id()
+        && predecessor.domain() == successor.domain()
+        && predecessor.component() == successor.component()
+        && predecessor.target() == successor.target()
+        && predecessor.mode() == successor.mode()
+        && predecessor.ownership() == successor.ownership()
+        && predecessor.scope() == successor.scope()
+}
+
+fn component_rebuild_terminal_matches(
+    journal: &OperationJournalEntry,
+    terminal: &ReconciliationTerminal,
+    instance_id: &str,
+) -> bool {
+    if terminal.rung() != ReconciliationRung::RebuildComponent
+        || terminal.outcome() != ReconciliationTerminalOutcome::Failed
+        || journal.targets
+            != [
+                terminal.target().clone(),
+                reconciliation_instance_target(instance_id),
+            ]
+        || journal.guardian_diagnosis_ids != [terminal.diagnosis_id()]
+        || journal.reconciliation_attempt() != Some(terminal.attempt())
+        || journal.reconciliation_terminal() != Some(terminal)
+    {
+        return false;
+    }
+    let expected_plan = match terminal.component() {
+        ReconciliationComponent::Runtime => vec![
+            (COMPONENT_REBUILD_START_STEP, RollbackState::NotApplicable),
+            (COMPONENT_QUARANTINE_STEP, RollbackState::Available),
+            (RUNTIME_COMPONENT_REBUILD_STEP, RollbackState::NotApplicable),
+        ],
+        ReconciliationComponent::VersionBundle => vec![
+            (COMPONENT_REBUILD_START_STEP, RollbackState::NotApplicable),
+            (
+                VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+                RollbackState::NotApplicable,
+            ),
+        ],
+        ReconciliationComponent::Libraries => vec![
+            (COMPONENT_REBUILD_START_STEP, RollbackState::NotApplicable),
+            (
+                LIBRARIES_COMPONENT_REBUILD_STEP,
+                RollbackState::NotApplicable,
+            ),
+        ],
+        ReconciliationComponent::Assets => vec![
+            (COMPONENT_REBUILD_START_STEP, RollbackState::NotApplicable),
+            (ASSETS_COMPONENT_REBUILD_STEP, RollbackState::NotApplicable),
+        ],
+    };
+    if journal.planned_steps.len() != expected_plan.len()
+        || journal
+            .planned_steps
+            .iter()
+            .zip(expected_plan)
+            .any(|(step, (step_id, rollback))| {
+                step.step_id != step_id
+                    || step.phase != OperationPhase::Repairing
+                    || step.result != OperationStepResult::Planned
+                    || step.changed_target.as_ref() != Some(terminal.target())
+                    || !step.generated_facts.is_empty()
+                    || step.rollback != rollback
+            })
+    {
+        return false;
+    }
+    let effect_step_id = match terminal.component() {
+        ReconciliationComponent::Runtime => RUNTIME_COMPONENT_REBUILD_STEP,
+        ReconciliationComponent::VersionBundle => VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+        ReconciliationComponent::Libraries => LIBRARIES_COMPONENT_REBUILD_STEP,
+        ReconciliationComponent::Assets => ASSETS_COMPONENT_REBUILD_STEP,
+    };
+    let terminal_steps = if terminal.quarantine_checkpoint().is_empty() {
+        journal.completed_steps.as_slice()
+    } else {
+        let Some((quarantine, terminal_steps)) = journal.completed_steps.split_first() else {
+            return false;
+        };
+        if terminal.component() != ReconciliationComponent::Runtime
+            || quarantine.step_id != COMPONENT_QUARANTINE_STEP
+            || quarantine.phase != OperationPhase::Repairing
+            || quarantine.result != OperationStepResult::Completed
+            || quarantine.changed_target.as_ref() != Some(terminal.target())
+            || quarantine.rollback != RollbackState::Available
+        {
+            return false;
+        }
+        terminal_steps
+    };
+    matches!(
+        terminal_steps,
+        [step]
+            if step.step_id == COMPONENT_REBUILD_START_STEP || step.step_id == effect_step_id
+    ) && terminal_steps[0].phase == OperationPhase::Repairing
+        && terminal_steps[0].result == OperationStepResult::Failed
+        && terminal_steps[0].changed_target.as_ref() == Some(terminal.target())
+        && journal.failure_point.as_deref() == Some(terminal_steps[0].step_id.as_str())
+        && journal.rollback == terminal_steps[0].rollback
+}
+
+fn active_reconciliation_terminal_at(
+    failure_memory: &GuardianFailureMemoryStore,
+    terminal: &ReconciliationTerminal,
+) -> Result<bool, ReconciliationEvidenceRejection> {
+    let memory = reconciliation_memory_entry(terminal.clone())?;
+    Ok(failure_memory.suppression_active(&memory))
+}
+
+pub(crate) fn reconciliation_instance_target(instance_id: &str) -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::State,
+        TargetKind::Instance,
+        instance_id,
+        OwnershipClass::LauncherManaged,
+    )
+}
+
+fn canonical_directory(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if absolute.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reconciliation root cannot contain relative traversal",
+        ));
+    }
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "reconciliation root ancestor must be a real directory",
+                    ));
+                }
+                let mut canonical = std::fs::canonicalize(ancestor)?;
+                if !same_canonical_directory(&canonical, ancestor) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "reconciliation root cannot traverse filesystem indirection",
+                    ));
+                }
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = ancestor.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "reconciliation root has no existing trusted ancestor",
+                    )
+                })?;
+                missing.push(component.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "reconciliation root has no existing trusted ancestor",
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn same_canonical_directory(canonical: &Path, configured: &Path) -> bool {
+    canonical == configured
+}
+
+#[cfg(windows)]
+fn same_canonical_directory(canonical: &Path, configured: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    #[derive(Eq, PartialEq)]
+    enum PrefixIdentity<'a> {
+        Disk(u8),
+        Unc(&'a std::ffi::OsStr, &'a std::ffi::OsStr),
+        Verbatim(&'a std::ffi::OsStr),
+        DeviceNamespace(&'a std::ffi::OsStr),
+    }
+
+    fn identity(prefix: Prefix<'_>) -> PrefixIdentity<'_> {
+        match prefix {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                PrefixIdentity::Disk(drive.to_ascii_uppercase())
+            }
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                PrefixIdentity::Unc(server, share)
+            }
+            Prefix::Verbatim(value) => PrefixIdentity::Verbatim(value),
+            Prefix::DeviceNS(value) => PrefixIdentity::DeviceNamespace(value),
+        }
+    }
+
+    let mut canonical_components = canonical.components();
+    let mut configured_components = configured.components();
+    let (Some(Component::Prefix(canonical_prefix)), Some(Component::Prefix(configured_prefix))) =
+        (canonical_components.next(), configured_components.next())
+    else {
+        return false;
+    };
+
+    identity(canonical_prefix.kind()) == identity(configured_prefix.kind())
+        && canonical_components.eq(configured_components)
+}
+
+fn reconciliation_fingerprint(
+    instance_id: &str,
+    version_id: &str,
+    created_at: &str,
+    roots: &ReconciliationRoots,
+) -> ReconciliationIncarnationFingerprint {
+    let mut hasher = Sha256::new();
+    update_frame(&mut hasher, b"domain", RECONCILIATION_FINGERPRINT_DOMAIN);
+    update_frame(&mut hasher, b"instance_id", instance_id.as_bytes());
+    update_frame(&mut hasher, b"version_id", version_id.as_bytes());
+    update_frame(&mut hasher, b"created_at", created_at.as_bytes());
+    update_path_frame(&mut hasher, b"instance_root", &roots.instance);
+    update_path_frame(&mut hasher, b"library_root", &roots.library);
+    update_path_frame(&mut hasher, b"runtime_root", &roots.runtime);
+    let hex = format!("{:x}", hasher.finalize());
+    let dotted = hex
+        .as_bytes()
+        .chunks(8)
+        .map(|chunk| std::str::from_utf8(chunk).expect("SHA-256 hex is ASCII"))
+        .collect::<Vec<_>>()
+        .join(".");
+    ReconciliationIncarnationFingerprint::from_digest(format!("sha256.{dotted}"))
+}
+
+fn reconciliation_inventory_fingerprint(
+    inventory: &axial_minecraft::known_good::KnownGoodInventory,
+) -> ReconciliationInventoryFingerprint {
+    let mut entry_digests = Vec::with_capacity(inventory.entries().len());
+    for (ordinal, entry) in inventory.entries().iter().enumerate() {
+        let mut entry_hasher = Sha256::new();
+        update_frame(
+            &mut entry_hasher,
+            b"domain",
+            RECONCILIATION_INVENTORY_ENTRY_DOMAIN,
+        );
+        update_frame(
+            &mut entry_hasher,
+            b"ordinal",
+            &(ordinal as u64).to_le_bytes(),
+        );
+        update_frame(
+            &mut entry_hasher,
+            b"root",
+            entry.root().stable_id().as_bytes(),
+        );
+        update_frame(
+            &mut entry_hasher,
+            b"root_scope",
+            entry.root().scope_id().as_bytes(),
+        );
+        update_frame(&mut entry_hasher, b"path", entry.path().as_str().as_bytes());
+        update_frame(
+            &mut entry_hasher,
+            b"kind",
+            entry.kind().stable_id().as_bytes(),
+        );
+        match entry.integrity() {
+            KnownGoodIntegrity::Sha1 { digest, size } => {
+                update_frame(&mut entry_hasher, b"integrity", b"sha1");
+                update_frame(&mut entry_hasher, b"digest", digest.as_str().as_bytes());
+                update_frame(&mut entry_hasher, b"size", &size.to_le_bytes());
+            }
+            KnownGoodIntegrity::ExactBytes { digest, size } => {
+                update_frame(&mut entry_hasher, b"integrity", b"exact_bytes");
+                update_frame(&mut entry_hasher, b"digest", digest.as_str().as_bytes());
+                update_frame(&mut entry_hasher, b"size", &size.to_le_bytes());
+            }
+            KnownGoodIntegrity::Directory => {
+                update_frame(&mut entry_hasher, b"integrity", b"directory");
+            }
+            KnownGoodIntegrity::LinkTarget(target) => {
+                update_frame(&mut entry_hasher, b"integrity", b"link_target");
+                update_frame(
+                    &mut entry_hasher,
+                    b"link_target",
+                    target.as_str().as_bytes(),
+                );
+            }
+        }
+        match inventory.bind_standalone_leaf_repair_source(ordinal) {
+            Ok(source) => {
+                update_frame(&mut entry_hasher, b"source", b"standalone");
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_root",
+                    source.root().stable_id().as_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_scope",
+                    source.root().scope_id().as_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_path",
+                    source.path().as_str().as_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_kind",
+                    source.kind().stable_id().as_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_digest",
+                    source.sha1().as_str().as_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_size",
+                    &source.size().to_le_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_provider",
+                    source.provider_url().as_bytes(),
+                );
+            }
+            Err(_) => update_frame(&mut entry_hasher, b"source", b"component_rebuild"),
+        }
+        entry_digests.push(entry_hasher.finalize());
+    }
+    entry_digests.sort_unstable();
+    let mut hasher = Sha256::new();
+    update_frame(
+        &mut hasher,
+        b"domain",
+        RECONCILIATION_INVENTORY_FINGERPRINT_DOMAIN,
+    );
+    update_frame(
+        &mut hasher,
+        b"entry_count",
+        &(entry_digests.len() as u64).to_le_bytes(),
+    );
+    for digest in entry_digests {
+        update_frame(&mut hasher, b"entry", digest.as_slice());
+    }
+    let hex = format!("{:x}", hasher.finalize());
+    let dotted = hex
+        .as_bytes()
+        .chunks(8)
+        .map(|chunk| std::str::from_utf8(chunk).expect("SHA-256 hex is ASCII"))
+        .collect::<Vec<_>>()
+        .join(".");
+    ReconciliationInventoryFingerprint::from_digest(format!("sha256.{dotted}"))
+}
+
+fn update_frame(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
+    hasher.update((label.len() as u64).to_le_bytes());
+    hasher.update(label);
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+#[cfg(unix)]
+fn update_path_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    update_frame(hasher, label, path.as_os_str().as_bytes());
+}
+
+#[cfg(windows)]
+fn update_path_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let encoded = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    update_frame(hasher, label, &encoded);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn update_path_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    update_frame(hasher, label, path.to_string_lossy().as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::guardian::{
+        ActionPlanPrerequisite, GuardianAction, GuardianActionPlan, GuardianConfidence,
+        GuardianDecision,
+    };
+    use crate::state::contracts::{JournalId, OperationPhase, OperationStepResult, RollbackState};
+    use crate::state::failure_memory::FailureMemorySnapshot;
+    use crate::state::{AppStateInit, InstallStore, SessionStore, new_instance};
+    use axial_config::{AppPaths, InstanceRegistrySnapshot};
+    use axial_minecraft::known_good::{
+        KnownGoodActivationSource, KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry,
+        TestKnownGoodIntegrity, TestKnownGoodRoot,
+    };
+    use axial_minecraft::{
+        KnownGoodActivationRejected, ManagedInstallAcknowledgementOutcome,
+        ManagedInstallActivationContractId, ManagedInstallDurableOutcome,
+    };
+    use sha1::Sha1;
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const INSTANCE_ID: &str = "0000000000000001";
+    const DIAGNOSIS_ID: DiagnosisId = DiagnosisId::LauncherManagedArtifactCorrupt;
+    trait AmbiguousIfClone<Marker> {
+        fn assert_not_clone() {}
+    }
+
+    struct CloneMarker;
+
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: Clone> AmbiguousIfClone<CloneMarker> for T {}
+
+    const _: fn() = || {
+        let _ = <RegisteredArtifactFailedRepair as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <RegisteredArtifactRecoveryEntry as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <crate::state::RegisteredArtifactRepairAdmission as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <RegisteredComponentRebuildAdmission as AmbiguousIfClone<_>>::assert_not_clone;
+    };
+
+    struct Fixture {
+        state: AppState,
+        journals: Arc<OperationJournalStore>,
+        failure_memory: Arc<GuardianFailureMemoryStore>,
+        root: PathBuf,
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_directory_identity_accepts_windows_verbatim_prefixes() {
+        assert!(same_canonical_directory(
+            Path::new(r"\\?\C:\Users\Alice\Axial"),
+            Path::new(r"c:\Users\Alice\Axial"),
+        ));
+        assert!(same_canonical_directory(
+            Path::new(r"\\?\UNC\server\share\Axial"),
+            Path::new(r"\\server\share\Axial"),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_directory_identity_rejects_distinct_windows_locations() {
+        assert!(!same_canonical_directory(
+            Path::new(r"\\?\C:\Users\Alice\Axial"),
+            Path::new(r"C:\Users\Alice\Other"),
+        ));
+        assert!(!same_canonical_directory(
+            Path::new(r"\\?\UNC\server\share\Axial"),
+            Path::new(r"\\server\other-share\Axial"),
+        ));
+        assert!(!same_canonical_directory(
+            Path::new(r"\\?\C:\Users\Alice\Axial"),
+            Path::new(r"C:\Users\alice\Axial"),
+        ));
+    }
+
+    fn fixture(label: &str) -> Fixture {
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+        let root = std::env::temp_dir().join(format!(
+            "axial-reconciliation-{label}-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let paths = AppPaths::from_root(root.to_path_buf()).expect("absolute test app root");
+        fs::create_dir_all(
+            paths
+                .config_file()
+                .parent()
+                .expect("config path has a parent"),
+        )
+        .expect("app root");
+        fs::create_dir_all(paths.instances_dir().join(INSTANCE_ID)).expect("instance root");
+        fs::create_dir_all(paths.library_dir()).expect("library root");
+        let root_session = crate::state::test_root_session(&paths);
+        let mut configured =
+            axial_config::ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                .expect("load test config")
+                .current();
+        configured.library_dir = paths.library_dir().to_string_lossy().into_owned();
+        let config = Arc::new(
+            axial_config::ConfigStore::from_config(
+                paths.clone(),
+                Arc::clone(&root_session),
+                configured,
+            )
+            .expect("configure test managed library"),
+        );
+        let instances = Arc::new(
+            axial_config::InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::new(
+                    vec![new_instance(
+                        INSTANCE_ID.to_string(),
+                        "Reconciliation Test".to_string(),
+                        "1.21.1".to_string(),
+                        String::new(),
+                        String::new(),
+                    )],
+                    INSTANCE_ID.to_string(),
+                    Vec::new(),
+                )
+                .expect("registered instance snapshot"),
+            )
+            .expect("load test instances"),
+        );
+        let journals = Arc::new(OperationJournalStore::new());
+        let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
+        let state = AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                axial_performance::PerformanceManager::load_for_startup(paths.performance_dir())
+                    .expect("load test performance state"),
+            ),
+            startup_warnings: Vec::new(),
+        })
+        .with_reconciliation_stores(journals.clone(), failure_memory.clone());
+        activate_empty_inventory(&state, INSTANCE_ID);
+        Fixture {
+            state,
+            journals,
+            failure_memory,
+            root,
+        }
+    }
+
+    fn empty_inventory() -> KnownGoodInventory {
+        KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+            .expect("empty known-good inventory")
+    }
+
+    const ASSETS_FIXTURE_OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
+
+    fn assets_fixture_index_bytes() -> Vec<u8> {
+        let object_digest = format!("{:x}", Sha1::digest(ASSETS_FIXTURE_OBJECT_BYTES));
+        let empty_digest = format!("{:x}", Sha1::digest([]));
+        serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "fixture/object": {
+                    "hash": object_digest.as_str(),
+                    "size": ASSETS_FIXTURE_OBJECT_BYTES.len()
+                },
+                "fixture/empty": {
+                    "hash": empty_digest.as_str(),
+                    "size": 0
+                }
+            }
+        }))
+        .expect("Assets fixture index")
+    }
+
+    fn assets_fixture_inventory() -> KnownGoodInventory {
+        let object_digest = format!("{:x}", Sha1::digest(ASSETS_FIXTURE_OBJECT_BYTES));
+        let empty_digest = format!("{:x}", Sha1::digest([]));
+        let index_bytes = assets_fixture_index_bytes();
+        let entries = [
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: "indexes/fixture-assets.json".to_string(),
+                kind: KnownGoodArtifactKind::AssetIndex,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(&index_bytes)),
+                    size: index_bytes.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("objects/{}/{}", &object_digest[..2], object_digest),
+                kind: KnownGoodArtifactKind::AssetObject,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: object_digest.clone(),
+                    size: ASSETS_FIXTURE_OBJECT_BYTES.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("objects/{}/{}", &empty_digest[..2], empty_digest),
+                kind: KnownGoodArtifactKind::AssetObject,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: empty_digest.clone(),
+                    size: 0,
+                },
+            },
+        ];
+        KnownGoodInventory::from_test_entries(entries)
+            .expect("Assets fixture inventory")
+            .with_test_standalone_leaf_repair_source(
+                0,
+                "https://example.invalid/fixture-assets.json",
+            )
+            .expect("Assets index fixture repair source")
+            .with_test_standalone_leaf_repair_source(
+                1,
+                &format!(
+                    "https://resources.download.minecraft.net/{}/{}",
+                    &object_digest[..2],
+                    object_digest
+                ),
+            )
+            .expect("Assets object fixture repair source")
+            .with_test_standalone_leaf_repair_source(
+                2,
+                &format!(
+                    "https://resources.download.minecraft.net/{}/{}",
+                    &empty_digest[..2],
+                    empty_digest
+                ),
+            )
+            .expect("empty Assets object fixture repair source")
+    }
+
+    fn version_bundle_fixture_inventory() -> KnownGoodInventory {
+        const CLIENT_BYTES: &[u8] = b"axial managed VersionBundle client fixture";
+        const LOG_ID: &str = "guardian-version-bundle.xml";
+        const LOG_BYTES: &[u8] = b"<Configuration/>";
+        let version_json = serde_json::to_vec(&serde_json::json!({
+            "id": "1.21.1",
+            "type": "release",
+            "mainClass": "org.axial.GuardianFixture"
+        }))
+        .expect("VersionBundle fixture metadata");
+        KnownGoodInventory::from_test_entries([
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: "1.21.1/1.21.1.json".to_string(),
+                kind: KnownGoodArtifactKind::VersionMetadata,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(&version_json)),
+                    size: version_json.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: "1.21.1/1.21.1.jar".to_string(),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(CLIENT_BYTES)),
+                    size: CLIENT_BYTES.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("log_configs/{LOG_ID}"),
+                kind: KnownGoodArtifactKind::LogConfig,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(LOG_BYTES)),
+                    size: LOG_BYTES.len() as u64,
+                },
+            },
+        ])
+        .expect("VersionBundle fixture inventory")
+    }
+
+    #[test]
+    fn reconciliation_inventory_fingerprint_is_stable_and_full_inventory_bound() {
+        let first = assets_fixture_inventory();
+        let same = assets_fixture_inventory();
+        let different = version_bundle_fixture_inventory();
+
+        assert_eq!(
+            reconciliation_inventory_fingerprint(&first),
+            reconciliation_inventory_fingerprint(&same),
+        );
+        assert_ne!(
+            reconciliation_inventory_fingerprint(&first),
+            reconciliation_inventory_fingerprint(&different),
+        );
+    }
+
+    fn test_activation_contract() -> ManagedInstallActivationContractId {
+        ManagedInstallActivationContractId::parse(
+            "managed-install-activation-v1.qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
+        )
+        .expect("canonical test activation contract")
+    }
+
+    fn alternate_activation_contract(
+        contract: &ManagedInstallActivationContractId,
+    ) -> ManagedInstallActivationContractId {
+        let mut alternate = contract.to_string();
+        let digest_start = alternate.find('.').expect("activation contract separator") + 1;
+        let replacement = if &alternate[digest_start..digest_start + 1] == "r" {
+            "s"
+        } else {
+            "r"
+        };
+        alternate.replace_range(digest_start..digest_start + 1, replacement);
+        ManagedInstallActivationContractId::parse(&alternate)
+            .expect("alternate canonical activation contract")
+    }
+
+    fn activate_assets_fixture_source_with_contract(
+        state: &AppState,
+        instance_id: &str,
+        activation_contract_id: ManagedInstallActivationContractId,
+    ) -> Arc<KnownGoodActivationSource> {
+        let instance = state.instances().get(instance_id).expect("test instance");
+        let library_root = PathBuf::from(state.library_dir().expect("test library root"));
+        let source = Arc::new(
+            KnownGoodActivationSource::from_test_inventory(
+                &instance.version_id,
+                assets_fixture_inventory(),
+                activation_contract_id,
+            )
+            .expect("Assets fixture activation source"),
+        );
+        state
+            .known_good
+            .activate_for_test(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+                source.clone(),
+            )
+            .expect("activate Assets fixture source");
+        source
+    }
+
+    fn activate_assets_fixture_inventory(
+        state: &AppState,
+        instance_id: &str,
+    ) -> Arc<KnownGoodInventory> {
+        state.activate_known_good_inventory_for_test(instance_id, assets_fixture_inventory());
+        let instance = state.instances().get(instance_id).expect("test instance");
+        let library_root = PathBuf::from(state.library_dir().expect("test library root"));
+        state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+            )
+            .expect("active Assets fixture inventory")
+    }
+
+    fn activate_version_bundle_fixture_inventory(
+        state: &AppState,
+        instance_id: &str,
+    ) -> Arc<KnownGoodInventory> {
+        state.activate_known_good_inventory_for_test(
+            instance_id,
+            version_bundle_fixture_inventory(),
+        );
+        let instance = state.instances().get(instance_id).expect("test instance");
+        let library_root = PathBuf::from(state.library_dir().expect("test library root"));
+        state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+            )
+            .expect("active VersionBundle fixture inventory")
+    }
+
+    fn activate_empty_inventory(state: &AppState, instance_id: &str) -> Arc<KnownGoodInventory> {
+        state.activate_known_good_inventory_for_test(instance_id, empty_inventory());
+        let instance = state.instances().get(instance_id).expect("test instance");
+        let library_root = PathBuf::from(state.library_dir().expect("test library root"));
+        state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+            )
+            .expect("active test known-good inventory")
+    }
+
+    async fn prepare_runtime_rebuild_fixture(
+        state: &AppState,
+        instance_id: &str,
+        component: RuntimeId,
+    ) -> axial_minecraft::ManagedRuntimeRebuildFixture {
+        let fixture = axial_minecraft::prepare_managed_runtime_rebuild_fixture_for_test(component)
+            .await
+            .expect("prepared managed Runtime fixture");
+        let expected_inventory = fixture
+            .replace_known_good_runtime_projection(&empty_inventory())
+            .expect("exact managed Runtime fixture inventory");
+        state.activate_known_good_inventory_for_test(instance_id, expected_inventory);
+        fixture
+    }
+
+    fn registered_artifact_target_for_ordinal(
+        fixture: &Fixture,
+        inventory_ordinal: usize,
+    ) -> TargetDescriptor {
+        let instance = fixture
+            .state
+            .instances
+            .get(INSTANCE_ID)
+            .expect("registered artifact target instance");
+        let current = fixture
+            .state
+            .current_reconciliation_incarnation(INSTANCE_ID)
+            .expect("registered artifact target incarnation");
+        let inventory = fixture
+            .state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &current.roots.library,
+            )
+            .expect("registered artifact target inventory");
+        super::super::registered_artifact_findings::registered_artifact_target_for_test(
+            &instance.id,
+            &instance.version_id,
+            &instance.created_at,
+            &current.roots.library,
+            &current.roots.runtime,
+            &inventory,
+            inventory_ordinal,
+        )
+        .expect("registered artifact target")
+    }
+
+    fn registered_artifact_repair_decision(target: TargetDescriptor) -> GuardianDecision {
+        GuardianDecision::for_test(
+            None,
+            GuardianMode::Managed,
+            GuardianActionKind::Repair,
+            vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+            Some(GuardianActionPlan::new(
+                StabilizationSystem::Guardian,
+                ActionPlanPrerequisite {
+                    diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
+                    ownership: OwnershipClass::LauncherManaged,
+                    confidence: GuardianConfidence::Confirmed,
+                    affected_targets: vec![target.clone()],
+                    candidate_actions: vec![GuardianActionKind::Repair],
+                },
+                vec![GuardianAction {
+                    kind: GuardianActionKind::Repair,
+                    target: Some(target),
+                    reason: DiagnosisId::LauncherManagedArtifactCorrupt,
+                }],
+            )),
+        )
+    }
+
+    fn authorize_registered_artifact_repair_from_verification(
+        state: &AppState,
+        verification: KnownGoodVerificationLease,
+        inventory_ordinal: usize,
+        condition: super::super::RegisteredArtifactCondition,
+    ) -> RegisteredArtifactRepairAuthorization {
+        let observation = verification
+            .registered_artifact_observation(inventory_ordinal, condition)
+            .expect("registered artifact observation");
+        let findings = state
+            .seal_registered_artifact_findings(verification, vec![observation])
+            .expect("seal artifact recovery finding");
+        let target = findings
+            .repair_candidate()
+            .map(|candidate| candidate.target())
+            .expect("artifact recovery target")
+            .clone();
+        findings
+            .authorize_repair(&registered_artifact_repair_decision(target))
+            .expect("authorize artifact recovery")
+    }
+
+    async fn authorized_registered_artifact_repair(
+        fixture: &Fixture,
+        inventory_ordinal: usize,
+        condition: super::super::RegisteredArtifactCondition,
+    ) -> RegisteredArtifactRepairAuthorization {
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let foreground = fixture
+            .state
+            .register_integrity_foreground()
+            .expect("register artifact recovery foreground")
+            .wait_for_settlement()
+            .await;
+        let verification = fixture
+            .state
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &PathBuf::from(fixture.state.library_dir().expect("artifact recovery root")),
+            )
+            .expect("mint artifact recovery verification");
+        let authorization = authorize_registered_artifact_repair_from_verification(
+            &fixture.state,
+            verification,
+            inventory_ordinal,
+            condition,
+        );
+        drop((foreground, lifecycle));
+        authorization
+    }
+
+    async fn cleanup(fixture: Fixture) {
+        fixture
+            .state
+            .shutdown()
+            .await
+            .expect("shutdown reconciliation fixture state");
+        fixture
+            .journals
+            .close()
+            .await
+            .expect("close reconciliation journals");
+        fixture
+            .failure_memory
+            .close()
+            .await
+            .expect("close reconciliation memory");
+        let Fixture {
+            state,
+            journals,
+            failure_memory,
+            root,
+        } = fixture;
+        drop((state, journals, failure_memory));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn artifact_target() -> TargetDescriptor {
+        TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            "version-bundle",
+            OwnershipClass::LauncherManaged,
+        )
+    }
+
+    fn runtime_target() -> TargetDescriptor {
+        TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Runtime,
+            "java-runtime-delta",
+            OwnershipClass::LauncherManaged,
+        )
+    }
+
+    fn version_bundle_publication_evidence() -> axial_minecraft::ManagedInstallPublicationEvidenceId
+    {
+        axial_minecraft::ManagedInstallPublicationEvidenceId::parse(
+            "managed-install-v1.T7ghN0PBffcxr4Rg08bVvTPOl9fRcUh9qyNnWZtd93c.Xsu8KmJnT7So_J1WS8rcqA.X-fR4EpDTc2mbfPpfNOFiA.JGoynsQN9LfT8e7hWyX1fknDskeaM7xQCAbFGATbD-I._FMcn_pUsOarv_sNtTJousevn4S1SMqttV6yiYdONOY",
+        )
+        .expect("canonical VersionBundle publication evidence")
+    }
+
+    fn alternate_version_bundle_publication_evidence()
+    -> axial_minecraft::ManagedInstallPublicationEvidenceId {
+        let mut evidence = version_bundle_publication_evidence().to_string();
+        evidence.replace_range(evidence.len() - 1.., "A");
+        axial_minecraft::ManagedInstallPublicationEvidenceId::parse(&evidence)
+            .expect("alternate canonical VersionBundle publication evidence")
+    }
+
+    fn version_bundle_publication_attempt(
+        fixture: &Fixture,
+        operation_id: &str,
+    ) -> (ReconciliationAttempt, ReconciliationTerminal) {
+        version_bundle_publication_attempt_at(
+            fixture,
+            operation_id,
+            GuardianDomain::Launch,
+            version_bundle_publication_evidence(),
+        )
+    }
+
+    fn version_bundle_publication_attempt_at(
+        fixture: &Fixture,
+        operation_id: &str,
+        domain: GuardianDomain,
+        evidence: axial_minecraft::ManagedInstallPublicationEvidenceId,
+    ) -> (ReconciliationAttempt, ReconciliationTerminal) {
+        version_bundle_publication_attempt_at_window(
+            fixture,
+            operation_id,
+            domain,
+            evidence,
+            "2026-07-15T00:00:00Z",
+            "2026-07-15T01:00:00Z",
+        )
+    }
+
+    fn version_bundle_publication_attempt_at_window(
+        fixture: &Fixture,
+        operation_id: &str,
+        domain: GuardianDomain,
+        evidence: axial_minecraft::ManagedInstallPublicationEvidenceId,
+        observed_at: &str,
+        suppression_until: &str,
+    ) -> (ReconciliationAttempt, ReconciliationTerminal) {
+        let current = fixture
+            .state
+            .current_reconciliation_incarnation(INSTANCE_ID)
+            .expect("current VersionBundle incarnation");
+        let attempt = ReconciliationAttempt::new(
+            OperationId::deterministic_test(operation_id),
+            DIAGNOSIS_ID,
+            domain,
+            ReconciliationRung::RebuildComponent,
+            ReconciliationScope::RegisteredInstance {
+                instance_id: INSTANCE_ID.to_string(),
+                fingerprint: current.fingerprint,
+                inventory_fingerprint: current.inventory_fingerprint,
+                activation_contract_id: current.source.activation_contract_id().clone(),
+            },
+            ReconciliationComponent::VersionBundle,
+            artifact_target(),
+            GuardianMode::Managed,
+            OwnershipClass::LauncherManaged,
+            observed_at,
+            suppression_until,
+            ReconciliationLineage::Predecessor {
+                operation_id: OperationId::deterministic_test(format!(
+                    "{operation_id}-predecessor"
+                )),
+            },
+        );
+        let terminal = ReconciliationTerminal::from_attempt(
+            attempt.clone(),
+            ReconciliationTerminalOutcome::Failed,
+            ReconciliationQuarantineCheckpoint::default(),
+        )
+        .with_version_bundle_publication(evidence, ReconciliationVersionBundleOutcome::RolledBack);
+        terminal
+            .validate()
+            .expect("valid VersionBundle publication terminal");
+        (attempt, terminal)
+    }
+
+    fn version_bundle_predecessor_attempt(
+        fixture: &Fixture,
+        operation_id: &str,
+    ) -> (ReconciliationAttempt, ReconciliationTerminal) {
+        let current = fixture
+            .state
+            .current_reconciliation_incarnation(INSTANCE_ID)
+            .expect("current VersionBundle predecessor incarnation");
+        let attempt = ReconciliationAttempt::new(
+            OperationId::deterministic_test(operation_id),
+            DIAGNOSIS_ID,
+            GuardianDomain::Launch,
+            ReconciliationRung::RepairArtifact,
+            ReconciliationScope::RegisteredInstance {
+                instance_id: INSTANCE_ID.to_string(),
+                fingerprint: current.fingerprint,
+                inventory_fingerprint: current.inventory_fingerprint,
+                activation_contract_id: current.source.activation_contract_id().clone(),
+            },
+            ReconciliationComponent::VersionBundle,
+            artifact_target(),
+            GuardianMode::Managed,
+            OwnershipClass::LauncherManaged,
+            "2026-07-15T00:00:00Z",
+            "2026-07-15T01:00:00Z",
+            ReconciliationLineage::Initial,
+        );
+        let terminal = ReconciliationTerminal::from_attempt(
+            attempt.clone(),
+            ReconciliationTerminalOutcome::Failed,
+            ReconciliationQuarantineCheckpoint::default(),
+        );
+        terminal
+            .validate()
+            .expect("valid VersionBundle predecessor terminal");
+        (attempt, terminal)
+    }
+
+    async fn registered_attempt(
+        fixture: &Fixture,
+        operation_id: &str,
+        component: ReconciliationComponent,
+    ) -> (ReconciliationAttempt, ReconciliationTerminal) {
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority(&lifecycle)
+            .expect("registered authority");
+        let attempt = authority
+            .repair_artifact_attempt(
+                OperationId::deterministic_test(operation_id),
+                DIAGNOSIS_ID,
+                GuardianDomain::Launch,
+                component,
+                artifact_target(),
+                chrono::Duration::minutes(30),
+            )
+            .expect("typed reconciliation attempt");
+        let terminal = authority
+            .terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed)
+            .expect("typed reconciliation terminal");
+        (attempt, terminal)
+    }
+
+    fn planned_journal(attempt: &ReconciliationAttempt) -> OperationJournalEntry {
+        let mut entry = OperationJournalEntry::new(
+            JournalId::new(format!("journal-{}", attempt.operation_id())),
+            attempt.operation_id().clone(),
+            CommandKind::RepairInstance,
+            StabilizationSystem::Guardian,
+            OwnershipClass::LauncherManaged,
+            RollbackState::Available,
+        );
+        entry.targets.push(attempt.target().clone());
+        let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();
+        entry
+            .targets
+            .push(reconciliation_instance_target(instance_id));
+        let mut step = OperationJournalStep::new("repair_artifact", OperationPhase::Repairing);
+        step.changed_target = Some(attempt.target().clone());
+        entry.planned_steps.push(step);
+        entry.guardian_diagnosis_ids.push(attempt.diagnosis_id());
+        reconciliation_journal_attempt(entry, attempt.clone())
+    }
+
+    fn component_required_journal(attempt: &ReconciliationAttempt) -> OperationJournalEntry {
+        let mut entry = OperationJournalEntry::new(
+            JournalId::new(format!("journal-{}", attempt.operation_id())),
+            attempt.operation_id().clone(),
+            CommandKind::RepairInstance,
+            StabilizationSystem::Guardian,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        );
+        entry.targets.push(attempt.target().clone());
+        let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();
+        entry
+            .targets
+            .push(reconciliation_instance_target(instance_id));
+        for step_id in [
+            "journal_repair_start",
+            "registered_artifact_already_exact",
+            REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
+            "record_repair_outcome",
+        ] {
+            let mut step = OperationJournalStep::new(step_id, OperationPhase::Repairing);
+            step.changed_target = Some(attempt.target().clone());
+            entry.planned_steps.push(step);
+        }
+        entry.guardian_diagnosis_ids.push(attempt.diagnosis_id());
+        reconciliation_journal_attempt(entry, attempt.clone())
+    }
+
+    fn failed_step(target: &TargetDescriptor) -> OperationJournalStep {
+        let mut step = OperationJournalStep::new("repair_artifact", OperationPhase::Failed);
+        step.result = OperationStepResult::Failed;
+        step.changed_target = Some(target.clone());
+        step
+    }
+
+    fn component_required_failed_step(target: &TargetDescriptor) -> OperationJournalStep {
+        let mut step = OperationJournalStep::new(
+            REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
+            OperationPhase::Repairing,
+        );
+        step.result = OperationStepResult::Failed;
+        step.changed_target = Some(target.clone());
+        step
+    }
+
+    async fn persist_failed_journal(
+        fixture: &Fixture,
+        attempt: &ReconciliationAttempt,
+        terminal: ReconciliationTerminal,
+    ) {
+        persist_failed_journal_at(fixture, attempt, terminal, "repair_failed").await;
+    }
+
+    async fn persist_failed_journal_at(
+        fixture: &Fixture,
+        attempt: &ReconciliationAttempt,
+        terminal: ReconciliationTerminal,
+        failure_point: &str,
+    ) {
+        fixture
+            .journals
+            .create(planned_journal(attempt))
+            .await
+            .expect("persist planned reconciliation");
+        record_reconciliation_journal_failure(
+            fixture.journals.as_ref(),
+            attempt.operation_id(),
+            failed_step(attempt.target()),
+            failure_point,
+            terminal,
+        )
+        .await
+        .expect("persist failed reconciliation");
+    }
+
+    async fn persist_component_required_failure(
+        fixture: &Fixture,
+        attempt: &ReconciliationAttempt,
+        terminal: ReconciliationTerminal,
+    ) {
+        fixture
+            .journals
+            .create(component_required_journal(attempt))
+            .await
+            .expect("persist planned component-required repair");
+        record_reconciliation_journal_failure(
+            fixture.journals.as_ref(),
+            attempt.operation_id(),
+            component_required_failed_step(attempt.target()),
+            REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
+            terminal,
+        )
+        .await
+        .expect("persist failed component-required repair");
+    }
+
+    async fn persist_version_bundle_publication_journal(
+        fixture: &Fixture,
+        attempt: &ReconciliationAttempt,
+        terminal: ReconciliationTerminal,
+    ) {
+        fixture
+            .journals
+            .create(component_rebuild_journal_for_attempt(attempt))
+            .await
+            .expect("persist VersionBundle rebuild plan");
+        let mut failure_step = component_rebuild_step(
+            VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+            attempt.target(),
+            RollbackState::NotApplicable,
+        );
+        failure_step.result = OperationStepResult::Failed;
+        record_reconciliation_journal_failure(
+            fixture.journals.as_ref(),
+            attempt.operation_id(),
+            failure_step,
+            VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+            terminal,
+        )
+        .await
+        .expect("persist VersionBundle publication terminal");
+    }
+
+    async fn registered_artifact_failure_attempt_at(
+        fixture: &Fixture,
+        operation_id: &str,
+        inventory_ordinal: usize,
+        domain: GuardianDomain,
+        component: ReconciliationComponent,
+    ) -> (ReconciliationAttempt, ReconciliationTerminal) {
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let foreground = fixture
+            .state
+            .register_integrity_foreground()
+            .expect("register persisted artifact failure foreground")
+            .wait_for_settlement()
+            .await;
+        let verification = fixture
+            .state
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &PathBuf::from(
+                    fixture
+                        .state
+                        .library_dir()
+                        .expect("persisted artifact failure root"),
+                ),
+            )
+            .expect("mint persisted artifact failure verification");
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority_for_verification(&verification)
+            .expect("persisted artifact failure authority");
+        let attempt = authority
+            .repair_artifact_attempt(
+                OperationId::deterministic_test(operation_id),
+                DIAGNOSIS_ID,
+                domain,
+                component,
+                registered_artifact_target_for_ordinal(fixture, inventory_ordinal),
+                chrono::Duration::minutes(30),
+            )
+            .expect("persisted artifact failure attempt");
+        let terminal = authority
+            .artifact_terminal(
+                attempt.clone(),
+                ReconciliationTerminalOutcome::Failed,
+                ReconciliationQuarantineCheckpoint::default(),
+            )
+            .expect("persisted artifact failure terminal");
+        drop((authority, verification, foreground, lifecycle));
+        (attempt, terminal)
+    }
+
+    async fn assets_artifact_failure_attempt(
+        fixture: &Fixture,
+        operation_id: &str,
+    ) -> (ReconciliationAttempt, ReconciliationTerminal) {
+        registered_artifact_failure_attempt_at(
+            fixture,
+            operation_id,
+            0,
+            GuardianDomain::Download,
+            ReconciliationComponent::Assets,
+        )
+        .await
+    }
+
+    async fn persist_component_required_pair(
+        fixture: &Fixture,
+        attempt: &ReconciliationAttempt,
+        terminal: ReconciliationTerminal,
+    ) {
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(attempt),
+        )
+        .expect("reserve component-required failure");
+        persist_component_required_failure(fixture, attempt, terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(terminal).expect("canonical artifact failure memory"),
+            &reservation,
+        )
+        .await
+        .expect("commit component-required failure memory");
+        drop(reservation);
+    }
+
+    #[tokio::test]
+    async fn activation_contract_rotation_invalidates_same_inventory_reconciliation_authority() {
+        let fixture = fixture("activation-contract-rotation");
+        let original_contract = test_activation_contract();
+        let rotated_contract = alternate_activation_contract(&original_contract);
+        let original_source = activate_assets_fixture_source_with_contract(
+            &fixture.state,
+            INSTANCE_ID,
+            original_contract.clone(),
+        );
+        let before = fixture
+            .state
+            .current_reconciliation_incarnation(INSTANCE_ID)
+            .expect("original reconciliation incarnation");
+
+        let (attempt, terminal) =
+            assets_artifact_failure_attempt(&fixture, "activation-contract-rotation-old").await;
+        persist_component_required_pair(&fixture, &attempt, terminal).await;
+        let old_key = reconciliation_attempt_key(&attempt);
+        assert!(fixture.failure_memory.get(&old_key).is_some());
+
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let foreground = fixture
+            .state
+            .register_integrity_foreground()
+            .expect("register activation-contract foreground")
+            .wait_for_settlement()
+            .await;
+        let library_root = PathBuf::from(
+            fixture
+                .state
+                .library_dir()
+                .expect("activation-contract root"),
+        );
+        let old_verification = fixture
+            .state
+            .mint_known_good_verification_lease(&foreground, &lifecycle, &library_root)
+            .expect("mint original verification");
+        let old_authority = fixture
+            .state
+            .registered_reconciliation_authority_for_verification(&old_verification)
+            .expect("original reconciliation authority");
+        let old_authorization = authorize_registered_artifact_repair_from_verification(
+            &fixture.state,
+            old_verification.retained(),
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        );
+        assert!(old_authority.attempt_is_current(&attempt));
+        assert!(
+            fixture
+                .state
+                .known_good_verification_lease_is_live(&old_verification)
+        );
+
+        let rotated_source = activate_assets_fixture_source_with_contract(
+            &fixture.state,
+            INSTANCE_ID,
+            rotated_contract.clone(),
+        );
+        let after = fixture
+            .state
+            .current_reconciliation_incarnation(INSTANCE_ID)
+            .expect("rotated reconciliation incarnation");
+
+        assert_eq!(before.fingerprint, after.fingerprint);
+        assert_eq!(before.inventory_fingerprint, after.inventory_fingerprint);
+        assert_eq!(
+            reconciliation_inventory_fingerprint(original_source.inventory()),
+            reconciliation_inventory_fingerprint(rotated_source.inventory()),
+        );
+        assert_ne!(
+            before.source.activation_contract_id(),
+            after.source.activation_contract_id(),
+        );
+        assert_eq!(
+            after.source.activation_contract_id(),
+            &rotated_contract,
+            "only the activation contract changed",
+        );
+        let ReconciliationScope::RegisteredInstance {
+            fingerprint,
+            inventory_fingerprint,
+            activation_contract_id,
+            ..
+        } = attempt.scope();
+        assert_eq!(fingerprint, &after.fingerprint);
+        assert_eq!(inventory_fingerprint, &after.inventory_fingerprint);
+        assert_eq!(activation_contract_id, &original_contract);
+
+        assert!(
+            !fixture
+                .state
+                .known_good_verification_lease_is_live(&old_verification)
+        );
+        assert!(
+            !fixture
+                .state
+                .known_good_verification_lease_can_admit(&old_verification)
+        );
+        assert!(!old_authority.attempt_is_current(&attempt));
+        assert_eq!(
+            fixture
+                .state
+                .registered_artifact_recovery_entry(old_authorization)
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch),
+        );
+        assert_eq!(
+            old_authority
+                .into_registered_artifact_failed_repair(&attempt, None)
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch),
+        );
+
+        let new_verification = fixture
+            .state
+            .mint_known_good_verification_lease(&foreground, &lifecycle, &library_root)
+            .expect("mint rotated verification");
+        let new_authority = fixture
+            .state
+            .registered_reconciliation_authority_for_verification(&new_verification)
+            .expect("rotated reconciliation authority");
+        let new_attempt = new_authority
+            .repair_artifact_attempt(
+                OperationId::deterministic_test("activation-contract-rotation-new"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Download,
+                ReconciliationComponent::Assets,
+                registered_artifact_target_for_ordinal(&fixture, 0),
+                chrono::Duration::minutes(30),
+            )
+            .expect("rotated-contract repair attempt");
+        let new_key = reconciliation_attempt_key(&new_attempt);
+        assert!(new_authority.attempt_is_current(&new_attempt));
+        assert_ne!(old_key, new_key);
+        assert!(fixture.failure_memory.get(&old_key).is_some());
+        assert!(fixture.failure_memory.get(&new_key).is_none());
+
+        let new_authorization = authorize_registered_artifact_repair_from_verification(
+            &fixture.state,
+            new_verification.retained(),
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        );
+        let RegisteredArtifactRecoveryEntry::Fresh(new_authorization) = fixture
+            .state
+            .registered_artifact_recovery_entry(new_authorization)
+            .expect("old-contract failure memory is irrelevant after contract rotation")
+        else {
+            panic!("rotated activation contract must not resume old-contract recovery");
+        };
+
+        drop((
+            new_authorization,
+            new_authority,
+            new_verification,
+            old_verification,
+            foreground,
+            lifecycle,
+            original_source,
+            rotated_source,
+            before,
+            after,
+        ));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn registered_artifact_recovery_entry_is_fresh_or_exact_resume() {
+        let fresh = fixture("assets-recovery-entry-fresh");
+        activate_assets_fixture_inventory(&fresh.state, INSTANCE_ID);
+        for condition in [
+            super::super::RegisteredArtifactCondition::Missing,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        ] {
+            let authorization = authorized_registered_artifact_repair(&fresh, 0, condition).await;
+            let RegisteredArtifactRecoveryEntry::Fresh(authorization) = fresh
+                .state
+                .registered_artifact_recovery_entry(authorization)
+                .expect("Assets finding without exact persistence stays fresh")
+            else {
+                panic!("Assets finding without exact persistence must not resume");
+            };
+            drop(authorization);
+        }
+        cleanup(fresh).await;
+
+        let resumed = fixture("assets-recovery-entry-resume");
+        activate_assets_fixture_inventory(&resumed.state, INSTANCE_ID);
+        let (attempt, terminal) =
+            assets_artifact_failure_attempt(&resumed, "assets-recovery-entry-resume").await;
+        persist_component_required_pair(&resumed, &attempt, terminal).await;
+        let missing = authorized_registered_artifact_repair(
+            &resumed,
+            0,
+            super::super::RegisteredArtifactCondition::Missing,
+        )
+        .await;
+        let RegisteredArtifactRecoveryEntry::Fresh(missing) = resumed
+            .state
+            .registered_artifact_recovery_entry(missing)
+            .expect("missing Assets remains fresh despite persisted corrupt evidence")
+        else {
+            panic!("missing Assets must never resume component recovery");
+        };
+        drop(missing);
+        let authorization = authorized_registered_artifact_repair(
+            &resumed,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        let RegisteredArtifactRecoveryEntry::Resume(continuation) = resumed
+            .state
+            .registered_artifact_recovery_entry(authorization)
+            .expect("exact persisted Assets failure resumes")
+        else {
+            panic!("exact persisted Assets failure must resume");
+        };
+        assert_eq!(
+            continuation
+                .evidence
+                .artifact_provenance
+                .map(|provenance| provenance.inventory_ordinal()),
+            Some(0)
+        );
+        drop(continuation);
+
+        let lifecycle = resumed.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        assert_eq!(
+            resumed
+                .state
+                .recorded_runtime_artifact_repair_failure(&lifecycle, attempt.operation_id())
+                .err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+        drop(lifecycle);
+        cleanup(resumed).await;
+
+        let unrelated = fixture("assets-recovery-entry-unrelated-leaf");
+        activate_assets_fixture_inventory(&unrelated.state, INSTANCE_ID);
+        let (attempt, terminal) = registered_artifact_failure_attempt_at(
+            &unrelated,
+            "assets-recovery-entry-unrelated-leaf",
+            1,
+            GuardianDomain::Download,
+            ReconciliationComponent::Assets,
+        )
+        .await;
+        persist_component_required_pair(&unrelated, &attempt, terminal).await;
+        let authorization = authorized_registered_artifact_repair(
+            &unrelated,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        let RegisteredArtifactRecoveryEntry::Fresh(authorization) = unrelated
+            .state
+            .registered_artifact_recovery_entry(authorization)
+            .expect("unrelated Assets predecessor does not block selected leaf")
+        else {
+            panic!("unrelated Assets predecessor must not resume selected leaf");
+        };
+        drop(authorization);
+        cleanup(unrelated).await;
+    }
+
+    #[tokio::test]
+    async fn orphaned_component_plan_resumes_after_predecessor_window_expires() {
+        let fixture = fixture("assets-orphan-resume-expired-predecessor");
+        activate_assets_fixture_inventory(&fixture.state, INSTANCE_ID);
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let foreground = fixture
+            .state
+            .register_integrity_foreground()
+            .expect("register orphan resume foreground")
+            .wait_for_settlement()
+            .await;
+        let verification = fixture
+            .state
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &PathBuf::from(fixture.state.library_dir().expect("library root")),
+            )
+            .expect("mint orphan resume verification");
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority_for_verification(&verification)
+            .expect("orphan resume authority");
+        let now = chrono::Utc::now().fixed_offset();
+        let predecessor = fixture
+            .state
+            .registered_reconciliation_attempt_at(
+                &lifecycle,
+                OperationId::deterministic_test("assets-orphan-expired-predecessor"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Download,
+                ReconciliationRung::RepairArtifact,
+                ReconciliationComponent::Assets,
+                registered_artifact_target_for_ordinal(&fixture, 0),
+                now - chrono::Duration::hours(2),
+                now - chrono::Duration::hours(1),
+                ReconciliationLineage::Initial,
+            )
+            .expect("expired predecessor attempt");
+        let predecessor_terminal = authority
+            .artifact_terminal(
+                predecessor.clone(),
+                ReconciliationTerminalOutcome::Failed,
+                ReconciliationQuarantineCheckpoint::default(),
+            )
+            .expect("expired predecessor terminal");
+        let successor = fixture
+            .state
+            .registered_reconciliation_attempt_at(
+                &lifecycle,
+                OperationId::deterministic_test("assets-orphan-resumed-component"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Download,
+                ReconciliationRung::RebuildComponent,
+                ReconciliationComponent::Assets,
+                predecessor.target().clone(),
+                now - chrono::Duration::minutes(90),
+                now + chrono::Duration::minutes(30),
+                ReconciliationLineage::Predecessor {
+                    operation_id: predecessor.operation_id().clone(),
+                },
+            )
+            .expect("orphaned component attempt");
+        drop((authority, verification, foreground, lifecycle));
+
+        persist_component_required_pair(&fixture, &predecessor, predecessor_terminal).await;
+        fixture
+            .journals
+            .create(component_rebuild_journal_for_attempt(&successor))
+            .await
+            .expect("persist orphaned component plan");
+
+        let authorization = authorized_registered_artifact_repair(
+            &fixture,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        let RegisteredArtifactRecoveryEntry::Resume(continuation) = fixture
+            .state
+            .registered_artifact_recovery_entry(authorization)
+            .expect("expired predecessor remains resumable through its orphaned component plan")
+        else {
+            panic!("orphaned component plan must resume its exact predecessor");
+        };
+        let resumed = fixture
+            .state
+            .admit_registered_artifact_component_rebuild(
+                continuation,
+                OperationId::deterministic_test("unused-assets-component-attempt"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("admit exact orphaned component attempt");
+        assert!(resumed.is_resumed());
+        assert_eq!(resumed.attempt(), &successor);
+
+        drop(resumed);
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn version_bundle_recovery_entry_resumes_only_the_exact_canonical_leaf_failure() {
+        let fresh = fixture("version-bundle-recovery-fresh");
+        activate_version_bundle_fixture_inventory(&fresh.state, INSTANCE_ID);
+        for inventory_ordinal in 0..3 {
+            for condition in [
+                super::super::RegisteredArtifactCondition::Missing,
+                super::super::RegisteredArtifactCondition::Corrupt,
+            ] {
+                let authorization =
+                    authorized_registered_artifact_repair(&fresh, inventory_ordinal, condition)
+                        .await;
+                let RegisteredArtifactRecoveryEntry::Fresh(authorization) = fresh
+                    .state
+                    .registered_artifact_recovery_entry(authorization)
+                    .expect("VersionBundle finding without durable evidence stays fresh")
+                else {
+                    panic!("VersionBundle finding without durable evidence must not resume");
+                };
+                drop(authorization);
+            }
+        }
+        cleanup(fresh).await;
+
+        let resumed = fixture("version-bundle-recovery-resume");
+        activate_version_bundle_fixture_inventory(&resumed.state, INSTANCE_ID);
+        let (attempt, terminal) = registered_artifact_failure_attempt_at(
+            &resumed,
+            "version-bundle-recovery-resume",
+            1,
+            GuardianDomain::Launch,
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        persist_component_required_pair(&resumed, &attempt, terminal).await;
+        let exact = authorized_registered_artifact_repair(
+            &resumed,
+            1,
+            super::super::RegisteredArtifactCondition::Missing,
+        )
+        .await;
+        let RegisteredArtifactRecoveryEntry::Resume(continuation) = resumed
+            .state
+            .registered_artifact_recovery_entry(exact)
+            .expect("exact durable VersionBundle failure resumes")
+        else {
+            panic!("exact durable VersionBundle failure must resume");
+        };
+        assert_eq!(
+            continuation
+                .evidence
+                .artifact_provenance
+                .map(|provenance| (provenance.inventory_ordinal(), provenance.component())),
+            Some((1, ReconciliationComponent::VersionBundle))
+        );
+        drop(continuation);
+        let unrelated = authorized_registered_artifact_repair(
+            &resumed,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        let RegisteredArtifactRecoveryEntry::Fresh(unrelated) = resumed
+            .state
+            .registered_artifact_recovery_entry(unrelated)
+            .expect("different VersionBundle leaf stays fresh")
+        else {
+            panic!("different VersionBundle leaf must not resume");
+        };
+        drop(unrelated);
+        cleanup(resumed).await;
+
+        let mismatched = fixture("version-bundle-recovery-component-mismatch");
+        activate_version_bundle_fixture_inventory(&mismatched.state, INSTANCE_ID);
+        let (attempt, terminal) = registered_artifact_failure_attempt_at(
+            &mismatched,
+            "version-bundle-recovery-component-mismatch",
+            1,
+            GuardianDomain::Download,
+            ReconciliationComponent::Assets,
+        )
+        .await;
+        persist_component_required_pair(&mismatched, &attempt, terminal).await;
+        let authorization = authorized_registered_artifact_repair(
+            &mismatched,
+            1,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        assert_eq!(
+            mismatched
+                .state
+                .registered_artifact_recovery_entry(authorization)
+                .err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+        cleanup(mismatched).await;
+    }
+
+    #[tokio::test]
+    async fn registered_assets_resume_refuses_partial_duplicate_and_drifted_evidence() {
+        let nonterminal = fixture("assets-resume-nonterminal");
+        activate_assets_fixture_inventory(&nonterminal.state, INSTANCE_ID);
+        let (attempt, _) =
+            assets_artifact_failure_attempt(&nonterminal, "assets-resume-nonterminal").await;
+        nonterminal
+            .journals
+            .create(component_required_journal(&attempt))
+            .await
+            .expect("persist nonterminal Assets candidate");
+        let authorization = authorized_registered_artifact_repair(
+            &nonterminal,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        assert_eq!(
+            nonterminal
+                .state
+                .registered_artifact_recovery_entry(authorization)
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+        cleanup(nonterminal).await;
+
+        let journal_only = fixture("assets-resume-journal-only");
+        activate_assets_fixture_inventory(&journal_only.state, INSTANCE_ID);
+        let (attempt, terminal) =
+            assets_artifact_failure_attempt(&journal_only, "assets-resume-journal-only").await;
+        persist_component_required_failure(&journal_only, &attempt, terminal).await;
+        let authorization = authorized_registered_artifact_repair(
+            &journal_only,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        assert_eq!(
+            journal_only
+                .state
+                .registered_artifact_recovery_entry(authorization)
+                .err(),
+            Some(ReconciliationEvidenceRejection::MemoryMissing)
+        );
+        cleanup(journal_only).await;
+
+        let memory_only = fixture("assets-resume-memory-only");
+        activate_assets_fixture_inventory(&memory_only.state, INSTANCE_ID);
+        let (attempt, terminal) =
+            assets_artifact_failure_attempt(&memory_only, "assets-resume-memory-only").await;
+        let reservation = reserve_reconciliation_attempt(
+            memory_only.failure_memory.as_ref(),
+            memory_only.journals.as_ref(),
+            reconciliation_attempt_key(&attempt),
+        )
+        .expect("reserve memory-only Assets failure");
+        commit_reconciliation_memory(
+            memory_only.failure_memory.as_ref(),
+            reconciliation_memory_entry(terminal).expect("memory-only Assets entry"),
+            &reservation,
+        )
+        .await
+        .expect("commit memory-only Assets failure");
+        drop(reservation);
+        let authorization = authorized_registered_artifact_repair(
+            &memory_only,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        assert_eq!(
+            memory_only
+                .state
+                .registered_artifact_recovery_entry(authorization)
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMissing)
+        );
+        cleanup(memory_only).await;
+
+        let disagreed = fixture("assets-resume-memory-disagreement");
+        activate_assets_fixture_inventory(&disagreed.state, INSTANCE_ID);
+        let (attempt, terminal) =
+            assets_artifact_failure_attempt(&disagreed, "assets-resume-memory-disagreement").await;
+        persist_component_required_pair(&disagreed, &attempt, terminal).await;
+        let mut snapshot = disagreed
+            .failure_memory
+            .snapshot()
+            .expect("Assets memory snapshot");
+        snapshot.entries[0].occurrence_count = 2;
+        let drifted_memory = Arc::new(GuardianFailureMemoryStore::new());
+        drifted_memory
+            .load_snapshot(snapshot)
+            .expect("load valid noncanonical Assets memory");
+        let drifted_state = disagreed
+            .state
+            .clone()
+            .with_reconciliation_stores(disagreed.journals.clone(), drifted_memory);
+        let authorization = authorized_registered_artifact_repair(
+            &disagreed,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        assert_eq!(
+            drifted_state
+                .registered_artifact_recovery_entry(authorization)
+                .err(),
+            Some(ReconciliationEvidenceRejection::MemoryNotFailed)
+        );
+        drop(drifted_state);
+        cleanup(disagreed).await;
+
+        let duplicate = fixture("assets-resume-duplicate");
+        activate_assets_fixture_inventory(&duplicate.state, INSTANCE_ID);
+        let (first, first_terminal) =
+            assets_artifact_failure_attempt(&duplicate, "assets-resume-duplicate-first").await;
+        persist_component_required_pair(&duplicate, &first, first_terminal).await;
+        let (second, second_terminal) =
+            assets_artifact_failure_attempt(&duplicate, "assets-resume-duplicate-second").await;
+        persist_component_required_failure(&duplicate, &second, second_terminal).await;
+        let authorization = authorized_registered_artifact_repair(
+            &duplicate,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        assert_eq!(
+            duplicate
+                .state
+                .registered_artifact_recovery_entry(authorization)
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+        cleanup(duplicate).await;
+
+        let drifted = fixture("assets-resume-inventory-drift");
+        activate_assets_fixture_inventory(&drifted.state, INSTANCE_ID);
+        let authorization = authorized_registered_artifact_repair(
+            &drifted,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        let replacement = activate_assets_fixture_inventory(&drifted.state, INSTANCE_ID);
+        assert_eq!(
+            drifted
+                .state
+                .registered_artifact_recovery_entry(authorization)
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+        drop(replacement);
+        cleanup(drifted).await;
+    }
+
+    #[tokio::test]
+    async fn registered_assets_resume_requires_exact_component_failure_shape() {
+        let fixture = fixture("assets-resume-terminal-shape");
+        activate_assets_fixture_inventory(&fixture.state, INSTANCE_ID);
+        let (attempt, terminal) =
+            assets_artifact_failure_attempt(&fixture, "assets-resume-terminal-shape").await;
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&attempt),
+        )
+        .expect("reserve malformed Assets failure");
+        persist_failed_journal_at(
+            &fixture,
+            &attempt,
+            terminal.clone(),
+            REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
+        )
+        .await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(terminal).expect("malformed canonical memory"),
+            &reservation,
+        )
+        .await
+        .expect("commit malformed Assets failure memory");
+        drop(reservation);
+        let authorization = authorized_registered_artifact_repair(
+            &fixture,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .state
+                .registered_artifact_recovery_entry(authorization)
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+        cleanup(fixture).await;
+    }
+
+    async fn recorded_runtime_artifact_failure(
+        fixture: &Fixture,
+        instance_id: &str,
+        operation_id: &str,
+    ) -> (RecordedRuntimeArtifactRepairFailure, ReconciliationAttempt) {
+        let lifecycle = fixture.state.acquire_instance_lifecycle(instance_id).await;
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority(&lifecycle)
+            .expect("registered Runtime authority");
+        let attempt = authority
+            .repair_artifact_attempt(
+                OperationId::deterministic_test(operation_id),
+                DIAGNOSIS_ID,
+                GuardianDomain::Runtime,
+                ReconciliationComponent::Runtime,
+                runtime_target(),
+                chrono::Duration::minutes(30),
+            )
+            .expect("Runtime artifact attempt");
+        let terminal = authority
+            .terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed)
+            .expect("Runtime artifact failure");
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&attempt),
+        )
+        .expect("reserve Runtime artifact attempt");
+        persist_failed_journal(fixture, &attempt, terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(terminal).expect("Runtime artifact memory"),
+            &reservation,
+        )
+        .await
+        .expect("commit Runtime artifact memory");
+        drop(reservation);
+        let evidence = fixture
+            .state
+            .recorded_runtime_artifact_repair_failure(&lifecycle, attempt.operation_id())
+            .expect("recorded Runtime artifact failure");
+        drop((authority, lifecycle));
+        (evidence, attempt)
+    }
+
+    #[tokio::test]
+    async fn registered_authority_rejects_foreign_lifecycle_and_changed_root() {
+        let owner = fixture("authority-owner");
+        let foreign = fixture("authority-foreign");
+        let owner_lifecycle = owner.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let foreign_lifecycle = foreign.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+
+        assert_eq!(
+            foreign
+                .state
+                .registered_reconciliation_authority(&owner_lifecycle)
+                .err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+        assert_eq!(
+            owner
+                .state
+                .registered_reconciliation_authority(&foreign_lifecycle)
+                .err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+
+        let authority = owner
+            .state
+            .registered_reconciliation_authority(&owner_lifecycle)
+            .expect("owner authority");
+        let attempt = authority
+            .repair_artifact_attempt(
+                OperationId::deterministic_test("authority-root-change"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Launch,
+                ReconciliationComponent::VersionBundle,
+                artifact_target(),
+                chrono::Duration::minutes(30),
+            )
+            .expect("attempt before root change");
+        let replacement_library = owner.root.join("replacement-library");
+        fs::create_dir_all(&replacement_library).expect("replacement library root");
+        owner
+            .state
+            .set_library_dir_for_test(replacement_library.to_string_lossy().into_owned());
+        assert_eq!(
+            authority
+                .terminal(attempt, ReconciliationTerminalOutcome::Failed)
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+
+        drop((authority, owner_lifecycle, foreign_lifecycle));
+        cleanup(owner).await;
+        cleanup(foreign).await;
+    }
+
+    #[tokio::test]
+    async fn ambiguous_running_attempt_survives_startup_and_blocks_a_new_operation() {
+        let fixture = fixture("ambiguous-running");
+        let (first, _) = registered_attempt(
+            &fixture,
+            "ambiguous-first",
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        fixture
+            .journals
+            .create(planned_journal(&first))
+            .await
+            .expect("persist ambiguous plan");
+        let mut checkpoint = OperationJournalStep::new("effect_started", OperationPhase::Repairing);
+        checkpoint.result = OperationStepResult::Completed;
+        fixture
+            .journals
+            .record_checkpoint(first.operation_id(), checkpoint)
+            .await
+            .expect("persist running transition");
+
+        fixture
+            .state
+            .reconcile_reconciliation_startup()
+            .await
+            .expect("nonterminal startup scan");
+        assert_eq!(
+            fixture
+                .journals
+                .get(first.operation_id())
+                .expect("running attempt survives")
+                .status,
+            OperationStatus::Running
+        );
+
+        let (second, _) = registered_attempt(
+            &fixture,
+            "ambiguous-second",
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        assert_eq!(
+            reconciliation_attempt_key(&first),
+            reconciliation_attempt_key(&second)
+        );
+        assert_eq!(
+            reserve_reconciliation_attempt(
+                fixture.failure_memory.as_ref(),
+                fixture.journals.as_ref(),
+                reconciliation_attempt_key(&second),
+            )
+            .err(),
+            Some(ReconciliationAttemptRejection::AmbiguousPriorAttempt)
+        );
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_replays_exact_active_terminal_once() {
+        let fixture = fixture("terminal-replay");
+        let (attempt, terminal) = registered_attempt(
+            &fixture,
+            "terminal-replay",
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        let expected_memory = reconciliation_memory_entry(terminal.clone()).expect("typed memory");
+        persist_failed_journal(&fixture, &attempt, terminal).await;
+        assert!(fixture.failure_memory.get(&expected_memory.key).is_none());
+
+        fixture
+            .state
+            .reconcile_reconciliation_startup()
+            .await
+            .expect("replay terminal into memory");
+        assert_eq!(
+            fixture.failure_memory.get(&expected_memory.key),
+            Some(expected_memory.clone())
+        );
+        let first_replay = fixture.failure_memory.list();
+        fixture
+            .state
+            .reconcile_reconciliation_startup()
+            .await
+            .expect("idempotent second replay");
+        assert_eq!(fixture.failure_memory.list(), first_replay);
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_rebuilds_missing_memory_for_expired_pending_publication() {
+        let fixture = fixture("pending-publication-memory-replay");
+        let (attempt, terminal) =
+            version_bundle_publication_attempt(&fixture, "pending-publication-memory-replay");
+        let expected_memory =
+            reconciliation_memory_entry(terminal.clone()).expect("canonical pending memory");
+        persist_version_bundle_publication_journal(&fixture, &attempt, terminal).await;
+
+        fixture
+            .state
+            .reconcile_reconciliation_startup()
+            .await
+            .expect("rebuild pending publication memory despite expired suppression");
+
+        assert_eq!(
+            fixture.failure_memory.get(&expected_memory.key),
+            Some(expected_memory)
+        );
+        assert_eq!(
+            fixture
+                .state
+                .pending_startup_version_bundle_publication_instances()
+                .expect("pending publication instances"),
+            vec![INSTANCE_ID.to_string()]
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_finishes_memory_first_publication_acknowledgement() {
+        let fixture = fixture("publication-memory-first-ack");
+        let (attempt, terminal) =
+            version_bundle_publication_attempt(&fixture, "publication-memory-first-ack");
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&attempt),
+        )
+        .expect("reserve publication memory");
+        persist_version_bundle_publication_journal(&fixture, &attempt, terminal.clone()).await;
+        let pending_memory =
+            reconciliation_memory_entry(terminal.clone()).expect("canonical pending memory");
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            pending_memory.clone(),
+            &reservation,
+        )
+        .await
+        .expect("persist pending publication memory");
+        drop(reservation);
+        let evidence = terminal
+            .version_bundle_publication()
+            .expect("pending publication")
+            .evidence();
+        let acknowledged_terminal = terminal
+            .clone()
+            .with_acknowledged_version_bundle_publication(evidence)
+            .expect("acknowledged terminal");
+        let acknowledged_memory = reconciliation_memory_entry(acknowledged_terminal.clone())
+            .expect("canonical acknowledged memory");
+        fixture
+            .failure_memory
+            .acknowledge_reconciliation_version_bundle_publication(
+                &pending_memory,
+                acknowledged_memory.clone(),
+            )
+            .await
+            .expect("persist memory-first acknowledgement");
+
+        fixture
+            .state
+            .reconcile_reconciliation_startup()
+            .await
+            .expect("converge journal acknowledgement");
+
+        assert_eq!(
+            fixture
+                .journals
+                .get(attempt.operation_id())
+                .and_then(|journal| journal.reconciliation_terminal().cloned()),
+            Some(acknowledged_terminal)
+        );
+        assert_eq!(
+            fixture.failure_memory.get(&acknowledged_memory.key),
+            Some(acknowledged_memory)
+        );
+        assert!(
+            fixture
+                .state
+                .pending_startup_version_bundle_publication_instances()
+                .expect("settled publication instances")
+                .is_empty()
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_journal_first_publication_acknowledgement() {
+        let fixture = fixture("publication-journal-first-ack");
+        let (attempt, terminal) =
+            version_bundle_publication_attempt(&fixture, "publication-journal-first-ack");
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&attempt),
+        )
+        .expect("reserve publication memory");
+        persist_version_bundle_publication_journal(&fixture, &attempt, terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(terminal.clone()).expect("canonical pending memory"),
+            &reservation,
+        )
+        .await
+        .expect("persist pending publication memory");
+        drop(reservation);
+        fixture
+            .journals
+            .acknowledge_reconciliation_version_bundle_publication(&terminal)
+            .await
+            .expect("inject forbidden journal-first acknowledgement");
+
+        assert_eq!(
+            fixture
+                .state
+                .reconcile_reconciliation_startup()
+                .await
+                .expect_err("journal-first acknowledgement must fail closed")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_ignores_acknowledged_publication_history_without_memory() {
+        let fixture = fixture("acknowledged-publication-history");
+        let (attempt, terminal) =
+            version_bundle_publication_attempt(&fixture, "acknowledged-publication-history");
+        persist_version_bundle_publication_journal(&fixture, &attempt, terminal.clone()).await;
+        fixture
+            .journals
+            .acknowledge_reconciliation_version_bundle_publication(&terminal)
+            .await
+            .expect("persist historical acknowledgement");
+
+        fixture
+            .state
+            .reconcile_reconciliation_startup()
+            .await
+            .expect("ignore expired acknowledged history without auxiliary memory");
+        assert!(
+            fixture
+                .state
+                .pending_startup_version_bundle_publication_instances()
+                .expect("historical publication scan")
+                .is_empty()
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_pending_evidence_owned_by_acknowledged_history() {
+        let fixture = fixture("duplicate-publication-history-evidence");
+        let (historical_attempt, historical_terminal) = version_bundle_publication_attempt_at(
+            &fixture,
+            "duplicate-publication-history-evidence-old",
+            GuardianDomain::Launch,
+            version_bundle_publication_evidence(),
+        );
+        persist_version_bundle_publication_journal(
+            &fixture,
+            &historical_attempt,
+            historical_terminal.clone(),
+        )
+        .await;
+        fixture
+            .journals
+            .acknowledge_reconciliation_version_bundle_publication(&historical_terminal)
+            .await
+            .expect("acknowledge historical publication");
+
+        let (pending_attempt, pending_terminal) = version_bundle_publication_attempt_at(
+            &fixture,
+            "duplicate-publication-history-evidence-new",
+            GuardianDomain::Download,
+            version_bundle_publication_evidence(),
+        );
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&pending_attempt),
+        )
+        .expect("reserve pending publication memory");
+        persist_version_bundle_publication_journal(
+            &fixture,
+            &pending_attempt,
+            pending_terminal.clone(),
+        )
+        .await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(pending_terminal).expect("pending publication memory"),
+            &reservation,
+        )
+        .await
+        .expect("persist pending publication memory");
+        drop(reservation);
+
+        assert_eq!(
+            fixture
+                .state
+                .reconcile_reconciliation_startup()
+                .await
+                .expect_err("publication evidence must have one operation owner")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn pending_publication_instances_reject_same_instance_multiplicity() {
+        let fixture = fixture("multiple-same-instance-publications");
+        for (operation_id, domain, evidence) in [
+            (
+                "multiple-same-instance-publications-launch",
+                GuardianDomain::Launch,
+                version_bundle_publication_evidence(),
+            ),
+            (
+                "multiple-same-instance-publications-download",
+                GuardianDomain::Download,
+                alternate_version_bundle_publication_evidence(),
+            ),
+        ] {
+            let (attempt, terminal) =
+                version_bundle_publication_attempt_at(&fixture, operation_id, domain, evidence);
+            let reservation = reserve_reconciliation_attempt(
+                fixture.failure_memory.as_ref(),
+                fixture.journals.as_ref(),
+                reconciliation_attempt_key(&attempt),
+            )
+            .expect("reserve pending publication memory");
+            persist_version_bundle_publication_journal(&fixture, &attempt, terminal.clone()).await;
+            commit_reconciliation_memory(
+                fixture.failure_memory.as_ref(),
+                reconciliation_memory_entry(terminal).expect("pending publication memory"),
+                &reservation,
+            )
+            .await
+            .expect("persist pending publication memory");
+            drop(reservation);
+        }
+
+        assert_eq!(
+            fixture
+                .state
+                .pending_startup_version_bundle_publication_instances()
+                .expect_err("shared root accepts only one pending publication")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_rebuilds_expired_predecessor_memory_referenced_by_orphan_plan() {
+        let fixture = fixture("orphan-plan-predecessor-replay");
+        let child_operation_id = "orphan-plan-predecessor-replay";
+        let (predecessor_attempt, predecessor_terminal) = version_bundle_predecessor_attempt(
+            &fixture,
+            &format!("{child_operation_id}-predecessor"),
+        );
+        let predecessor_memory = reconciliation_memory_entry(predecessor_terminal.clone())
+            .expect("canonical predecessor memory");
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&predecessor_attempt),
+        )
+        .expect("reserve predecessor memory");
+        persist_failed_journal(&fixture, &predecessor_attempt, predecessor_terminal).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            predecessor_memory.clone(),
+            &reservation,
+        )
+        .await
+        .expect("persist predecessor memory");
+        drop(reservation);
+
+        let (child_attempt, _) = version_bundle_publication_attempt(&fixture, child_operation_id);
+        fixture
+            .journals
+            .create(component_rebuild_journal_for_attempt(&child_attempt))
+            .await
+            .expect("persist resumable VersionBundle child");
+        let restarted_memory = Arc::new(GuardianFailureMemoryStore::new());
+        let restarted_state = fixture
+            .state
+            .clone()
+            .with_reconciliation_stores(fixture.journals.clone(), restarted_memory.clone());
+
+        restarted_state
+            .reconcile_reconciliation_startup()
+            .await
+            .expect("rebuild referenced predecessor memory after suppression expiry");
+        assert_eq!(
+            restarted_memory.get(&predecessor_memory.key),
+            Some(predecessor_memory)
+        );
+        assert_eq!(
+            restarted_state
+                .pending_startup_version_bundle_publication_instances()
+                .expect("orphan recovery instance"),
+            vec![INSTANCE_ID.to_string()]
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_routes_install_settlement_before_guardian_orphan_retry() {
+        let fixture = fixture("orphan-plan-install-settlement");
+        activate_version_bundle_fixture_inventory(&fixture.state, INSTANCE_ID);
+        let child_operation_id = "orphan-plan-install-settlement";
+        let (predecessor_attempt, predecessor_terminal) = version_bundle_predecessor_attempt(
+            &fixture,
+            &format!("{child_operation_id}-predecessor"),
+        );
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&predecessor_attempt),
+        )
+        .expect("reserve predecessor memory");
+        persist_failed_journal(&fixture, &predecessor_attempt, predecessor_terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(predecessor_terminal)
+                .expect("canonical predecessor memory"),
+            &reservation,
+        )
+        .await
+        .expect("persist predecessor memory");
+        drop(reservation);
+
+        let (child_attempt, _) = version_bundle_publication_attempt(&fixture, child_operation_id);
+        fixture
+            .journals
+            .create(component_rebuild_journal_for_attempt(&child_attempt))
+            .await
+            .expect("persist Guardian VersionBundle plan");
+
+        fixture
+            .state
+            .settle_startup_version_bundle_publications()
+            .await
+            .expect("first restart retains a Guardian plan with no settlement");
+
+        let library = fixture
+            .state
+            .try_acquire_managed_library()
+            .expect("acquire managed library");
+        let receipt = axial_minecraft::publish_managed_install_fixture_for_test(
+            library.retained_core(),
+            "1.21.1",
+        )
+        .await
+        .expect("publish install-owned VersionBundle settlement");
+
+        assert_eq!(
+            fixture
+                .state
+                .settle_startup_version_bundle_publications()
+                .await
+                .expect_err("Guardian must reject an install-owned settlement")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let install_owner = library.retained_core();
+        assert!(
+            crate::app::settle_startup_publication_barriers(&fixture.state, async move {
+                let evidence = match axial_minecraft::classify_managed_install_publication(
+                    install_owner,
+                    "1.21.1",
+                )
+                .await
+                {
+                    ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+                    _ => return false,
+                };
+                let Ok(verified) = evidence.verify_install_receipt(receipt) else {
+                    return false;
+                };
+                let acknowledgement = verified
+                    .activate_with(|source| async move {
+                        assert_eq!(source.version_id(), "1.21.1");
+                        Ok::<_, KnownGoodActivationRejected>(())
+                    })
+                    .await;
+                let Ok(acknowledgement) = acknowledgement else {
+                    return false;
+                };
+                let mut outcome = acknowledgement.acknowledge().await;
+                loop {
+                    match outcome {
+                        ManagedInstallAcknowledgementOutcome::Acknowledged => return true,
+                        ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) => {
+                            outcome = recovery.retry().await;
+                        }
+                    }
+                }
+            })
+            .await
+            .is_ok(),
+            "install startup recovery must settle its exact marker before Guardian retries",
+        );
+        assert_eq!(
+            fixture
+                .state
+                .pending_startup_version_bundle_publication_instances()
+                .expect("Guardian orphan remains safely resumable"),
+            vec![INSTANCE_ID.to_string()]
+        );
+
+        drop(library);
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn orphan_plan_accepts_pruned_same_key_prior_memory() {
+        let fixture = fixture("orphan-plan-same-key-prior");
+        let (prior_attempt, _) = version_bundle_publication_attempt_at_window(
+            &fixture,
+            "orphan-plan-same-key-prior-old",
+            GuardianDomain::Launch,
+            version_bundle_publication_evidence(),
+            "2026-07-14T00:00:00Z",
+            "2026-07-14T01:00:00Z",
+        );
+        let prior_terminal = ReconciliationTerminal::from_attempt(
+            prior_attempt.clone(),
+            ReconciliationTerminalOutcome::Failed,
+            ReconciliationQuarantineCheckpoint::default(),
+        );
+        let prior_memory =
+            reconciliation_memory_entry(prior_terminal.clone()).expect("canonical prior memory");
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&prior_attempt),
+        )
+        .expect("reserve prior component memory");
+        persist_version_bundle_publication_journal(&fixture, &prior_attempt, prior_terminal).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            prior_memory.clone(),
+            &reservation,
+        )
+        .await
+        .expect("persist prior component memory");
+        drop(reservation);
+
+        let child_operation_id = "orphan-plan-same-key-prior-new";
+        let (predecessor_attempt, predecessor_terminal) = version_bundle_predecessor_attempt(
+            &fixture,
+            &format!("{child_operation_id}-predecessor"),
+        );
+        let predecessor_reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&predecessor_attempt),
+        )
+        .expect("reserve new predecessor memory");
+        persist_failed_journal(&fixture, &predecessor_attempt, predecessor_terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(predecessor_terminal)
+                .expect("canonical new predecessor memory"),
+            &predecessor_reservation,
+        )
+        .await
+        .expect("persist new predecessor memory");
+        drop(predecessor_reservation);
+
+        let (child_attempt, _) = version_bundle_publication_attempt_at_window(
+            &fixture,
+            child_operation_id,
+            GuardianDomain::Launch,
+            alternate_version_bundle_publication_evidence(),
+            "2026-07-16T00:00:00Z",
+            "2026-07-16T01:00:00Z",
+        );
+        assert_eq!(
+            reconciliation_attempt_key(&prior_attempt),
+            reconciliation_attempt_key(&child_attempt)
+        );
+        fixture
+            .journals
+            .create(component_rebuild_journal_for_attempt(&child_attempt))
+            .await
+            .expect("persist newer orphan child plan");
+
+        assert!(
+            fixture
+                .failure_memory
+                .get(&reconciliation_attempt_key(&child_attempt))
+                .is_none(),
+            "a later admission prunes the expired prior memory"
+        );
+        assert_eq!(
+            fixture
+                .state
+                .pending_startup_version_bundle_publication_instances()
+                .expect("supersedable prior memory permits orphan recovery"),
+            vec![INSTANCE_ID.to_string()]
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn journal_pruning_retains_predecessor_referenced_by_orphan_plan() {
+        let fixture = fixture("orphan-plan-predecessor-pruning");
+        let journals = Arc::new(OperationJournalStore::with_max_entries(3));
+        let fixture = Fixture {
+            state: fixture
+                .state
+                .with_reconciliation_stores(journals.clone(), fixture.failure_memory.clone()),
+            journals,
+            failure_memory: fixture.failure_memory,
+            root: fixture.root,
+        };
+        let ordinary_id = OperationId::deterministic_test("orphan-pruning-ordinary");
+        let mut ordinary = OperationJournalEntry::new(
+            JournalId::new("journal-orphan-pruning-ordinary"),
+            ordinary_id.clone(),
+            CommandKind::RefreshPerformanceRules,
+            StabilizationSystem::Application,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        );
+        ordinary.planned_steps.push(OperationJournalStep::new(
+            "refresh_remote_rules",
+            OperationPhase::Running,
+        ));
+        fixture
+            .journals
+            .create(ordinary)
+            .await
+            .expect("persist ordinary pruning candidate");
+        let mut completed =
+            OperationJournalStep::new("refresh_remote_rules", OperationPhase::Running);
+        completed.result = OperationStepResult::Completed;
+        fixture
+            .journals
+            .record_success(&ordinary_id, completed, OperationOutcome::Succeeded)
+            .await
+            .expect("terminalize ordinary pruning candidate");
+
+        let child_operation_id = "orphan-plan-predecessor-pruning";
+        let (predecessor_attempt, predecessor_terminal) = version_bundle_predecessor_attempt(
+            &fixture,
+            &format!("{child_operation_id}-predecessor"),
+        );
+        persist_failed_journal(&fixture, &predecessor_attempt, predecessor_terminal).await;
+        let (child_attempt, _) = version_bundle_publication_attempt(&fixture, child_operation_id);
+        fixture
+            .journals
+            .create(component_rebuild_journal_for_attempt(&child_attempt))
+            .await
+            .expect("persist orphan child plan");
+
+        let pressure_id = OperationId::deterministic_test("orphan-pruning-pressure");
+        let mut pressure = OperationJournalEntry::new(
+            JournalId::new("journal-orphan-pruning-pressure"),
+            pressure_id,
+            CommandKind::RefreshPerformanceRules,
+            StabilizationSystem::Application,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        );
+        pressure.planned_steps.push(OperationJournalStep::new(
+            "refresh_remote_rules",
+            OperationPhase::Running,
+        ));
+        fixture
+            .journals
+            .create(pressure)
+            .await
+            .expect("prune unreferenced terminal under pressure");
+
+        assert!(fixture.journals.get(&ordinary_id).is_none());
+        assert!(
+            fixture
+                .journals
+                .get(predecessor_attempt.operation_id())
+                .is_some(),
+            "referenced predecessor must survive capacity pruning"
+        );
+        assert!(fixture.journals.get(child_attempt.operation_id()).is_some());
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_orphan_memory_and_overlapping_active_terminals() {
+        let orphan = fixture("orphan-memory");
+        let (_, orphan_terminal) = registered_attempt(
+            &orphan,
+            "orphan-memory",
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        let orphan_memory = reconciliation_memory_entry(orphan_terminal).expect("orphan memory");
+        orphan
+            .failure_memory
+            .load_snapshot(
+                FailureMemorySnapshot::new(vec![orphan_memory]).expect("valid memory snapshot"),
+            )
+            .expect("load orphan memory");
+        assert_eq!(
+            orphan
+                .state
+                .reconcile_reconciliation_startup()
+                .await
+                .expect_err("orphan active memory must fail startup")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        cleanup(orphan).await;
+
+        let overlap = fixture("overlapping-terminals");
+        let (first, first_terminal) = registered_attempt(
+            &overlap,
+            "overlap-first",
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        let (second, second_terminal) = registered_attempt(
+            &overlap,
+            "overlap-second",
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        assert_eq!(
+            reconciliation_attempt_key(&first),
+            reconciliation_attempt_key(&second)
+        );
+        persist_failed_journal(&overlap, &first, first_terminal).await;
+        persist_failed_journal(&overlap, &second, second_terminal).await;
+        assert_eq!(
+            overlap
+                .state
+                .reconcile_reconciliation_startup()
+                .await
+                .expect_err("overlapping active terminals must fail startup")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        cleanup(overlap).await;
+    }
+
+    #[tokio::test]
+    async fn assets_component_requires_the_closed_persisted_predecessor_shape() {
+        let fixture = fixture("assets-component-leaf-shape");
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority(&lifecycle)
+            .expect("registered authority");
+        let wrong_domain = authority
+            .repair_artifact_attempt(
+                OperationId::deterministic_test("assets-wrong-domain-artifact"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Library,
+                ReconciliationComponent::Assets,
+                artifact_target(),
+                chrono::Duration::minutes(30),
+            )
+            .expect("structurally valid attempt carrier");
+        assert_eq!(
+            authority
+                .artifact_terminal(
+                    wrong_domain,
+                    ReconciliationTerminalOutcome::Failed,
+                    ReconciliationQuarantineCheckpoint::default(),
+                )
+                .err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+        drop((authority, lifecycle));
+        cleanup(fixture).await;
+    }
+
+    #[test]
+    fn component_rollback_effect_gates_reject_no_effect() {
+        assert!(!libraries_rollback_has_effect(
+            ManagedLibrariesRollbackEffect::None
+        ));
+        assert!(!assets_rollback_has_effect(
+            ManagedAssetsRollbackEffect::None
+        ));
+        assert!(libraries_rollback_has_effect(
+            ManagedLibrariesRollbackEffect::Execution
+        ));
+        assert!(assets_rollback_has_effect(
+            ManagedAssetsRollbackEffect::Reconciliation
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_continuation_rejects_noncanonical_memory() {
+        let fixture = fixture("verified-continuation-memory-drift");
+        activate_assets_fixture_inventory(&fixture.state, INSTANCE_ID);
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let foreground = fixture
+            .state
+            .register_integrity_foreground()
+            .expect("register verified predecessor foreground")
+            .wait_for_settlement()
+            .await;
+        let verification = fixture
+            .state
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &PathBuf::from(
+                    fixture
+                        .state
+                        .library_dir()
+                        .expect("verified predecessor root"),
+                ),
+            )
+            .expect("mint verified predecessor lease");
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority_for_verification(&verification)
+            .expect("verified predecessor authority");
+        let attempt = authority
+            .repair_artifact_attempt(
+                OperationId::deterministic_test("verified-continuation-memory-drift"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Download,
+                ReconciliationComponent::Assets,
+                registered_artifact_target_for_ordinal(&fixture, 0),
+                chrono::Duration::minutes(30),
+            )
+            .expect("verified predecessor attempt");
+        let terminal = authority
+            .artifact_terminal(
+                attempt.clone(),
+                ReconciliationTerminalOutcome::Failed,
+                ReconciliationQuarantineCheckpoint::default(),
+            )
+            .expect("verified predecessor terminal");
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&attempt),
+        )
+        .expect("reserve verified predecessor");
+        persist_failed_journal(&fixture, &attempt, terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(terminal).expect("canonical predecessor memory"),
+            &reservation,
+        )
+        .await
+        .expect("commit canonical predecessor memory");
+        drop(reservation);
+        let mut snapshot = fixture.failure_memory.snapshot().expect("memory snapshot");
+        snapshot.entries[0].occurrence_count = 2;
+        let drifted_memory = Arc::new(GuardianFailureMemoryStore::new());
+        drifted_memory
+            .load_snapshot(snapshot)
+            .expect("load valid but noncanonical memory");
+        let drifted_state = fixture
+            .state
+            .clone()
+            .with_reconciliation_stores(fixture.journals.clone(), drifted_memory);
+        let drifted_authority = drifted_state
+            .registered_reconciliation_authority_for_verification(&verification)
+            .expect("drifted verified authority");
+
+        assert_eq!(
+            drifted_authority
+                .into_registered_artifact_failed_repair(&attempt, None)
+                .err(),
+            Some(ReconciliationEvidenceRejection::MemoryNotFailed)
+        );
+
+        drop((
+            drifted_state,
+            authority,
+            verification,
+            foreground,
+            lifecycle,
+        ));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_admission_revalidates_root_after_both_mutation_waits() {
+        let fixture = fixture("component-admission-root-drift");
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-admission-root-drift-artifact",
+        )
+        .await;
+        let component_writer = fixture
+            .state
+            .sessions
+            .acquire_shared_component_mutation()
+            .await
+            .expect("hold component writer");
+        let (config_acquired_tx, config_acquired_rx) = tokio::sync::oneshot::channel();
+        let state = fixture.state.clone();
+        let admission = tokio::spawn(async move {
+            state
+                .admit_component_rebuild_with_config_observer(
+                    evidence,
+                    None,
+                    None,
+                    None,
+                    OperationId::deterministic_test("component-admission-root-drift-rebuild"),
+                    chrono::Duration::minutes(30),
+                    move || {
+                        let _ = config_acquired_tx.send(());
+                    },
+                )
+                .await
+        });
+        config_acquired_rx
+            .await
+            .expect("admission owns config before waiting for component writer");
+
+        let replacement_library = fixture.root.join("replacement-library-during-admission");
+        fs::create_dir_all(&replacement_library).expect("replacement library root");
+        fixture
+            .state
+            .set_library_dir_for_test(replacement_library.to_string_lossy().into_owned());
+        drop(component_writer);
+
+        assert_eq!(
+            admission.await.expect("admission task").err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_admission_rejects_inventory_replacement_during_wait() {
+        let fixture = fixture("component-admission-inventory-wait-drift");
+        let original_inventory = {
+            let instance = fixture
+                .state
+                .instances()
+                .get(INSTANCE_ID)
+                .expect("test instance");
+            fixture
+                .state
+                .known_good
+                .active_inventory(
+                    &instance.id,
+                    &instance.version_id,
+                    &instance.created_at,
+                    &PathBuf::from(fixture.state.library_dir().expect("library root")),
+                )
+                .expect("original inventory")
+        };
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-admission-inventory-artifact",
+        )
+        .await;
+        let component_writer = fixture
+            .state
+            .sessions
+            .acquire_shared_component_mutation()
+            .await
+            .expect("hold component writer");
+        let (config_acquired_tx, config_acquired_rx) = tokio::sync::oneshot::channel();
+        let state = fixture.state.clone();
+        let admission = tokio::spawn(async move {
+            state
+                .admit_component_rebuild_with_config_observer(
+                    evidence,
+                    None,
+                    None,
+                    None,
+                    OperationId::deterministic_test("component-admission-inventory-rebuild"),
+                    chrono::Duration::minutes(30),
+                    move || {
+                        let _ = config_acquired_tx.send(());
+                    },
+                )
+                .await
+        });
+        config_acquired_rx
+            .await
+            .expect("admission owns config before waiting for component writer");
+        let admitted_inventory = activate_empty_inventory(&fixture.state, INSTANCE_ID);
+        assert!(!Arc::ptr_eq(&original_inventory, &admitted_inventory));
+        drop(component_writer);
+
+        assert_eq!(
+            admission.await.expect("admission task").err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_admission_pins_inventory_after_admission() {
+        let fixture = fixture("component-admission-inventory-post-admission-drift");
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-admission-inventory-post-admission-artifact",
+        )
+        .await;
+        let admission = fixture
+            .state
+            .admit_runtime_component_rebuild(
+                evidence,
+                OperationId::deterministic_test(
+                    "component-admission-inventory-post-admission-rebuild",
+                ),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("component admission");
+        let admitted_inventory = admission.admitted_inventory().clone();
+        admission
+            .validate_runtime_identity(&RuntimeId::from("java-runtime-delta"), true)
+            .expect("admitted Runtime inventory is current");
+
+        let later_inventory = activate_empty_inventory(&fixture.state, INSTANCE_ID);
+        assert!(!Arc::ptr_eq(&admitted_inventory, &later_inventory));
+        assert_eq!(
+            admission
+                .validate_runtime_identity(&RuntimeId::from("java-runtime-delta"), true)
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+
+        drop(admission);
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_postactivation_failure_invalidates_refreshed_inventory() {
+        let fixture = fixture("component-postactivation-failure");
+        let component = RuntimeId::from("java-runtime-delta");
+        let runtime_fixture =
+            prepare_runtime_rebuild_fixture(&fixture.state, INSTANCE_ID, component.clone()).await;
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-postactivation-failure-artifact",
+        )
+        .await;
+        let admission = fixture
+            .state
+            .admit_runtime_component_rebuild(
+                evidence,
+                OperationId::deterministic_test("component-postactivation-failure-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("component admission");
+        let receipt = axial_minecraft::rebuild_managed_runtime_prepared_fixture_for_test(
+            fixture.state.managed_runtime_cache(),
+            runtime_fixture,
+        )
+        .await
+        .expect("sealed Runtime rebuild receipt");
+        let runtime_root = fixture
+            .state
+            .managed_runtime_cache()
+            .component_root_for_test(component.as_str())
+            .expect("managed Runtime root");
+        let java = if cfg!(target_os = "windows") {
+            runtime_root.join("bin").join("javaw.exe")
+        } else if cfg!(target_os = "macos") {
+            runtime_root
+                .join("jre.bundle")
+                .join("Contents")
+                .join("Home")
+                .join("bin")
+                .join("java")
+        } else {
+            runtime_root.join("bin").join("java")
+        };
+
+        assert_eq!(
+            admission
+                .succeeded_terminal_with_activation_observer(&receipt, || {
+                    fs::write(&java, b"invalidated after known-good activation")
+                        .expect("invalidate sealed Runtime receipt");
+                })
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+        assert!(
+            admission
+                .runtime_postcondition_failure_source_for_test()
+                .get()
+                .is_some()
+        );
+        let instance = fixture
+            .state
+            .instances()
+            .get(INSTANCE_ID)
+            .expect("test instance");
+        assert!(
+            fixture
+                .state
+                .known_good
+                .active_inventory(
+                    &instance.id,
+                    &instance.version_id,
+                    &instance.created_at,
+                    &PathBuf::from(fixture.state.library_dir().expect("library root")),
+                )
+                .is_none(),
+            "failed refreshed projection must not remain live authority"
+        );
+        let terminal = admission
+            .failed_postcondition_terminal(&receipt)
+            .expect("failed terminal retains exact refreshed projection proof");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+
+        drop((receipt, admission));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_postactivation_cleanup_retains_replacement_inventory() {
+        let fixture = fixture("component-postactivation-inventory-replacement");
+        let component = RuntimeId::from("java-runtime-delta");
+        let runtime_fixture =
+            prepare_runtime_rebuild_fixture(&fixture.state, INSTANCE_ID, component).await;
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-postactivation-inventory-replacement-artifact",
+        )
+        .await;
+        let admission = fixture
+            .state
+            .admit_runtime_component_rebuild(
+                evidence,
+                OperationId::deterministic_test(
+                    "component-postactivation-inventory-replacement-rebuild",
+                ),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("component admission");
+        let receipt = axial_minecraft::rebuild_managed_runtime_prepared_fixture_for_test(
+            fixture.state.managed_runtime_cache(),
+            runtime_fixture,
+        )
+        .await
+        .expect("sealed Runtime rebuild receipt");
+        let replacement = Arc::new(std::sync::Mutex::new(None));
+        let observed_replacement = replacement.clone();
+        let state = fixture.state.clone();
+
+        assert_eq!(
+            admission
+                .succeeded_terminal_with_activation_observer(&receipt, move || {
+                    let inventory = activate_empty_inventory(&state, INSTANCE_ID);
+                    *observed_replacement
+                        .lock()
+                        .expect("replacement inventory observation") = Some(inventory);
+                })
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+        let replacement = replacement
+            .lock()
+            .expect("replacement inventory observation")
+            .clone()
+            .expect("replacement inventory");
+        let active = fixture
+            .state
+            .known_good
+            .active_inventory(
+                &admission.known_good.instance_id,
+                &admission.known_good.version_id,
+                &admission.known_good.created_at,
+                &admission.known_good.library_root,
+            )
+            .expect("replacement remains active");
+        assert!(Arc::ptr_eq(&active, &replacement));
+        assert!(
+            admission
+                .runtime_postcondition_failure_source_for_test()
+                .get()
+                .is_some()
+        );
+        let terminal = admission
+            .failed_postcondition_terminal(&receipt)
+            .expect("sealed failure proof does not adopt the replacement");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+        assert!(Arc::ptr_eq(
+            &fixture
+                .state
+                .known_good
+                .active_inventory(
+                    &admission.known_good.instance_id,
+                    &admission.known_good.version_id,
+                    &admission.known_good.created_at,
+                    &admission.known_good.library_root,
+                )
+                .expect("replacement remains active after terminalization"),
+            &replacement,
+        ));
+
+        drop((receipt, admission));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_postactivation_root_drift_keeps_sealed_failure_proof() {
+        let fixture = fixture("component-postactivation-root-drift");
+        let component = RuntimeId::from("java-runtime-delta");
+        let runtime_fixture =
+            prepare_runtime_rebuild_fixture(&fixture.state, INSTANCE_ID, component).await;
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-postactivation-root-drift-artifact",
+        )
+        .await;
+        let admission = fixture
+            .state
+            .admit_runtime_component_rebuild(
+                evidence,
+                OperationId::deterministic_test("component-postactivation-root-drift-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("component admission");
+        let receipt = axial_minecraft::rebuild_managed_runtime_prepared_fixture_for_test(
+            fixture.state.managed_runtime_cache(),
+            runtime_fixture,
+        )
+        .await
+        .expect("sealed Runtime rebuild receipt");
+        let replacement_library = fixture.root.join("postactivation-replacement-library");
+        fs::create_dir_all(&replacement_library).expect("replacement library root");
+        let replacement_library = replacement_library.to_string_lossy().into_owned();
+        let state = fixture.state.clone();
+
+        assert_eq!(
+            admission
+                .succeeded_terminal_with_activation_observer(&receipt, move || {
+                    state.set_library_dir_for_test(replacement_library);
+                })
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+        assert!(
+            admission
+                .runtime_postcondition_failure_source_for_test()
+                .get()
+                .is_some()
+        );
+        assert!(
+            fixture
+                .state
+                .known_good
+                .active_inventory(
+                    &admission.known_good.instance_id,
+                    &admission.known_good.version_id,
+                    &admission.known_good.created_at,
+                    &admission.known_good.library_root,
+                )
+                .is_none(),
+            "cleanup uses the admitted root binding after config drift"
+        );
+        let terminal = admission
+            .failed_postcondition_terminal(&receipt)
+            .expect("sealed failure proof survives current root drift");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+
+        drop((receipt, admission));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_admission_retains_config_mutation_until_drop() {
+        let fixture = fixture("component-admission-config-retention");
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-admission-config-retention-artifact",
+        )
+        .await;
+        let admission = fixture
+            .state
+            .admit_runtime_component_rebuild(
+                evidence,
+                OperationId::deterministic_test("component-admission-config-retention-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("component admission");
+        let (mutation_entered_tx, mut mutation_entered_rx) = tokio::sync::oneshot::channel();
+        let state = fixture.state.clone();
+        let mutation = tokio::spawn(async move {
+            state
+                .mutate_config(move |config| {
+                    let _ = mutation_entered_tx.send(());
+                    config.theme = "nether".to_string();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            mutation_entered_rx.try_recv().is_err(),
+            "config mutation must not enter while component admission is live"
+        );
+
+        drop(admission);
+        mutation_entered_rx
+            .await
+            .expect("config mutation enters after admission drops");
+        mutation
+            .await
+            .expect("config mutation task")
+            .expect("config mutation commits");
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn shared_runtime_failure_terminal_suppresses_queued_cross_instance_rebuild() {
+        let fixture = fixture("component-admission-shared-runtime");
+        let second = fixture
+            .state
+            .instances()
+            .insert_for_test("Second Runtime instance", "1.21.1")
+            .expect("register second instance");
+        activate_empty_inventory(&fixture.state, &second.id);
+        let (first_evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "shared-runtime-first-artifact",
+        )
+        .await;
+        let (second_evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            &second.id,
+            "shared-runtime-second-artifact",
+        )
+        .await;
+        let first_admission = fixture
+            .state
+            .admit_runtime_component_rebuild(
+                first_evidence,
+                OperationId::deterministic_test("shared-runtime-first-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("first Runtime rebuild admission");
+
+        let second_state = fixture.state.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut second_admission = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            second_state
+                .admit_runtime_component_rebuild(
+                    second_evidence,
+                    OperationId::deterministic_test("shared-runtime-second-rebuild"),
+                    chrono::Duration::minutes(30),
+                )
+                .await
+        });
+        started_rx
+            .await
+            .expect("second admission reaches shared Runtime writer");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut second_admission)
+                .await
+                .is_err(),
+            "second Runtime admission must wait behind the active component writer"
+        );
+
+        let first_attempt = first_admission.attempt().clone();
+        let first_terminal = first_admission
+            .failed_terminal()
+            .expect("first Runtime rebuild failure terminal");
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&first_attempt),
+        )
+        .expect("reserve first Runtime rebuild");
+        persist_failed_journal(&fixture, &first_attempt, first_terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(first_terminal).expect("first Runtime rebuild memory"),
+            &reservation,
+        )
+        .await
+        .expect("settle first successful Runtime rebuild memory");
+        drop((reservation, first_admission));
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), second_admission)
+                .await
+                .expect("queued Runtime admission resumes")
+                .expect("queued Runtime admission task completes")
+                .err(),
+            Some(ReconciliationEvidenceRejection::SuppressedPriorAttempt)
+        );
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn reconciliation_window_rejects_durable_attempts_above_state_bound() {
+        let fixture = fixture("reconciliation-window-bound");
+        let rung = ReconciliationRung::RepairArtifact;
+        let components = [
+            ReconciliationComponent::VersionBundle,
+            ReconciliationComponent::Libraries,
+        ];
+        assert_eq!(
+            components.len(),
+            rung.max_attempts_per_suppression_window() + 1
+        );
+
+        for (index, component) in components.into_iter().enumerate() {
+            let (attempt, terminal) = registered_attempt(
+                &fixture,
+                &format!("reconciliation-window-bound-{index}"),
+                component,
+            )
+            .await;
+            let reservation = reserve_reconciliation_attempt(
+                fixture.failure_memory.as_ref(),
+                fixture.journals.as_ref(),
+                reconciliation_attempt_key(&attempt),
+            )
+            .expect("reserve bounded reconciliation attempt");
+            persist_failed_journal(&fixture, &attempt, terminal.clone()).await;
+            commit_reconciliation_memory(
+                fixture.failure_memory.as_ref(),
+                reconciliation_memory_entry(terminal).expect("bounded reconciliation memory"),
+                &reservation,
+            )
+            .await
+            .expect("commit bounded reconciliation memory");
+        }
+
+        assert_eq!(
+            fixture
+                .state
+                .refuse_active_reconciliation_window(rung, |_| true,)
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_artifact_recovery_refuses_stale_indeterminate_later_attempt() {
+        let fixture = fixture("runtime-artifact-recovery-ambiguous");
+        let (prior, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "runtime-recovery-prior-failure",
+        )
+        .await;
+        drop(prior);
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let observed_at = chrono::Utc::now().fixed_offset() - chrono::Duration::hours(2);
+        let suppression_until = observed_at + chrono::Duration::minutes(30);
+        let ambiguous = fixture
+            .state
+            .registered_reconciliation_attempt_at(
+                &lifecycle,
+                OperationId::deterministic_test("runtime-recovery-stale-running"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Runtime,
+                ReconciliationRung::RepairArtifact,
+                ReconciliationComponent::Runtime,
+                runtime_target(),
+                observed_at,
+                suppression_until,
+                ReconciliationLineage::Initial,
+            )
+            .expect("stale indeterminate Runtime attempt");
+        fixture
+            .journals
+            .create(planned_journal(&ambiguous))
+            .await
+            .expect("persist stale indeterminate Runtime attempt");
+
+        assert_eq!(
+            fixture
+                .state
+                .active_recorded_runtime_artifact_failure(&lifecycle)
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+
+        drop(lifecycle);
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn repair_ladder_admission_suppresses_active_terminals_after_store_reload() {
+        let fixture = fixture("component-admission-restart-suppression");
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority(&lifecycle)
+            .expect("registered authority");
+        let artifact_attempt = authority
+            .repair_artifact_attempt(
+                OperationId::deterministic_test("component-restart-artifact"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Runtime,
+                ReconciliationComponent::Runtime,
+                runtime_target(),
+                chrono::Duration::minutes(30),
+            )
+            .expect("runtime artifact attempt");
+        let artifact_terminal = authority
+            .terminal(
+                artifact_attempt.clone(),
+                ReconciliationTerminalOutcome::Failed,
+            )
+            .expect("runtime artifact failure");
+        let artifact_reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&artifact_attempt),
+        )
+        .expect("reserve artifact attempt");
+        persist_failed_journal(&fixture, &artifact_attempt, artifact_terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(artifact_terminal).expect("artifact memory"),
+            &artifact_reservation,
+        )
+        .await
+        .expect("commit artifact memory");
+        drop(artifact_reservation);
+
+        let evidence = fixture
+            .state
+            .recorded_runtime_artifact_repair_failure(&lifecycle, artifact_attempt.operation_id())
+            .expect("recorded artifact failure");
+        let admission = fixture
+            .state
+            .admit_runtime_component_rebuild(
+                evidence,
+                OperationId::deterministic_test("component-restart-first"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("first component admission");
+        let component_attempt = admission.attempt().clone();
+        let component_terminal = admission
+            .failed_terminal()
+            .expect("component failure terminal");
+        let component_reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&component_attempt),
+        )
+        .expect("reserve component attempt");
+        persist_failed_journal(&fixture, &component_attempt, component_terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(component_terminal).expect("component memory"),
+            &component_reservation,
+        )
+        .await
+        .expect("commit component memory");
+        drop((component_reservation, admission, authority, lifecycle));
+
+        let restarted_journals = Arc::new(OperationJournalStore::new());
+        restarted_journals
+            .load_snapshot(fixture.journals.snapshot().expect("journal snapshot"))
+            .expect("reload journal snapshot");
+        let restarted_memory = Arc::new(GuardianFailureMemoryStore::new());
+        restarted_memory
+            .load_snapshot(fixture.failure_memory.snapshot().expect("memory snapshot"))
+            .expect("reload memory snapshot");
+        let restarted_state = fixture
+            .state
+            .clone()
+            .with_reconciliation_stores(restarted_journals, restarted_memory);
+        let restarted_lifecycle = restarted_state
+            .acquire_instance_lifecycle(INSTANCE_ID)
+            .await;
+        let restarted_authority = restarted_state
+            .registered_reconciliation_authority(&restarted_lifecycle)
+            .expect("restarted registered authority");
+        let restarted_artifact_attempt = restarted_authority
+            .repair_artifact_attempt(
+                OperationId::deterministic_test("artifact-restart-repeated"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Runtime,
+                ReconciliationComponent::Runtime,
+                runtime_target(),
+                chrono::Duration::minutes(30),
+            )
+            .expect("equivalent restarted artifact attempt");
+        assert_eq!(
+            reconciliation_attempt_key(&restarted_artifact_attempt),
+            reconciliation_attempt_key(&artifact_attempt),
+            "the restarted rung-one attempt must address the same suppression window"
+        );
+        assert_eq!(
+            restarted_state
+                .refuse_active_artifact_repair_window(&restarted_artifact_attempt)
+                .err(),
+            Some(ReconciliationEvidenceRejection::SuppressedPriorAttempt)
+        );
+        let restarted_evidence = restarted_state
+            .recorded_runtime_artifact_repair_failure(
+                &restarted_lifecycle,
+                artifact_attempt.operation_id(),
+            )
+            .expect("reloaded artifact failure");
+
+        assert_eq!(
+            restarted_state
+                .admit_runtime_component_rebuild(
+                    restarted_evidence,
+                    OperationId::deterministic_test("component-restart-repeated"),
+                    chrono::Duration::minutes(30),
+                )
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::SuppressedPriorAttempt)
+        );
+
+        let component_key = reconciliation_attempt_key(&component_attempt);
+        let disagreed_journals = Arc::new(OperationJournalStore::new());
+        disagreed_journals
+            .load_snapshot(fixture.journals.snapshot().expect("journal snapshot"))
+            .expect("reload disagreed journal snapshot");
+        let mut memory_without_component = fixture
+            .failure_memory
+            .snapshot()
+            .expect("memory snapshot without component");
+        memory_without_component
+            .entries
+            .retain(|entry| entry.key.as_str() != component_key.as_str());
+        let disagreed_memory = Arc::new(GuardianFailureMemoryStore::new());
+        disagreed_memory
+            .load_snapshot(memory_without_component)
+            .expect("reload disagreed memory snapshot");
+        let disagreed_state = fixture
+            .state
+            .clone()
+            .with_reconciliation_stores(disagreed_journals, disagreed_memory);
+        let disagreed_evidence = disagreed_state
+            .recorded_runtime_artifact_repair_failure(
+                &restarted_lifecycle,
+                artifact_attempt.operation_id(),
+            )
+            .expect("artifact failure remains available");
+        assert_eq!(
+            disagreed_state
+                .admit_runtime_component_rebuild(
+                    disagreed_evidence,
+                    OperationId::deterministic_test("component-restart-disagreed"),
+                    chrono::Duration::minutes(30),
+                )
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+
+        drop((
+            disagreed_state,
+            restarted_authority,
+            restarted_lifecycle,
+            restarted_state,
+        ));
+        cleanup(fixture).await;
+    }
+}

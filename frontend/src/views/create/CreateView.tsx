@@ -22,7 +22,7 @@ import { errMessage, getMemoryRecommendation } from '../../utils';
 import { hashStr } from '../../tokens';
 import { Sound } from '../../sound';
 import { createInstance } from '../../instance-create';
-import type { LoaderComponentId } from '../../types-loader';
+import { createNoticePresentation, type CreateNotice } from '../../create-presenters';
 import {
   defaultIconFor,
   defaultNameFor,
@@ -35,13 +35,7 @@ import {
 } from './defaults';
 import { LoaderLogo } from './loader-logos';
 import { Modal, ModalContent } from '../../ui/Modal';
-import {
-  CHANNEL_ORDER,
-  CHANNEL_LABEL,
-  type VersionDownloadState,
-  type VersionRowModel,
-  type VersionRowTagModel,
-} from './view-model';
+import { CHANNEL_ORDER, CHANNEL_LABEL, type VersionDownloadState, type VersionRowModel } from './view-model';
 import {
   buildWindowPresets,
   detectMaxScreenSize,
@@ -49,120 +43,24 @@ import {
   type ScreenSize,
   type WindowPresetSpec,
 } from '../../ui/screen-presets';
+import {
+  createBackendViewResponse,
+  createLoaderBuildsResponse,
+  createLoaderSelection,
+  type CreateBackendViewResponse,
+  type CreateLoaderBuildsResponse,
+  type CreateOption,
+  type CreatePresetOption,
+  type CreateSourceId,
+  type CreateVersionRow,
+} from './contract';
+export { createBackendViewResponse, createLoaderBuildsResponse } from './contract';
 
 type CreateStep = 'version' | 'details';
 
 /* Last good create-view response per source, kept across dialog opens so the
    version list renders immediately while a fresh copy loads in the background. */
-const createViewCache = new Map<string, CreateBackendViewResponse>();
-
-interface CreatePresetOption {
-  id: string;
-  label: string;
-  detail: string;
-  default: boolean;
-  disabled_reason?: string | null;
-}
-
-interface CreateOption {
-  id: string;
-  label: string;
-  enabled: boolean;
-  disabled_reason?: string | null;
-}
-
-interface CreateVersionRow {
-  source_id: string;
-  selection_id: string;
-  minecraft_version_id: string;
-  loader_build?: CreateLoaderBuildIdentity | null;
-  display_name: string;
-  hint?: string | null;
-  channel: string;
-  tags?: CreateVersionTag[];
-  download_state: string;
-  create_enabled: boolean;
-  disabled_reason?: string | null;
-}
-
-interface CreateVersionTag {
-  id?: string;
-  label?: string;
-}
-
-interface CreateLoaderBuildIdentity {
-  component_id: LoaderComponentId;
-  build_id: string;
-  target_version_id: string;
-  minecraft_version_id: string;
-  loader_version: string;
-  installability: string;
-  availability: {
-    fresh: boolean;
-    stale: boolean;
-    cache_hit: boolean;
-    checked_at_ms: number;
-    last_success_at_ms?: number | null;
-    last_error?: string | null;
-    last_failure_kind?: string | null;
-  };
-}
-
-interface CreateNotice {
-  state_id: string;
-  tone: string;
-  message: string;
-  detail?: string | null;
-}
-
-interface CreateOptimizeOption {
-  id: string;
-  label: string;
-  detail: string;
-  default_enabled: boolean;
-}
-
-interface CreateLoaderAutoOption {
-  selection_id: string;
-  label: string;
-  detail: string;
-}
-
-interface CreateLoaderBuildOption {
-  selection_id: string;
-  build_id: string;
-  label: string;
-  channel_id: string;
-  channel_label: string;
-  recommended: boolean;
-  installed: boolean;
-  enabled: boolean;
-  disabled_reason?: string | null;
-}
-
-interface CreateLoaderBuildsResponse {
-  source_id: string;
-  minecraft_version_id: string;
-  auto: CreateLoaderAutoOption;
-  builds: CreateLoaderBuildOption[];
-}
-
-interface CreateBackendViewResponse {
-  sources?: CreateOption[];
-  channels?: CreateOption[];
-  versions?: CreateVersionRow[];
-  preset_options?: CreatePresetOption[];
-  optimize_option?: CreateOptimizeOption;
-  notices?: CreateNotice[];
-  defaults?: {
-    source_id?: string;
-    channel_id?: string;
-    jvm_preset_id?: string;
-    max_memory_mb?: number | null;
-    window_width?: number | null;
-    window_height?: number | null;
-  };
-}
+const createViewCache = new Map<CreateSourceId, CreateBackendViewResponse>();
 
 export function CreateView(): JSX.Element {
   return (
@@ -194,13 +92,19 @@ function versionStatusTitle(state: VersionDownloadState, source: LoaderKey): str
   return '';
 }
 
-function loaderKeyFromSourceId(sourceId: string): LoaderKey {
+function loaderKeyFromSourceId(sourceId: CreateSourceId): LoaderKey {
   if (sourceId === 'vanilla') return 'vanilla';
-  return loaderKeyFromComponentId(sourceId as LoaderComponentId);
+  return loaderKeyFromComponentId(sourceId);
 }
 
-function sourceIdFromLoaderKey(loader: LoaderKey): string {
+function sourceIdFromLoaderKey(loader: LoaderKey): CreateSourceId {
   return loader === 'vanilla' ? 'vanilla' : LOADER_COMPONENT_IDS[loader];
+}
+
+function loaderKeyFromWire(value: string | null | undefined): LoaderKey {
+  if (!value || value === 'vanilla') return 'vanilla';
+  if (value === 'fabric' || value === 'quilt' || value === 'forge' || value === 'neoforge') return value;
+  throw new Error('Create loader response was invalid.');
 }
 
 function normalizeChannel(value: string | undefined): Channel {
@@ -209,31 +113,6 @@ function normalizeChannel(value: string | undefined): Channel {
 
 function normalizeDownloadState(value: string | undefined): VersionDownloadState {
   return value === 'base' || value === 'full' ? value : 'none';
-}
-
-function noticeTone(value: string): string {
-  if (value === 'warn' || value === 'warned') return 'warned';
-  if (value === 'error') return 'error';
-  if (value === 'intervened') return 'intervened';
-  if (value === 'success') return 'success';
-  return 'info';
-}
-
-function noticeIcon(tone: string): string {
-  if (tone === 'success') return 'check-circle';
-  if (tone === 'error' || tone === 'warned') return 'alert';
-  if (tone === 'intervened') return 'shield-check';
-  return 'info';
-}
-
-function normalizeVersionTags(tags: CreateVersionTag[] | undefined): VersionRowTagModel[] {
-  return Array.isArray(tags)
-    ? tags
-        .filter((tag): tag is Required<CreateVersionTag> => {
-          return typeof tag.id === 'string' && typeof tag.label === 'string';
-        })
-        .map((tag) => ({ id: tag.id, label: tag.label }))
-    : [];
 }
 
 function rowSearchText(row: VersionRowModel): string {
@@ -386,7 +265,7 @@ function CompatibilityPreview({
 function CreateCard(): JSX.Element {
   const pack = createModpack.value;
   const [step, setStep] = useState<CreateStep>(pack ? 'details' : 'version');
-  const [sourceId, setSourceId] = useState('vanilla');
+  const [sourceId, setSourceId] = useState<CreateSourceId>('vanilla');
   const [selectedSelectionId, setSelectedSelectionId] = useState<string | null>(null);
   const [channel, setChannel] = useState<Channel>('release');
   const [query, setQuery] = useState('');
@@ -395,6 +274,7 @@ function CreateCard(): JSX.Element {
   const [viewLoading, setViewLoading] = useState(Boolean(createDraft.value));
   const [backendView, setBackendView] = useState<CreateBackendViewResponse | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const versionWellRef = useRef<HTMLDivElement | null>(null);
   const loadRequestRef = useRef(0);
   const loadedCreateViewSourceRef = useRef<string | null>(null);
@@ -437,10 +317,10 @@ function CreateCard(): JSX.Element {
         if (cancelled) return;
         const best = response.candidates[0];
         if (best) {
-          const source = sourceIdFromLoaderKey((best.loader || 'vanilla') as LoaderKey);
+          const source = sourceIdFromLoaderKey(loaderKeyFromWire(best.loader));
           setSourceId(source);
           if (response.create_view) {
-            void loadCreateView(source, response.create_view as CreateBackendViewResponse);
+            void loadCreateView(source, createBackendViewResponse(response.create_view));
           }
         }
         setDraftCandidates(response.candidates);
@@ -456,12 +336,12 @@ function CreateCard(): JSX.Element {
 
   const draftCandidateFor = (loader: LoaderKey, mcVersion: string): CompatCandidate | null =>
     draftCandidates?.find(
-      (candidate) => ((candidate.loader || 'vanilla') as LoaderKey) === loader && candidate.game_version === mcVersion,
+      (candidate) => loaderKeyFromWire(candidate.loader) === loader && candidate.game_version === mcVersion,
     ) ?? null;
 
   const draftLoaders = useMemo(() => {
     if (!draft || !draftCandidates) return null;
-    return new Set(draftCandidates.map((candidate) => (candidate.loader || 'vanilla') as LoaderKey));
+    return new Set(draftCandidates.map((candidate) => loaderKeyFromWire(candidate.loader)));
   }, [draft, draftCandidates]);
 
   const [screenMax, setScreenMax] = useState<ScreenSize>(() => ({
@@ -504,12 +384,7 @@ function CreateCard(): JSX.Element {
   const applyCreateView = (source: string, res: CreateBackendViewResponse, applyMutableDefaults = true): void => {
     loadedCreateViewSourceRef.current = source;
     setBackendView(res);
-    const options = Array.isArray(res.preset_options)
-      ? res.preset_options.filter(
-          (option): option is CreatePresetOption =>
-            typeof option.id === 'string' && typeof option.label === 'string' && typeof option.detail === 'string',
-        )
-      : [];
+    const options = res.preset_options;
     setPresetOptions(options);
     const selectableOptions = options.filter((option) => !option.disabled_reason);
     const defaultPresetId = res.defaults?.jvm_preset_id;
@@ -552,7 +427,10 @@ function CreateCard(): JSX.Element {
     setChannel((current) => (CHANNEL_ORDER.includes(current) ? current : defaultChannel));
   };
 
-  const loadCreateView = async (source = sourceId, providedView?: CreateBackendViewResponse): Promise<void> => {
+  const loadCreateView = async (
+    source: CreateSourceId = sourceId,
+    providedView?: CreateBackendViewResponse,
+  ): Promise<void> => {
     const requestId = loadRequestRef.current + 1;
     loadRequestRef.current = requestId;
     if (providedView) {
@@ -567,12 +445,10 @@ function CreateCard(): JSX.Element {
     setViewLoading(!cached);
     setViewError(null);
     try {
-      const res = (await api(
-        'GET',
-        `/instances/create-view?source=${encodeURIComponent(source)}`,
-      )) as CreateBackendViewResponse & { error?: string };
+      const res = createBackendViewResponse(
+        await api('GET', `/instances/create-view?source=${encodeURIComponent(source)}`),
+      );
       if (requestId !== loadRequestRef.current) return;
-      if (res.error) throw new Error(res.error);
       createViewCache.set(source, res);
       applyCreateView(source, res, !cached);
     } catch (err: unknown) {
@@ -605,21 +481,9 @@ function CreateCard(): JSX.Element {
     node.scrollTop = 0;
   }, [versionListKey]);
 
-  const sourceOptions = useMemo<CreateOption[]>(() => {
-    return Array.isArray(backendView?.sources)
-      ? backendView.sources.filter((option): option is CreateOption => {
-          return typeof option.id === 'string' && typeof option.label === 'string';
-        })
-      : [];
-  }, [backendView]);
+  const sourceOptions = useMemo<CreateOption<CreateSourceId>[]>(() => backendView?.sources ?? [], [backendView]);
 
-  const channelOptions = useMemo<CreateOption[]>(() => {
-    return Array.isArray(backendView?.channels)
-      ? backendView.channels.filter((option): option is CreateOption => {
-          return typeof option.id === 'string' && typeof option.label === 'string';
-        })
-      : [];
-  }, [backendView]);
+  const channelOptions = useMemo<CreateOption[]>(() => backendView?.channels ?? [], [backendView]);
 
   useEffect(() => {
     if (sourceOptions.some((option) => option.id === sourceId)) return;
@@ -627,28 +491,9 @@ function CreateCard(): JSX.Element {
     if (fallback) setSourceId(fallback.id);
   }, [sourceOptions, sourceId]);
 
-  const backendRows = useMemo<CreateVersionRow[]>(() => {
-    return Array.isArray(backendView?.versions)
-      ? backendView.versions.filter((row): row is CreateVersionRow => {
-          return (
-            typeof row.source_id === 'string' &&
-            typeof row.selection_id === 'string' &&
-            typeof row.minecraft_version_id === 'string' &&
-            typeof row.display_name === 'string'
-          );
-        })
-      : [];
-  }, [backendView]);
+  const backendRows = useMemo<CreateVersionRow[]>(() => backendView?.versions ?? [], [backendView]);
 
-  const createNotices = useMemo<CreateNotice[]>(() => {
-    return Array.isArray(backendView?.notices)
-      ? backendView.notices.filter((notice): notice is CreateNotice => {
-          return (
-            typeof notice.state_id === 'string' && typeof notice.tone === 'string' && typeof notice.message === 'string'
-          );
-        })
-      : [];
-  }, [backendView]);
+  const createNotices = useMemo<CreateNotice[]>(() => backendView?.notices ?? [], [backendView]);
 
   const availableForSource = useMemo(
     () => backendRows.filter((row) => row.source_id === sourceId),
@@ -660,8 +505,7 @@ function CreateCard(): JSX.Element {
     return availableForSource.filter((row) =>
       draftCandidates.some(
         (candidate) =>
-          ((candidate.loader || 'vanilla') as LoaderKey) === sourceKey &&
-          candidate.game_version === row.minecraft_version_id,
+          loaderKeyFromWire(candidate.loader) === sourceKey && candidate.game_version === row.minecraft_version_id,
       ),
     );
   }, [availableForSource, draft, draftCandidates, sourceKey]);
@@ -682,22 +526,13 @@ function CreateCard(): JSX.Element {
     const q = query.trim().toLowerCase();
     return compatibleForSource
       .map((row) => {
-        const candidate =
-          draft && draftCandidates
-            ? (draftCandidates.find(
-                (entry) =>
-                  ((entry.loader || 'vanilla') as LoaderKey) === sourceKey &&
-                  entry.game_version === row.minecraft_version_id,
-              ) ?? null)
-            : null;
-        const tags = normalizeVersionTags(row.tags);
         return {
           id: row.minecraft_version_id,
           selectionId: row.selection_id,
           displayName: row.display_name,
           hint: row.hint ?? null,
           channel: normalizeChannel(row.channel),
-          tags,
+          tags: row.tags,
           downloadState: normalizeDownloadState(row.download_state),
           createEnabled: row.create_enabled,
           disabledReason: row.disabled_reason ?? null,
@@ -710,7 +545,7 @@ function CreateCard(): JSX.Element {
     ? (versionRows.find((row) => row.selectionId === selectedSelectionId) ?? null)
     : null;
   const mcVersionId = pack ? pack.minecraft : (selectedVersionRow?.id ?? null);
-  const packKey = pack ? ((pack.loader || 'vanilla') as LoaderKey) : null;
+  const packKey = pack ? loaderKeyFromWire(pack.loader) : null;
   const identityKey = packKey ?? sourceKey;
 
   const selectionId = pack ? pack.selection_id : (selectedVersionRow?.selectionId ?? '');
@@ -719,7 +554,7 @@ function CreateCard(): JSX.Element {
     if (!draft || !draftCandidates || draftAutoPicked) return;
     const best = draftCandidates[0];
     if (!best) return;
-    const bestKey = (best.loader || 'vanilla') as LoaderKey;
+    const bestKey = loaderKeyFromWire(best.loader);
     if (sourceKey !== bestKey) return;
     const row = versionRows.find((entry) => entry.id === best.game_version && entry.createEnabled);
     if (row) {
@@ -778,13 +613,13 @@ function CreateCard(): JSX.Element {
   }, [versionRows, selectedSelectionId]);
 
   const draftReady = !draft || draftCandidates !== null;
-  const versionReady = pack ? true : Boolean(selectionId && selectedVersionRow?.createEnabled !== false) && draftReady;
+  const versionReady = pack ? true : Boolean(selectionId && selectedVersionRow?.createEnabled === true) && draftReady;
+  const currentLoaderBuilds =
+    loaderBuilds?.source_id === sourceId && loaderBuilds.minecraft_version_id === mcVersionId ? loaderBuilds : null;
   const createSelectionId = pack
     ? pack.selection_id
-    : sourceKey === 'vanilla'
-      ? selectionId
-      : (loaderChoice ?? selectionId);
-  const canCreate = versionReady && name.trim().length > 0 && !submitting;
+    : createLoaderSelection(currentLoaderBuilds, sourceId, mcVersionId, selectionId, loaderChoice);
+  const canCreate = versionReady && Boolean(createSelectionId) && name.trim().length > 0 && !submitting;
 
   useEffect(() => {
     if (step === 'details' && !versionReady) setStep('version');
@@ -800,10 +635,10 @@ function CreateCard(): JSX.Element {
       'GET',
       `/instances/create-view/loader-builds?source=${encodeURIComponent(sourceId)}&minecraft_version=${encodeURIComponent(mcVersionId)}`,
     )
-      .then((res: any) => {
+      .then((value) => createLoaderBuildsResponse(value, { sourceId, minecraftVersionId: mcVersionId }))
+      .then((res) => {
         if (cancelled) return;
-        if (res.error) throw new Error(res.error);
-        setLoaderBuilds(res as CreateLoaderBuildsResponse);
+        setLoaderBuilds(res);
       })
       .catch((err: unknown) => {
         if (!cancelled) setLoaderBuildsError(errMessage(err));
@@ -822,9 +657,10 @@ function CreateCard(): JSX.Element {
   const autoOptimize = optimizeChoice ?? optimizeOption?.default_enabled ?? false;
 
   const submit = async (): Promise<void> => {
-    if (submitting || !canCreate) return;
+    if (submittingRef.current || !canCreate) return;
     const trimmed = name.trim();
     if (!trimmed || !createSelectionId) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       const keptSelections = draft
@@ -883,6 +719,7 @@ function CreateCard(): JSX.Element {
       }
       closeCreate();
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };
@@ -956,12 +793,16 @@ function CreateCard(): JSX.Element {
   const currentSourceLabel = pack
     ? pack.loader_label
     : (sourceOptions.find((option) => option.id === sourceId)?.label ?? LOADER_LABELS[sourceKey]);
-  const loaderSelection = loaderChoice ?? loaderBuilds?.auto.selection_id ?? '';
+  const loaderSelection = loaderChoice ?? currentLoaderBuilds?.auto.selection_id ?? '';
   const loaderOptions = useMemo(() => {
-    if (!loaderBuilds) return [];
+    if (!currentLoaderBuilds) return [];
     return [
-      { value: loaderBuilds.auto.selection_id, label: loaderBuilds.auto.label },
-      ...loaderBuilds.builds.map((build) => {
+      {
+        value: currentLoaderBuilds.auto.selection_id,
+        label: currentLoaderBuilds.auto.label,
+        disabled: !currentLoaderBuilds.auto.enabled,
+      },
+      ...currentLoaderBuilds.builds.map((build) => {
         const extras = [
           build.channel_label,
           build.recommended ? 'Recommended' : null,
@@ -974,7 +815,7 @@ function CreateCard(): JSX.Element {
         };
       }),
     ];
-  }, [loaderBuilds]);
+  }, [currentLoaderBuilds]);
 
   return (
     <>
@@ -1120,7 +961,7 @@ function CreateCard(): JSX.Element {
             {createNotices.length > 0 && (
               <div class="cp-cr-notices" aria-live="polite">
                 {createNotices.map((notice) => {
-                  const tone = noticeTone(notice.tone);
+                  const { tone, icon } = createNoticePresentation(notice);
                   return (
                     <section
                       key={notice.state_id}
@@ -1129,7 +970,7 @@ function CreateCard(): JSX.Element {
                       role={tone === 'warned' || tone === 'error' ? 'alert' : 'status'}
                     >
                       <span class="cp-notice-mark" aria-hidden="true">
-                        <Icon name={noticeIcon(tone)} size={15} stroke={2.2} />
+                        <Icon name={icon} size={15} stroke={2.2} />
                       </span>
                       <div class="cp-notice-copy">
                         <strong>{notice.message}</strong>
@@ -1251,13 +1092,16 @@ function CreateCard(): JSX.Element {
                 {versionRows.length} version{versionRows.length === 1 ? '' : 's'}
               </span>
               {sourceKey !== 'vanilla' && mcVersionId != null && (
-                <div class="cp-cr-loader-pick">
+                <div
+                  class="cp-cr-loader-pick"
+                  title={!loaderChoice ? currentLoaderBuilds?.auto.disabled_reason || undefined : undefined}
+                >
                   <span class="cp-cr-loader-pick-label">Loader</span>
-                  {loaderBuilds ? (
+                  {currentLoaderBuilds ? (
                     <SelectField
                       value={loaderSelection}
                       onChange={(next) => {
-                        setLoaderChoice(next === loaderBuilds.auto.selection_id ? null : next);
+                        setLoaderChoice(next === currentLoaderBuilds.auto.selection_id ? null : next);
                       }}
                       options={loaderOptions}
                       ariaLabel="Loader version"

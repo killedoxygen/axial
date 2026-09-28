@@ -1,57 +1,48 @@
 import { signal } from '@preact/signals';
 import type { LocalPrefs } from './types-ui';
+import { LOCAL_PREFERENCES_KEY, defaultLocalPreferences, parseLocalPreferences } from './preferences/local';
+import { hasNativeDesktopRuntime } from './native';
+import { canEditPreferences, saveNativeLocalPreferences } from './preferences/persistence';
+export { canEditPreferences } from './preferences/persistence';
 
-export const STORAGE_KEY: string = 'axial_ui';
+export const STORAGE_KEY: string = LOCAL_PREFERENCES_KEY;
 export const PRESET_HUES: Record<string, number> = { obsidian: 140, deepslate: 215, nether: 15, end: 268, birch: 100 };
 
-export const defaults: LocalPrefs = {
-  theme: 'obsidian',
-  customHue: 140,
-  customVibrancy: 100,
-  lightness: 0,
-  logHeight: 0,
-  collapsedGroups: {},
-  sidebarFilter: 'all',
-  sounds: true,
-  hideSkinNametag: false,
-  selectedSkin: '',
-  selectedSkinsByAccount: {},
-  shortcuts: {},
-  overlayPositions: {},
-  lastUpdateCheckAt: '',
-  dismissedUpdateVersion: '',
-};
+export const defaults: LocalPrefs = defaultLocalPreferences();
 
 export function loadLocalState(): LocalPrefs {
+  if (hasNativeDesktopRuntime()) return defaultLocalPreferences();
   try {
     const raw: string | null = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { ...defaults };
-    const saved = JSON.parse(raw) as Partial<LocalPrefs>;
-    return {
-      ...defaults,
-      ...saved,
-      selectedSkinsByAccount: stringRecord(saved.selectedSkinsByAccount),
-    };
+    if (!raw) return defaultLocalPreferences();
+    return parseLocalPreferences(JSON.parse(raw) as unknown);
   } catch {
-    return { ...defaults };
+    return defaultLocalPreferences();
   }
 }
 
 export const local: LocalPrefs = loadLocalState();
 export const localStateVersion = signal(0);
+let persistenceSuspended = false;
+
+/** Keep late callbacks from overwriting imported preferences while this document reloads. */
+export function suspendLocalStatePersistence(): () => void {
+  const previous = persistenceSuspended;
+  persistenceSuspended = true;
+  return () => {
+    persistenceSuspended = previous;
+  };
+}
 
 export function saveLocalState(): void {
+  if (persistenceSuspended || !canEditPreferences()) return;
+  if (hasNativeDesktopRuntime()) {
+    saveNativeLocalPreferences(local);
+    localStateVersion.value += 1;
+    return;
+  }
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(local));
   } catch {}
   localStateVersion.value += 1;
-}
-
-function stringRecord(value: unknown): Record<string, string> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const output: Record<string, string> = {};
-  for (const [key, entry] of Object.entries(value)) {
-    if (typeof entry === 'string') output[key] = entry;
-  }
-  return output;
 }

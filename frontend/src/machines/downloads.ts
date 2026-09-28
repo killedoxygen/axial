@@ -1,43 +1,28 @@
-import { batch, signal } from '@preact/signals';
-import { api, apiUrl } from '../api';
-import { showError, errMessage } from '../utils';
+import { batch, computed, effect, signal } from '@preact/signals';
+import { api } from '../api';
+import { errMessage, showError } from '../utils';
 import { toast } from '../toast';
-import { connectLoaderInstallSSE } from '../loaders/api';
-import {
-  hasNativeDesktopRuntime,
-  nativeInstallEventName,
-  nativeLoaderInstallEventName,
-  onNativeEvent,
-  startNativeInstallEvents,
-  startNativeLoaderInstallEvents,
-} from '../native';
-import { catalog, instances, lastInstanceId, versions } from '../store';
+import { connectInstallQueueSSE } from '../loaders/api';
+import { config, instances, lastInstanceId, launchSessions, launchState, versions } from '../store';
 import { markContentChanged } from '../content-activity';
+import { installQueueStateResponse } from '../dto-install';
+import { instancesResponse, versionsResponse } from '../dto-core';
 import {
   cloneInstallItem,
   installItemFromQueueInstallItem,
-  installItemFromQueuedViewModel,
   installQueueRequestFromItem,
   isSameInstallItem,
 } from '../install-item';
-import {
-  installFailureViewModel,
-  installProgressViewModel,
-  queueNoticeToastKind,
-  unresolvedFailureViewModel,
-} from './download-view-models';
-import type { LoaderBuildRecord } from '../types-loader';
+import { installQueueNoticePresentation } from './download-view-models';
 import type {
+  InstallActionViewModel,
   InstallFailureViewModel,
   InstallItem,
   InstallProgressStepViewModel,
-  InstallProgressViewModel,
   InstallQueueActiveViewModel,
-  InstallQueueNoticeViewModel,
   InstallQueueStateResponse,
   InstallQueueViewModel,
   InstallQueuedItemViewModel,
-  InstallStatusResponse,
 } from '../types-install';
 
 export type ActiveDownload = {
@@ -52,6 +37,7 @@ export type ActiveDownload = {
   phase: string;
   activeStep: InstallProgressStepViewModel | null;
   startedAt: number | null;
+  retryAction?: InstallActionViewModel;
 };
 
 export type DownloadFailure = {
@@ -85,38 +71,55 @@ export const emptyDownloadQueue: DownloadQueue = {
   },
 };
 
-export const activeDownload = signal<ActiveDownload | null>(null);
-export const downloadQueue = signal<DownloadQueue>(emptyDownloadQueue);
-export const downloadFailure = signal<DownloadFailure | null>(null);
+// Every view derives from the backend's full queue snapshot, including after reload.
+const queueSnapshot = signal<InstallQueueStateResponse | null>(null);
+const dismissedFailureOperation = signal<string | null>(null);
+export const activeInstallRetryPending = signal(false);
+let closeQueueStream: (() => void) | null = null;
+let registryRefreshGeneration = 0;
+const retiredQueueEpochs = new Set<string>();
+type RegistryCursor = { epoch: string; revision: number };
+let reconciledRegistry: RegistryCursor | null = null;
+let registryRead: { cursor: RegistryCursor; promise: Promise<void>; dispose: () => void } | null = null;
+let registryRetryTimer: ReturnType<typeof setTimeout> | undefined;
+let registryReadFailures = 0;
 
-type CloseableSource = {
-  close(): void;
-};
+export const activeDownload = computed<ActiveDownload | null>(() => {
+  const active = queueSnapshot.value?.active;
+  return active ? activeDownloadFromQueue(active) : null;
+});
 
-type PendingInstallEventSource = CloseableSource & {
-  setSource(source: CloseableSource): boolean;
-};
+export const downloadQueue = computed<DownloadQueue>(() => {
+  const snapshot = queueSnapshot.value;
+  return snapshot ? { items: snapshot.items, view_model: snapshot.view_model } : emptyDownloadQueue;
+});
 
-type InstallProgressEvent = {
-  phase?: string;
-  current?: number;
-  total?: number;
-  file?: string;
-  error?: string;
-  done?: boolean;
-  view_model?: InstallProgressViewModel;
-};
+export const downloadFailure = computed<DownloadFailure | null>(() => {
+  const failure = queueSnapshot.value?.latest_failure;
+  if (!failure || failure.operation_id === dismissedFailureOperation.value) return null;
+  return {
+    item: cloneInstallItem(installItemFromQueueInstallItem(failure.install_item)),
+    displayName: failure.label,
+    viewModel: failure.failure_view_model,
+    failedAt: failure.failed_at_ms,
+  };
+});
 
-let progressStream: CloseableSource | null = null;
-let connectedInstallId: string | null = null;
-const INSTALL_STREAM_SILENCE_MS = 15_000;
-const INSTALL_RECONCILE_ATTEMPTS = 4;
-const INSTALL_RECONCILE_DELAY_MS = 160;
-const reconcilingInstallIds = new Set<string>();
-
-function setProgressStream(source: CloseableSource | null): void {
-  progressStream?.close();
-  progressStream = source;
+function activeDownloadFromQueue(active: InstallQueueActiveViewModel): ActiveDownload {
+  return {
+    queueId: active.queue_id,
+    installId: active.install_id ?? undefined,
+    operationId: active.operation_id ?? undefined,
+    kind: active.kind,
+    item: cloneInstallItem(installItemFromQueueInstallItem(active.install_item)),
+    displayName: active.label,
+    pct: Math.max(0, Math.min(100, active.progress.progress_pct)),
+    label: active.progress.label,
+    phase: active.progress.phase_id,
+    activeStep: active.progress.active_step ?? null,
+    startedAt: active.install_started_at_ms ?? null,
+    retryAction: active.retry_action,
+  };
 }
 
 export function isActiveInstallItem(item: InstallItem): boolean {
@@ -124,523 +127,218 @@ export function isActiveInstallItem(item: InstallItem): boolean {
   return active !== null && isSameInstallItem(active.item, item);
 }
 
-function isActiveInstallSource(item: InstallItem, source: CloseableSource | null): boolean {
-  return isActiveInstallItem(item) && source !== null && progressStream === source;
-}
-
-function activeDownloadFromQueue(active: InstallQueueActiveViewModel): ActiveDownload {
-  const item = installItemFromQueueInstallItem(active.install_item);
-  const startedAt =
-    typeof active.install_started_at_ms === 'number' && Number.isFinite(active.install_started_at_ms)
-      ? active.install_started_at_ms
-      : null;
-  return {
-    queueId: active.queue_id,
-    installId: active.install_id ?? undefined,
-    operationId: active.operation_id ?? undefined,
-    kind: active.kind,
-    item: cloneInstallItem(item),
-    displayName: active.label,
-    pct: Math.max(0, Math.min(100, active.progress.progress_pct)),
-    label: active.progress.label,
-    phase: active.progress.phase_id,
-    activeStep: active.progress.active_step ?? null,
-    startedAt,
-  };
-}
-
-function reconcileDownloadQueue(response: InstallQueueStateResponse): void {
-  const closingStream = !response.active ? progressStream : null;
-  batch(() => {
-    downloadQueue.value = { items: response.items, view_model: response.view_model };
-    if (response.active) {
-      activeDownload.value = activeDownloadFromQueue(response.active);
-      return;
-    }
-    if (activeDownload.value) activeDownload.value = null;
-  });
-  if (closingStream) {
-    if (progressStream === closingStream) progressStream = null;
-    closingStream.close();
-  }
-}
-
-function updateActiveDownloadProgress(viewModel: InstallProgressViewModel): void {
-  const current = activeDownload.value;
-  if (!current) return;
-  const nextPct = Number.isFinite(viewModel.progress_pct)
-    ? Math.max(0, Math.min(100, viewModel.progress_pct))
-    : current.pct;
-  // A lower pct means a stale event: the SSE stream replays install history
-  // on (re)connect after the queue snapshot already seeded current progress.
-  // Keep the newer copy until replay catches up.
-  const regressed = nextPct < current.pct;
-  activeDownload.value = {
-    ...current,
-    pct: Math.max(current.pct, nextPct),
-    label: regressed ? current.label : viewModel.label,
-    phase: regressed ? current.phase : viewModel.phase_id || current.phase,
-    activeStep: regressed ? current.activeStep : (viewModel.active_step ?? null),
-  };
-}
-
-function completeActiveDownload(): void {
-  activeDownload.value = null;
-  setProgressStream(null);
-}
-
-export function recordDownloadFailure(
-  item: InstallItem,
-  displayName: string,
-  viewModel: InstallFailureViewModel,
-): void {
-  downloadFailure.value = {
-    item: cloneInstallItem(item),
-    displayName,
-    viewModel,
-    failedAt: Date.now(),
-  };
-}
-
 export function clearDownloadFailure(): void {
-  downloadFailure.value = null;
+  const failure = queueSnapshot.value?.latest_failure;
+  const action = failure?.failure_view_model.dismiss_action;
+  if (!failure || action?.action !== 'dismiss' || action.enabled !== true) return;
+  // This local notice dismissal applies only to the captured operation.
+  dismissedFailureOperation.value = failure.operation_id;
 }
 
-export function clearDownloadFailureForItem(item: InstallItem): void {
-  const failure = downloadFailure.value;
-  if (!failure || !isSameInstallItem(failure.item, item)) return;
-  downloadFailure.value = null;
+function ensureQueueSubscription(): void {
+  if (closeQueueStream) return;
+  closeQueueStream = connectInstallQueueSSE(
+    (response) => {
+      void applyInstallQueueResponse(response).catch(showInstallQueueError);
+    },
+    (error) => {
+      showError('Install progress connection failed: ' + errMessage(error));
+    },
+  );
 }
 
-async function installFailureViewModelForStatus(
-  installId: string,
-  fallback: InstallFailureViewModel,
-): Promise<InstallFailureViewModel> {
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    try {
-      const status = await api<InstallStatusResponse>('GET', `/install/${encodeURIComponent(installId)}/status`);
-      const viewModel = installFailureViewModel(status.failure_view_model);
-      if (viewModel) return viewModel;
-    } catch {
-      return fallback;
-    }
-    await delay(120);
-  }
-  return fallback;
-}
-
-async function recordBackendInstallFailure(
-  item: InstallItem,
-  displayName: string,
-  installId: string,
-  fallback: InstallFailureViewModel,
-): Promise<InstallFailureViewModel> {
-  const viewModel = await installFailureViewModelForStatus(installId, fallback);
-  recordDownloadFailure(item, displayName, viewModel);
-  return viewModel;
-}
-
-function showInstallQueueNotice(notice: InstallQueueNoticeViewModel | null | undefined): void {
-  if (!notice?.message?.trim()) return;
-  const message = notice.detail?.trim() ? `${notice.message}: ${notice.detail.trim()}` : notice.message.trim();
-  toast(message, queueNoticeToastKind(notice));
+export function disconnectInstallQueue(): void {
+  closeQueueStream?.();
+  closeQueueStream = null;
+  registryRefreshGeneration += 1;
+  registryRead?.dispose();
+  registryRead = null;
+  if (registryRetryTimer !== undefined) clearTimeout(registryRetryTimer);
+  registryRetryTimer = undefined;
 }
 
 export async function refreshInstallQueue(
-  options: { connectActive?: boolean } = {},
+  options: { connectActive?: boolean; requireInstalledState?: boolean } = {},
 ): Promise<InstallQueueStateResponse> {
-  const response = await api<InstallQueueStateResponse>('GET', '/install/queue');
-  await applyInstallQueueResponse(response, { connectActive: options.connectActive });
+  if (options.requireInstalledState) {
+    // Each explicit startup attempt needs a fresh projection: account/config or
+    // instance changes need not advance the install queue's registry revision.
+    registryRefreshGeneration += 1;
+    registryRead?.dispose();
+    registryRead = null;
+    reconciledRegistry = null;
+    if (registryRetryTimer !== undefined) clearTimeout(registryRetryTimer);
+    registryRetryTimer = undefined;
+  }
+  // Subscribe while idle too: the next operation may originate elsewhere.
+  // Each connection begins with an atomic complete backend snapshot.
+  if (options.connectActive) ensureQueueSubscription();
+  const epochAtRequest = queueSnapshot.value?.queue_epoch;
+  const response = installQueueStateResponse(await api('GET', '/install/queue'));
+  const currentEpoch = queueSnapshot.value?.queue_epoch;
+  if (!currentEpoch || currentEpoch === epochAtRequest || currentEpoch === response.queue_epoch) {
+    await applyInstallQueueResponse(response, { requireInstalledState: options.requireInstalledState });
+  }
+  // A superseded queue read is not proof that the current registry projection
+  // has loaded. Startup must join the current owner's read before becoming ready.
+  if (options.requireInstalledState) await refreshInstalledState(true);
   return response;
 }
 
 export async function applyInstallQueueResponse(
   response: InstallQueueStateResponse,
-  options: { showNotice?: boolean; connectActive?: boolean } = {},
+  options: { showNotice?: boolean; connectActive?: boolean; requireInstalledState?: boolean } = {},
 ): Promise<InstallQueueStateResponse> {
-  if (response.removed_instance_id) {
-    const removedId = response.removed_instance_id;
-    batch(() => {
-      instances.value = instances.value.filter((instance) => instance.id !== removedId);
-      if (lastInstanceId.value === removedId) lastInstanceId.value = null;
-    });
+  if (options.connectActive) ensureQueueSubscription();
+  if (!response.queue_epoch || !Number.isSafeInteger(response.registry_revision) || response.registry_revision < 0 ||
+      !Number.isSafeInteger(response.revision) || response.revision < 0) {
+    throw new Error('Install queue revision is invalid.');
   }
-  const terminalActive = response.active?.progress.failed || response.active?.progress.terminal;
-  const activeResponse = terminalActive ? { ...response, active: null } : response;
-  reconcileDownloadQueue(activeResponse);
-  if (!activeResponse.active) connectedInstallId = null;
-  if (options.showNotice) showInstallQueueNotice(response.notice);
-  if (terminalActive && response.active) {
-    const active = response.active;
-    if (!active.install_id) {
-      if (options.connectActive) await refreshInstallQueue({ connectActive: true });
+  const previous = queueSnapshot.value;
+  if (retiredQueueEpochs.has(response.queue_epoch)) return response;
+  if (previous?.queue_epoch === response.queue_epoch) {
+    if (response.revision < previous.revision) return response;
+    if (response.revision === previous.revision) {
+      await refreshInstalledState(options.requireInstalledState);
       return response;
     }
-    const item = installItemFromQueueInstallItem(active.install_item);
-    const resolved = await reconcileInstallStatus(active.install_id, item, active.label);
-    if (!resolved) await refreshInstallQueue({ connectActive: options.connectActive });
-  } else if (options.connectActive) {
-    await connectBackendActiveInstall(response.active ?? null);
+    if (response.registry_revision < previous.registry_revision) {
+      throw new Error('Install registry revision moved backwards.');
+    }
+  } else if (previous) {
+    retiredQueueEpochs.add(previous.queue_epoch);
   }
+
+  batch(() => {
+    queueSnapshot.value = response;
+    if (response.removed_instance_id) {
+      const removedId = response.removed_instance_id;
+      instances.value = instances.value.filter((instance) => instance.id !== removedId);
+      if (lastInstanceId.value === removedId) lastInstanceId.value = null;
+    }
+  });
+
+  if (options.showNotice) {
+    const notice = installQueueNoticePresentation(response.notice);
+    if (notice) toast(notice.message, notice.kind);
+  }
+
+  // A complete snapshot retains invalidation even when an entire operation was
+  // coalesced before this client observed its active phase.
+  if (previous?.queue_epoch !== response.queue_epoch || previous.registry_revision !== response.registry_revision) {
+    markContentChanged();
+    if (registryRetryTimer !== undefined) clearTimeout(registryRetryTimer);
+    registryRetryTimer = undefined;
+  }
+  await refreshInstalledState(options.requireInstalledState);
   return response;
 }
 
-async function connectBackendActiveInstall(active: InstallQueueActiveViewModel | null): Promise<void> {
-  if (!active?.install_id) {
-    connectedInstallId = null;
-    return;
-  }
-  if (connectedInstallId === active.install_id && activeDownload.value && progressStream) {
-    return;
-  }
-  const item = installItemFromQueueInstallItem(active.install_item);
-  connectedInstallId = active.install_id;
-  try {
-    await connectInstallEvents(active.kind, active.install_id, item, active.label);
-  } catch (err: unknown) {
-    const message = errMessage(err);
-    connectedInstallId = null;
-    setProgressStream(null);
-    showError(`Install progress connection failed: ${message}`);
-    await reconcileInstallStreamIssue(active.install_id, item, active.label, {
-      reconnect: false,
-      notice: 'Install progress connection failed; refreshed backend status.',
-    });
-  }
+function sameRegistry(left: RegistryCursor | null, right: RegistryCursor): boolean {
+  return left?.epoch === right.epoch && left.revision === right.revision;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
-}
-
-async function reconcileInstallStatus(installId: string, item: InstallItem, displayName: string): Promise<boolean> {
-  for (let attempt = 0; attempt < INSTALL_RECONCILE_ATTEMPTS; attempt += 1) {
-    let status: InstallStatusResponse;
-    try {
-      status = await api<InstallStatusResponse>('GET', `/install/${encodeURIComponent(installId)}/status`);
-    } catch {
-      await delay(INSTALL_RECONCILE_DELAY_MS);
-      continue;
-    }
-
-    const viewModel = installProgressViewModel(status.view_model);
-    if (!viewModel) {
-      await delay(INSTALL_RECONCILE_DELAY_MS);
-      continue;
-    }
-
-    updateActiveDownloadProgress(viewModel);
-
-    const failureViewModel = installFailureViewModel(status.failure_view_model);
-    if (viewModel.failed || failureViewModel) {
-      const failure = failureViewModel ?? unresolvedFailureViewModel(viewModel.label);
-      recordDownloadFailure(item, displayName, failure);
-      showError(failure.summary);
-      await onInstallDone();
-      return true;
-    }
-
-    if (status.done || viewModel.terminal) {
-      await onInstallDone(item);
-      return true;
-    }
-
-    return false;
-  }
-
-  return false;
-}
-
-async function reconcileInstallStreamIssue(
-  installId: string,
-  item: InstallItem,
-  displayName: string,
-  options: {
-    source?: CloseableSource | null;
-    closeSource?: boolean;
-    reconnect?: boolean;
-    notice?: string;
-  } = {},
-): Promise<void> {
-  if (!isActiveInstallItem(item) || reconcilingInstallIds.has(installId)) return;
-  reconcilingInstallIds.add(installId);
-
-  try {
-    if (options.closeSource && options.source && progressStream === options.source) {
-      connectedInstallId = null;
-      setProgressStream(null);
-    }
-
-    const resolved = await reconcileInstallStatus(installId, item, displayName);
-    if (resolved || !isActiveInstallItem(item)) return;
-
-    try {
-      await refreshInstallQueue({
-        connectActive: options.reconnect !== false,
-      });
-    } catch (err: unknown) {
-      const prefix = options.notice || 'Install progress refresh failed.';
-      showError(`${prefix} ${errMessage(err)}`);
-    }
-  } finally {
-    reconcilingInstallIds.delete(installId);
-  }
-}
-
-type InstallStreamWatchdog = {
-  markProgress(): void;
-  stop(): void;
-};
-
-function createInstallStreamWatchdog(onSilence: () => Promise<void>): InstallStreamWatchdog {
-  let timer: number | undefined;
-  let stopped = false;
-  let reconciling = false;
-
-  const arm = (): void => {
-    if (timer !== undefined) window.clearTimeout(timer);
-    if (stopped) return;
-    timer = window.setTimeout(() => {
-      if (stopped || reconciling) {
-        arm();
-        return;
-      }
-      reconciling = true;
-      void onSilence()
-        .catch(() => {})
-        .finally(() => {
-          reconciling = false;
-          arm();
-        });
-    }, INSTALL_STREAM_SILENCE_MS);
-  };
-
-  arm();
-
-  return {
-    markProgress: arm,
-    stop(): void {
-      stopped = true;
-      if (timer !== undefined) window.clearTimeout(timer);
-      timer = undefined;
-    },
-  };
-}
-
-function createPendingInstallEventSource(): PendingInstallEventSource {
-  let closed = false;
-  let source: CloseableSource | null = null;
-
-  return {
-    close(): void {
-      if (closed) return;
-      closed = true;
-      source?.close();
-      source = null;
-    },
-    setSource(nextSource: CloseableSource): boolean {
-      if (closed) {
-        nextSource.close();
-        return false;
-      }
-      source = nextSource;
-      return true;
-    },
-  };
-}
-
-async function connectNativeInstallEventSource(
-  item: InstallItem,
-  controller: PendingInstallEventSource,
-  eventName: string,
-  onData: (data: InstallProgressEvent) => void,
-  startEvents: () => Promise<boolean>,
-  unavailableMessage: string,
-): Promise<void> {
-  setProgressStream(controller);
-
-  let subscription: CloseableSource | null = null;
-  try {
-    subscription = await onNativeEvent(eventName, onData);
-  } catch (err: unknown) {
-    if (!isActiveInstallSource(item, controller)) return;
-    throw err;
-  }
-
-  if (!subscription) {
-    if (!isActiveInstallSource(item, controller)) return;
-    throw new Error(unavailableMessage);
-  }
-  if (!controller.setSource(subscription)) return;
-  if (!isActiveInstallSource(item, controller)) return;
-
-  let started = false;
-  try {
-    started = await startEvents();
-  } catch (err: unknown) {
-    if (!isActiveInstallSource(item, controller)) return;
-    controller.close();
-    if (progressStream === controller) progressStream = null;
-    throw err;
-  }
-
-  if (!started) {
-    controller.close();
-    if (progressStream === controller) progressStream = null;
-    throw new Error(unavailableMessage);
-  }
-}
-
-const STREAM_COPY = {
-  vanilla: {
-    unavailable: 'Desktop install progress is unavailable.',
-    invalid: 'Install progress data was invalid; refreshed backend status.',
-    stopped: 'Install progress stopped unexpectedly; refreshed backend status.',
-  },
-  loader: {
-    unavailable: 'Desktop loader install progress is unavailable.',
-    invalid: 'Loader install progress data was invalid. Refreshed backend status.',
-    stopped: 'Loader install progress stopped unexpectedly. Refreshed backend status.',
-  },
-  content: {
-    unavailable: 'Desktop content progress is unavailable.',
-    invalid: 'Content progress data was invalid. Refreshed backend status.',
-    stopped: 'Content progress stopped unexpectedly. Refreshed backend status.',
-  },
-} as const;
-
-async function connectInstallEvents(
-  kind: 'vanilla' | 'loader' | 'content',
-  installId: string,
-  item: InstallItem,
-  displayName: string,
-): Promise<void> {
-  if (!isActiveInstallItem(item)) return;
-  const copy = STREAM_COPY[kind];
-
-  let source: CloseableSource | null = null;
-  let watchdog: InstallStreamWatchdog | null = null;
-
-  const stopWatchdog = (): void => {
-    watchdog?.stop();
-    watchdog = null;
-  };
-
-  const startWatchdog = (): void => {
-    stopWatchdog();
-    watchdog = createInstallStreamWatchdog(async () => {
-      if (!isActiveInstallSource(item, source)) {
-        stopWatchdog();
-        return;
-      }
-      await reconcileInstallStreamIssue(installId, item, displayName, {
-        source,
-        closeSource: true,
-        reconnect: true,
-      });
-    });
-  };
-
-  const reconcileIssue = (notice: string): void => {
-    if (!isActiveInstallSource(item, source)) return;
-    stopWatchdog();
-    void reconcileInstallStreamIssue(installId, item, displayName, {
-      source,
-      closeSource: true,
-      reconnect: true,
-      notice,
-    });
-  };
-
-  const onProgress = async (data: InstallProgressEvent): Promise<void> => {
-    if (!isActiveInstallSource(item, source)) return;
-    watchdog?.markProgress();
-
-    const viewModel = installProgressViewModel(data.view_model);
-    if (!viewModel) {
-      reconcileIssue(copy.invalid);
+async function refreshInstalledState(required = false): Promise<void> {
+  for (;;) {
+    const snapshot = queueSnapshot.value;
+    if (!snapshot) {
+      if (required) throw new Error('Install state has not loaded.');
       return;
     }
-
-    updateActiveDownloadProgress(viewModel);
-    if (viewModel.failed) {
-      stopWatchdog();
-      completeActiveDownload();
-      const failure = await recordBackendInstallFailure(
-        item,
-        displayName,
-        installId,
-        unresolvedFailureViewModel(viewModel.label),
-      );
-      showError(failure.summary);
-      await onInstallDone();
+    const cursor = { epoch: snapshot.queue_epoch, revision: snapshot.registry_revision };
+    if (sameRegistry(reconciledRegistry, cursor)) return;
+    if (registryRetryTimer !== undefined) {
+      if (required) throw new Error('Install state could not be refreshed. Retry startup.');
       return;
     }
-    if (data.done || viewModel.terminal) {
-      stopWatchdog();
-      await onInstallDone(item);
-    }
-  };
-
-  if (hasNativeDesktopRuntime()) {
-    const controller = createPendingInstallEventSource();
-    source = controller;
-    startWatchdog();
-
+    const read = registryRead && sameRegistry(registryRead.cursor, cursor)
+      ? registryRead.promise : readInstalledState(cursor);
     try {
-      await connectNativeInstallEventSource(
-        item,
-        controller,
-        kind === 'loader' ? nativeLoaderInstallEventName(installId) : nativeInstallEventName(installId),
-        (data) => {
-          void onProgress(data);
-        },
-        () => (kind === 'loader' ? startNativeLoaderInstallEvents(installId) : startNativeInstallEvents(installId)),
-        copy.unavailable,
-      );
-    } catch (err: unknown) {
-      stopWatchdog();
-      throw err;
+      await read;
+    } catch (error) {
+      if (required) throw error;
+      return;
+    }
+    if (!required) return;
+    const current = queueSnapshot.value;
+    if (!current || current.queue_epoch !== cursor.epoch || current.registry_revision !== cursor.revision) continue;
+    if (!sameRegistry(reconciledRegistry, cursor)) {
+      throw new Error(registryRetryTimer !== undefined
+        ? 'Launcher state changed while refreshing. Retry startup.'
+        : 'Install state refresh was interrupted. Retry startup.');
     }
     return;
   }
+}
 
-  if (kind === 'loader') {
-    const es = connectLoaderInstallSSE(
-      installId,
-      (data) => {
-        void onProgress(data as InstallProgressEvent);
-      },
-      (message) => {
-        reconcileIssue(`${message} Refreshed backend status.`);
-      },
-    );
-    source = es;
-    setProgressStream(es);
-    startWatchdog();
-    return;
-  }
-
-  const es = new EventSource(apiUrl(`/install/${installId}/events`));
-  source = es;
-  setProgressStream(es);
-  startWatchdog();
-
-  es.addEventListener('progress', (e: MessageEvent) => {
-    let data: InstallProgressEvent;
+function readInstalledState(cursor: RegistryCursor): Promise<void> {
+  registryRead?.dispose();
+  const generation = ++registryRefreshGeneration;
+  let stopWatching = (): void => {};
+  const promise = Promise.resolve().then(async () => {
     try {
-      data = JSON.parse(e.data) as InstallProgressEvent;
-    } catch {
-      reconcileIssue(copy.invalid);
-      return;
+      // Account edits and session settlement do not advance the install cursor.
+      // Rebase once against their existing owners before falling back to paced retry.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (generation !== registryRefreshGeneration) return;
+        const expectedInstances = instances.value;
+        const expectedVersions = versions.value;
+        const expectedConfig = config.value;
+        const expectedLastInstance = lastInstanceId.value;
+        const expectedSessions = Object.entries(launchSessions.value).map(([id, session]) => [id, session.sessionId] as const);
+        const expectedPreparing = launchState.value.status === 'preparing' ? launchState.value.instanceId : null;
+        const ownershipCurrent = (): boolean =>
+          Object.keys(launchSessions.value).length === expectedSessions.length &&
+          expectedSessions.every(([id, sessionId]) => launchSessions.value[id]?.sessionId === sessionId) &&
+          (launchState.value.status === 'preparing' ? launchState.value.instanceId : null) === expectedPreparing;
+        const inputsCurrent = (): boolean => instances.value === expectedInstances && versions.value === expectedVersions &&
+          config.value === expectedConfig && lastInstanceId.value === expectedLastInstance && ownershipCurrent();
+        // A session may start and end during this pair of reads. Remember that
+        // transition without invalidating on ordinary same-session progress ticks.
+        let superseded = false;
+        stopWatching = effect(() => { if (!inputsCurrent()) superseded = true; });
+        try {
+          const [versionsRes, instancesRes] = await Promise.all([
+            api('GET', '/versions').then(versionsResponse),
+            api('GET', '/instances').then(instancesResponse),
+          ]);
+          if (generation !== registryRefreshGeneration) return;
+          if (superseded || !inputsCurrent()) continue;
+          stopWatching();
+          batch(() => {
+            versions.value = versionsRes.versions;
+            instances.value = instancesRes.instances;
+            lastInstanceId.value = instancesRes.last_instance_id;
+          });
+          reconciledRegistry = cursor;
+          registryReadFailures = 0;
+          return;
+        } catch (error: unknown) {
+          if (generation !== registryRefreshGeneration) return;
+          if (superseded || !inputsCurrent()) continue;
+          if (registryReadFailures === 0) {
+            showError('Install state changed, but launcher state could not be refreshed: ' + errMessage(error));
+          }
+          scheduleRegistryRetry(Math.min(10000, 500 * 2 ** Math.min(registryReadFailures++, 5)));
+          throw error;
+        } finally {
+          stopWatching();
+        }
+      }
+      scheduleRegistryRetry(500);
+    } finally {
+      if (generation === registryRefreshGeneration) registryRead = null;
     }
-    void onProgress(data);
   });
+  registryRead = { cursor, promise, dispose: () => stopWatching() };
+  return promise;
+}
 
-  es.onerror = () => {
-    if (es.readyState !== EventSource.CLOSED) return;
-    reconcileIssue(copy.stopped);
-  };
+function scheduleRegistryRetry(delay: number): void {
+  registryRetryTimer = setTimeout(() => {
+    registryRetryTimer = undefined;
+    void refreshInstalledState();
+  }, delay);
 }
 
 export function handleInstallClick(item: InstallItem): void {
@@ -648,102 +346,67 @@ export function handleInstallClick(item: InstallItem): void {
 }
 
 export function installVersion(target: string): void {
-  if (!target) return;
-  const item: InstallItem = { versionId: target };
-  void enqueueBackendInstallItem(item).catch(showInstallQueueError);
-}
-
-export function installLoaderVersion(build: LoaderBuildRecord): void {
-  if (!build.component_id || !build.build_id || !build.version_id) return;
-  const item: InstallItem = {
-    versionId: build.version_id,
-    loader: {
-      componentId: build.component_id,
-      buildId: build.build_id,
-      minecraftVersion: build.minecraft_version,
-      loaderVersion: build.loader_version,
-    },
-  };
-  void enqueueBackendInstallItem(item).catch(showInstallQueueError);
+  if (target) handleInstallClick({ versionId: target });
 }
 
 export function retryFailedInstall(): void {
   const failure = downloadFailure.value;
-  const retryAction = failure?.viewModel.retry_action;
-  if (!failure || retryAction?.enabled === false) return;
+  const action = failure?.viewModel.retry_action;
+  if (!failure || action?.action !== 'retry' || action.enabled !== true) return;
   void enqueueBackendInstallItem(failure.item, { retry: true }).catch(showInstallQueueError);
 }
 
-export async function removeQueuedInstall(queueId: string): Promise<void> {
-  if (!queueId) return;
+export async function retryActiveInstall(expectedInstallId: string | undefined): Promise<void> {
+  const active = activeDownload.value;
+  const action = active?.retryAction;
+  if (!expectedInstallId || active?.installId !== expectedInstallId || activeInstallRetryPending.value ||
+      action?.action !== 'retry' || action.enabled !== true) return;
+  activeInstallRetryPending.value = true;
   try {
-    const response = await api<InstallQueueStateResponse>('DELETE', `/install/queue/${encodeURIComponent(queueId)}`);
-    await applyInstallQueueResponse(response, { showNotice: true, connectActive: true });
-  } catch (err: unknown) {
-    showError(`Install queue update failed: ${errMessage(err)}`);
+    await enqueueBackendInstallItem(active.item, { retry: true, expectedInstallId });
+  } catch (error: unknown) {
+    showInstallQueueError(error);
+  } finally {
+    activeInstallRetryPending.value = false;
   }
 }
 
-function installQueueResponseContainsItem(response: InstallQueueStateResponse, item: InstallItem): boolean {
-  const activeItem = response.active ? installItemFromQueueInstallItem(response.active.install_item) : null;
-  if (activeItem && isSameInstallItem(activeItem, item)) return true;
-  return response.items.some((queuedItem) => isSameInstallItem(installItemFromQueuedViewModel(queuedItem), item));
+export async function removeQueuedInstall(queueId: string): Promise<void> {
+  const item = downloadQueue.value.items.find((candidate) => candidate.queue_id === queueId);
+  if (!item || item.remove_action.action !== 'remove_from_queue' || item.remove_action.enabled !== true) return;
+  try {
+    const response = installQueueStateResponse(await api('DELETE', '/install/queue/' + encodeURIComponent(queueId)));
+    await applyInstallQueueResponse(response, { showNotice: true, connectActive: true });
+  } catch (error: unknown) {
+    showError('Install queue update failed: ' + errMessage(error));
+    await reconcileUncertainMutation();
+  }
 }
 
 async function enqueueBackendInstallItem(
   item: InstallItem,
-  options: { retry?: boolean } = {},
+  options: { retry?: boolean; expectedInstallId?: string } = {},
 ): Promise<InstallQueueStateResponse> {
-  const response = await api<InstallQueueStateResponse>(
-    'POST',
-    options.retry ? '/install/queue/retry' : '/install/queue',
-    installQueueRequestFromItem(item),
-  );
-  await applyInstallQueueResponse(response, { showNotice: true, connectActive: true });
-  if (installQueueResponseContainsItem(response, item)) clearDownloadFailureForItem(item);
-  return response;
+  const request = installQueueRequestFromItem(item);
+  const path = (options.retry ? '/install/queue/retry' : '/install/queue') +
+    (options.expectedInstallId ? '?expected_install_id=' + encodeURIComponent(options.expectedInstallId) : '');
+  try {
+    const response = installQueueStateResponse(
+      await api('POST', path, request),
+    );
+    await applyInstallQueueResponse(response, { showNotice: true, connectActive: true });
+    return response;
+  } catch (error: unknown) {
+    await reconcileUncertainMutation();
+    throw error;
+  }
 }
 
-function showInstallQueueError(err: unknown): void {
-  showError(`Install queue failed: ${errMessage(err)}`);
+async function reconcileUncertainMutation(): Promise<void> {
+  // A lost response is resolved by an authoritative read, never mutation replay.
+  await refreshInstallQueue({ connectActive: true }).catch(showInstallQueueError);
 }
 
-async function onInstallDone(completedItem?: InstallItem): Promise<void> {
-  connectedInstallId = null;
-  completeActiveDownload();
-  if (completedItem) clearDownloadFailureForItem(completedItem);
-  if (completedItem?.content) markContentChanged();
-
-  try {
-    const [versionsRes, instancesRes] = await Promise.all([api('GET', '/versions'), api('GET', '/instances')]);
-    if (versionsRes.error) throw new Error(versionsRes.error);
-    if (instancesRes.error) throw new Error(instancesRes.error);
-    const nextVersions = versionsRes.versions || [];
-    versions.value = nextVersions;
-    instances.value = instancesRes.instances || [];
-    lastInstanceId.value = instancesRes.last_instance_id || null;
-
-    if (catalog.value) {
-      const installed = new Set<string>(
-        nextVersions
-          .filter((version: { launchable: boolean }) => version.launchable)
-          .map((version: { id: string }) => version.id),
-      );
-      catalog.value = {
-        ...catalog.value,
-        versions: catalog.value.versions.map((version) => ({
-          ...version,
-          installed: installed.has(version.id),
-        })),
-      };
-    }
-  } catch (err: unknown) {
-    showError(`Install completed, but failed to refresh launcher state: ${errMessage(err)}`);
-  }
-
-  try {
-    await refreshInstallQueue({ connectActive: true });
-  } catch (err: unknown) {
-    showError(`Install queue refresh failed: ${errMessage(err)}`);
-  }
+function showInstallQueueError(error: unknown): void {
+  showError('Install queue failed: ' + errMessage(error));
 }

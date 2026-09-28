@@ -1,86 +1,242 @@
 pub mod api;
-pub mod artifacts;
+mod bound_processors;
 mod compose;
 mod forge_installer;
 mod http;
 pub mod index;
-pub mod legacy;
-mod processors;
+mod install_flight;
 pub mod providers;
-pub mod strategies;
+mod source;
+mod strategies;
 pub mod types;
 pub mod workspace;
 
-pub use api::{build_id_for, installed_version_id_for, loader_components, parse_build_id};
+pub use api::{
+    MaterializedLoaderProfile, build_id_for, installed_version_id_for,
+    is_canonical_installed_loader_id, loader_components, parse_build_id,
+    validate_materialized_loader_profile,
+};
+pub(crate) use bound_processors::VerifiedProcessorOutputs;
+pub use compose::{LoaderProfileFragment, compose_loader_version};
+#[cfg(test)]
+pub(crate) use forge_installer::ProcessorDerivation;
+pub(crate) use forge_installer::{
+    AuthenticatedEmbeddedMavenArtifact, AuthenticatedInstallerLibraryInputs,
+    AuthenticatedInstallerLibraryParts, AuthenticatedInstallerReceiptInput,
+    BoundForgeInstallExecution, BoundProcessorOutputExpectation, PendingForgeInstallExecution,
+    PendingForgeNetworkInstall, PendingForgeReconstructionSources, VerifiedInstallerClientBytes,
+    VerifiedInstallerReceiptSource,
+};
 pub use index::{
     fetch_builds, fetch_cached_builds, fetch_components, fetch_supported_versions,
-    resolve_build_record,
+    resolve_build_record_for_install,
+};
+#[cfg(feature = "test-support")]
+pub use index::{
+    persist_loader_build_cache_fixture_for_test,
+    persist_loader_supported_versions_cache_fixture_for_test,
+};
+pub(crate) use strategies::{
+    AuthenticatedInstallerReconstructionAuthority, AuthenticatedLegacyOverlayAuthority,
 };
 pub use types::{
-    LOADER_CATALOG_SCHEMA_VERSION, LoaderArtifactKind, LoaderAvailability, LoaderBuildId,
-    LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState, LoaderComponentId,
-    LoaderComponentRecord, LoaderError, LoaderGameVersion, LoaderInstallFailureKind,
-    LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
+    LOADER_CATALOG_SCHEMA_VERSION, LoaderActiveInstallFailure, LoaderArtifactKind,
+    LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord,
+    LoaderBuildSubjectKind, LoaderCatalogState, LoaderComponentId, LoaderComponentRecord,
+    LoaderError, LoaderGameVersion, LoaderInstallBaseActivationError,
+    LoaderInstallBaseCheckpointVerificationFailure, LoaderInstallBaseCommit,
+    LoaderInstallBaseCommitVerificationFailure, LoaderInstallBaseContinuation,
+    LoaderInstallContinuation, LoaderInstallError, LoaderInstallFailureKind, LoaderInstallPlan,
+    LoaderInstallPublicationOutcome, LoaderInstallPublicationRecovery, LoaderInstallSource,
+    LoaderInstallStrategy, LoaderInstallability, LoaderPreOperationFailureKind,
     LoaderProviderFailureKind, LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource,
     LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
+    VerifiedLoaderInstallBaseCheckpoint, VerifiedLoaderInstallBaseCommit,
 };
 
 use crate::download::DownloadProgress;
-use crate::paths::loader_work_dir;
-use std::fs;
-use std::path::{Component, Path};
+use crate::known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
+use crate::managed_fs::ManagedLibraryOperation;
+use crate::portable_path::{MAX_PORTABLE_FILE_NAME_BYTES, PortableFileName};
+use crate::runtime::ManagedRuntimeCache;
+pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_PORTABLE_FILE_NAME_BYTES - ".json".len();
 
-pub async fn install_build<F>(
-    library_dir: &Path,
+pub fn install_build<'a, F>(
+    library_root: &'a ManagedLibraryOperation,
+    runtime_cache: ManagedRuntimeCache,
     record: LoaderBuildRecord,
     send: F,
-) -> Result<String, LoaderError>
+) -> impl std::future::Future<Output = Result<LoaderInstallPublicationOutcome, LoaderInstallError>> + 'a
+where
+    F: FnMut(DownloadProgress) + 'a,
+{
+    Box::pin(async move {
+        api::validate_loader_build_record_identity(&record).map_err(LoaderInstallError::from)?;
+        validate_version_id(&record.version_id, "loader build version id")
+            .map_err(LoaderInstallError::from)?;
+        let install_flight = install_flight::acquire(library_root, &record.version_id)
+            .await
+            .map_err(LoaderInstallError::from)?;
+        let live_record = resolve_build_record_for_install(record.component_id, &record.build_id)
+            .await
+            .map_err(LoaderInstallError::from)?;
+        let record = require_exact_live_build_record(&record, live_record)
+            .map_err(LoaderInstallError::from)?;
+        let plan = LoaderInstallPlan { record };
+        install_flight
+            .revalidate()
+            .map_err(LoaderInstallError::from)?;
+        Box::pin(strategies::install_build(
+            library_root,
+            &runtime_cache,
+            plan,
+            send,
+        ))
+        .await
+        .map(LoaderInstallPublicationOutcome::BaseCommitted)
+        .map_err(LoaderInstallError::from)
+    })
+}
+
+pub fn resume_install_build_after_base(
+    installed_version_id: &str,
+    base_receipt: KnownGoodReconstructionReceipt,
+) -> Result<LoaderInstallBaseCommit, LoaderError> {
+    let plan = api::loader_reconstruction_plan(installed_version_id)?;
+    if base_receipt.version_id() != plan.record.minecraft_version {
+        return Err(LoaderError::Verify(
+            "reconstructed base receipt does not match the installed loader identity".to_string(),
+        ));
+    }
+    Ok(LoaderInstallBaseCommit::new(
+        base_receipt.into_loader_install_receipt(),
+        LoaderInstallContinuation::new(plan),
+    ))
+}
+
+pub async fn continue_install_build_after_base<F>(
+    library_root: &ManagedLibraryOperation,
+    continuation: LoaderInstallBaseContinuation,
+    send: F,
+) -> Result<KnownGoodInstallReceipt, LoaderInstallError>
+where
+    F: FnMut(DownloadProgress) + Send + 'static,
+{
+    continue_install_build_after_base_owned(library_root, continuation, send).await
+}
+
+async fn continue_install_build_after_base_owned<F>(
+    library_root: &ManagedLibraryOperation,
+    continuation: LoaderInstallBaseContinuation,
+    send: F,
+) -> Result<KnownGoodInstallReceipt, LoaderInstallError>
 where
     F: FnMut(DownloadProgress),
 {
-    validate_version_id(&record.version_id, "loader build version id")?;
-    let stage_dir = loader_work_dir(library_dir).join(&record.version_id);
-    if stage_dir.exists() {
-        let _ = fs::remove_dir_all(&stage_dir);
+    api::validate_loader_build_record_identity(&continuation.plan().record)
+        .map_err(LoaderInstallError::from)?;
+    validate_version_id(
+        &continuation.plan().record.version_id,
+        "loader build version id",
+    )
+    .map_err(LoaderInstallError::from)?;
+    if continuation.base_version_id() != continuation.plan().record.minecraft_version.as_str() {
+        return Err(LoaderInstallError::from(LoaderError::Verify(
+            "recovered base receipt does not match the retained loader plan".to_string(),
+        )));
     }
-    fs::create_dir_all(&stage_dir)?;
+    let install_flight =
+        install_flight::acquire(library_root, &continuation.plan().record.version_id)
+            .await
+            .map_err(LoaderInstallError::from)?;
+    install_flight
+        .revalidate()
+        .map_err(LoaderInstallError::from)?;
+    let (base_derivation, continuation) = continuation.into_parts();
+    strategies::continue_install_build_after_base(library_root, base_derivation, continuation, send)
+        .await
+        .map_err(LoaderInstallError::from)
+}
 
-    let plan = LoaderInstallPlan { record, stage_dir };
-    let result = Box::pin(strategies::install_build(library_dir, &plan, send)).await;
-    let _ = fs::remove_dir_all(&plan.stage_dir);
-    result
+pub(crate) async fn reconstruct_build(
+    installed_version_id: &str,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    let plan = api::loader_reconstruction_plan(installed_version_id)?;
+    strategies::reconstruct_build(&plan).await
+}
+
+pub(crate) async fn reconstruct_managed_component(
+    installed_version_id: &str,
+    context: &crate::download::ManagedReconstructionContext,
+) -> Result<crate::known_good::RetainedKnownGoodReconstruction, LoaderError> {
+    let plan = api::loader_reconstruction_plan(installed_version_id)?;
+    strategies::reconstruct_managed_component(&plan, context).await
+}
+
+fn require_exact_live_build_record(
+    requested: &LoaderBuildRecord,
+    live: LoaderBuildRecord,
+) -> Result<LoaderBuildRecord, LoaderError> {
+    if requested != &live {
+        return Err(LoaderError::InvalidProfile(
+            "requested loader build does not match live provider authority".to_string(),
+        ));
+    }
+    Ok(live)
 }
 
 pub(crate) fn validate_version_id(version_id: &str, context: &str) -> Result<(), LoaderError> {
+    validate_version_id_shape(version_id, context).map_err(LoaderError::InstallExecutionFailed)
+}
+
+pub(crate) fn validate_provider_version_id(
+    version_id: &str,
+    context: &str,
+) -> Result<(), LoaderError> {
+    validate_version_id_shape(version_id, context).map_err(LoaderError::InvalidProfile)
+}
+
+fn validate_version_id_shape(version_id: &str, context: &str) -> Result<(), String> {
     let trimmed = version_id.trim();
     if trimmed.is_empty() {
-        return Err(LoaderError::Other(format!("{context} is empty")));
+        return Err(format!("{context} is empty"));
     }
     if version_id != trimmed {
-        return Err(LoaderError::Other(format!(
-            "{context} contains surrounding whitespace"
-        )));
+        return Err(format!("{context} contains surrounding whitespace"));
     }
-    if trimmed.contains(['/', '\\']) {
-        return Err(LoaderError::Other(format!(
-            "{context} contains path separators"
-        )));
+    if version_id.len() > MAX_VERSION_ID_BYTES {
+        return Err(format!("{context} is too long"));
     }
-    let mut components = Path::new(trimmed).components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-        return Err(LoaderError::Other(format!("{context} is invalid")));
+    let portable = PortableFileName::new_exact(version_id);
+    let json_name = format!("{version_id}.json");
+    if portable.is_err() || PortableFileName::new_exact(&json_name).is_err() {
+        return Err(format!("{context} is not a portable path segment"));
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_version_id;
+    use super::{
+        LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderComponentId, LoaderError,
+        LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, MAX_VERSION_ID_BYTES,
+        build_id_for, install_build, installed_version_id_for, reconstruct_build,
+        require_exact_live_build_record, validate_version_id,
+    };
+    use crate::ManagedRuntimeCache;
+    use crate::loaders::types::LoaderBuildSubjectKind;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn rejects_empty_version_ids() {
         let error = validate_version_id(" \t ", "loader build version id").expect_err("error");
-        assert_eq!(error.to_string(), "loader build version id is empty");
+        assert!(matches!(
+            error,
+            LoaderError::InstallExecutionFailed(message)
+                if message == "loader build version id is empty"
+        ));
     }
 
     #[test]
@@ -100,9 +256,150 @@ mod tests {
     fn rejects_whitespace_padded_version_ids() {
         let error =
             validate_version_id(" loader-id ", "loader build version id").expect_err("error");
-        assert_eq!(
-            error.to_string(),
-            "loader build version id contains surrounding whitespace"
+        assert!(matches!(
+            error,
+            LoaderError::InstallExecutionFailed(message)
+                if message == "loader build version id contains surrounding whitespace"
+        ));
+    }
+
+    #[test]
+    fn rejects_ids_whose_json_filename_exceeds_known_good_segment_limit() {
+        let version_id = "a".repeat(MAX_VERSION_ID_BYTES + 1);
+        let error =
+            validate_version_id(&version_id, "loader build version id").expect_err("oversized id");
+
+        assert!(error.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn rejects_noncanonical_and_windows_reserved_version_ids() {
+        for version_id in ["cafe\u{301}", "CON", "COM1.release", "bad*id"] {
+            assert!(
+                validate_version_id(version_id, "loader build version id").is_err(),
+                "accepted {version_id:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn install_rejects_noncanonical_identity_before_creating_workspace() {
+        let root = temp_library("noncanonical-install-identity");
+        let component_id = LoaderComponentId::Fabric;
+        let version_id = installed_version_id_for(component_id, "1.21.5", "0.16.14")
+            .expect("canonical installed version id");
+        let mut build_id = build_id_for(component_id, "1.21.5", "0.16.14");
+        build_id.push('A');
+        let record = LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+            component_id,
+            component_name: component_id.display_name().to_string(),
+            build_id,
+            minecraft_version: "1.21.5".to_string(),
+            loader_version: "0.16.14".to_string(),
+            version_id,
+            build_meta: LoaderBuildMetadata::default(),
+            strategy: LoaderInstallStrategy::FabricProfile,
+            artifact_kind: LoaderArtifactKind::ProfileJson,
+            installability: LoaderInstallability::Installable,
+            install_source: LoaderInstallSource::ProfileJson {
+                url: "https://example.invalid/profile.json".to_string(),
+            },
+        };
+
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(&root)
+            .expect("managed library root");
+        let operation = managed_root
+            .try_acquire()
+            .expect("managed library operation");
+        install_build(&operation, runtime_cache, record, |_| {})
+            .await
+            .expect_err("noncanonical identity");
+
+        drop((operation, managed_root));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reconstruction_rejects_unsupported_strategies_before_effects() {
+        let sentinel_root = temp_library("unsupported-reconstruction-strategy");
+        let sentinel = sentinel_root.join("untouched");
+        fs::create_dir_all(&sentinel_root).expect("sentinel root");
+        fs::write(&sentinel, b"untouched").expect("sentinel");
+
+        for (component, loader_version) in [
+            (LoaderComponentId::Forge, "55.0.0"),
+            (LoaderComponentId::NeoForge, "21.5.74"),
+        ] {
+            let unsupported = installed_version_id_for(component, "1.21.5", loader_version)
+                .expect("canonical unsupported identity");
+            let Err(_) = reconstruct_build(&unsupported).await else {
+                panic!("unsupported reconstruction strategy");
+            };
+            assert_eq!(fs::read(&sentinel).expect("sentinel remains"), b"untouched");
+            assert_eq!(
+                fs::read_dir(&sentinel_root).expect("sentinel root").count(),
+                1
+            );
+        }
+
+        let _ = fs::remove_dir_all(sentinel_root);
+    }
+
+    #[test]
+    fn live_build_gate_rejects_canonical_records_with_caller_mutations() {
+        let component_id = LoaderComponentId::Fabric;
+        let loader_version = "0.16.14";
+        let minecraft_version = "1.21.5";
+        let live = LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+            component_id,
+            component_name: component_id.display_name().to_string(),
+            build_id: super::build_id_for(component_id, minecraft_version, loader_version),
+            minecraft_version: minecraft_version.to_string(),
+            loader_version: loader_version.to_string(),
+            version_id: installed_version_id_for(component_id, minecraft_version, loader_version)
+                .expect("canonical installed version id"),
+            build_meta: LoaderBuildMetadata::default(),
+            strategy: LoaderInstallStrategy::FabricProfile,
+            artifact_kind: LoaderArtifactKind::ProfileJson,
+            installability: LoaderInstallability::Installable,
+            install_source: LoaderInstallSource::ProfileJson {
+                url: "https://meta.fabricmc.net/official-profile.json".to_string(),
+            },
+        };
+
+        let mut attacker_source = live.clone();
+        attacker_source.install_source = LoaderInstallSource::ProfileJson {
+            url: "https://attacker.invalid/profile.json".to_string(),
+        };
+        assert!(
+            require_exact_live_build_record(&attacker_source, live.clone()).is_err(),
+            "caller-selected source must not mint install authority"
         );
+
+        let mut mutated_metadata = live.clone();
+        mutated_metadata.component_name = "Caller Fabric".to_string();
+        assert!(
+            require_exact_live_build_record(&mutated_metadata, live.clone()).is_err(),
+            "all caller-supplied record fields must match live authority"
+        );
+
+        assert_eq!(
+            require_exact_live_build_record(&live, live.clone()).expect("exact live record"),
+            live
+        );
+    }
+
+    fn temp_library(name: &str) -> PathBuf {
+        crate::test_temp_root().join(format!(
+            "axial-loader-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
     }
 }

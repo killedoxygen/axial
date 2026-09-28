@@ -27,3 +27,5 @@ import './views/discover/discover.css';
 import './views/settings/settings.css';
 import './views/accounts/accounts.css';
 import './views/views.css';
+import './ui/download-failure-notice.css';
+import './views/downloads/downloads.css';

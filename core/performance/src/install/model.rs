@@ -1,4 +1,3 @@
-use crate::modrinth::ModrinthError;
 use crate::rules_cache::RulesCacheStatus;
 use crate::signature::{RulesSignatureError, RulesSignatureMetadata};
 use crate::state::StateError;
@@ -13,20 +12,10 @@ pub enum InstallError {
     Manifest(#[from] crate::resolve::ResolveError),
     #[error("failed to access performance state: {0}")]
     State(#[from] StateError),
-    #[error("modrinth error: {0}")]
-    Modrinth(#[from] ModrinthError),
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("composition plan is required")]
-    MissingPlan,
-    #[error("no compatible versions found for {0}")]
-    NoCompatibleVersion(String),
-    #[error("no downloadable file for {0}")]
-    NoPrimaryFile(String),
-    #[error("mod filename is invalid: {0}")]
-    InvalidFilename(String),
-    #[error("managed artifact target already exists: {0}")]
-    ManagedArtifactTargetExists(String),
+    #[error("managed artifact transfer failed")]
+    Transfer,
     #[error("no performance rollback snapshot available")]
     NoRollbackSnapshot,
     #[error("performance rollback snapshot not found")]
@@ -65,7 +54,19 @@ pub(super) struct ActiveRules {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct RemoteRulesCandidate {
+pub struct RemoteRulesCandidate {
     pub(super) manifest: crate::types::Manifest,
     pub(super) signature: RulesSignatureMetadata,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedRemoteRules {
+    pub(super) active: ActiveRules,
+    pub(super) snapshot: crate::rules_cache::RulesCacheSnapshot,
+}
+
+impl VerifiedRemoteRules {
+    pub fn snapshot(&self) -> &crate::rules_cache::RulesCacheSnapshot {
+        &self.snapshot
+    }
 }

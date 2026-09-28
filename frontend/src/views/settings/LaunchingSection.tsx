@@ -1,5 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
+import { setConfig } from '../../actions';
 import { Toggle } from '../../ui/Atoms';
 import { SelectField } from '../../ui/Select';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
@@ -7,8 +8,7 @@ import { MemoryField, recommendedHeapRange } from '../../ui/MemoryField';
 import { WindowField } from '../../ui/WindowField';
 import { JavaPathField } from '../../ui/RuntimeFields';
 import { useJvmPresets, jvmPresetSelectLabel, normalizeJvmPreset } from '../../hooks/use-jvm-presets';
-import { useAutoSave } from '../../hooks/use-autosave';
-import { api } from '../../api';
+import { saveConfigPatch, useAutoSave } from '../../hooks/use-autosave';
 import { config, systemInfo } from '../../store';
 import { fmtMem } from '../../format';
 import type { Config } from '../../types-settings';
@@ -20,10 +20,8 @@ export function LaunchingSection(): JSX.Element {
   const [recMin, recMax] = recommendedHeapRange(totalGb);
 
   const { commit } = useAutoSave<Config & { error?: string }>({
-    send: (patch) => api('PUT', '/config', patch),
-    apply: (res) => {
-      config.value = res;
-    },
+    send: saveConfigPatch,
+    apply: setConfig,
     errorLabel: 'settings',
   });
 
@@ -41,9 +39,15 @@ export function LaunchingSection(): JSX.Element {
   useEffect(() => {
     setMinGb(savedMinGb);
     setMaxGb(savedMaxGb);
+  }, [savedMinGb, savedMaxGb]);
+
+  useEffect(() => {
     setJavaPath(savedJavaPath);
+  }, [savedJavaPath]);
+
+  useEffect(() => {
     setDiscordOn(savedDiscord);
-  }, [savedMinGb, savedMaxGb, savedJavaPath, savedDiscord]);
+  }, [savedDiscord]);
 
   const width = cfg?.window_width && cfg.window_width > 0 ? cfg.window_width : 854;
   const height = cfg?.window_height && cfg.window_height > 0 ? cfg.window_height : 480;

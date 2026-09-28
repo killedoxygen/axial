@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-app-reset"
+description = "Enables the app_reset command without any pre-configured scope."
+commands.allow = ["app_reset"]
+
+[[permission]]
+identifier = "deny-app-reset"
+description = "Denies the app_reset command without any pre-configured scope."
+commands.deny = ["app_reset"]

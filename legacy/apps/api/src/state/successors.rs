@@ -1,0 +1,662 @@
+use crate::execution::anchored_record::AnchoredRecordTarget;
+use crate::state::benchmark_suite_drivers::is_safe_driver_id;
+use crate::state::benchmark_suites::is_canonical_suite_id;
+use crate::state::launch_reports::canonical_session_id;
+use axial_config::is_canonical_instance_id;
+use axial_fs::RootStateSuccessor;
+use axial_performance::PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER;
+use std::collections::BTreeSet;
+use std::io;
+
+const SNAPSHOT_SUCCESSOR_SCHEMA: u16 = 1;
+const PERFORMANCE_COMPOSITION_STATE_LEAF: &str = ".axial-lock.json";
+const SAVED_SKIN_INDEX_SUCCESSOR_OWNER: &[u8] = b"saved-skin-index";
+const SAVED_SKIN_INDEX_SUCCESSOR_PARENT: &[&str] = &["skins"];
+const SAVED_SKIN_INDEX_SUCCESSOR_LEAF: &str = "index.json";
+const LAUNCH_REPORT_SUCCESSOR_OWNER: &[u8] = b"launch-report";
+const LAUNCH_REPORT_SUCCESSOR_PARENT: &[&str] = &["benchmarks", "launch"];
+const BENCHMARK_SUITE_SUCCESSOR_OWNER: &[u8] = b"benchmark-suite";
+const BENCHMARK_SUITE_SUCCESSOR_PARENT: &[&str] = &["benchmarks", "suites"];
+const BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER: &[u8] = b"benchmark-suite-driver";
+const BENCHMARK_SUITE_DRIVER_SUCCESSOR_PARENT: &[&str] = &["benchmarks", "suite-drivers"];
+
+#[derive(Clone, Copy)]
+pub(super) struct StateSnapshotSuccessorSpec {
+    owner_id: &'static [u8],
+    parent: &'static [&'static str],
+    leaf: &'static str,
+}
+
+impl StateSnapshotSuccessorSpec {
+    pub(super) fn bind(self, target: AnchoredRecordTarget) -> io::Result<AnchoredRecordTarget> {
+        target.with_state_successor(SNAPSHOT_SUCCESSOR_SCHEMA, self.owner_id)
+    }
+}
+
+pub(super) fn bind_launch_report_successor(
+    target: AnchoredRecordTarget,
+) -> io::Result<AnchoredRecordTarget> {
+    target.with_state_successor(SNAPSHOT_SUCCESSOR_SCHEMA, LAUNCH_REPORT_SUCCESSOR_OWNER)
+}
+
+pub(super) fn bind_benchmark_suite_successor(
+    target: AnchoredRecordTarget,
+) -> io::Result<AnchoredRecordTarget> {
+    target.with_state_successor(SNAPSHOT_SUCCESSOR_SCHEMA, BENCHMARK_SUITE_SUCCESSOR_OWNER)
+}
+
+pub(super) fn bind_benchmark_suite_driver_successor(
+    target: AnchoredRecordTarget,
+) -> io::Result<AnchoredRecordTarget> {
+    target.with_state_successor(
+        SNAPSHOT_SUCCESSOR_SCHEMA,
+        BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+    )
+}
+
+pub(super) fn bind_saved_skin_index_successor(
+    target: AnchoredRecordTarget,
+) -> io::Result<AnchoredRecordTarget> {
+    target.with_state_successor(SNAPSHOT_SUCCESSOR_SCHEMA, SAVED_SKIN_INDEX_SUCCESSOR_OWNER)
+}
+
+pub(super) const ACCOUNT_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"launcher-accounts",
+        parent: &[],
+        leaf: "accounts.json",
+    };
+pub(super) const CONFIG_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"config",
+        parent: &[],
+        leaf: "config.json",
+    };
+pub(super) const INSTANCE_REGISTRY_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"instance-registry",
+        parent: &[],
+        leaf: "instances.json",
+    };
+pub(super) const FAILURE_MEMORY_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"guardian-failure-memory",
+        parent: &["guardian"],
+        leaf: "failure-memory.json",
+    };
+pub(super) const OPERATION_JOURNAL_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"operation-journals",
+        parent: &["state"],
+        leaf: "operation-journals.json",
+    };
+pub(super) const PERFORMANCE_RULES_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"performance-rules",
+        parent: &["performance"],
+        leaf: "rules-cache.json",
+    };
+pub(super) const REJECTION_STREAK_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"persisted-state-rejection-streaks",
+        parent: &["state"],
+        leaf: "persisted-state-rejection-streaks.json",
+    };
+pub(super) const USER_MOD_WITNESS_SNAPSHOT_SUCCESSOR: StateSnapshotSuccessorSpec =
+    StateSnapshotSuccessorSpec {
+        owner_id: b"guardian-user-mod-witnesses",
+        parent: &[],
+        leaf: "guardian-user-mod-witnesses.json",
+    };
+
+const STARTUP_SNAPSHOT_SUCCESSORS: [StateSnapshotSuccessorSpec; 8] = [
+    ACCOUNT_SNAPSHOT_SUCCESSOR,
+    CONFIG_SNAPSHOT_SUCCESSOR,
+    FAILURE_MEMORY_SNAPSHOT_SUCCESSOR,
+    INSTANCE_REGISTRY_SUCCESSOR,
+    OPERATION_JOURNAL_SUCCESSOR,
+    PERFORMANCE_RULES_SNAPSHOT_SUCCESSOR,
+    REJECTION_STREAK_SNAPSHOT_SUCCESSOR,
+    USER_MOD_WITNESS_SNAPSHOT_SUCCESSOR,
+];
+
+pub(crate) fn admit_startup_state_successor(successor: &RootStateSuccessor) -> io::Result<()> {
+    let admitted = admits_performance_composition_state(
+        successor.owner_schema(),
+        successor.owner_id(),
+        successor.recovery_count(),
+        |index| successor.recovery_destination(index),
+    ) || admits_saved_skin_index(
+        successor.owner_schema(),
+        successor.owner_id(),
+        successor.recovery_count(),
+        |index| successor.recovery_destination(index),
+    ) || admits_launch_report_batch(
+        successor.owner_schema(),
+        successor.owner_id(),
+        successor.recovery_count(),
+        |index| successor.recovery_destination(index),
+    ) || admits_benchmark_suite_batch(
+        successor.owner_schema(),
+        successor.owner_id(),
+        successor.recovery_count(),
+        |index| successor.recovery_destination(index),
+    ) || admits_benchmark_suite_driver_batch(
+        successor.owner_schema(),
+        successor.owner_id(),
+        successor.recovery_count(),
+        |index| successor.recovery_destination(index),
+    ) || successor
+        .recovery_destination(0)
+        .as_ref()
+        .is_some_and(|(parent, leaf)| {
+            matching_spec(
+                successor.owner_schema(),
+                successor.owner_id(),
+                successor.recovery_count(),
+                parent,
+                leaf,
+            )
+            .is_some()
+        });
+    admitted.then_some(()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "State successor does not describe an admitted startup record",
+        )
+    })
+}
+
+fn admits_saved_skin_index<'a>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+) -> bool {
+    owner_schema == SNAPSHOT_SUCCESSOR_SCHEMA
+        && owner_id == SAVED_SKIN_INDEX_SUCCESSOR_OWNER
+        && count == 1
+        && destination(0).is_some_and(|(parent, leaf)| {
+            parent == SAVED_SKIN_INDEX_SUCCESSOR_PARENT && leaf == SAVED_SKIN_INDEX_SUCCESSOR_LEAF
+        })
+}
+
+fn admits_performance_composition_state<'a>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+) -> bool {
+    if owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA
+        || owner_id != PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER
+        || count != 1
+    {
+        return false;
+    }
+    destination(0).is_some_and(|(parent, leaf)| {
+        matches!(parent.as_slice(), ["instances", instance_id, "mods"]
+            if is_canonical_instance_id(instance_id))
+            && leaf == PERFORMANCE_COMPOSITION_STATE_LEAF
+    })
+}
+
+fn admits_launch_report_batch<'a>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+) -> bool {
+    admits_dynamic_batch(
+        owner_schema,
+        owner_id,
+        count,
+        &mut destination,
+        LAUNCH_REPORT_SUCCESSOR_OWNER,
+        LAUNCH_REPORT_SUCCESSOR_PARENT,
+        launch_report_session_from_leaf,
+    )
+}
+
+fn launch_report_session_from_leaf(leaf: &str) -> Option<&str> {
+    let session = leaf.strip_suffix(".json")?;
+    canonical_session_id(session).then_some(session)
+}
+
+fn admits_benchmark_suite_batch<'a>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+) -> bool {
+    admits_dynamic_batch(
+        owner_schema,
+        owner_id,
+        count,
+        &mut destination,
+        BENCHMARK_SUITE_SUCCESSOR_OWNER,
+        BENCHMARK_SUITE_SUCCESSOR_PARENT,
+        benchmark_suite_from_leaf,
+    )
+}
+
+fn benchmark_suite_from_leaf(leaf: &str) -> Option<&str> {
+    let suite_id = leaf.strip_suffix(".json")?;
+    is_canonical_suite_id(suite_id).then_some(suite_id)
+}
+
+fn admits_benchmark_suite_driver_batch<'a>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    mut destination: impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+) -> bool {
+    admits_dynamic_batch(
+        owner_schema,
+        owner_id,
+        count,
+        &mut destination,
+        BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+        BENCHMARK_SUITE_DRIVER_SUCCESSOR_PARENT,
+        benchmark_suite_driver_from_leaf,
+    )
+}
+
+fn benchmark_suite_driver_from_leaf(leaf: &str) -> Option<&str> {
+    let driver_id = leaf.strip_suffix(".json")?;
+    is_safe_driver_id(driver_id).then_some(driver_id)
+}
+
+fn admits_dynamic_batch<'a, T: Ord>(
+    owner_schema: u16,
+    owner_id: &[u8],
+    count: usize,
+    destination: &mut impl FnMut(usize) -> Option<(Vec<&'a str>, &'a str)>,
+    admitted_owner: &[u8],
+    admitted_parent: &[&str],
+    mut leaf_id: impl FnMut(&'a str) -> Option<T>,
+) -> bool {
+    if owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA
+        || owner_id != admitted_owner
+        || !(1..=32).contains(&count)
+    {
+        return false;
+    }
+    let mut identities = BTreeSet::new();
+    (0..count).all(|index| {
+        let Some((parent, leaf)) = destination(index) else {
+            return false;
+        };
+        parent == admitted_parent
+            && leaf_id(leaf).is_some_and(|identity| identities.insert(identity))
+    })
+}
+
+fn matching_spec(
+    owner_schema: u16,
+    owner_id: &[u8],
+    recovery_count: usize,
+    parent: &[&str],
+    leaf: &str,
+) -> Option<StateSnapshotSuccessorSpec> {
+    if owner_schema != SNAPSHOT_SUCCESSOR_SCHEMA || recovery_count != 1 {
+        return None;
+    }
+    let mut matches = STARTUP_SNAPSHOT_SUCCESSORS
+        .iter()
+        .copied()
+        .filter(|spec| spec.owner_id == owner_id && spec.parent == parent && spec.leaf == leaf);
+    let admitted = matches.next()?;
+    matches.next().is_none().then_some(admitted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER, BENCHMARK_SUITE_SUCCESSOR_OWNER,
+        LAUNCH_REPORT_SUCCESSOR_OWNER, PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+        SAVED_SKIN_INDEX_SUCCESSOR_OWNER, admits_benchmark_suite_batch,
+        admits_benchmark_suite_driver_batch, admits_launch_report_batch,
+        admits_performance_composition_state, admits_saved_skin_index,
+        benchmark_suite_driver_from_leaf, benchmark_suite_from_leaf,
+        launch_report_session_from_leaf, matching_spec,
+    };
+
+    #[test]
+    fn startup_successor_registry_is_exact_and_closed() {
+        for (owner, parent, leaf) in [
+            (b"launcher-accounts".as_slice(), &[][..], "accounts.json"),
+            (b"config".as_slice(), &[][..], "config.json"),
+            (
+                b"guardian-failure-memory".as_slice(),
+                &["guardian"][..],
+                "failure-memory.json",
+            ),
+            (b"instance-registry".as_slice(), &[][..], "instances.json"),
+            (
+                b"operation-journals".as_slice(),
+                &["state"][..],
+                "operation-journals.json",
+            ),
+            (
+                b"performance-rules".as_slice(),
+                &["performance"][..],
+                "rules-cache.json",
+            ),
+            (
+                b"persisted-state-rejection-streaks".as_slice(),
+                &["state"][..],
+                "persisted-state-rejection-streaks.json",
+            ),
+            (
+                b"guardian-user-mod-witnesses".as_slice(),
+                &[][..],
+                "guardian-user-mod-witnesses.json",
+            ),
+        ] {
+            assert!(matching_spec(1, owner, 1, parent, leaf).is_some());
+            assert!(matching_spec(2, owner, 1, parent, leaf).is_none());
+            assert!(matching_spec(1, owner, 2, parent, leaf).is_none());
+            assert!(matching_spec(1, owner, 1, parent, "other.json").is_none());
+        }
+        assert!(matching_spec(1, b"config", 1, &["state"], "config.json").is_none());
+        assert!(matching_spec(1, b"unknown", 1, &[], "config.json").is_none());
+    }
+
+    #[test]
+    fn performance_composition_state_successor_is_exact_and_singleton() {
+        let admitted = |schema, owner: &[u8], count, parent: &[&str], leaf: &str| {
+            admits_performance_composition_state(schema, owner, count, |index| {
+                (index == 0).then(|| (parent.to_vec(), leaf))
+            })
+        };
+        let parent = ["instances", "0123456789abcdef", "mods"];
+        assert!(admitted(
+            1,
+            PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+            1,
+            &parent,
+            ".axial-lock.json",
+        ));
+        for (schema, owner, count, parent, leaf) in [
+            (
+                2,
+                PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+                1,
+                &parent[..],
+                ".axial-lock.json",
+            ),
+            (1, b"other".as_slice(), 1, &parent[..], ".axial-lock.json"),
+            (
+                1,
+                PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+                2,
+                &parent[..],
+                ".axial-lock.json",
+            ),
+            (
+                1,
+                PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+                1,
+                &["instances", "0123456789ABCDEf", "mods"][..],
+                ".axial-lock.json",
+            ),
+            (
+                1,
+                PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+                1,
+                &["instances", "0123456789abcdef", "config"][..],
+                ".axial-lock.json",
+            ),
+            (
+                1,
+                PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
+                1,
+                &parent[..],
+                ".axial-lock.json.tmp",
+            ),
+        ] {
+            assert!(!admitted(schema, owner, count, parent, leaf));
+        }
+    }
+
+    #[test]
+    fn saved_skin_index_successor_is_exact_and_singleton() {
+        let admitted = |schema, owner: &[u8], count, parent: &[&str], leaf: &str| {
+            admits_saved_skin_index(schema, owner, count, |index| {
+                (index == 0).then(|| (parent.to_vec(), leaf))
+            })
+        };
+        assert!(admitted(
+            1,
+            SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
+            1,
+            &["skins"],
+            "index.json",
+        ));
+        for (schema, owner, count, parent, leaf) in [
+            (
+                2,
+                SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
+                1,
+                &["skins"][..],
+                "index.json",
+            ),
+            (1, b"other".as_slice(), 1, &["skins"][..], "index.json"),
+            (
+                1,
+                SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
+                2,
+                &["skins"][..],
+                "index.json",
+            ),
+            (
+                1,
+                SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
+                1,
+                &["skin"][..],
+                "index.json",
+            ),
+            (
+                1,
+                SAVED_SKIN_INDEX_SUCCESSOR_OWNER,
+                1,
+                &["skins"][..],
+                "Index.json",
+            ),
+        ] {
+            assert!(!admitted(schema, owner, count, parent, leaf));
+        }
+    }
+
+    #[test]
+    fn launch_report_batch_admission_is_exact_and_complete() {
+        let leaves = ["launch-session_1.json", "launch-session_2.json"];
+        let admitted = |schema, owner: &[u8], count, leaves: &[&str], parent: &[&str]| {
+            admits_launch_report_batch(schema, owner, count, |index| {
+                leaves.get(index).map(|leaf| (parent.to_vec(), *leaf))
+            })
+        };
+        let parent = ["benchmarks", "launch"];
+        assert!(admitted(
+            1,
+            LAUNCH_REPORT_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &parent,
+        ));
+        assert!(!admitted(
+            1,
+            LAUNCH_REPORT_SUCCESSOR_OWNER,
+            2,
+            &[leaves[0], leaves[0]],
+            &parent,
+        ));
+        assert!(!admitted(
+            1,
+            LAUNCH_REPORT_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &["benchmarks", "other"],
+        ));
+        assert!(!admitted(
+            2,
+            LAUNCH_REPORT_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &parent
+        ));
+        assert!(!admitted(1, b"other", 2, &leaves, &parent));
+        assert!(!admitted(
+            1,
+            LAUNCH_REPORT_SUCCESSOR_OWNER,
+            3,
+            &leaves,
+            &parent,
+        ));
+        assert_eq!(
+            launch_report_session_from_leaf(leaves[0]),
+            Some("launch-session_1")
+        );
+        for leaf in [
+            "Launch-session.json",
+            "launch/session.json",
+            "launch-session",
+        ] {
+            assert!(launch_report_session_from_leaf(leaf).is_none());
+        }
+    }
+
+    #[test]
+    fn benchmark_suite_batch_admission_is_exact_and_complete() {
+        let leaves = [
+            "suite-dev-0123456789abcdef.json",
+            "suite-qual-fedcba9876543210.json",
+        ];
+        let admitted = |schema, owner: &[u8], count, leaves: &[&str], parent: &[&str]| {
+            admits_benchmark_suite_batch(schema, owner, count, |index| {
+                leaves.get(index).map(|leaf| (parent.to_vec(), *leaf))
+            })
+        };
+        let parent = ["benchmarks", "suites"];
+        assert!(admitted(
+            1,
+            BENCHMARK_SUITE_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &parent,
+        ));
+        assert!(!admitted(
+            1,
+            BENCHMARK_SUITE_SUCCESSOR_OWNER,
+            2,
+            &[leaves[0], leaves[0]],
+            &parent,
+        ));
+        for (schema, owner, count, candidates, parent) in [
+            (
+                2,
+                BENCHMARK_SUITE_SUCCESSOR_OWNER,
+                2,
+                &leaves[..],
+                &parent[..],
+            ),
+            (1, b"other".as_slice(), 2, &leaves[..], &parent[..]),
+            (1, BENCHMARK_SUITE_SUCCESSOR_OWNER, 0, &[][..], &parent[..]),
+            (
+                1,
+                BENCHMARK_SUITE_SUCCESSOR_OWNER,
+                33,
+                &leaves[..],
+                &parent[..],
+            ),
+            (
+                1,
+                BENCHMARK_SUITE_SUCCESSOR_OWNER,
+                2,
+                &leaves[..1],
+                &parent[..],
+            ),
+            (
+                1,
+                BENCHMARK_SUITE_SUCCESSOR_OWNER,
+                2,
+                &leaves[..],
+                &["benchmarks", "other"][..],
+            ),
+        ] {
+            assert!(!admitted(schema, owner, count, candidates, parent));
+        }
+        assert_eq!(
+            benchmark_suite_from_leaf(leaves[0]),
+            Some("suite-dev-0123456789abcdef")
+        );
+        for leaf in [
+            "suite-dev-0123456789ABCDEf.json",
+            "suite-other-0123456789abcdef.json",
+            "suite-dev-0123456789abcdef",
+        ] {
+            assert!(benchmark_suite_from_leaf(leaf).is_none());
+        }
+    }
+
+    #[test]
+    fn benchmark_suite_driver_batch_admission_is_exact_and_complete() {
+        let leaves = [
+            "benchmark-suite-driver-0000000000000001.json",
+            "benchmark-suite-driver-0000000000000002.json",
+        ];
+        let admitted = |schema, owner: &[u8], count, leaves: &[&str], parent: &[&str]| {
+            admits_benchmark_suite_driver_batch(schema, owner, count, |index| {
+                leaves.get(index).map(|leaf| (parent.to_vec(), *leaf))
+            })
+        };
+        let parent = ["benchmarks", "suite-drivers"];
+        assert!(admitted(
+            1,
+            BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &parent,
+        ));
+        assert!(!admitted(
+            1,
+            BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+            2,
+            &[leaves[0], leaves[0]],
+            &parent,
+        ));
+        assert!(!admitted(
+            1,
+            BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &["benchmarks", "other"],
+        ));
+        assert!(!admitted(
+            2,
+            BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+            2,
+            &leaves,
+            &parent,
+        ));
+        assert!(!admitted(1, b"other", 2, &leaves, &parent));
+        assert!(!admitted(
+            1,
+            BENCHMARK_SUITE_DRIVER_SUCCESSOR_OWNER,
+            3,
+            &leaves,
+            &parent,
+        ));
+        assert_eq!(
+            benchmark_suite_driver_from_leaf(leaves[0]),
+            Some("benchmark-suite-driver-0000000000000001")
+        );
+        for leaf in [
+            "benchmark-suite-driver-000000000000000A.json",
+            "driver-0000000000000001.json",
+            "benchmark-suite-driver-0000000000000001",
+        ] {
+            assert!(benchmark_suite_driver_from_leaf(leaf).is_none());
+        }
+    }
+}

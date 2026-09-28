@@ -2,100 +2,99 @@ import { prompt, showChoice } from '../../ui/Dialog';
 import type { ContextMenuItem } from '../../ui/ContextMenu';
 import { api } from '../../api';
 import { toast } from '../../toast';
-import { errMessage } from '../../utils';
 import type { EnrichedInstance } from '../../types-instance';
 import { openInstanceFolder } from './instance-actions';
-import { confirmDeleteItems, partialFailureMessage, runBulkMutation } from './bulk-actions';
+import { confirmDeleteItems, partialFailureMessage, runBulkMutation, runResourceMutation } from './bulk-actions';
+import { dtoString } from '../../dto-contract';
+import { requireResourceCommandSuccess } from './resources';
 
 function worldNameError(value: string): string | null {
-  const name = value.trim();
-  if (!name || name === '.' || name === '..') return 'Use a world name.';
-  if (name.startsWith('.')) return 'World names cannot start with a dot.';
-  if (/[\\/]/.test(name)) return 'World names cannot include folders.';
-  if (/[\u0000-\u001f\u007f]/.test(name)) return 'World names cannot include control characters.';
-  return null;
+  return value ? null : 'Use a world name.';
 }
 
 export async function renameWorld(inst: EnrichedInstance, worldName: string, onDone: () => void): Promise<void> {
-  const next = await prompt('New name for this world', worldName, {
-    title: 'Rename world',
-    confirmText: 'Rename',
-    validate: worldNameError,
-  });
-  const nextName = next?.trim() ?? '';
-  if (!nextName || nextName === worldName) return;
-  try {
-    const res: any = await api(
-      'PUT',
-      `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`,
-      { name: nextName },
-    );
-    if (res?.error) throw new Error(res.error);
+  await runResourceMutation(inst.id, 'Rename world', async () => {
+    const next = await prompt('New name for this world', worldName, {
+      title: 'Rename world',
+      confirmText: 'Rename',
+      validate: worldNameError,
+    });
+    const nextName = next ?? '';
+    if (!nextName || nextName === worldName) return;
+    const res = await api('PUT', `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`, {
+      name: nextName,
+    });
+    dtoString(requireResourceCommandSuccess(res, 'World rename').name, 'World name');
     toast('World renamed');
     onDone();
-  } catch (err) {
-    toast(`Could not rename the world: ${errMessage(err)}`, 'error');
-  }
+  });
 }
 
 export async function deleteWorld(inst: EnrichedInstance, worldName: string, onDone: () => void): Promise<void> {
-  const choice = await showChoice<'delete'>(
-    `Delete "${worldName}" from this instance. This removes the save folder from disk.`,
-    [{ value: 'delete', label: 'Delete world', variant: 'danger' }],
-    { title: 'Delete world' },
-  );
-  if (choice !== 'delete') return;
-  try {
-    const res: any = await api(
+  await runResourceMutation(inst.id, 'Delete world', async () => {
+    const choice = await showChoice<'delete'>(
+      `Delete "${worldName}" from this instance. This removes the save folder from disk.`,
+      [{ value: 'delete', label: 'Delete world', variant: 'danger' }],
+      { title: 'Delete world' },
+    );
+    if (choice !== 'delete') return;
+    const res = await api(
       'DELETE',
       `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`,
     );
-    if (res?.error) throw new Error(res.error);
+    requireResourceCommandSuccess(res, 'World deletion');
     toast('World deleted');
     onDone();
-  } catch (err) {
-    toast(`Could not delete the world: ${errMessage(err)}`, 'error');
-  }
+  });
 }
 
-export async function deleteWorlds(inst: EnrichedInstance, worldNames: string[], onDone: () => void): Promise<void> {
-  const confirmed = await confirmDeleteItems({
-    count: worldNames.length,
-    itemLabel: 'world',
-    message:
-      worldNames.length === 1
-        ? `Delete "${worldNames[0]!}" from this instance. This removes the save folder from disk.`
-        : `Delete ${worldNames.length} worlds from this instance. This removes the selected save folders from disk.`,
-  });
-  if (!confirmed) return;
-  await runBulkMutation({
-    items: worldNames,
-    action: async (worldName) => {
-      const res: any = await api(
-        'DELETE',
-        `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`,
-      );
-      if (res?.error) throw new Error(res.error);
-    },
-    success: (count) => (count === 1 ? 'World deleted' : `${count} worlds deleted`),
-    partial: (done, total, err) => partialFailureMessage('Deleted', done, total, err),
-    onDone,
+export async function deleteWorlds(
+  inst: EnrichedInstance,
+  worldNames: string[],
+  onDone: () => void,
+  onFailure?: () => void,
+): Promise<void> {
+  if (worldNames.length === 0) return;
+  await runResourceMutation(inst.id, 'Delete worlds', async () => {
+    const confirmed = await confirmDeleteItems({
+      count: worldNames.length,
+      itemLabel: 'world',
+      message:
+        worldNames.length === 1
+          ? `Delete "${worldNames[0]!}" from this instance. This removes the save folder from disk.`
+          : `Delete ${worldNames.length} worlds from this instance. This removes the selected save folders from disk.`,
+    });
+    if (!confirmed) return;
+    await runBulkMutation({
+      items: worldNames,
+      action: async (worldName) => {
+        const res = await api(
+          'DELETE',
+          `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}`,
+        );
+        requireResourceCommandSuccess(res, 'World deletion');
+      },
+      success: (count) => (count === 1 ? 'World deleted' : `${count} worlds deleted`),
+      partial: (done, total, err) => partialFailureMessage('Deleted', done, total, err),
+      onDone,
+      onFailure,
+    });
   });
 }
 
 export async function backupWorld(inst: EnrichedInstance, worldName: string, onDone: () => void): Promise<void> {
-  try {
-    const res: any = await api(
+  await runResourceMutation(inst.id, 'Back up world', async () => {
+    const res = await api(
       'POST',
       `/instances/${encodeURIComponent(inst.id)}/worlds/${encodeURIComponent(worldName)}/backup`,
       {},
     );
-    if (res?.error) throw new Error(res.error);
-    toast(res?.location ? `World backed up to ${res.location}` : 'World backed up');
+    const result = requireResourceCommandSuccess(res, 'World backup');
+    dtoString(result.backup, 'World backup name');
+    const location = dtoString(result.location, 'World backup location');
+    toast(`World backed up to ${location}`);
     onDone();
-  } catch (err) {
-    toast(`Could not back up the world: ${errMessage(err)}`, 'error');
-  }
+  });
 }
 
 export function worldMenuItems(inst: EnrichedInstance, worldName: string, onDone: () => void): ContextMenuItem[] {

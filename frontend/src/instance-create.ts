@@ -4,9 +4,11 @@ import { errMessage } from './utils';
 import { navigate } from './ui-state';
 import { addInstance } from './actions';
 import { applyInstallQueueResponse } from './machines/downloads';
-import type { Instance } from './types-instance';
-import type { InstallQueueStateResponse } from './types-install';
-import type { ToastKind } from './types-ui';
+import { createResultToastMessage, createToastKind, type CreateResultPresentationSource } from './create-presenters';
+import type { EnrichedInstance } from './types-instance';
+import { dtoError, dtoOptionalString, dtoRecord, dtoString } from './dto-contract';
+import { enrichedInstanceResponse } from './dto-core';
+import { installQueueStateResponse } from './dto-install';
 
 export interface InitialInstanceSettings {
   max_memory_mb?: number;
@@ -29,85 +31,13 @@ export interface CreateInstanceArgs {
 
 export interface CreateInstanceResult {
   ok: boolean;
-  instance?: Instance;
+  instance?: EnrichedInstance;
   error?: string;
 }
 
-interface CreateResultViewModel {
-  state_id?: string;
-  tone?: string;
-  title?: string;
-  summary?: string;
-  detail?: string | null;
-}
-
-interface CreateQueuedInstallSummary {
-  state_id?: string;
-  kind?: string;
-  label?: string;
-  queue_id?: string | null;
-  install_id?: string | null;
-  operation_id?: string | null;
-}
-
-interface CreateGuardianNotice {
-  state_id?: string;
-  tone?: string;
-  message?: string;
-  detail?: string | null;
-}
-
-interface CreateResponse {
+interface CreateResponse extends CreateResultPresentationSource {
   id?: string;
   error?: string;
-  view_model?: CreateResultViewModel;
-  install_queue?: InstallQueueStateResponse;
-  queued_install?: CreateQueuedInstallSummary;
-  guardian_notice?: CreateGuardianNotice;
-}
-
-function trimmed(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function createToastKind(tone: string | undefined): ToastKind {
-  if (tone === 'error') return 'error';
-  if (tone === 'warn') return 'info';
-  return 'success';
-}
-
-function appendUnique(parts: string[], value: string): void {
-  if (!value || parts.some((part) => part.includes(value))) return;
-  parts.push(value);
-}
-
-function createResultToastMessage(res: CreateResponse): string {
-  const summary = trimmed(res.view_model?.summary);
-  const detail = trimmed(res.view_model?.detail);
-  const guardianMessage = trimmed(res.guardian_notice?.message);
-  const guardianDetail = trimmed(res.guardian_notice?.detail);
-  const parts: string[] = [];
-
-  appendUnique(parts, summary);
-  appendUnique(parts, guardianMessage);
-  appendUnique(parts, detail);
-  appendUnique(parts, guardianDetail);
-  return parts.join(' ');
-}
-
-function isInstance(value: CreateResponse & Partial<Instance>): value is CreateResponse & Instance {
-  return (
-    typeof value.id === 'string' &&
-    value.id.trim().length > 0 &&
-    typeof value.name === 'string' &&
-    value.name.trim().length > 0 &&
-    typeof value.version_id === 'string' &&
-    value.version_id.trim().length > 0 &&
-    typeof value.created_at === 'string' &&
-    value.created_at.trim().length > 0 &&
-    typeof value.view_model?.summary === 'string' &&
-    value.view_model.summary.trim().length > 0
-  );
 }
 
 export async function createInstance(args: CreateInstanceArgs): Promise<CreateInstanceResult> {
@@ -116,10 +46,11 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
   if (!baseName) return { ok: false, error: 'Name is required' };
   if (!selectionId) return { ok: false, error: 'Version is required' };
 
-  let res: CreateResponse & Partial<Instance>;
+  let res: CreateResponse & EnrichedInstance;
+  let queueSnapshot: unknown;
   try {
     const endpoint = args.modpack ? '/instances/modpack' : args.setupPlanId ? '/instances/setup' : '/instances';
-    res = (await api('POST', endpoint, {
+    const payload = await api('POST', endpoint, {
       ...(args.setupPlanId ? { plan_id: args.setupPlanId } : {}),
       ...(args.modpack ? { canonical_id: args.modpack.canonicalId, version_id: args.modpack.versionId } : {}),
       name: baseName,
@@ -127,26 +58,42 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
       icon,
       accent,
       ...(args.initialSettings ?? {}),
-    })) as CreateResponse & Partial<Instance>;
+    });
+    const responseError = dtoError(payload);
+    if (responseError) throw new Error(responseError);
+    const record = dtoRecord(payload, 'Create instance');
+    const view = dtoRecord(record.view_model, 'Create instance view');
+    res = {
+      ...enrichedInstanceResponse(record),
+      view_model: {
+        state_id: dtoOptionalString(view.state_id, 'Create result state'),
+        tone: dtoOptionalString(view.tone, 'Create result tone'),
+        title: dtoOptionalString(view.title, 'Create result title'),
+        summary: dtoString(view.summary, 'Create result summary'),
+        detail: view.detail == null ? null : dtoString(view.detail, 'Create result detail'),
+      },
+    };
+    queueSnapshot = record.install_queue;
   } catch (err: unknown) {
     const message = errMessage(err);
     toast(`Failed to create instance: ${message}`, 'error');
     return { ok: false, error: message };
   }
 
-  if (res.error || !isInstance(res)) {
-    const error = res.error || 'server returned an incomplete instance';
-    if (!res.error) console.error('Create instance returned invalid payload');
-    toast(`Failed to create instance: ${error}`, 'error');
-    return { ok: false, error };
-  }
-
   const created = res;
   addInstance(created);
-  if (res.install_queue) {
-    await applyInstallQueueResponse(res.install_queue, { connectActive: true });
+  let queueError: string | null = null;
+  if (queueSnapshot != null) {
+    try {
+      await applyInstallQueueResponse(installQueueStateResponse(queueSnapshot), { connectActive: true });
+    } catch (error: unknown) {
+      // Creation is already confirmed. A progress connection failure must not
+      // leave the create form available to repeat the accepted mutation.
+      queueError = errMessage(error);
+    }
   }
-  toast(createResultToastMessage(res), createToastKind(res.view_model?.tone ?? res.guardian_notice?.tone));
+  toast(createResultToastMessage(res), createToastKind(res.view_model?.tone));
+  if (queueError) toast(`Instance created, but download status could not be refreshed: ${queueError}`, 'error');
   navigate({ name: 'instance', id: created.id });
 
   return { ok: true, instance: created };

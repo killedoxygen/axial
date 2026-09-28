@@ -1,9 +1,5 @@
-import { collapsedLogSeverity, currentPage, logLines } from './store';
+import { collapsedLogSeverity, logLines } from './store';
 import { toast } from './toast';
-import { loaderKeyFromComponentId, LOADER_LABELS } from './views/create/defaults';
-import type { CatalogVersion, LifecycleLabel, LifecycleMeta, Version } from './types-version';
-import type { LoaderBuildRecord, LoaderBuildMetadata } from './types-loader';
-import type { Page } from './types-ui';
 
 import type { LogSeverity } from './store';
 
@@ -45,128 +41,6 @@ export function errMessage(err: unknown): string {
   return 'Unknown error';
 }
 
-interface VersionDisplay {
-  name: string;
-  hint: string | null;
-  loader?: string | null;
-}
-
-type VersionLike =
-  | Pick<Version, 'id' | 'inherits_from' | 'loader' | 'minecraft_meta' | 'lifecycle' | 'release_time'>
-  | Pick<CatalogVersion, 'id' | 'minecraft_meta' | 'lifecycle' | 'release_time'>;
-
-export function hasLifecycleLabel(lifecycle: LifecycleMeta | undefined | null, label: LifecycleLabel): boolean {
-  return !!lifecycle?.labels?.includes(label);
-}
-
-export function isReleaseVersion(
-  version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined,
-): boolean {
-  return version?.lifecycle?.channel === 'stable' && hasLifecycleLabel(version.lifecycle, 'release');
-}
-
-export function isSnapshotVersion(
-  version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined,
-): boolean {
-  if (!version?.lifecycle) return false;
-  if (hasLifecycleLabel(version.lifecycle, 'old_beta') || hasLifecycleLabel(version.lifecycle, 'old_alpha')) {
-    return false;
-  }
-  return version.lifecycle.channel === 'preview' || version.lifecycle.channel === 'experimental';
-}
-
-export function isOldBetaVersion(
-  version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined,
-): boolean {
-  return hasLifecycleLabel(version?.lifecycle, 'old_beta');
-}
-
-export function isOldAlphaVersion(
-  version: Pick<Version, 'lifecycle'> | Pick<CatalogVersion, 'lifecycle'> | null | undefined,
-): boolean {
-  return hasLifecycleLabel(version?.lifecycle, 'old_alpha');
-}
-
-export function supportsMods(version: Pick<Version, 'loader'> | null | undefined): boolean {
-  return !!version?.loader;
-}
-
-export function matchesVersionFilter(
-  version: Pick<CatalogVersion, 'lifecycle'> | Pick<Version, 'lifecycle'>,
-  filter: string,
-): boolean {
-  if (filter === 'release') return isReleaseVersion(version);
-  if (filter === 'snapshot') return isSnapshotVersion(version);
-  if (filter === 'old_beta') return isOldBetaVersion(version);
-  if (filter === 'old_alpha') return isOldAlphaVersion(version);
-  return true;
-}
-
-export function versionBadgeInfo(version: Version | null | undefined): { cls: string; text: string } {
-  if (isReleaseVersion(version)) return { cls: 'badge-release', text: 'REL' };
-  if (isSnapshotVersion(version)) return { cls: 'badge-snapshot', text: 'SNAP' };
-  if (isOldBetaVersion(version)) return { cls: 'badge-old', text: 'BETA' };
-  if (isOldAlphaVersion(version)) return { cls: 'badge-old', text: 'ALPH' };
-  return { cls: 'badge-old', text: version?.lifecycle?.badge_text || '?' };
-}
-
-export function parseVersionDisplay(versionId: string, version: VersionLike | null | undefined): VersionDisplay {
-  if (version && 'inherits_from' in version && version.inherits_from) {
-    return parseModded(versionId, version.inherits_from, version as Version | null);
-  }
-  if (version?.minecraft_meta?.display_name) {
-    return {
-      name: version.minecraft_meta.display_name,
-      hint: version.minecraft_meta.display_hint || null,
-    };
-  }
-  if (isOldBetaVersion(version)) return { name: versionId.replace(/^b/, 'Beta '), hint: null };
-  if (isOldAlphaVersion(version)) return { name: versionId.replace(/^a/, 'Alpha '), hint: null };
-  return { name: versionId, hint: null };
-}
-
-function loaderTermTags(buildMeta: LoaderBuildMetadata | undefined | null): string[] {
-  return buildMeta?.display_tags ?? [];
-}
-
-export function formatLoaderBuildLabel(build: Pick<LoaderBuildRecord, 'loader_version' | 'build_meta'>): string {
-  const tags = loaderTermTags(build.build_meta);
-  return tags.length > 0 ? `${build.loader_version} (${tags.join(', ')})` : build.loader_version;
-}
-
-export function formatLoaderVersionLabel(loaderVersion: string, buildMeta?: LoaderBuildMetadata | null): string {
-  const tags = loaderTermTags(buildMeta);
-  return tags.length > 0 ? `${loaderVersion} (${tags.join(', ')})` : loaderVersion;
-}
-
-function parseModded(id: string, base: string, version?: Version | null): VersionDisplay {
-  const normalized = parseNormalizedLoaderDisplay(base, version);
-  if (normalized) return normalized;
-  return { name: base, hint: id !== base ? id : null, loader: null };
-}
-
-function parseNormalizedLoaderDisplay(base: string, version?: Version | null): VersionDisplay | null {
-  if (!version?.loader) return null;
-  const loader = loaderKeyFromComponentId(version.loader.component_id);
-  if (loader === 'vanilla') return null;
-  return loaderDisplay(loader, base, version.loader.loader_version, version.loader.build_meta);
-}
-
-function loaderDisplay(
-  loader: Exclude<ReturnType<typeof loaderKeyFromComponentId>, 'vanilla'>,
-  base: string,
-  loaderVersion: string,
-  buildMeta?: LoaderBuildMetadata | null,
-): VersionDisplay {
-  const title = `${LOADER_LABELS[loader]} ${base}`;
-  const hintPrefix = loader === 'fabric' || loader === 'quilt' ? 'Loader' : loader === 'forge' ? 'Forge' : 'NeoForge';
-  return {
-    name: title,
-    hint: loaderVersion ? `${hintPrefix} ${formatLoaderVersionLabel(loaderVersion, buildMeta)}` : null,
-    loader,
-  };
-}
-
 /** Disk name of a mod without its `.disabled` suffix; the manifest keys mods by
  * this enabled-state base name. */
 export function modBaseName(name: string): string {
@@ -191,12 +65,4 @@ export function getMemoryRecommendation(totalGB: number): { rec: number; text: s
   if (totalGB <= 8) return { rec: 4, text: '4 GB recommended' };
   if (totalGB <= 16) return { rec: 6, text: '6 GB recommended' };
   return { rec: 8, text: '8 GB recommended' };
-}
-
-export function setPage(page: Page): void {
-  currentPage.value = page;
-}
-
-export function toggleShortcutHints(show: boolean): void {
-  document.body.classList.toggle('show-shortcuts', show);
 }

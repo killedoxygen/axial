@@ -115,8 +115,6 @@ pub fn rules_status_for(
         validation,
         health_states: vec![
             BundleHealth::Healthy,
-            BundleHealth::Degraded,
-            BundleHealth::Fallback,
             BundleHealth::Disabled,
             BundleHealth::Invalid,
         ],
@@ -238,8 +236,6 @@ mod tests {
             status.health_states,
             vec![
                 BundleHealth::Healthy,
-                BundleHealth::Degraded,
-                BundleHealth::Fallback,
                 BundleHealth::Disabled,
                 BundleHealth::Invalid,
             ]

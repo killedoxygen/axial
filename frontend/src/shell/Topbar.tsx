@@ -1,16 +1,18 @@
 import type { JSX } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { Icon } from '../ui/Icons';
+import { Icon, type IconName } from '../ui/Icons';
 import { IconButton } from '../ui/Atoms';
 import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
 import { UpdateWidget } from './UpdateWidget';
 import { goBack, goForward, navigate, route } from '../ui-state';
-import { runningSessions, instances, versionById, launchState } from '../store';
+import { launchSessions, instances, versionById, launchState } from '../store';
 import { activeDownload, downloadFailure, downloadQueue } from '../machines/downloads';
 import { hasVisibleUpdate, updateFlow, updateFlowActive } from '../updater';
 import { minecraftVersionLabel } from '../version-display';
 import { hasCustomDragRegion, windowStartDragging, windowToggleMaximize } from '../native';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
+import type { LaunchSession } from '../types-launch';
 
 function assertUnreachable(value: never): never {
   throw new Error(`Unhandled route: ${JSON.stringify(value)}`);
@@ -74,25 +76,28 @@ function versionTag(versionId: string | undefined): string | null {
 
 type GlyphState = 'idle' | 'preparing' | 'monitoring' | 'playing' | 'stopping' | 'downloading' | 'queued' | 'failed';
 
+const STATUS_ICON_BY_STATE = {
+  idle: 'circle-dashed',
+  preparing: 'refresh',
+  monitoring: 'activity',
+  playing: 'play',
+  stopping: 'stop',
+  downloading: 'download',
+  queued: 'clock',
+  failed: 'alert',
+} as const satisfies Record<GlyphState, IconName>;
+
 function StatusGlyph({ state }: { state: GlyphState }): JSX.Element {
   return (
-    <span class="cp-status-mark cp-status-glyph" data-state={state} aria-hidden="true">
-      <span />
-      <span />
-      <span />
-      <span />
-      <span />
-      <span />
-      <span />
-      <span />
-      <span />
+    <span class="cp-status-mark cp-status-icon" data-state={state} aria-hidden="true">
+      <Icon name={STATUS_ICON_BY_STATE[state]} size={14} stroke={2} />
     </span>
   );
 }
 
-function sessionGlyph(session: { stopping?: boolean; state?: string }): GlyphState {
+function sessionGlyph(session: Pick<LaunchSession, 'stopping' | 'viewModel'>): GlyphState {
   if (session.stopping) return 'stopping';
-  if (session.state === 'running' || session.state === 'degraded') return 'playing';
+  if (launchSessionIsPlaying(session)) return 'playing';
   return 'monitoring';
 }
 
@@ -121,7 +126,7 @@ function useSettledLabel(label: string | null, holdMs = 600): string | null {
 }
 
 function StatusPill(): JSX.Element {
-  const sessions = runningSessions.value;
+  const sessions = launchSessions.value;
   const install = activeDownload.value;
 
   const runIds = Object.keys(sessions);
@@ -144,20 +149,20 @@ function StatusPill(): JSX.Element {
     inst && session
       ? session.stopping
         ? 'Stopping'
-        : session.viewModel?.label || 'Playing'
+        : launchSessionActivityLabel(session)
       : !install && launch.status === 'preparing'
         ? launch.label
         : null;
   const flowLabel = useSettledLabel(rawFlowLabel);
 
   if (inst && session) {
-    const label = flowLabel || (session.stopping ? 'Stopping' : session.viewModel?.label || 'Playing');
+    const label = flowLabel || (session.stopping ? 'Stopping' : launchSessionActivityLabel(session));
     const tag = versionTag(inst.version_id);
     glyph = sessionGlyph(session);
     mod = ' cp-status-pill--running';
     onClick = () => navigate({ name: 'instance', id: inst.id });
-    title = `${label} · ${inst.name}`;
-    ariaLabel = `Open running instance. ${label} · ${inst.name}`;
+    title = `${label}: ${inst.name}`;
+    ariaLabel = `Open active instance. ${label}: ${inst.name}`;
     content = (
       <>
         <span class="cp-status-pill-label">{label}</span>
@@ -172,7 +177,7 @@ function StatusPill(): JSX.Element {
     glyph = 'downloading';
     mod = ' cp-status-pill--installing';
     onClick = () => navigate({ name: 'downloads' });
-    title = `${installName}: ${install.label} · ${installPct}%${queueView.active_queued_count_label || ''}`;
+    title = `${installName}: ${install.label}, ${installPct}%${queueView.active_queued_count_label || ''}`;
     ariaLabel = `Open downloads. ${title}`;
     style = { '--cp-install-ratio': String(installPct / 100) } as JSX.CSSProperties;
     content = (
@@ -187,7 +192,7 @@ function StatusPill(): JSX.Element {
     const prepTag = versionTag(li?.version_id);
     glyph = 'preparing';
     mod = ' cp-status-pill--preparing';
-    title = `${launch.label} · ${li?.name || 'launch'}`;
+    title = `${launch.label}: ${li?.name || 'launch'}`;
     content = (
       <>
         <span class="cp-status-pill-label">{flowLabel || launch.label}</span>
@@ -284,7 +289,7 @@ export function Topbar(): JSX.Element {
   };
 
   const crumbs = crumbsFor();
-  const sessionActive = Object.keys(runningSessions.value).length > 0;
+  const sessionActive = Object.keys(launchSessions.value).length > 0;
   const flow = updateFlow.value;
   const hasUpdate = hasVisibleUpdate() || updateFlowActive();
   const updateBusy = flow.phase === 'downloading' || flow.phase === 'applying';

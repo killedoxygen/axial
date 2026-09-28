@@ -21,6 +21,7 @@ import {
 import { devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
 import { reportRenderError } from './error-reporting';
+import { reloadApplication } from './preferences/persistence';
 
 type DevLabViewComponent = (typeof import('./views/dev-lab/DevLabView'))['DevLabView'];
 type CommandPaletteComponent = (typeof import('./ui/CommandPalette'))['CommandPalette'];
@@ -219,6 +220,7 @@ function CurrentView(): JSX.Element {
 }
 
 function AppErrorBoundary({ children }: { children: ComponentChildren }): JSX.Element {
+  const [reloadFailed, setReloadFailed] = useState(false);
   const [error] = useErrorBoundary((caughtError) => {
     reportRenderError(caughtError);
   });
@@ -248,7 +250,17 @@ function AppErrorBoundary({ children }: { children: ComponentChildren }): JSX.El
               Reloading usually gets the launcher back in sync with the backend.
             </div>
           </div>
-          <Button variant="secondary" icon="refresh" onClick={() => location.reload()}>
+          {reloadFailed && (
+            <p style={{ color: 'var(--text-dim)', fontSize: 13, margin: 0 }}>
+              Interface preferences could not be confirmed. Keep this window open and retry Reload.
+            </p>
+          )}
+          <Button variant="secondary" icon="refresh" onClick={() => {
+            void (async () => {
+              try { setReloadFailed(!(await reloadApplication())); }
+              catch { setReloadFailed(true); }
+            })();
+          }}>
             Reload
           </Button>
         </Card>

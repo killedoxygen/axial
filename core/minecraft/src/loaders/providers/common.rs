@@ -1,6 +1,8 @@
 use crate::loaders::http::fetch_bytes;
+use crate::loaders::installed_version_id_for;
 use crate::loaders::types::{
-    LoaderBuildMetadata, LoaderError, LoaderSelectionMeta, LoaderSelectionReason,
+    LoaderArtifactKind, LoaderBuildMetadata, LoaderComponentId, LoaderError, LoaderInstallSource,
+    LoaderInstallStrategy, LoaderProviderFailureKind, LoaderSelectionMeta, LoaderSelectionReason,
     LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
 };
 
@@ -15,10 +17,202 @@ pub const NEOFORGE_MAVEN_META: &str =
 pub const FORGE_MAVEN_BASE: &str = "https://maven.minecraftforge.net";
 pub const NEOFORGE_MAVEN_BASE: &str = "https://maven.neoforged.net/releases";
 
+pub(crate) fn profile_source_url(
+    component: LoaderComponentId,
+    minecraft_version: &str,
+    loader_version: &str,
+) -> Result<String, LoaderError> {
+    let base = match component {
+        LoaderComponentId::Fabric => FABRIC_META_BASE,
+        LoaderComponentId::Quilt => QUILT_META_BASE,
+        LoaderComponentId::Forge | LoaderComponentId::NeoForge => {
+            return Err(LoaderError::InvalidProfile(
+                "loader component does not provide a profile source".to_string(),
+            ));
+        }
+    };
+    fixed_provider_url(
+        base,
+        &[
+            "loader",
+            minecraft_version,
+            loader_version,
+            "profile",
+            "json",
+        ],
+    )
+}
+
+pub(crate) fn profile_proof_url(
+    component: LoaderComponentId,
+    minecraft_version: &str,
+    loader_version: &str,
+) -> Result<String, LoaderError> {
+    let base = match component {
+        LoaderComponentId::Fabric => FABRIC_META_BASE,
+        LoaderComponentId::Quilt => QUILT_META_BASE,
+        LoaderComponentId::Forge | LoaderComponentId::NeoForge => {
+            return Err(LoaderError::InvalidProfile(
+                "loader component does not provide profile metadata".to_string(),
+            ));
+        }
+    };
+    fixed_provider_url(base, &["loader", minecraft_version, loader_version])
+}
+
+pub fn forge_install_source(
+    minecraft_version: &str,
+    loader_version: &str,
+) -> Result<
+    (
+        LoaderInstallStrategy,
+        LoaderArtifactKind,
+        LoaderInstallSource,
+    ),
+    LoaderError,
+> {
+    let exact = format!("{minecraft_version}-{loader_version}");
+    if !minecraft_version_at_least(minecraft_version, &[1, 5]) {
+        let suffix = if minecraft_version_at_least(minecraft_version, &[1, 3]) {
+            "universal.zip"
+        } else {
+            "client.zip"
+        };
+        let filename = format!("forge-{exact}-{suffix}");
+        return Ok((
+            LoaderInstallStrategy::ForgeEarliestLegacy,
+            LoaderArtifactKind::LegacyArchive,
+            LoaderInstallSource::LegacyArchive {
+                url: fixed_provider_url(
+                    FORGE_MAVEN_BASE,
+                    &["net", "minecraftforge", "forge", &exact, &filename],
+                )?,
+            },
+        ));
+    }
+
+    let strategy = if minecraft_version_at_least(minecraft_version, &[1, 13]) {
+        LoaderInstallStrategy::ForgeModern
+    } else {
+        LoaderInstallStrategy::ForgeLegacyInstaller
+    };
+    let filename = format!("forge-{exact}-installer.jar");
+    Ok((
+        strategy,
+        LoaderArtifactKind::InstallerJar,
+        LoaderInstallSource::InstallerJar {
+            url: fixed_provider_url(
+                FORGE_MAVEN_BASE,
+                &["net", "minecraftforge", "forge", &exact, &filename],
+            )?,
+        },
+    ))
+}
+
+pub(crate) fn neoforge_install_source(
+    loader_version: &str,
+) -> Result<
+    (
+        LoaderInstallStrategy,
+        LoaderArtifactKind,
+        LoaderInstallSource,
+    ),
+    LoaderError,
+> {
+    let filename = format!("neoforge-{loader_version}-installer.jar");
+    Ok((
+        LoaderInstallStrategy::NeoForgeModern,
+        LoaderArtifactKind::InstallerJar,
+        LoaderInstallSource::InstallerJar {
+            url: fixed_provider_url(
+                NEOFORGE_MAVEN_BASE,
+                &["net", "neoforged", "neoforge", loader_version, &filename],
+            )?,
+        },
+    ))
+}
+
+fn fixed_provider_url(base: &str, segments: &[&str]) -> Result<String, LoaderError> {
+    let mut url = reqwest::Url::parse(base).map_err(|_| {
+        LoaderError::InvalidProfile("fixed loader provider URL is invalid".to_string())
+    })?;
+    url.path_segments_mut()
+        .map_err(|_| {
+            LoaderError::InvalidProfile("fixed loader provider URL cannot carry paths".to_string())
+        })?
+        .extend(segments.iter().copied());
+    Ok(url.into())
+}
+
 pub async fn fetch_text(url: &str) -> Result<String, LoaderError> {
     let bytes = fetch_bytes(url, 2 << 20).await?;
-    String::from_utf8(bytes)
-        .map_err(|error| LoaderError::Other(format!("invalid text body for {url}: {error}")))
+    String::from_utf8(bytes).map_err(|_| LoaderError::ProviderDataInvalid {
+        kind: crate::loaders::types::LoaderProviderFailureKind::SchemaInvalid,
+        status: None,
+    })
+}
+
+pub fn provider_installed_version_id(
+    component_id: LoaderComponentId,
+    minecraft_version: &str,
+    loader_version: &str,
+) -> Result<String, LoaderError> {
+    installed_version_id_for(component_id, minecraft_version, loader_version).map_err(|_| {
+        LoaderError::ProviderDataInvalid {
+            kind: LoaderProviderFailureKind::SchemaInvalid,
+            status: None,
+        }
+    })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{profile_source_url, provider_installed_version_id};
+    use crate::loaders::types::{LoaderComponentId, LoaderError, LoaderProviderFailureKind};
+
+    #[test]
+    fn invalid_provider_coordinate_is_a_schema_failure() {
+        let error = provider_installed_version_id(LoaderComponentId::Fabric, "1.21.1", " invalid")
+            .expect_err("invalid provider coordinate");
+
+        assert!(matches!(
+            error,
+            LoaderError::ProviderDataInvalid {
+                kind: LoaderProviderFailureKind::SchemaInvalid,
+                status: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn profile_source_coordinates_cannot_escape_structured_path_segments() {
+        let url = profile_source_url(
+            LoaderComponentId::Fabric,
+            "1.21/../../alternate?query",
+            "loader#fragment/escape",
+        )
+        .expect("structured profile URL");
+        let parsed = reqwest::Url::parse(&url).expect("profile URL");
+        let segments = parsed
+            .path_segments()
+            .expect("hierarchical URL")
+            .collect::<Vec<_>>();
+
+        assert_eq!(parsed.host_str(), Some("meta.fabricmc.net"));
+        assert_eq!(parsed.query(), None);
+        assert_eq!(parsed.fragment(), None);
+        assert_eq!(
+            &segments[segments.len() - 5..],
+            [
+                "loader",
+                "1.21%2F..%2F..%2Falternate%3Fquery",
+                "loader%23fragment%2Fescape",
+                "profile",
+                "json",
+            ]
+            .as_slice()
+        );
+    }
 }
 
 pub fn parse_maven_versions(xml: &str) -> Vec<String> {

@@ -9,13 +9,15 @@ import { openContextMenu } from '../../ui/ContextMenu';
 import { SelectionActionTray, SelectionCheckbox } from '../../ui/SelectionActionTray';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../ui/selection';
 import { useTheme } from '../../hooks/use-theme';
-import { instances, versionById, runningSessions } from '../../store';
+import { instances, versionById, launchSessions } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../../launch-presenters';
 import { navigate, openCreate } from '../../ui-state';
 import { instanceMenuItems } from '../instance/instance-menu';
 import { deleteInstancesFlow } from '../instance/instance-actions';
 import { fmtRelativeCompact } from '../../format';
 import type { EnrichedInstance } from '../../types-instance';
+import { PendingRemovalsNotice } from './PendingRemovalsNotice';
 
 const LIST_COLS = '28px 52px 2.4fr 1fr 1fr 1fr 140px';
 
@@ -32,7 +34,8 @@ function ListRow({
 }): JSX.Element {
   const theme = useTheme();
   const v = versionById(inst.version_id);
-  const running = !!runningSessions.value[inst.id];
+  const session = launchSessions.value[inst.id];
+  const playing = launchSessionIsPlaying(session);
   const install = instanceInstallStatus(inst, v);
   const installing = install.installing;
   const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
@@ -44,13 +47,24 @@ function ListRow({
         ? 'download'
         : 'alert';
   const actionLabel = launchAction.primary_action === 'launch' ? 'Play' : launchAction.label;
-  const showModsCount = inst.version_display.supports_mods;
+  const showModsCount = inst.version_display.supports_mods && inst.counts_available === true;
+  const open = (): void => navigate({ name: 'instance', id: inst.id });
+  const onKeyDown = (e: KeyboardEvent): void => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    open();
+  };
   return (
     <div
       class="cp-table-row cp-selection-row"
       style={{ gridTemplateColumns: LIST_COLS }}
+      role="button"
+      tabIndex={0}
+      aria-label={installing ? `Open ${inst.name}. ${installLabel}` : `Open ${inst.name}`}
       data-selected={selected}
-      onClick={() => navigate({ name: 'instance', id: inst.id })}
+      onClick={open}
+      onKeyDown={onKeyDown}
       onContextMenu={onContextMenu}
     >
       <SelectionCheckbox
@@ -65,9 +79,9 @@ function ListRow({
       <div>
         <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {inst.name}
-          {running && (
-            <Pill tone="accent" icon="play">
-              Live
+          {session && (
+            <Pill tone={playing ? 'accent' : undefined} icon={playing ? 'play' : 'clock'}>
+              {launchSessionActivityLabel(session)}
             </Pill>
           )}
           {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installLabel}</Pill>}
@@ -86,7 +100,7 @@ function ListRow({
           title={launchAction.primary_action === 'blocked' ? launchAction.disabled_reason : undefined}
           onClick={(e) => {
             e.stopPropagation();
-            navigate({ name: 'instance', id: inst.id });
+            open();
           }}
         >
           {installing ? installLabel : actionLabel}
@@ -94,6 +108,7 @@ function ListRow({
         <IconButton
           icon="dots"
           size={28}
+          tooltip={`Actions for ${inst.name}`}
           onClick={(e: any) => {
             e.stopPropagation();
             onContextMenu(e);
@@ -107,7 +122,7 @@ function ListRow({
 export function InstancesView(): JSX.Element {
   const [view, setView] = useState<'grid' | 'list'>('grid');
   const [q, setQ] = useState('');
-  const all = instances.value as EnrichedInstance[];
+  const all = instances.value;
   const query = q.trim().toLowerCase();
   const filtered = all.filter((i) => i.name.toLowerCase().includes(query));
   const selection = useSelection(
@@ -135,7 +150,10 @@ export function InstancesView(): JSX.Element {
         <div>
           <h1>Instances</h1>
           <div class="cp-page-sub">
-            {all.length} total, {all.reduce((s, i) => s + (i.mods_count ?? 0), 0)} mods across all
+            {all.length} total
+            {all.every((inst) => inst.counts_available === true)
+              ? `, ${all.reduce((sum, inst) => sum + inst.mods_count, 0)} mods across all`
+              : null}
           </div>
         </div>
         <div style={{ flex: 1 }} />
@@ -154,6 +172,7 @@ export function InstancesView(): JSX.Element {
         </Button>
       </div>
 
+      <PendingRemovalsNotice />
       {filtered.length === 0 ? (
         <div class="cp-empty">
           <Icon name="stack" size={36} color="var(--text-mute)" />

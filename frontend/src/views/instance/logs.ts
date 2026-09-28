@@ -1,5 +1,6 @@
 import { api } from '../../api';
 import type { InstanceResourceSummary, InstanceLogTail } from '../../types-instance';
+import { instanceLogTailResponse, launchLogsResponse } from '../../dto-launch';
 
 export type InstanceLogEntry = InstanceResourceSummary['logs'][number];
 export type LogFilter = 'all' | 'important' | 'errors' | 'warnings' | 'system-info';
@@ -95,10 +96,17 @@ export function logLineMatchesFilter(line: ClassifiedLogLine, filter: LogFilter)
 }
 
 export async function fetchLogTail(id: string, name: string): Promise<InstanceLogTail> {
-  const res: InstanceLogTail & { error?: string } = await api(
-    'GET',
-    `/instances/${encodeURIComponent(id)}/logs/${encodeURIComponent(name)}`,
+  const tail = instanceLogTailResponse(
+    await api('GET', `/instances/${encodeURIComponent(id)}/logs/${encodeURIComponent(name)}`),
   );
-  if (res?.error) throw new Error(res.error);
-  return res;
+  if (tail.name !== name) throw new Error('The log response did not match the selected file.');
+  return tail;
+}
+
+export async function fetchSessionLog(sessionId: string): Promise<Pick<InstanceLogTail, 'text' | 'truncated'>> {
+  const entries = launchLogsResponse(await api('GET', `/launch/${encodeURIComponent(sessionId)}/logs`));
+  return {
+    text: entries.map((entry) => (entry.truncated ? `${entry.text} [truncated]` : entry.text)).join('\n'),
+    truncated: (entries[0]?.sequence ?? 1) > 1 || entries.some((entry) => entry.truncated),
+  };
 }

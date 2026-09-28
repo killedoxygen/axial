@@ -1,13 +1,28 @@
 mod artifact;
-mod fallback;
+pub(crate) use artifact::ManagedArtifactTransferRecovery;
+pub use artifact::ManagedArtifactTransferResolver;
 mod manager;
 mod model;
 mod mutation;
-mod promotion;
+pub(crate) mod plan;
 mod rules_refresh;
 
 #[cfg(test)]
 mod tests;
 
-pub use manager::PerformanceManager;
-pub use model::{InstallError, PERFORMANCE_RULES_URL_ENV, RulesRefreshError};
+pub use crate::storage::ManagedInstanceEffectAuthority;
+pub use manager::{
+    ManagedCompositionAuthority, ManagedIdentityError, ManagedInstanceIdentity, PerformanceManager,
+    PerformanceRulesAuthority,
+};
+pub use model::{InstallError, PERFORMANCE_RULES_URL_ENV, RulesRefreshError, VerifiedRemoteRules};
+pub use mutation::{
+    ManagedArtifactWitnessProof, ManagedCompositionInspection, ManagedIndeterminate,
+    ManagedInstallExecutionError, ManagedInstallExecutionOutcome, ManagedMutationError,
+    ManagedResolvedInspection,
+};
+pub use plan::{
+    ManagedArtifactPin, ManagedArtifactRole, ManagedCompositionInstallPlan, ManagedDependencyEdge,
+    ManagedInstallPlanError,
+};
+pub use rules_refresh::remote_rules_refresh_warning;

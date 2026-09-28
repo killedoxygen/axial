@@ -1,36 +1,118 @@
-use crate::application::{
-    self, PerformanceHealthRequest, PerformanceHealthResponse, PerformanceInstallRequest,
-    PerformanceInstallResponse, PerformanceInstanceOperationResponse, PerformancePlanRequest,
-    PerformancePlanResponse, PerformanceRollbackListRequest, PerformanceRollbackListResponse,
+//! Authenticated HTTP adaptation for the Performance owner.
+
+use axial_app::{
+    instances::model::InstanceId,
+    performance::{
+        PerformanceMutationError, PerformanceService,
+        health::health_response,
+        model::PerformancePlanRequest,
+        plan::{configured_mode, plan_response, resolve_mode, version_target},
+    },
+    settings::SettingsStore,
 };
-use crate::state::AppState;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{
+        DefaultBodyLimit, Path, Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::StatusCode,
     routing::{get, post},
 };
 use serde::Deserialize;
+use serde_json::{Value, json};
+use std::sync::Arc;
 
-#[derive(Debug, Deserialize)]
-struct PlanQuery {
-    game_version: Option<String>,
-    loader: Option<String>,
-    mode: Option<String>,
-    instance_id: Option<String>,
+#[derive(Clone)]
+struct PerformanceApi {
+    service: Arc<PerformanceService>,
+    settings: Arc<SettingsStore>,
+}
+type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
+
+pub fn router(service: Arc<PerformanceService>, settings: Arc<SettingsStore>) -> Router {
+    Router::new()
+        .route("/api/v1/performance/status", get(status))
+        .route("/api/v1/performance/rules/refresh", post(refresh))
+        .route("/api/v1/performance/plan", get(plan))
+        .route("/api/v1/performance/health", get(health))
+        .route("/api/v1/performance/rollback", get(rollback))
+        .route("/api/v1/performance/install", post(install))
+        .route(
+            "/api/v1/performance/instances/{id}/operation",
+            get(instance_operation),
+        )
+        .route("/api/v1/performance/operations/{id}", get(operation))
+        .layer(DefaultBodyLimit::max(8192))
+        .with_state(PerformanceApi { service, settings })
 }
 
-#[derive(Debug, Deserialize)]
-struct HealthQuery {
+async fn status(State(api): State<PerformanceApi>) -> ApiResult {
+    Ok(Json(json!(api.service.rules().status())))
+}
+async fn refresh(State(api): State<PerformanceApi>) -> ApiResult {
+    api.service
+        .rules()
+        .refresh()
+        .await
+        .map(|value| Json(json!(value)))
+        .map_err(|error| {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({"error":error.to_string()})),
+            )
+        })
+}
+async fn plan(
+    State(api): State<PerformanceApi>,
+    query: Result<Query<PerformancePlanRequest>, QueryRejection>,
+) -> ApiResult {
+    let Query(input) = query.map_err(|_| invalid())?;
+    let request = resolution(&api, &input)?;
+    let planned = api.service.rules().plan(request).await.map_err(|error| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error":error.to_string()})),
+        )
+    })?;
+    Ok(Json(json!(plan_response(planned.plan()))))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstanceQuery {
     instance_id: Option<String>,
 }
-
-#[derive(Debug, Deserialize)]
-struct RollbackQuery {
-    instance_id: Option<String>,
+async fn health(
+    State(api): State<PerformanceApi>,
+    query: Result<Query<InstanceQuery>, QueryRejection>,
+) -> ApiResult {
+    let Query(query) = query.map_err(|_| invalid())?;
+    let id = selected(&api, query.instance_id.as_deref())?;
+    let request = resolution(
+        &api,
+        &PerformancePlanRequest {
+            instance_id: Some(id.to_string()),
+            ..Default::default()
+        },
+    )?;
+    Ok(Json(json!(health_response(
+        api.service
+            .inspect_with_request(&id, Some(request))
+            .await
+            .map_err(error)?
+    ))))
 }
-
-#[derive(Debug, Deserialize)]
+async fn rollback(
+    State(api): State<PerformanceApi>,
+    query: Result<Query<InstanceQuery>, QueryRejection>,
+) -> ApiResult {
+    let Query(query) = query.map_err(|_| invalid())?;
+    let id = selected(&api, query.instance_id.as_deref())?;
+    let inspected = api.service.inspect(&id).await.map_err(error)?;
+    Ok(Json(json!({"snapshots":inspected.rollback_snapshots})))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InstallRequest {
     instance_id: Option<String>,
     game_version: Option<String>,
@@ -40,339 +122,185 @@ struct InstallRequest {
     rollback_id: Option<String>,
     queued: Option<bool>,
 }
-
-pub(crate) fn spawn_pending_performance_operations(state: &AppState) -> bool {
-    application::spawn_pending_performance_operations(state)
-}
-
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/api/v1/performance/status", get(handle_status))
-        .route(
-            "/api/v1/performance/rules/refresh",
-            post(handle_rules_refresh),
-        )
-        .route("/api/v1/performance/plan", get(handle_plan))
-        .route("/api/v1/performance/health", get(handle_health))
-        .route("/api/v1/performance/rollback", get(handle_rollback_list))
-        .route("/api/v1/performance/install", post(handle_install))
-        .route(
-            "/api/v1/performance/instances/{instance_id}/operation",
-            get(handle_instance_operation),
-        )
-        .route(
-            "/api/v1/performance/operations/{id}",
-            get(handle_operation_status),
-        )
-}
-
-async fn handle_status(
-    State(state): State<AppState>,
-) -> Result<Json<application::PerformanceRulesStatusResponse>, (StatusCode, Json<serde_json::Value>)>
-{
-    Ok(Json(application::performance_rules_status(&state)))
-}
-
-async fn handle_rules_refresh(
-    State(state): State<AppState>,
-) -> Result<Json<application::PerformanceRulesStatusResponse>, (StatusCode, Json<serde_json::Value>)>
-{
-    application::refresh_performance_rules(&state)
-        .await
-        .map(Json)
-        .map_err(application::refresh_performance_rules_error_response)
-}
-
-async fn handle_plan(
-    State(state): State<AppState>,
-    Query(query): Query<PlanQuery>,
-) -> Result<Json<PerformancePlanResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::performance_plan(
-        &state,
-        PerformancePlanRequest {
-            game_version: query.game_version,
-            loader: query.loader,
-            mode: query.mode,
-            instance_id: query.instance_id,
+async fn install(
+    State(api): State<PerformanceApi>,
+    body: Result<Json<InstallRequest>, JsonRejection>,
+) -> ApiResult {
+    let Json(body) = body.map_err(|_| invalid())?;
+    let id = selected(&api, body.instance_id.as_deref())?;
+    let request = resolution(
+        &api,
+        &PerformancePlanRequest {
+            instance_id: Some(id.to_string()),
+            game_version: body.game_version,
+            loader: body.loader,
+            mode: body.mode,
         },
-    )
-    .await
-    .map(Json)
+    )?;
+    let action = body.action.as_deref().unwrap_or("apply");
+    if body.queued == Some(true) {
+        let operation = api
+            .service
+            .submit(&id, request, action, body.rollback_id)
+            .map_err(error)?;
+        return Ok(Json(
+            json!({"active":true,"status":"queued","install_id":operation.id,"health":"disabled","composition_id":"","tier":"","installed_count":0,"managed_artifacts":[],"warnings":[],"operation":operation_payload(operation)}),
+        ));
+    }
+    let inspected = match action {
+        "apply" | "reapply" => api.service.apply(&id, request).await,
+        "remove" => api.service.remove(&id).await,
+        "rollback" => api.service.rollback(&id, body.rollback_id).await,
+        _ => return Err(invalid()),
+    }
+    .map_err(error)?;
+    let state = inspected.state.as_ref();
+    let response = json!({"active":state.is_some(),"status":"complete","health":inspected.health,
+        "composition_id":state.map(|s| s.composition_id.as_str()).unwrap_or(""), "tier":state.map(|s| match s.tier { axial_app::performance::model::CompositionTier::Core => "core", axial_app::performance::model::CompositionTier::Extended => "extended", axial_app::performance::model::CompositionTier::VanillaEnhanced => "vanilla_enhanced" }).unwrap_or(""),
+        "installed_count":state.map_or(0,|s|s.installed_mods.len()),"managed_artifacts":health_response(inspected.clone()).managed_artifacts,"warnings":inspected.warnings});
+    Ok(Json(response))
 }
-
-async fn handle_health(
-    State(state): State<AppState>,
-    Query(query): Query<HealthQuery>,
-) -> Result<Json<PerformanceHealthResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::performance_health(
-        &state,
-        PerformanceHealthRequest {
-            instance_id: query.instance_id,
-        },
-    )
-    .await
-    .map(Json)
+async fn operation(State(api): State<PerformanceApi>, Path(id): Path<String>) -> ApiResult {
+    let operation = api.service.operation(&id).map_err(error)?.ok_or((
+        StatusCode::NOT_FOUND,
+        Json(json!({"error":"performance operation not found"})),
+    ))?;
+    Ok(Json(operation_payload(operation)))
 }
-
-async fn handle_rollback_list(
-    State(state): State<AppState>,
-    Query(query): Query<RollbackQuery>,
-) -> Result<Json<PerformanceRollbackListResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::performance_rollback_list(
-        &state,
-        PerformanceRollbackListRequest {
-            instance_id: query.instance_id,
-        },
-    )
-    .await
-    .map(Json)
-}
-
-async fn handle_install(
-    State(state): State<AppState>,
-    Json(payload): Json<InstallRequest>,
-) -> Result<Json<PerformanceInstallResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::performance_install(
-        state,
-        PerformanceInstallRequest {
-            instance_id: payload.instance_id,
-            game_version: payload.game_version,
-            loader: payload.loader,
-            mode: payload.mode,
-            action: payload.action,
-            rollback_id: payload.rollback_id,
-            queued: payload.queued,
-        },
-    )
-    .await
-    .map(Json)
-}
-
-async fn handle_operation_status(
-    State(state): State<AppState>,
+async fn instance_operation(
+    State(api): State<PerformanceApi>,
     Path(id): Path<String>,
-) -> Result<
-    Json<crate::application::performance::PerformanceOperationStatusResponse>,
-    (StatusCode, Json<serde_json::Value>),
-> {
-    application::performance_operation_status(&state, &id)
-        .await
-        .map(Json)
+) -> ApiResult {
+    let id = id.parse().map_err(|_| invalid())?;
+    Ok(Json(
+        json!({"operation":api.service.instance_operation(&id).map_err(error)?.map(operation_payload)}),
+    ))
 }
-
-async fn handle_instance_operation(
-    State(state): State<AppState>,
-    Path(instance_id): Path<String>,
-) -> Result<Json<PerformanceInstanceOperationResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::performance_instance_operation(&state, &instance_id)
-        .await
-        .map(Json)
+fn operation_payload(
+    operation: axial_app::performance::mutation::PerformanceOperationStatus,
+) -> Value {
+    let complete = operation.state == "complete";
+    let terminal = matches!(
+        operation.state.as_str(),
+        "complete" | "failed" | "interrupted"
+    );
+    let title = if operation.history.is_some() {
+        "Historical Performance operation"
+    } else {
+        "Performance operation"
+    };
+    let mut value = json!(operation);
+    value["view_model"] = json!({"state_label":operation.state,"tone":if complete {"ok"} else if terminal {"warn"} else {"mute"},
+        "title":title,"detail":operation.error.unwrap_or_default(),"progress":{"phase":operation.state,"current":if terminal {1}else{0},"total":1,"done":terminal},"is_terminal":terminal,"is_complete":complete});
+    value
+}
+fn resolution(
+    api: &PerformanceApi,
+    input: &PerformancePlanRequest,
+) -> Result<axial_app::performance::model::ResolutionRequest, (StatusCode, Json<Value>)> {
+    let settings = api.settings.current().map_err(|_| unavailable())?;
+    let record = input
+        .instance_id
+        .as_deref()
+        .map(|raw| {
+            let id: InstanceId = raw.parse().map_err(|_| invalid())?;
+            api.service
+                .instances()
+                .registry()
+                .get_live(&id)
+                .map_err(|_| unavailable())
+        })
+        .transpose()?;
+    let mode = resolve_mode(
+        configured_mode(settings.performance_mode),
+        record
+            .as_ref()
+            .map(|r| r.instance.settings.performance_mode.as_str()),
+        input.mode.as_deref(),
+    )
+    .map_err(|_| invalid())?;
+    let (game, loader) = version_target(
+        record
+            .as_ref()
+            .map(|r| r.instance.minecraft_version.as_str()),
+        record.as_ref().map(|r| r.instance.loader_key.as_str()),
+        input.game_version.as_deref(),
+        input.loader.as_deref(),
+    )
+    .map_err(|_| invalid())?;
+    Ok(api.service.resolution_request(game, loader, mode.mode))
+}
+fn selected(
+    api: &PerformanceApi,
+    raw: Option<&str>,
+) -> Result<InstanceId, (StatusCode, Json<Value>)> {
+    if let Some(raw) = raw {
+        return raw.parse().map_err(|_| invalid());
+    }
+    api.service
+        .instances()
+        .registry()
+        .last_instance_id()
+        .map_err(|_| unavailable())?
+        .ok_or_else(invalid)
+}
+fn error(error: PerformanceMutationError) -> (StatusCode, Json<Value>) {
+    let code = match error {
+        PerformanceMutationError::SnapshotNotFound => StatusCode::NOT_FOUND,
+        PerformanceMutationError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::CONFLICT,
+    };
+    (code, Json(json!({"error":error.to_string()})))
+}
+fn invalid() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error":"invalid performance request"})),
+    )
+}
+fn unavailable() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"error":"performance target is unavailable"})),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{
-        AppStateInit, InstallStore, SessionStore,
-        performance_operations::PerformanceOperationPayload,
-    };
-    use axial_config::{AppPaths, ConfigStore, InstanceStore};
-    use axial_performance::PerformanceManager;
-    use axum::{
-        body::{Body, to_bytes},
-        http::{Method, Request},
-    };
-    use serde_json::Value;
-    use std::{fs, path::PathBuf, sync::Arc};
-    use tower::ServiceExt;
 
-    #[tokio::test]
-    async fn operation_status_route_redacts_payload_through_production_router() {
-        let fixture = RoutePerformanceFixture::new("operation-status-production-route");
-        let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
-        let operation = fixture
-            .state
-            .performance_operations()
-            .start(
-                instance_id.clone(),
-                "install/provider_payload=secret-token".to_string(),
-                PerformanceOperationPayload {
-                    game_version: Some("/Users/alice/.minecraft/private-version".to_string()),
-                    loader: Some("fabric".to_string()),
-                    mode: Some("managed --accessToken secret-token".to_string()),
-                    rollback_id: Some("rb-old\\secret".to_string()),
-                },
-            )
-            .await
-            .expect("operation starts");
-        fixture
-            .state
-            .performance_operations()
-            .record_failed(
-                &operation.id,
-                "provider_payload={\"url\":\"https://cdn.example.test/private/sodium-secret.jar?token=secret-token\"}; java_path=C:\\Users\\Alice\\Java\\bin\\java.exe; -Xmx8192M",
-            )
-            .await;
-
-        let (status, payload) = fixture
-            .request_json(
-                Method::GET,
-                &format!("/api/v1/performance/operations/{}", operation.id),
-            )
-            .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["id"], operation.id);
-        assert_eq!(payload["instance_id"], instance_id);
-        assert_eq!(payload["state"], "failed");
-        assert_eq!(payload["action"], "unknown");
-        assert_eq!(payload["error"], "performance operation failed");
-        assert_eq!(payload["view_model"]["tone"], "err");
+    #[test]
+    fn operation_projection_preserves_history_and_unchanged_live_wire() {
+        let mut record = json!({
+            "id":"e89198a7-fc9a-4268-8237-1d03a7865d7d",
+            "instance_id":"d6926227-f5e6-47a3-a736-f6c1cef14435", "action":"apply",
+            "state":"failed", "error":"Operation failed",
+            "created_at":"2026-01-01T00:00:00.000Z", "updated_at":"2026-01-01T00:00:01.000Z"
+        });
+        let live = operation_payload(serde_json::from_value(record.clone()).unwrap());
+        assert!(live.get("history").is_none());
+        assert_eq!(live["view_model"]["title"], "Performance operation");
+        let history = json!({
+            "operation_id":"op-2b709312-e6ce-4ee3-89c6-2d15d9b30d66", "sequence":3,
+            "intent":{
+                "instance_id":"0000000000000001", "requested_action":"install", "action":"remove",
+                "base_target_id":"performance_composition_lock", "rollback":"Unavailable",
+                "game_version":"1.20.1", "loader":"fabric", "mode":"custom"
+            },
+            "terminal":{"outcome":"failed_before_effect", "error":"Operation failed"}
+        });
+        record["id"] = json!(format!("legacy-performance-{:064x}", 3));
+        record["action"] = json!("install");
+        record["history"] = history.clone();
+        let historical = operation_payload(serde_json::from_value(record).unwrap());
+        assert_eq!(historical["history"], history);
+        assert_eq!(historical["action"], "install");
         assert_eq!(
-            payload["view_model"]["detail"],
-            "performance operation failed"
+            historical["view_model"]["title"],
+            "Historical Performance operation"
         );
-        assert_eq!(payload["view_model"]["progress"]["phase"], "error");
-        assert_eq!(payload["payload"]["game_version"], "redacted");
-        assert_eq!(payload["payload"]["loader"], "fabric");
-        assert_eq!(payload["payload"]["mode"], "redacted");
-        assert_eq!(payload["payload"]["rollback_id"], "redacted");
-        assert_no_performance_route_sensitive_fragments(&payload);
-
-        let (status, payload) = fixture
-            .request_json(
-                Method::GET,
-                &format!("/api/v1/performance/instances/{instance_id}/operation"),
-            )
-            .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["operation"]["id"], operation.id);
-        assert_eq!(payload["operation"]["action"], "unknown");
-        assert_eq!(
-            payload["operation"]["error"],
-            "performance operation failed"
-        );
-        assert_eq!(payload["operation"]["view_model"]["tone"], "err");
-        assert_eq!(payload["operation"]["payload"]["game_version"], "redacted");
-        assert_eq!(payload["operation"]["payload"]["loader"], "fabric");
-        assert_eq!(payload["operation"]["payload"]["mode"], "redacted");
-        assert_eq!(payload["operation"]["payload"]["rollback_id"], "redacted");
-        assert_no_performance_route_sensitive_fragments(&payload);
-    }
-
-    struct RoutePerformanceFixture {
-        state: AppState,
-        root: PathBuf,
-    }
-
-    impl RoutePerformanceFixture {
-        fn new(name: &str) -> Self {
-            let root = test_root(name);
-            let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            let instances =
-                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
-            let state = AppState::new(AppStateInit {
-                app_name: "Axial".to_string(),
-                version: "test".to_string(),
-                config,
-                instances,
-                installs: Arc::new(InstallStore::new()),
-                sessions: Arc::new(SessionStore::new()),
-                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
-                startup_warnings: Vec::new(),
-                frontend_dir: root.join("frontend"),
-            });
-
-            Self { state, root }
-        }
-
-        async fn request_json(&self, method: Method, uri: &str) -> (StatusCode, Value) {
-            let response = router()
-                .with_state(self.state.clone())
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("route response");
-            let status = response.status();
-            let body = to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("read body");
-            let payload = serde_json::from_slice(&body).expect("json response");
-            (status, payload)
-        }
-
-        fn add_instance(&self, name: &str, version_id: &str) -> String {
-            self.state
-                .instances()
-                .add(
-                    name.to_string(),
-                    version_id.to_string(),
-                    String::new(),
-                    String::new(),
-                    None,
-                )
-                .expect("add instance")
-                .id
-        }
-    }
-
-    impl Drop for RoutePerformanceFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn test_root(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "axial-api-performance-route-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|value| value.as_nanos())
-                .unwrap_or_default()
-        ));
-        fs::create_dir_all(&path).expect("create test root");
-        path
-    }
-
-    fn test_paths(root: &std::path::Path) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
-    }
-
-    fn assert_no_performance_route_sensitive_fragments(value: &Value) {
-        let text = value.to_string();
-        for material in [
-            "/Users/alice",
-            "C:\\Users\\Alice",
-            ".minecraft",
-            "provider_payload",
-            "private",
-            "sodium-secret.jar",
-            "secret-token",
-            "accessToken",
-            "token=secret",
-            "-Xmx8192M",
-            "java_path",
-        ] {
-            assert!(
-                !text.contains(material),
-                "public performance JSON exposed sensitive material {material}: {text}"
-            );
-        }
+        assert_eq!(historical["view_model"]["is_terminal"], true);
+        assert_eq!(historical["view_model"]["is_complete"], false);
+        assert_eq!(historical["view_model"]["progress"]["done"], true);
     }
 }

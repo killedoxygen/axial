@@ -6,6 +6,8 @@ pub enum ResolveError {
     Parse(#[from] serde_json::Error),
     #[error("unsupported schema_version")]
     UnsupportedSchema,
+    #[error("performance manifest exceeds the current {0} bound")]
+    ManifestBound(&'static str),
     #[error("minimum_app_version is required")]
     MissingMinimumAppVersion,
     #[error("minimum_app_version is invalid: {0}")]
@@ -49,6 +51,18 @@ pub enum ResolveError {
         artifact_id: String,
         version_range: String,
     },
+    #[error("managed mod {artifact_id} cannot declare both version_range and exact_game_versions")]
+    ConflictingManagedModVersionSelectors { artifact_id: String },
+    #[error("managed mod {artifact_id} has invalid exact_game_versions entry: {game_version}")]
+    InvalidManagedModExactGameVersion {
+        artifact_id: String,
+        game_version: String,
+    },
+    #[error("managed mod {artifact_id} has duplicate exact_game_versions entry: {game_version}")]
+    DuplicateManagedModExactGameVersion {
+        artifact_id: String,
+        game_version: String,
+    },
     #[error("managed mod {artifact_id} has invalid hardware_req.{field}: {value}")]
     InvalidManagedModHardwareRequirement {
         artifact_id: String,
@@ -65,8 +79,6 @@ pub enum ResolveError {
     MissingCompositionId,
     #[error("duplicate composition id: {0}")]
     DuplicateCompositionId(String),
-    #[error("fallback_to references unknown composition: {0}")]
-    UnknownFallback(String),
     #[error("emergency disable id is required")]
     MissingEmergencyDisableId,
     #[error("emergency disable target_id is required")]

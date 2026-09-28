@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { SelectField } from './Select';
 import { Icon } from './Icons';
 import { api } from '../api';
+import { dtoArray, dtoRecord, dtoString } from '../dto-contract';
 
 type JavaRuntime = { path: string; component: string; source: string };
 
@@ -17,8 +18,15 @@ async function loadRuntimes(): Promise<JavaRuntime[]> {
   runtimeRequest ??= (async () => {
     try {
       const res = await api('GET', '/java');
-      const list = Array.isArray(res?.runtimes) ? (res.runtimes as JavaRuntime[]) : [];
-      const valid = list.filter((runtime) => runtime?.path);
+      const list = dtoArray(dtoRecord(res, 'Java runtimes').runtimes, 'Java runtimes').map((value): JavaRuntime => {
+        const runtime = dtoRecord(value, 'Java runtime');
+        return {
+          path: dtoString(runtime.path, 'Java runtime path'),
+          component: dtoString(runtime.component, 'Java runtime component'),
+          source: dtoString(runtime.source, 'Java runtime source'),
+        };
+      });
+      const valid = list.filter((runtime) => runtime.path);
       if (valid.length > 0) runtimeCache = valid;
       return valid;
     } catch {

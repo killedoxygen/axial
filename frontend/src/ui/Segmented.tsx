@@ -1,11 +1,11 @@
 import type { JSX } from 'preact';
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { Icon } from './Icons';
+import { Icon, type IconName } from './Icons';
 
 export type SegmentedOption<T extends string> = {
   value: T;
   label: string;
-  icon?: string;
+  icon?: IconName;
   disabled?: boolean;
   title?: string;
 };

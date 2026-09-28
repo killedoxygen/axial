@@ -1,19 +1,20 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { InstanceTile } from '../ui/InstanceVisual';
-import { Icon } from '../ui/Icons';
+import { Icon, type IconName } from '../ui/Icons';
 import { Logo } from '../ui/Logo';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
 import { route, navigate, commandPaletteOpen, type Route, openCreate, openAccountSwitcher } from '../ui-state';
-import { runningSessions, config, instances, versionById } from '../store';
+import { launchSessions, config, instances, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
 import { accountDisplayName, accountSkinSrc } from '../player-skin';
 import { Music, musicStateVersion } from '../music';
-import { local, saveLocalState } from '../state';
+import { local, saveLocalState, canEditPreferences } from '../state';
 import { Sound } from '../sound';
 import { openInstanceContextMenu } from '../views/instance/instance-menu';
 import type { Instance } from '../types-instance';
 import { shortcutHint } from '../shortcuts';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
 
 type RailTip = {
   label: string;
@@ -48,7 +49,7 @@ function railTipAttrs(label: string, tooltip: RailTooltipController) {
   };
 }
 
-function RailIcon({ name, size = 20 }: { name: string; size?: number }): JSX.Element {
+function RailIcon({ name, size = 20 }: { name: IconName; size?: number }): JSX.Element {
   if (name === 'stack') {
     return (
       <span class="cp-rail-icon" aria-hidden="true">
@@ -91,7 +92,7 @@ function RailButton({
   accent,
   tooltip,
 }: {
-  icon: string;
+  icon: IconName;
   label: string;
   target: Route;
   accent?: boolean;
@@ -172,7 +173,9 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
         <div class="cp-rail-instances" ref={listRef} onScroll={updateScrollCue}>
           {list.map((inst) => {
             const active = current.name === 'instance' && current.id === inst.id;
-            const running = !!runningSessions.value[inst.id];
+            const session = launchSessions.value[inst.id];
+            const playing = launchSessionIsPlaying(session);
+            const sessionLabel = launchSessionActivityLabel(session);
             const version = versionById(inst.version_id);
             const install = instanceInstallStatus(inst, version);
             const installing = install.installing;
@@ -182,7 +185,8 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
                 key={inst.id}
                 class="cp-rail-tile"
                 data-active={active}
-                data-running={running}
+                data-running={playing}
+                data-session-active={Boolean(session)}
                 data-installing={installing}
                 onClick={() => {
                   tooltip.hide();
@@ -192,8 +196,13 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
                   tooltip.hide();
                   openInstanceContextMenu(e, inst);
                 }}
-                aria-label={installing ? `${inst.name}: ${installLabel}` : inst.name}
-                {...railTipAttrs(installing ? `${inst.name}: ${installLabel}` : inst.name, tooltip)}
+                aria-label={
+                  installing ? `${inst.name}: ${installLabel}` : session ? `${inst.name}: ${sessionLabel}` : inst.name
+                }
+                {...railTipAttrs(
+                  installing ? `${inst.name}: ${installLabel}` : session ? `${inst.name}: ${sessionLabel}` : inst.name,
+                  tooltip,
+                )}
               >
                 <InstanceTile inst={inst} radius={12} className="cp-rail-tile-art" />
                 {installing && (
@@ -201,7 +210,12 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
                     <Icon name={install.state === 'queued' ? 'clock' : 'download'} size={10} stroke={2.4} />
                   </span>
                 )}
-                {running && <span class="cp-rail-tile-dot" aria-hidden="true" />}
+                {playing && <span class="cp-rail-tile-dot" aria-hidden="true" />}
+                {session && !playing && !installing && (
+                  <span class="cp-rail-tile-session" aria-hidden="true">
+                    <Icon name="clock" size={10} stroke={2.4} />
+                  </span>
+                )}
               </button>
             );
           })}
@@ -219,6 +233,7 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
   const soundsOn = local.sounds;
 
   const toggleSounds = (): void => {
+    if (!canEditPreferences()) return;
     const next = !soundsOn;
     local.sounds = next;
     Sound.enabled = next;
@@ -237,7 +252,7 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
     hint,
     right,
   }: {
-    icon: string;
+    icon: IconName;
     label: string;
     onSelect: () => void;
     hint?: string;
@@ -344,7 +359,7 @@ function UserTrigger({ tooltip }: { tooltip: RailTooltipController }): JSX.Eleme
         aria-label={`${username}, account menu`}
         {...railTipAttrs(username, tooltip)}
       >
-        <PlayerHeadPreview username={username} textureSrc={accountSkinSrc.value ?? undefined} size={34} radius={11} />
+        <PlayerHeadPreview textureSrc={accountSkinSrc.value ?? undefined} size={34} radius={11} />
       </button>
     </div>
   );

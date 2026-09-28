@@ -1,9 +1,9 @@
 import { api } from './api';
+import { config } from './store';
 
 type FrontendErrorKind = 'error' | 'unhandledrejection' | 'render';
 
 const MAX_REPORTS_PER_SESSION = 5;
-const MAX_MESSAGE_CHARS = 200;
 
 let initialized = false;
 let reportsSent = 0;
@@ -17,7 +17,7 @@ export function initErrorReporting(): void {
 
   const previousOnError = window.onerror;
   window.onerror = (message, _source, _lineno, _colno, error): boolean | void => {
-    reportBrowserError('error', error, message);
+    reportBrowserError('error', error);
     if (typeof previousOnError === 'function') {
       return previousOnError(message, _source, _lineno, _colno, error);
     }
@@ -33,12 +33,19 @@ export function reportRenderError(error: unknown): void {
   reportBrowserError('render', error);
 }
 
-function reportBrowserError(kind: FrontendErrorKind, error: unknown, fallbackMessage?: unknown): void {
+function reportBrowserError(kind: FrontendErrorKind, error: unknown): void {
+  let dedupeKey: string | undefined;
   try {
-    if (reportingInFlight || consecutiveReportingFailures >= 3 || reportsSent >= MAX_REPORTS_PER_SESSION) return;
+    if (
+      config.peek()?.telemetry_enabled !== true ||
+      reportingInFlight ||
+      consecutiveReportingFailures >= 3 ||
+      reportsSent >= MAX_REPORTS_PER_SESSION
+    )
+      return;
 
-    const payload = errorPayload(kind, error, fallbackMessage);
-    const dedupeKey = `${payload.kind}:${payload.name}:${payload.message}`;
+    const payload = errorPayload(kind, error);
+    dedupeKey = `${payload.kind}:${payload.name}:${payload.message}`;
     if (reportedKeys.has(dedupeKey)) return;
 
     reportedKeys.add(dedupeKey);
@@ -51,13 +58,14 @@ function reportBrowserError(kind: FrontendErrorKind, error: unknown, fallbackMes
       })
       .catch(() => {
         consecutiveReportingFailures += 1;
-        reportedKeys.delete(dedupeKey);
+        if (dedupeKey !== undefined) reportedKeys.delete(dedupeKey);
       })
       .finally(() => {
         reportingInFlight = false;
       });
   } catch {
     consecutiveReportingFailures += 1;
+    if (dedupeKey !== undefined) reportedKeys.delete(dedupeKey);
     if (reportingInFlight) {
       reportingInFlight = false;
     }
@@ -67,7 +75,6 @@ function reportBrowserError(kind: FrontendErrorKind, error: unknown, fallbackMes
 function errorPayload(
   kind: FrontendErrorKind,
   error: unknown,
-  fallbackMessage?: unknown,
 ): {
   kind: FrontendErrorKind;
   name: string;
@@ -76,33 +83,23 @@ function errorPayload(
   return {
     kind,
     name: errorName(error),
-    message: truncateMessage(errorMessage(error, fallbackMessage)),
+    // Error messages, stacks, filenames and thrown values can contain credentials,
+    // paths or account names. Never read or send them, even to the local API.
+    message:
+      kind === 'render'
+        ? 'Render failed.'
+        : kind === 'unhandledrejection'
+          ? 'Unhandled promise rejection.'
+          : 'Browser error.',
   };
 }
 
 function errorName(error: unknown): string {
-  if (error instanceof Error && typeof error.constructor?.name === 'string' && error.constructor.name.trim()) {
-    return error.constructor.name;
-  }
+  if (error instanceof TypeError) return 'TypeError';
+  if (error instanceof ReferenceError) return 'ReferenceError';
+  if (error instanceof RangeError) return 'RangeError';
+  if (error instanceof SyntaxError) return 'SyntaxError';
+  if (error instanceof URIError) return 'URIError';
+  if (error instanceof EvalError) return 'EvalError';
   return 'Error';
-}
-
-function errorMessage(error: unknown, fallbackMessage?: unknown): string {
-  if (error instanceof Error && error.message) return safeString(error.message);
-  if (fallbackMessage !== undefined) return safeString(fallbackMessage);
-  return safeString(error);
-}
-
-function truncateMessage(message: string): string {
-  const normalized = message.replace(/\s+/g, ' ').trim();
-  if (normalized.length <= MAX_MESSAGE_CHARS) return normalized;
-  return `${normalized.slice(0, MAX_MESSAGE_CHARS - 3)}...`;
-}
-
-function safeString(value: unknown): string {
-  try {
-    return String(value);
-  } catch {
-    return 'Unknown error';
-  }
 }

@@ -9,9 +9,10 @@ import { formatBytes, fmtDayLabel, fmtRelative } from '../../../format';
 import type { EnrichedInstance, InstanceScreenshot } from '../../../types-instance';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
-import { ResourceEmpty, ResourceStatus } from '../components/resource-bits';
+import { ResourceEmpty, ResourceMutationStatus, ResourceStatus } from '../components/resource-bits';
 import { ScreenshotLightbox } from '../components/screenshot-lightbox';
 import { deleteScreenshots, screenshotFileUrl, screenshotMenuItems } from '../screenshot-actions';
+import { resourceMutationState } from '../bulk-actions';
 
 type ScreenshotSort = 'newest' | 'name' | 'size';
 
@@ -36,6 +37,7 @@ export function ScreenshotsPane({
   onRefresh: () => void;
 }): JSX.Element {
   const rawScreenshots = resources.data?.screenshots ?? [];
+  const busy = resourceMutationState(inst.id).status === 'pending';
   const [sort, setSort] = useState<ScreenshotSort>('newest');
   const [viewer, setViewer] = useState<string>('');
   const [optimisticRename, setOptimisticRename] = useState<OptimisticScreenshotRename | null>(null);
@@ -82,7 +84,7 @@ export function ScreenshotsPane({
       onRefresh,
     });
   const deleteSelected = async (): Promise<void> => {
-    await deleteScreenshots(inst, selection.selectedItems, clearAndRefresh);
+    await deleteScreenshots(inst, selection.selectedItems, clearAndRefresh, onRefresh);
   };
   const clearAndRefresh = (): void => {
     selection.clear();
@@ -144,7 +146,8 @@ export function ScreenshotsPane({
         </div>
       </div>
       <ResourceStatus state={resources} onRetry={onRefresh} />
-      {screenshots.length === 0 && resources.status !== 'loading' ? (
+      <ResourceMutationStatus instanceId={inst.id} />
+      {screenshots.length === 0 && resources.status === 'ready' ? (
         <ResourceEmpty
           icon="image"
           title="No screenshots yet"
@@ -226,7 +229,9 @@ export function ScreenshotsPane({
       <SelectionActionTray
         selection={selection}
         itemLabel="screenshot"
-        actions={[{ label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() }]}
+        actions={[
+          { label: 'Delete', icon: 'trash', danger: true, disabled: busy, onClick: () => void deleteSelected() },
+        ]}
       />
     </div>
   );

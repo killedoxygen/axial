@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-window-set-resize-background"
+description = "Enables the window_set_resize_background command without any pre-configured scope."
+commands.allow = ["window_set_resize_background"]
+
+[[permission]]
+identifier = "deny-window-set-resize-background"
+description = "Denies the window_set_resize_background command without any pre-configured scope."
+commands.deny = ["window_set_resize_background"]

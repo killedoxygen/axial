@@ -3,49 +3,48 @@ name = "axial-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-authors.workspace = true
+
+[features]
+default = ["embedded-frontend"]
+embedded-frontend = ["dep:include_dir", "dep:mime_guess"]
 
 [dependencies]
-async-stream.workspace = true
+axial-app.workspace = true
+axial-fs.workspace = true
+axial-minecraft.workspace = true
 axum.workspace = true
-base64.workspace = true
-chrono.workspace = true
-flate2.workspace = true
+async-stream.workspace = true
 futures-util.workspace = true
-include_dir.workspace = true
-keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
-p256.workspace = true
-png.workspace = true
-rand.workspace = true
-reqwest = { workspace = true, features = ["blocking", "multipart"] }
-self-replace.workspace = true
-semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha1.workspace = true
-sha2.workspace = true
-shlex.workspace = true
-sysinfo.workspace = true
-tar.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
-tower.workspace = true
-tower-http.workspace = true
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
-url.workspace = true
 uuid.workspace = true
-zip.workspace = true
-axial-config = { path = "../../core/config" }
-axial-content = { path = "../../core/content" }
-axial-launcher = { path = "../../core/launcher" }
-axial-minecraft = { path = "../../core/minecraft" }
-axial-performance = { path = "../../core/performance" }
+url.workspace = true
+dirs.workspace = true
+thiserror.workspace = true
+include_dir = { workspace = true, optional = true }
+mime_guess = { workspace = true, optional = true }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+
+[build-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
+axial-app = { workspace = true, features = ["test-support"] }
+axial-minecraft = { workspace = true, features = ["test-support"] }
+axial-performance.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+tempfile.workspace = true
+reqwest.workspace = true
+http-body-util.workspace = true
+png.workspace = true
+sha1.workspace = true
+zip.workspace = true

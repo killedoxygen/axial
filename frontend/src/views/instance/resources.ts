@@ -1,5 +1,7 @@
 import { api } from '../../api';
 import type { InstanceResourceSummary } from '../../types-instance';
+import { instanceResourcesResponse } from '../../dto-core';
+import { dtoWithoutError, type DtoRecord } from '../../dto-contract';
 
 export type ResourceLoadState =
   | { status: 'loading'; data: InstanceResourceSummary | null; error?: undefined }
@@ -20,14 +22,11 @@ export function emptyResources(): InstanceResourceSummary {
 }
 
 export async function fetchInstanceResources(id: string): Promise<InstanceResourceSummary> {
-  const res: any = await api('GET', `/instances/${encodeURIComponent(id)}/resources`);
-  if (res?.error) throw new Error(res.error);
-  return {
-    ...emptyResources(),
-    ...res,
-    worlds: Array.isArray(res?.worlds) ? res.worlds : [],
-    mods: Array.isArray(res?.mods) ? res.mods : [],
-    screenshots: Array.isArray(res?.screenshots) ? res.screenshots : [],
-    logs: Array.isArray(res?.logs) ? res.logs : [],
-  };
+  return instanceResourcesResponse(await api('GET', `/instances/${encodeURIComponent(id)}/resources`));
+}
+
+export function requireResourceCommandSuccess(value: unknown, label: string): DtoRecord {
+  const response = dtoWithoutError(value, label);
+  if (response.status !== 'ok') throw new Error(`${label} was not confirmed. Refresh the list before trying again.`);
+  return response;
 }

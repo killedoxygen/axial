@@ -1,16 +1,16 @@
 import type { JSX } from 'preact';
 import type { LoaderKey } from './defaults';
 
-const LOADER_LOGO_SRC: Partial<Record<LoaderKey, string>> = {
-  vanilla: 'vanilla_icon.svg',
-  fabric: 'fabric_icon.svg',
-  forge: 'forge_icon.svg',
-  neoforge: 'neoforge_icon.svg',
-  quilt: 'quilt_icon.svg',
+const LOADER_LOGO_SRC: Record<LoaderKey, string> = {
+  vanilla: 'loader-base.svg',
+  fabric: 'loader-grid.svg',
+  forge: 'loader-cross.svg',
+  neoforge: 'loader-orbit.svg',
+  quilt: 'loader-diamonds.svg',
 };
 
-export function loaderLogoSrc(loader: LoaderKey): string | null {
-  return LOADER_LOGO_SRC[loader] ?? null;
+export function loaderLogoSrc(loader: LoaderKey): string {
+  return LOADER_LOGO_SRC[loader];
 }
 
 export function LoaderLogo({
@@ -21,14 +21,12 @@ export function LoaderLogo({
   loader: LoaderKey;
   size?: number;
   class?: string;
-}): JSX.Element | null {
+}): JSX.Element {
   const src = loaderLogoSrc(loader);
-  if (!src) return null;
   return (
     <span
       aria-hidden="true"
       class={className}
-      data-loader={loader}
       style={{
         ['--cp-loader-src' as any]: `url("${src}")`,
         width: `${size}px`,

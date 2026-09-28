@@ -32,8 +32,6 @@ interface MockRequest {
 interface StatusResponse {
   status: string;
   warnings: string[];
-  library_dir: string;
-  library_mode: string;
   setup_required: boolean;
   app_name: string;
   version: string;
@@ -115,6 +113,8 @@ interface CreateLoaderBuildsViewResponse {
     selection_id: string;
     label: string;
     detail: string;
+    enabled: boolean;
+    disabled_reason: string | null;
   };
   builds: Array<{
     selection_id: string;
@@ -131,20 +131,6 @@ interface CreateLoaderBuildsViewResponse {
 
 interface CreateInstanceResponse extends EnrichedInstance {
   install_queue?: InstallQueueStateResponse;
-  result: {
-    command: 'CreateInstance';
-    operation_id: null;
-    status: 'succeeded';
-    safety: null;
-    carriers: Record<string, never>;
-    payload: {
-      instance_id: string;
-      queue_id: null;
-      install_id: null;
-      operation_id: null;
-    };
-    view_model: null;
-  };
   view_model: {
     state_id: 'created';
     tone: 'success';
@@ -185,10 +171,13 @@ const flagOverrides = new Map<string, boolean>();
 const FABRIC_COMPONENT_ID = 'net.fabricmc.fabric-loader';
 const MOCK_FABRIC_MC_VERSION = '1.21.5';
 const MOCK_FABRIC_MC_ALT = '1.21.4';
-const MOCK_FABRIC_BUILD_ID = 'fabric-loader-0.16.14-1.21.5';
+const MOCK_FABRIC_BUILD_ID = 'loader-build-v1-YXhpYWwtbG9hZGVyLWJ1aWxkAAEAAAAAAAAABjEuMjEuNQAAAAAAAAAHMC4xNi4xNA';
+const MOCK_FABRIC_VERSION_ID = 'loader-v2-YXhpYWwtaW5zdGFsbGVkLWxvYWRlcgABAAYxLjIxLjUABzAuMTYuMTQ';
 const MOCK_FABRIC_LOADER_VERSION = '0.16.14';
 
 let configFixture: Config = {
+  revision: 0,
+  account_selection_revision: 0,
   username: 'MockPlayer',
   launch_auth_mode: 'offline',
   max_memory_mb: 4096,
@@ -198,7 +187,6 @@ let configFixture: Config = {
   window_height: 720,
   jvm_preset: '',
   performance_mode: 'managed',
-  guardian_mode: 'managed',
   theme: 'obsidian',
   custom_hue: 140,
   custom_vibrancy: 100,
@@ -207,8 +195,6 @@ let configFixture: Config = {
   telemetry_enabled: false,
   discord_rpc_enabled: true,
   discord_rpc_onboarding_seen: true,
-  library_dir: '/mock/Axial Library',
-  library_mode: 'managed',
   music_enabled: false,
   music_volume: 35,
   music_track: 0,
@@ -468,7 +454,6 @@ function seedContent(seed: MockSeed): CanonicalContent {
     game_versions: seed.games ?? MOCK_GAME_VERSIONS,
     loaders,
     updated: daysAgo(seed.updatedDays),
-    sources: [{ provider: 'modrinth', project_id: projectId, slug: projectId }],
   };
 }
 
@@ -515,7 +500,6 @@ const mockInstanceContent: Record<string, InstanceContentEntry[]> = {
       version_id: 'fabric-api-mock-1',
       filename: 'fabric-api.jar',
       enabled: true,
-      source: 'managed',
     },
   ],
 };
@@ -691,7 +675,12 @@ function mockModpackTarget(canonicalId: string): ModpackTarget {
 }
 
 function mockModpackInstall(body: unknown): InstallQueueStateResponse {
-  if (!isRecord(body) || typeof body.instance_id !== 'string' || typeof body.canonical_id !== 'string') {
+  if (
+    !isRecord(body) ||
+    typeof body.instance_id !== 'string' ||
+    typeof body.canonical_id !== 'string' ||
+    !Array.isArray(body.selected_file_ids)
+  ) {
     throw apiError(400, 'Bad Request', { error: 'invalid modpack install request' });
   }
   return mockEmptyInstallQueue('Content queued', 'Modpack files');
@@ -727,7 +716,6 @@ function mockContentInstall(body: unknown): InstallQueueStateResponse {
       version_id: item.version_id,
       filename: item.filename,
       enabled: true,
-      source: 'managed',
     });
   }
   return mockEmptyInstallQueue('Content queued', `${plan.items.length} items`);
@@ -750,6 +738,9 @@ function mockContentUninstalls(instanceId: string, canonicalIds: string[]): Inst
 
 function mockEmptyInstallQueue(message?: string, detail?: string): InstallQueueStateResponse {
   return {
+    queue_epoch: 'mock-queue',
+    revision: 0,
+    registry_revision: 0,
     active: null,
     items: [],
     view_model: {
@@ -782,7 +773,7 @@ function mockModpackFiles(_instanceId: string, canonicalId: string): ModpackFile
     loader: 'fabric',
     files: [
       {
-        path: 'mods/sodium.jar',
+        selection_id: `mpf1-${'1'.repeat(64)}`,
         filename: 'sodium.jar',
         kind: 'mod',
         size: 1_250_000,
@@ -792,7 +783,7 @@ function mockModpackFiles(_instanceId: string, canonicalId: string): ModpackFile
         installed: false,
       },
       {
-        path: 'mods/lithium.jar',
+        selection_id: `mpf1-${'2'.repeat(64)}`,
         filename: 'lithium.jar',
         kind: 'mod',
         size: 740_000,
@@ -893,15 +884,13 @@ const handlers: Record<string, Handler> = {
   'GET /config': () => configFixture,
   'PUT /config': (body) => {
     if (isRecord(body)) {
-      configFixture = { ...configFixture, ...body };
+      configFixture = { ...configFixture, ...body, revision: configFixture.revision + 1 };
     }
     return configFixture;
   },
   'GET /status': (): StatusResponse => ({
     status: 'ok',
     warnings: [],
-    library_dir: configFixture.library_dir ?? '',
-    library_mode: configFixture.library_mode ?? 'managed',
     setup_required: false,
     app_name: 'Axial',
     version: 'mock-dev',
@@ -1105,25 +1094,14 @@ const versionFixtures: Version[] = [
   vanillaVersion('1.21.5', '2025-03-25T12:00:00Z', true),
   vanillaVersion('1.20.1', '2023-06-12T12:00:00Z', true),
   {
-    ...vanillaVersion('fabric-loader-0.16.14-1.21.5', '2025-03-26T12:00:00Z', true),
+    ...vanillaVersion(MOCK_FABRIC_VERSION_ID, '2025-03-26T12:00:00Z', true),
     raw_kind: 'fabric',
     inherits_from: '1.21.5',
     minecraft_meta: minecraftMeta('1.21.5'),
     loader: {
       component_id: 'net.fabricmc.fabric-loader',
-      component_name: 'Fabric Loader',
-      build_id: 'fabric-loader-0.16.14-1.21.5',
+      build_id: MOCK_FABRIC_BUILD_ID,
       loader_version: '0.16.14',
-      build_meta: {
-        terms: ['recommended'],
-        evidence: [{ term: 'recommended', source: 'explicit_version_label' }],
-        selection: {
-          default_rank: 100,
-          reason: 'recommended',
-          source: 'explicit_version_label',
-        },
-        display_tags: ['stable'],
-      },
     },
   },
 ];
@@ -1143,7 +1121,7 @@ const instanceFixtures: EnrichedInstance[] = [
   instanceFixture({
     id: 'mock-fabric-lab',
     name: 'Fabric Lab',
-    version_id: 'fabric-loader-0.16.14-1.21.5',
+    version_id: MOCK_FABRIC_VERSION_ID,
     created_at: '2026-06-20T14:30:00.000Z',
     last_played_at: '2026-07-05T18:05:00.000Z',
     art_seed: 84291,
@@ -1173,14 +1151,14 @@ const instanceFixtures: EnrichedInstance[] = [
 
 let lastInstanceId: string | null = 'mock-fabric-lab';
 
-export async function mockApi<T>(method: string, path: string, body?: unknown): Promise<T> {
+export async function mockApi(method: string, path: string, body?: unknown): Promise<unknown> {
   const normalizedMethod = method.toUpperCase();
   const request = normalizeRequest(path);
   const normalizedPath = request.path;
   const key = handlerKey(normalizedMethod, normalizedPath);
   const handler = handlers[key];
   if (!handler) throw missingHandlerError(key);
-  return cloneJsonResponse(await handler(body, normalizedPath, request)) as T;
+  return cloneJsonResponse(await handler(body, normalizedPath, request));
 }
 
 function handlerKey(method: string, path: string): string {
@@ -1298,6 +1276,8 @@ function createLoaderBuildsView(request: MockRequest | undefined): CreateLoaderB
       selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${minecraftVersion}`,
       label: 'Automatic',
       detail: 'Axial picks the newest stable Fabric build.',
+      enabled: true,
+      disabled_reason: null,
     },
     builds: [
       {
@@ -1348,20 +1328,6 @@ function createInstance(body: unknown): CreateInstanceResponse {
 
   return {
     ...created,
-    result: {
-      command: 'CreateInstance',
-      operation_id: null,
-      status: 'succeeded',
-      safety: null,
-      carriers: {},
-      payload: {
-        instance_id: created.id,
-        queue_id: null,
-        install_id: null,
-        operation_id: null,
-      },
-      view_model: null,
-    },
     view_model: {
       state_id: 'created',
       tone: 'success',
@@ -1498,7 +1464,7 @@ function createSelection(selectionId: string): {
   ) {
     const minecraft = kind === 'loader_version' ? value : MOCK_FABRIC_MC_VERSION;
     return {
-      versionId: MOCK_FABRIC_BUILD_ID,
+      versionId: MOCK_FABRIC_VERSION_ID,
       versionDisplay: versionDisplay(
         'fabric',
         'Fabric',
@@ -1534,6 +1500,7 @@ function versionDisplay(
 
 function flagsResponse(): FlagsResponse {
   return {
+    revision: configFixture.revision,
     flags: flagRegistry.map((flag): FeatureFlagViewModel => {
       const override = flagOverrides.get(flag.key);
       return {
@@ -1606,7 +1573,6 @@ function vanillaVersion(id: string, releaseTime: string, installed: boolean): Ve
     needs_install: installed ? '' : 'client',
     java_component: 'java-runtime-delta',
     java_major: 21,
-    manifest_url: '',
     loader: null,
   };
 }
@@ -1696,6 +1662,6 @@ function nextArtSeed(name: string): number {
   return Math.abs(hash) || 1;
 }
 
-function isRecord(value: unknown): value is Record<string, any> {
+function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

@@ -31,6 +31,7 @@ import type { ContextMenuItem } from '../../ui/ContextMenu';
 import {
   activeMinecraftCape,
   activeMinecraftSkin,
+  boundedMessage,
   capeFileUrl,
   DEFAULT_SKIN_SOURCE,
   skinVariantValue,
@@ -79,7 +80,10 @@ export function SavedSkinLibrary({
   const uploadWorkflow = useSavedSkinUploadWorkflow();
 
   const skins = data.skins;
-  const pendingApplyKey = data.pendingApplyKey;
+  const pendingApplyKey =
+    data.pendingApply?.phase === 'queued' || data.pendingApply?.phase === 'applying'
+      ? data.pendingApply.texture_key
+      : null;
   const profileSkin = activeMinecraftSkin(profile ?? undefined);
   const profileCape = activeMinecraftCape(profile ?? undefined);
   const availableCapes = profile?.capes ?? [];
@@ -208,17 +212,16 @@ export function SavedSkinLibrary({
     stageEditReplacementFile: edit.stageEditReplacementFile,
   });
 
-  const profileMenuItems: ContextMenuItem[] = [
-    ...(skinActionsEnabled && profileSkin && op === null
-      ? [{ icon: 'download', label: 'Save locally', onSelect: () => void saveProfileSkinLocally() }]
-      : []),
-    ...(skinActionsEnabled && profileSkin && op === null
-      ? [{ icon: 'x', label: 'Reset profile skin', onSelect: () => void resetProfileSkin() }]
-      : []),
-    ...(skinActionsEnabled && profileCape && op === null
-      ? [{ icon: 'x', label: 'Reset profile cape', onSelect: () => void resetProfileCape() }]
-      : []),
-  ];
+  const profileMenuItems: ContextMenuItem[] = [];
+  if (skinActionsEnabled && profileSkin && op === null) {
+    profileMenuItems.push(
+      { icon: 'download', label: 'Save locally', onSelect: () => void saveProfileSkinLocally() },
+      { icon: 'x', label: 'Reset profile skin', onSelect: () => void resetProfileSkin() },
+    );
+  }
+  if (skinActionsEnabled && profileCape && op === null) {
+    profileMenuItems.push({ icon: 'x', label: 'Reset profile cape', onSelect: () => void resetProfileCape() });
+  }
   const showProfileSkinTile = Boolean(profile && profileSkin && !showProfileSelectedPreview && !currentProfileSavedKey);
 
   const editingSkin = edit.editKey ? (savedSkinByKey.get(edit.editKey) ?? null) : null;
@@ -233,7 +236,8 @@ export function SavedSkinLibrary({
     lookup.lookupUsernameError && lookup.lookupState !== 'error' ? lookup.lookupUsernameError : null,
     lookup.lookupState === 'error' ? lookup.lookupError : null,
     notice,
-    data.state === 'unavailable' ? (data.error ?? 'Saved skins are unavailable.') : null,
+    data.pendingApply?.error ? boundedMessage(data.pendingApply.error, 'Minecraft profile apply failed.') : null,
+    data.error ?? (data.state === 'unavailable' ? 'Saved skins are unavailable.' : null),
   ].filter((text): text is string => Boolean(text));
 
   const tileMenuItems = (skin: SavedSkinRecord): ContextMenuItem[] =>
@@ -271,7 +275,7 @@ export function SavedSkinLibrary({
         onSaveLookup={(applyAfterSave) => void lookup.saveUsernameSkin(applyAfterSave)}
         onDismissLookup={lookup.dismissLookup}
         onStartEdit={startEditGuarded}
-        onOpenUploadPicker={() => uploadWorkflow.openUploadPicker(false)}
+        onOpenUploadPicker={uploadWorkflow.openUploadPicker}
       />
 
       <section
@@ -341,7 +345,7 @@ export function SavedSkinLibrary({
               deletingKey={op?.kind === 'delete' ? (op.key ?? null) : null}
               capeSrcForId={capeSrcForId}
               tileMenuItems={tileMenuItems}
-              onOpenUploadPicker={() => uploadWorkflow.openUploadPicker(false)}
+              onOpenUploadPicker={uploadWorkflow.openUploadPicker}
               onViewProfileSkin={previewProfileSkin}
               onViewSavedSkin={(textureKey) => void viewSavedSkin(textureKey)}
             />

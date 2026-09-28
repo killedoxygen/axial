@@ -1,613 +1,343 @@
-use crate::{
-    application::instances::{
-        self, CreateInstanceRequest, CreateInstanceResponse, CreateInstanceViewResponse,
-        CreateLoaderBuildsViewResponse, DuplicateInstanceRequest, InstanceLogInfo,
-        InstanceLogTailResponse, InstanceModInfo, InstancePatch, InstanceResourcesResponse,
-        InstanceScreenshotInfo, InstanceWorldInfo, OpenFolderQuery, RenameScreenshotRequest,
-        RenameWorldRequest, UpdateModRequest, WorldBackupResponse,
-    },
-    state::AppState,
+use axial_app::instances::{
+    create::{CreateInstanceRequest, InstanceService},
+    delete::{DeleteIntent, DeletionError},
+    duplicate::DuplicateRequest,
+    from_pack::CreateFromModpackRequest,
+    model::{InstanceError, InstanceId, InstancePatch},
+    setup::{InstanceSetupExecuteRequest, InstanceSetupPlanRequest, SetupService},
 };
-use axial_config::EnrichedInstance;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{
+        DefaultBodyLimit, Path, Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::StatusCode,
-    response::Response,
-    routing::{get, post, put},
+    routing::{get, post},
 };
-use std::collections::HashMap;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::sync::Arc;
 
-#[derive(Debug, Default, serde::Deserialize)]
-struct CreateInstanceViewQuery {
-    source: Option<String>,
+#[derive(Clone)]
+struct Services {
+    instances: Arc<InstanceService>,
+    setup: Arc<SetupService>,
 }
+type ApiError = (StatusCode, Json<Value>);
 
-#[derive(Debug, Default, serde::Deserialize)]
-struct CreateLoaderBuildsViewQuery {
-    #[serde(default)]
-    source: String,
-    #[serde(default)]
-    minecraft_version: String,
-}
-
-pub fn router() -> Router<AppState> {
+/// Authentication and origin admission are attached once by API composition.
+pub fn router(instances: Arc<InstanceService>, setup: Arc<SetupService>) -> Router<()> {
     Router::new()
-        .route(
-            "/api/v1/instances",
-            get(handle_list_instances).post(handle_create_instance),
-        )
-        .route(
-            "/api/v1/instances/create-view",
-            get(handle_create_instance_view),
-        )
+        .route("/api/v1/instances", get(list).post(create))
+        .route("/api/v1/instances/modpack", post(create_modpack))
+        .route("/api/v1/instances/create-view", get(create_view))
         .route(
             "/api/v1/instances/create-view/loader-builds",
-            get(handle_create_loader_builds_view),
+            get(loader_builds),
+        )
+        .route("/api/v1/instances/pending", get(pending))
+        .route("/api/v1/instances/setup/plan", post(plan_setup))
+        .route("/api/v1/instances/setup", post(execute_setup))
+        .route("/api/v1/instances/{id}/setup/resume", post(resume_setup))
+        .route(
+            "/api/v1/instances/pending/{id}/resume",
+            post(resume_creation),
         )
         .route(
-            "/api/v1/instances/setup/plan",
-            post(handle_instance_setup_plan),
-        )
-        .route("/api/v1/instances/setup", post(handle_instance_setup))
-        .route(
-            "/api/v1/instances/modpack",
-            post(handle_modpack_instance_setup),
+            "/api/v1/instances/deletions/{operation_id}",
+            get(deletion_status),
         )
         .route(
             "/api/v1/instances/{id}",
-            get(handle_get_instance)
-                .put(handle_update_instance)
-                .delete(handle_delete_instance),
+            get(detail).put(update).delete(delete),
         )
-        .route(
-            "/api/v1/instances/{id}/duplicate",
-            post(handle_duplicate_instance),
-        )
-        .route(
-            "/api/v1/instances/{id}/resources",
-            get(handle_instance_resources),
-        )
-        .route("/api/v1/instances/{id}/worlds", get(handle_instance_worlds))
-        .route(
-            "/api/v1/instances/{id}/worlds/{name}",
-            put(handle_rename_instance_world).delete(handle_delete_instance_world),
-        )
-        .route(
-            "/api/v1/instances/{id}/worlds/{name}/backup",
-            post(handle_backup_instance_world),
-        )
-        .route("/api/v1/instances/{id}/mods", get(handle_instance_mods))
-        .route(
-            "/api/v1/instances/{id}/mods/{name}",
-            put(handle_update_instance_mod).delete(handle_delete_instance_mod),
-        )
-        .route(
-            "/api/v1/instances/{id}/screenshots",
-            get(handle_instance_screenshots),
-        )
-        .route(
-            "/api/v1/instances/{id}/screenshots/{name}",
-            put(handle_rename_instance_screenshot).delete(handle_delete_instance_screenshot),
-        )
-        .route(
-            "/api/v1/instances/{id}/screenshots/{name}/file",
-            get(handle_instance_screenshot_file),
-        )
-        .route("/api/v1/instances/{id}/logs", get(handle_instance_logs))
-        .route(
-            "/api/v1/instances/{id}/logs/{name}",
-            get(handle_instance_log_tail),
-        )
-        .route(
-            "/api/v1/instances/{id}/open-folder",
-            post(handle_open_instance_folder),
-        )
+        .route("/api/v1/instances/{id}/duplicate", post(duplicate))
+        .layer(DefaultBodyLimit::max(32 * 1024))
+        .with_state(Services { instances, setup })
 }
 
-async fn handle_list_instances(
-    State(state): State<AppState>,
-) -> Json<instances::InstancesResponse> {
-    Json(instances::handle_list_instances(&state).await)
+async fn list(State(services): State<Services>) -> Result<Json<Value>, ApiError> {
+    let records = services.instances.registry().list().map_err(error)?;
+    let versions = services.setup.installed().await.map_err(error)?;
+    let mut instances = Vec::with_capacity(records.len());
+    for record in records {
+        instances.push(services.setup.enrich(record.instance, &versions).await);
+    }
+    let last_instance_id = services
+        .instances
+        .registry()
+        .last_instance_id()
+        .map_err(error)?;
+    Ok(Json(
+        json!({"instances": instances, "last_instance_id": last_instance_id}),
+    ))
 }
 
-async fn handle_modpack_instance_setup(
-    State(state): State<AppState>,
-    Json(payload): Json<instances::ModpackInstanceSetupRequest>,
-) -> Result<Json<CreateInstanceResponse>, (StatusCode, Json<serde_json::Value>)> {
-    instances::execute_modpack_instance_setup(&state, payload)
-        .await
-        .map(Json)
-}
-
-async fn handle_get_instance(
-    State(state): State<AppState>,
+async fn detail(
+    State(services): State<Services>,
     Path(id): Path<String>,
-) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_get_instance(&state, &id).await.map(Json)
+) -> Result<Json<Value>, ApiError> {
+    let record = services
+        .instances
+        .registry()
+        .get_live(&identity(&id)?)
+        .map_err(error)?;
+    let versions = services.setup.installed().await.map_err(error)?;
+    Ok(Json(json!(
+        services.setup.enrich(record.instance, &versions).await
+    )))
 }
 
-async fn handle_create_instance_view(
-    State(state): State<AppState>,
-    Query(query): Query<CreateInstanceViewQuery>,
-) -> Json<CreateInstanceViewResponse> {
-    Json(instances::handle_create_instance_view(&state, query.source.as_deref()).await)
-}
-
-async fn handle_create_loader_builds_view(
-    State(state): State<AppState>,
-    Query(query): Query<CreateLoaderBuildsViewQuery>,
-) -> Result<Json<CreateLoaderBuildsViewResponse>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_create_loader_builds_view(&state, &query.source, &query.minecraft_version)
+async fn create(
+    State(services): State<Services>,
+    body: Result<Json<CreateInstanceRequest>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(request) = body.map_err(|_| invalid())?;
+    services
+        .setup
+        .create(request)
         .await
-        .map(Json)
+        .map(|response| Json(json!(response)))
+        .map_err(error)
 }
 
-async fn handle_instance_setup_plan(
-    State(state): State<AppState>,
-    Json(payload): Json<instances::InstanceSetupPlanRequest>,
-) -> Result<Json<instances::InstanceSetupPlanResponse>, (StatusCode, Json<serde_json::Value>)> {
-    instances::plan_instance_setup(&state, payload)
-        .await
-        .map(Json)
+async fn create_modpack(
+    State(services): State<Services>,
+    body: Result<Json<CreateFromModpackRequest>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(request) = body.map_err(|_| invalid())?;
+    services.setup.create_from_modpack(request).await
+        .map(|response| Json(json!(response)))
+        .map_err(error)
 }
 
-async fn handle_instance_setup(
-    State(state): State<AppState>,
-    Json(payload): Json<instances::InstanceSetupExecuteRequest>,
-) -> Result<Json<CreateInstanceResponse>, (StatusCode, Json<serde_json::Value>)> {
-    instances::execute_instance_setup(&state, payload)
-        .await
-        .map(Json)
-}
-
-async fn handle_create_instance(
-    State(state): State<AppState>,
-    Json(payload): Json<CreateInstanceRequest>,
-) -> Result<Json<CreateInstanceResponse>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_create_instance(&state, payload)
-        .await
-        .map(Json)
-}
-
-async fn handle_duplicate_instance(
-    State(state): State<AppState>,
+async fn update(
+    State(services): State<Services>,
     Path(id): Path<String>,
-    payload: Option<Json<DuplicateInstanceRequest>>,
-) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_duplicate_instance(&state, &id, payload.map(|Json(payload)| payload))
-        .await
-        .map(Json)
+    body: Result<Json<InstancePatch>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(patch) = body.map_err(|_| invalid())?;
+    let instance = services
+        .instances
+        .update(&identity(&id)?, patch)
+        .map_err(error)?;
+    let versions = services.setup.installed().await.map_err(error)?;
+    Ok(Json(json!(
+        services.setup.enrich(instance, &versions).await
+    )))
 }
 
-async fn handle_update_instance(
-    State(state): State<AppState>,
+async fn duplicate(
+    State(services): State<Services>,
     Path(id): Path<String>,
-    Json(patch): Json<InstancePatch>,
-) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_update_instance(&state, &id, patch)
+    body: Result<Option<Json<DuplicateRequest>>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let request = body
+        .map_err(|_| invalid())?
+        .map(|Json(request)| request)
+        .unwrap_or_default();
+    let work = services
+        .instances
+        .duplicate(&identity(&id)?, request)
+        .map_err(error)?;
+    let instance = work
+        .join()
         .await
-        .map(Json)
+        .map_err(|_| error(InstanceError::SettlementRequired))?
+        .map_err(error)?;
+    let versions = services.setup.installed().await.map_err(error)?;
+    Ok(Json(json!(
+        services.setup.enrich(instance, &versions).await
+    )))
 }
 
-async fn handle_open_instance_folder(
-    State(state): State<AppState>,
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteQuery {
+    #[serde(default)]
+    keep_files: bool,
+    operation_id: Option<uuid::Uuid>,
+}
+
+async fn delete(
+    State(services): State<Services>,
     Path(id): Path<String>,
-    Query(query): Query<OpenFolderQuery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_open_instance_folder(&state, &id, query)
-        .await
-        .map(Json)
-}
-
-async fn handle_instance_resources(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<InstanceResourcesResponse>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_instance_resources(&state, &id)
-        .await
-        .map(Json)
-}
-
-async fn handle_instance_worlds(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<InstanceWorldInfo>>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_instance_worlds(&state, &id)
-        .await
-        .map(Json)
-}
-
-async fn handle_rename_instance_world(
-    State(state): State<AppState>,
-    Path((id, name)): Path<(String, String)>,
-    Json(payload): Json<RenameWorldRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_rename_instance_world(&state, &id, &name, payload)
-        .await
-        .map(Json)
-}
-
-async fn handle_delete_instance_world(
-    State(state): State<AppState>,
-    Path((id, name)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_delete_instance_world(&state, &id, &name)
-        .await
-        .map(Json)
-}
-
-async fn handle_backup_instance_world(
-    State(state): State<AppState>,
-    Path((id, name)): Path<(String, String)>,
-) -> Result<Json<WorldBackupResponse>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_backup_instance_world(&state, &id, &name)
-        .await
-        .map(Json)
-}
-
-async fn handle_instance_mods(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<InstanceModInfo>>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_instance_mods(&state, &id).await.map(Json)
-}
-
-async fn handle_update_instance_mod(
-    State(state): State<AppState>,
-    Path((id, name)): Path<(String, String)>,
-    Json(payload): Json<UpdateModRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_update_instance_mod(&state, &id, &name, payload)
-        .await
-        .map(Json)
-}
-
-async fn handle_delete_instance_mod(
-    State(state): State<AppState>,
-    Path((id, name)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_delete_instance_mod(&state, &id, &name)
-        .await
-        .map(Json)
-}
-
-async fn handle_instance_screenshots(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<InstanceScreenshotInfo>>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_instance_screenshots(&state, &id)
-        .await
-        .map(Json)
-}
-
-async fn handle_instance_screenshot_file(
-    State(state): State<AppState>,
-    Path((id, name)): Path<(String, String)>,
-) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_instance_screenshot_file(&state, &id, &name).await
-}
-
-async fn handle_rename_instance_screenshot(
-    State(state): State<AppState>,
-    Path((id, name)): Path<(String, String)>,
-    Json(payload): Json<RenameScreenshotRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_rename_instance_screenshot(&state, &id, &name, payload)
-        .await
-        .map(Json)
-}
-
-async fn handle_delete_instance_screenshot(
-    State(state): State<AppState>,
-    Path((id, name)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_delete_instance_screenshot(&state, &id, &name)
-        .await
-        .map(Json)
-}
-
-async fn handle_instance_logs(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<InstanceLogInfo>>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_instance_logs(&state, &id).await.map(Json)
-}
-
-async fn handle_instance_log_tail(
-    State(state): State<AppState>,
-    Path((id, name)): Path<(String, String)>,
-) -> Result<Json<InstanceLogTailResponse>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_instance_log_tail(&state, &id, &name)
-        .await
-        .map(Json)
-}
-
-async fn handle_delete_instance(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_delete_instance(&state, &id, query)
-        .await
-        .map(Json)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::{AppStateInit, InstallStore, SessionStore};
-    use axial_config::{AppPaths, ConfigStore, InstanceStore};
-    use axial_performance::PerformanceManager;
-    use axum::{
-        body::{Body, to_bytes},
-        http::{Method, Request, header},
+    query: Result<Query<DeleteQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(query) = query.map_err(|_| invalid())?;
+    let intent = if query.keep_files {
+        DeleteIntent::KeepFiles
+    } else {
+        DeleteIntent::DeleteFiles
     };
-    use serde_json::{Value, json};
-    use std::{
-        fs,
-        path::{Path as FsPath, PathBuf},
-        sync::Arc,
+    let work = services
+        .instances
+        .delete(
+            &identity(&id)?,
+            intent,
+            query.operation_id.unwrap_or_else(uuid::Uuid::new_v4),
+        )
+        .map_err(deletion_error)?;
+    let snapshot = work
+        .join()
+        .await
+        .map_err(|_| error(InstanceError::SettlementRequired))?
+        .map_err(deletion_error)?;
+    Ok(Json(
+        json!({ "status": snapshot.status, "deletion": snapshot }),
+    ))
+}
+
+async fn deletion_status(
+    State(services): State<Services>,
+    Path(operation_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let operation_id = uuid::Uuid::parse_str(&operation_id).map_err(|_| invalid())?;
+    services
+        .instances
+        .deletion_status(operation_id)
+        .map(|snapshot| Json(json!(snapshot)))
+        .map_err(deletion_error)
+}
+
+async fn pending(State(services): State<Services>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({ "creations": services.instances.pending().map_err(error)?,
+        "deletions": services.instances.pending_deletions().map_err(deletion_error)? }),
+    ))
+}
+
+async fn plan_setup(
+    State(services): State<Services>,
+    body: Result<Json<InstanceSetupPlanRequest>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(request) = body.map_err(|_| invalid())?;
+    services
+        .setup
+        .plan_setup(request)
+        .await
+        .map(|plan| Json(json!(plan)))
+        .map_err(error)
+}
+
+async fn execute_setup(
+    State(services): State<Services>,
+    body: Result<Json<InstanceSetupExecuteRequest>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(request) = body.map_err(|_| invalid())?;
+    services
+        .setup
+        .execute_setup(request)
+        .await
+        .map(|result| Json(json!(result)))
+        .map_err(error)
+}
+
+async fn resume_setup(
+    State(services): State<Services>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    services
+        .setup
+        .resume_setup(&identity(&id)?)
+        .await
+        .map(|result| Json(json!(result)))
+        .map_err(error)
+}
+
+async fn resume_creation(
+    State(services): State<Services>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let instance = services
+        .instances
+        .recover_creation(&identity(&id)?)
+        .map_err(error)?
+        .join()
+        .await
+        .map_err(|_| error(InstanceError::SettlementRequired))?
+        .map_err(error)?;
+    Ok(Json(json!({"instance": instance})))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ViewQuery {
+    source: Option<String>,
+}
+async fn create_view(
+    State(services): State<Services>,
+    query: Result<Query<ViewQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(query) = query.map_err(|_| invalid())?;
+    services
+        .setup
+        .create_view(query.source.as_deref())
+        .await
+        .map(|view| Json(json!(view)))
+        .map_err(error)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuildsQuery {
+    source: String,
+    minecraft_version: String,
+}
+async fn loader_builds(
+    State(services): State<Services>,
+    query: Result<Query<BuildsQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(query) = query.map_err(|_| invalid())?;
+    services
+        .setup
+        .loader_builds(&query.source, &query.minecraft_version)
+        .await
+        .map(|view| Json(json!(view)))
+        .map_err(error)
+}
+
+fn identity(value: &str) -> Result<InstanceId, ApiError> {
+    value.parse().map_err(error)
+}
+fn invalid() -> ApiError {
+    error(InstanceError::InvalidInput)
+}
+
+pub(super) fn error(failure: InstanceError) -> ApiError {
+    let status = match failure {
+        InstanceError::InvalidId
+        | InstanceError::InvalidName
+        | InstanceError::InvalidInput
+        | InstanceError::InvalidSettings => StatusCode::BAD_REQUEST,
+        InstanceError::NotFound => StatusCode::NOT_FOUND,
+        InstanceError::Conflict
+        | InstanceError::NameConflict
+        | InstanceError::Busy
+        | InstanceError::Cancelled
+        | InstanceError::ManagedDuplicateUnavailable => StatusCode::CONFLICT,
+        InstanceError::Closed
+        | InstanceError::SetupUnavailable
+        | InstanceError::LibraryUnavailable
+        | InstanceError::VersionUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        InstanceError::DirectoryUnavailable
+        | InstanceError::SettlementRequired
+        | InstanceError::Storage(_) => StatusCode::CONFLICT,
     };
-    use tower::ServiceExt;
+    (status, Json(json!({"error": failure.to_string()})))
+}
 
-    #[tokio::test]
-    async fn create_view_route_serializes_backend_preset_options() {
-        let fixture = RouteInstanceFixture::new("create-view-route");
-
-        let (status, payload) = fixture
-            .request_json(Method::GET, "/api/v1/instances/create-view", None)
-            .await;
-
-        assert_eq!(status, StatusCode::OK);
-        let preset_options = payload["preset_options"]
-            .as_array()
-            .expect("preset options array");
-        assert!(
-            preset_options
-                .iter()
-                .any(|option| option["id"] == "" && option["default"] == true)
-        );
-        assert!(preset_options.iter().any(|option| {
-            option["id"] == "performance"
-                && option["label"]
-                    .as_str()
-                    .is_some_and(|label| !label.is_empty())
-                && option["detail"]
-                    .as_str()
-                    .is_some_and(|detail| !detail.is_empty())
-        }));
-    }
-
-    #[tokio::test]
-    async fn create_instance_route_resets_unknown_jvm_preset_without_echoing_raw_value() {
-        let fixture = RouteInstanceFixture::new("create-route-unknown-preset");
-        fixture.configure_create_manifest(&["1.21.1"]);
-
-        let (status, payload) = fixture
-            .request_json(
-                Method::POST,
-                "/api/v1/instances",
-                Some(json!({
-                    "name": "Route preset tamper",
-                    "selection_id": "vanilla|1.21.1",
-                    "jvm_preset_id": "C:\\Users\\Alice\\java.exe --accessToken raw-secret-token"
-                })),
-            )
-            .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["name"], "Route preset tamper");
-        assert_eq!(payload["jvm_preset"], "");
-        assert_eq!(
-            payload["guardian_notice"]["state_id"],
-            "unknown_reset_to_auto"
-        );
-        assert_eq!(payload["result"]["command"], "CreateInstance");
-        assert_no_route_sensitive_fragments(&payload);
-    }
-
-    #[tokio::test]
-    async fn create_instance_route_rejects_raw_version_id_without_echoing_raw_value() {
-        let fixture = RouteInstanceFixture::new("create-route-legacy-version-id");
-        fixture.configure_create_manifest(&["1.21.1"]);
-
-        let (status, payload) = fixture
-            .request_json(
-                Method::POST,
-                "/api/v1/instances",
-                Some(json!({
-                    "name": "Raw selector",
-                    "version_id": "C:\\Users\\Alice\\java.exe --accessToken raw-secret-token"
-                })),
-            )
-            .await;
-
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(payload, json!({ "error": "selection_id is required" }));
-        assert_no_route_sensitive_fragments(&payload);
-    }
-
-    #[tokio::test]
-    async fn update_instance_route_redacts_java_path_and_jvm_args() {
-        let fixture = RouteInstanceFixture::new("update-route-runtime-redaction");
-        let instance = fixture
-            .state
-            .instances()
-            .add(
-                "Route override".to_string(),
-                "1.21.1".to_string(),
-                String::new(),
-                String::new(),
-                None,
-            )
-            .expect("add instance");
-
-        let (status, payload) = fixture
-            .request_json(
-                Method::PUT,
-                &format!("/api/v1/instances/{}", instance.id),
-                Some(json!({
-                    "java_path": "C:\\Users\\Alice\\.jdks\\bad\\bin\\java.exe",
-                    "extra_jvm_args": "-Dtoken=raw-secret-token -javaagent:C:\\Users\\Alice\\agent.jar"
-                })),
-            )
-            .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["java_path"], "");
-        assert_eq!(payload["extra_jvm_args"], "");
-        assert_no_route_sensitive_fragments(&payload);
-        let stored = fixture
-            .state
-            .instances()
-            .get(&instance.id)
-            .expect("stored instance");
-        assert!(stored.java_path.contains("java.exe"));
-        assert!(stored.extra_jvm_args.contains("raw-secret-token"));
-    }
-
-    struct RouteInstanceFixture {
-        state: AppState,
-        root: PathBuf,
-    }
-
-    impl RouteInstanceFixture {
-        fn new(name: &str) -> Self {
-            let root = test_root(name);
-            let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            let instances =
-                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
-            let state = AppState::new(AppStateInit {
-                app_name: "Axial".to_string(),
-                version: "test".to_string(),
-                config,
-                instances,
-                installs: Arc::new(InstallStore::new()),
-                sessions: Arc::new(SessionStore::new()),
-                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
-                startup_warnings: Vec::new(),
-                frontend_dir: root.join("frontend"),
-            });
-
-            Self { state, root }
-        }
-
-        fn configure_create_manifest(&self, version_ids: &[&str]) {
-            let library_dir = self.root.join("library");
-            self.state
-                .set_library_dir(library_dir.to_string_lossy().to_string());
-            write_route_version_manifest_cache(&library_dir, version_ids);
-        }
-
-        async fn request_json(
-            &self,
-            method: Method,
-            uri: &str,
-            payload: Option<Value>,
-        ) -> (StatusCode, Value) {
-            let mut request = Request::builder().method(method).uri(uri);
-            let body = if let Some(payload) = payload {
-                request = request.header(header::CONTENT_TYPE, "application/json");
-                Body::from(serde_json::to_vec(&payload).expect("serialize request"))
+fn deletion_error(failure: DeletionError) -> ApiError {
+    match failure {
+        DeletionError::Instance(failure) => error(failure),
+        other => (
+            if matches!(other, DeletionError::NotFound) {
+                StatusCode::NOT_FOUND
             } else {
-                Body::empty()
-            };
-            let response = router()
-                .with_state(self.state.clone())
-                .oneshot(request.body(body).expect("request"))
-                .await
-                .expect("route response");
-            let status = response.status();
-            let body = to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("read body");
-            let payload = serde_json::from_slice(&body).expect("json response");
-            (status, payload)
-        }
-    }
-
-    fn write_route_version_manifest_cache(library_dir: &FsPath, version_ids: &[&str]) {
-        let cache_path = axial_minecraft::version_manifest_cache_path(library_dir);
-        fs::create_dir_all(cache_path.parent().expect("version manifest cache parent"))
-            .expect("create version manifest cache dir");
-        let versions = version_ids
-            .iter()
-            .enumerate()
-            .map(|(index, version_id)| {
-                json!({
-                    "id": version_id,
-                    "type": "release",
-                    "url": format!("https://example.invalid/{version_id}.json"),
-                    "time": format!("2026-01-{:02}T00:00:00+00:00", index + 1),
-                    "releaseTime": format!("2026-01-{:02}T00:00:00+00:00", index + 1),
-                    "sha1": "",
-                    "complianceLevel": 1
-                })
-            })
-            .collect::<Vec<_>>();
-        fs::write(
-            cache_path,
-            serde_json::to_vec_pretty(&json!({
-                "latest": {
-                    "release": version_ids.first().copied().unwrap_or("1.21.1"),
-                    "snapshot": version_ids.last().copied().unwrap_or("1.21.1")
-                },
-                "versions": versions
-            }))
-            .expect("serialize version manifest cache"),
-        )
-        .expect("write version manifest cache");
-    }
-
-    impl Drop for RouteInstanceFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn test_root(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "axial-api-instance-route-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|value| value.as_nanos())
-                .unwrap_or_default()
-        ));
-        fs::create_dir_all(&path).expect("create test root");
-        path
-    }
-
-    fn test_paths(root: &FsPath) -> AppPaths {
-        let config_dir = root.join("config");
-        AppPaths {
-            config_file: config_dir.join("config.json"),
-            instances_file: config_dir.join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir,
-        }
-    }
-
-    fn assert_no_route_sensitive_fragments(value: &Value) {
-        let text = value.to_string();
-        for material in [
-            "Alice",
-            "java.exe",
-            "accessToken",
-            "raw-secret-token",
-            "javaagent",
-            "agent.jar",
-            "C:\\Users",
-            "AppData",
-        ] {
-            assert!(
-                !text.contains(material),
-                "public instance route JSON exposed sensitive material {material}: {text}"
-            );
-        }
+                StatusCode::CONFLICT
+            },
+            Json(json!({"error": other.to_string()})),
+        ),
     }
 }

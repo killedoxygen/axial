@@ -1,0 +1,9 @@
+id	file	planned_start	planned_end	planned_footprint_loc	authority	planned_disposition
+REDUCTION-PERFORMANCE-JOURNAL-A	apps/api/src/state/performance_operations.rs	1	2182	2182	parallel durable performance status store	delete file after journal projection cutover
+REDUCTION-PERFORMANCE-JOURNAL-B	apps/api/src/application/performance/workflow/operations.rs	469	1009	541	status reservation start retry and worker-status supervision	delete; journal create and producer ownership replace it
+REDUCTION-PERFORMANCE-JOURNAL-C	apps/api/src/application/performance/workflow/operations.rs	1026	1304	279	status-versus-journal orphan cross-product	delete; typed journal restart disposition replaces it
+REDUCTION-PERFORMANCE-JOURNAL-D	apps/api/src/application/performance/workflow/operations.rs	1605	2463	859	status-versus-journal resume terminal and mismatch reconstruction	delete; one journal transition/restart path replaces it
+REDUCTION-PERFORMANCE-JOURNAL-E	apps/api/src/application/performance/workflow/operations.rs	2499	2772	274	status progress persistence and duplicate journal parsing	delete mirror write; retain one typed journal projection parser
+REDUCTION-PERFORMANCE-JOURNAL-F	apps/api/src/application/performance/workflow/operations.rs	2833	3119	287	status DTO sanitization and reverse operation reconstruction	delete reverse reconstruction; project public DTO from journal intent
+REDUCTION-PERFORMANCE-JOURNAL-G	apps/api/src/application/performance/workflow/operations.rs	3192	3316	125	status/journal identity comparison and duplicate reconciliation journal	delete cross-authority comparison
+REDUCTION-PERFORMANCE-JOURNAL-H	apps/api/src/application/performance/workflow/operations.rs	3427	3770	344	parallel status checkpoints and retry loop	delete; journal transition retry is sole durable retry

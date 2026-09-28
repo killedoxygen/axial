@@ -1,10 +1,10 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
-import { Icon } from '../../ui/Icons';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { Icon, type IconName } from '../../ui/Icons';
 import { Button, IconButton, Pill } from '../../ui/Atoms';
 import { InstanceTile, guardedInstanceHue } from '../../ui/InstanceVisual';
 import { openContextMenu } from '../../ui/ContextMenu';
-import { instances, launchNotices, launchState, runningSessions, versionById } from '../../store';
+import { instances, launchNotices, launchSessions, launchState, versionById } from '../../store';
 import { navigate, resetViewScroll } from '../../ui-state';
 import { selectInstance } from '../../actions';
 import { launchGame, killGame } from '../../launch';
@@ -12,6 +12,14 @@ import { handleInstallClick, retryFailedInstall } from '../../machines/downloads
 import { errMessage } from '../../utils';
 import { formatDate, fmtRelative } from '../../format';
 import { instanceInstallStatus } from '../../instance-install-status';
+import { resumeInstanceSetup } from '../../instance-setup';
+import {
+  launchActionPresentation,
+  launchSessionActivityLabel,
+  launchSessionCanStop,
+  launchSessionHasLiveProcess,
+  launchSessionIsPlaying,
+} from '../../launch-presenters';
 import type { EnrichedInstance } from '../../types-instance';
 import { fetchInstanceResources, type ResourceLoadState } from './resources';
 import { LOG_RESOURCE_POLL_MS } from './logs';
@@ -24,12 +32,10 @@ import { SettingsPane } from './tabs/SettingsPane';
 import { InstallBarrierPane, LaunchOutcomeNotice, LaunchSplitButton } from './components/launch';
 import { useTheme } from '../../hooks/use-theme';
 
-export { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
-
 type Tab = 'mods' | 'worlds' | 'screenshots' | 'logs' | 'settings';
 type TabSelection = { instanceId: string; tab: Tab } | null;
 
-const TABS: Array<{ id: Tab; icon: string; label: string }> = [
+const TABS: Array<{ id: Tab; icon: IconName; label: string }> = [
   { id: 'mods', icon: 'puzzle', label: 'Mods' },
   { id: 'worlds', icon: 'globe', label: 'Worlds' },
   { id: 'screenshots', icon: 'image', label: 'Screenshots' },
@@ -52,14 +58,23 @@ function defaultTabFor(inst: EnrichedInstance | undefined): Tab {
 }
 
 export function InstanceDetailView({ id }: { id: string }): JSX.Element {
+  return <InstanceDetailContent key={id} id={id} />;
+}
+
+function InstanceDetailContent({ id }: { id: string }): JSX.Element {
   const theme = useTheme();
-  const inst = instances.value.find((i) => i.id === id) as EnrichedInstance | undefined;
+  const inst = instances.value.find((i) => i.id === id);
   const [selectedTab, setSelectedTab] = useState<TabSelection>(null);
   const selectedTabForCurrentInstance = selectedTab?.instanceId === id ? selectedTab.tab : null;
   const [resources, setResources] = useState<ResourceLoadState>({ status: 'loading', data: null });
+  const resourceRequest = useRef(0);
   const [now, setNow] = useState(() => Date.now());
-  const running = inst ? !!runningSessions.value[inst.id] : false;
-  const session = inst ? runningSessions.value[inst.id] : undefined;
+  const session = inst ? launchSessions.value[inst.id] : undefined;
+  const sessionActive = Boolean(session);
+  const playing = launchSessionIsPlaying(session);
+  const processLive = launchSessionHasLiveProcess(session);
+  const canStop = launchSessionCanStop(session);
+  const sessionLabel = launchSessionActivityLabel(session);
   const launch = launchState.value;
   const preparing = inst && launch.status === 'preparing' && launch.instanceId === inst.id ? launch : null;
   const selectTab = (next: Tab): void => {
@@ -67,68 +82,40 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
     resetViewScroll();
   };
 
-  const reloadResources = (): void => {
+  const reloadResources = (quiet = false): void => {
     if (!inst) return;
-    setResources((current) => ({ status: 'loading', data: current.data ?? null }));
+    const request = ++resourceRequest.current;
+    if (!quiet) setResources((current) => ({ status: 'loading', data: current.data ?? null }));
     void fetchInstanceResources(inst.id)
-      .then((data) => setResources({ status: 'ready', data }))
-      .catch((err) =>
+      .then((data) => {
+        if (request === resourceRequest.current) setResources({ status: 'ready', data });
+      })
+      .catch((err) => {
+        if (request !== resourceRequest.current) return;
         setResources((current) => ({
           status: 'error',
           data: current.data ?? null,
           error: errMessage(err),
-        })),
-      );
+        }));
+      });
   };
 
   useEffect(() => {
     if (!inst) return;
-    let alive = true;
-    setResources({ status: 'loading', data: null });
-    void fetchInstanceResources(inst.id)
-      .then((data) => {
-        if (alive) setResources({ status: 'ready', data });
-      })
-      .catch((err) => {
-        if (alive) setResources({ status: 'error', data: null, error: errMessage(err) });
-      });
+    reloadResources();
+    const timer = processLive ? window.setInterval(() => reloadResources(true), LOG_RESOURCE_POLL_MS) : 0;
     return () => {
-      alive = false;
+      resourceRequest.current += 1;
+      if (timer) window.clearInterval(timer);
     };
-  }, [inst?.id]);
+  }, [inst?.id, processLive]);
 
   useEffect(() => {
-    if (!inst || !running) return;
-    let alive = true;
-    const refreshQuietly = (): void => {
-      void fetchInstanceResources(inst.id)
-        .then((data) => {
-          if (alive) setResources({ status: 'ready', data });
-        })
-        .catch((err) => {
-          if (alive) {
-            setResources((current) => ({
-              status: 'error',
-              data: current.data ?? null,
-              error: errMessage(err),
-            }));
-          }
-        });
-    };
-    refreshQuietly();
-    const timer = window.setInterval(refreshQuietly, LOG_RESOURCE_POLL_MS);
-    return () => {
-      alive = false;
-      window.clearInterval(timer);
-    };
-  }, [inst?.id, running]);
-
-  useEffect(() => {
-    if (!running) return;
+    if (!playing) return;
     setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [running]);
+  }, [playing]);
 
   if (!inst) {
     return (
@@ -161,12 +148,31 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const installLabel = installStatus.label;
   const installLocked =
     launchAction.primary_action === 'install' && (installStatus.installing || Boolean(matchingInstallFailure));
+  const launchPresentation = launchActionPresentation({
+    launchAction,
+    installQueued,
+    installQueuedView,
+    installProgress,
+    preparing,
+  });
+  const statusLabel = session
+    ? sessionLabel
+    : launchPresentation.progress || installQueued
+      ? launchPresentation.label
+      : launchAction.launchable
+        ? 'Ready'
+        : (launchAction.primary_action === 'install' && matchingInstallFailure?.viewModel.title) || launchAction.label;
 
   const onPlay = (): void => {
     selectInstance(inst.id);
     void launchGame();
   };
   const onInstall = (): void => {
+    if (launchAction.state_id === 'setup_pending') {
+      void resumeInstanceSetup(inst.id);
+      return;
+    }
+    if (!installStatus.item) return;
     selectInstance(inst.id);
     handleInstallClick(installStatus.item);
   };
@@ -199,7 +205,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const launchNotice = launchNotices.value[inst.id];
 
   return (
-    <div class="cp-instance-view" data-running={running} style={{ ['--cp-aurora-h' as any]: auroraHue }}>
+    <div class="cp-instance-view" data-running={playing} style={{ ['--cp-aurora-h' as any]: auroraHue }}>
       <div class="cp-instance-stage" aria-hidden="true">
         <div class="cp-instance-aurora-sheet">
           <div class="cp-instance-aurora cp-instance-aurora--b1" />
@@ -224,8 +230,8 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             </div>
             <h1 class="cp-instance-hero-title">{inst.name}</h1>
             <div class="cp-instance-hero-meta">
-              <span class="cp-instance-status" data-running={running}>
-                {running ? 'Playing now' : 'Ready'}
+              <span class="cp-instance-status" data-running={playing}>
+                {statusLabel}
               </span>
               <span>
                 Last played <b>{fmtRelative(inst.last_played_at)}</b>
@@ -237,15 +243,17 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           </div>
           <div class="cp-instance-hero-actions">
             <div class="cp-instance-launch">
-              {running ? (
+              {sessionActive ? (
                 <div class="cp-session">
                   <span class="cp-session-time">
-                    <span>{fmtElapsed(session?.launchedAt, now)}</span>
+                    <span>{playing ? `${sessionLabel} - ${fmtElapsed(session?.launchedAt, now)}` : sessionLabel}</span>
                   </span>
-                  <button class="cp-session-stop" type="button" onClick={onStop}>
-                    <Icon name="stop" size={13} />
-                    Stop
-                  </button>
+                  {canStop && (
+                    <button class="cp-session-stop" type="button" disabled={session?.stopping} onClick={onStop}>
+                      <Icon name="stop" size={13} />
+                      Stop
+                    </button>
+                  )}
                 </div>
               ) : (
                 <LaunchSplitButton
@@ -341,7 +349,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />
         )}
         {!installLocked && activeTab === 'logs' && (
-          <LogsPane inst={inst} resources={resources} running={running} onRefresh={reloadResources} />
+          <LogsPane inst={inst} resources={resources} processLive={processLive} onRefresh={reloadResources} />
         )}
         {!installLocked && activeTab === 'settings' && <SettingsPane inst={inst} />}
       </div>

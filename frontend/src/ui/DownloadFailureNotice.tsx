@@ -1,5 +1,4 @@
 import type { ComponentChildren, JSX } from 'preact';
-import './download-failure-notice.css';
 import { Button, IconButton, Pill } from './Atoms';
 import { Icon } from './Icons';
 import type { DownloadFailure } from '../machines/downloads';
@@ -22,7 +21,6 @@ export function DownloadFailureNotice({
   const view = failure.viewModel;
   const extraDetails = view.details.length > 1 ? view.details.slice(1) : [];
   const retryAction = view.retry_action;
-  const repairAction = view.repair_action;
   const dismissAction = view.dismiss_action;
 
   return (
@@ -52,23 +50,12 @@ export function DownloadFailureNotice({
         <div class="cp-dlfail-time">Failed at {formatFailureTime(failure.failedAt)}</div>
       </div>
       <div class="cp-dlfail-actions">
-        {repairAction && (
-          <Button
-            variant="secondary"
-            size="sm"
-            icon="shield-check"
-            disabled={!repairAction.enabled}
-            title={repairAction.disabled_reason || undefined}
-          >
-            {repairAction.label}
-          </Button>
-        )}
         <Button
           variant="secondary"
           size="sm"
           icon="refresh"
           onClick={onRetry}
-          disabled={retryAction ? !retryAction.enabled : false}
+          disabled={retryAction?.enabled !== true}
           title={retryAction?.disabled_reason || undefined}
         >
           {retryAction?.label || 'Retry install'}
@@ -80,7 +67,7 @@ export function DownloadFailureNotice({
             size={28}
             tooltip={dismissAction?.label || 'Dismiss failed install'}
             onClick={onDismiss}
-            disabled={dismissAction ? !dismissAction.enabled : false}
+            disabled={dismissAction?.enabled !== true}
           />
         )}
       </div>

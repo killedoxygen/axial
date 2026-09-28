@@ -15,12 +15,14 @@ import { updateInstanceInList } from '../../../actions';
 import { fmtMem, memoryGb } from '../../../format';
 import type { InstancePerformanceMode } from '../../../types-performance';
 import type { EnrichedInstance } from '../../../types-instance';
+import { performanceHealthNotice } from '../../../performance-presenters';
 import {
   fetchPerformanceHealth,
   globalPerformanceMode,
   performanceModeFrom,
   performanceModeLabel,
 } from '../performance-mode';
+import { enrichedInstanceResponse } from '../../../dto-core';
 
 function instancePerformanceModeFrom(value: string | undefined): InstancePerformanceMode {
   return performanceModeFrom(value) ?? '';
@@ -31,6 +33,10 @@ function windowDimension(value: number | undefined, fallback: number): number {
 }
 
 export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
+  return <InstanceSettingsPane key={inst.id} inst={inst} />;
+}
+
+function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const cfg = config.value;
   const globalMode = globalPerformanceMode();
   const totalGb = systemInfo.value?.total_memory_mb
@@ -39,18 +45,15 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const [recMin, recMax] = recommendedHeapRange(totalGb);
 
   const { commit, saving } = useAutoSave<EnrichedInstance & { error?: string }>({
-    send: (patch) => api('PUT', `/instances/${encodeURIComponent(inst.id)}`, patch),
+    send: (patch) => api('PUT', `/instances/${encodeURIComponent(inst.id)}`, patch).then(enrichedInstanceResponse),
     apply: (res) => updateInstanceInList(res),
     errorLabel: 'instance settings',
+    target: `/instances/${inst.id}`,
   });
 
   const [healthRefreshKey, setHealthRefreshKey] = useState(0);
   const bumpHealth = (): void => setHealthRefreshKey((current) => current + 1);
-  const [healthNotice, setHealthNotice] = useState<{
-    tone: 'warned' | 'error';
-    title: string;
-    detail: string;
-  } | null>(null);
+  const [healthNotice, setHealthNotice] = useState<ReturnType<typeof performanceHealthNotice>>(null);
 
   const memoryOverridden = (inst.max_memory_mb ?? 0) > 0 || (inst.min_memory_mb ?? 0) > 0;
   const savedMaxGb = memoryGb(inst.max_memory_mb, cfg?.max_memory_mb ?? 4096);
@@ -80,21 +83,32 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const [jvmArgs, setJvmArgs] = useState(savedArgs);
   const argsTimer = useRef<number | null>(null);
   const pendingArgs = useRef<string | null>(null);
+  const flushArgs = useRef<() => void>(() => {});
 
   useEffect(() => {
     setMaxGb(savedMaxGb);
     setMinGb(savedMinGb);
+  }, [savedMaxGb, savedMinGb]);
+
+  useEffect(() => {
     setMode(savedMode);
+  }, [savedMode]);
+
+  useEffect(() => {
     setJavaPath(savedJavaPath);
-    setJvmArgs(savedArgs);
-  }, [inst.id, savedMaxGb, savedMinGb, savedMode, savedJavaPath, savedArgs]);
+  }, [savedJavaPath]);
+
+  useEffect(() => {
+    if (pendingArgs.current === null) setJvmArgs(savedArgs);
+  }, [savedArgs]);
 
   useEffect(() => {
     let cancelled = false;
     void api('GET', `/instances/${encodeURIComponent(inst.id)}`)
-      .then((res: any) => {
-        if (cancelled || !res || res.error) return;
-        updateInstanceInList(res as EnrichedInstance);
+      .then(enrichedInstanceResponse)
+      .then((res) => {
+        if (cancelled) return;
+        updateInstanceInList(res);
       })
       .catch(() => {});
     return () => {
@@ -107,16 +121,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     void fetchPerformanceHealth(inst.id)
       .then((health) => {
         if (cancelled) return;
-        const viewModel = health?.view_model;
-        if (viewModel && (viewModel.tone === 'warn' || viewModel.tone === 'err')) {
-          setHealthNotice({
-            tone: viewModel.tone === 'warn' ? 'warned' : 'error',
-            title: viewModel.title,
-            detail: viewModel.detail,
-          });
-        } else {
-          setHealthNotice(null);
-        }
+        setHealthNotice(performanceHealthNotice(health));
       })
       .catch(() => {
         if (!cancelled) setHealthNotice(null);
@@ -141,8 +146,12 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     if (argsTimer.current !== null) window.clearTimeout(argsTimer.current);
     argsTimer.current = window.setTimeout(() => {
       argsTimer.current = null;
-      if (pendingArgs.current !== null) commitArgs(pendingArgs.current);
+      flushArgs.current();
     }, 600);
+  };
+
+  flushArgs.current = () => {
+    if (pendingArgs.current !== null) commitArgs(pendingArgs.current);
   };
 
   useEffect(() => {
@@ -151,7 +160,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
         window.clearTimeout(argsTimer.current);
         argsTimer.current = null;
       }
-      if (pendingArgs.current !== null) commitArgs(pendingArgs.current);
+      flushArgs.current();
     };
   }, [inst.id]);
 
@@ -224,7 +233,10 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
               <OverrideChip
                 onReset={() => {
                   setJavaPath('');
-                  commit({ jvm_preset: '', java_path: '' }, { label: 'runtime', onSuccess: bumpHealth });
+                  commit(
+                    { jvm_preset: '', java_path: '' },
+                    { label: 'runtime', revert: () => setJavaPath(savedJavaPath), onSuccess: bumpHealth },
+                  );
                 }}
               />
             )

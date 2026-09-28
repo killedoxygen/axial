@@ -28,14 +28,6 @@ export interface InstallProgressViewModel {
   active_step?: InstallProgressStepViewModel | null;
 }
 
-export interface InstallGuardianOutcome {
-  diagnosis_id: string;
-  decision: string;
-  label: string;
-  detail?: string;
-  guidance?: string[];
-}
-
 export interface InstallActionViewModel {
   action: string;
   label: string;
@@ -52,28 +44,18 @@ export interface InstallFailureViewModel {
   details: string[];
   retry_action: InstallActionViewModel;
   dismiss_action: InstallActionViewModel;
-  repair_action: InstallActionViewModel;
-}
-
-export interface InstallGuardianRepairSummary {
-  repair_operation_id: string;
-  diagnosis_id: string;
-  status: string;
-  label: string;
-  detail?: string | null;
 }
 
 export interface InstallStatusResponse {
+  revision: number;
+  queue_id: string;
+  outcome: 'succeeded' | 'failed' | 'cancelled' | 'removed' | null;
+  allowed_actions: InstallActionViewModel[];
   install_id: string;
   operation_id: string;
   done: boolean;
-  progress: unknown[];
   view_model: InstallProgressViewModel;
   failure_view_model?: InstallFailureViewModel | null;
-  failure_point?: string | null;
-  guardian?: InstallGuardianOutcome | null;
-  guardian_repair?: InstallGuardianRepairSummary | null;
-  proof?: unknown;
 }
 
 export interface InstallStartResponse {
@@ -82,16 +64,22 @@ export interface InstallStartResponse {
   view_model: InstallProgressViewModel;
 }
 
-export interface InstallQueueRequest {
-  kind: 'vanilla' | 'loader' | 'content';
-  version_id?: string;
-  manifest_url?: string;
-  component_id?: LoaderComponentId;
-  build_id?: string;
-  instance_id?: string;
-  label?: string;
-  content_action?: InstallQueueContentAction;
-}
+export type InstallQueueRequest =
+  | {
+      kind: 'vanilla';
+      version_id: string;
+    }
+  | {
+      kind: 'loader';
+      component_id: LoaderComponentId;
+      build_id: string;
+    }
+  | {
+      kind: 'content';
+      instance_id: string;
+      label: string;
+      action: InstallQueueContentAction;
+    };
 
 export interface InstallQueueLoaderItemViewModel {
   component_id: LoaderComponentId;
@@ -123,12 +111,13 @@ export type InstallQueueContentAction =
       kind: 'modpack';
       canonical_id: string;
       version_id: string;
-      selected_paths: string[];
+      selected_file_ids: string[];
       include_overrides: boolean;
     };
 
 export interface InstallQueueContentItemViewModel {
   instance_id: string;
+  label: string;
   action: InstallQueueContentAction;
 }
 
@@ -157,6 +146,7 @@ export interface InstallQueueActiveViewModel {
   summary: string;
   install_item: InstallQueueInstallItemViewModel;
   progress: InstallProgressViewModel;
+  retry_action?: InstallActionViewModel;
 }
 
 export interface InstallQueueViewModel {
@@ -182,10 +172,24 @@ export interface InstallQueueNoticeViewModel {
 }
 
 export interface InstallQueueStateResponse {
+  queue_epoch: string;
+  revision: number;
+  registry_revision: number;
+  latest_failure?: InstallQueueFailureViewModel | null;
   active?: InstallQueueActiveViewModel | null;
   items: InstallQueuedItemViewModel[];
   view_model: InstallQueueViewModel;
   notice?: InstallQueueNoticeViewModel | null;
   started_install?: InstallStartResponse | null;
   removed_instance_id?: string | null;
+}
+
+export interface InstallQueueFailureViewModel {
+  failed_at_ms: number;
+  queue_id: string;
+  install_id: string;
+  operation_id: string;
+  label: string;
+  install_item: InstallQueueInstallItemViewModel;
+  failure_view_model: InstallFailureViewModel;
 }

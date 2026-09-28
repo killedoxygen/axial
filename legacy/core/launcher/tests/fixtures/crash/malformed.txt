@@ -1,0 +1,6 @@
+\0\0not a crash report
+Description: /home/alice/Secret
+Exception: ../../access-token
+Suspected Mods: /home/alice/mod.jar (secret)
+# Problematic frame:
+# C  [/home/alice/libprivate.so+0x123]

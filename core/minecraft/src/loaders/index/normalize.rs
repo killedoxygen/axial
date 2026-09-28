@@ -51,6 +51,7 @@ fn compare_supported_versions(
 mod tests {
     use super::{normalize_build_index, normalize_supported_versions};
     use crate::lifecycle::LifecycleMeta;
+    use crate::loaders::installed_version_id_for;
     use crate::loaders::types::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
         LoaderComponentId, LoaderGameVersion, LoaderInstallSource, LoaderInstallStrategy,
@@ -202,7 +203,8 @@ mod tests {
             build_id: format!("{}:1.18.2:{loader_version}", component_id.short_key()),
             minecraft_version: "1.18.2".to_string(),
             loader_version: loader_version.to_string(),
-            version_id: format!("1.18.2-forge-{loader_version}"),
+            version_id: installed_version_id_for(component_id, "1.18.2", loader_version)
+                .expect("canonical installed version id"),
             build_meta: LoaderBuildMetadata {
                 terms: if default_rank >= 1_000 {
                     vec![LoaderTerm::Recommended]

@@ -9,9 +9,9 @@ import { formatBytes, fmtRelative } from '../../../format';
 import type { EnrichedInstance } from '../../../types-instance';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
-import { ResourceRow, ResourceStatus, ResourceToolbar } from '../components/resource-bits';
-import { WorldsEmptyArt } from '../components/worlds-empty-art';
+import { ResourceMutationStatus, ResourceRow, ResourceStatus, ResourceToolbar } from '../components/resource-bits';
 import { deleteWorlds, worldMenuItems } from '../world-actions';
+import { resourceMutationState } from '../bulk-actions';
 
 export function WorldsPane({
   inst,
@@ -23,6 +23,7 @@ export function WorldsPane({
   onRefresh: () => void;
 }): JSX.Element {
   const worlds = resources.data?.worlds ?? [];
+  const busy = resourceMutationState(inst.id).status === 'pending';
   const selection = useSelection(
     worlds,
     useCallback((world) => world.name, []),
@@ -37,6 +38,7 @@ export function WorldsPane({
       inst,
       selection.selectedItems.map((world) => world.name),
       clearAndRefresh,
+      onRefresh,
     );
   };
   const clearAndRefresh = (): void => {
@@ -52,9 +54,10 @@ export function WorldsPane({
         action={{ icon: 'folder', label: 'Open saves', onClick: () => void openInstanceFolder(inst.id, 'saves') }}
       />
       <ResourceStatus state={resources} onRetry={onRefresh} />
-      {worlds.length === 0 && resources.status !== 'loading' ? (
+      <ResourceMutationStatus instanceId={inst.id} />
+      {worlds.length === 0 && resources.status === 'ready' ? (
         <div class="cp-resource-empty cp-worlds-empty">
-          <WorldsEmptyArt />
+          <div class="cp-worlds-empty-art" aria-hidden="true" />
           <strong>No worlds yet</strong>
           <p>Create a new world, import an existing save, or launch Minecraft and create one there.</p>
           <div class="cp-worlds-empty-actions">
@@ -100,7 +103,9 @@ export function WorldsPane({
       <SelectionActionTray
         selection={selection}
         itemLabel="world"
-        actions={[{ label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() }]}
+        actions={[
+          { label: 'Delete', icon: 'trash', danger: true, disabled: busy, onClick: () => void deleteSelected() },
+        ]}
       />
     </div>
   );
