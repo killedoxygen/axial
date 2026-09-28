@@ -374,6 +374,10 @@ impl Inventory {
         self.directories.iter().map(|(name, _, _)| name.as_str())
     }
 
+    pub(super) fn saved_skins_validated(&self) -> bool {
+        self.preview.skin_import_available
+    }
+
     /// Converters can reread original bytes using a captured source file name.
     /// A serialized source path or a JSON pointer never grants file authority.
     pub fn record_bytes(&self, relative: &str) -> ImportResult<Vec<u8>> {
@@ -521,7 +525,10 @@ impl Inventory {
             let relative = format!("profile/{leaf}");
             match entry.kind() {
                 EntryKind::Directory => {
-                    if !matches!(leaf, "skins" | "performance" | "benchmarks" | "state") {
+                    if !matches!(
+                        leaf,
+                        "skins" | "performance" | "benchmarks" | "state" | "music"
+                    ) {
                         self.retain(&relative, None, ImportBlocker::UnknownRetainedRecord);
                     }
                     self.capture_tree(&profile.open_observed_directory(entry)?, &relative, 0)?
@@ -656,7 +663,10 @@ impl Inventory {
                             None,
                             ImportBlocker::ContentProvenanceRequiresConversion,
                         );
-                    } else if relative == "profile/state" {
+                    } else if relative == "profile/state"
+                        || relative == "profile/music"
+                        || relative.starts_with("profile/music/")
+                    {
                         self.retain(&path, None, ImportBlocker::UnknownRetainedRecord);
                     }
                     self.capture_tree(&directory.open_observed_directory(entry)?, &path, depth + 1)?
@@ -866,9 +876,9 @@ impl Inventory {
         let paths: Vec<_> = self
             .files
             .iter()
-            .map(|file| file.manifest.relative.clone())
+            .map(|file| (file.manifest.relative.clone(), file.manifest.size))
             .collect();
-        for path in paths {
+        for (path, size) in paths {
             let blocker = if path.starts_with("instances/") {
                 let leaf = path
                     .rsplit('/')
@@ -888,6 +898,12 @@ impl Inventory {
                 Some(ImportBlocker::RetainedHistoryRequiresConversion)
             } else if path.starts_with("profile/skins/") {
                 Some(ImportBlocker::SavedSkinsRequireConversion)
+            } else if size <= crate::music::MUSIC_MAX_BYTES
+                && path
+                    .strip_prefix("profile/music/")
+                    .is_some_and(|leaf| crate::music::MUSIC_FILES.contains(&leaf))
+            {
+                None
             } else if matches!(
                 path.as_str(),
                 "profile/config.json"

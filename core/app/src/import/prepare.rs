@@ -289,6 +289,19 @@ pub(super) fn prepare_payloads_with_rules(
         performance_witnesses: BTreeMap::new(),
     };
     let mut supported_records = BTreeSet::new();
+    // The owning wardrobe converter validated these immutable captured inputs
+    // before preview projection. Instance copy neither publishes nor applies them.
+    if inventory.saved_skins_validated() {
+        prepared
+            .supported_blockers
+            .insert(ImportBlocker::SavedSkinsRequireConversion);
+        supported_records.extend(
+            inventory
+                .file_manifests()
+                .filter(|file| file.relative.starts_with("profile/skins/"))
+                .map(|file| file.relative.as_str()),
+        );
+    }
     // History preparation has already verified this exact source receipt.
     // Cache activation is never a side effect of copying an instance.
     if rules.is_some() {

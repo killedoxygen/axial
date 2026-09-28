@@ -201,7 +201,7 @@ fn check_cancel(cancel: &CancellationToken) -> ImportResult<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         accounts::directory::AccountDirectory,
@@ -284,7 +284,7 @@ mod tests {
         bytes
     }
 
-    fn skin(red: u8) -> (SavedSkinRecord, Vec<u8>) {
+    pub(in crate::import) fn skin(red: u8) -> (SavedSkinRecord, Vec<u8>) {
         let bytes = normalize_skin_png(&png(red, 64)).unwrap().png_bytes;
         let record = SavedSkinRecord {
             texture_key: texture_key(&bytes),
@@ -309,7 +309,7 @@ mod tests {
         .unwrap();
     }
 
-    fn install(source: &Fixture, records: &[(SavedSkinRecord, Vec<u8>)]) {
+    pub(in crate::import) fn install(source: &Fixture, records: &[(SavedSkinRecord, Vec<u8>)]) {
         write_index(
             source,
             &json!({"schema":"axial.skins.saved","schema_version":3,

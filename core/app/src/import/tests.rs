@@ -1946,6 +1946,382 @@ fn prepare_first(fixture: &Fixture) -> PreparedInstanceImport {
         .unwrap()
 }
 
+#[tokio::test]
+async fn ordinary_profile_records_saved_skins_allow_independent_instance_publication() {
+    use super::skins::tests::{install, skin};
+    use crate::instances::model::InstanceResult;
+
+    for empty in [false, true] {
+        let fixture = Fixture::new();
+        let records = if empty { vec![] } else { vec![skin(80)] };
+        install(&fixture, &records);
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        let preview = inventory.preview();
+        assert!(preview.skin_import_available);
+        assert!(preview.instances[0].ordinary_import_available);
+        assert!(
+            preview
+                .blockers
+                .contains(&ImportBlocker::SavedSkinsRequireConversion)
+        );
+        assert!(!preview.cutover_available);
+        let (root, service) = import_service();
+        service
+            .registry()
+            .storage()
+            .migrate(&[
+                crate::accounts::directory::MIGRATION,
+                crate::skins::store::MIGRATION,
+                crate::skins::store::IMPORT_MIGRATION,
+            ])
+            .unwrap();
+        let imported = service
+            .import_instance(
+                inventory
+                    .prepare_instance(&preview.fingerprint, FIRST)
+                    .unwrap(),
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read(imported_path(&service, &imported.id).join("options.txt")).unwrap(),
+            fs::read(
+                fixture
+                    .baseline
+                    .join(format!("instances/{FIRST}/options.txt"))
+            )
+            .unwrap()
+        );
+        let copied = snapshot(&imported_path(&service, &imported.id));
+        let library_id = service
+            .directories()
+            .library()
+            .admit()
+            .unwrap()
+            .library_id();
+        drop(service);
+        let service = reopen_import_service(root.path(), library_id);
+        let repeated = service
+            .import_instance(prepare_first(&fixture))
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.id, imported.id);
+        assert_eq!(snapshot(&imported_path(&service, &imported.id)), copied);
+        let counts = service.registry().storage().read(|connection| -> InstanceResult<(u64, u64, u64)> {
+            Ok(connection.query_row("SELECT (SELECT COUNT(*) FROM saved_skins), (SELECT COUNT(*) FROM saved_skin_imports), (SELECT COUNT(*) FROM saved_skin_accounts)", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?)
+        }).unwrap();
+        assert_eq!(
+            counts,
+            (0, 0, 0),
+            "instance publication must not publish or apply skins"
+        );
+        assert!(!root.path().join("skins").exists());
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn ordinary_profile_records_malformed_or_unknown_skins_stay_blocked() {
+    use super::skins::tests::{install, skin};
+    for invalid in [
+        "unknown-field",
+        "unlisted",
+        "missing",
+        "changed-png",
+        "nested",
+        "schema",
+        "duplicate",
+    ] {
+        let fixture = Fixture::new();
+        let skin = skin(80);
+        let png = fixture
+            .baseline
+            .join(format!("skins/files/{}.png", skin.0.texture_key));
+        install(&fixture, &[skin]);
+        let mut index = fixture.record("skins/index.json");
+        match invalid {
+            "unknown-field" => {
+                index["future"] = json!(true);
+                fixture.write("skins/index.json", &index);
+            }
+            "unlisted" => fs::write(
+                fixture.baseline.join("skins/files/unlisted.png"),
+                b"retain unknown",
+            )
+            .unwrap(),
+            "missing" => fs::remove_file(png).unwrap(),
+            "changed-png" => fs::write(png, b"different bytes").unwrap(),
+            "nested" => fs::create_dir(fixture.baseline.join("skins/files/nested")).unwrap(),
+            "schema" => {
+                index["schema_version"] = json!(4);
+                fixture.write("skins/index.json", &index);
+            }
+            _ => {
+                let duplicate = index["skins"][0].clone();
+                index["skins"].as_array_mut().unwrap().push(duplicate);
+                fixture.write("skins/index.json", &index);
+            }
+        }
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        assert!(!inventory.preview().skin_import_available, "{invalid}");
+        assert!(
+            !inventory.preview().instances[0].ordinary_import_available,
+            "{invalid}"
+        );
+        assert!(
+            inventory
+                .prepare_instance(inventory.fingerprint(), FIRST)
+                .is_err(),
+            "{invalid}"
+        );
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[tokio::test]
+async fn ordinary_profile_records_exact_music_cache_does_not_block_instance_import() {
+    use crate::music::MUSIC_FILES;
+    for count in 0..=MUSIC_FILES.len() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.baseline.join("music")).unwrap();
+        for (index, name) in MUSIC_FILES[..count].iter().enumerate() {
+            // Legacy accepts an exact bounded file, including an empty cache.
+            fs::write(
+                fixture.baseline.join("music").join(name),
+                if index == 0 {
+                    b"".as_slice()
+                } else {
+                    b"cached fixed track".as_slice()
+                },
+            )
+            .unwrap();
+        }
+        let mut config = fixture.record("config.json");
+        config["music_enabled"] = json!(true);
+        config["music_volume"] = json!(37);
+        config["music_track"] = json!(1);
+        fixture.write("config.json", &config);
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        let preview = inventory.preview();
+        assert!(
+            preview.instances[0].ordinary_import_available,
+            "{count} cached tracks"
+        );
+        assert!(preview.metadata_import_available);
+        assert!(
+            !preview
+                .blockers
+                .contains(&ImportBlocker::UnknownRetainedRecord)
+        );
+        assert!(!preview.cutover_available);
+        for name in &MUSIC_FILES[..count] {
+            assert_eq!(
+                inventory
+                    .record_bytes(&format!("profile/music/{name}"))
+                    .unwrap(),
+                fs::read(fixture.baseline.join("music").join(name)).unwrap()
+            );
+        }
+        let settings =
+            crate::settings::prepare_legacy_import(&fixture.record("config.json")).unwrap();
+        assert_eq!(settings.config.music_enabled, Some(true));
+        assert_eq!(settings.config.music_volume, Some(37));
+        assert_eq!(settings.config.music_track, 1);
+        let (root, service) = import_service();
+        let imported = service
+            .import_instance(
+                inventory
+                    .prepare_instance(&preview.fingerprint, FIRST)
+                    .unwrap(),
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            imported_path(&service, &imported.id)
+                .join("options.txt")
+                .is_file()
+        );
+        assert!(
+            !root.path().join("music").exists(),
+            "cache omission must not claim offline music migration"
+        );
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn ordinary_profile_records_unknown_music_topology_stays_blocked() {
+    use crate::music::{MUSIC_FILES, MUSIC_MAX_BYTES};
+    for invalid in [
+        "unknown",
+        "alias",
+        "scratch",
+        "nested",
+        "wrong-kind",
+        "root-file",
+        "root-alias",
+        "oversize",
+    ] {
+        let fixture = Fixture::new();
+        let music = fixture.baseline.join("music");
+        if invalid == "root-file" {
+            fs::write(&music, b"not a directory").unwrap();
+        } else if invalid == "root-alias" {
+            fs::create_dir(fixture.baseline.join("Music")).unwrap();
+        } else {
+            fs::create_dir(&music).unwrap();
+            match invalid {
+                "unknown" => fs::write(music.join("custom.mp3"), b"user file").unwrap(),
+                "alias" => fs::write(music.join("VAPOR-HALO.MP3"), b"wrong spelling").unwrap(),
+                "scratch" => {
+                    fs::write(music.join(".axial-rstage-retained"), b"retained effect").unwrap()
+                }
+                "nested" => fs::create_dir(music.join("nested")).unwrap(),
+                "wrong-kind" => fs::create_dir(music.join(MUSIC_FILES[0])).unwrap(),
+                _ => fs::File::create(music.join(MUSIC_FILES[0]))
+                    .unwrap()
+                    .set_len(MUSIC_MAX_BYTES + 1)
+                    .unwrap(),
+            }
+        }
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        assert!(
+            !inventory.preview().instances[0].ordinary_import_available,
+            "{invalid}"
+        );
+        assert!(
+            inventory
+                .prepare_instance(inventory.fingerprint(), FIRST)
+                .is_err(),
+            "{invalid}"
+        );
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_profile_records_skin_and_music_links_are_not_admitted() {
+    use super::skins::tests::{install, skin};
+    for boundary in ["skin", "music-file", "music-root", "music-hardlink"] {
+        let fixture = Fixture::new();
+        let external = fixture.root.path().join("external");
+        fs::create_dir(&external).unwrap();
+        let private = external.join("private.mp3");
+        fs::write(&private, b"external canary").unwrap();
+        let target = if boundary == "skin" {
+            let record = skin(80);
+            let target = fixture
+                .baseline
+                .join(format!("skins/files/{}.png", record.0.texture_key));
+            install(&fixture, &[record]);
+            fs::remove_file(&target).unwrap();
+            target
+        } else if boundary == "music-root" {
+            fixture.baseline.join("music")
+        } else {
+            fs::create_dir(fixture.baseline.join("music")).unwrap();
+            fixture
+                .baseline
+                .join("music")
+                .join(crate::music::MUSIC_FILES[0])
+        };
+        if boundary == "music-hardlink" {
+            fs::hard_link(&private, &target).unwrap();
+        } else {
+            std::os::unix::fs::symlink(
+                if boundary == "music-root" {
+                    &external
+                } else {
+                    &private
+                },
+                &target,
+            )
+            .unwrap();
+        }
+        let source_before = snapshot(&fixture.baseline);
+        let external_before = snapshot(&external);
+        if let Ok(inventory) = Inventory::capture(&fixture.source, &BTreeMap::new()) {
+            let inventory = Arc::new(inventory);
+            assert!(
+                !inventory.preview().instances[0].ordinary_import_available,
+                "{boundary}"
+            );
+            assert!(
+                inventory
+                    .prepare_instance(inventory.fingerprint(), FIRST)
+                    .is_err()
+            );
+        }
+        assert_eq!(snapshot(&fixture.baseline), source_before);
+        assert_eq!(snapshot(&external), external_before);
+    }
+}
+
+#[test]
+fn ordinary_profile_records_skin_and_music_drift_rejects_prepared_copy() {
+    use super::skins::tests::{install, skin};
+    for boundary in [
+        "skin-png",
+        "skin-index",
+        "music-file",
+        "music-insertion",
+        "music-parent",
+    ] {
+        let fixture = Fixture::new();
+        let record = skin(80);
+        let png = fixture
+            .baseline
+            .join(format!("skins/files/{}.png", record.0.texture_key));
+        install(&fixture, &[record]);
+        let music = fixture.baseline.join("music");
+        fs::create_dir(&music).unwrap();
+        let track = music.join(crate::music::MUSIC_FILES[0]);
+        fs::write(&track, b"original cached track").unwrap();
+        let inventory = Arc::new(fixture.capture());
+        assert!(inventory.preview().instances[0].ordinary_import_available);
+        let prepared = inventory
+            .prepare_instance(inventory.fingerprint(), FIRST)
+            .unwrap();
+        match boundary {
+            "skin-png" => fs::write(png, b"changed skin").unwrap(),
+            "skin-index" => {
+                let mut index = fixture.record("skins/index.json");
+                index["skins"][0]["name"] = json!("Changed after admission");
+                fixture.write("skins/index.json", &index);
+            }
+            "music-file" => fs::write(track, b"changed track").unwrap(),
+            "music-insertion" => {
+                fs::write(music.join("new-effect.keep"), b"preserve new file").unwrap()
+            }
+            _ => fs::rename(music, fixture.baseline.join("moved-music")).unwrap(),
+        }
+        let after_change = snapshot(&fixture.baseline);
+        assert!(matches!(
+            inventory.prepare_instance(inventory.fingerprint(), FIRST),
+            Err(ImportError::SourceChanged)
+        ));
+        let (_root, service) = import_service();
+        assert!(service.import_instance(prepared).is_err(), "{boundary}");
+        assert!(service.registry().list().unwrap().is_empty());
+        assert!(service.pending().unwrap().is_empty());
+        assert_eq!(snapshot(&fixture.baseline), after_change);
+    }
+}
+
 fn terminal_performance_journal() -> Value {
     let cases = [
         (
