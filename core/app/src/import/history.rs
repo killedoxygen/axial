@@ -4,7 +4,7 @@ use super::{ImportBlocker, ImportError, ImportResult, Inventory};
 use crate::{
     install::history::{
         PreparedImport as PreparedInstallImport, PreparedOperation as PreparedInstallOperation,
-        SourceIntent, SourceMetrics, SourceOperation, SourceStep,
+        SourceGuardianTerminal, SourceIntent, SourceMetrics, SourceOperation, SourceStep,
         SourceTarget as LegacyPerformanceTarget,
     },
     instances::model::InstanceId,
@@ -394,7 +394,7 @@ struct LegacyOperation {
     reconciliation_terminal: Option<serde_json::Value>,
     persisted_state_repair_attempt: Option<serde_json::Value>,
     persisted_state_repair_terminal: Option<serde_json::Value>,
-    guardian_install_terminal: Option<serde_json::Value>,
+    guardian_install_terminal: Option<SourceGuardianTerminal>,
 }
 
 #[derive(Deserialize)]

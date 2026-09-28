@@ -138,6 +138,23 @@ pub(crate) enum SourceIntent {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct SourceGuardianTerminal {
+    pub(crate) diagnosis_id: String,
+    pub(crate) action: String,
+    pub(crate) memory: Option<SourceGuardianMemory>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceGuardianMemory {
+    pub(crate) binding: String,
+    pub(crate) target: SourceTarget,
+    pub(crate) observed_at: String,
+    pub(crate) suppression_until: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SourceOperation {
     pub(crate) journal_id: String,
     pub(crate) operation_id: String,
@@ -159,7 +176,7 @@ pub(crate) struct SourceOperation {
     pub(crate) reconciliation_terminal: Option<serde_json::Value>,
     pub(crate) persisted_state_repair_attempt: Option<serde_json::Value>,
     pub(crate) persisted_state_repair_terminal: Option<serde_json::Value>,
-    pub(crate) guardian_install_terminal: Option<serde_json::Value>,
+    pub(crate) guardian_install_terminal: Option<SourceGuardianTerminal>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
@@ -628,12 +645,10 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
         || source.owner != "Application"
         || source.ownership != "LauncherManaged"
         || source.rollback != "NotApplicable"
-        || !source.guardian_diagnosis_ids.is_empty()
         || source.reconciliation_attempt.is_some()
         || source.reconciliation_terminal.is_some()
         || source.persisted_state_repair_attempt.is_some()
         || source.persisted_state_repair_terminal.is_some()
-        || source.guardian_install_terminal.is_some()
         || source.targets.len() != 2
         || source.planned_steps.len() != 1
         || source.completed_steps.is_empty()
@@ -726,7 +741,7 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
         }
         _ => return Err(HistoryError::Invalid),
     };
-    match (
+    let failed = match (
         &identity,
         source.status.as_str(),
         source.outcome.as_deref(),
@@ -738,6 +753,11 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
             Some("Failed"),
             Some("content_initialization_cancelled"),
         ) => {
+            if !source.guardian_diagnosis_ids.is_empty()
+                || source.guardian_install_terminal.is_some()
+            {
+                return Err(HistoryError::Invalid);
+            }
             let [step] = source.completed_steps.as_slice() else {
                 return Err(HistoryError::Invalid);
             };
@@ -759,9 +779,23 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
             }
             return Ok(Some(id.clone()));
         }
-        (_, "Succeeded", Some("Succeeded"), None) => {}
+        (_, "Succeeded", Some("Succeeded"), None)
+            if source.guardian_diagnosis_ids.is_empty()
+                && source.guardian_install_terminal.is_none() =>
+        {
+            false
+        }
+        (
+            Identity::Vanilla(_) | Identity::Loader { .. },
+            "Failed",
+            Some("Failed"),
+            Some("install_progress_error"),
+        ) => {
+            validate_guardian_terminal(source)?;
+            true
+        }
         _ => return Err(HistoryError::Invalid),
-    }
+    };
     let namespace = if matches!(&identity, Identity::Content(_)) {
         "content"
     } else {
@@ -769,39 +803,57 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
     };
     let mut seen = BTreeSet::new();
     let mut checkpoints = 0usize;
+    let mut rolled_back = false;
     let mut recovering_seen = false;
     for (index, step) in source.completed_steps.iter().enumerate() {
         if !seen.insert(&step.step_id)
             || !structured_token(&step.step_id, 96)
-            || !step.guardian_fact_ids.is_empty()
-            || step.rollback != "NotApplicable"
+            || (!(failed && index + 1 == source.completed_steps.len())
+                && !step.guardian_fact_ids.is_empty())
         {
             return Err(HistoryError::Invalid);
         }
         if index + 1 == source.completed_steps.len() {
-            validate_progress(step, namespace, true)?;
+            if failed {
+                validate_failed_progress(step)?;
+            } else {
+                validate_progress(step, namespace, true)?;
+            }
             continue;
+        }
+        if rolled_back {
+            return Err(HistoryError::Invalid);
         }
         if step.step_id.starts_with(&format!("{namespace}_progress_")) {
             validate_progress(step, namespace, false)?;
             recovering_seen |= step.step_id == "install_progress_recovering";
             continue;
         }
-        let (kind, version) = match (&identity, checkpoints) {
-            (Identity::Vanilla(version), 0) => ("committed", version),
-            (Identity::Loader { base, .. }, 0) => ("base_committed", base),
-            (Identity::Loader { version, .. }, 1) => ("child_committed", version),
+        let (kind, version) = match (&identity, checkpoints, failed) {
+            (Identity::Vanilla(version), 0, false) => ("committed", version),
+            (Identity::Loader { base, .. }, 0, false) => ("base_committed", base),
+            (Identity::Loader { version, .. }, 1, false) => ("child_committed", version),
+            (Identity::Vanilla(version), 0, true) => ("rolled_back", version),
+            (Identity::Loader { base, .. }, 0, true)
+                if step.step_id == "install_publication_rolled_back" =>
+            {
+                ("rolled_back", base)
+            }
+            (Identity::Loader { base, .. }, 0, true) => ("base_committed", base),
+            (Identity::Loader { version, .. }, 1, true) => ("rolled_back", version),
             _ => return Err(HistoryError::Invalid),
         };
         if !recovering_seen {
             return Err(HistoryError::Invalid);
         }
         validate_checkpoint(step, kind, version)?;
+        rolled_back = kind == "rolled_back";
         checkpoints += 1;
     }
     match identity {
+        _ if failed && !rolled_back => Err(HistoryError::Invalid),
         Identity::Vanilla(_) if checkpoints == 1 => Ok(None),
-        Identity::Loader { .. } if checkpoints == 2 => Ok(None),
+        Identity::Loader { .. } if checkpoints == 2 || (failed && checkpoints == 1) => Ok(None),
         Identity::Content(id) if checkpoints == 0 => Ok(Some(id)),
         _ => Err(HistoryError::Invalid),
     }
@@ -837,6 +889,7 @@ fn validate_progress(
         operation_phase(phase)
     };
     if step.result != "Completed"
+        || step.rollback != "NotApplicable"
         || step.changed_target.is_some()
         || step.generated_facts != expected_facts
         || step.phase != expected_phase
@@ -848,32 +901,334 @@ fn validate_progress(
     Ok(())
 }
 
+fn validate_failed_progress(step: &SourceStep) -> Result<(), HistoryError> {
+    if step.step_id != "install_progress_error"
+        || step.phase != "Failed"
+        || step.result != "Failed"
+        || step.changed_target.is_some()
+        || step.generated_facts
+            != [
+                "install_phase:error",
+                "install_done:true",
+                "install_error:true",
+            ]
+        || step.rollback != "NotApplicable"
+        || step.metrics.is_some()
+        || !guardian_labels(&step.guardian_fact_ids, 64, GUARDIAN_FACT_IDS)
+    {
+        return Err(HistoryError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_guardian_terminal(source: &SourceOperation) -> Result<(), HistoryError> {
+    if !guardian_labels(&source.guardian_diagnosis_ids, 32, GUARDIAN_DIAGNOSIS_IDS) {
+        return Err(HistoryError::Invalid);
+    }
+    let Some(terminal) = &source.guardian_install_terminal else {
+        return Ok(());
+    };
+    if !source
+        .guardian_diagnosis_ids
+        .contains(&terminal.diagnosis_id)
+        || !matches!(
+            terminal.action.as_str(),
+            "Allow"
+                | "Warn"
+                | "Repair"
+                | "Retry"
+                | "Strip"
+                | "Downgrade"
+                | "Fallback"
+                | "Quarantine"
+                | "AskUser"
+                | "Block"
+                | "RecordOnly"
+        )
+        || (terminal.action == "Retry") != terminal.memory.is_some()
+    {
+        return Err(HistoryError::Invalid);
+    }
+    if let Some(memory) = &terminal.memory {
+        let target = &memory.target;
+        let timestamp = |value: &str| {
+            if value.len() > 40 {
+                return None;
+            }
+            let parsed = chrono::DateTime::parse_from_rfc3339(value)
+                .ok()?
+                .with_timezone(&chrono::Utc);
+            (parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) == value).then_some(parsed)
+        };
+        let observed = timestamp(&memory.observed_at).ok_or(HistoryError::Invalid)?;
+        let suppression = timestamp(&memory.suppression_until).ok_or(HistoryError::Invalid)?;
+        if !lower_hex(&memory.binding, 64)
+            || target.system != "Execution"
+            || target.kind != "Artifact"
+            || !matches!(
+                target.ownership.as_str(),
+                "LauncherManaged" | "ExternalProviderDerived"
+            )
+            || !structured_token(&target.id, 96)
+            || legacy_target_id(&target.id) != target.id
+            || observed.checked_add_signed(chrono::Duration::minutes(5)) != Some(suppression)
+        {
+            return Err(HistoryError::Invalid);
+        }
+    }
+    Ok(())
+}
+
+fn guardian_labels(values: &[String], maximum: usize, known: &[&str]) -> bool {
+    values.len() <= maximum
+        && values.iter().collect::<BTreeSet<_>>().len() == values.len()
+        && values.iter().all(|value| known.contains(&value.as_str()))
+}
+
+// Closed predecessor wire registries, retained only to validate excluded data.
+const GUARDIAN_FACT_IDS: &[&str] = &[
+    "agent_hook_failed",
+    "agent_unavailable",
+    "artifact_checksum_mismatch",
+    "artifact_hash_mismatch",
+    "artifact_missing",
+    "artifact_quarantined",
+    "artifact_size_drift",
+    "artifact_size_mismatch",
+    "asset_index_missing",
+    "atomic_promotion_completed",
+    "atomic_promotion_failed",
+    "auth_mode_incompatible",
+    "boot_marker_observed",
+    "boot_milestone_overdue",
+    "boot_milestone_reached",
+    "classpath_module_conflict",
+    "client_jar_missing",
+    "custom_java_override_present",
+    "custom_jvm_args_present",
+    "custom_jvm_preset_present",
+    "download_interrupted",
+    "download_provider_unavailable",
+    "download_temp_discarded",
+    "download_written_to_temp",
+    "exit_code_nonzero",
+    "exit_code_unknown",
+    "exit_code_zero",
+    "filesystem_permission_denied",
+    "frame_budget_exceeded",
+    "gc_pause_storm",
+    "graphics_driver_crash",
+    "heap_pressure_critical",
+    "incomplete_install",
+    "install_dependency_failed",
+    "install_execution_failed",
+    "install_processor_failed",
+    "installed_versions_degraded",
+    "java_major_mismatch",
+    "java_override_empty",
+    "java_override_missing",
+    "java_override_undefined_sentinel",
+    "java_probe_failed",
+    "java_update_too_old",
+    "jvm_arg_agent_override",
+    "jvm_arg_experimental_unlock_missing",
+    "jvm_arg_memory_conflict",
+    "jvm_arg_reserved_launcher_flag",
+    "jvm_arg_unlock_order_invalid",
+    "jvm_arg_unsafe_classpath_override",
+    "jvm_arg_unsafe_native_path_override",
+    "jvm_arg_unsupported",
+    "jvm_arg_unsupported_gc",
+    "jvm_args_empty",
+    "jvm_args_parse_failed",
+    "jvm_preset_compatibility_adjusted",
+    "launch_failure_classified",
+    "launch_jvm_preset_downgrade_available",
+    "launch_jvm_strip_available",
+    "launch_memory_allocation_low",
+    "launch_memory_min_clamped",
+    "launch_resource_cpu_pressure",
+    "launch_resource_disk_pressure",
+    "launch_resource_install_pressure",
+    "launch_resource_memory_pressure",
+    "launch_runtime_fallback_available",
+    "launcher_managed_artifact_signature_corruption",
+    "launcher_stop_requested",
+    "libraries_missing",
+    "loader_bootstrap_failure",
+    "managed_runtime_corrupt",
+    "managed_runtime_missing",
+    "managed_runtime_ready_marker_missing",
+    "managed_runtime_repair_applied",
+    "managed_runtime_rosetta_required",
+    "managed_runtime_unavailable_for_platform",
+    "missing_dependency",
+    "mod_attributed_crash",
+    "mod_transformation_failure",
+    "no_structured_fact_startup",
+    "no_structured_fact_planning",
+    "no_structured_fact_validating",
+    "no_structured_fact_downloading",
+    "no_structured_fact_installing",
+    "no_structured_fact_preparing",
+    "no_structured_fact_launching",
+    "no_structured_fact_running",
+    "no_structured_fact_repairing",
+    "no_structured_fact_rolling_back",
+    "no_structured_fact_completed",
+    "no_structured_fact_failed",
+    "out_of_memory",
+    "parent_version_missing",
+    "performance_fallback_selected",
+    "performance_health_invalid",
+    "performance_rules_invalid",
+    "performance_user_owned_conflict",
+    "persisted_state_repair_available",
+    "persisted_state_schema_invalid",
+    "primitive_refused",
+    "process_exited",
+    "process_exited_after_boot",
+    "process_exited_before_boot",
+    "process_killed",
+    "process_spawned",
+    "provider_data_invalid",
+    "recent_repair_failed",
+    "recent_startup_failure",
+    "registered_artifact_repair_available",
+    "registered_component_rebuild_failed",
+    "repair_suppressed_until",
+    "startup_window_expired",
+    "temp_file_write_failed",
+    "unknown_launch_failure",
+    "user_mod_set_drift",
+    "version_json_missing",
+    "watchdog_action_observed",
+    "watchdog_killed_process",
+];
+
+const GUARDIAN_DIAGNOSIS_IDS: &[&str] = &[
+    "artifact_ownership_unsafe",
+    "atomic_promotion_failed",
+    "download_unavailable",
+    "filesystem_permission_denied",
+    "install_artifact_metadata_invalid",
+    "install_dependency_failed",
+    "install_execution_failed",
+    "install_processor_failed",
+    "java_override_unavailable",
+    "java_probe_failed",
+    "java_runtime_major_mismatch",
+    "java_runtime_update_too_old",
+    "jvm_arg_unsafe_override",
+    "jvm_arg_unsupported",
+    "jvm_args_empty",
+    "jvm_args_malformed",
+    "launcher_managed_artifact_corrupt",
+    "launcher_managed_artifact_signature_corrupt",
+    "managed_runtime_corrupt",
+    "managed_runtime_missing",
+    "managed_runtime_rosetta_required",
+    "managed_runtime_unavailable_for_platform",
+    "performance_fallback_selected",
+    "performance_rules_invalid",
+    "performance_user_owned_conflict",
+    "persisted_state_schema_invalid",
+    "process_lifecycle_observed",
+    "temp_file_write_failed",
+    "installed_version_metadata_missing",
+    "parent_version_metadata_missing",
+    "install_incomplete",
+    "client_jar_missing",
+    "libraries_missing",
+    "asset_index_missing",
+    "launch_memory_min_clamped",
+    "launch_memory_allocation_low",
+    "launch_resource_memory_pressure",
+    "launch_resource_cpu_pressure",
+    "launch_resource_install_pressure",
+    "launch_resource_disk_pressure",
+    "custom_java_override_present",
+    "custom_jvm_preset_present",
+    "custom_jvm_args_present",
+    "performance_health_invalid",
+    "jvm_preset_adjusted",
+    "launch_prepare_failed",
+    "startup_stalled",
+    "out_of_memory",
+    "graphics_driver_crash",
+    "missing_dependency",
+    "mod_transformation_failure",
+    "mod_attributed_crash",
+    "classpath_module_conflict",
+    "auth_mode_incompatible",
+    "loader_bootstrap_failure",
+    "startup_failed_unknown",
+    "java_runtime_recovery",
+    "jvm_preset_recovery",
+    "unknown",
+    "jvm_unsupported_option",
+    "jvm_experimental_unlock",
+    "jvm_option_ordering",
+    "java_runtime_mismatch",
+    "launcher_managed_artifact_signature",
+    "unknown_failure_startup",
+    "unknown_failure_planning",
+    "unknown_failure_validating",
+    "unknown_failure_downloading",
+    "unknown_failure_installing",
+    "unknown_failure_preparing",
+    "unknown_failure_launching",
+    "unknown_failure_running",
+    "unknown_failure_repairing",
+    "unknown_failure_rolling_back",
+    "unknown_failure_completed",
+    "unknown_failure_failed",
+];
+
 fn validate_checkpoint(step: &SourceStep, kind: &str, version: &str) -> Result<(), HistoryError> {
     let expected_step = match kind {
         "committed" => "install_publication_committed",
         "base_committed" => "install_base_publication_committed",
         "child_committed" => "install_child_publication_committed",
+        "rolled_back" => "install_publication_rolled_back",
         _ => return Err(HistoryError::Invalid),
     };
-    let [publication, recorded_version, evidence, contract] = step.generated_facts.as_slice()
-    else {
-        return Err(HistoryError::Invalid);
+    let rolled_back = kind == "rolled_back";
+    let (publication, recorded_version, evidence) = match step.generated_facts.as_slice() {
+        [publication, version, evidence] if rolled_back => (publication, version, evidence),
+        [publication, version, evidence, contract]
+            if !rolled_back
+                && contract
+                    .strip_prefix("install_activation_contract:")
+                    .and_then(|id| ManagedInstallActivationContractId::parse(id).ok())
+                    .is_some() =>
+        {
+            (publication, version, evidence)
+        }
+        _ => return Err(HistoryError::Invalid),
     };
     let evidence = evidence
         .strip_prefix("install_publication_evidence:")
         .and_then(|id| ManagedInstallPublicationEvidenceId::parse(id).ok())
         .ok_or(HistoryError::Invalid)?;
     if step.step_id != expected_step
-        || step.phase != "Installing"
+        || step.phase
+            != if rolled_back {
+                "RollingBack"
+            } else {
+                "Installing"
+            }
+        || step.rollback
+            != if rolled_back {
+                "Applied"
+            } else {
+                "NotApplicable"
+            }
         || step.result != "Completed"
         || step.metrics.is_some()
         || publication != &format!("install_publication:{kind}")
         || recorded_version != &format!("install_publication_version_id:{version}")
         || !evidence.matches_version_id(version)
-        || contract
-            .strip_prefix("install_activation_contract:")
-            .and_then(|id| ManagedInstallActivationContractId::parse(id).ok())
-            .is_none()
         || step.changed_target.as_ref().is_none_or(|target| {
             target.system != "Application"
                 || target.kind != "Version"
@@ -1095,6 +1450,11 @@ mod tests {
         serde_json::from_value(journal["entries"][0].clone()).unwrap()
     }
 
+    fn rolled_back_records() -> Vec<SourceOperation> {
+        let journal = crate::import::tests::rolled_back_install_journal();
+        serde_json::from_value(journal["entries"].clone()).unwrap()
+    }
+
     fn prepare(records: Vec<SourceOperation>) -> Vec<PreparedOperation> {
         records
             .into_iter()
@@ -1257,7 +1617,10 @@ mod tests {
             |record: &mut SourceOperation| record.reconciliation_terminal = Some(json!({})),
             |record: &mut SourceOperation| record.persisted_state_repair_attempt = Some(json!({})),
             |record: &mut SourceOperation| record.persisted_state_repair_terminal = Some(json!({})),
-            |record: &mut SourceOperation| record.guardian_install_terminal = Some(json!({})),
+            |record: &mut SourceOperation| {
+                record.guardian_install_terminal =
+                    rolled_back_records()[0].guardian_install_terminal.clone()
+            },
             |record: &mut SourceOperation| {
                 record.planned_steps[0]
                     .generated_facts
@@ -1695,7 +2058,10 @@ mod tests {
                     .push("DownloadUnavailable".into())
             },
             |record: &mut SourceOperation| record.reconciliation_attempt = Some(json!({})),
-            |record: &mut SourceOperation| record.guardian_install_terminal = Some(json!({})),
+            |record: &mut SourceOperation| {
+                record.guardian_install_terminal =
+                    rolled_back_records()[0].guardian_install_terminal.clone()
+            },
         ] {
             let mut changed = source.clone();
             mutate(&mut changed);
@@ -1777,6 +2143,377 @@ mod tests {
                                 payload["source"]["targets"][1].clone()
                         }
                         "guardian" => payload["source"]["guardian_install_terminal"] = json!({}),
+                        _ => unreachable!(),
+                    }
+                    tx.execute(
+                        "UPDATE install_history SET payload=?1 WHERE id=?2",
+                        params![serde_json::to_vec(&payload).unwrap(), id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    read(&store, &legacy, &instance, None),
+                    Err(HistoryError::Conflict)
+                ),
+                "{mutation}"
+            );
+            assert!(
+                matches!(
+                    store.transaction(|tx| batch.verify_in(tx)),
+                    Err(HistoryError::Conflict)
+                ),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn rolled_back_history_preserves_neutral_proof_and_excludes_guardian_annotations() {
+        for diagnostics in [true, false] {
+            let (store, instance, legacy, _) = fixture();
+            let mut sources = rolled_back_records();
+            if !diagnostics {
+                for source in &mut sources {
+                    source.guardian_diagnosis_ids.clear();
+                    source.guardian_install_terminal = None;
+                    source
+                        .completed_steps
+                        .last_mut()
+                        .unwrap()
+                        .guardian_fact_ids
+                        .clear();
+                }
+            }
+            sources[2].sequence = u64::MAX - 1;
+            let batch = PreparedImport::bind(prepare(sources.clone()), &legacy, &instance).unwrap();
+            store.transaction(|tx| batch.insert_in(tx)).unwrap();
+            store.transaction(|tx| batch.insert_in(tx)).unwrap();
+            store.transaction(|tx| batch.verify_in(tx)).unwrap();
+            let wire =
+                serde_json::to_value(read(&store, &legacy, &instance, None).unwrap()).unwrap();
+            assert_eq!(wire["records"].as_array().unwrap().len(), 3);
+            for source in sources {
+                let saved = wire["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|record| record["operation_id"] == source.operation_id)
+                    .unwrap();
+                assert_eq!(saved["outcome"], "Failed");
+                assert_eq!(saved["failure_point"], "install_progress_error");
+                assert_eq!(saved["sequence"], source.sequence.to_string());
+                assert_eq!(saved["rollback"], "NotApplicable");
+                assert!(saved["instance_id"].is_null());
+                assert!(saved.get("guardian_install_terminal").is_none());
+                assert!(saved.get("guardian_diagnosis_ids").is_none());
+                assert!(saved.get("allowed_actions").is_none());
+                let mut neutral = serde_json::to_value(&source.completed_steps).unwrap();
+                for step in neutral.as_array_mut().unwrap() {
+                    step.as_object_mut().unwrap().remove("guardian_fact_ids");
+                }
+                assert_eq!(saved["completed_steps"], neutral);
+            }
+            assert_eq!(count(&store), 3);
+        }
+    }
+
+    #[test]
+    fn rolled_back_history_requires_exact_settled_checkpoint_sequence() {
+        let sources = rolled_back_records();
+        let mut invalid = Vec::new();
+        for mutate in [
+            |source: &mut SourceOperation| {
+                source.failure_point = Some("install_worker_interrupted".into())
+            },
+            |source: &mut SourceOperation| source.rollback = "Applied".into(),
+            |source: &mut SourceOperation| {
+                source.completed_steps.remove(0);
+            },
+            |source: &mut SourceOperation| {
+                source.completed_steps.remove(1);
+            },
+            |source: &mut SourceOperation| {
+                source.completed_steps.pop();
+            },
+            |source: &mut SourceOperation| source.completed_steps[1].phase = "Installing".into(),
+            |source: &mut SourceOperation| {
+                source.completed_steps[1].rollback = "NotApplicable".into()
+            },
+            |source: &mut SourceOperation| {
+                source.completed_steps[1]
+                    .changed_target
+                    .as_mut()
+                    .unwrap()
+                    .id = "another".into()
+            },
+            |source: &mut SourceOperation| {
+                source.completed_steps[1].generated_facts[1] =
+                    "install_publication_version_id:another".into()
+            },
+            |source: &mut SourceOperation| {
+                source.completed_steps[1].generated_facts[2] =
+                    "install_publication_evidence:invalid".into()
+            },
+            |source: &mut SourceOperation| {
+                source.completed_steps.last_mut().unwrap().rollback = "Applied".into()
+            },
+            |source: &mut SourceOperation| {
+                source
+                    .completed_steps
+                    .last_mut()
+                    .unwrap()
+                    .generated_facts
+                    .swap(1, 2)
+            },
+            |source: &mut SourceOperation| {
+                source.completed_steps.last_mut().unwrap().changed_target =
+                    Some(source.targets[1].clone())
+            },
+            |source: &mut SourceOperation| {
+                source.completed_steps[0]
+                    .guardian_fact_ids
+                    .push("download_interrupted".into())
+            },
+            |source: &mut SourceOperation| source.reconciliation_terminal = Some(json!({})),
+        ] {
+            let mut changed = sources[0].clone();
+            mutate(&mut changed);
+            invalid.push(changed);
+        }
+        let successes = source_records();
+        let mut activation_on_rollback = sources[0].clone();
+        activation_on_rollback.completed_steps[1]
+            .generated_facts
+            .push(successes[0].completed_steps[1].generated_facts[3].clone());
+        invalid.push(activation_on_rollback);
+        let mut metrics = sources[0].clone();
+        metrics.completed_steps.last_mut().unwrap().metrics =
+            successes[2].completed_steps.last().unwrap().metrics.clone();
+        invalid.push(metrics);
+        let mut after_rollback = sources[0].clone();
+        let mut progress = successes[2].completed_steps[0].clone();
+        progress.step_id = "install_progress_download".into();
+        after_rollback.completed_steps.insert(2, progress);
+        invalid.push(after_rollback);
+        let mut missing_base = sources[2].clone();
+        missing_base.completed_steps.remove(1);
+        invalid.push(missing_base);
+        let mut repeated_base = sources[2].clone();
+        repeated_base.completed_steps[2] = sources[1].completed_steps[1].clone();
+        invalid.push(repeated_base);
+        let mut committed_after_rollback = sources[1].clone();
+        committed_after_rollback
+            .completed_steps
+            .insert(2, successes[1].completed_steps[2].clone());
+        invalid.push(committed_after_rollback);
+        for (index, source) in invalid.into_iter().enumerate() {
+            assert!(
+                matches!(
+                    PreparedOperation::prepare(SOURCE, source),
+                    Err(HistoryError::Invalid)
+                ),
+                "mutation {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn rolled_back_history_validates_excluded_raw_schema_labels_and_historical_window() {
+        let original = rolled_back_records().remove(1);
+        let raw = serde_json::to_string(&original).unwrap();
+        for (field, replacement) in [
+            (
+                "\"action\":\"Retry\"",
+                "\"action\":\"Retry\",\"action\":\"Retry\"",
+            ),
+            ("\"diagnosis_id\":", "\"unknown\":true,\"diagnosis_id\":"),
+            ("\"binding\":", "\"unknown\":true,\"binding\":"),
+            (
+                "\"observed_at\":\"2026-08-13T10:00:00.000Z\"",
+                "\"observed_at\":\"2026-08-13T10:00:00.000Z\",\"observed_at\":\"2026-08-13T10:00:00.000Z\"",
+            ),
+            (
+                "\"system\":\"Execution\"",
+                "\"system\":\"Execution\",\"system\":\"Execution\"",
+            ),
+        ] {
+            let changed = raw.replacen(field, replacement, 1);
+            assert_ne!(changed, raw);
+            assert!(
+                serde_json::from_str::<SourceOperation>(&changed).is_err(),
+                "{field}"
+            );
+        }
+        for year in ["2000", "2099"] {
+            let mut historical = original.clone();
+            let memory = historical
+                .guardian_install_terminal
+                .as_mut()
+                .unwrap()
+                .memory
+                .as_mut()
+                .unwrap();
+            memory.target.ownership = "ExternalProviderDerived".into();
+            memory.observed_at = format!("{year}-01-01T00:00:00.000Z");
+            memory.suppression_until = format!("{year}-01-01T00:05:00.000Z");
+            PreparedOperation::prepare(SOURCE, historical).unwrap();
+        }
+        let mut exact_bounds = original.clone();
+        exact_bounds.guardian_diagnosis_ids = GUARDIAN_DIAGNOSIS_IDS[..32]
+            .iter()
+            .map(|id| (*id).into())
+            .collect();
+        exact_bounds
+            .completed_steps
+            .last_mut()
+            .unwrap()
+            .guardian_fact_ids = GUARDIAN_FACT_IDS[..64]
+            .iter()
+            .map(|id| (*id).into())
+            .collect();
+        PreparedOperation::prepare(SOURCE, exact_bounds).unwrap();
+        for mutate in [
+            |source: &mut SourceOperation| {
+                source
+                    .guardian_diagnosis_ids
+                    .push("unknown_diagnosis".into())
+            },
+            |source: &mut SourceOperation| {
+                source
+                    .guardian_diagnosis_ids
+                    .push("download_unavailable".into())
+            },
+            |source: &mut SourceOperation| {
+                source.guardian_diagnosis_ids = GUARDIAN_DIAGNOSIS_IDS[..33]
+                    .iter()
+                    .map(|id| (*id).into())
+                    .collect()
+            },
+            |source: &mut SourceOperation| source.guardian_diagnosis_ids.clear(),
+            |source: &mut SourceOperation| {
+                source
+                    .completed_steps
+                    .last_mut()
+                    .unwrap()
+                    .guardian_fact_ids
+                    .push("unknown_fact".into())
+            },
+            |source: &mut SourceOperation| {
+                source
+                    .completed_steps
+                    .last_mut()
+                    .unwrap()
+                    .guardian_fact_ids
+                    .push("download_provider_unavailable".into())
+            },
+            |source: &mut SourceOperation| {
+                source.completed_steps.last_mut().unwrap().guardian_fact_ids = GUARDIAN_FACT_IDS
+                    [..65]
+                    .iter()
+                    .map(|id| (*id).into())
+                    .collect()
+            },
+            |source: &mut SourceOperation| {
+                source
+                    .guardian_install_terminal
+                    .as_mut()
+                    .unwrap()
+                    .diagnosis_id = "install_execution_failed".into()
+            },
+            |source: &mut SourceOperation| {
+                source.guardian_install_terminal.as_mut().unwrap().action = "Unknown".into()
+            },
+            |source: &mut SourceOperation| {
+                source.guardian_install_terminal.as_mut().unwrap().action = "Block".into()
+            },
+            |source: &mut SourceOperation| {
+                source.guardian_install_terminal.as_mut().unwrap().memory = None
+            },
+        ] {
+            let mut changed = original.clone();
+            mutate(&mut changed);
+            assert!(matches!(
+                PreparedOperation::prepare(SOURCE, changed),
+                Err(HistoryError::Invalid)
+            ));
+        }
+        for mutate in [
+            |memory: &mut SourceGuardianMemory| memory.binding.make_ascii_uppercase(),
+            |memory: &mut SourceGuardianMemory| memory.target.system = "Application".into(),
+            |memory: &mut SourceGuardianMemory| memory.target.kind = "Version".into(),
+            |memory: &mut SourceGuardianMemory| memory.target.ownership = "UserOwned".into(),
+            |memory: &mut SourceGuardianMemory| memory.target.id = "bearer".into(),
+            |memory: &mut SourceGuardianMemory| memory.target.id = "clean+artifact".into(),
+            |memory: &mut SourceGuardianMemory| memory.observed_at = "2026-08-13T10:00:00Z".into(),
+            |memory: &mut SourceGuardianMemory| {
+                memory.observed_at = "2026-08-13T10:00:00.000+00:00".into()
+            },
+            |memory: &mut SourceGuardianMemory| {
+                memory.suppression_until = "2026-08-13T10:06:00.000Z".into()
+            },
+        ] {
+            let mut changed = original.clone();
+            mutate(
+                changed
+                    .guardian_install_terminal
+                    .as_mut()
+                    .unwrap()
+                    .memory
+                    .as_mut()
+                    .unwrap(),
+            );
+            assert!(matches!(
+                PreparedOperation::prepare(SOURCE, changed),
+                Err(HistoryError::Invalid)
+            ));
+        }
+    }
+
+    #[test]
+    fn rolled_back_history_readback_revalidates_checkpoint_and_excluded_terminal() {
+        for mutation in [
+            "rollback",
+            "evidence",
+            "diagnosis",
+            "action",
+            "window",
+            "target",
+        ] {
+            let (store, instance, legacy, _) = fixture();
+            let operation =
+                PreparedOperation::prepare(SOURCE, rolled_back_records().remove(1)).unwrap();
+            let id = operation.0.id.clone();
+            let batch = PreparedImport::bind(vec![operation], &legacy, &instance).unwrap();
+            store.transaction(|tx| batch.insert_in(tx)).unwrap();
+            store
+                .transaction(|tx| -> Result<(), StorageError> {
+                    let bytes: Vec<u8> = tx.query_row(
+                        "SELECT payload FROM install_history WHERE id=?1",
+                        [&id],
+                        |row| row.get(0),
+                    )?;
+                    let mut payload: Value = serde_json::from_slice(&bytes).unwrap();
+                    let source = &mut payload["source"];
+                    match mutation {
+                        "rollback" => {
+                            source["completed_steps"][1]["rollback"] = json!("NotApplicable")
+                        }
+                        "evidence" => {
+                            source["completed_steps"][1]["generated_facts"][2] =
+                                json!("install_publication_evidence:invalid")
+                        }
+                        "diagnosis" => source["guardian_diagnosis_ids"] = json!([]),
+                        "action" => source["guardian_install_terminal"]["action"] = json!("Block"),
+                        "window" => {
+                            source["guardian_install_terminal"]["memory"]["suppression_until"] =
+                                json!("2026-08-13T10:06:00.000Z")
+                        }
+                        "target" => {
+                            source["guardian_install_terminal"]["memory"]["target"]["id"] =
+                                json!("bearer")
+                        }
                         _ => unreachable!(),
                     }
                     tx.execute(

@@ -388,9 +388,76 @@ mod tests {
                 "install_error:true"
             ])
         )]);
+        let rolled_back_id = "op-00000000-0000-4000-8000-000000000003";
+        let evidence = concat!(
+            "managed-install-v1.d04GQwjfbBL-0D8y3lfjdZK09vfV7jEm-Ej_MLnnOLY.",
+            "AQEBAQEBAQEBAQEBAQEBAQ.AgICAgICAgICAgICAgICAg.",
+            "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM.",
+            "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+        );
+        assert!(
+            axial_minecraft::ManagedInstallPublicationEvidenceId::parse(evidence)
+                .unwrap()
+                .matches_version_id("1.20.1")
+        );
+        let mut rollback = step(
+            "install_publication_rolled_back",
+            "RollingBack",
+            "Completed",
+            json!([
+                "install_publication:rolled_back",
+                "install_publication_version_id:1.20.1",
+                format!("install_publication_evidence:{evidence}")
+            ]),
+        );
+        rollback["changed_target"] = target("Version", "1.20.1");
+        rollback["rollback"] = json!("Applied");
+        let mut failure = step(
+            "install_progress_error",
+            "Failed",
+            "Failed",
+            json!([
+                "install_phase:error",
+                "install_done:true",
+                "install_error:true"
+            ]),
+        );
+        failure["guardian_fact_ids"] = json!(["install_execution_failed"]);
+        let mut rolled_back = operation.clone();
+        rolled_back["journal_id"] = json!(format!("journal-{rolled_back_id}"));
+        rolled_back["operation_id"] = json!(rolled_back_id);
+        rolled_back["sequence"] = json!(SEQUENCE + 2);
+        rolled_back["command"] = json!("InstallVersion");
+        rolled_back["targets"] = json!([
+            target("Session", "install-00000000000000000000000000000003"),
+            target("Version", "1.20.1")
+        ]);
+        rolled_back["status"] = json!("Failed");
+        rolled_back["outcome"] = json!("Failed");
+        rolled_back["failure_point"] = json!("install_progress_error");
+        rolled_back["planned_steps"] = json!([step(
+            "install_version",
+            "Planning",
+            "Planned",
+            json!(["install_kind:vanilla", "install_version_id:1.20.1"])
+        )]);
+        rolled_back["completed_steps"] = json!([
+            step(
+                "install_progress_recovering",
+                "Repairing",
+                "Completed",
+                json!(["install_phase:recovering"])
+            ),
+            rollback,
+            failure
+        ]);
+        rolled_back["guardian_diagnosis_ids"] = json!(["install_execution_failed"]);
+        rolled_back["guardian_install_terminal"] = json!({
+            "diagnosis_id":"install_execution_failed", "action":"Block", "memory":null
+        });
         fs::create_dir_all(baseline.join("state")).unwrap();
         fs::write(baseline.join("state/operation-journals.json"), serde_json::to_vec(&json!({
-            "schema":"axial.state.operation_journals.v10","next_sequence":SEQUENCE+2,"entries":[operation,cancelled]
+            "schema":"axial.state.operation_journals.v10","next_sequence":SEQUENCE+3,"entries":[operation,cancelled,rolled_back]
         })).unwrap()).unwrap();
         let unchanged = source_snapshot(&baseline);
         let profile = root.path().join("replacement");
@@ -453,7 +520,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{page}");
         assert!(page["next_after"].is_null());
         let records = page["records"].as_array().unwrap();
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 3);
         let record = records
             .iter()
             .find(|record| record["operation_id"] == operation_id)
@@ -506,6 +573,48 @@ mod tests {
                 "rollback":"NotApplicable","metrics":null
             }])
         );
+        let rolled_back_record = records
+            .iter()
+            .find(|record| record["operation_id"] == rolled_back_id)
+            .unwrap();
+        assert_eq!(rolled_back_record["historical"], true);
+        assert!(rolled_back_record["instance_id"].is_null());
+        assert_eq!(rolled_back_record["sequence"], (SEQUENCE + 2).to_string());
+        assert_eq!(rolled_back_record["command"], "InstallVersion");
+        assert_eq!(rolled_back_record["outcome"], "Failed");
+        assert_eq!(
+            rolled_back_record["failure_point"],
+            "install_progress_error"
+        );
+        assert_eq!(rolled_back_record["rollback"], "NotApplicable");
+        assert_eq!(rolled_back_record["targets"], rolled_back["targets"]);
+        assert_eq!(
+            rolled_back_record["completed_steps"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            rolled_back_record["completed_steps"][1],
+            json!({
+                "step_id":"install_publication_rolled_back","phase":"RollingBack","result":"Completed",
+                "changed_target":target("Version", "1.20.1"),
+                "generated_facts":["install_publication:rolled_back","install_publication_version_id:1.20.1",
+                    format!("install_publication_evidence:{evidence}")],
+                "rollback":"Applied","metrics":null
+            })
+        );
+        assert_eq!(rolled_back_record["completed_steps"][2]["phase"], "Failed");
+        assert_eq!(rolled_back_record["completed_steps"][2]["result"], "Failed");
+        assert_eq!(
+            rolled_back_record["completed_steps"][2]["generated_facts"],
+            json!([
+                "install_phase:error",
+                "install_done:true",
+                "install_error:true"
+            ])
+        );
         for record in records {
             for absent in [
                 "status",
@@ -515,8 +624,13 @@ mod tests {
                 "can_retry",
                 "created_at",
                 "updated_at",
+                "guardian_diagnosis_ids",
+                "guardian_install_terminal",
             ] {
                 assert!(record.get(absent).is_none(), "{absent}");
+            }
+            for step in record["completed_steps"].as_array().unwrap() {
+                assert!(step.get("guardian_fact_ids").is_none());
             }
         }
         let last_id = records.last().unwrap()["id"].as_str().unwrap();

@@ -2838,6 +2838,300 @@ pub(crate) fn successful_install_journal() -> Value {
     json!({"schema":"axial.state.operation_journals.v10", "next_sequence":14, "entries":entries})
 }
 
+pub(crate) fn rolled_back_install_journal() -> Value {
+    let successful = successful_install_journal();
+    let mut entries = Vec::new();
+    for index in 0..3 {
+        let mut entry = successful["entries"][usize::from(index > 0)].clone();
+        let operation = format!("op-00000000-0000-4000-8000-{:012x}", index + 21);
+        entry["operation_id"] = json!(operation);
+        entry["journal_id"] = json!(format!("journal-{operation}"));
+        entry["sequence"] = json!(index + 15);
+        entry["targets"][0]["id"] = json!(format!(
+            "{}-{:032x}",
+            if index == 0 {
+                "install"
+            } else {
+                "loader-install"
+            },
+            index + 21
+        ));
+        entry["status"] = json!("Failed");
+        entry["outcome"] = json!("Failed");
+        entry["failure_point"] = json!("install_progress_error");
+        let checkpoint_index = if index == 2 { 2 } else { 1 };
+        let mut rollback = entry["completed_steps"][checkpoint_index].clone();
+        rollback["step_id"] = json!("install_publication_rolled_back");
+        rollback["phase"] = json!("RollingBack");
+        rollback["rollback"] = json!("Applied");
+        rollback["generated_facts"][0] = json!("install_publication:rolled_back");
+        rollback["generated_facts"].as_array_mut().unwrap().pop();
+        let mut steps = entry["completed_steps"].as_array().unwrap()[..checkpoint_index].to_vec();
+        steps.push(rollback);
+        let mut terminal = json!({
+            "step_id":"install_progress_error", "phase":"Failed", "result":"Failed", "changed_target":null,
+            "generated_facts":["install_phase:error", "install_done:true", "install_error:true"],
+            "rollback":"NotApplicable", "guardian_fact_ids":[], "metrics":null
+        });
+        match index {
+            0 => {
+                terminal["guardian_fact_ids"] = json!(["install_execution_failed"]);
+                entry["guardian_diagnosis_ids"] = json!(["install_execution_failed"]);
+                entry["guardian_install_terminal"] = json!({"diagnosis_id":"install_execution_failed", "action":"Block", "memory":null});
+            }
+            1 => {
+                // Exact historical Retry carrier from the predecessor's v10 fixture.
+                let snapshot: Value = serde_json::from_str(include_str!("../../../../legacy/apps/api/tests/fixtures/guardian/operation-journals-v10.json")).unwrap();
+                let retry = &snapshot["entries"][1];
+                terminal["guardian_fact_ids"] =
+                    retry["completed_steps"][0]["guardian_fact_ids"].clone();
+                entry["guardian_diagnosis_ids"] = retry["guardian_diagnosis_ids"].clone();
+                entry["guardian_install_terminal"] = retry["guardian_install_terminal"].clone();
+            }
+            _ => terminal["guardian_fact_ids"] = json!(["download_temp_discarded"]),
+        }
+        steps.push(terminal);
+        entry["completed_steps"] = json!(steps);
+        entries.push(entry);
+    }
+    json!({"schema":"axial.state.operation_journals.v10", "next_sequence":18, "entries":entries})
+}
+
+#[tokio::test]
+async fn rolled_back_install_import_copies_reopens_and_replays_without_live_authority() {
+    for diagnostics in [true, false] {
+        let fixture = Fixture::new();
+        let mut journal = rolled_back_install_journal();
+        journal["entries"][2]["sequence"] = json!(u64::MAX - 1);
+        journal["next_sequence"] = json!(u64::MAX);
+        if !diagnostics {
+            for entry in journal["entries"].as_array_mut().unwrap() {
+                entry["guardian_diagnosis_ids"] = json!([]);
+                entry["guardian_install_terminal"] = Value::Null;
+                for step in entry["completed_steps"].as_array_mut().unwrap() {
+                    step["guardian_fact_ids"] = json!([]);
+                }
+            }
+        }
+        fixture.write("state/operation-journals.json", &journal);
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        assert!(
+            inventory.preview().instances[0].ordinary_import_available,
+            "diagnostics={diagnostics}"
+        );
+        assert!(!inventory.preview().cutover_available);
+        let (root, service) = import_service();
+        service
+            .registry()
+            .storage()
+            .migrate(&[crate::install::queue::MIGRATION])
+            .unwrap();
+        let imported = service
+            .import_instance(
+                inventory
+                    .prepare_instance(inventory.fingerprint(), FIRST)
+                    .unwrap(),
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        let destination = imported_path(&service, &imported.id);
+        assert_eq!(
+            fs::read(destination.join("options.txt")).unwrap(),
+            fs::read(
+                fixture
+                    .baseline
+                    .join(format!("instances/{FIRST}/options.txt"))
+            )
+            .unwrap()
+        );
+        let history = service
+            .imported_install_history(&imported.id, None)
+            .unwrap();
+        assert_eq!(history.records.len(), 3);
+        for record in &history.records {
+            let source = journal["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["operation_id"] == record.operation_id)
+                .unwrap();
+            let wire = serde_json::to_value(record).unwrap();
+            assert!(record.historical);
+            assert!(record.instance_id.is_none());
+            assert_eq!(
+                wire["sequence"],
+                source["sequence"].as_u64().unwrap().to_string()
+            );
+            for field in ["targets", "outcome", "failure_point", "rollback"] {
+                assert_eq!(wire[field], source[field]);
+            }
+            for field in ["planned_steps", "completed_steps"] {
+                let mut expected = source[field].clone();
+                for step in expected.as_array_mut().unwrap() {
+                    step.as_object_mut().unwrap().remove("guardian_fact_ids");
+                }
+                assert_eq!(wire[field], expected);
+            }
+            assert!(wire.get("guardian_install_terminal").is_none());
+            assert!(wire.get("guardian_diagnosis_ids").is_none());
+        }
+        let library_id = service
+            .directories()
+            .library()
+            .admit()
+            .unwrap()
+            .library_id();
+        drop(service);
+        let service = reopen_import_service(root.path(), library_id);
+        assert_eq!(
+            service
+                .imported_install_history(&imported.id, None)
+                .unwrap(),
+            history
+        );
+        fs::write(destination.join("options.txt"), b"keep destination edit").unwrap();
+        let copied = snapshot(&destination);
+        let repeated = service
+            .import_instance(prepare_first(&fixture))
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.id, imported.id);
+        assert_eq!(
+            service
+                .imported_install_history(&imported.id, None)
+                .unwrap(),
+            history
+        );
+        let counts = service.registry().storage().read(|db| -> Result<_, crate::storage::StorageError> {
+            Ok(db.query_row("SELECT (SELECT COUNT(*) FROM install_history), (SELECT COUNT(*) FROM install_queue), (SELECT COUNT(*) FROM installed_versions)", [], |row| Ok((row.get::<_,u64>(0)?, row.get::<_,u64>(1)?, row.get::<_,u64>(2)?)))?)
+        }).unwrap();
+        assert_eq!(counts, (3, 0, 0));
+        assert_eq!(snapshot(&destination), copied);
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn rolled_back_install_import_refuses_unproven_effects_and_raw_guardian_corruption() {
+    for invalid in [
+        "running",
+        "missing-rollback",
+        "order",
+        "wrong-version",
+        "activation",
+        "rollback-state",
+        "terminal-first",
+        "diagnosis-reference",
+        "missing-memory",
+        "memory-on-block",
+        "window",
+        "target",
+        "binding",
+        "unknown-action",
+        "unknown-memory",
+        "duplicate-terminal",
+        "duplicate-memory",
+        "duplicate-target",
+    ] {
+        let fixture = Fixture::new();
+        let mut journal = rolled_back_install_journal();
+        match invalid {
+            "running" => { journal["entries"][0]["status"] = json!("Running"); journal["entries"][0]["outcome"] = Value::Null; }
+            "missing-rollback" => { journal["entries"][0]["completed_steps"].as_array_mut().unwrap().remove(1); }
+            "order" => journal["entries"][2]["completed_steps"].as_array_mut().unwrap().swap(1,2),
+            "wrong-version" => journal["entries"][1]["completed_steps"][1]["generated_facts"][1] = json!("install_publication_version_id:1.20.2"),
+            "activation" => journal["entries"][0]["completed_steps"][1]["generated_facts"].as_array_mut().unwrap().push(successful_install_journal()["entries"][0]["completed_steps"][1]["generated_facts"][3].clone()),
+            "rollback-state" => journal["entries"][0]["completed_steps"][1]["rollback"] = json!("NotApplicable"),
+            "terminal-first" => journal["entries"][0]["completed_steps"].as_array_mut().unwrap().swap(1,2),
+            "diagnosis-reference" => journal["entries"][1]["guardian_diagnosis_ids"] = json!([]),
+            "missing-memory" => journal["entries"][1]["guardian_install_terminal"]["memory"] = Value::Null,
+            "memory-on-block" => journal["entries"][1]["guardian_install_terminal"]["action"] = json!("Block"),
+            "window" => journal["entries"][1]["guardian_install_terminal"]["memory"]["suppression_until"] = json!("2026-08-13T10:06:00.000Z"),
+            "target" => journal["entries"][1]["guardian_install_terminal"]["memory"]["target"]["kind"] = json!("Instance"),
+            "binding" => journal["entries"][1]["guardian_install_terminal"]["memory"]["binding"] = json!("A".repeat(64)),
+            "unknown-action" => journal["entries"][0]["guardian_install_terminal"]["action"] = json!("FutureEffect"),
+            "unknown-memory" => journal["entries"][1]["guardian_install_terminal"]["memory"]["future"] = json!(true),
+            _ => {}
+        }
+        journal["entries"].as_array_mut().unwrap().extend(
+            terminal_rules_journal()["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+        fixture.write("state/operation-journals.json", &journal);
+        let raw = serde_json::to_string(&journal).unwrap();
+        let raw = match invalid {
+            "duplicate-terminal" => raw.replacen("\"action\":\"Block\"", "\"action\":\"Block\",\"action\":\"Block\"", 1),
+            "duplicate-memory" => raw.replacen("\"observed_at\":\"2026-08-13T10:00:00.000Z\"", "\"observed_at\":\"2026-08-13T10:00:00.000Z\",\"observed_at\":\"2026-08-13T10:00:00.000Z\"", 1),
+            "duplicate-target" => raw.replacen("\"kind\":\"Artifact\"", "\"kind\":\"Artifact\",\"kind\":\"Artifact\"", 1),
+            _ => raw,
+        };
+        if invalid.starts_with("duplicate-") {
+            assert_ne!(raw, serde_json::to_string(&journal).unwrap(), "{invalid}");
+        }
+        fs::write(
+            fixture.baseline.join("state/operation-journals.json"),
+            raw.as_bytes(),
+        )
+        .unwrap();
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        assert!(
+            !inventory.preview().instances[0].ordinary_import_available,
+            "{invalid}"
+        );
+        assert!(!inventory.preview().rules_import_available, "{invalid}");
+        assert!(
+            inventory
+                .prepare_instance(inventory.fingerprint(), FIRST)
+                .is_err(),
+            "{invalid}"
+        );
+        assert_eq!(
+            inventory
+                .record_bytes("profile/state/operation-journals.json")
+                .unwrap(),
+            raw.as_bytes()
+        );
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn rolled_back_install_import_keeps_source_fences() {
+    let fixture = Fixture::new();
+    let mut journal = rolled_back_install_journal();
+    fixture.write("state/operation-journals.json", &journal);
+    let inventory = Arc::new(fixture.capture());
+    let prepared = inventory
+        .prepare_instance(inventory.fingerprint(), FIRST)
+        .unwrap();
+    journal["entries"][1]["guardian_install_terminal"]["memory"]["observed_at"] =
+        json!("2026-08-13T11:00:00.000Z");
+    journal["entries"][1]["guardian_install_terminal"]["memory"]["suppression_until"] =
+        json!("2026-08-13T11:05:00.000Z");
+    fixture.write("state/operation-journals.json", &journal);
+    let before = snapshot(&fixture.baseline);
+    assert!(matches!(
+        inventory.revalidate(),
+        Err(ImportError::SourceChanged)
+    ));
+    let (_root, service) = import_service();
+    assert!(service.import_instance(prepared).is_err());
+    assert!(service.registry().list().unwrap().is_empty());
+    assert!(service.pending().unwrap().is_empty());
+    assert_eq!(snapshot(&fixture.baseline), before);
+}
+
 pub(crate) fn cancelled_content_initialization_journal() -> Value {
     let mut entry = successful_install_journal()["entries"][2].clone();
     let operation = "op-00000000-0000-4000-8000-00000000000e";
@@ -3381,10 +3675,18 @@ async fn successful_install_history_import_allows_real_copy_and_reopen() {
 }
 
 #[tokio::test]
-async fn successful_install_history_import_does_not_block_mixed_rules_preparation() {
+async fn rolled_back_install_import_preserves_mixed_rules_and_success_history() {
     let fixture = Fixture::new();
     let (_, key) = seed_rules_source(&fixture);
     let mut journal = successful_install_journal();
+    journal["next_sequence"] = json!(18);
+    journal["entries"].as_array_mut().unwrap().extend(
+        rolled_back_install_journal()["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
     journal["entries"].as_array_mut().unwrap().extend(
         terminal_rules_journal()["entries"]
             .as_array()
@@ -3461,7 +3763,7 @@ async fn successful_install_history_import_does_not_block_mixed_rules_preparatio
             .unwrap()
             .records
             .len(),
-        3
+        6
     );
     assert_eq!(historical_commands(&service).len(), 6);
     assert_eq!(snapshot(&fixture.baseline), before);
