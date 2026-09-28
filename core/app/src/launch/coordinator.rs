@@ -44,6 +44,13 @@ pub const INTENT_SETTLEMENT_MIGRATION: Migration = Migration {
                OR json_extract(CAST(settlement AS TEXT), '$.version') IS NOT 1 ELSE 1 END;",
 };
 
+pub const INTENT_RECOVERY_MIGRATION: Migration = Migration {
+    id: "launch_intents.v4",
+    sql: "DROP INDEX launch_intents_unresolved;
+    CREATE INDEX launch_intents_unresolved ON launch_intents(intent_key)
+        WHERE state IN ('accepted','interrupted') AND terminal_ack=0;",
+};
+
 use super::session::SessionSnapshot;
 use super::{
     model::{LaunchAuthContext, LaunchOptions, LaunchPlanRequest},
@@ -57,16 +64,16 @@ use crate::{
         selection::CapturedAccount,
         session::AuthService,
     },
-    install::queue::{InstallError, InstallQueue},
+    install::queue::{InstallError, InstallQueue, InstalledVersionReceipt},
     instances::{
         directory::{InstanceDirectories, RegisteredInstance},
         model::InstanceError,
     },
-    library::ApplicationRootPin,
+    library::{ApplicationRootPin, GenerationPin},
     performance::{PerformanceMutationError, PerformanceService},
     runtime::discovery::RuntimeDiscovery,
     settings::{EffectiveLaunchSettings, SettingsStore},
-    tasks::{CancellationToken, TaskOwner},
+    tasks::{CancellationToken, ExclusionLease, TaskOwner},
 };
 
 #[derive(Clone)]
@@ -83,6 +90,28 @@ pub struct LaunchCoordinator {
     tasks: TaskOwner,
     intents: LaunchIntents,
     telemetry: Option<Arc<crate::telemetry::Telemetry>>,
+    #[cfg(test)]
+    pub(crate) fresh_install_checks: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(crate) struct PreflightProjection {
+    current: Option<Arc<PreflightArtifacts>>,
+    installs: InstallQueue,
+}
+
+impl Drop for PreflightProjection {
+    fn drop(&mut self) {
+        drop(self.current.take());
+        // Admission refusal can release proof without a task-completion wake.
+        self.installs.resume_queued();
+    }
+}
+
+struct PreflightArtifacts {
+    pin: GenerationPin,
+    _lease: ExclusionLease,
+    bundle: axial_minecraft::VersionBundleReadGuard,
+    installed: InstalledVersionReceipt,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -118,6 +147,8 @@ impl LaunchCoordinator {
             tasks,
             intents: LaunchIntents::new(4096),
             telemetry: None,
+            #[cfg(test)]
+            fresh_install_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -366,7 +397,23 @@ impl LaunchCoordinator {
     /// Read-only readiness with an owned Java diagnostic probe, never game
     /// launch or native extraction. It does not reserve the instance while probing.
     pub async fn preflight(&self, id: InstanceId) -> LaunchPreflight {
-        let result = self.check_preflight(&id).await;
+        self.preflight_with_projection(id, &mut self.preflight_projection())
+            .await
+    }
+
+    pub(crate) fn preflight_projection(&self) -> PreflightProjection {
+        PreflightProjection {
+            current: None,
+            installs: self.installs.clone(),
+        }
+    }
+
+    pub(crate) async fn preflight_with_projection(
+        &self,
+        id: InstanceId,
+        projection: &mut PreflightProjection,
+    ) -> LaunchPreflight {
+        let result = self.check_preflight(&id, projection).await;
         LaunchPreflight {
             instance_id: id,
             launchable: result.is_ok(),
@@ -374,9 +421,23 @@ impl LaunchCoordinator {
         }
     }
 
-    async fn check_preflight(&self, id: &InstanceId) -> Result<(), LaunchError> {
+    async fn check_preflight(
+        &self,
+        id: &InstanceId,
+        projection: &mut PreflightProjection,
+    ) -> Result<(), LaunchError> {
         let admitted = Arc::new(self.instances.admit_read(id).map_err(instance_error)?);
         let pin = admitted.game_directory().pin().clone();
+        if projection.current.as_ref().is_some_and(|proof| {
+            proof.pin.generation() != pin.generation()
+                || proof.pin.library_id() != pin.library_id()
+                || proof.installed.version().id != admitted.record().instance.version_id
+        }) {
+            projection.current = None;
+        }
+        // The current row owns even a newly created proof if its waiter disappears
+        // or its task panics. Only a normally joined task returns it to the list.
+        let proof_slot = Arc::new(Mutex::new(projection.current.take()));
         let artifacts = self
             .instances
             .exclusions()
@@ -387,7 +448,8 @@ impl LaunchCoordinator {
                 )],
             )
             .map_err(|_| LaunchError::InstanceBusy)?;
-        let retained = (admitted.clone(), artifacts);
+        let retained = (admitted.clone(), artifacts.clone(), proof_slot.clone());
+        let owned_proof = proof_slot.clone();
         let coordinator = self.clone();
         let task = self
             .tasks
@@ -398,32 +460,48 @@ impl LaunchCoordinator {
                     // Installation can be repaired without selecting an account.
                     // Only the guarded install proof establishes that need;
                     // catalogue display flags and transient admission failures do not.
-                    let operation = pin
-                        .managed_library()
-                        .map_err(|_| LaunchError::LibraryUnavailable)?;
-                    bundle_guard = Some(
-                        axial_minecraft::VersionBundleReadGuard::acquire(&operation).map_err(
-                            |error| {
-                                if error.kind() == std::io::ErrorKind::WouldBlock {
-                                    LaunchError::InstanceBusy
-                                } else {
-                                    LaunchError::LibraryUnavailable
-                                }
-                            },
-                        )?,
-                    );
-                    let installed = coordinator
-                        .installs
-                        .ready_version(&pin, &admitted.record().instance.version_id)
+                    let previous = owned_proof.lock().unwrap().clone();
+                    let proof = if let Some(proof) = previous {
+                        let checked = proof.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            checked.bundle.revalidate().map_err(bundle_read_error)?;
+                            checked.installed.revalidate().map_err(install_read_error)
+                        })
                         .await
-                        .map_err(|error| match error {
-                            InstallError::NotReady => LaunchError::InstallUnavailable,
-                            InstallError::Busy => LaunchError::InstanceBusy,
-                            InstallError::AtCapacity => LaunchError::AtCapacity,
-                            InstallError::Closed => LaunchError::Closed,
-                            _ => LaunchError::LibraryUnavailable,
-                        })?;
-                    let version = installed.version();
+                        .map_err(|_| LaunchError::PreparationFailed)
+                        .and_then(|result| result);
+                        if result.is_err() {
+                            *owned_proof.lock().unwrap() = None;
+                        }
+                        result?;
+                        proof
+                    } else {
+                        let operation = pin
+                            .managed_library()
+                            .map_err(|_| LaunchError::LibraryUnavailable)?;
+                        bundle_guard = Some(
+                            axial_minecraft::VersionBundleReadGuard::acquire(&operation)
+                                .map_err(bundle_read_error)?,
+                        );
+                        #[cfg(test)]
+                        coordinator
+                            .fresh_install_checks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let installed = coordinator
+                            .installs
+                            .ready_version(&pin, &admitted.record().instance.version_id)
+                            .await
+                            .map_err(install_read_error)?;
+                        let proof = Arc::new(PreflightArtifacts {
+                            pin,
+                            _lease: artifacts,
+                            bundle: bundle_guard.take().unwrap(),
+                            installed,
+                        });
+                        *owned_proof.lock().unwrap() = Some(proof.clone());
+                        proof
+                    };
+                    let version = proof.installed.version();
                     let (account, settings) =
                         coordinator.capture(&admitted.record().instance, None)?;
                     let result = async {
@@ -508,9 +586,12 @@ impl LaunchCoordinator {
                 result
             })
             .map_err(|_| LaunchError::AtCapacity)?;
-        task.join()
+        let result = task
+            .join()
             .await
-            .map_err(|_| LaunchError::PreparationFailed)?
+            .map_err(|_| LaunchError::PreparationFailed)?;
+        projection.current = proof_slot.lock().unwrap().take();
+        result
     }
 
     fn capture(
@@ -816,6 +897,24 @@ fn launch_options(
         is_modded: !matches!(instance.loader_key.as_str(), "" | "vanilla"),
         ..Default::default()
     })
+}
+
+fn bundle_read_error(error: std::io::Error) -> LaunchError {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        LaunchError::InstanceBusy
+    } else {
+        LaunchError::LibraryUnavailable
+    }
+}
+
+fn install_read_error(error: InstallError) -> LaunchError {
+    match error {
+        InstallError::NotReady => LaunchError::InstallUnavailable,
+        InstallError::Busy => LaunchError::InstanceBusy,
+        InstallError::AtCapacity => LaunchError::AtCapacity,
+        InstallError::Closed => LaunchError::Closed,
+        _ => LaunchError::LibraryUnavailable,
+    }
 }
 
 fn instance_error(error: InstanceError) -> LaunchError {
@@ -1344,8 +1443,8 @@ impl LaunchIntents {
         let mut examined = 0usize;
         let mut acknowledged = false;
         loop {
-            // The partial index excludes lifetime history. One row at a time
-            // also lets old profiles make durable, bounded migration progress.
+            // Acknowledged history is excluded. Reportless observations still
+            // consume the bounded scan and require exact validation.
             let row = storage
                 .read(|db| -> Result<_, StorageError> {
                     Ok(db
@@ -1353,10 +1452,7 @@ impl LaunchIntents {
                             "SELECT CASE WHEN length(intent_key)=36 THEN intent_key END,
                      CASE WHEN length(payload)<=16384 THEN payload END,settlement
                      FROM launch_intents WHERE state IN ('accepted','interrupted')
-                     AND terminal_ack=0 AND CASE WHEN json_valid(CAST(settlement AS TEXT))
-                     THEN json_type(CAST(settlement AS TEXT), '$.version') IS NOT 'integer'
-                       OR json_extract(CAST(settlement AS TEXT), '$.version') IS NOT 1 ELSE 1 END
-                     AND intent_key>?1 ORDER BY intent_key LIMIT 1",
+                     AND terminal_ack=0 AND intent_key>?1 ORDER BY intent_key LIMIT 1",
                             [&after],
                             |row| {
                                 Ok((
@@ -1386,10 +1482,10 @@ impl LaunchIntents {
             bytes += row_bytes;
             let record = decode_intent(&key, &payload)?;
             if let Some(bytes) = settlement {
-                // Unsupported envelopes remain in the bounded recovery index.
-                // Only the exact owner publication can waive restoration.
+                // This proof is independent of optional report persistence.
                 decode_settlement(&record, &payload, &bytes)?;
-                return Err(LaunchError::IntentUnavailable);
+                after = key;
+                continue;
             }
             if let Some(context) = &record.context {
                 serde_json::from_str::<super::reports::LaunchProofScenario>(context)
@@ -2007,6 +2103,212 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn preflight_projection_reuses_verified_install_but_ordinary_reads_stay_fresh() {
+        let (root, coordinator, id) = preflight_fixture().await;
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        let mut projection = coordinator.preflight_projection();
+        for _ in 0..2 {
+            let result = coordinator
+                .preflight_with_projection(id.clone(), &mut projection)
+                .await;
+            assert!(result.launchable, "{result:?}");
+        }
+        assert_eq!(
+            coordinator
+                .fresh_install_checks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one exact installed version must be verified once per projection"
+        );
+        for _ in 0..2 {
+            let result = coordinator.preflight(id.clone()).await;
+            assert!(result.launchable, "{result:?}");
+        }
+        assert_eq!(
+            coordinator
+                .fresh_install_checks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "ordinary preflight must retain fresh exact verification"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preflight_projection_release_resumes_a_queued_install() {
+        let (root, coordinator, id) = preflight_fixture().await;
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        let mut projection = coordinator.preflight_projection();
+        assert!(
+            coordinator
+                .preflight_with_projection(id, &mut projection)
+                .await
+                .launchable
+        );
+        assert!(coordinator.tasks.status().is_idle());
+
+        // Queue subscriptions are newer than the completed preflight's wake.
+        // Its retained projection is now the only blocker, with no running task.
+        let queued = coordinator
+            .installs
+            .start_vanilla("queued-after-preflight")
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .installs
+                .status(&queued.install_id)
+                .unwrap()
+                .view_model
+                .phase_id,
+            "queued"
+        );
+        drop(projection);
+        let started = coordinator
+            .installs
+            .status(&queued.install_id)
+            .unwrap()
+            .view_model
+            .phase_id
+            == "starting";
+        // This current-thread test cancels before the accepted worker can poll
+        // any provider work; the red path removes its still-queued request.
+        if started {
+            coordinator.installs.cancel(&queued.install_id).unwrap();
+        } else {
+            coordinator
+                .installs
+                .remove(&queued.install_id)
+                .await
+                .unwrap();
+        }
+        coordinator
+            .tasks
+            .shutdown(std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        coordinator.installs.shutdown_queued().unwrap();
+        assert!(
+            started,
+            "releasing the projection must wake its blocked install queue"
+        );
+        assert_eq!(
+            coordinator
+                .installs
+                .status(&queued.install_id)
+                .unwrap()
+                .outcome,
+            Some(crate::install::model::InstallOutcome::Cancelled)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preflight_projection_rejects_artifact_drift_and_does_not_cache_refusals() {
+        for ancestor in [false, true] {
+            let (root, coordinator, id) = preflight_fixture().await;
+            std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+            let mut projection = coordinator.preflight_projection();
+            assert!(
+                coordinator
+                    .preflight_with_projection(id.clone(), &mut projection)
+                    .await
+                    .launchable
+            );
+            let directory = root.path().join("versions/1.20.1");
+            let jar = directory.join("1.20.1.jar");
+            let original = std::fs::read(&jar).unwrap();
+            if ancestor {
+                std::fs::rename(&directory, root.path().join("old-version")).unwrap();
+                std::fs::create_dir(&directory).unwrap();
+                for entry in std::fs::read_dir(root.path().join("old-version")).unwrap() {
+                    let entry = entry.unwrap();
+                    std::fs::copy(entry.path(), directory.join(entry.file_name())).unwrap();
+                }
+            } else {
+                std::fs::write(&jar, b"external drift").unwrap();
+            }
+            let drifted = coordinator
+                .preflight_with_projection(id.clone(), &mut projection)
+                .await;
+            assert_eq!(drifted.error.unwrap().code, LaunchError::InstallUnavailable);
+            assert!(projection.current.is_none());
+            assert_eq!(
+                coordinator
+                    .fresh_install_checks
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            if !ancestor {
+                std::fs::write(&jar, original).unwrap();
+            }
+            let repaired = coordinator
+                .preflight_with_projection(id, &mut projection)
+                .await;
+            assert!(repaired.launchable, "{repaired:?}");
+            assert_eq!(
+                coordinator
+                    .fresh_install_checks
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                2
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preflight_projection_rechecks_publication_lane_and_exact_generation() {
+        let (root, coordinator, id) = preflight_fixture().await;
+        let lane = root.path().join(".axial-publication");
+        std::fs::rename(&lane, root.path().join("previous-publication")).unwrap();
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        let mut projection = coordinator.preflight_projection();
+        assert!(
+            coordinator
+                .preflight_with_projection(id.clone(), &mut projection)
+                .await
+                .launchable
+        );
+        assert!(!lane.exists(), "first proof must exercise NoLane");
+        let library = coordinator.instances.library();
+        let pin = library.admit().unwrap();
+        let operation = pin.managed_library().unwrap();
+        std::fs::rename(root.path().join("previous-publication"), &lane).unwrap();
+        let publication =
+            axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
+        let busy = coordinator
+            .preflight_with_projection(id.clone(), &mut projection)
+            .await;
+        assert_eq!(busy.error.unwrap().code, LaunchError::InstanceBusy);
+        assert!(projection.current.is_none());
+        drop(publication);
+        assert!(
+            coordinator
+                .preflight_with_projection(id.clone(), &mut projection)
+                .await
+                .launchable
+        );
+        let before = pin.generation();
+        let mut change = library.begin_switch().unwrap();
+        change.prepare_managed(pin.library_id()).unwrap();
+        let after = change.commit_after_persistence().unwrap();
+        assert_ne!(before, after);
+        drop((operation, pin));
+        let reselected = coordinator
+            .preflight_with_projection(id, &mut projection)
+            .await;
+        assert!(reselected.launchable, "{reselected:?}");
+        assert_eq!(
+            coordinator
+                .fresh_install_checks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+        assert_eq!(projection.current.as_ref().unwrap().pin.generation(), after);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn preflight_probe_does_not_reserve_the_foreground_launch_target() {
         let (root, coordinator, id) = preflight_fixture().await;
         assert!(
@@ -2093,13 +2395,27 @@ mod tests {
             ("none", true, Some(LaunchError::RuntimeUnavailable)),
         ] {
             let (root, coordinator, id) = preflight_fixture().await;
+            let mut projection = coordinator.preflight_projection();
+            std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+            assert!(
+                coordinator
+                    .preflight_with_projection(id.clone(), &mut projection)
+                    .await
+                    .launchable
+            );
+            std::fs::remove_file(root.path().join("probe-release")).unwrap();
+            std::fs::remove_file(root.path().join("probe-started")).unwrap();
             if fail_probe {
                 std::fs::write(root.path().join("probe-fail"), b"fail").unwrap();
             }
             let waiter = tokio::spawn({
                 let coordinator = coordinator.clone();
                 let id = id.clone();
-                async move { coordinator.preflight(id).await }
+                async move {
+                    coordinator
+                        .preflight_with_projection(id, &mut projection)
+                        .await
+                }
             });
             let started = wait_for_preflight_probe(root.path()).await;
             let mut foreground = None;
@@ -2176,6 +2492,12 @@ mod tests {
             let result = result.unwrap();
             assert_eq!(result.error.map(|error| error.code), expected, "{change}");
             assert_eq!(result.launchable, expected.is_none(), "{change}");
+            assert_eq!(
+                coordinator
+                    .fresh_install_checks
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
         }
     }
 
@@ -2183,10 +2505,24 @@ mod tests {
     #[tokio::test]
     async fn preflight_waiter_loss_retains_artifacts_until_the_probe_is_reaped() {
         let (root, coordinator, id) = preflight_fixture().await;
+        let mut projection = coordinator.preflight_projection();
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        assert!(
+            coordinator
+                .preflight_with_projection(id.clone(), &mut projection)
+                .await
+                .launchable
+        );
+        std::fs::remove_file(root.path().join("probe-release")).unwrap();
+        std::fs::remove_file(root.path().join("probe-started")).unwrap();
         let waiter = tokio::spawn({
             let coordinator = coordinator.clone();
             let id = id.clone();
-            async move { coordinator.preflight(id).await }
+            async move {
+                coordinator
+                    .preflight_with_projection(id, &mut projection)
+                    .await
+            }
         });
         let started = wait_for_preflight_probe(root.path()).await;
         let pid = started.as_ref().ok().copied();
@@ -2227,6 +2563,12 @@ mod tests {
             "PID {pid:?}"
         );
         assert!(coordinator.tasks.status().is_idle());
+        assert_eq!(
+            coordinator
+                .fresh_install_checks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
         assert!(
             coordinator
                 .instances
@@ -2336,6 +2678,7 @@ mod tests {
                 INTENT_MIGRATION,
                 INTENT_TERMINAL_MIGRATION,
                 INTENT_SETTLEMENT_MIGRATION,
+                INTENT_RECOVERY_MIGRATION,
             ])
             .unwrap();
         let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
@@ -2350,7 +2693,7 @@ mod tests {
     }
 
     async fn observed_fixture(
-        storage: Arc<MetadataStore>,
+        intents: LaunchIntents,
     ) -> (
         LaunchIntents,
         LaunchRequest,
@@ -2358,7 +2701,6 @@ mod tests {
         SessionSnapshot,
         super::super::reports::LaunchProofRecord,
     ) {
-        let intents = durable_intents(storage.clone());
         let request = request();
         let ReservedIntent::New {
             key, session_id, ..
@@ -2367,7 +2709,7 @@ mod tests {
             panic!()
         };
         let acceptance = intents.accept(&key, binding(&request)).unwrap();
-        refuse_reports(&storage);
+        refuse_reports(intents.storage.as_ref().unwrap());
         let (session, report) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             super::super::session::finish_unstarted_for_test(
@@ -2389,7 +2731,8 @@ mod tests {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let path = root.path().join("metadata.sqlite");
         let storage = Arc::new(MetadataStore::open(&path).unwrap());
-        let (intents, request, acceptance, session, _) = observed_fixture(storage.clone()).await;
+        let (intents, request, acceptance, session, _) =
+            observed_fixture(durable_intents(storage.clone())).await;
         let key = request.intent_key.as_deref().unwrap();
         assert_eq!(session.phase, super::super::session::SessionPhase::Exited);
         assert!(
@@ -2417,9 +2760,24 @@ mod tests {
                 .is_none()
         );
         assert!(!terminal_ack(&storage, key));
+        let evidence_bytes: usize = storage
+            .read(|db| -> Result<_, StorageError> {
+                Ok(db.query_row(
+                    "SELECT length(payload)+length(settlement) FROM launch_intents WHERE intent_key=?1",
+                    [key],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        for (rows, bytes) in [(0, 0), (0, evidence_bytes), (1, evidence_bytes - 1)] {
+            assert!(matches!(
+                intents.interrupted_records_with_limits(rows, bytes),
+                Err(LaunchError::AtCapacity)
+            ));
+        }
         assert!(
             intents
-                .interrupted_records_with_limits(0, 0)
+                .interrupted_records_with_limits(1, evidence_bytes)
                 .unwrap()
                 .is_empty()
         );
@@ -2445,19 +2803,110 @@ mod tests {
         // never a library-wide waiver of unrelated obligations.
         let other = self::request();
         reopened.reserve(&other).unwrap();
-        reopened
+        let other_acceptance = reopened
             .accept(other.intent_key.as_deref().unwrap(), binding(&other))
             .unwrap();
-        let unresolved = reopened.interrupted_records_with_limits(1, 16384).unwrap();
+        let total_bytes = evidence_bytes + other_acceptance.payload.len();
+        for (rows, bytes) in [(1, total_bytes), (2, total_bytes - 1)] {
+            assert!(matches!(
+                reopened.interrupted_records_with_limits(rows, bytes),
+                Err(LaunchError::AtCapacity)
+            ));
+        }
+        let unresolved = reopened
+            .interrupted_records_with_limits(2, total_bytes)
+            .unwrap();
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].request.instance_id, other.instance_id);
+    }
+
+    #[tokio::test]
+    async fn observed_settlement_v3_upgrade_checks_mixed_evidence_after_reopen() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let path = root.path().join("metadata.sqlite");
+        let storage = Arc::new(MetadataStore::open(&path).unwrap());
+        storage
+            .migrate(&[
+                INTENT_MIGRATION,
+                INTENT_TERMINAL_MIGRATION,
+                INTENT_SETTLEMENT_MIGRATION,
+            ])
+            .unwrap();
+        let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
+        let legacy = LaunchIntents::with_storage(storage.clone(), reports, 8).unwrap();
+        let (intents, valid, acceptance, _, _) = observed_fixture(legacy).await;
+        let mut invalid = request();
+        invalid.intent_key = Some("ffffffff-ffff-ffff-ffff-ffffffffffff".into());
+        let invalid_key = invalid.intent_key.as_deref().unwrap();
+        assert!(valid.intent_key.as_deref().unwrap() < invalid_key);
+        intents.reserve(&invalid).unwrap();
+        intents.accept(invalid_key, binding(&invalid)).unwrap();
+        storage
+            .transaction(|tx| -> Result<(), StorageError> {
+                tx.execute(
+                    "UPDATE launch_intents SET settlement=?2 WHERE intent_key=?1",
+                    params![invalid_key, br#"{"version":1}"#.as_slice()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let saved_rows = |storage: &MetadataStore| {
+            storage
+                .read(|db| -> Result<_, StorageError> {
+                    let mut query = db.prepare(
+                        "SELECT intent_key,payload,state,terminal_ack,settlement FROM launch_intents ORDER BY intent_key",
+                    )?;
+                    Ok(query
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, bool>(3)?,
+                                row.get::<_, Option<Vec<u8>>>(4)?,
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?)
+                })
+                .unwrap()
+        };
+        let original = saved_rows(&storage);
+        drop((intents, acceptance, storage));
+        for _ in 0..2 {
+            let storage = Arc::new(MetadataStore::open(&path).unwrap());
+            let reopened = durable_intents(storage.clone());
+            assert!(matches!(
+                reopened.interrupted_records(),
+                Err(LaunchError::IntentUnavailable)
+            ));
+            assert!(matches!(
+                reopened.snapshot(valid.intent_key.as_deref().unwrap()).unwrap(),
+                Some(LaunchIntentStatus::Accepted { session }) if session.view_model.terminal
+            ));
+            assert!(matches!(
+                reopened.snapshot(invalid_key),
+                Err(LaunchError::IntentUnavailable)
+            ));
+            assert_eq!(saved_rows(&storage), original);
+            let indexed: usize = storage
+                .read(|db| -> Result<_, StorageError> {
+                    Ok(db.query_row(
+                        "SELECT count(*) FROM launch_intents INDEXED BY launch_intents_unresolved
+                         WHERE state IN ('accepted','interrupted') AND terminal_ack=0",
+                        [],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(indexed, 2);
+        }
     }
 
     #[tokio::test]
     async fn observed_settlement_is_immutable_and_report_concordance_is_required() {
         let storage = Arc::new(MetadataStore::in_memory().unwrap());
         let (intents, request, acceptance, session, report) =
-            observed_fixture(storage.clone()).await;
+            observed_fixture(durable_intents(storage.clone())).await;
         let key = request.intent_key.as_deref().unwrap();
         let bytes: Vec<u8> = storage
             .read(|db| -> Result<_, StorageError> {
@@ -2529,11 +2978,14 @@ mod tests {
             "unsupported",
             "boolean",
             "malformed",
+            "malformed_v1",
             "binding",
+            "observation",
             "noncanonical",
         ] {
-            let storage = Arc::new(MetadataStore::in_memory().unwrap());
-            let (intents, request, acceptance, _, _) = observed_fixture(storage.clone()).await;
+            let (_root, directories, storage, _) = recovery_fixture().await;
+            let (intents, request, acceptance, _, _) =
+                observed_fixture(durable_intents(storage.clone())).await;
             let key = request.intent_key.as_deref().unwrap();
             let original: Vec<u8> = storage
                 .read(|db| -> Result<_, StorageError> {
@@ -2564,10 +3016,18 @@ mod tests {
                             serde_json::to_vec(&value).unwrap()
                         }
                         "malformed" => b"{".to_vec(),
+                        "malformed_v1" => br#"{"version":1}"#.to_vec(),
                         "binding" => {
-                            value["accepted_payload"][0] =
-                                (value["accepted_payload"][0].as_u64().unwrap() ^ 1).into();
-                            serde_json::to_vec(&value).unwrap()
+                            let mut settlement: SettlementRecord =
+                                serde_json::from_slice(&bytes).unwrap();
+                            settlement.accepted_payload[0] ^= 1;
+                            serde_json::to_vec(&settlement).unwrap()
+                        }
+                        "observation" => {
+                            value["observation"]["boot_observed"] = true.into();
+                            let settlement: SettlementRecord =
+                                serde_json::from_value(value).unwrap();
+                            serde_json::to_vec(&settlement).unwrap()
                         }
                         "noncanonical" => {
                             let mut bytes = bytes;
@@ -2587,15 +3047,30 @@ mod tests {
                 matches!(intents.snapshot(key), Err(LaunchError::IntentUnavailable)),
                 "{change}"
             );
-            if matches!(change, "unsupported" | "boolean" | "malformed") {
-                assert!(
-                    matches!(
-                        intents.interrupted_records(),
-                        Err(LaunchError::IntentUnavailable)
-                    ),
-                    "{change}"
-                );
-            }
+            let restored = LaunchIntents::restore(
+                storage.clone(),
+                intents.reports.clone().unwrap(),
+                &directories,
+            );
+            directories.library().try_preserve().unwrap();
+            assert!(
+                matches!(restored, Err(LaunchError::IntentUnavailable)),
+                "{change}"
+            );
+            assert!(
+                directories
+                    .library()
+                    .ensure_no_interrupted_launch()
+                    .is_err()
+            );
+            assert!(
+                matches!(
+                    intents.interrupted_records(),
+                    Err(LaunchError::IntentUnavailable)
+                ),
+                "{change}"
+            );
+            assert!(!terminal_ack(&storage, key));
             assert_eq!(
                 acceptance.observe(&observation),
                 Err(ObservationError::Conflict)
@@ -3026,6 +3501,7 @@ mod tests {
                 INTENT_MIGRATION,
                 INTENT_TERMINAL_MIGRATION,
                 INTENT_SETTLEMENT_MIGRATION,
+                INTENT_RECOVERY_MIGRATION,
             ])
             .unwrap();
         let directories =
@@ -3237,6 +3713,7 @@ mod tests {
                 INTENT_MIGRATION,
                 INTENT_TERMINAL_MIGRATION,
                 INTENT_SETTLEMENT_MIGRATION,
+                INTENT_RECOVERY_MIGRATION,
             ])
             .unwrap();
         storage.transaction(|tx| -> Result<(), StorageError> {

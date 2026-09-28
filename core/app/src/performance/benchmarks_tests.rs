@@ -316,6 +316,7 @@ fn service_with_directories(
             crate::launch::coordinator::INTENT_MIGRATION,
             crate::launch::coordinator::INTENT_TERMINAL_MIGRATION,
             crate::launch::coordinator::INTENT_SETTLEMENT_MIGRATION,
+            crate::launch::coordinator::INTENT_RECOVERY_MIGRATION,
         ])
         .unwrap();
     let library = match LibraryLifecycle::open(root) {

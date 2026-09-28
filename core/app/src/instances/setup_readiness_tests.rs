@@ -939,6 +939,148 @@ async fn unavailable_setup_metadata_blocks_an_otherwise_launchable_instance() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, service, accounts) = fixture();
+    crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+    accounts.create_offline_account("GroupedPlayer").unwrap();
+    let java = root.path().join("java");
+    std::fs::write(&java, format!(
+        "#!/bin/sh\nprobe_dir=${{0%/*}}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nwhile [ ! -f \"$probe_dir/probe-release\" ]; do sleep 0.01; done\nprintf 'java.version = 21.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
+        std::env::consts::ARCH,
+    )).unwrap();
+    std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+    service
+        .settings
+        .update(
+            serde_json::from_value(serde_json::json!({
+                "expected_revision": service.settings.current().unwrap().revision,
+                "java_path_override": java.to_str().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let first = super::super::create::tests::create(&service.instances, "First ready").await;
+    let bad = super::super::create::tests::create(&service.instances, "Bad Java").await;
+    let bad = service
+        .instances
+        .update(
+            &bad.id,
+            super::super::model::InstancePatch {
+                java_path: Some(root.path().join("missing-java").to_str().unwrap().into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let last = super::super::create::tests::create(&service.instances, "Last ready").await;
+    let missing = service
+        .instances
+        .create(
+            CreateInstanceRequest {
+                name: "Missing install".into(),
+                selection_id: "vanilla|1.20.1".into(),
+                ..Default::default()
+            },
+            CreateTarget {
+                selection_id: "vanilla|1.20.1".into(),
+                version_id: "1.20.1".into(),
+                minecraft_version: "1.20.1".into(),
+                loader_key: "vanilla".into(),
+            },
+        )
+        .unwrap()
+        .join()
+        .await
+        .unwrap()
+        .unwrap();
+    let input = vec![first.clone(), missing.clone(), bad.clone(), last.clone()];
+    let versions = service.installed().await.unwrap();
+    let rows = service.enrich_all(input.clone(), &versions).await;
+    assert_eq!(
+        rows.iter().map(|row| &row.instance.id).collect::<Vec<_>>(),
+        input.iter().map(|row| &row.id).collect::<Vec<_>>()
+    );
+    assert!(rows[0].launchable && rows[3].launchable);
+    assert_eq!(rows[1].launch_action.primary_action, "install");
+    assert_eq!(rows[1].needs_install, "1.20.1");
+    assert_eq!(rows[2].launch_action.primary_action, "blocked");
+    assert_eq!(
+        rows[2].status_detail,
+        LaunchError::RuntimeUnavailable.to_string()
+    );
+    assert_eq!(
+        service
+            .launch
+            .fresh_install_checks
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    assert!(service.enrich(first.clone(), &versions).await.launchable);
+    assert_eq!(
+        service
+            .launch
+            .fresh_install_checks
+            .load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
+
+    // A dropped list finishes its accepted row, not the remaining group.
+    std::fs::remove_file(root.path().join("probe-release")).unwrap();
+    std::fs::write(root.path().join("probes"), b"").unwrap();
+    let service = Arc::new(service);
+    let waiter = tokio::spawn({
+        let service = service.clone();
+        async move { service.enrich_all(vec![first, last], &versions).await }
+    });
+    let started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while std::fs::read(root.path().join("probes"))
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    waiter.abort();
+    assert!(waiter.await.is_err_and(|error| error.is_cancelled()));
+    let pin = service.instances.directories().library().admit().unwrap();
+    let artifact = crate::install::queue::library_artifact(&pin.library_id().to_string());
+    let blocked = service
+        .instances
+        .directories()
+        .exclusions()
+        .try_acquire(std::iter::empty::<String>(), [artifact.clone()])
+        .is_err();
+    std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !service.instances.tasks.status().is_idle() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(started.is_ok() && blocked && drained.is_ok());
+    assert!(!service.instances.tasks.status().closing);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("probes"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        service
+            .instances
+            .directories()
+            .exclusions()
+            .try_acquire(std::iter::empty::<String>(), [artifact])
+            .is_ok()
+    );
+}
+
 #[tokio::test]
 async fn create_view_download_indicators_use_settled_install_and_scanner_status() {
     let (root, mut service, _) = fixture();

@@ -509,7 +509,8 @@ async fn start_profile_inner(
             axial_app::skins::store::MIGRATION, axial_app::skins::store::IMPORT_MIGRATION,
             axial_app::launch::coordinator::INTENT_MIGRATION,
             axial_app::launch::coordinator::INTENT_TERMINAL_MIGRATION,
-            axial_app::launch::coordinator::INTENT_SETTLEMENT_MIGRATION])
+            axial_app::launch::coordinator::INTENT_SETTLEMENT_MIGRATION,
+            axial_app::launch::coordinator::INTENT_RECOVERY_MIGRATION])
             .map_err(|_| "Could not migrate replacement metadata. Existing data has been preserved.".to_string())?;
         let settings = Arc::new(SettingsStore::new_with_telemetry_identity(metadata.clone(), telemetry_for_init.export_configured())
             .map_err(|error| error.to_string())?);

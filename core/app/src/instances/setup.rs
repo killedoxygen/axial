@@ -907,11 +907,42 @@ impl SetupService {
     }
 
     pub async fn enrich(&self, instance: Instance, versions: &[VersionEntry]) -> EnrichedInstance {
+        let preflight = self.launch.preflight(instance.id.clone()).await;
+        self.enrich_preflight(instance, versions, preflight)
+    }
+
+    pub async fn enrich_all(
+        &self,
+        instances: Vec<Instance>,
+        versions: &[VersionEntry],
+    ) -> Vec<EnrichedInstance> {
+        let mut pending = instances.into_iter().enumerate().collect::<Vec<_>>();
+        // Registry version strings only schedule adjacent work. Launch admission
+        // checks the actual generation, library and version before sharing proof.
+        pending.sort_by(|(_, left), (_, right)| left.version_id.cmp(&right.version_id));
+        let mut projection = self.launch.preflight_projection();
+        let mut enriched = Vec::with_capacity(pending.len());
+        for (index, instance) in pending {
+            let preflight = self
+                .launch
+                .preflight_with_projection(instance.id.clone(), &mut projection)
+                .await;
+            enriched.push((index, self.enrich_preflight(instance, versions, preflight)));
+        }
+        enriched.sort_unstable_by_key(|(index, _)| *index);
+        enriched.into_iter().map(|(_, instance)| instance).collect()
+    }
+
+    fn enrich_preflight(
+        &self,
+        instance: Instance,
+        versions: &[VersionEntry],
+        preflight: crate::launch::coordinator::LaunchPreflight,
+    ) -> EnrichedInstance {
         let version = versions
             .iter()
             .find(|entry| entry.id == instance.version_id);
         let mut install_target = install_target_for_instance(&instance, version);
-        let preflight = self.launch.preflight(instance.id.clone()).await;
         let repair_install = preflight.error.as_ref().is_some_and(|error| {
             error.code == crate::launch::coordinator::LaunchError::InstallUnavailable
         });

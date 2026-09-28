@@ -60,10 +60,13 @@ pub fn router(instances: Arc<InstanceService>, setup: Arc<SetupService>) -> Rout
 async fn list(State(services): State<Services>) -> Result<Json<Value>, ApiError> {
     let records = services.instances.registry().list().map_err(error)?;
     let versions = services.setup.installed().await.map_err(error)?;
-    let mut instances = Vec::with_capacity(records.len());
-    for record in records {
-        instances.push(services.setup.enrich(record.instance, &versions).await);
-    }
+    let instances = services
+        .setup
+        .enrich_all(
+            records.into_iter().map(|record| record.instance).collect(),
+            &versions,
+        )
+        .await;
     let last_instance_id = services
         .instances
         .registry()
