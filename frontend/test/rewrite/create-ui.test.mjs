@@ -36,6 +36,7 @@ const seam = `
     queues.push(args);
     if (queueError) throw queueError;
   }
+  export async function refreshInstallQueue() {}
   export function toast(...args) { notices.push(args); }
   export function navigate(value) { navigation.push(value); }
   export function errMessage(value) { return value instanceof Error ? value.message : String(value); }

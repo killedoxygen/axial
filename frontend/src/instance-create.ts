@@ -4,7 +4,7 @@ import { errMessage } from './utils';
 import { navigate } from './ui-state';
 import { addInstance } from './actions';
 import { instances } from './store';
-import { applyInstallQueueResponse } from './machines/downloads';
+import { applyInstallQueueResponse, refreshInstallQueue } from './machines/downloads';
 import { createResultToastMessage, createToastKind, type CreateResultPresentationSource } from './create-presenters';
 import type { EnrichedInstance } from './types-instance';
 import { dtoError, dtoOptionalString, dtoRecord, dtoString } from './dto-contract';
@@ -47,6 +47,7 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
   if (!baseName) return { ok: false, error: 'Name is required' };
   if (!selectionId) return { ok: false, error: 'Version is required' };
 
+  const expectedInstances = instances.value;
   let res: CreateResponse & EnrichedInstance;
   let queueSnapshot: unknown;
   try {
@@ -81,9 +82,6 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
     return { ok: false, error: message };
   }
 
-  const existing = instances.value.find((instance) => instance.id === res.id);
-  const created = existing ?? res;
-  if (!existing) addInstance(created);
   let queueError: string | null = null;
   if (queueSnapshot != null) {
     try {
@@ -94,9 +92,23 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
       queueError = errMessage(error);
     }
   }
+  let created = instances.value.find((instance) => instance.id === res.id);
+  if (!created) {
+    if (instances.value === expectedInstances) {
+      created = res;
+      addInstance(created);
+    } else {
+      try {
+        await refreshInstallQueue({ connectActive: true, requireInstalledState: true });
+      } catch (error: unknown) {
+        queueError = errMessage(error);
+      }
+      created = instances.value.find((instance) => instance.id === res.id);
+    }
+  }
   toast(createResultToastMessage(res), createToastKind(res.view_model?.tone));
   if (queueError) toast(`Instance created, but download status could not be refreshed: ${queueError}`, 'error');
-  navigate({ name: 'instance', id: created.id });
+  if (created) navigate({ name: 'instance', id: created.id });
 
   return { ok: true, instance: created };
 }

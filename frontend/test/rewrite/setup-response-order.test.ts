@@ -69,6 +69,19 @@ function response(snapshot: InstallQueueStateResponse | null = queue(3, 0)) {
   return { ...instance(), view_model: { tone: 'success', summary: 'Setup accepted.', detail: null }, install_queue: snapshot };
 }
 
+function queuedSetup(): InstallQueueStateResponse {
+  return installs.installQueueStateResponse({
+    ...queue(4, 1),
+    items: [{ queue_id: 'queued-setup', state_id: 'queued', kind: 'content', title: 'Content', label: 'Fixture pack',
+      summary: 'Waiting', detail: '', position: 1, total: 1,
+      install_item: { version_id: '1.21.4', content: { instance_id: 'fixture-instance', label: 'Setting up Fixture pack',
+        action: { kind: 'install', allow_incompatible: false,
+          selections: [{ canonical_id: 'modrinth:fixture', kind: 'mod', version_id: 'v1' }] } } },
+      remove_action: { action: 'remove_from_queue', label: 'Remove', enabled: true } }],
+    view_model: { ...queue(4, 1).view_model, state_id: 'queued', queued_count: 1, queued_count_label: '1 queued' },
+  });
+}
+
 function harness(create = false) {
   const requests: string[][] = [];
   const errors: string[] = [];
@@ -76,7 +89,9 @@ function harness(create = false) {
   const navigation: unknown[] = [];
   const reply = deferred<unknown>();
   let backend = create ? [] : [instance()];
+  let currentQueue = queue(3, 0);
   let readInstance: () => Promise<unknown> = async () => backend[0];
+  let readInstances: () => Promise<unknown> = async () => ({ instances: backend, last_instance_id: null });
   let subscription: ((snapshot: InstallQueueStateResponse) => void) | undefined;
   const store = {
     config: signals.signal(null), instances: signals.signal(backend.map(core.enrichedInstanceResponse)),
@@ -88,10 +103,10 @@ function harness(create = false) {
     requests.push([method, path]);
     if (method === 'POST') return reply.promise;
     assert.equal(method, 'GET');
-    if (path === '/instances') return { instances: backend, last_instance_id: null };
+    if (path === '/instances') return readInstances();
     if (path === '/instances/fixture-instance') return readInstance();
     if (path === '/versions') return { versions: [] };
-    if (path === '/install/queue') return queue(3, 0);
+    if (path === '/install/queue') return currentQueue;
     throw new Error(`Unexpected setup read: ${path}`);
   } };
   const utils = { errMessage: String, showError: (message: string) => errors.push(message) };
@@ -119,8 +134,15 @@ function harness(create = false) {
   return {
     requests, errors, notices, navigation, reply, store, downloads, setup, creation,
     ready(): void { backend = [instance(true)]; },
+    registered(): void { backend = [instance()]; },
+    removed(): void { backend = []; },
     readInstance(next: typeof readInstance): void { readInstance = next; },
-    emit(snapshot: InstallQueueStateResponse): void { assert.ok(subscription); subscription(snapshot); },
+    readInstances(next: typeof readInstances): void { readInstances = next; },
+    emit(snapshot: InstallQueueStateResponse): void {
+      currentQueue = snapshot;
+      assert.ok(subscription);
+      subscription(snapshot);
+    },
   };
 }
 
@@ -198,4 +220,56 @@ test('an ordinary create response publishes its instance once and navigates to i
   assert.equal(h.store.instances.value[0].id, 'fixture-instance');
   assert.equal(h.requests.length, 1);
   assert.equal(h.navigation.length, 1);
+});
+
+for (const readFailure of [false, true]) {
+  test(`a delayed creation cannot resurrect a pristine setup removed through another client's queue${readFailure ? ' when reconciliation fails' : ''}`, async (t) => {
+    const h = harness(true);
+    t.after(() => h.downloads.disconnectInstallQueue());
+    await h.downloads.refreshInstallQueue({ connectActive: true });
+    const work = h.creation.createInstance(createArgs);
+    h.registered();
+    const accepted = queuedSetup();
+    h.emit(accepted);
+    await flush();
+    assert.equal(h.store.instances.value[0].id, 'fixture-instance');
+    assert.equal(h.downloads.downloadQueue.value.items[0].remove_action.enabled, true);
+    h.removed();
+    // The shared SSE projection carries the new registry cursor, not the
+    // removing client's response-only removed_instance_id.
+    h.emit(queue(6, 3));
+    await flush();
+    assert.equal(h.store.instances.value.length, 0);
+    const published: number[] = [];
+    const stop = signals.effect(() => { published.push(h.store.instances.value.length); });
+    t.after(stop);
+    if (readFailure) h.readInstances(async () => { throw new Error('Registry unavailable'); });
+    h.reply.resolve(response(accepted));
+    const result = await work;
+    assert.equal(result.ok, true, 'creation was accepted before the later removal');
+    assert.ok(published.every((length) => length === 0), 'the removed instance must never reappear');
+    assert.equal(result.instance, undefined);
+    assert.equal(h.navigation.length, 0, 'do not navigate to a deleted instance');
+    assert.equal(h.requests.filter(([method]) => method === 'POST').length, 1);
+    if (readFailure) assert.ok(h.errors.length + h.notices.filter(([, kind]) => kind === 'error').length > 0);
+  });
+}
+
+test('a registry read preceding creation does not make later accepted creation look deleted', async (t) => {
+  const h = harness(true);
+  t.after(() => h.downloads.disconnectInstallQueue());
+  await h.downloads.refreshInstallQueue({ connectActive: true });
+  const work = h.creation.createInstance(createArgs);
+  h.emit(queue(4, 1));
+  await flush();
+  assert.equal(h.store.instances.value.length, 0);
+  h.ready();
+  h.reply.resolve(response(queue(3, 0)));
+  const result = await work;
+  assert.equal(result.ok, true);
+  assert.equal(h.store.instances.value.length, 1);
+  assert.equal(h.store.instances.value[0].launch_action.label, 'Play');
+  assert.equal(result.instance, h.store.instances.value[0]);
+  assert.equal(h.navigation.length, 1);
+  assert.equal(h.requests.filter(([method]) => method === 'POST').length, 1);
 });
