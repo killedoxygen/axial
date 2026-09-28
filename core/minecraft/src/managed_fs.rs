@@ -5307,7 +5307,8 @@ pub struct ManagedLibraryFile {
 
 /// A per-call observation cursor, not a readiness cache. Only the most recent
 /// parent chain is retained; portable path bounds limit its depth independently
-/// of the number of files. Namespace drift invalidates the entire chain.
+/// of the number of files. Namespace drift refreshes its exact-name proofs
+/// without replacing retained directory authority.
 pub struct ManagedLibraryFileBatch {
     operation: ManagedLibraryOperation,
     parent: Option<FileBatchParent>,
@@ -5322,14 +5323,84 @@ struct FileBatchParent {
 }
 
 impl FileBatchParent {
-    fn revalidate(&self) -> io::Result<()> {
-        for (directory, revision) in &self.revisions {
-            directory
-                .validate_passive_revision(revision)
-                .map_err(loader_io)?;
+    fn revalidate(&mut self) -> io::Result<()> {
+        self.directory.revalidate().map_err(loader_io)?;
+        for (index, name) in self
+            .relative
+            .split('/')
+            .filter(|name| !name.is_empty())
+            .enumerate()
+        {
+            let child = self
+                .revisions
+                .get(index + 1)
+                .map(|(directory, _)| directory)
+                .unwrap_or(&self.directory)
+                .clone();
+            let (directory, revision) = &mut self.revisions[index];
+            revalidate_batch_child(directory, &child, name, revision)?;
         }
+        self.directory.revalidate().map_err(loader_io)?;
         Ok(())
     }
+
+    fn finish_observation(
+        &mut self,
+        name: &str,
+        revision: &DirectoryRevision,
+        guard: Option<&ManagedFileGuard>,
+    ) -> io::Result<()> {
+        self.revalidate()?;
+        if let Some(guard) = guard
+            && !self
+                .directory
+                .file_guard_matches(name, guard)
+                .map_err(loader_io)?
+        {
+            return Err(io::Error::other(
+                "managed batch file changed during observation",
+            ));
+        }
+        // Unlike cached ancestor proofs, the leaf namespace is fenced for
+        // this observation only, including absence and newly added aliases.
+        self.directory
+            .validate_passive_revision(revision)
+            .map_err(loader_io)
+    }
+}
+
+fn revalidate_batch_child(
+    directory: &ManagedDir,
+    child: &ManagedDir,
+    name: &str,
+    revision: &mut DirectoryRevision,
+) -> io::Result<()> {
+    // A changed directory stamp expires the cached name proof. Recheck the
+    // exact portable name while retaining the original child capability.
+    for _ in 0..3 {
+        child.revalidate().map_err(loader_io)?;
+        let before = directory.passive_revision().map_err(loader_io)?;
+        if before == *revision {
+            return Ok(());
+        }
+        let observed = directory
+            .open_child_if_exists(name)
+            .map_err(loader_io)?
+            .ok_or_else(|| io::Error::other("managed batch ancestor disappeared"))?;
+        if observed.inner.identity != child.inner.identity {
+            return Err(io::Error::other("managed batch ancestor changed"));
+        }
+        child.revalidate().map_err(loader_io)?;
+        let after = directory.passive_revision().map_err(loader_io)?;
+        if before == after {
+            *revision = after;
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "managed batch ancestor namespace kept changing",
+    ))
 }
 
 impl ManagedLibraryFileBatch {
@@ -5369,33 +5440,33 @@ impl ManagedLibraryFileBatch {
                 for segment in parent_path.split('/') {
                     // Capture before the alias-checked listing. A later stamp
                     // must never bless a namespace change during that walk.
-                    let revision = directory.passive_revision().map_err(loader_io)?;
+                    let mut revision = directory.passive_revision().map_err(loader_io)?;
                     let child = directory.open_child_if_exists(segment).map_err(loader_io)?;
-                    directory
-                        .validate_passive_revision(&revision)
-                        .map_err(loader_io)?;
-                    revisions.push((directory, revision));
                     let Some(child) = child else {
+                        directory
+                            .validate_passive_revision(&revision)
+                            .map_err(loader_io)?;
                         return Ok(None);
                     };
+                    revalidate_batch_child(&directory, &child, segment, &mut revision)?;
+                    revisions.push((directory, revision));
                     directory = child;
                 }
             }
-            let revision = directory.passive_revision().map_err(loader_io)?;
-            revisions.push((directory.clone(), revision));
             self.parent = Some(FileBatchParent {
                 relative: parent_path.to_owned(),
                 directory,
                 revisions,
             });
         }
-        let parent = self.parent.as_ref().expect("observed parent chain");
+        let parent = self.parent.as_mut().expect("observed parent chain");
         parent.revalidate()?;
+        let revision = parent.directory.passive_revision().map_err(loader_io)?;
         let guard = parent
             .directory
             .inspect_regular_file(name)
             .map_err(loader_io)?;
-        parent.revalidate()?;
+        parent.finish_observation(name, &revision, guard.as_ref())?;
         self.operation.revalidate()?;
         Ok(guard.map(|guard| ManagedLibraryFile {
             operation: self.operation.clone(),
@@ -6799,12 +6870,11 @@ mod library_lifecycle_tests {
     }
 
     #[test]
-    fn file_batch_refuses_namespace_addition_and_restarts_from_checked_walk() {
+    fn file_batch_preserves_artifacts_after_an_unrelated_sibling_is_added() {
         let (temporary, _root, operation) = file_batch_fixture();
         let mut batch = operation.file_batch();
         batch.observe_file(&batch_path("first")).unwrap().unwrap();
         std::fs::write(temporary.path().join("assets/objects/aa/added"), b"added").unwrap();
-        assert!(batch.observe_file(&batch_path("second")).is_err());
         assert_eq!(
             batch
                 .observe_file(&batch_path("second"))
@@ -6814,7 +6884,233 @@ mod library_lifecycle_tests {
                 .unwrap(),
             b"second payload"
         );
-        assert_eq!(batch.parent_walks, 2);
+        assert_eq!(batch.parent_walks, 1);
+    }
+
+    #[test]
+    fn file_batch_preserves_artifacts_across_unrelated_root_journal_churn() {
+        for remove_journal in [false, true] {
+            let (temporary, _root, operation) = file_batch_fixture();
+            let mut batch = operation.file_batch();
+            let first = batch.observe_file(&batch_path("first")).unwrap().unwrap();
+            let journal = temporary.path().join("metadata.sqlite-journal");
+            std::fs::write(&journal, b"unrelated metadata transaction").unwrap();
+            if remove_journal {
+                std::fs::remove_file(journal).unwrap();
+            }
+
+            first.revalidate().unwrap();
+            assert_eq!(first.read_bounded(32).unwrap(), b"first payload");
+            assert_eq!(
+                operation
+                    .observe_file(&batch_path("second"))
+                    .unwrap()
+                    .unwrap()
+                    .read_bounded(32)
+                    .unwrap(),
+                b"second payload"
+            );
+            assert_eq!(
+                batch
+                    .observe_file(&batch_path("second"))
+                    .unwrap()
+                    .unwrap()
+                    .read_bounded(32)
+                    .unwrap(),
+                b"second payload"
+            );
+        }
+    }
+
+    #[test]
+    fn file_batch_root_churn_cannot_adopt_a_replaced_ancestor() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        let mut batch = operation.file_batch();
+        let first = batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        let journal = temporary.path().join("metadata.sqlite-journal");
+        std::fs::write(&journal, b"unrelated metadata transaction").unwrap();
+        std::fs::remove_file(journal).unwrap();
+        std::fs::rename(
+            temporary.path().join("assets"),
+            temporary.path().join("previous-assets"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(temporary.path().join("assets/objects/aa")).unwrap();
+        std::fs::write(
+            temporary.path().join("assets/objects/aa/second"),
+            b"second payload",
+        )
+        .unwrap();
+
+        assert!(first.revalidate().is_err());
+        assert!(batch.observe_file(&batch_path("second")).is_err());
+        for parent in ["assets", "previous-assets"] {
+            assert_eq!(
+                std::fs::read(temporary.path().join(parent).join("objects/aa/second")).unwrap(),
+                b"second payload"
+            );
+        }
+    }
+
+    #[test]
+    fn file_batch_root_churn_preserves_replaced_leaf_refusal() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        let mut batch = operation.file_batch();
+        let first = batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        let original_revision = first.revision_observation();
+        let journal = temporary.path().join("metadata.sqlite-journal");
+        std::fs::write(&journal, b"unrelated metadata transaction").unwrap();
+        std::fs::remove_file(journal).unwrap();
+        std::fs::rename(
+            temporary.path().join("assets/objects/aa/first"),
+            temporary.path().join("assets/objects/aa/previous"),
+        )
+        .unwrap();
+        std::fs::write(
+            temporary.path().join("assets/objects/aa/first"),
+            b"first payload",
+        )
+        .unwrap();
+
+        assert!(first.revalidate().is_err());
+        assert!(first.read_bounded(32).is_err());
+        let replacement = batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        assert_ne!(replacement.revision_observation(), original_revision);
+        assert_eq!(replacement.read_bounded(32).unwrap(), b"first payload");
+        assert_eq!(
+            std::fs::read(temporary.path().join("assets/objects/aa/previous")).unwrap(),
+            b"first payload"
+        );
+    }
+
+    #[test]
+    fn file_batch_initial_walk_refreshes_only_the_retained_child() {
+        for replace_child in [false, true] {
+            let (temporary, _root, operation) = file_batch_fixture();
+            let directory = operation.managed_directory().unwrap();
+            let mut revision = directory.passive_revision().unwrap();
+            let child = directory.open_child_if_exists("assets").unwrap().unwrap();
+            let journal = temporary.path().join("metadata.sqlite-journal");
+            std::fs::write(&journal, b"unrelated metadata transaction").unwrap();
+            std::fs::remove_file(journal).unwrap();
+            if replace_child {
+                std::fs::rename(
+                    temporary.path().join("assets"),
+                    temporary.path().join("previous-assets"),
+                )
+                .unwrap();
+                std::fs::create_dir(temporary.path().join("assets")).unwrap();
+            }
+
+            let result = revalidate_batch_child(&directory, &child, "assets", &mut revision);
+            assert_eq!(result.is_ok(), !replace_child);
+            if !replace_child {
+                directory.validate_passive_revision(&revision).unwrap();
+                child.revalidate().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn file_batch_finishes_observation_after_root_journal_churn() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        let mut batch = operation.file_batch();
+        batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        let parent = batch.parent.as_mut().unwrap();
+        let revision = parent.directory.passive_revision().unwrap();
+        let guard = parent
+            .directory
+            .inspect_regular_file("second")
+            .unwrap()
+            .unwrap();
+        let journal = temporary.path().join("metadata.sqlite-journal");
+        std::fs::write(&journal, b"unrelated metadata transaction").unwrap();
+        std::fs::remove_file(journal).unwrap();
+
+        parent
+            .finish_observation("second", &revision, Some(&guard))
+            .unwrap();
+        assert!(
+            parent
+                .directory
+                .file_guard_matches("second", &guard)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn file_batch_finishing_refuses_changed_leaf_evidence_or_namespace() {
+        for change in ["replacement", "alias", "appearance", "rewrite"] {
+            let (temporary, _root, operation) = file_batch_fixture();
+            let mut batch = operation.file_batch();
+            batch.observe_file(&batch_path("first")).unwrap().unwrap();
+            let parent = batch.parent.as_mut().unwrap();
+            let name = if change == "appearance" {
+                "missing"
+            } else {
+                "first"
+            };
+            let revision = parent.directory.passive_revision().unwrap();
+            let guard = parent.directory.inspect_regular_file(name).unwrap();
+            let path = temporary.path().join("assets/objects/aa");
+            match change {
+                "replacement" => {
+                    std::fs::rename(path.join("first"), path.join("previous")).unwrap();
+                    std::fs::write(path.join("first"), b"first payload").unwrap();
+                }
+                "alias" => match std::fs::create_dir(path.join("First")) {
+                    Ok(()) => assert!(
+                        parent
+                            .directory
+                            .file_guard_matches("first", guard.as_ref().unwrap())
+                            .unwrap()
+                    ),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let alias = parent
+                            .directory
+                            .inspect_regular_file("First")
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(alias.identity, guard.as_ref().unwrap().identity);
+                        continue;
+                    }
+                    Err(error) => panic!("create distinct portable alias: {error}"),
+                },
+                "appearance" => std::fs::write(path.join("missing"), b"new payload").unwrap(),
+                "rewrite" => std::fs::write(path.join("first"), b"other payload").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                parent
+                    .finish_observation(name, &revision, guard.as_ref())
+                    .is_err(),
+                "accepted {change} during file observation"
+            );
+        }
+    }
+
+    #[test]
+    fn file_batch_refresh_refuses_a_distinct_portable_ancestor_alias() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        let mut batch = operation.file_batch();
+        batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        match std::fs::create_dir(temporary.path().join("Assets")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let directory = operation.managed_directory().unwrap();
+                assert_eq!(
+                    directory.open_child("assets").unwrap().inner.identity,
+                    directory.open_child("Assets").unwrap().inner.identity,
+                );
+                return;
+            }
+            Err(error) => panic!("create distinct portable alias: {error}"),
+        }
+        assert!(batch.observe_file(&batch_path("second")).is_err());
+        assert_eq!(
+            std::fs::read(temporary.path().join("assets/objects/aa/second")).unwrap(),
+            b"second payload"
+        );
     }
 
     #[test]
