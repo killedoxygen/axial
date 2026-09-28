@@ -951,7 +951,12 @@ async fn run_session(
         sentinel.settled = true;
         return;
     }
-    if prepared.validate_before_spawn().is_err() {
+    if let Err(error) = prepared.validate_before_spawn() {
+        tracing::warn!(
+            stage = "input_revalidation",
+            cause = ?error,
+            "Accepted launch could not start."
+        );
         finish_without_process(&entry, false, prepared.natives()).await;
         sentinel.settled = true;
         return;
@@ -972,7 +977,13 @@ async fn run_session(
     }
     let (process, output, spawn_failed) = match OwnedProcess::spawn(command) {
         Ok((process, output)) => (process, output, false),
-        Err(SpawnError::BeforeSpawn(_error)) => {
+        Err(SpawnError::BeforeSpawn(error)) => {
+            tracing::warn!(
+                stage = "process_spawn",
+                error_kind = ?error.kind(),
+                os_error_code = error.raw_os_error(),
+                "Accepted launch could not start."
+            );
             entry
                 .telemetry
                 .failure(Some(TelemetryErrorKind::LaunchSpawnFailed));
@@ -980,7 +991,15 @@ async fn run_session(
             sentinel.settled = true;
             return;
         }
-        Err(SpawnError::Unsettled(process, output, _error)) => (process, output, true),
+        Err(SpawnError::Unsettled(process, output, error)) => {
+            tracing::warn!(
+                stage = "process_containment",
+                error_kind = ?error.kind(),
+                os_error_code = error.raw_os_error(),
+                "Accepted launch process could not be contained."
+            );
+            (process, output, true)
+        }
     };
     supervise_process(
         process,

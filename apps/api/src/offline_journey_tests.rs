@@ -985,8 +985,45 @@ async fn real_offline_vanilla_install_launch_stop_and_restart() {
     assert!(reopened.server.is_shutdown_settled());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_benchmark_mapping_survives_response_loss_and_restart() {
+#[test]
+fn real_benchmark_mapping_survives_response_loss_and_restart() {
+    use tracing_subscriber::prelude::*;
+
+    thread_local! {
+        static DIAGNOSTICS: std::cell::RefCell<Option<tracing::dispatcher::DefaultGuard>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let diagnostics = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_ansi(false)
+            .without_time()
+            .finish()
+            .with(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("axial_app::launch::session", tracing::Level::WARN)
+                    .with_target("axial_app::launch::prepare", tracing::Level::WARN),
+            ),
+    );
+    let _diagnostics = tracing::dispatcher::set_default(&diagnostics);
+    // HTTP and retained launch tasks run on this test's runtime threads.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .on_thread_start(move || {
+            DIAGNOSTICS.with(|guard| {
+                *guard.borrow_mut() = Some(tracing::dispatcher::set_default(&diagnostics));
+            });
+        })
+        .on_thread_stop(|| {
+            DIAGNOSTICS.with(|guard| drop(guard.borrow_mut().take()));
+        })
+        .build()
+        .unwrap();
+    runtime.block_on(benchmark_mapping_survives_response_loss_and_restart());
+}
+
+async fn benchmark_mapping_survives_response_loss_and_restart() {
     use axial_app::storage::StorageError;
     use axial_app::{
         launch::reports::LaunchProofScenario, performance::benchmarks::BenchmarkLaunchRequest,
