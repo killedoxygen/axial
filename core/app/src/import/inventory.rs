@@ -24,6 +24,76 @@ const RECORDS_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
 const RECORDS_LIMIT: usize = 4096;
 const MAX_DEPTH: usize = 64;
 const REJECTION_STREAK_RECORD: &str = "profile/state/persisted-state-rejection-streaks.json";
+const USER_MOD_WITNESS_RECORD: &str = "profile/guardian-user-mod-witnesses.json";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyUserModWitnesses {
+    schema: String,
+    schema_version: u32,
+    witnesses: Vec<LegacyUserModWitness>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyUserModWitness {
+    instance_id: String,
+    instance_created_at: String,
+    entries: Vec<LegacyUserModWitnessEntry>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyUserModWitnessEntry {
+    digest: String,
+    size: u64,
+    modified_at_ns: u64,
+}
+
+impl LegacyUserModWitnessEntry {
+    fn key(&self) -> (&str, u64, u64) {
+        (&self.digest, self.size, self.modified_at_ns)
+    }
+}
+
+fn valid_user_mod_witnesses(bytes: &[u8]) -> bool {
+    if bytes.len() > 2 * 1024 * 1024 {
+        return false;
+    }
+    let Ok(snapshot) = serde_json::from_slice::<LegacyUserModWitnesses>(bytes) else {
+        return false;
+    };
+    if snapshot.schema != "axial.guardian_user_mod_witnesses"
+        || snapshot.schema_version != 1
+        || snapshot.witnesses.len() > 1024
+    {
+        return false;
+    }
+    let mut previous = None;
+    for record in &snapshot.witnesses {
+        if !legacy_id(&record.instance_id)
+            || record.instance_created_at.len() > 64
+            || chrono::DateTime::parse_from_rfc3339(&record.instance_created_at).is_err()
+            || previous.is_some_and(|previous| previous >= record.instance_id.as_str())
+            || record.entries.len() > 1024
+            || record.entries.iter().any(|entry| {
+                entry.digest.len() != 64
+                    || !entry
+                        .digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            || record
+                .entries
+                .windows(2)
+                .any(|pair| pair[0].key() > pair[1].key())
+        {
+            return false;
+        }
+        previous = Some(record.instance_id.as_str());
+    }
+    true
+}
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -601,9 +671,11 @@ impl Inventory {
             .validate_revision(&revision)
             .map_err(|_| ImportError::SourceChanged)?;
         if record {
-            // Guardian eligibility is excluded, but its exact source schema must
+            // Guardian records are excluded, but their exact source schemas must
             // be checked before JSON normalization can hide duplicate fields.
-            if relative == REJECTION_STREAK_RECORD && !valid_rejection_streaks(&bytes) {
+            if (relative == REJECTION_STREAK_RECORD && !valid_rejection_streaks(&bytes))
+                || (relative == USER_MOD_WITNESS_RECORD && !valid_user_mod_witnesses(&bytes))
+            {
                 self.retain(relative, None, ImportBlocker::UnsupportedSchema);
             }
             if revision.size() <= RECORD_LIMIT {
@@ -911,6 +983,7 @@ impl Inventory {
                     | "profile/instances.json"
                     | "profile/state/operation-journals.json"
                     | REJECTION_STREAK_RECORD
+                    | USER_MOD_WITNESS_RECORD
             ) {
                 None
             } else {

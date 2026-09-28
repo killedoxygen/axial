@@ -652,6 +652,366 @@ fn guardian_rejection_streaks_do_not_waive_retained_effects_or_unknown_records()
     }
 }
 
+const USER_MOD_WITNESS_PATH: &str = "guardian-user-mod-witnesses.json";
+
+fn guardian_user_mod_witness_snapshot() -> Value {
+    let entry = json!({"digest": "a".repeat(64), "size": u64::MAX, "modified_at_ns": u64::MAX});
+    json!({
+        "schema": "axial.guardian_user_mod_witnesses", "schema_version": 1,
+        "witnesses": [
+            {"instance_id": FIRST, "instance_created_at": "2024-02-29T12:34:56.123456+02:00",
+                "entries": [entry.clone(), entry]},
+            {"instance_id": "ffffffffffffffff", "instance_created_at": "2020-01-01T00:00:00Z", "entries": []}
+        ]
+    })
+}
+
+#[tokio::test]
+async fn guardian_user_mod_witness_import_copies_instances_without_guardian_state() {
+    let fixture = Fixture::new();
+    fixture.write(USER_MOD_WITNESS_PATH, &guardian_user_mod_witness_snapshot());
+    let before = snapshot(&fixture.baseline);
+    let inventory = Arc::new(fixture.capture());
+    let preview = inventory.preview();
+    assert!(preview.instances[0].ordinary_import_available);
+    assert!(!preview.cutover_available);
+    assert!(inventory.obligations().is_empty());
+    assert_eq!(
+        inventory
+            .record_bytes(&format!("profile/{USER_MOD_WITNESS_PATH}"))
+            .unwrap(),
+        fs::read(fixture.baseline.join(USER_MOD_WITNESS_PATH)).unwrap()
+    );
+    let (root, service) = import_service();
+    let imported = service
+        .import_instance(
+            inventory
+                .prepare_instance(&preview.fingerprint, FIRST)
+                .unwrap(),
+        )
+        .unwrap()
+        .join()
+        .await
+        .unwrap()
+        .unwrap();
+    let destination = imported_path(&service, &imported.id);
+    assert_eq!(
+        fs::read(destination.join("options.txt")).unwrap(),
+        fs::read(
+            fixture
+                .baseline
+                .join(format!("instances/{FIRST}/options.txt"))
+        )
+        .unwrap()
+    );
+    let copied = snapshot(&destination);
+    let library_id = service
+        .directories()
+        .library()
+        .admit()
+        .unwrap()
+        .library_id();
+    drop(service);
+    let service = reopen_import_service(root.path(), library_id);
+    let repeated = service
+        .import_instance(prepare_first(&fixture))
+        .unwrap()
+        .join()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.id, imported.id);
+    assert_eq!(snapshot(&destination), copied);
+    assert!(!root.path().join(USER_MOD_WITNESS_PATH).exists());
+    assert!(!destination.join(USER_MOD_WITNESS_PATH).exists());
+    assert!(!root.path().join("guardian").exists());
+    assert_eq!(snapshot(&fixture.baseline), before);
+}
+
+#[test]
+fn guardian_user_mod_witness_import_preserves_legacy_bounds_and_empty_records() {
+    for boundary in ["empty", "records", "entries", "bytes"] {
+        let fixture = Fixture::new();
+        let mut record = guardian_user_mod_witness_snapshot();
+        match boundary {
+            "empty" => record["witnesses"] = json!([]),
+            "records" => record["witnesses"] = json!((0..1024).map(|index| json!({
+                "instance_id": format!("{index:016x}"), "instance_created_at": "2020-01-01T00:00:00Z", "entries": []
+            })).collect::<Vec<_>>()),
+            "entries" => record["witnesses"][0]["entries"] = json!(vec![
+                json!({"digest":"0".repeat(64), "size":0, "modified_at_ns":0}); 1024
+            ]),
+            _ => {}
+        }
+        let mut bytes = serde_json::to_vec(&record).unwrap();
+        if boundary == "bytes" {
+            bytes.resize(2 * 1024 * 1024, b' ');
+        }
+        fs::write(fixture.baseline.join(USER_MOD_WITNESS_PATH), &bytes).unwrap();
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        assert!(
+            inventory.preview().instances[0].ordinary_import_available,
+            "{boundary}"
+        );
+        inventory
+            .prepare_instance(inventory.fingerprint(), FIRST)
+            .unwrap()
+            .revalidate()
+            .unwrap();
+        assert_eq!(
+            inventory
+                .record_bytes(&format!("profile/{USER_MOD_WITNESS_PATH}"))
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn guardian_user_mod_witness_import_refuses_malformed_original_records() {
+    for invalid in [
+        "schema",
+        "version",
+        "envelope-field",
+        "record-field",
+        "entry-field",
+        "missing",
+        "id",
+        "timestamp",
+        "timestamp-limit",
+        "duplicate-record",
+        "record-order",
+        "digest",
+        "digest-order",
+        "size-order",
+        "time-order",
+        "negative",
+        "overflow",
+        "fraction",
+        "records-limit",
+        "entries-limit",
+        "bytes-limit",
+        "duplicate-envelope-field",
+        "duplicate-record-field",
+        "duplicate-entry-field",
+        "malformed",
+    ] {
+        let fixture = Fixture::new();
+        let mut record = guardian_user_mod_witness_snapshot();
+        match invalid {
+            "schema" => record["schema"] = json!("axial.guardian_user_mod_witnesses.v2"),
+            "version" => record["schema_version"] = json!(2),
+            "envelope-field" => record["effect"] = json!(true),
+            "record-field" => record["witnesses"][0]["effect"] = json!(true),
+            "entry-field" => record["witnesses"][0]["entries"][0]["effect"] = json!(true),
+            "missing" => { record["witnesses"][0].as_object_mut().unwrap().remove("instance_created_at"); }
+            "id" => record["witnesses"][0]["instance_id"] = json!("000000000000000A"),
+            "timestamp" => record["witnesses"][0]["instance_created_at"] = json!("not-a-time"),
+            "timestamp-limit" => record["witnesses"][0]["instance_created_at"] = json!(format!("2024-01-01T00:00:00.{}Z", "1".repeat(50))),
+            "duplicate-record" => record["witnesses"][1] = record["witnesses"][0].clone(),
+            "record-order" => record["witnesses"].as_array_mut().unwrap().reverse(),
+            "digest" => record["witnesses"][0]["entries"][0]["digest"] = json!("A".repeat(64)),
+            "digest-order" => record["witnesses"][0]["entries"][1]["digest"] = json!("0".repeat(64)),
+            "size-order" => record["witnesses"][0]["entries"][1]["size"] = json!(u64::MAX - 1),
+            "time-order" => record["witnesses"][0]["entries"][1]["modified_at_ns"] = json!(u64::MAX - 1),
+            "negative" => record["witnesses"][0]["entries"][0]["size"] = json!(-1),
+            "fraction" => record["witnesses"][0]["entries"][0]["modified_at_ns"] = json!(1.5),
+            "records-limit" => record["witnesses"] = json!((0..1025).map(|index| json!({
+                "instance_id": format!("{index:016x}"), "instance_created_at": "2020-01-01T00:00:00Z", "entries": []
+            })).collect::<Vec<_>>()),
+            "entries-limit" => record["witnesses"][0]["entries"] = json!(vec![record["witnesses"][0]["entries"][0].clone(); 1025]),
+            _ => {}
+        }
+        let mut bytes = serde_json::to_vec(&record).unwrap();
+        match invalid {
+            "bytes-limit" => bytes.resize(2 * 1024 * 1024 + 1, b' '),
+            "duplicate-envelope-field" | "duplicate-record-field" | "duplicate-entry-field" => {
+                let field = match invalid {
+                    "duplicate-envelope-field" => "\"schema_version\":1".to_owned(),
+                    "duplicate-record-field" => format!("\"instance_id\":\"{FIRST}\""),
+                    _ => format!("\"size\":{}", u64::MAX),
+                };
+                let original = String::from_utf8(bytes).unwrap();
+                bytes = original
+                    .replacen(&field, &format!("{field},{field}"), 1)
+                    .into_bytes();
+                assert_ne!(bytes, original.as_bytes());
+            }
+            "overflow" => {
+                bytes = String::from_utf8(bytes)
+                    .unwrap()
+                    .replacen(&u64::MAX.to_string(), "18446744073709551616", 1)
+                    .into_bytes()
+            }
+            "malformed" => bytes = b"{".to_vec(),
+            _ => {}
+        }
+        fs::write(fixture.baseline.join(USER_MOD_WITNESS_PATH), &bytes).unwrap();
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        assert!(
+            !inventory.preview().instances[0].ordinary_import_available,
+            "{invalid}"
+        );
+        assert!(
+            inventory
+                .prepare_instance(inventory.fingerprint(), FIRST)
+                .is_err(),
+            "{invalid}"
+        );
+        assert_eq!(
+            inventory
+                .record_bytes(&format!("profile/{USER_MOD_WITNESS_PATH}"))
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn guardian_user_mod_witness_import_keeps_source_fences() {
+    for boundary in ["changed", "renamed"] {
+        let fixture = Fixture::new();
+        let mut record = guardian_user_mod_witness_snapshot();
+        fixture.write(USER_MOD_WITNESS_PATH, &record);
+        let inventory = Arc::new(fixture.capture());
+        let prepared = inventory
+            .prepare_instance(inventory.fingerprint(), FIRST)
+            .unwrap();
+        if boundary == "changed" {
+            record["witnesses"][0]["entries"] = json!([]);
+            fixture.write(USER_MOD_WITNESS_PATH, &record);
+        } else {
+            fs::rename(
+                fixture.baseline.join(USER_MOD_WITNESS_PATH),
+                fixture.baseline.join("old-witness.json"),
+            )
+            .unwrap();
+        }
+        let before = snapshot(&fixture.baseline);
+        assert!(matches!(
+            inventory.revalidate(),
+            Err(ImportError::SourceChanged)
+        ));
+        let (_root, service) = import_service();
+        assert!(service.import_instance(prepared).is_err());
+        assert!(service.registry().list().unwrap().is_empty());
+        assert!(service.pending().unwrap().is_empty());
+        if boundary == "changed" {
+            let refreshed = fixture.capture();
+            assert_ne!(refreshed.fingerprint(), inventory.fingerprint());
+            assert!(refreshed.preview().instances[0].ordinary_import_available);
+        }
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn guardian_user_mod_witness_import_does_not_waive_unknown_topology_or_effects() {
+    for boundary in [
+        "case",
+        "nested",
+        "directory",
+        "sibling",
+        "deletion",
+        "journal",
+        "hardlink",
+    ] {
+        let fixture = Fixture::new();
+        let record = guardian_user_mod_witness_snapshot();
+        fixture.write(USER_MOD_WITNESS_PATH, &record);
+        match boundary {
+            "case" => {
+                fs::remove_file(fixture.baseline.join(USER_MOD_WITNESS_PATH)).unwrap();
+                fixture.write("Guardian-user-mod-witnesses.json", &record);
+            }
+            "nested" => {
+                fs::remove_file(fixture.baseline.join(USER_MOD_WITNESS_PATH)).unwrap();
+                fixture.write(&format!("state/{USER_MOD_WITNESS_PATH}"), &record);
+            }
+            "directory" => {
+                fs::remove_file(fixture.baseline.join(USER_MOD_WITNESS_PATH)).unwrap();
+                fs::create_dir(fixture.baseline.join(USER_MOD_WITNESS_PATH)).unwrap();
+            }
+            "sibling" => fixture.write("guardian-user-mod-witnesses.json.next", &record),
+            "deletion" => {
+                let mut registry = fixture.record("instances.json");
+                registry["pending_deletions"] =
+                    json!([{"instance_id": FIRST, "delete_files": true}]);
+                fixture.write("instances.json", &registry);
+            }
+            "journal" => {
+                let mut journal = terminal_performance_journal();
+                journal["entries"][0]["status"] = json!("Running");
+                journal["entries"][0]["outcome"] = Value::Null;
+                fixture.write("state/operation-journals.json", &journal);
+            }
+            "hardlink" => fs::hard_link(
+                fixture.baseline.join(USER_MOD_WITNESS_PATH),
+                fixture.root.path().join("external-witness.json"),
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        }
+        let before = snapshot(&fixture.baseline);
+        let captured = Inventory::capture(&fixture.source, &BTreeMap::new());
+        if boundary != "hardlink" {
+            assert!(captured.is_ok(), "{boundary}");
+        }
+        if let Ok(inventory) = captured {
+            let inventory = Arc::new(inventory);
+            if boundary == "journal" {
+                assert!(
+                    inventory
+                        .preview()
+                        .blockers
+                        .contains(&ImportBlocker::UnsettledOperation)
+                );
+            }
+            assert!(
+                !inventory.preview().instances[0].ordinary_import_available,
+                "{boundary}"
+            );
+            assert!(
+                inventory
+                    .prepare_instance(inventory.fingerprint(), FIRST)
+                    .is_err(),
+                "{boundary}"
+            );
+        }
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+    #[cfg(unix)]
+    {
+        let fixture = Fixture::new();
+        let external = fixture.root.path().join("external-witness.json");
+        fs::write(
+            &external,
+            serde_json::to_vec(&guardian_user_mod_witness_snapshot()).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&external, fixture.baseline.join(USER_MOD_WITNESS_PATH))
+            .unwrap();
+        let before = snapshot(fixture.root.path());
+        let inventory = Arc::new(fixture.capture());
+        assert!(
+            inventory
+                .preview()
+                .blockers
+                .contains(&ImportBlocker::UnsafeFile)
+        );
+        assert!(
+            inventory
+                .prepare_instance(inventory.fingerprint(), FIRST)
+                .is_err()
+        );
+        assert_eq!(snapshot(fixture.root.path()), before);
+    }
+}
+
 #[test]
 fn invalid_offline_identity_is_not_replaced_with_new_identity() {
     let fixture = Fixture::new();
