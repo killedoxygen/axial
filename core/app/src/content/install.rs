@@ -180,6 +180,8 @@ pub enum MutationError {
     Required,
     #[error("content not found")]
     NotFound,
+    #[error("managed mods must be removed through content operations")]
+    Managed,
     #[error("content is unavailable")]
     Unavailable,
     #[error("content payload failed integrity verification")]
@@ -205,7 +207,7 @@ impl From<rusqlite::Error> for MutationError {
 impl MutationError {
     pub fn status_code(&self) -> u16 {
         match self {
-            Self::Changed | Self::Conflict | Self::Pending | Self::Required => 409,
+            Self::Changed | Self::Conflict | Self::Pending | Self::Required | Self::Managed => 409,
             Self::NotFound => 404,
             Self::Cancelled => 409,
             Self::Capacity => 413,
@@ -285,6 +287,15 @@ struct Receipt {
     native_settled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pack: Option<CanonicalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_mod: Option<LocalModIntent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalModIntent {
+    source: String,
+    destination: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -620,6 +631,7 @@ impl ContentMutations {
             changes,
             native_settled: false,
             pack: Some(canonical_id),
+            local_mod: None,
         };
         validate_receipt(&receipt)?;
         if cancel.is_cancelled() {
@@ -994,18 +1006,6 @@ impl ContentMutations {
                 if !live.contains(old) {
                     return Err(MutationError::Changed);
                 }
-                if enabled != Some(true)
-                    && before.entries().iter().any(|entry| {
-                        entry.canonical_id() != &content
-                            && entry.enabled()
-                            && live.contains(entry)
-                            && entry.dependencies().iter().any(|dependency| {
-                                dependency.requires_project(old.project_id(), old.version_id())
-                            })
-                    })
-                {
-                    return Err(MutationError::Required);
-                }
                 let mut after = before.clone();
                 let mut sources = HashMap::new();
                 if let Some(enabled) = enabled {
@@ -1028,6 +1028,91 @@ impl ContentMutations {
                     .await
             })
             .map_err(|_| MutationError::Unavailable)
+    }
+
+    pub(crate) async fn change_local_mod_admitted(
+        &self,
+        instance: RegisteredInstance,
+        from: &PortableName,
+        to: Option<&PortableName>,
+        cancel: &CancellationToken,
+    ) -> Result<bool, MutationError> {
+        let Some(receipt) = self.plan_local_mod_change(&instance, from, to)? else {
+            return Ok(false);
+        };
+        self.accept_batch(instance, receipt, cancel).await?;
+        Ok(true)
+    }
+
+    fn plan_local_mod_change(
+        &self,
+        instance: &RegisteredInstance,
+        from: &PortableName,
+        to: Option<&PortableName>,
+    ) -> Result<Option<Receipt>, MutationError> {
+        let raw = read_path(instance.game_directory(), MANIFEST_FILE)?;
+        let before = ContentManifest::decode_managed(raw.as_deref())?;
+        let key = crate::files::portable::managed_content_name_key(from);
+        let Some(entry) = before.entries().iter().find(|entry| {
+            entry.kind() == ContentKind::Mod
+                && entry
+                    .managed_filename()
+                    .is_some_and(|name| name.key() == key)
+        }) else {
+            return Ok(None);
+        };
+        let intent = LocalModIntent {
+            source: format!("mods/{}", from.as_str()),
+            destination: to.map(|name| format!("mods/{}", name.as_str())),
+        };
+        let proof = observe_path(instance.game_directory(), &intent.source)?
+            .ok_or(MutationError::NotFound)?;
+        if proof == Proof::entry(entry)? {
+            return Err(MutationError::Managed);
+        }
+        if to == Some(from) {
+            return Ok(None);
+        }
+        let mut changes = Vec::new();
+        if let Some(destination) = &intent.destination {
+            if observe_path(instance.game_directory(), destination)?.is_some() {
+                return Err(MutationError::Conflict);
+            }
+            changes.push(Change {
+                path: destination.clone(),
+                before: None,
+                after: Some(proof.clone()),
+                source: Some(Source::Local {
+                    path: intent.source.clone(),
+                    proof: proof.clone(),
+                }),
+            });
+        }
+        changes.push(Change {
+            path: intent.source.clone(),
+            before: Some(proof),
+            after: None,
+            source: None,
+        });
+        let receipt = Receipt {
+            schema: 1,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: instance.record().instance.id.clone(),
+            instance_revision: instance.record().revision,
+            directory_receipt: instance
+                .game_directory()
+                .receipt()
+                .map_err(|_| MutationError::Changed)?,
+            after_manifest: raw.clone().ok_or(MutationError::Changed)?,
+            before_manifest: raw,
+            before_observed_manifest: before.encode_managed()?,
+            changes,
+            native_settled: false,
+            pack: None,
+            local_mod: Some(intent),
+        };
+        validate_receipt(&receipt)?;
+        Ok(Some(receipt))
     }
 
     async fn begin(
@@ -1080,7 +1165,17 @@ impl ContentMutations {
             changes,
             native_settled: false,
             pack: None,
+            local_mod: None,
         };
+        self.accept_batch(instance, receipt, cancel).await
+    }
+
+    async fn accept_batch(
+        &self,
+        instance: RegisteredInstance,
+        receipt: Receipt,
+        cancel: &CancellationToken,
+    ) -> Result<MutationReceipt, MutationError> {
         validate_receipt(&receipt)?;
         for change in &receipt.changes {
             if let Some(name) = change.path.strip_prefix("mods/") {
@@ -1104,8 +1199,18 @@ impl ContentMutations {
             return Err(MutationError::Capacity);
         }
         self.directories.registry().storage().transaction(|tx| -> Result<(), MutationError> {
-            tx.execute("INSERT INTO content_batches(instance_id, operation_id, receipt_json) VALUES(?1, ?2, ?3)",
+            let inserted = tx.execute("INSERT INTO content_batches(instance_id, operation_id, receipt_json) VALUES(?1, ?2, ?3)",
                 params![receipt.instance_id.as_str(), receipt.operation_id, json])?;
+            if inserted != 1 {
+                return Err(MutationError::Changed);
+            }
+            let persisted: Option<(String, String)> = tx.query_row(
+                "SELECT operation_id,receipt_json FROM content_batches WHERE instance_id=?1",
+                [receipt.instance_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            if persisted.as_ref().is_none_or(|(operation, payload)| operation != &receipt.operation_id || payload != &json) {
+                return Err(MutationError::Changed);
+            }
             Ok(())
         })
     }
@@ -1571,6 +1676,9 @@ fn validate_receipt(receipt: &Receipt) -> Result<(), MutationError> {
     }
     let mut recorded = ContentManifest::decode_managed(receipt.before_manifest.as_deref())?;
     let before = ContentManifest::decode_managed(Some(&receipt.before_observed_manifest))?;
+    if let Some(intent) = &receipt.local_mod {
+        return validate_local_mod_receipt(receipt, intent, &recorded, &before);
+    }
     // Observation may correct only enabled/disabled spelling. It cannot invent
     // provenance or change a provider identity, digest, dependency, or filename.
     for entry in before.entries() {
@@ -1636,6 +1744,81 @@ fn validate_receipt(receipt: &Receipt) -> Result<(), MutationError> {
     }
     for path in before.keys().chain(after.keys()) {
         if before.get(path) != after.get(path) && after.contains_key(path) && !paths.contains(path)
+        {
+            return Err(MutationError::Changed);
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_mod_receipt(
+    receipt: &Receipt,
+    intent: &LocalModIntent,
+    recorded: &ContentManifest,
+    before: &ContentManifest,
+) -> Result<(), MutationError> {
+    if receipt.pack.is_some()
+        || recorded != before
+        || receipt.before_manifest.as_deref() != Some(receipt.after_manifest.as_slice())
+        || receipt.changes.len() != 1 + usize::from(intent.destination.is_some())
+    {
+        return Err(MutationError::Changed);
+    }
+    let source_name = portable(
+        intent
+            .source
+            .strip_prefix("mods/")
+            .ok_or(MutationError::Changed)?,
+    )?;
+    let source_key = source_name.key();
+    let alternate = if source_key.as_str().ends_with(".jar.disabled") {
+        intent.source[..intent.source.len() - ".disabled".len()].to_string()
+    } else if source_key.as_str().ends_with(".jar") {
+        format!("{}.disabled", intent.source)
+    } else {
+        return Err(MutationError::Changed);
+    };
+    if intent
+        .destination
+        .as_ref()
+        .is_some_and(|path| path != &alternate)
+    {
+        return Err(MutationError::Changed);
+    }
+    let key = crate::files::portable::managed_content_name_key(&source_name);
+    let entry = recorded
+        .entries()
+        .iter()
+        .find(|entry| {
+            entry.kind() == ContentKind::Mod
+                && entry
+                    .managed_filename()
+                    .is_some_and(|name| name.key() == key)
+        })
+        .ok_or(MutationError::Changed)?;
+    let source = receipt
+        .changes
+        .iter()
+        .find(|change| change.path == intent.source)
+        .ok_or(MutationError::Changed)?;
+    let proof = source.before.as_ref().ok_or(MutationError::Changed)?;
+    if source.after.is_some()
+        || source.source.is_some()
+        || proof.size > MAX_CONTENT_FILE_BYTES
+        || !super::provenance::valid_sha512(&proof.sha512)
+        || proof == &Proof::entry(entry)?
+    {
+        return Err(MutationError::Changed);
+    }
+    if let Some(destination) = &intent.destination {
+        let target = receipt
+            .changes
+            .iter()
+            .find(|change| &change.path == destination)
+            .ok_or(MutationError::Changed)?;
+        if target.before.is_some()
+            || target.after.as_ref() != Some(proof)
+            || !matches!(&target.source, Some(Source::Local { path, proof: copied }) if path == &intent.source && copied == proof)
         {
             return Err(MutationError::Changed);
         }
@@ -2419,6 +2602,7 @@ mod tests {
             changes,
             native_settled: false,
             pack: Some(pack.canonical_id.clone()),
+            local_mod: None,
         };
         validate_receipt(&receipt).unwrap();
         receipt
@@ -2439,10 +2623,11 @@ mod tests {
                 crate::instances::delete::MIGRATION,
                 MIGRATION,
                 crate::performance::mutation::MIGRATION,
+                crate::performance::rules::MIGRATION,
             ])
             .unwrap();
         let directories =
-            InstanceDirectories::new(Registry::new(storage), library, Exclusions::new());
+            InstanceDirectories::new(Registry::new(storage.clone()), library, Exclusions::new());
         let tasks = TaskOwner::new(16).unwrap();
         let instances = InstanceService::new(directories.clone(), tasks.clone());
         let instance = instances
@@ -2464,11 +2649,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let owner = ContentMutations::new(
-            directories,
-            ProviderClient::new(ClientConfig::default()).unwrap(),
-            tasks,
-        );
+        let client = ProviderClient::new(ClientConfig::default()).unwrap();
+        let performance = crate::performance::PerformanceService::new(
+            storage,
+            directories.clone(),
+            tasks.clone(),
+            Arc::new(ContentService::new(client.clone()).unwrap()),
+            crate::performance::public_transfer_resolver(),
+        )
+        .unwrap();
+        let owner = ContentMutations::new(directories, client, tasks).with_performance(performance);
         (root, owner, instance.id)
     }
 
@@ -2509,6 +2699,7 @@ mod tests {
             after_manifest: after.encode_managed().unwrap(),
             native_settled: false,
             pack: None,
+            local_mod: None,
             changes: vec![Change {
                 path,
                 before: before
@@ -2579,6 +2770,261 @@ mod tests {
             std::fs::read(game.join("resourcepacks/pack.zip")).unwrap(),
             b"owned"
         );
+    }
+
+    fn local_mod_record(owner: &ContentMutations, instance: &RegisteredInstance) -> Receipt {
+        let game = instance.game_directory().read_projection().unwrap();
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert(
+                ManifestEntry::managed_file(
+                    CanonicalId::for_project(ProviderId::Modrinth, "recorded"),
+                    ProviderId::Modrinth,
+                    "recorded".into(),
+                    "v1".into(),
+                    ContentKind::Mod,
+                    ManagedContentFileName::new_exact("recorded.jar").unwrap(),
+                    Some(Proof::bytes(b"managed").sha512),
+                    Some(7),
+                    vec![],
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut raw = b" \n".to_vec();
+        raw.extend(manifest.encode_managed().unwrap());
+        raw.extend_from_slice(b"\n ");
+        std::fs::write(game.join(MANIFEST_FILE), raw).unwrap();
+        std::fs::write(game.join("mods/recorded.jar"), b"local replacement").unwrap();
+        owner
+            .plan_local_mod_change(
+                instance,
+                &portable("recorded.jar").unwrap(),
+                Some(&portable("recorded.jar.disabled").unwrap()),
+            )
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_mod_receipt_refuses_later_source_manifest_and_destination_changes() {
+        for change in ["source-bytes", "source-identity", "manifest", "destination"] {
+            let (root, owner, id) = fixture().await;
+            let game = root.path().join("instances").join(id.as_str());
+            let instance = owner.directories.admit(&id).unwrap();
+            let record = local_mod_record(&owner, &instance);
+            let source = game.join("mods/recorded.jar");
+            let destination = game.join("mods/recorded.jar.disabled");
+            let mut expected_manifest = record.after_manifest.clone();
+            match change {
+                "source-bytes" => std::fs::write(&source, b"later bytes").unwrap(),
+                "source-identity" => {
+                    std::fs::rename(&source, game.join("mods/preserved.jar")).unwrap();
+                    std::fs::write(&source, b"later bytes").unwrap();
+                }
+                "manifest" => {
+                    expected_manifest.push(b' ');
+                    std::fs::write(game.join(MANIFEST_FILE), &expected_manifest).unwrap();
+                }
+                "destination" => std::fs::write(&destination, b"user destination").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                owner
+                    .accept_batch(instance, record, &CancellationToken::new())
+                    .await
+                    .is_err(),
+                "{change}"
+            );
+            assert_eq!(
+                std::fs::read(&source).unwrap(),
+                if change.starts_with("source-") {
+                    b"later bytes".as_slice()
+                } else {
+                    b"local replacement".as_slice()
+                }
+            );
+            if change == "destination" {
+                assert_eq!(std::fs::read(&destination).unwrap(), b"user destination");
+            } else {
+                assert!(!destination.exists());
+            }
+            assert_eq!(
+                std::fs::read(game.join(MANIFEST_FILE)).unwrap(),
+                expected_manifest
+            );
+            assert!(!owner.has_unsettled_effects());
+            assert!(owner.directories.admit(&id).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_mod_receipt_rejects_unrelated_or_managed_mutation_authority() {
+        let (_root, owner, id) = fixture().await;
+        let instance = owner.directories.admit(&id).unwrap();
+        let original = local_mod_record(&owner, &instance);
+        for tamper in [
+            "source",
+            "destination",
+            "managed",
+            "download",
+            "extra",
+            "manifest",
+            "pack",
+            "digest",
+        ] {
+            let mut record = original.clone();
+            match tamper {
+                "source" => record.local_mod.as_mut().unwrap().source = "mods/unrelated.jar".into(),
+                "destination" => {
+                    record.local_mod.as_mut().unwrap().destination =
+                        Some("mods/unrelated.jar".into())
+                }
+                "managed" => {
+                    let managed = Proof::bytes(b"managed");
+                    record.changes[1].before = Some(managed.clone());
+                    record.changes[0].after = Some(managed.clone());
+                    record.changes[0].source = Some(Source::Local {
+                        path: "mods/recorded.jar".into(),
+                        proof: managed,
+                    });
+                }
+                "download" => record.changes[0].source = Some(Source::PackOverride),
+                "extra" => record.changes.push(record.changes[1].clone()),
+                "manifest" => record.after_manifest.push(b' '),
+                "pack" => {
+                    record.pack = Some(CanonicalId::for_project(ProviderId::Modrinth, "pack"))
+                }
+                "digest" => record.changes[1].before.as_mut().unwrap().sha512 = "invalid".into(),
+                _ => unreachable!(),
+            }
+            assert!(validate_receipt(&record).is_err(), "{tamper}");
+        }
+        let encoded = serde_json::to_string(&original).unwrap();
+        validate_receipt(&serde_json::from_str(&encoded).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_mod_receipt_must_be_durably_inserted_unchanged_before_file_effects() {
+        for trigger in [
+            "CREATE TRIGGER refuse_content_receipt BEFORE INSERT ON content_batches BEGIN SELECT RAISE(IGNORE); END;",
+            "CREATE TRIGGER change_content_receipt AFTER INSERT ON content_batches BEGIN UPDATE content_batches SET receipt_json='{}' WHERE instance_id=NEW.instance_id; END;",
+        ] {
+            let (root, owner, id) = fixture().await;
+            let instance = owner.directories.admit(&id).unwrap();
+            let record = local_mod_record(&owner, &instance);
+            owner
+                .directories
+                .registry()
+                .storage()
+                .transaction(|tx| tx.execute_batch(trigger).map_err(StorageError::from))
+                .unwrap();
+            assert!(matches!(
+                owner
+                    .change_local_mod_admitted(
+                        instance,
+                        &portable("recorded.jar").unwrap(),
+                        Some(&portable("recorded.jar.disabled").unwrap()),
+                        &CancellationToken::new(),
+                    )
+                    .await,
+                Err(MutationError::Changed)
+            ));
+            let game = root.path().join("instances").join(id.as_str());
+            assert_eq!(
+                std::fs::read(game.join("mods/recorded.jar")).unwrap(),
+                b"local replacement"
+            );
+            assert!(!game.join("mods/recorded.jar.disabled").exists());
+            assert_eq!(
+                std::fs::read(game.join(MANIFEST_FILE)).unwrap(),
+                record.after_manifest
+            );
+            assert!(!owner.has_unsettled_effects());
+            assert!(owner.directories.admit(&id).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_mod_restart_requires_native_settlement_and_verifies_acknowledged_publication() {
+        for phase in ["prepared", "committed", "acknowledged"] {
+            let (root, owner, id) = fixture().await;
+            let instance = owner.directories.admit(&id).unwrap();
+            let mut record = local_mod_record(&owner, &instance);
+            owner.persist_receipt(&record).unwrap();
+            if phase != "prepared" {
+                apply_streamed(
+                    &instance,
+                    &record,
+                    &mut HashMap::new(),
+                    None,
+                    &mut Vec::new(),
+                    &CancellationToken::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+                if phase == "acknowledged" {
+                    owner.mark_native_settled(&mut record).unwrap();
+                }
+            }
+            drop(instance);
+            let reopened = ContentMutations::new(
+                owner.directories.clone(),
+                owner._client.clone(),
+                owner.tasks.clone(),
+            );
+            assert!(reopened.directories.admit(&id).is_err());
+            let result = reopened.resume(&id).unwrap().join().await.unwrap();
+            if phase == "acknowledged" {
+                assert_eq!(result.unwrap().status, "complete");
+                assert!(reopened.directories.admit(&id).is_ok());
+                assert!(!reopened.has_unsettled_effects());
+            } else {
+                assert!(matches!(result, Err(MutationError::Pending)));
+                assert!(reopened.directories.admit(&id).is_err());
+                assert!(reopened.has_unsettled_effects());
+            }
+            let game = root.path().join("instances").join(id.as_str());
+            assert_eq!(
+                std::fs::read(game.join(MANIFEST_FILE)).unwrap(),
+                record.after_manifest
+            );
+            let file = if phase == "prepared" {
+                "mods/recorded.jar"
+            } else {
+                "mods/recorded.jar.disabled"
+            };
+            assert_eq!(
+                std::fs::read(game.join(file)).unwrap(),
+                b"local replacement"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_local_mod_receipt_keeps_files_and_releases_admission() {
+        let (root, owner, id) = fixture().await;
+        let instance = owner.directories.admit(&id).unwrap();
+        let record = local_mod_record(&owner, &instance);
+        let expected = record.after_manifest.clone();
+        owner.persist_receipt(&record).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            owner.apply(instance, record, HashMap::new(), &cancel).await,
+            Err(MutationError::Cancelled)
+        ));
+        assert!(owner.directories.admit(&id).is_ok());
+        assert!(!owner.has_unsettled_effects());
+        let game = root.path().join("instances").join(id.as_str());
+        assert_eq!(
+            std::fs::read(game.join("mods/recorded.jar")).unwrap(),
+            b"local replacement"
+        );
+        assert!(!game.join("mods/recorded.jar.disabled").exists());
+        assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), expected);
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 
 use super::{mods, screenshots, worlds};
 use crate::{
-    content::{install::ContentMutations, provenance::ContentManifest},
+    content::install::{ContentMutations, MutationError},
     files::{PortableName, ScopedDirectory},
     instances::{directory::InstanceDirectories, model::InstanceId},
     tasks::{TaskHandle, TaskOwner},
@@ -268,13 +268,17 @@ impl ResourceService {
         enabled: bool,
     ) -> Result<TaskHandle<Result<ResourceCommand, ResourceError>>, ResourceError> {
         mods::validate_mod_filename(name).map_err(|_| ResourceError::InvalidName)?;
-        let manifest = self
-            .content
-            .installed(id)
+        let read = self
+            .directories
+            .admit_read(id)
             .map_err(|_| ResourceError::Busy)?;
+        let (manifest, live, _) = crate::content::install::observe(read.game_directory())
+            .map_err(|_| ResourceError::Busy)?;
+        read.validate_current().map_err(|_| ResourceError::Busy)?;
         let key = crate::files::portable::managed_content_name_key(&portable(name)?);
         if let Some(entry) = manifest.entries().iter().find(|entry| {
             entry.kind() == crate::content::model::ContentKind::Mod
+                && live.contains(entry)
                 && entry
                     .managed_filename()
                     .is_some_and(|filename| filename.key() == key)
@@ -282,7 +286,10 @@ impl ResourceService {
             let work = self
                 .content
                 .set_enabled(id, entry.canonical_id(), enabled)
-                .map_err(|_| ResourceError::Conflict)?;
+                .map_err(|error| match error {
+                    MutationError::Unavailable => ResourceError::Busy,
+                    _ => ResourceError::Conflict,
+                })?;
             let filename = entry.managed_filename().ok_or(ResourceError::Managed)?;
             let name = if enabled {
                 filename.as_str()
@@ -350,7 +357,16 @@ impl ResourceService {
                         .protect_performance_mod(&instance, from.as_str())
                         .await
                         .map_err(|_| ResourceError::Managed)?;
-                    refuse_managed(instance.game_directory(), &from)?;
+                    if owner
+                        .content
+                        .change_local_mod_admitted(instance.clone(), &from, Some(&to), &cancel)
+                        .await
+                        .map_err(mod_mutation_error)?
+                    {
+                        let mut result = ResourceCommand::ok(Some(to.as_str().into()));
+                        result.enabled = enabled;
+                        return Ok(result);
+                    }
                 }
                 let file = parent.open_file(&from).map_err(read_error)?;
                 if from != to {
@@ -394,7 +410,14 @@ impl ResourceService {
                         .protect_performance_mod(&instance, name.as_str())
                         .await
                         .map_err(|_| ResourceError::Managed)?;
-                    refuse_managed(instance.game_directory(), &name)?;
+                    if owner
+                        .content
+                        .change_local_mod_admitted(instance.clone(), &name, None, &cancel)
+                        .await
+                        .map_err(mod_mutation_error)?
+                    {
+                        return Ok(ResourceCommand::ok(None));
+                    }
                 }
                 let parent = child(instance.game_directory(), folder)?;
                 let file = parent.open_file(&name).map_err(read_error)?;
@@ -593,6 +616,17 @@ impl ResourceService {
 fn portable(name: &str) -> Result<PortableName, ResourceError> {
     PortableName::new_exact(name).map_err(|_| ResourceError::InvalidName)
 }
+fn mod_mutation_error(error: MutationError) -> ResourceError {
+    match error {
+        MutationError::Unavailable | MutationError::Cancelled => ResourceError::Busy,
+        MutationError::Managed => ResourceError::Managed,
+        MutationError::Pending => ResourceError::Pending,
+        MutationError::NotFound => ResourceError::NotFound,
+        MutationError::Capacity => ResourceError::Limit,
+        MutationError::Changed | MutationError::Conflict => ResourceError::Conflict,
+        _ => ResourceError::Files,
+    }
+}
 fn child(game: &ScopedDirectory, name: &str) -> Result<ScopedDirectory, ResourceError> {
     game.open_directory(&portable(name)?).map_err(read_error)
 }
@@ -602,28 +636,6 @@ fn read_error(error: io::Error) -> ResourceError {
         io::ErrorKind::AlreadyExists | io::ErrorKind::InvalidData => ResourceError::Conflict,
         _ => ResourceError::Files,
     }
-}
-fn refuse_managed(game: &ScopedDirectory, name: &PortableName) -> Result<(), ResourceError> {
-    let path = crate::files::ScopedPath::new_exact(crate::content::provenance::MANIFEST_FILE)
-        .expect("fixed name");
-    let bytes =
-        match game.read_bounded(&path, crate::content::provenance::MAX_MANIFEST_BYTES as u64) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(_) => return Err(ResourceError::Files),
-        };
-    let manifest =
-        ContentManifest::decode_managed(bytes.as_deref()).map_err(|_| ResourceError::Conflict)?;
-    let key = crate::files::portable::managed_content_name_key(name);
-    if manifest.entries().iter().any(|entry| {
-        entry.kind() == crate::content::model::ContentKind::Mod
-            && entry
-                .managed_filename()
-                .is_some_and(|name| name.key() == key)
-    }) {
-        return Err(ResourceError::Managed);
-    }
-    Ok(())
 }
 fn log_name(name: &str) -> Result<PortableName, ResourceError> {
     let name = portable(name)?;
@@ -683,6 +695,7 @@ fn list_logs(game: &ScopedDirectory) -> Result<Vec<InstanceLogInfo>, ResourceErr
 mod tests {
     use super::*;
     use crate::{
+        content::provenance::ContentManifest,
         instances::{
             create::{CreateInstanceRequest, CreateTarget, InstanceService},
             directory::Registry,
@@ -708,10 +721,11 @@ mod tests {
                 crate::instances::delete::MIGRATION,
                 crate::content::install::MIGRATION,
                 crate::performance::mutation::MIGRATION,
+                crate::performance::rules::MIGRATION,
             ])
             .unwrap();
         let directories =
-            InstanceDirectories::new(Registry::new(storage), library, Exclusions::new());
+            InstanceDirectories::new(Registry::new(storage.clone()), library, Exclusions::new());
         let tasks = TaskOwner::new(16).unwrap();
         let instances = InstanceService::new(directories.clone(), tasks.clone());
         let instance = instances
@@ -733,16 +747,257 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let content = ContentMutations::new(
+        let client = ProviderClient::new(ClientConfig::default()).unwrap();
+        let performance = crate::performance::PerformanceService::new(
+            storage,
             directories.clone(),
-            ProviderClient::new(ClientConfig::default()).unwrap(),
             tasks.clone(),
-        );
+            Arc::new(crate::content::catalog::ContentService::new(client.clone()).unwrap()),
+            crate::performance::public_transfer_resolver(),
+        )
+        .unwrap();
+        let content = ContentMutations::new(directories.clone(), client, tasks.clone())
+            .with_performance(performance);
         (
             root,
             ResourceService::new(directories, content, tasks),
             instance.id,
         )
+    }
+
+    fn recorded_mod(game: &std::path::Path, enabled: bool) -> Vec<u8> {
+        use crate::content::{
+            model::{CanonicalId, ContentKind, ProviderId},
+            provenance::{ManagedContentFileName, ManifestEntry},
+        };
+        let id = CanonicalId::for_project(ProviderId::Modrinth, "recorded");
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert(
+                ManifestEntry::managed_file(
+                    id.clone(),
+                    ProviderId::Modrinth,
+                    "recorded".into(),
+                    "v1".into(),
+                    ContentKind::Mod,
+                    ManagedContentFileName::new_exact("recorded.jar").unwrap(),
+                    Some(format!("{:x}", sha2::Sha512::digest(b"managed"))),
+                    Some(7),
+                    vec![],
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        manifest.try_set_enabled(&id, enabled).unwrap();
+        let mut raw = b" \n".to_vec();
+        raw.extend(manifest.encode_managed().unwrap());
+        raw.extend_from_slice(b"\n ");
+        std::fs::write(game.join(crate::content::provenance::MANIFEST_FILE), &raw).unwrap();
+        raw
+    }
+
+    #[tokio::test]
+    async fn drifted_recorded_mods_toggle_and_delete_as_local_without_changing_provenance() {
+        for (enabled, replacement) in [
+            (true, b"local replacement".as_slice()),
+            (false, b"local replacement".as_slice()),
+            (true, b"".as_slice()),
+            (false, b"".as_slice()),
+        ] {
+            let (root, service, id) = fixture().await;
+            let game = root.path().join("instances").join(id.as_str());
+            let raw = recorded_mod(&game, enabled);
+            let (from, to) = if enabled {
+                ("recorded.jar", "recorded.jar.disabled")
+            } else {
+                ("recorded.jar.disabled", "recorded.jar")
+            };
+            std::fs::write(game.join("mods").join(from), replacement).unwrap();
+            std::fs::write(game.join("mods/unrelated.jar"), b"unrelated").unwrap();
+            let (_, _, live) = service.content.instance_context(&id).unwrap();
+            assert!(
+                !live.contains(
+                    service
+                        .content
+                        .installed(&id)
+                        .unwrap()
+                        .entries()
+                        .first()
+                        .unwrap()
+                )
+            );
+            let result = service
+                .set_mod_enabled(&id, from, !enabled)
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.name.as_deref(), Some(to));
+            assert_eq!(result.enabled, Some(!enabled));
+            assert!(!game.join("mods").join(from).exists());
+            assert_eq!(
+                std::fs::read(game.join("mods").join(to)).unwrap(),
+                replacement
+            );
+            assert_eq!(
+                std::fs::read(game.join(crate::content::provenance::MANIFEST_FILE)).unwrap(),
+                raw
+            );
+            service
+                .delete_mod(&id, to)
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!game.join("mods").join(to).exists());
+            assert_eq!(
+                std::fs::read(game.join("mods/unrelated.jar")).unwrap(),
+                b"unrelated"
+            );
+            assert_eq!(
+                std::fs::read(game.join(crate::content::provenance::MANIFEST_FILE)).unwrap(),
+                raw
+            );
+            assert!(!service.has_unsettled_effects());
+            assert!(service.directories.admit(&id).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_recorded_mods_still_refuse_direct_resource_deletion() {
+        let (root, service, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        let raw = recorded_mod(&game, true);
+        std::fs::write(game.join("mods/recorded.jar"), b"managed").unwrap();
+        assert!(matches!(
+            service
+                .delete_mod(&id, "recorded.jar")
+                .unwrap()
+                .join()
+                .await
+                .unwrap(),
+            Err(ResourceError::Managed)
+        ));
+        assert_eq!(
+            std::fs::read(game.join("mods/recorded.jar")).unwrap(),
+            b"managed"
+        );
+        assert_eq!(
+            std::fs::read(game.join(crate::content::provenance::MANIFEST_FILE)).unwrap(),
+            raw
+        );
+        assert!(!service.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn live_recorded_mod_toggle_reports_busy_without_changing_files() {
+        let (root, service, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        let raw = recorded_mod(&game, true);
+        std::fs::write(game.join("mods/recorded.jar"), b"managed").unwrap();
+        let launch = service.directories.admit(&id).unwrap();
+        assert!(matches!(
+            service.set_mod_enabled(&id, "recorded.jar", false),
+            Err(ResourceError::Busy)
+        ));
+        assert_eq!(
+            std::fs::read(game.join("mods/recorded.jar")).unwrap(),
+            b"managed"
+        );
+        assert!(!game.join("mods/recorded.jar.disabled").exists());
+        assert_eq!(
+            std::fs::read(game.join(crate::content::provenance::MANIFEST_FILE)).unwrap(),
+            raw
+        );
+        drop(launch);
+        assert!(!service.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn required_managed_mod_can_be_disabled_and_reenabled_but_not_removed() {
+        use crate::content::{
+            model::{CanonicalId, ContentDependency, ContentKind, DependencyKind, ProviderId},
+            provenance::{MANIFEST_FILE, ManagedContentFileName, ManifestEntry},
+        };
+        let (root, service, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        let raw = recorded_mod(&game, true);
+        let mut manifest = ContentManifest::decode_managed(Some(&raw)).unwrap();
+        let dependent = ManifestEntry::managed_file(
+            CanonicalId::for_project(ProviderId::Modrinth, "dependent"),
+            ProviderId::Modrinth,
+            "dependent".into(),
+            "v1".into(),
+            ContentKind::Mod,
+            ManagedContentFileName::new_exact("dependent.jar").unwrap(),
+            Some(format!("{:x}", sha2::Sha512::digest(b"dependent"))),
+            Some(9),
+            vec![ContentDependency {
+                project_id: Some("recorded".into()),
+                version_id: None,
+                kind: DependencyKind::Required,
+            }],
+            None,
+        )
+        .unwrap();
+        manifest.try_upsert(dependent.clone()).unwrap();
+        std::fs::write(game.join(MANIFEST_FILE), manifest.encode_managed().unwrap()).unwrap();
+        std::fs::write(game.join("mods/recorded.jar"), b"managed").unwrap();
+        std::fs::write(game.join("mods/dependent.jar"), b"dependent").unwrap();
+        for (from, enabled, expected_name) in [
+            ("recorded.jar", false, "recorded.jar.disabled"),
+            ("recorded.jar.disabled", false, "recorded.jar.disabled"),
+            ("recorded.jar.disabled", true, "recorded.jar"),
+        ] {
+            let result = service
+                .set_mod_enabled(&id, from, enabled)
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(result).unwrap(),
+                serde_json::json!({"status":"ok", "name": expected_name, "enabled": enabled})
+            );
+            let manifest = ContentManifest::decode_managed(Some(
+                &std::fs::read(game.join(MANIFEST_FILE)).unwrap(),
+            ))
+            .unwrap();
+            assert_eq!(manifest.find(dependent.canonical_id()), Some(&dependent));
+            assert_eq!(
+                manifest
+                    .find(&CanonicalId::for_project(ProviderId::Modrinth, "recorded"))
+                    .unwrap()
+                    .enabled(),
+                enabled
+            );
+            assert_eq!(
+                std::fs::read(game.join("mods").join(expected_name)).unwrap(),
+                b"managed"
+            );
+            assert_eq!(
+                std::fs::read(game.join("mods/dependent.jar")).unwrap(),
+                b"dependent"
+            );
+            assert!(matches!(
+                service
+                    .content
+                    .remove(
+                        &id,
+                        &CanonicalId::for_project(ProviderId::Modrinth, "recorded")
+                    )
+                    .unwrap()
+                    .join()
+                    .await
+                    .unwrap(),
+                Err(MutationError::Required)
+            ));
+        }
+        assert!(!service.has_unsettled_effects());
     }
 
     #[tokio::test]
