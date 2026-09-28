@@ -1142,6 +1142,191 @@ fn manual_modded_import_does_not_waive_invalid_or_untrusted_settings() {
 }
 
 #[test]
+fn instance_import_preserves_effective_managed_java_ids_against_destination_defaults() {
+    use crate::settings::ConfigView;
+    for (global, local, expected) in [
+        ("java-runtime-gamma", "", "java-runtime-gamma"),
+        (
+            "java-runtime-alpha",
+            "java-runtime-delta",
+            "java-runtime-delta",
+        ),
+        ("", " jre-legacy ", "jre-legacy"),
+        (" java-runtime-beta ", " ", "java-runtime-beta"),
+    ] {
+        let fixture = Fixture::new();
+        let mut config = fixture.record("config.json");
+        config["java_path_override"] = json!(global);
+        fixture.write("config.json", &config);
+        let mut registry = fixture.record("instances.json");
+        registry["instances"][0]["java_path"] = json!(local);
+        fixture.write("instances.json", &registry);
+        let before = snapshot(&fixture.baseline);
+        let inventory = Arc::new(fixture.capture());
+        assert!(
+            inventory.preview().instances[0].ordinary_import_available,
+            "global={global:?}, local={local:?}"
+        );
+        let prepared = inventory
+            .prepare_instance(inventory.fingerprint(), FIRST)
+            .unwrap();
+        assert_eq!(prepared.instance().settings.java_path, expected);
+        for destination_java in ["", "java-runtime-epsilon", "/destination/custom/java"] {
+            let destination = ConfigView {
+                java_path_override: destination_java.into(),
+                ..ConfigView::default()
+            };
+            prepared.validate_destination(&destination).unwrap();
+            assert_eq!(
+                prepared
+                    .instance()
+                    .settings
+                    .effective(&destination)
+                    .unwrap()
+                    .java_path,
+                expected
+            );
+        }
+        assert_eq!(inventory.instances()[0].original["java_path"], local);
+        assert_eq!(snapshot(&fixture.baseline), before);
+    }
+    // An empty source means Automatic, not permission to inherit another
+    // destination's explicit Java choice.
+    let fixture = Fixture::new();
+    let prepared = prepare_first(&fixture);
+    assert!(
+        prepared
+            .validate_destination(&ConfigView {
+                java_path_override: "java-runtime-delta".into(),
+                ..ConfigView::default()
+            })
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn instance_import_managed_java_selection_survives_copy_reopen_and_missing_runtime() {
+    use crate::{
+        runtime::{discovery::RuntimeDiscovery, model::JavaDiscoveryError},
+        settings::SettingsStore,
+        storage::MetadataStore,
+        tasks::{CancellationToken, TaskOwner},
+    };
+    let fixture = Fixture::new();
+    let mut config = fixture.record("config.json");
+    config["java_path_override"] = json!("java-runtime-gamma");
+    fixture.write("config.json", &config);
+    let before = snapshot(&fixture.baseline);
+    let (root, service) = import_service();
+    let settings = SettingsStore::new(Arc::new(
+        MetadataStore::open(root.path().join("metadata.sqlite")).unwrap(),
+    ))
+    .unwrap();
+    let destination = settings.update(serde_json::from_value(json!({"expected_revision":settings.current().unwrap().revision,"java_path_override":"java-runtime-delta"})).unwrap()).unwrap();
+    let imported = service
+        .import_instance(prepare_first(&fixture))
+        .unwrap()
+        .join()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        imported.settings.java_path.is_empty(),
+        "public responses retain runtime-override redaction"
+    );
+    let stored = service.registry().get_live(&imported.id).unwrap().instance;
+    assert_eq!(stored.settings.java_path, "java-runtime-gamma");
+    assert_eq!(
+        stored.settings.effective(&destination).unwrap().java_path,
+        "java-runtime-gamma"
+    );
+    let runtime = RuntimeDiscovery::new(
+        axial_minecraft::ManagedRuntimeCache::isolated_for_test().unwrap(),
+        TaskOwner::new(2).unwrap(),
+    );
+    assert!(
+        matches!(
+            runtime
+                .select(
+                    &axial_minecraft::JavaVersion {
+                        component: "java-runtime-gamma".into(),
+                        major_version: 17
+                    },
+                    &stored.settings.java_path,
+                    &CancellationToken::new()
+                )
+                .await,
+            Err(JavaDiscoveryError::Missing)
+        ),
+        "selection metadata is not an installed executable receipt"
+    );
+    let library_id = service
+        .directories()
+        .library()
+        .admit()
+        .unwrap()
+        .library_id();
+    drop(service);
+    let reopened = reopen_import_service(root.path(), library_id);
+    let stored = reopened.registry().get_live(&imported.id).unwrap().instance;
+    assert_eq!(stored.settings.java_path, "java-runtime-gamma");
+    let repeated = reopened
+        .import_instance(prepare_first(&fixture))
+        .unwrap()
+        .join()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.id, imported.id);
+    assert!(repeated.settings.java_path.is_empty());
+    assert_eq!(
+        reopened
+            .registry()
+            .get_live(&repeated.id)
+            .unwrap()
+            .instance
+            .settings
+            .java_path,
+        "java-runtime-gamma"
+    );
+    assert_eq!(reopened.registry().list().unwrap().len(), 1);
+    assert_eq!(snapshot(&fixture.baseline), before);
+}
+
+#[test]
+fn instance_import_java_selection_keeps_unknown_ids_and_predecessor_paths_refused() {
+    for value in [
+        "java-runtime-future",
+        "Java-runtime-gamma",
+        "../java-runtime-gamma",
+        "/predecessor/runtime/bin/java",
+        "C:\\Predecessor\\runtime\\bin\\java.exe",
+    ] {
+        for global in [false, true] {
+            let fixture = Fixture::new();
+            if global {
+                let mut config = fixture.record("config.json");
+                config["java_path_override"] = json!(value);
+                fixture.write("config.json", &config);
+            } else {
+                let mut registry = fixture.record("instances.json");
+                registry["instances"][0]["java_path"] = json!(value);
+                fixture.write("instances.json", &registry);
+            }
+            let before = snapshot(&fixture.baseline);
+            let inventory = Arc::new(fixture.capture());
+            assert!(!inventory.preview().instances[0].ordinary_import_available);
+            assert!(
+                inventory
+                    .prepare_instance(inventory.fingerprint(), FIRST)
+                    .is_err()
+            );
+            assert_eq!(snapshot(&fixture.baseline), before);
+        }
+    }
+}
+
+#[test]
 fn manual_modded_import_keeps_retained_records_and_private_directories_blocking() {
     use axial_minecraft::loaders::{LoaderComponentId, installed_version_id_for};
     for blocker in [

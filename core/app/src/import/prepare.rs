@@ -393,7 +393,10 @@ struct LegacyRegistry {
 }
 
 fn validate_profile(inventory: &Inventory, settings: &PreparedSettingsImport) -> ImportResult<()> {
-    if !settings.config.java_path_override.is_empty() {
+    if matches!(
+        axial_minecraft::runtime::parse_runtime_override(&settings.config.java_path_override),
+        axial_minecraft::RuntimeOverride::ExecutablePath(_)
+    ) {
         return Err(ImportError::InvalidData);
     }
     super::metadata::prepare_accounts(inventory, settings)?;
@@ -440,7 +443,10 @@ fn convert_instance(
     instance_settings
         .validate()
         .map_err(|_| ImportError::InvalidData)?;
-    if !instance_settings.java_path.is_empty() {
+    if matches!(
+        axial_minecraft::runtime::parse_runtime_override(&instance_settings.java_path),
+        axial_minecraft::RuntimeOverride::ExecutablePath(_)
+    ) {
         return Err(ImportError::InvalidData);
     }
     const FIELDS: [&str; 10] = [
@@ -496,6 +502,7 @@ fn convert_instance(
         .map_err(|_| ImportError::InvalidData)?;
     instance.settings.max_memory_mb = effective.max_memory_mb;
     instance.settings.min_memory_mb = effective.min_memory_mb;
+    instance.settings.java_path = effective.java_path.clone();
     instance.settings.window_width = effective.window_width;
     instance.settings.window_height = effective.window_height;
     instance.settings.jvm_preset = effective.jvm_preset.as_str().to_owned();

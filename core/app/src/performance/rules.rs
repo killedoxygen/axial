@@ -6,7 +6,7 @@ use crate::{
         MetadataStore, Migration, StorageError,
         rusqlite::{Connection, OptionalExtension, Transaction, params},
     },
-    tasks::CancellationToken,
+    tasks::{CancellationToken, SpawnError, TaskOwner},
 };
 use axial_performance::{
     CompositionPlan, PerformanceManager, PerformanceRulesAuthority, ResolutionRequest,
@@ -20,7 +20,16 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
+use tokio::sync::watch;
+
+const REFRESH_INTERVAL_ENV: &str = "AXIAL_PERFORMANCE_RULES_REFRESH_INTERVAL_SECONDS";
+
+fn refresh_interval(value: Option<&str>) -> Duration {
+    let seconds = value.and_then(|value| value.trim().parse::<u64>().ok());
+    Duration::from_secs(seconds.unwrap_or(6 * 60 * 60).clamp(15 * 60, 24 * 60 * 60))
+}
 
 pub const MIGRATION: Migration = Migration {
     id: "performance_rules.v1",
@@ -382,6 +391,65 @@ impl PerformanceRules {
         rules_response(self.manager.rules_status())
     }
 
+    /// The caller retains this idle worker; only accepted refreshes count as work.
+    pub async fn run(&self, tasks: TaskOwner, mut shutdown: watch::Receiver<bool>) {
+        if !self.manager.remote_refresh_enabled() {
+            return;
+        }
+        let interval = refresh_interval(std::env::var(REFRESH_INTERVAL_ENV).ok().as_deref());
+        let mut changes = tasks.subscribe();
+        loop {
+            let stopping = *shutdown.borrow_and_update();
+            if stopping || shutdown.has_changed().is_err() {
+                return;
+            }
+            changes.borrow_and_update();
+            let rules = self.clone();
+            let mut attempt_shutdown = shutdown.clone();
+            let accepted = tasks.try_spawn(self.clone(), move |cancel| async move {
+                // Dropping a network/gate wait has no effects. Persistence and
+                // active-rule publication in refresh contain no yielding gap.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    _ = attempt_shutdown.wait_for(|stop| *stop) => None,
+                    result = rules.refresh() => Some(result),
+                }
+            });
+            let accepted = match accepted {
+                Ok(accepted) => accepted,
+                Err(SpawnError::Closed) => return,
+                Err(SpawnError::AtCapacity) => {
+                    tokio::select! {
+                        _ = shutdown.wait_for(|stop| *stop) => return,
+                        _ = changes.changed() => continue,
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "background rules refresh admission failed");
+                    return;
+                }
+            };
+            // TaskOwner retains the attempt even if this worker's waiter drops.
+            match accepted.join().await {
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(error))) => {
+                    // RulesWorkflowError's Display is fixed, safe public copy.
+                    tracing::warn!(%error, "background rules refresh failed");
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(?error, "background rules refresh did not settle");
+                    return;
+                }
+            }
+            tokio::select! {
+                _ = shutdown.wait_for(|stop| *stop) => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+    }
+
     pub fn import_status(
         &self,
         id: &str,
@@ -676,6 +744,330 @@ pub(crate) mod tests {
         rules
             .commit_import(prepared, &CancellationToken::new(), async { Ok(()) })
             .await
+    }
+
+    async fn refresh_fixture() -> (
+        Arc<MetadataStore>,
+        PerformanceRules,
+        tokio::net::TcpListener,
+        axial_performance::RulesCacheSnapshot,
+    ) {
+        let (storage, _, prepared) = fixture();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (next, key) = signed_cache("2002-01-01T00:00:00Z");
+        let rules = PerformanceRules::with_remote(
+            storage.clone(),
+            Some(format!("http://{}/rules", listener.local_addr().unwrap())),
+            Some(key),
+        )
+        .unwrap();
+        commit(&rules, &prepared).await.unwrap();
+        (
+            storage,
+            rules,
+            listener,
+            serde_json::from_slice(&next).unwrap(),
+        )
+    }
+
+    async fn respond_rules(
+        mut stream: tokio::net::TcpStream,
+        snapshot: &axial_performance::RulesCacheSnapshot,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut request = [0; 4096];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        let body = serde_json::to_vec(&snapshot.manifest).unwrap();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nx-axial-rules-signature-ed25519: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+            snapshot.signature.signature,
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+    }
+
+    async fn refresh_idle(tasks: &crate::tasks::TaskOwner) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !tasks.status().is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn start_refresh(
+        rules: &PerformanceRules,
+        tasks: &TaskOwner,
+    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let (shutdown, receiver) = watch::channel(false);
+        let rules = rules.clone();
+        let tasks = tasks.clone();
+        let worker = tokio::spawn(async move { rules.run(tasks, receiver).await });
+        (shutdown, worker)
+    }
+
+    async fn accept_refresh(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+        tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn periodic_rules_interval_preserves_legacy_default_and_bounds() {
+        for (value, seconds) in [
+            (None, 21_600),
+            (Some(""), 21_600),
+            (Some(" \t\n"), 21_600),
+            (Some("invalid"), 21_600),
+            (Some("-1"), 21_600),
+            (Some("18446744073709551616"), 21_600),
+            (Some("0"), 900),
+            (Some("1"), 900),
+            (Some("900"), 900),
+            (Some(" 1800 "), 1_800),
+            (Some("21600"), 21_600),
+            (Some("86400"), 86_400),
+            (Some("86401"), 86_400),
+            (Some("18446744073709551615"), 86_400),
+        ] {
+            assert_eq!(refresh_interval(value), Duration::from_secs(seconds));
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_rules_refreshes_configured_signed_provider_immediately() {
+        let (storage, rules, listener, next) = refresh_fixture().await;
+        let tasks = crate::tasks::TaskOwner::new(1).unwrap();
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let worker = {
+            let rules = rules.clone();
+            let tasks = tasks.clone();
+            tokio::spawn(async move { rules.run(tasks, receiver).await })
+        };
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await;
+        if accepted.is_err() {
+            shutdown.send_replace(true);
+            worker.await.unwrap();
+            panic!("configured background rules refresh did not contact its provider");
+        }
+        let (stream, _) = accepted.unwrap().unwrap();
+        assert!(!tasks.status().is_idle());
+        respond_rules(stream, &next).await;
+        refresh_idle(&tasks).await;
+        tokio::task::yield_now().await;
+        assert!(!worker.is_finished(), "the periodic worker remains asleep");
+        tasks.try_close_idle().unwrap();
+        shutdown.send_replace(true);
+        worker.await.unwrap();
+        assert_eq!(rules.status().status.generated_at, next.generated_at);
+        let saved = storage.read(read_cache).unwrap().unwrap();
+        let saved: axial_performance::RulesCacheSnapshot = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(saved.manifest, next.manifest);
+        assert_eq!(rules.revision.load(Ordering::Acquire), 3);
+        tasks.try_close_idle().unwrap();
+    }
+
+    #[tokio::test]
+    async fn periodic_rules_delay_starts_after_completion_and_failed_refresh_preserves_cache() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (storage, rules, listener, next) = refresh_fixture().await;
+        let tasks = TaskOwner::new(1).unwrap();
+        let gate = rules.gate.write().await;
+        let (shutdown, worker) = start_refresh(&rules, &tasks);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tasks.status().is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let interval = refresh_interval(std::env::var(REFRESH_INTERVAL_ENV).ok().as_deref());
+        tokio::time::pause();
+        tokio::time::advance(interval + Duration::from_secs(10)).await;
+        tokio::time::resume();
+        drop(gate);
+        respond_rules(accept_refresh(&listener).await, &next).await;
+        refresh_idle(&tasks).await;
+        tokio::task::yield_now().await;
+        let saved = storage.read(read_cache).unwrap();
+        let revision = rules.revision.load(Ordering::Acquire);
+
+        tokio::time::pause();
+        tokio::time::advance(interval - Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(tasks.status().is_idle(), "no fixed-rate catch-up attempt");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::resume();
+        let mut stream = accept_refresh(&listener).await;
+        let mut request = [0; 4096];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        stream
+            .write_all(
+                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        refresh_idle(&tasks).await;
+        assert_eq!(storage.read(read_cache).unwrap(), saved);
+        assert_eq!(rules.revision.load(Ordering::Acquire), revision);
+        assert_eq!(rules.status().status.generated_at, next.generated_at);
+        assert!(!rules.status().status.warnings.is_empty());
+        shutdown.send_replace(true);
+        worker.await.unwrap();
+        tasks.try_close_idle().unwrap();
+    }
+
+    #[tokio::test]
+    async fn periodic_rules_skips_unconfigured_closed_and_stopped_admission() {
+        use futures_util::FutureExt;
+        for case in ["unconfigured", "stopped", "watch_closed", "owner_closed"] {
+            let (storage, mut rules, listener, _) = refresh_fixture().await;
+            let saved = storage.read(read_cache).unwrap();
+            let tasks = TaskOwner::new(1).unwrap();
+            let (shutdown, receiver) = watch::channel(case == "stopped");
+            if case == "unconfigured" {
+                rules = PerformanceRules::with_remote(storage.clone(), None, None).unwrap();
+            }
+            if case == "watch_closed" {
+                drop(shutdown);
+            }
+            if case == "owner_closed" {
+                tasks.try_close_idle().unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(1), rules.run(tasks.clone(), receiver))
+                .await
+                .unwrap();
+            assert!(listener.accept().now_or_never().is_none(), "{case}");
+            assert!(tasks.status().is_idle(), "{case}");
+            assert_eq!(storage.read(read_cache).unwrap(), saved, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_rules_waits_for_capacity_then_refreshes() {
+        use futures_util::FutureExt;
+        let (storage, rules, listener, next) = refresh_fixture().await;
+        let tasks = TaskOwner::new(1).unwrap();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let occupied = tasks
+            .try_spawn((), |_| async move { held.await.unwrap() })
+            .unwrap();
+        let (shutdown, worker) = start_refresh(&rules, &tasks);
+        tokio::task::yield_now().await;
+        assert!(!worker.is_finished());
+        assert!(listener.accept().now_or_never().is_none());
+        release.send(()).unwrap();
+        occupied.join().await.unwrap();
+        respond_rules(accept_refresh(&listener).await, &next).await;
+        refresh_idle(&tasks).await;
+        shutdown.send_replace(true);
+        worker.await.unwrap();
+        assert_eq!(rules.status().status.generated_at, next.generated_at);
+        let saved: axial_performance::RulesCacheSnapshot =
+            serde_json::from_slice(&storage.read(read_cache).unwrap().unwrap()).unwrap();
+        assert_eq!(saved.manifest, next.manifest);
+        tasks.try_close_idle().unwrap();
+    }
+
+    #[tokio::test]
+    async fn periodic_rules_dropped_waiter_keeps_accepted_refresh_owned_through_publication() {
+        let (storage, rules, listener, next) = refresh_fixture().await;
+        let tasks = TaskOwner::new(1).unwrap();
+        let (_shutdown, worker) = start_refresh(&rules, &tasks);
+        let stream = accept_refresh(&listener).await;
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(!tasks.status().is_idle());
+        assert!(tasks.try_close_idle().is_err());
+        assert!(rules.gate.try_write().is_err());
+        respond_rules(stream, &next).await;
+        refresh_idle(&tasks).await;
+        assert!(rules.gate.try_write().is_ok());
+        assert_eq!(rules.status().status.generated_at, next.generated_at);
+        let saved: axial_performance::RulesCacheSnapshot =
+            serde_json::from_slice(&storage.read(read_cache).unwrap().unwrap()).unwrap();
+        assert_eq!(saved.manifest, next.manifest);
+        assert_eq!(rules.revision.load(Ordering::Acquire), 3);
+        tasks.try_close_idle().unwrap();
+    }
+
+    #[tokio::test]
+    async fn periodic_rules_pending_refresh_cancels_without_partial_publication() {
+        use futures_util::FutureExt;
+        for waiting_on_gate in [true, false] {
+            for owner_shutdown in [true, false] {
+                let (storage, rules, listener, _) = refresh_fixture().await;
+                let saved = storage.read(read_cache).unwrap();
+                let revision = rules.revision.load(Ordering::Acquire);
+                let generated_at = rules.status().status.generated_at;
+                let tasks = TaskOwner::new(1).unwrap();
+                let gate = if waiting_on_gate {
+                    Some(rules.gate.write().await)
+                } else {
+                    None
+                };
+                let (shutdown, worker) = start_refresh(&rules, &tasks);
+                let stream = if waiting_on_gate {
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        while tasks.status().is_idle() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    None
+                } else {
+                    Some(accept_refresh(&listener).await)
+                };
+                assert!(tasks.try_close_idle().is_err());
+                if owner_shutdown {
+                    tasks.shutdown(Duration::from_secs(1)).await.unwrap();
+                } else {
+                    shutdown.send_replace(true);
+                }
+                tokio::time::timeout(Duration::from_secs(1), worker)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                refresh_idle(&tasks).await;
+                drop(gate);
+                drop(stream);
+                assert!(rules.gate.try_write().is_ok());
+                assert_eq!(storage.read(read_cache).unwrap(), saved);
+                assert_eq!(rules.revision.load(Ordering::Acquire), revision);
+                assert_eq!(rules.status().status.generated_at, generated_at);
+                assert!(listener.accept().now_or_never().is_none());
+                tasks.try_close_idle().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn periodic_rules_failed_storage_does_not_publish_verified_provider_rules() {
+        let (storage, rules, listener, next) = refresh_fixture().await;
+        let saved = storage.read(read_cache).unwrap();
+        let generated_at = rules.status().status.generated_at;
+        storage
+            .transaction::<_, StorageError>(|db| {
+                db.execute_batch("CREATE TRIGGER refuse_refresh BEFORE INSERT ON performance_rules BEGIN SELECT RAISE(IGNORE); END;")?;
+                Ok(())
+            })
+            .unwrap();
+        let tasks = TaskOwner::new(1).unwrap();
+        let (shutdown, worker) = start_refresh(&rules, &tasks);
+        respond_rules(accept_refresh(&listener).await, &next).await;
+        refresh_idle(&tasks).await;
+        assert_eq!(storage.read(read_cache).unwrap(), saved);
+        assert_eq!(rules.status().status.generated_at, generated_at);
+        assert_eq!(rules.revision.load(Ordering::Acquire), 2);
+        shutdown.send_replace(true);
+        worker.await.unwrap();
+        tasks.try_close_idle().unwrap();
     }
 
     #[tokio::test]

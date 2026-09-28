@@ -225,6 +225,7 @@ pub struct ServerHandle {
     shutdown: watch::Sender<bool>,
     serving: Mutex<ServerTask>,
     telemetry_worker: Mutex<ServerTask>,
+    rules_worker: Mutex<ServerTask>,
     file_settlement: Mutex<Option<JoinHandle<Result<(), String>>>>,
     shutdown_settled: AtomicBool,
 }
@@ -298,8 +299,13 @@ impl ServerHandle {
             "The telemetry worker did not stop cleanly.",
         )
         .await;
+        let rules = Self::join_owned(
+            &self.rules_worker,
+            "The performance rules worker did not stop cleanly.",
+        )
+        .await;
         self.shutdown_settled.store(true, Ordering::Release);
-        http.and(telemetry)
+        http.and(telemetry).and(rules)
     }
 
     async fn settle_files(&self) -> Result<(), String> {
@@ -844,6 +850,15 @@ async fn start_profile_inner(
             Ok(())
         })
     };
+    let rules_worker = {
+        let rules = performance.rules().clone();
+        let tasks = tasks.clone();
+        let receiver = receiver.clone();
+        tokio::spawn(async move {
+            rules.run(tasks, receiver).await;
+            Ok(())
+        })
+    };
     let join = tokio::spawn(serve(listener, router, receiver));
     let server = Arc::new(ServerHandle {
         authority,
@@ -866,6 +881,10 @@ async fn start_profile_inner(
         }),
         telemetry_worker: Mutex::new(ServerTask {
             join: Some(telemetry_worker),
+            result: None,
+        }),
+        rules_worker: Mutex::new(ServerTask {
+            join: Some(rules_worker),
             result: None,
         }),
         shutdown_settled: AtomicBool::new(false),
@@ -1049,6 +1068,107 @@ fn admit_profile(requested: &Path) -> Result<AdmittedProfile, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn configured_rules_refreshes_on_startup_without_an_http_command() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temporary =
+            tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/rules", listener.local_addr().unwrap());
+        let mut manifest = axial_performance::builtin_manifest().unwrap();
+        manifest.generated_at = "2001-01-01T00:00:00Z".into();
+        let body = axial_performance::canonical_manifest_payload(&manifest).unwrap();
+        let key = SigningKey::from_bytes(&[23; 32]);
+        let signature = hex::encode(key.sign(&body).to_bytes());
+        let provider = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(15), listener.accept())
+                .await
+                .expect("startup never contacted configured rules provider")
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(count > 0 && request.len() + count <= 8192);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            assert!(request.starts_with(b"GET /rules HTTP/1.1\r\n"));
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nx-axial-rules-signature-ed25519: {signature}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            ).as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::configured_rules_startup_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(
+                "AXIAL_TEST_RULES_PROFILE",
+                temporary.path().join("replacement"),
+            )
+            .env(axial_performance::PERFORMANCE_RULES_URL_ENV, url)
+            .env(
+                axial_performance::PERFORMANCE_RULES_PUBLIC_KEY_ENV,
+                hex::encode(key.verifying_key().to_bytes()),
+            )
+            .env("AXIAL_PERFORMANCE_RULES_REFRESH_INTERVAL_SECONDS", "900")
+            .output()
+            .await
+            .unwrap();
+        let served = provider.await;
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        served.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "configured startup child isolates process-wide provider configuration"]
+    async fn configured_rules_startup_helper() {
+        let root = PathBuf::from(std::env::var_os("AXIAL_TEST_RULES_PROFILE").unwrap());
+        let services = start_in_profile(root, None).await.unwrap();
+        let refreshed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = services.performance.rules().status().status;
+                if status.rule_source == axial_performance::RuleSource::Remote
+                    && status.generated_at == "2001-01-01T00:00:00Z"
+                    && services.tasks.status().is_idle()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let idle_close = services.tasks.try_close_idle().is_ok();
+        let shutdown = services.server.shutdown().await;
+        let settled = services.server.is_shutdown_settled();
+        drop(services);
+        assert!(
+            refreshed,
+            "configured rules did not publish through actual startup"
+        );
+        assert!(
+            idle_close,
+            "sleeping rules worker blocked native idle closure"
+        );
+        shutdown.unwrap();
+        assert!(settled);
+    }
 
     #[test]
     fn profile_identity_persists_and_unknown_files_are_preserved() {

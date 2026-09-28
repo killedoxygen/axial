@@ -421,6 +421,314 @@ async fn continuation_service(
     (service, instance.id)
 }
 
+async fn persist_automatic_restart_fixture(
+    service: &BenchmarkService,
+    instance: &InstanceId,
+    count: usize,
+) -> Vec<BenchmarkSuiteDriverStatus> {
+    let mut accepted = Vec::new();
+    for index in 0..count {
+        let input = serde_json::from_value(serde_json::json!({
+            "instance_id": instance, "suite_id": format!("restart-suite-{index}"),
+            "suite_mode": "development", "interval_ms": 5_000
+        }))
+        .unwrap();
+        accepted.push(service.start_driver(input).await.unwrap());
+    }
+    // Preserve the actual accepted pre-tick rows as the restart fixture.
+    // Stop the fixture's retained tasks before restoring that crash boundary.
+    for driver in &accepted {
+        service.stop_driver(&driver.id).unwrap();
+    }
+    service
+        .tasks
+        .shutdown(std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    service
+        .storage
+        .transaction(|tx| {
+            assert_eq!(
+                tx.query_row("SELECT count(*) FROM launch_intents", [], |row| row
+                    .get::<_, usize>(0))?,
+                0
+            );
+            for driver in &accepted {
+                assert_eq!(
+                    tx.execute(
+                        "UPDATE benchmark_drivers SET payload=?1 WHERE driver_id=?2",
+                        params![serde_json::to_vec(driver).unwrap(), driver.id],
+                    )?,
+                    1
+                );
+            }
+            Ok::<_, BenchmarkError>(())
+        })
+        .unwrap();
+    accepted
+}
+
+#[tokio::test]
+async fn automatic_restart_schedules_owned_driver_once_without_historical_work() {
+    let root = fixture_directory();
+    let path = root.path().join("metadata.sqlite");
+    let storage = open_storage(&path);
+    let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+    let accepted = persist_automatic_restart_fixture(&service, &instance, 1).await;
+    let history = PreparedBenchmarkImport::prepare(vec![suite()], vec![driver()]).unwrap();
+    storage.transaction(|tx| history.insert_in(tx)).unwrap();
+    drop(service);
+    drop(storage);
+
+    let storage = open_storage(&path);
+    let reopened = self::service(root.path(), storage.clone());
+    assert_eq!(
+        reopened.driver(&accepted[0].id).unwrap().state,
+        "interrupted"
+    );
+    assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 1);
+    assert_eq!(reopened.driver(&accepted[0].id).unwrap().state, "running");
+    assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
+    assert_eq!(reopened.driver(&driver().id).unwrap(), driver());
+    assert!(reopened.sessions.sessions().is_empty());
+    reopened.stop_driver(&accepted[0].id).unwrap();
+    reopened
+        .tasks
+        .shutdown(std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    storage.transaction(|tx| history.verify_in(tx)).unwrap();
+    drop(reopened);
+    drop(storage);
+    let reopened = self::service(root.path(), open_storage(&path));
+    assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
+    assert_eq!(reopened.driver(&accepted[0].id).unwrap().state, "stopped");
+    assert!(reopened.tasks.status().is_idle());
+}
+
+#[tokio::test]
+async fn automatic_restart_limit_is_durable_across_two_reopens() {
+    let root = fixture_directory();
+    let path = root.path().join("metadata.sqlite");
+    let storage = open_storage(&path);
+    let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+    persist_automatic_restart_fixture(&service, &instance, 9).await;
+    drop(service);
+    drop(storage);
+
+    let storage = open_storage(&path);
+    let reopened = self::service(root.path(), storage.clone());
+    assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 8);
+    let statuses = reopened.drivers().unwrap();
+    let limited = statuses
+        .iter()
+        .find(|driver| driver.state == "interrupted")
+        .unwrap()
+        .clone();
+    for driver in statuses.iter().filter(|driver| driver.state == "running") {
+        reopened.stop_driver(&driver.id).unwrap();
+    }
+    reopened
+        .tasks
+        .shutdown(std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    drop(reopened);
+    drop(storage);
+    assert_eq!(
+        limited.error.as_deref(),
+        Some("driver ignored after restart resume limit")
+    );
+
+    for _ in 0..2 {
+        let reopened = self::service(root.path(), open_storage(&path));
+        assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
+        assert_eq!(reopened.driver(&limited.id).unwrap(), limited);
+        assert!(reopened.tasks.status().is_idle());
+        assert!(reopened.sessions.sessions().is_empty());
+        assert!(reopened.can_resume_driver(&limited.id).unwrap());
+    }
+}
+
+#[tokio::test]
+async fn automatic_restart_invalid_driver_does_not_suppress_unrelated_work() {
+    for case in [
+        "missing_suite",
+        "missing_request",
+        "malformed_request",
+        "wrong_binding",
+    ] {
+        let root = fixture_directory();
+        let path = root.path().join("metadata.sqlite");
+        let storage = open_storage(&path);
+        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+        let accepted = persist_automatic_restart_fixture(&service, &instance, 2).await;
+        let invalid = &accepted[1];
+        storage.transaction(|tx| {
+            match case {
+                "missing_suite" => {
+                    tx.execute("DELETE FROM benchmark_suites WHERE suite_id=?1", [&invalid.suite_id])?;
+                }
+                "missing_request" => {
+                    tx.execute("UPDATE benchmark_drivers SET request=NULL WHERE driver_id=?1", [&invalid.id])?;
+                }
+                "malformed_request" => {
+                    tx.execute("UPDATE benchmark_drivers SET request=?1 WHERE driver_id=?2", params![b"{".as_slice(), invalid.id])?;
+                }
+                "wrong_binding" => {
+                    let request = serde_json::json!({"instance_id":instance,"suite_id":accepted[0].suite_id,"suite_mode":"development"});
+                    tx.execute("UPDATE benchmark_drivers SET request=?1 WHERE driver_id=?2", params![serde_json::to_vec(&request).unwrap(), invalid.id])?;
+                }
+                _ => unreachable!(),
+            }
+            Ok::<_, BenchmarkError>(())
+        }).unwrap();
+        drop(service);
+        drop(storage);
+        let storage = open_storage(&path);
+        let reopened = self::service(root.path(), storage.clone());
+        assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 1, "{case}");
+        let failed = reopened.driver(&invalid.id).unwrap();
+        assert_eq!(failed.state, "interrupted");
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("driver automatic resume failed:")
+        );
+        assert_eq!(reopened.driver(&accepted[0].id).unwrap().state, "running");
+        reopened.stop_driver(&accepted[0].id).unwrap();
+        reopened
+            .tasks
+            .shutdown(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        drop(reopened);
+        drop(storage);
+        let reopened = self::service(root.path(), open_storage(&path));
+        assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0, "{case}");
+        assert_eq!(reopened.driver(&invalid.id).unwrap(), failed);
+        assert!(reopened.tasks.status().is_idle());
+        assert!(reopened.sessions.sessions().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn automatic_restart_checkpoint_failure_cannot_schedule_or_change_proof() {
+    for effect in ["ignore", "abort", "payload", "request", "source"] {
+        let root = fixture_directory();
+        let path = root.path().join("metadata.sqlite");
+        let storage = open_storage(&path);
+        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+        let accepted = persist_automatic_restart_fixture(&service, &instance, 9).await;
+        drop(service);
+        drop(storage);
+        let storage = open_storage(&path);
+        let reopened = self::service(root.path(), storage.clone());
+        let snapshot = || {
+            storage.read(|db| {
+                let mut query = db.prepare("SELECT driver_id,payload,request,source_driver_id FROM benchmark_drivers ORDER BY driver_id")?;
+                query.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Option<Vec<u8>>>(2)?, row.get::<_, Option<String>>(3)?)))?
+                    .collect::<Result<Vec<_>, _>>().map_err(BenchmarkError::from)
+            }).unwrap()
+        };
+        let before = snapshot();
+        let (when, body) = match effect {
+            "ignore" => ("BEFORE", "SELECT RAISE(IGNORE)"),
+            "abort" => ("BEFORE", "SELECT RAISE(ABORT,'checkpoint refused')"),
+            "payload" => (
+                "AFTER",
+                "UPDATE benchmark_drivers SET payload=OLD.payload WHERE driver_id=NEW.driver_id",
+            ),
+            "request" => (
+                "AFTER",
+                "UPDATE benchmark_drivers SET request=NULL WHERE driver_id=NEW.driver_id",
+            ),
+            "source" => (
+                "AFTER",
+                "UPDATE benchmark_drivers SET source_driver_id='unknown' WHERE driver_id=NEW.driver_id",
+            ),
+            _ => unreachable!(),
+        };
+        storage.transaction(|tx| {
+            tx.execute_batch(&format!("CREATE TRIGGER refuse_restart_checkpoint {when} UPDATE ON benchmark_drivers WHEN NEW.driver_id='{}' BEGIN {body}; END;", accepted[0].id))?;
+            Ok::<_, BenchmarkError>(())
+        }).unwrap();
+        assert!(reopened.resume_interrupted_drivers().is_err(), "{effect}");
+        assert_eq!(snapshot(), before, "{effect}");
+        assert!(reopened.tasks.status().is_idle());
+        assert!(reopened.sessions.sessions().is_empty());
+        storage
+            .read(|db| {
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM launch_intents", [], |row| row
+                        .get::<_, usize>(0))?,
+                    0
+                );
+                Ok::<_, BenchmarkError>(())
+            })
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn automatic_restart_global_failure_does_not_admit_later_drivers() {
+    for case in ["malformed_suite", "source_link", "busy", "task_owner"] {
+        let root = fixture_directory();
+        let path = root.path().join("metadata.sqlite");
+        let storage = open_storage(&path);
+        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+        let accepted = persist_automatic_restart_fixture(&service, &instance, 2).await;
+        drop(service);
+        drop(storage);
+        let storage = open_storage(&path);
+        let reopened = self::service(root.path(), storage.clone());
+        if case == "malformed_suite" {
+            storage
+                .transaction(|tx| {
+                    tx.execute(
+                        "UPDATE benchmark_suites SET payload=?1 WHERE suite_id=?2",
+                        params![b"{".as_slice(), accepted[1].suite_id],
+                    )?;
+                    Ok::<_, BenchmarkError>(())
+                })
+                .unwrap();
+        } else if case == "source_link" {
+            storage
+                .transaction(|tx| {
+                    tx.execute(
+                        "UPDATE benchmark_drivers SET source_driver_id=?1 WHERE driver_id=?2",
+                        params![accepted[0].id, accepted[1].id],
+                    )?;
+                    Ok::<_, BenchmarkError>(())
+                })
+                .unwrap();
+        } else if case == "task_owner" {
+            reopened
+                .tasks
+                .shutdown(std::time::Duration::from_secs(2))
+                .await
+                .unwrap();
+        }
+        let _gate = (case == "busy").then(|| reopened.admit_suite(&accepted[1].suite_id).unwrap());
+        let result = reopened.resume_interrupted_drivers();
+        if matches!(case, "busy" | "task_owner") {
+            assert!(matches!(result, Err(BenchmarkError::Busy)), "{case}");
+        } else {
+            assert!(matches!(result, Err(BenchmarkError::Unavailable)), "{case}");
+        }
+        let untouched = reopened.driver(&accepted[0].id).unwrap();
+        assert_eq!(untouched.state, "interrupted");
+        assert_eq!(
+            untouched.error.as_deref(),
+            Some("Driver interrupted by application restart")
+        );
+        assert!(reopened.tasks.status().is_idle());
+        assert!(reopened.sessions.sessions().is_empty());
+    }
+}
+
 fn continuation_history(
     instance: &InstanceId,
     mixed: bool,

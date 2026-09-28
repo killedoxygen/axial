@@ -24,6 +24,9 @@ mod import_tests;
 const MATRIX_SCHEMA: &str = "axial.launch.benchmark.matrix";
 const MATRIX_SCHEMA_VERSION: u32 = 1;
 const MAX_MATRIX_JSON_BYTES: usize = 12 * 1024;
+const MAX_RESTART_DRIVERS: usize = 8;
+const RESTART_INTERRUPTED_ERROR: &str = "Driver interrupted by application restart";
+const RESTART_LIMIT_ERROR: &str = "driver ignored after restart resume limit";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BenchmarkMatrix {
@@ -1245,6 +1248,25 @@ fn decode_driver(
     Ok(driver)
 }
 
+fn stored_resume_request(
+    connection: &Connection,
+    driver: &BenchmarkSuiteDriverStatus,
+    suite: &BenchmarkSuiteManifest,
+) -> Result<Option<BenchmarkLaunchRequest>, BenchmarkError> {
+    let bytes: Option<Vec<u8>> = connection.query_row(
+        "SELECT request FROM benchmark_drivers WHERE driver_id=?1",
+        [&driver.id],
+        |row| row.get(0),
+    )?;
+    Ok(bytes
+        .and_then(|bytes| serde_json::from_slice::<BenchmarkLaunchRequest>(&bytes).ok())
+        .filter(|input| {
+            input.instance_id.as_ref().map(InstanceId::as_str) == Some(suite.instance_id.as_str())
+                && input.suite_id.as_deref() == Some(suite.suite_id.as_str())
+                && input.suite_mode.as_deref() == Some(suite.mode.as_str())
+        }))
+}
+
 #[derive(Clone)]
 pub struct BenchmarkService {
     storage: Arc<MetadataStore>,
@@ -1281,7 +1303,7 @@ impl BenchmarkService {
         for mut driver in service.stored_drivers()? {
             if !driver.historical && matches!(driver.state.as_str(), "running" | "waiting") {
                 driver.state = "interrupted".into();
-                driver.error = Some("Driver interrupted by application restart".into());
+                driver.error = Some(RESTART_INTERRUPTED_ERROR.into());
                 service.save_driver(&driver)?;
             }
         }
@@ -1295,21 +1317,81 @@ impl BenchmarkService {
     /// Resume only user-created drivers which were running at this startup.
     /// A run with an uncertain launch mapping remains fenced by `tick`.
     pub fn resume_interrupted_drivers(&self) -> Result<usize, BenchmarkError> {
-        let mut resumed = 0;
-        for driver in self
+        let candidates = self
             .stored_drivers()?
             .into_iter()
             .filter(|driver| {
                 !driver.historical
                     && driver.state == "interrupted"
-                    && driver.error.as_deref() == Some("Driver interrupted by application restart")
+                    && driver.error.as_deref() == Some(RESTART_INTERRUPTED_ERROR)
             })
-            .take(8)
-        {
+            .collect::<Vec<_>>();
+        for driver in candidates.iter().skip(MAX_RESTART_DRIVERS) {
+            self.checkpoint_automatic_resume(driver, RESTART_LIMIT_ERROR)?;
+        }
+        let mut resumed = 0;
+        for driver in candidates.iter().take(MAX_RESTART_DRIVERS) {
+            let failure = self.storage.read(|connection| {
+                let Some(suite) = stored_suite(connection, &driver.suite_id)? else {
+                    return Ok(Some(
+                        "driver automatic resume failed: benchmark suite not found",
+                    ));
+                };
+                Ok::<_, BenchmarkError>(
+                    stored_resume_request(connection, driver, &suite)?
+                        .is_none()
+                        .then_some(
+                            "driver automatic resume failed: benchmark launch request is invalid",
+                        ),
+                )
+            })?;
+            if let Some(failure) = failure {
+                self.checkpoint_automatic_resume(driver, failure)?;
+                continue;
+            }
             self.resume_driver(&driver.id)?;
             resumed += 1;
         }
         Ok(resumed)
+    }
+
+    fn checkpoint_automatic_resume(
+        &self,
+        expected: &BenchmarkSuiteDriverStatus,
+        error: &str,
+    ) -> Result<(), BenchmarkError> {
+        let mut updated = expected.clone();
+        updated.error = Some(error.into());
+        updated.updated_at = now();
+        let payload = serde_json::to_vec(&updated).map_err(|_| BenchmarkError::Unavailable)?;
+        self.storage.transaction(|tx| {
+            if stored_driver(tx, &expected.id)?.as_ref() != Some(expected) {
+                return Err(BenchmarkError::Busy);
+            }
+            let (request, source): (Option<Vec<u8>>, Option<String>) = tx.query_row(
+                "SELECT request,source_driver_id FROM benchmark_drivers WHERE driver_id=?1",
+                [&expected.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if tx.execute(
+                "UPDATE benchmark_drivers SET payload=?1 WHERE driver_id=?2",
+                params![payload, expected.id],
+            )? != 1
+            {
+                return Err(BenchmarkError::Unavailable);
+            }
+            let saved: (Vec<u8>, Option<Vec<u8>>, Option<String>) = tx.query_row(
+                "SELECT payload,request,source_driver_id FROM benchmark_drivers WHERE driver_id=?1",
+                [&expected.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if saved != (payload, request, source)
+                || stored_driver(tx, &expected.id)?.as_ref() != Some(&updated)
+            {
+                return Err(BenchmarkError::Unavailable);
+            }
+            Ok(())
+        })
     }
 
     pub async fn qualification(
@@ -1822,21 +1904,9 @@ impl BenchmarkService {
             .suite(&driver.suite_id)?
             .ok_or(BenchmarkError::NotFound)?;
         require_mutable(suite.historical)?;
-        let input: BenchmarkLaunchRequest = self.storage.read(|connection| {
-            let bytes: Option<Vec<u8>> = connection.query_row(
-                "SELECT request FROM benchmark_drivers WHERE driver_id=?1",
-                [id],
-                |row| row.get(0),
-            )?;
-            serde_json::from_slice(&bytes.ok_or(BenchmarkError::Unavailable)?)
-                .map_err(|_| BenchmarkError::Unavailable)
+        let input = self.storage.read(|connection| {
+            stored_resume_request(connection, &driver, &suite)?.ok_or(BenchmarkError::Unavailable)
         })?;
-        if input.instance_id.as_ref().map(InstanceId::as_str) != Some(suite.instance_id.as_str())
-            || input.suite_id.as_deref() != Some(suite.suite_id.as_str())
-            || input.suite_mode.as_deref() != Some(suite.mode.as_str())
-        {
-            return Err(BenchmarkError::Unavailable);
-        }
         driver.state = "running".into();
         driver.error = None;
         self.save_driver(&driver)?;
