@@ -10,6 +10,7 @@ use axial_app::{
             SkinImportResponse, SkinImportStatus,
         },
     },
+    install::history::HistoryPage,
     instances::{create::InstanceService, model::InstanceError},
     performance::rules::PerformanceRules,
     settings::{SettingsError, SettingsStore},
@@ -19,7 +20,10 @@ use axial_app::{
 };
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
+    extract::{
+        DefaultBodyLimit, Path, Query, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
     http::StatusCode,
     routing::{get, post},
 };
@@ -67,6 +71,10 @@ pub fn router(
         )
         .route("/api/v1/import/metadata", post(import_metadata))
         .route("/api/v1/import/metadata/{id}", get(metadata_status))
+        .route(
+            "/api/v1/import/metadata/{id}/install-history",
+            get(metadata_install_history),
+        )
         .route("/api/v1/import/skins", post(import_skins))
         .route("/api/v1/import/skins/{id}", get(skin_status))
         .route("/api/v1/import/rules", post(import_rules))
@@ -150,6 +158,27 @@ async fn metadata_status(
         .map_err(|_| public_error(ImportError::Unavailable))?
         .map(Json)
         .map_err(metadata_error)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataHistoryQuery {
+    after: Option<String>,
+}
+
+async fn metadata_install_history(
+    State(services): State<Services>,
+    Path(id): Path<String>,
+    query: Result<Query<MetadataHistoryQuery>, QueryRejection>,
+) -> Result<Json<HistoryPage>, ApiError> {
+    let Query(query) = query.map_err(|_| public_error(ImportError::InvalidData))?;
+    tokio::task::spawn_blocking(move || {
+        axial_app::import::metadata_install_history(&services.settings, &id, query.after.as_deref())
+    })
+    .await
+    .map_err(|_| public_error(ImportError::Unavailable))?
+    .map(Json)
+    .map_err(metadata_error)
 }
 
 async fn import_metadata(
@@ -455,9 +484,11 @@ pub(super) mod tests {
                     axial_app::instances::create::MIGRATION,
                     axial_app::instances::create::DUPLICATE_WITNESS_MIGRATION,
                     axial_app::instances::import::MIGRATION,
+                    axial_app::install::history::MIGRATION,
                     axial_app::settings::SETTINGS_MIGRATION,
                     axial_app::import::METADATA_IMPORT_MIGRATION,
                     axial_app::import::METADATA_IMPORT_IDENTITIES_MIGRATION,
+                    axial_app::import::METADATA_IMPORT_HISTORY_MIGRATION,
                     axial_app::performance::rules::MIGRATION,
                     axial_app::performance::rules::IMPORT_MIGRATION,
                 ])
@@ -1792,6 +1823,380 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn composed_metadata_import_preserves_global_install_history_without_instances() {
+        let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let baseline = root.path().join("baseline");
+        fs::create_dir(&baseline).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../acceptance/fixtures/profiles/offline-vanilla");
+        for leaf in ["config.json", "accounts.json"] {
+            fs::copy(fixture.join(leaf), baseline.join(leaf)).unwrap();
+        }
+        fs::write(
+            baseline.join("instances.json"),
+            serde_json::to_vec(&json!({
+                "schema_version":3,"last_instance_id":"","pending_deletions":[],"instances":[]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let evidence = concat!(
+            "managed-install-v1.d04GQwjfbBL-0D8y3lfjdZK09vfV7jEm-Ej_MLnnOLY.",
+            "AQEBAQEBAQEBAQEBAQEBAQ.AgICAgICAgICAgICAgICAg.",
+            "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM.",
+            "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+        );
+        assert!(
+            axial_minecraft::ManagedInstallPublicationEvidenceId::parse(evidence)
+                .unwrap()
+                .matches_version_id("1.20.1")
+        );
+        let contract = format!("managed-install-activation-v1.{}BQU", "BQUF".repeat(10));
+        axial_minecraft::ManagedInstallActivationContractId::parse(&contract).unwrap();
+        let target = |kind: &str, id: &str| {
+            json!({
+                "system":"Application","kind":kind,"id":id,"ownership":"LauncherManaged"
+            })
+        };
+        let step = |id: &str, phase: &str, result: &str, facts: Value| {
+            json!({
+                "step_id":id,"phase":phase,"result":result,"changed_target":null,
+                "generated_facts":facts,"rollback":"NotApplicable","guardian_fact_ids":[],"metrics":null
+            })
+        };
+        let mut committed = step(
+            "install_publication_committed",
+            "Installing",
+            "Completed",
+            json!([
+                "install_publication:committed",
+                "install_publication_version_id:1.20.1",
+                format!("install_publication_evidence:{evidence}"),
+                format!("install_activation_contract:{contract}")
+            ]),
+        );
+        committed["changed_target"] = target("Version", "1.20.1");
+        let operation_id = "op-00000000-0000-4000-8000-000000000001";
+        let succeeded = json!({
+            "journal_id":format!("journal-{operation_id}"),"operation_id":operation_id,"sequence":9007199254740993_u64,
+            "parent_operation_id":null,"command":"InstallVersion","intent":{"kind":"generic"},
+            "status":"Succeeded","owner":"Application","ownership":"LauncherManaged",
+            "targets":[target("Session","install-00000000000000000000000000000001"),target("Version","1.20.1")],
+            "planned_steps":[step("install_version","Planning","Planned",json!(["install_kind:vanilla","install_version_id:1.20.1"]))],
+            "completed_steps":[step("install_progress_recovering","Repairing","Completed",json!(["install_phase:recovering"])),
+                committed,step("install_progress_done","Completed","Completed",json!(["install_phase:done","install_done:true"]))],
+            "failure_point":null,"rollback":"NotApplicable","guardian_diagnosis_ids":[],"outcome":"Succeeded",
+            "reconciliation_attempt":null,"reconciliation_terminal":null,"persisted_state_repair_attempt":null,
+            "persisted_state_repair_terminal":null,"guardian_install_terminal":null
+        });
+        let failed_id = "op-00000000-0000-4000-8000-000000000002";
+        let mut failed = succeeded.clone();
+        failed["journal_id"] = json!(format!("journal-{failed_id}"));
+        failed["operation_id"] = json!(failed_id);
+        failed["sequence"] = json!(9007199254740994_u64);
+        failed["targets"][0] = target("Session", "install-00000000000000000000000000000002");
+        failed["status"] = json!("Failed");
+        failed["outcome"] = json!("Failed");
+        failed["failure_point"] = json!("install_progress_error");
+        let mut rolled_back = committed.clone();
+        rolled_back["step_id"] = json!("install_publication_rolled_back");
+        rolled_back["phase"] = json!("RollingBack");
+        rolled_back["rollback"] = json!("Applied");
+        rolled_back["generated_facts"][0] = json!("install_publication:rolled_back");
+        rolled_back["generated_facts"].as_array_mut().unwrap().pop();
+        failed["completed_steps"] = json!([
+            step(
+                "install_progress_recovering",
+                "Repairing",
+                "Completed",
+                json!(["install_phase:recovering"])
+            ),
+            rolled_back,
+            step(
+                "install_progress_error",
+                "Failed",
+                "Failed",
+                json!([
+                    "install_phase:error",
+                    "install_done:true",
+                    "install_error:true"
+                ])
+            )
+        ]);
+        fs::create_dir(baseline.join("state")).unwrap();
+        fs::write(baseline.join("state/operation-journals.json"), serde_json::to_vec(&json!({
+            "schema":"axial.state.operation_journals.v10","next_sequence":9007199254740995_u64,"entries":[succeeded,failed]
+        })).unwrap()).unwrap();
+        let source_files = [
+            "config.json",
+            "accounts.json",
+            "instances.json",
+            "state/operation-journals.json",
+        ];
+        let source_snapshot = || {
+            source_files.map(|path| {
+                (
+                    fs::read(baseline.join(path)).unwrap(),
+                    fs::metadata(baseline.join(path))
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                )
+            })
+        };
+        let unchanged = source_snapshot();
+        let profile = root.path().join("replacement");
+        let services = crate::start_in_profile(profile.clone(), None)
+            .await
+            .unwrap();
+        let source = ReadOnlySource::from_native_selection(
+            services.library.admit_application_root().unwrap(),
+            &baseline,
+        )
+        .unwrap();
+        let preview = services
+            .imports
+            .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
+            .unwrap();
+        assert!(preview.instances.is_empty());
+        assert!(preview.metadata_import_available);
+        let input = json!({"metadata_import_id":preview.metadata_import_id,"fingerprint":preview.fingerprint,
+            "expected_settings_revision":services.settings.current().unwrap().revision,
+            "expected_account_selection_revision":services.accounts.selection_revision().unwrap()});
+        let status_path = format!("/api/v1/import/metadata/{}", preview.metadata_import_id);
+        let history_path = format!("{status_path}/install-history");
+        let bootstrap = services.server.bootstrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let request = |method, path: &str| {
+            client
+                .request(method, format!("{}{path}", bootstrap.base_url))
+                .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
+        };
+        assert_eq!(
+            client
+                .get(format!("{}{history_path}", bootstrap.base_url))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(reqwest::Method::GET, &history_path)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let consent = services.telemetry.consent_change_owned().await;
+        let mut tasks = services.tasks.subscribe();
+        let dispatch = request(reqwest::Method::POST, "/api/v1/import/metadata").json(&input);
+        let waiter = tokio::spawn(async move { dispatch.send().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while services.tasks.status().running.is_empty() {
+                tasks.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        services.imports.forget().unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        drop(consent);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !services.tasks.status().is_idle() {
+                tasks.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let recorded: Value = request(reqwest::Method::GET, &status_path)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(recorded["receipt"]["imported_offline_account_count"], 2);
+        assert_eq!(services.accounts.snapshot().unwrap().accounts.len(), 2);
+        assert_eq!(
+            services.settings.current().unwrap().username,
+            "FixturePlayer"
+        );
+        assert_eq!(recorded["cutover_available"], false);
+        assert_eq!(recorded["receipt"]["global_install_history_count"], 2);
+        for suffix in [
+            "?after=",
+            "?after=private-predecessor-secret",
+            "?after=a&after=b",
+            "?source_path=private-predecessor-secret",
+        ] {
+            let response = request(reqwest::Method::GET, &format!("{history_path}{suffix}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let error: Value = response.json().await.unwrap();
+            assert!(!error.to_string().contains("predecessor-secret"));
+        }
+        assert_eq!(
+            request(reqwest::Method::POST, &history_path)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        let page: Value = request(reqwest::Method::GET, &history_path)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let records = page["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(page["next_after"].is_null());
+        for (operation, outcome, sequence) in [
+            (operation_id, "Succeeded", "9007199254740993"),
+            (failed_id, "Failed", "9007199254740994"),
+        ] {
+            let row = records
+                .iter()
+                .find(|row| row["operation_id"] == operation)
+                .unwrap();
+            assert_eq!(row["historical"], true);
+            assert!(row["instance_id"].is_null());
+            assert_eq!(row["command"], "InstallVersion");
+            assert_eq!(row["outcome"], outcome);
+            assert_eq!(row["sequence"], sequence);
+            if outcome == "Failed" {
+                assert_eq!(row["failure_point"], "install_progress_error");
+                assert_eq!(row["completed_steps"][1]["rollback"], "Applied");
+                assert_eq!(
+                    row["completed_steps"][1]["generated_facts"],
+                    rolled_back["generated_facts"]
+                );
+            } else {
+                assert!(row.get("failure_point").is_none());
+                assert_eq!(
+                    row["completed_steps"][1]["generated_facts"],
+                    committed["generated_facts"]
+                );
+            }
+            assert!(row.get("request").is_none());
+            assert!(row.get("actions").is_none());
+        }
+        let last_id = records.last().unwrap()["id"].as_str().unwrap();
+        let empty: Value = request(
+            reqwest::Method::GET,
+            &format!("{history_path}?after={last_id}"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(empty, json!({"records":[],"next_after":null}));
+        let current = services.settings.current().unwrap();
+        let changed: Value = request(reqwest::Method::PUT, "/api/v1/config")
+            .json(&json!({"expected_revision":current.revision,"theme":"birch"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        services
+            .imports
+            .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
+            .unwrap();
+        let repeated: Value = request(reqwest::Method::POST, "/api/v1/import/metadata")
+            .json(&input)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(repeated["already_imported"], true);
+        assert_eq!(repeated["receipt"], recorded["receipt"]);
+        assert_eq!(
+            services.settings.current().unwrap().revision,
+            changed["revision"].as_u64().unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(services.settings.current().unwrap()).unwrap()["theme"],
+            "birch"
+        );
+        services.imports.forget().unwrap();
+        let assert_inert = |services: &crate::DesktopServices| {
+            assert!(services.instances.registry().list().unwrap().is_empty());
+            assert!(services.instances.pending().unwrap().is_empty());
+            assert!(services.installs.snapshot().active.is_none());
+            assert!(services.installs.snapshot().items.is_empty());
+            assert!(services.sessions.snapshots().is_empty());
+            services.settings.metadata().read::<_, StorageError>(|db| {
+                let counts: (u64,u64,u64) = db.query_row(
+                    "SELECT (SELECT COUNT(*) FROM install_queue),(SELECT COUNT(*) FROM installed_versions),(SELECT COUNT(*) FROM launch_intents)",
+                    [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+                assert_eq!(counts, (0,0,0));
+                Ok(())
+            }).unwrap();
+        };
+        assert_inert(&services);
+        assert_eq!(source_snapshot(), unchanged);
+        drop(source);
+        services.server.shutdown().await.unwrap();
+        services.server.wait().await.unwrap();
+        drop(services);
+        let reopened = crate::start_in_profile(profile, None).await.unwrap();
+        let reopened_bootstrap = reopened.server.bootstrap();
+        for (path, expected) in [(&status_path, &recorded), (&history_path, &page)] {
+            let actual: Value = client
+                .get(format!("{}{path}", reopened_bootstrap.base_url))
+                .header(
+                    crate::transport::CAPABILITY_HEADER,
+                    &reopened_bootstrap.capability,
+                )
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(&actual, expected);
+        }
+        assert_eq!(
+            serde_json::to_value(reopened.settings.current().unwrap()).unwrap()["theme"],
+            "birch"
+        );
+        assert_inert(&reopened);
+        assert_eq!(source_snapshot(), unchanged);
+        reopened.server.shutdown().await.unwrap();
+        reopened.server.wait().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn metadata_import_is_atomic_repeatable_and_has_a_read_only_receipt() {
         let fixture = Fixture::new();
         let request = fixture.metadata_request();
@@ -1812,6 +2217,7 @@ pub(super) mod tests {
         assert_eq!(response["already_imported"], false);
         assert_eq!(response["cutover_available"], false);
         assert_eq!(response["receipt"]["imported_offline_account_count"], 2);
+        assert_eq!(response["receipt"]["global_install_history_count"], 0);
         assert_eq!(
             response["receipt"]["metadata_import_id"],
             request["metadata_import_id"]
@@ -1873,11 +2279,66 @@ pub(super) mod tests {
             recorded,
             json!({"receipt":response["receipt"],"cutover_available":false})
         );
+        let (status, history) = fixture
+            .request(
+                Method::GET,
+                &format!("{status_path}/install-history"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{history}");
+        assert_eq!(history, json!({"records":[],"next_after":null}));
         assert_eq!(
             fs::read(fixture.baseline.join("accounts.json")).unwrap(),
             before_source
         );
         assert!(!fixture.baseline.join(".axial-root.lease").exists());
+    }
+
+    #[tokio::test]
+    async fn metadata_install_history_does_not_fabricate_an_old_receipts_completion() {
+        let fixture = Fixture::new();
+        let input = fixture.metadata_request();
+        let status_path = format!(
+            "/api/v1/import/metadata/{}",
+            input["metadata_import_id"].as_str().unwrap()
+        );
+        let (status, imported) = fixture
+            .request(Method::POST, "/api/v1/import/metadata", input)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{imported}");
+        assert_eq!(imported["receipt"]["global_install_history_count"], 0);
+        fixture
+            .services
+            .settings
+            .metadata()
+            .transaction::<_, StorageError>(|db| {
+                db.execute(
+                    "UPDATE profile_metadata_imports SET global_install_history_proof = NULL",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        fixture.services.previews.forget().unwrap();
+        let (status, recorded) = fixture
+            .request(Method::GET, &status_path, Value::Null)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{recorded}");
+        assert!(
+            recorded["receipt"]
+                .get("global_install_history_count")
+                .is_none()
+        );
+        let (status, history) = fixture
+            .request(
+                Method::GET,
+                &format!("{status_path}/install-history"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{history}");
+        assert!(history.get("records").is_none());
     }
 
     #[tokio::test]

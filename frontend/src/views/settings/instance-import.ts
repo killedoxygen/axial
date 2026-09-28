@@ -154,10 +154,15 @@ function metadataReceipt(value: unknown, expectedId: string): MetadataImportRece
   const microsoftCount = count(record.imported_microsoft_account_count, 'Imported Microsoft account count');
   const total = importedCount + microsoftCount;
   const settingsRevision = count(record.settings_revision, 'Imported settings revision');
+  const historyCount =
+    record.global_install_history_count == null
+      ? undefined
+      : count(record.global_install_history_count, 'Imported global install history count');
   if (
     total === 0 ||
     total > 256 ||
     settingsRevision === 0 ||
+    (historyCount !== undefined && historyCount > 128) ||
     (record.account_id_mapping === null && microsoftCount > 0)
   ) {
     throw new Error('The metadata import receipt was invalid.');
@@ -184,6 +189,7 @@ function metadataReceipt(value: unknown, expectedId: string): MetadataImportRece
     account_id_mapping: mapping,
     settings_revision: settingsRevision,
     account_selection_revision: count(record.account_selection_revision, 'Imported account selection revision'),
+    ...(historyCount === undefined ? {} : { global_install_history_count: historyCount }),
   };
 }
 

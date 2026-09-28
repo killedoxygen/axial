@@ -20,6 +20,7 @@ use ts_rs::TS;
 const MAX_RECORD_BYTES: usize = 256 * 1024;
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BATCH_RECORDS: usize = 128;
+pub(crate) const MAX_COMPLETION_PROOF_BYTES: usize = 16 * 1024;
 const PAGE_SIZE: usize = 32;
 const ID_PREFIX: &str = "legacy-install-";
 
@@ -329,6 +330,14 @@ impl PreparedOperation {
 
 pub(crate) struct PreparedImport(Vec<BoundOperation>);
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompletionProof {
+    source_id: String,
+    ids: Vec<String>,
+    digest: String,
+}
+
 struct BoundOperation {
     operation: PreparedOperation,
     instance_id: Option<InstanceId>,
@@ -395,30 +404,59 @@ impl PreparedImport {
         }
         let mut bound = Vec::with_capacity(records.len());
         for operation in records {
-            let value = &operation.0;
             let instance_id = match operation.legacy_instance_id() {
                 None => None,
                 Some(id) if id == legacy_id => Some(instance.clone()),
                 Some(_) => return Err(HistoryError::Invalid),
             };
-            let bytes = serde_json::to_vec(&StoredRef {
-                schema: 1,
-                id: &value.id,
-                source_id: &value.source_id,
-                instance_id: instance_id.as_ref(),
-                source: &value.source,
-            })
-            .map_err(|_| HistoryError::Invalid)?;
-            if bytes.len() != value.stored_bytes || bytes.len() > MAX_RECORD_BYTES {
-                return Err(HistoryError::Invalid);
-            }
-            bound.push(BoundOperation {
-                operation,
-                instance_id,
-                bytes,
-            });
+            bound.push(BoundOperation::new(operation, instance_id)?);
         }
         Ok(Self(bound))
+    }
+
+    pub(crate) fn bind_global(records: Vec<PreparedOperation>) -> Result<Self, HistoryError> {
+        Self::validate(&records)?;
+        records
+            .into_iter()
+            .map(|operation| {
+                if operation.legacy_instance_id().is_some() {
+                    return Err(HistoryError::Invalid);
+                }
+                BoundOperation::new(operation, None)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
+    }
+
+    pub(crate) fn completion_proof(
+        &self,
+        source_id: &str,
+    ) -> Result<CompletionProof, HistoryError> {
+        if !lower_hex(source_id, 64)
+            || self.0.iter().any(|record| {
+                record.operation.0.source_id != source_id
+                    || record.instance_id.is_some()
+                    || record.operation.legacy_instance_id().is_some()
+            })
+        {
+            return Err(HistoryError::Invalid);
+        }
+        let mut records: Vec<_> = self.0.iter().collect();
+        records.sort_unstable_by_key(|record| &record.operation.0.id);
+        let ids: Vec<_> = records
+            .iter()
+            .map(|record| record.operation.0.id.clone())
+            .collect();
+        let mut digest = completion_hash(source_id, &ids);
+        for record in records {
+            digest.update((record.bytes.len() as u64).to_be_bytes());
+            digest.update(&record.bytes);
+        }
+        Ok(CompletionProof {
+            source_id: source_id.to_owned(),
+            ids,
+            digest: hex::encode(digest.finalize()),
+        })
     }
 
     pub(crate) fn insert_in(&self, tx: &Transaction<'_>) -> Result<(), HistoryError> {
@@ -460,6 +498,29 @@ impl PreparedImport {
 }
 
 impl BoundOperation {
+    fn new(
+        operation: PreparedOperation,
+        instance_id: Option<InstanceId>,
+    ) -> Result<Self, HistoryError> {
+        let value = &operation.0;
+        let bytes = serde_json::to_vec(&StoredRef {
+            schema: 1,
+            id: &value.id,
+            source_id: &value.source_id,
+            instance_id: instance_id.as_ref(),
+            source: &value.source,
+        })
+        .map_err(|_| HistoryError::Invalid)?;
+        if bytes.len() != value.stored_bytes || bytes.len() > MAX_RECORD_BYTES {
+            return Err(HistoryError::Invalid);
+        }
+        Ok(Self {
+            operation,
+            instance_id,
+            bytes,
+        })
+    }
+
     fn matches(&self, saved: &ReadRecord) -> bool {
         self.operation.0.id == saved.operation.0.id
             && self.operation.0.source_id == saved.operation.0.source_id
@@ -469,16 +530,24 @@ impl BoundOperation {
 }
 
 fn stored(db: &Connection, id: &str) -> Result<Option<ReadRecord>, HistoryError> {
-    let row: Option<(String, Option<String>, Option<Vec<u8>>)> = db
+    stored_row(db, id, MAX_RECORD_BYTES)?
+        .map(|(source, instance, bytes)| decode_stored(id, &source, instance.as_deref(), bytes))
+        .transpose()
+}
+
+fn stored_row(
+    db: &Connection,
+    id: &str,
+    max_bytes: usize,
+) -> Result<Option<(String, Option<String>, Option<Vec<u8>>)>, HistoryError> {
+    Ok(db
         .query_row(
-            "SELECT source_id,instance_id,CASE WHEN length(payload)<=262144 THEN payload END
+            "SELECT source_id,instance_id,CASE WHEN length(payload)<=?2 THEN payload END
          FROM install_history WHERE id=?1",
-            [id],
+            params![id, max_bytes],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .optional()?;
-    row.map(|(source, instance, bytes)| decode_stored(id, &source, instance.as_deref(), bytes))
-        .transpose()
+        .optional()?)
 }
 
 fn decode_stored(
@@ -507,6 +576,97 @@ fn decode_stored(
         operation,
         instance_id: saved.instance_id,
     })
+}
+
+impl CompletionProof {
+    pub(crate) fn count(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub(crate) fn verify_in(&self, db: &Connection, source_id: &str) -> Result<(), HistoryError> {
+        self.read_in(db, source_id, None).map(|_| ())
+    }
+
+    fn read_in(
+        &self,
+        db: &Connection,
+        source_id: &str,
+        after: Option<&str>,
+    ) -> Result<HistoryPage, HistoryError> {
+        validate_cursor(after)?;
+        if !lower_hex(source_id, 64)
+            || self.source_id != source_id
+            || !lower_hex(&self.digest, 64)
+            || self.ids.len() > MAX_BATCH_RECORDS
+            || self.ids.iter().any(|id| !valid_history_id(id))
+            || self.ids.windows(2).any(|ids| ids[0] >= ids[1])
+        {
+            return Err(HistoryError::Conflict);
+        }
+        let mut digest = completion_hash(source_id, &self.ids);
+        let mut total = 0usize;
+        let mut sequences = BTreeSet::new();
+        let mut records = Vec::new();
+        let mut has_more = false;
+        for id in &self.ids {
+            // Cap the next payload before it crosses the SQLite boundary, not
+            // after allocating an entire snapshot of individually bounded rows.
+            let (source, instance, bytes) =
+                stored_row(db, id, MAX_RECORD_BYTES.min(MAX_BATCH_BYTES - total))?
+                    .ok_or(HistoryError::Conflict)?;
+            let bytes = bytes.ok_or(HistoryError::Conflict)?;
+            total += bytes.len();
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(&bytes);
+            let saved = decode_stored(id, &source, instance.as_deref(), Some(bytes))?;
+            if source != source_id
+                || saved.instance_id.is_some()
+                || saved.operation.legacy_instance_id().is_some()
+                || !sequences.insert(saved.operation.0.source.sequence)
+            {
+                return Err(HistoryError::Conflict);
+            }
+            if id.as_str() > after.unwrap_or("") {
+                if records.len() < PAGE_SIZE {
+                    records.push(saved.project());
+                } else {
+                    has_more = true;
+                }
+            }
+        }
+        if hex::encode(digest.finalize()) != self.digest {
+            return Err(HistoryError::Conflict);
+        }
+        Ok(HistoryPage {
+            next_after: has_more.then(|| records.last().expect("full history page").id.clone()),
+            records,
+        })
+    }
+}
+
+fn completion_hash(source_id: &str, ids: &[String]) -> Sha256 {
+    let mut hash = Sha256::new();
+    hash.update(b"axial.legacy.install.completion.v1\0");
+    hash.update((source_id.len() as u64).to_be_bytes());
+    hash.update(source_id.as_bytes());
+    hash.update((ids.len() as u64).to_be_bytes());
+    for id in ids {
+        hash.update((id.len() as u64).to_be_bytes());
+        hash.update(id.as_bytes());
+    }
+    hash
+}
+
+/// The metadata owner resolves this exact snapshot from a completed receipt in
+/// the same metadata read. Each page verifies at most 128 rows / 8 MiB;
+/// unrelated records imported later neither join nor invalidate the snapshot.
+pub(crate) fn read_global_in(
+    db: &Connection,
+    source_id: &str,
+    proof: &CompletionProof,
+    after: Option<&str>,
+) -> Result<HistoryPage, HistoryError> {
+    proof.read_in(db, source_id, after)
 }
 
 /// The instance owner supplies its completed import mapping in this same read
@@ -1459,6 +1619,20 @@ mod tests {
         records
             .into_iter()
             .map(|record| PreparedOperation::prepare(SOURCE, record).unwrap())
+            .collect()
+    }
+
+    fn global_records(count: u64) -> Vec<PreparedOperation> {
+        let original = source_records().remove(0);
+        (1..=count)
+            .map(|number| {
+                let mut source = original.clone();
+                source.operation_id = format!("op-10000000-0000-4000-8000-{number:012x}");
+                source.journal_id = format!("journal-{}", source.operation_id);
+                source.sequence = number;
+                source.targets[0].id = format!("install-{number:032x}");
+                PreparedOperation::prepare(SOURCE, source).unwrap()
+            })
             .collect()
     }
 
@@ -2537,6 +2711,257 @@ mod tests {
                 ),
                 "{mutation}"
             );
+        }
+    }
+
+    #[test]
+    fn global_history_receipt_pages_preserve_the_snapshot_across_appends_and_reopen() {
+        let root =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let path = root.path().join("history.sqlite");
+        let store = MetadataStore::open(&path).unwrap();
+        store.migrate(&[MIGRATION]).unwrap();
+        let batch = PreparedImport::bind_global(global_records(35)).unwrap();
+        let proof = batch.completion_proof(SOURCE).unwrap();
+        assert_eq!(proof.count(), 35);
+        let encoded = serde_json::to_vec(&proof).unwrap();
+        assert!(encoded.len() <= MAX_COMPLETION_PROOF_BYTES);
+        store.transaction(|tx| batch.insert_in(tx)).unwrap();
+        store.transaction(|tx| batch.insert_in(tx)).unwrap();
+        let first = store
+            .read(|db| read_global_in(db, SOURCE, &proof, None))
+            .unwrap();
+        assert_eq!(first.records.len(), PAGE_SIZE);
+        assert!(
+            first
+                .records
+                .iter()
+                .all(|record| record.instance_id.is_none())
+        );
+
+        let content = prepare(source_records()).remove(2);
+        let legacy = content.legacy_instance_id().unwrap().to_owned();
+        let later = PreparedImport::bind(
+            vec![global_records(36).pop().unwrap(), content],
+            &legacy,
+            &InstanceId::new(),
+        )
+        .unwrap();
+        store.transaction(|tx| later.insert_in(tx)).unwrap();
+        let other = PreparedImport::bind_global(vec![
+            PreparedOperation::prepare(OTHER_SOURCE, source_records().remove(0)).unwrap(),
+        ])
+        .unwrap();
+        store.transaction(|tx| other.insert_in(tx)).unwrap();
+        assert_eq!(count(&store), 38);
+        drop(store);
+
+        let store = MetadataStore::open(&path).unwrap();
+        store.migrate(&[MIGRATION]).unwrap();
+        let proof: CompletionProof = serde_json::from_slice(&encoded).unwrap();
+        store.read(|db| proof.verify_in(db, SOURCE)).unwrap();
+        assert_eq!(
+            first,
+            store
+                .read(|db| read_global_in(db, SOURCE, &proof, None))
+                .unwrap()
+        );
+        let last = store
+            .read(|db| read_global_in(db, SOURCE, &proof, first.next_after.as_deref()))
+            .unwrap();
+        assert_eq!(last.records.len(), 3);
+        assert!(last.next_after.is_none());
+        let ids: Vec<_> = first
+            .records
+            .iter()
+            .chain(&last.records)
+            .map(|row| row.id.clone())
+            .collect();
+        assert_eq!(ids, proof.ids);
+        assert!(
+            store
+                .read(|db| read_global_in(db, SOURCE, &proof, Some("../invalid")))
+                .is_err()
+        );
+        assert!(
+            store
+                .read(|db| read_global_in(db, OTHER_SOURCE, &proof, None))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn global_history_binding_and_completion_proof_are_strict_and_empty_is_source_bound() {
+        let (store, instance, legacy, records) = fixture();
+        assert!(PreparedImport::bind_global(records.clone()).is_err());
+        assert!(
+            PreparedImport::bind(records, &legacy, &instance)
+                .unwrap()
+                .completion_proof(SOURCE)
+                .is_err()
+        );
+        assert!(PreparedImport::bind_global(global_records(129)).is_err());
+        let records = global_records(2);
+        assert!(PreparedImport::bind_global(vec![records[0].clone(); 2]).is_err());
+        let mut other = source_records().remove(0);
+        other.sequence = 2;
+        assert!(
+            PreparedImport::bind_global(vec![
+                records[0].clone(),
+                PreparedOperation::prepare(OTHER_SOURCE, other).unwrap()
+            ])
+            .is_err()
+        );
+
+        let batch = PreparedImport::bind_global(records).unwrap();
+        let proof = batch.completion_proof(SOURCE).unwrap();
+        assert!(batch.completion_proof(OTHER_SOURCE).is_err());
+        store.transaction(|tx| batch.insert_in(tx)).unwrap();
+        let empty = PreparedImport::bind_global(vec![]).unwrap();
+        let empty_proof = empty.completion_proof(SOURCE).unwrap();
+        assert_eq!(empty_proof.count(), 0);
+        assert_ne!(
+            empty_proof.digest,
+            empty.completion_proof(OTHER_SOURCE).unwrap().digest
+        );
+        let page = store
+            .read(|db| read_global_in(db, SOURCE, &empty_proof, None))
+            .unwrap();
+        assert!(page.records.is_empty());
+        assert!(page.next_after.is_none());
+        assert_eq!(count(&store), 2);
+
+        for mutation in ["order", "duplicate", "id", "digest", "source", "count"] {
+            let mut changed = proof.clone();
+            match mutation {
+                "order" => changed.ids.reverse(),
+                "duplicate" => changed.ids[1] = changed.ids[0].clone(),
+                "id" => changed.ids[0] = "unknown".into(),
+                "digest" => changed.digest = "0".repeat(64),
+                "source" => changed.source_id = OTHER_SOURCE.into(),
+                "count" => {
+                    changed.ids = global_records(129)
+                        .iter()
+                        .map(|record| record.0.id.clone())
+                        .collect();
+                    changed.ids.sort();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    store.read(|db| changed.verify_in(db, SOURCE)),
+                    Err(HistoryError::Conflict)
+                ),
+                "{mutation}"
+            );
+        }
+        let encoded = serde_json::to_string(&proof).unwrap();
+        let duplicate = format!("{{\"source_id\":\"{SOURCE}\",{}", &encoded[1..]);
+        assert!(serde_json::from_str::<CompletionProof>(&duplicate).is_err());
+        let mut unknown = serde_json::to_value(&proof).unwrap();
+        unknown["unknown"] = json!(true);
+        assert!(serde_json::from_value::<CompletionProof>(unknown).is_err());
+    }
+
+    #[test]
+    fn global_history_completion_checks_records_beyond_the_page_without_repair() {
+        for corruption in ["missing", "valid_change", "source", "binding", "step"] {
+            let (store, _, _, _) = fixture();
+            let batch = PreparedImport::bind_global(global_records(35)).unwrap();
+            let proof = batch.completion_proof(SOURCE).unwrap();
+            store.transaction(|tx| batch.insert_in(tx)).unwrap();
+            let id = proof.ids.last().unwrap();
+            store
+                .transaction(|tx| -> Result<(), StorageError> {
+                    if corruption == "missing" {
+                        tx.execute("DELETE FROM install_history WHERE id=?1", [id])?;
+                        return Ok(());
+                    }
+                    let bytes: Vec<u8> = tx.query_row(
+                        "SELECT payload FROM install_history WHERE id=?1",
+                        [id],
+                        |row| row.get(0),
+                    )?;
+                    let mut payload: Value = serde_json::from_slice(&bytes).unwrap();
+                    match corruption {
+                        "valid_change" => payload["source"]["sequence"] = json!(99),
+                        "source" => {
+                            tx.execute(
+                                "UPDATE install_history SET source_id=?1 WHERE id=?2",
+                                params![OTHER_SOURCE, id],
+                            )?;
+                        }
+                        "binding" => {
+                            tx.execute(
+                                "UPDATE install_history SET instance_id=?1 WHERE id=?2",
+                                params![InstanceId::new().as_str(), id],
+                            )?;
+                        }
+                        "step" => {
+                            payload["source"]["completed_steps"][0]["generated_facts"] =
+                                json!(["future:effect"])
+                        }
+                        _ => unreachable!(),
+                    }
+                    tx.execute(
+                        "UPDATE install_history SET payload=?1 WHERE id=?2",
+                        params![serde_json::to_vec(&payload).unwrap(), id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    store.read(|db| proof.verify_in(db, SOURCE)),
+                    Err(HistoryError::Conflict)
+                ),
+                "{corruption}"
+            );
+            assert!(
+                matches!(
+                    store.read(|db| read_global_in(db, SOURCE, &proof, None)),
+                    Err(HistoryError::Conflict)
+                ),
+                "{corruption}"
+            );
+            assert_eq!(count(&store), if corruption == "missing" { 34 } else { 35 });
+        }
+    }
+
+    #[test]
+    fn global_history_publication_rolls_back_ignored_or_corrupted_writes() {
+        for rewrite in [false, true] {
+            let (store, _, _, _) = fixture();
+            let batch = PreparedImport::bind_global(global_records(2)).unwrap();
+            let proof = batch.completion_proof(SOURCE).unwrap();
+            let first = &batch.0[0].operation.0.id;
+            let second = &batch.0[1].operation.0.id;
+            let trigger = if rewrite {
+                format!(
+                    "CREATE TRIGGER break_history AFTER INSERT ON install_history WHEN NEW.id='{second}' BEGIN UPDATE install_history SET payload=CAST('{{}}' AS BLOB) WHERE id='{first}'; END;"
+                )
+            } else {
+                format!(
+                    "CREATE TRIGGER break_history BEFORE INSERT ON install_history WHEN NEW.id='{second}' BEGIN SELECT RAISE(IGNORE); END;"
+                )
+            };
+            store
+                .transaction(|tx| -> Result<(), StorageError> {
+                    tx.execute_batch(&trigger)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(matches!(
+                store.transaction(|tx| {
+                    batch.insert_in(tx)?;
+                    proof.verify_in(tx, SOURCE)
+                }),
+                Err(HistoryError::Conflict)
+            ));
+            assert_eq!(count(&store), 0);
+            assert!(store.read(|db| proof.verify_in(db, SOURCE)).is_err());
+            assert_eq!(count(&store), 0);
         }
     }
 }

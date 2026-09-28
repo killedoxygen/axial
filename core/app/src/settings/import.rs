@@ -19,25 +19,26 @@ pub struct PreparedSettingsImport {
 
 impl SettingsStore {
     /// The import owner writes accounts and its completed receipt here. Returning
-    /// false means that exact receipt already exists: later destination edits
-    /// must be returned unchanged, without testing the obsolete import revision.
-    pub(crate) fn commit_prepared_import(
+    /// false preserves later destination edits without testing the old revision.
+    /// Verify the import receipt after the final settings write, before commit.
+    pub(crate) fn commit_prepared_import<T>(
         &self,
         prepared: &PreparedSettingsImport,
         expected_revision: u64,
         import_metadata: impl FnOnce(
             &rusqlite::Transaction<'_>,
             &mut ConfigView,
-        ) -> Result<bool, SettingsError>,
-    ) -> Result<(SettingsCommit, bool), SettingsError> {
+        ) -> Result<(bool, T), SettingsError>,
+        verify_import: impl FnOnce(&rusqlite::Transaction<'_>, &T) -> Result<(), SettingsError>,
+    ) -> Result<(SettingsCommit, bool, T), SettingsError> {
         let changes = self
             .changes
             .lock()
             .map_err(|_| SettingsError::Unavailable)?;
-        let (document, imported) = self.metadata.transaction(|transaction| {
+        let (document, imported, receipt) = self.metadata.transaction(|transaction| {
             let mut document = required_document(transaction)?;
             let mut config = prepared.config.clone();
-            let imported = import_metadata(transaction, &mut config)?;
+            let (imported, receipt) = import_metadata(transaction, &mut config)?;
             if imported {
                 if document.config.revision != expected_revision {
                     return Err(SettingsError::Conflict);
@@ -53,7 +54,8 @@ impl SettingsStore {
                 }
                 write_updated_document(transaction, &mut document, expected_revision)?;
             }
-            Ok::<_, SettingsError>((document, imported))
+            verify_import(transaction, &receipt)?;
+            Ok::<_, SettingsError>((document, imported, receipt))
         })?;
         if imported {
             changes.send_replace(document.config.clone());
@@ -64,6 +66,7 @@ impl SettingsStore {
                 telemetry_identity: document.telemetry_install_id,
             },
             imported,
+            receipt,
         ))
     }
 }

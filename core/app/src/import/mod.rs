@@ -16,8 +16,9 @@ mod skins;
 
 pub use inventory::{CaptureLimits, Inventory, ReadOnlySource};
 pub use metadata::{
-    METADATA_IMPORT_IDENTITIES_MIGRATION, METADATA_IMPORT_MIGRATION, MetadataImportCommit,
-    MetadataImportError, PreparedMetadataImport, metadata_status,
+    METADATA_IMPORT_HISTORY_MIGRATION, METADATA_IMPORT_IDENTITIES_MIGRATION,
+    METADATA_IMPORT_MIGRATION, MetadataImportCommit, MetadataImportError, PreparedMetadataImport,
+    metadata_install_history, metadata_status,
 };
 pub use model::{ImportBlocker, ImportPreview, LegacyInstance, RetainedObligation};
 pub use prepare::PreparedInstanceImport;

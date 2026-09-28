@@ -592,10 +592,15 @@ mod tests {
         )
         .unwrap();
         settings
-            .commit_prepared_import(&imported, 1, |_, config| {
-                config.account_selection_revision = 7;
-                Ok(true)
-            })
+            .commit_prepared_import(
+                &imported,
+                1,
+                |_, config| {
+                    config.account_selection_revision = 7;
+                    Ok((true, ()))
+                },
+                |_, _| Ok(()),
+            )
             .unwrap();
         assert_eq!(settings.interface_preferences().unwrap(), snapshot);
         assert_eq!(settings.current().unwrap().revision, 2);

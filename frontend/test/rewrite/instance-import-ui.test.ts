@@ -1460,6 +1460,25 @@ test('unknown metadata outcomes use only source-independent receipt reads and nu
   assert.equal(h.store.config.value.username, 'Later_Edit');
 });
 
+test('metadata history completion remains optional, bounded and separate from instance eligibility', async () => {
+  for (const historyCount of [undefined, 0, 128]) {
+    const h = harness();
+    h.setPreview(preview({ instances: [], blockers: ['cutover_not_implemented', 'unsettled_operation'] }));
+    await h.workflow.chooseProfile();
+    await h.workflow.prepareMetadataImport();
+    const result = {
+      ...receipt,
+      ...(historyCount === undefined ? {} : { global_install_history_count: historyCount }),
+    };
+    h.setMetadataPost(async () => ({ receipt: result, already_imported: false, cutover_available: false }));
+    await h.workflow.importMetadata();
+    assert.equal(h.workflow.state.value.phase, 'metadata-imported');
+    assert.equal(JSON.stringify(h.workflow.state.value.metadataReceipt), JSON.stringify(result));
+    assert.equal(h.workflow.state.value.preview?.cutover_available, false);
+    assert.equal(h.navigation.length, 0);
+  }
+});
+
 test('invalid or mismatched metadata receipts cannot claim completion or refresh destination state', async () => {
   for (const invalid of [
     { ...receipt, metadata_import_id: 'd'.repeat(64) },
@@ -1483,6 +1502,7 @@ test('invalid or mismatched metadata receipts cannot claim completion or refresh
     },
     { ...receipt, settings_revision: 0 },
     { ...receipt, account_selection_revision: 0.5 },
+    ...[-1, 0.5, 129, '2', true].map((global_install_history_count) => ({ ...receipt, global_install_history_count })),
   ]) {
     const h = harness();
     await h.workflow.chooseProfile();

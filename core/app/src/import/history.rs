@@ -484,6 +484,26 @@ fn decode_journal(raw: &[u8]) -> ImportResult<Vec<LegacyOperation>> {
     Ok(journal.entries)
 }
 
+pub(super) fn prepare_global_install_history(
+    inventory: &Inventory,
+) -> ImportResult<PreparedInstallImport> {
+    let mut records = Vec::new();
+    if inventory
+        .file_manifests()
+        .any(|file| file.relative == JOURNAL)
+    {
+        let source = inventory.source_identity()?;
+        // Decode the original whole journal before selecting this domain. An
+        // unsupported or malformed global record must not become an empty proof.
+        for entry in decode_journal(&inventory.record_bytes(JOURNAL)?)? {
+            if entry.command == "InstallVersion" {
+                records.push(entry.convert_install(&source)?);
+            }
+        }
+    }
+    PreparedInstallImport::bind_global(records).map_err(|_| ImportError::InvalidData)
+}
+
 pub(super) fn prepare_rules_history(
     inventory: &Inventory,
 ) -> ImportResult<Vec<HistoricalRulesRefresh>> {

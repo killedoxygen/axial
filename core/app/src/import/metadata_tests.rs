@@ -58,6 +58,8 @@ fn stores(path: &Path) -> (SettingsStore, AccountDirectory) {
         .migrate(&[
             METADATA_IMPORT_MIGRATION,
             METADATA_IMPORT_IDENTITIES_MIGRATION,
+            METADATA_IMPORT_HISTORY_MIGRATION,
+            install_history::MIGRATION,
         ])
         .unwrap();
     let settings = SettingsStore::new_with_telemetry_identity(Arc::clone(&store), true).unwrap();
@@ -86,6 +88,310 @@ fn config(source: &Fixture, change: impl FnOnce(&mut Value)) {
     let mut value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     change(&mut value);
     fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
+fn global_journal(source: &Fixture, change: impl FnOnce(&mut Value)) {
+    let mut journal = crate::import::tests::successful_install_journal();
+    journal["entries"].as_array_mut().unwrap().truncate(2);
+    change(&mut journal);
+    let path = source.baseline.join("state/operation-journals.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+}
+
+#[test]
+fn global_history_late_settings_write_must_roll_back_receipt_and_batch() {
+    let source = Fixture::new();
+    global_journal(&source, |_| {});
+    let before = snapshot(&source.baseline);
+    let (prepared, request) = prepare(&source);
+    let destination = Destination::new();
+    let changes = destination.settings.subscribe().unwrap();
+    destination
+        .settings
+        .metadata()
+        .transaction(|tx| -> Result<(), StorageError> {
+            tx.execute_batch(
+                "CREATE TRIGGER corrupt_late_history AFTER UPDATE ON settings_config
+            BEGIN UPDATE install_history SET payload=CAST('{}' AS BLOB); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(destination.commit(&prepared, &request).is_err());
+    assert_eq!(destination.settings.current().unwrap().revision, 0);
+    assert!(destination.accounts.snapshot().unwrap().accounts.is_empty());
+    assert!(!changes.has_changed().unwrap());
+    let counts = destination
+        .settings
+        .metadata()
+        .read(|db| -> Result<_, StorageError> {
+            Ok(db.query_row(
+                "SELECT (SELECT count(*) FROM profile_metadata_imports),
+            (SELECT count(*) FROM install_history)",
+                [],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(counts, (0, 0));
+    assert_eq!(snapshot(&source.baseline), before);
+}
+
+#[test]
+fn global_history_optional_conversion_preserves_metadata_without_claiming_completion() {
+    for corruption in ["none", "unsupported", "partial", "duplicate", "raw_unknown"] {
+        let source = Fixture::new();
+        if corruption != "none" {
+            global_journal(&source, |journal| match corruption {
+                "unsupported" => journal["entries"][0]["status"] = json!("Running"),
+                "partial" => journal["entries"][1]["status"] = json!("Failed"),
+                "duplicate" => journal["entries"][1] = journal["entries"][0].clone(),
+                _ => journal["entries"][0]["unrecognized_effect"] = json!(true),
+            });
+        }
+        let before = snapshot(&source.baseline);
+        let inventory = source.capture();
+        assert!(
+            inventory.preview().metadata_import_available,
+            "{corruption}"
+        );
+        if corruption != "none" {
+            assert!(
+                !inventory.preview().instances[0].ordinary_import_available,
+                "{corruption}"
+            );
+        }
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        let receipt = destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt;
+        let wire = serde_json::to_value(&receipt).unwrap();
+        if corruption == "none" {
+            assert_eq!(wire["global_install_history_count"], 0);
+            assert!(
+                metadata_install_history(&destination.settings, &request.metadata_import_id, None)
+                    .unwrap()
+                    .records
+                    .is_empty()
+            );
+        } else {
+            assert!(
+                !wire
+                    .as_object()
+                    .unwrap()
+                    .contains_key("global_install_history_count")
+            );
+            assert!(
+                metadata_install_history(&destination.settings, &request.metadata_import_id, None)
+                    .is_err()
+            );
+        }
+        assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
+        assert_eq!(snapshot(&source.baseline), before);
+    }
+}
+
+#[test]
+fn global_history_old_receipt_completion_preserves_later_edits_and_reopen() {
+    let source = Fixture::new();
+    global_journal(&source, |_| {});
+    let before = snapshot(&source.baseline);
+    let (prepared, request) = prepare(&source);
+    let destination = Destination::new();
+    // The preceding metadata converter committed the same accounts/preferences,
+    // without global history. Exercise that real transaction with no batch.
+    let mut metadata_only = prepared.clone();
+    metadata_only.global_history = None;
+    let original = destination
+        .commit(&metadata_only, &request)
+        .unwrap()
+        .response
+        .receipt;
+    assert_eq!(original.global_install_history_count, None);
+    assert!(
+        metadata_install_history(&destination.settings, &request.metadata_import_id, None).is_err()
+    );
+    destination.accounts.select(SECOND).unwrap();
+    let accounts = destination.accounts.snapshot().unwrap();
+    let config = destination
+        .settings
+        .update(ConfigPatch {
+            expected_revision: 1,
+            theme: Some(ConfigTheme::Birch),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    let changes = destination.settings.subscribe().unwrap();
+    let completed = destination.commit(&prepared, &request).unwrap();
+    let mut expected = original;
+    expected.global_install_history_count = Some(2);
+    assert!(completed.response.already_imported);
+    assert_eq!(completed.response.receipt, expected);
+    assert_eq!(completed.settings.config, config);
+    assert_eq!(destination.accounts.snapshot().unwrap(), accounts);
+    assert!(!changes.has_changed().unwrap());
+    let page =
+        metadata_install_history(&destination.settings, &request.metadata_import_id, None).unwrap();
+    assert_eq!(page.records.len(), 2);
+    assert!(
+        page.records
+            .iter()
+            .all(|record| record.historical && record.instance_id.is_none())
+    );
+    assert_eq!(
+        destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt,
+        expected
+    );
+    let path = destination._root.path().join("metadata.sqlite");
+    let (reopened, _) = stores(&path);
+    assert_eq!(
+        metadata_status(&reopened, &request.metadata_import_id)
+            .unwrap()
+            .receipt,
+        Some(expected)
+    );
+    assert_eq!(
+        metadata_install_history(&reopened, &request.metadata_import_id, None).unwrap(),
+        page
+    );
+    assert_eq!(snapshot(&source.baseline), before);
+}
+
+#[test]
+fn global_history_receipt_publication_is_exact_and_atomic_for_first_and_old_receipts() {
+    for old in [false, true] {
+        for effect in ["ignore", "rewrite_receipt", "rewrite_history"] {
+            let source = Fixture::new();
+            global_journal(&source, |_| {});
+            let (prepared, request) = prepare(&source);
+            let destination = Destination::new();
+            if old {
+                let mut metadata_only = prepared.clone();
+                metadata_only.global_history = None;
+                destination.commit(&metadata_only, &request).unwrap();
+            }
+            let before_config = destination.settings.current().unwrap();
+            let before_accounts = destination.accounts.snapshot().unwrap();
+            let before_receipt =
+                metadata_status(&destination.settings, &request.metadata_import_id)
+                    .unwrap()
+                    .receipt;
+            let changes = destination.settings.subscribe().unwrap();
+            let action = if old {
+                "UPDATE OF global_install_history_proof"
+            } else {
+                "INSERT"
+            };
+            let (timing, statement) = match effect {
+                "ignore" => ("BEFORE", "SELECT RAISE(IGNORE);"),
+                "rewrite_receipt" => (
+                    "AFTER",
+                    "UPDATE profile_metadata_imports SET settings_revision=settings_revision+1;",
+                ),
+                _ => (
+                    "AFTER",
+                    "UPDATE install_history SET payload=CAST('{}' AS BLOB);",
+                ),
+            };
+            destination.settings.metadata().transaction(|tx| -> Result<(), StorageError> {
+                tx.execute_batch(&format!("CREATE TRIGGER corrupt_publication {timing} {action} ON profile_metadata_imports BEGIN {statement} END;"))?;
+                Ok(())
+            }).unwrap();
+            assert!(
+                destination.commit(&prepared, &request).is_err(),
+                "{old}/{effect}"
+            );
+            assert_eq!(destination.settings.current().unwrap(), before_config);
+            assert_eq!(destination.accounts.snapshot().unwrap(), before_accounts);
+            assert_eq!(
+                metadata_status(&destination.settings, &request.metadata_import_id)
+                    .unwrap()
+                    .receipt,
+                before_receipt
+            );
+            assert!(!changes.has_changed().unwrap());
+            let count = destination
+                .settings
+                .metadata()
+                .read(|db| -> Result<u32, StorageError> {
+                    Ok(db.query_row("SELECT count(*) FROM install_history", [], |row| row.get(0))?)
+                })
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+    }
+}
+
+#[test]
+fn global_history_completed_proof_is_never_repaired_or_rebound() {
+    for corruption in ["missing", "changed", "source", "fingerprint", "proof"] {
+        let source = Fixture::new();
+        global_journal(&source, |_| {});
+        let before = snapshot(&source.baseline);
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        destination.commit(&prepared, &request).unwrap();
+        destination
+            .settings
+            .metadata()
+            .transaction(|tx| -> Result<(), StorageError> {
+                tx.execute_batch(match corruption {
+                    "missing" => "DELETE FROM install_history;",
+                    "changed" => "UPDATE install_history SET payload=CAST('{}' AS BLOB);",
+                    "source" => "UPDATE profile_metadata_imports SET source_id=printf('%064d',0);",
+                    "fingerprint" => {
+                        "UPDATE profile_metadata_imports SET fingerprint=printf('%064d',0);"
+                    }
+                    _ => "UPDATE profile_metadata_imports SET global_install_history_proof='{}';",
+                })?;
+                Ok(())
+            })
+            .unwrap();
+        let rows_before = destination
+            .settings
+            .metadata()
+            .read(|db| -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+                Ok(db
+                    .prepare("SELECT id,payload FROM install_history ORDER BY id")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<_, _>>()?)
+            })
+            .unwrap();
+        assert!(
+            metadata_status(&destination.settings, &request.metadata_import_id).is_err(),
+            "{corruption}"
+        );
+        assert!(
+            metadata_install_history(&destination.settings, &request.metadata_import_id, None)
+                .is_err(),
+            "{corruption}"
+        );
+        assert!(
+            destination.commit(&prepared, &request).is_err(),
+            "{corruption}"
+        );
+        let rows_after = destination
+            .settings
+            .metadata()
+            .read(|db| -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+                Ok(db
+                    .prepare("SELECT id,payload FROM install_history ORDER BY id")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<_, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(rows_before, rows_after, "{corruption}");
+        assert_eq!(destination.settings.current().unwrap().revision, 1);
+        assert_eq!(snapshot(&source.baseline), before);
+    }
 }
 
 #[test]
@@ -636,7 +942,10 @@ fn v1_receipts_keep_historical_meaning_and_new_mapping_corruption_is_rejected() 
         Ok(())
     }).unwrap();
     old_store
-        .migrate(&[METADATA_IMPORT_IDENTITIES_MIGRATION])
+        .migrate(&[
+            METADATA_IMPORT_IDENTITIES_MIGRATION,
+            METADATA_IMPORT_HISTORY_MIGRATION,
+        ])
         .unwrap();
     let receipt = metadata_status(&old_settings, &old_id)
         .unwrap()
@@ -646,6 +955,7 @@ fn v1_receipts_keep_historical_meaning_and_new_mapping_corruption_is_rejected() 
     assert_eq!(receipt.imported_microsoft_account_count, 0);
     assert_eq!(receipt.account_id_mapping, None);
     assert_eq!(receipt.settings_revision, 3);
+    assert_eq!(receipt.global_install_history_count, None);
 
     let destination = Destination::new();
     let source = Fixture::new();

@@ -8,4 +8,9 @@ export type MetadataImportReceipt = { metadata_import_id: string, imported_offli
  * Every legacy identity maps to its destination identity. Receipts created
  * before this mapping was retained return null, never an invented mapping.
  */
-account_id_mapping: { [key in string]: string } | null, settings_revision: number, account_selection_revision: number, };
+account_id_mapping: { [key in string]: string } | null, 
+/**
+ * Absent means history completion was not proved, including old receipts.
+ * Zero is a verified empty source-global install-history snapshot.
+ */
+global_install_history_count?: number | null, settings_revision: number, account_selection_revision: number, };

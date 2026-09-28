@@ -20,6 +20,10 @@ use crate::{
         directory::AccountDirectory,
         model::{AccountError, AccountId, MicrosoftIdentityImport, OfflineIdentityImport},
     },
+    install::history::{
+        self as install_history, CompletionProof, HistoryError, HistoryPage,
+        MAX_COMPLETION_PROOF_BYTES, PreparedImport as PreparedInstallImport,
+    },
     library::ApplicationRootPin,
     settings::{
         ConfigLaunchAuthMode, PreparedSettingsImport, SettingsCommit, SettingsError, SettingsStore,
@@ -52,6 +56,12 @@ pub const METADATA_IMPORT_IDENTITIES_MIGRATION: Migration = Migration {
         CHECK(account_id_mapping IS NULL OR length(CAST(account_id_mapping AS BLOB)) <= 131072);",
 };
 
+pub const METADATA_IMPORT_HISTORY_MIGRATION: Migration = Migration {
+    id: "profile_metadata_imports.v3",
+    sql: "ALTER TABLE profile_metadata_imports ADD COLUMN global_install_history_proof TEXT
+        CHECK(global_install_history_proof IS NULL OR length(CAST(global_install_history_proof AS BLOB)) <= 16384);",
+};
+
 const MAX_MAPPING_BYTES: usize = 131072;
 
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +82,7 @@ pub struct PreparedMetadataImport {
     import_id: String,
     accounts: PreparedAccounts,
     settings: PreparedSettingsImport,
+    global_history: Option<(Arc<PreparedInstallImport>, CompletionProof)>,
 }
 
 /// Telemetry consent is published by the accepted command's owned consent
@@ -101,6 +112,16 @@ impl Inventory {
         }
         let (settings, accounts) = self.metadata_inputs()?;
         let source_id = self.source_identity()?;
+        let global_history = match super::history::prepare_global_install_history(self) {
+            Ok(batch) => {
+                let proof = batch
+                    .completion_proof(&source_id)
+                    .map_err(|_| ImportError::InvalidData)?;
+                Some((Arc::new(batch), proof))
+            }
+            Err(ImportError::InvalidData | ImportError::LimitExceeded) => None,
+            Err(error) => return Err(error),
+        };
         self.revalidate()?;
         Ok(PreparedMetadataImport {
             inventory: Arc::clone(self),
@@ -108,6 +129,7 @@ impl Inventory {
             source_id,
             accounts,
             settings,
+            global_history,
         })
     }
 
@@ -145,7 +167,6 @@ impl PreparedMetadataImport {
         let root = destination.directory().map_err(ImportError::Io)?;
         self.inventory.validate_destination_root(&root)?;
         check_cancel(cancel)?;
-        let mut receipt = None;
         let result = settings.commit_prepared_import(
             &self.settings,
             request.expected_settings_revision,
@@ -159,8 +180,33 @@ impl PreparedMetadataImport {
                     if fingerprint != self.inventory.fingerprint() || id != self.import_id {
                         return Err(SettingsError::Conflict);
                     }
-                    receipt = Some(read_receipt(transaction, &id)?.ok_or(SettingsError::Corrupt)?);
-                    return Ok(false);
+                    let mut stored = read_receipt(transaction, &id)?.ok_or(SettingsError::Corrupt)?;
+                    if let Some((batch, proof)) = &self.global_history {
+                        match &stored.global_history {
+                            Some(existing) if existing != proof => return Err(SettingsError::Conflict),
+                            Some(_) => {}
+                            None => {
+                                if cancel.is_cancelled() {
+                                    return Err(SettingsError::Unavailable);
+                                }
+                                batch.insert_in(transaction).map_err(history_error)?;
+                                if transaction.execute(
+                                    "UPDATE profile_metadata_imports SET global_install_history_proof=?1
+                                     WHERE source_id=?2 AND fingerprint=?3 AND import_id=?4
+                                     AND global_install_history_proof IS NULL",
+                                    params![encode_proof(proof)?, self.source_id, fingerprint, id],
+                                )? != 1 {
+                                    return Err(SettingsError::Conflict);
+                                }
+                                stored.global_history = Some(proof.clone());
+                                stored.receipt.global_install_history_count = Some(proof.count());
+                                if cancel.is_cancelled() {
+                                    return Err(SettingsError::Unavailable);
+                                }
+                            }
+                        }
+                    }
+                    return Ok((false, stored));
                 }
                 if cancel.is_cancelled() {
                     return Err(SettingsError::Unavailable);
@@ -173,32 +219,44 @@ impl PreparedMetadataImport {
                     request.expected_account_selection_revision,
                 ).map_err(account_error)?;
                 config.account_selection_revision = snapshot.selection_revision;
+                if let Some((batch, _)) = &self.global_history {
+                    batch.insert_in(transaction).map_err(history_error)?;
+                }
                 let completed = MetadataImportReceipt {
                     metadata_import_id: self.import_id.clone(),
                     imported_offline_account_count: self.accounts.offline.len(),
                     imported_microsoft_account_count: self.accounts.microsoft.len(),
                     account_id_mapping: Some(self.accounts.mapping.clone()),
+                    global_install_history_count: self.global_history.as_ref().map(|(_, proof)| proof.count()),
                     settings_revision: request.expected_settings_revision.checked_add(1)
                         .ok_or(SettingsError::Unavailable)?,
                     account_selection_revision: snapshot.selection_revision,
                 };
-                transaction.execute(
-                    "INSERT INTO profile_metadata_imports(source_id, fingerprint, import_id, account_count, settings_revision, selection_revision, microsoft_account_count, account_id_mapping) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                if transaction.execute(
+                    "INSERT INTO profile_metadata_imports(source_id, fingerprint, import_id, account_count, settings_revision, selection_revision, microsoft_account_count, account_id_mapping, global_install_history_proof) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![self.source_id, self.inventory.fingerprint(), self.import_id,
                         self.accounts.mapping.len(), completed.settings_revision,
                         completed.account_selection_revision, completed.imported_microsoft_account_count,
-                        encode_mapping(&self.accounts.mapping)?],
-                )?;
+                        encode_mapping(&self.accounts.mapping)?,
+                        self.global_history.as_ref().map(|(_, proof)| encode_proof(proof)).transpose()?],
+                )? != 1 {
+                    return Err(SettingsError::Conflict);
+                }
                 if cancel.is_cancelled() {
                     return Err(SettingsError::Unavailable);
                 }
-                receipt = Some(completed);
-                Ok(true)
+                Ok((true, StoredReceipt {
+                    receipt: completed,
+                    source_id: self.source_id.clone(),
+                    fingerprint: self.inventory.fingerprint().to_owned(),
+                    global_history: self.global_history.as_ref().map(|(_, proof)| proof.clone()),
+                }))
             },
+            |transaction, receipt| verify_receipt(transaction, receipt),
         );
         // Cancellation may win before persistence, never after a successful
         // commit. Returning cancellation after commit would hide its outcome.
-        let (settings, imported) = match result {
+        let (settings, imported, receipt) = match result {
             Err(SettingsError::Unavailable) if cancel.is_cancelled() => {
                 return Err(ImportError::Cancelled.into());
             }
@@ -206,7 +264,7 @@ impl PreparedMetadataImport {
         };
         Ok(MetadataImportCommit {
             response: MetadataImportResponse {
-                receipt: receipt.ok_or(SettingsError::Corrupt)?,
+                receipt: receipt.receipt,
                 already_imported: !imported,
                 cutover_available: false,
             },
@@ -221,33 +279,91 @@ pub fn metadata_status(
     settings: &SettingsStore,
     import_id: &str,
 ) -> Result<MetadataImportStatus, MetadataImportError> {
-    if import_id.len() != 64
-        || !import_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !valid_identity(import_id) {
         return Err(ImportError::InvalidData.into());
     }
-    let receipt = settings
-        .metadata()
-        .read(|connection| read_receipt(connection, import_id))?;
+    let receipt = settings.metadata().read(|connection| {
+        let transaction = connection.unchecked_transaction()?;
+        let stored = read_receipt(&transaction, import_id)?;
+        if let Some(stored) = &stored {
+            stored.verify_history(&transaction)?;
+        }
+        transaction.commit()?;
+        Ok::<_, SettingsError>(stored.map(|stored| stored.receipt))
+    })?;
     Ok(MetadataImportStatus {
         receipt,
         cutover_available: false,
     })
 }
 
+/// The receipt, not a current instance or a caller-supplied source ID, selects
+/// the immutable history snapshot. A missing proof is not a verified empty page.
+pub fn metadata_install_history(
+    settings: &SettingsStore,
+    id: &str,
+    after: Option<&str>,
+) -> Result<HistoryPage, MetadataImportError> {
+    if !valid_identity(id) || install_history::validate_cursor(after).is_err() {
+        return Err(ImportError::InvalidData.into());
+    }
+    let page = settings.metadata().read(|connection| {
+        let transaction = connection.unchecked_transaction()?;
+        let stored = read_receipt(&transaction, id)?.ok_or(SettingsError::Unavailable)?;
+        let proof = stored
+            .global_history
+            .as_ref()
+            .ok_or(SettingsError::Unavailable)?;
+        let page = install_history::read_global_in(&transaction, &stored.source_id, proof, after)
+            .map_err(history_error)?;
+        transaction.commit()?;
+        Ok::<_, SettingsError>(page)
+    })?;
+    Ok(page)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StoredReceipt {
+    receipt: MetadataImportReceipt,
+    source_id: String,
+    fingerprint: String,
+    global_history: Option<CompletionProof>,
+}
+
+impl StoredReceipt {
+    fn verify_history(&self, connection: &Connection) -> Result<(), SettingsError> {
+        if let Some(proof) = &self.global_history {
+            proof
+                .verify_in(connection, &self.source_id)
+                .map_err(history_error)?;
+        }
+        Ok(())
+    }
+}
+
+fn verify_receipt(connection: &Connection, expected: &StoredReceipt) -> Result<(), SettingsError> {
+    let stored = read_receipt(connection, &expected.receipt.metadata_import_id)?
+        .ok_or(SettingsError::Conflict)?;
+    if &stored != expected {
+        return Err(SettingsError::Conflict);
+    }
+    stored.verify_history(connection)
+}
+
 fn read_receipt(
     connection: &Connection,
     import_id: &str,
-) -> Result<Option<MetadataImportReceipt>, SettingsError> {
+) -> Result<Option<StoredReceipt>, SettingsError> {
     let row = connection
         .query_row(
             "SELECT account_count, settings_revision, selection_revision, microsoft_account_count,
             length(CAST(account_id_mapping AS BLOB)),
-            CASE WHEN length(CAST(account_id_mapping AS BLOB)) <= ?2 THEN account_id_mapping END
+            CASE WHEN length(CAST(account_id_mapping AS BLOB)) <= ?2 THEN account_id_mapping END,
+            CASE WHEN length(CAST(source_id AS BLOB)) <= 64 THEN source_id END,
+            fingerprint, length(CAST(global_install_history_proof AS BLOB)),
+            CASE WHEN length(CAST(global_install_history_proof AS BLOB)) <= ?3 THEN global_install_history_proof END
          FROM profile_metadata_imports WHERE import_id = ?1",
-            params![import_id, MAX_MAPPING_BYTES],
+            params![import_id, MAX_MAPPING_BYTES, MAX_COMPLETION_PROOF_BYTES],
             |row| {
                 Ok((
                     row.get::<_, usize>(0)?,
@@ -256,6 +372,10 @@ fn read_receipt(
                     row.get::<_, usize>(3)?,
                     row.get::<_, Option<usize>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<usize>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             },
         )
@@ -267,6 +387,10 @@ fn read_receipt(
         microsoft_count,
         length,
         encoded,
+        source_id,
+        fingerprint,
+        proof_length,
+        encoded_proof,
     )) = row
     else {
         return Ok(None);
@@ -285,14 +409,57 @@ fn read_receipt(
         (Some(_), Some(encoded)) => Some(decode_mapping(&encoded, count, microsoft_count)?),
         _ => return Err(SettingsError::Corrupt),
     };
-    Ok(Some(MetadataImportReceipt {
-        metadata_import_id: import_id.to_owned(),
-        imported_offline_account_count: count - microsoft_count,
-        imported_microsoft_account_count: microsoft_count,
-        account_id_mapping: mapping,
-        settings_revision,
-        account_selection_revision,
+    let source_id = source_id.ok_or(SettingsError::Corrupt)?;
+    let global_history: Option<CompletionProof> = match (proof_length, encoded_proof) {
+        (None, None) => None,
+        (Some(length), Some(encoded)) if length <= MAX_COMPLETION_PROOF_BYTES => {
+            if !valid_identity(&source_id)
+                || !valid_identity(&fingerprint)
+                || self::import_id(&source_id, &fingerprint) != import_id
+            {
+                return Err(SettingsError::Corrupt);
+            }
+            Some(serde_json::from_str(&encoded).map_err(|_| SettingsError::Corrupt)?)
+        }
+        _ => return Err(SettingsError::Corrupt),
+    };
+    Ok(Some(StoredReceipt {
+        receipt: MetadataImportReceipt {
+            metadata_import_id: import_id.to_owned(),
+            imported_offline_account_count: count - microsoft_count,
+            imported_microsoft_account_count: microsoft_count,
+            account_id_mapping: mapping,
+            global_install_history_count: global_history.as_ref().map(CompletionProof::count),
+            settings_revision,
+            account_selection_revision,
+        },
+        source_id,
+        fingerprint,
+        global_history,
     }))
+}
+
+fn valid_identity(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn encode_proof(proof: &CompletionProof) -> Result<String, SettingsError> {
+    let encoded = serde_json::to_string(proof).map_err(|_| SettingsError::Unavailable)?;
+    if encoded.len() > MAX_COMPLETION_PROOF_BYTES {
+        return Err(SettingsError::Unavailable);
+    }
+    Ok(encoded)
+}
+
+fn history_error(error: HistoryError) -> SettingsError {
+    match error {
+        HistoryError::Invalid => SettingsError::Corrupt,
+        HistoryError::Conflict => SettingsError::Conflict,
+        HistoryError::Storage(error) => SettingsError::Storage(error),
+    }
 }
 
 fn encode_mapping(mapping: &BTreeMap<String, String>) -> Result<String, SettingsError> {

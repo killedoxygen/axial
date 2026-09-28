@@ -131,6 +131,10 @@ pub struct MetadataImportReceipt {
     /// Every legacy identity maps to its destination identity. Receipts created
     /// before this mapping was retained return null, never an invented mapping.
     pub account_id_mapping: Option<std::collections::BTreeMap<String, String>>,
+    /// Absent means history completion was not proved, including old receipts.
+    /// Zero is a verified empty source-global install-history snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_install_history_count: Option<usize>,
     pub settings_revision: u64,
     pub account_selection_revision: u64,
 }
