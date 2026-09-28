@@ -34,6 +34,16 @@ pub const MIGRATION: Migration = Migration {
     CREATE TABLE performance_commands (id TEXT PRIMARY KEY NOT NULL, instance_id TEXT NOT NULL, state TEXT NOT NULL, payload BLOB NOT NULL CHECK(length(payload)<=16384)) STRICT;",
 };
 
+pub const MIGRATION_V2: Migration = Migration {
+    id: "performance_operations.v2",
+    sql: "CREATE INDEX performance_commands_active ON performance_commands(state) WHERE state IN ('queued','running');",
+};
+
+const MAX_PENDING_OPERATIONS: usize = 128;
+const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PENDING_ROW_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ACTIVE_COMMANDS: usize = 128;
+
 pub fn has_pending(storage: &MetadataStore, id: &InstanceId) -> Result<bool, StorageError> {
     storage.read(|connection| {
         connection
@@ -783,6 +793,32 @@ fn decode_pending(
     Ok(pending)
 }
 
+fn check_pending_budget(count: usize, bytes: usize) -> Result<(), PerformanceMutationError> {
+    if count > MAX_PENDING_OPERATIONS || bytes > MAX_PENDING_BYTES {
+        return Err(PerformanceMutationError::Unsettled);
+    }
+    Ok(())
+}
+
+fn pending_inventory(connection: &Connection) -> Result<(usize, usize), PerformanceMutationError> {
+    let mut query =
+        connection.prepare("SELECT length(payload) FROM performance_operations LIMIT ?1")?;
+    let mut rows = query.query([MAX_PENDING_OPERATIONS + 1])?;
+    let (mut count, mut bytes) = (0, 0usize);
+    while let Some(row) = rows.next()? {
+        let length: usize = row.get(0)?;
+        if length > MAX_PENDING_ROW_BYTES {
+            return Err(PerformanceMutationError::Unsettled);
+        }
+        count += 1;
+        bytes = bytes
+            .checked_add(length)
+            .ok_or(PerformanceMutationError::Unsettled)?;
+        check_pending_budget(count, bytes)?;
+    }
+    Ok((count, bytes))
+}
+
 fn write_command(
     tx: &Transaction<'_>,
     status: &PerformanceOperationStatus,
@@ -807,6 +843,13 @@ fn write_command(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
+    let admits_active = matches!(status.state.as_str(), "queued" | "running")
+        && !previous
+            .as_ref()
+            .is_some_and(|(_, state, _)| matches!(state.as_str(), "queued" | "running"));
+    if admits_active && active_command_count(tx)? >= MAX_ACTIVE_COMMANDS {
+        return Err(PerformanceMutationError::Unsettled);
+    }
     if let Some((instance, state, bytes)) = previous {
         let previous = command_status(&status.id, &instance, &state, &bytes)?;
         if previous.history.is_some()
@@ -833,7 +876,18 @@ fn write_command(
     if saved != (status.instance_id.clone(), status.state.clone(), bytes) {
         return Err(PerformanceMutationError::Unsettled);
     }
+    if admits_active && active_command_count(tx)? > MAX_ACTIVE_COMMANDS {
+        return Err(PerformanceMutationError::Unsettled);
+    }
     Ok(())
+}
+
+fn active_command_count(connection: &Connection) -> Result<usize, PerformanceMutationError> {
+    Ok(connection.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM performance_commands WHERE state IN ('queued','running') LIMIT ?1)",
+        [MAX_ACTIVE_COMMANDS + 1],
+        |row| row.get(0),
+    )?)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -918,16 +972,25 @@ impl PerformanceService {
         }
         service.storage.transaction(|tx| {
             let mut query = tx.prepare(
-                "SELECT id,instance_id,state,payload FROM performance_commands WHERE state IN ('queued','running')",
+                "SELECT id,instance_id,state,payload FROM performance_commands WHERE state IN ('queued','running') LIMIT ?1",
             )?;
-            let records = query
-                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?)))?
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut rows = query.query([MAX_ACTIVE_COMMANDS + 1])?;
+            let mut records = Vec::new();
+            while let Some(row) = rows.next()? {
+                if records.len() == MAX_ACTIVE_COMMANDS {
+                    return Err(PerformanceMutationError::Unsettled);
+                }
+                let id = row.get_ref(0)?.as_str().map_err(|_| PerformanceMutationError::Unsettled)?;
+                let instance = row.get_ref(1)?.as_str().map_err(|_| PerformanceMutationError::Unsettled)?;
+                let state = row.get_ref(2)?.as_str().map_err(|_| PerformanceMutationError::Unsettled)?;
+                let bytes = row.get_ref(3)?.as_blob().map_err(|_| PerformanceMutationError::Unsettled)?;
+                records.push(command_status(id, instance, state, bytes)?);
+            }
+            drop(rows);
             drop(query);
-            for (id, instance, state, bytes) in records {
-                let mut status = command_status(&id, &instance, &state, &bytes)?;
-                let instance_id = instance.parse().map_err(|_| PerformanceMutationError::Unsettled)?;
-                if read_pending(tx, &instance_id)?.is_some_and(|pending| pending.operation_id == id) {
+            for mut status in records {
+                let instance_id = status.instance_id.parse().map_err(|_| PerformanceMutationError::Unsettled)?;
+                if read_pending(tx, &instance_id)?.is_some_and(|pending| pending.operation_id == status.id) {
                     continue;
                 }
                 status.state = "interrupted".into();
@@ -1237,9 +1300,9 @@ impl PerformanceService {
                 match inspection {
                     Ok(inspection) => {
                         if service
-                            .pending()?
-                            .iter()
-                            .any(|pending| pending.operation_id == checkpoint.operation_id)
+                            .storage
+                            .read(|db| read_pending(db, &checkpoint.instance_id))?
+                            .is_some_and(|pending| pending.operation_id == checkpoint.operation_id)
                         {
                             service.finish(&checkpoint, None)?;
                         }
@@ -1817,16 +1880,29 @@ impl PerformanceService {
     }
     fn pending(&self) -> Result<Vec<PendingOperation>, PerformanceMutationError> {
         self.storage.read(|connection| {
-            let mut query = connection.prepare("SELECT instance_id,operation_id,payload FROM performance_operations ORDER BY instance_id")?;
-            query.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)))?.map(|row| {
-                let (instance_id, operation_id, bytes) = row?;
-                decode_pending(&instance_id, &operation_id, &bytes)
-            }).collect()
+            let mut query = connection.prepare("SELECT instance_id,operation_id,payload FROM performance_operations ORDER BY instance_id LIMIT ?1")?;
+            let mut rows = query.query([MAX_PENDING_OPERATIONS + 1])?;
+            let mut pending = Vec::new();
+            let mut total_bytes = 0usize;
+            while let Some(row) = rows.next()? {
+                let bytes = row.get_ref(2)?.as_blob().map_err(|_| PerformanceMutationError::Unsettled)?;
+                if bytes.len() > MAX_PENDING_ROW_BYTES {
+                    return Err(PerformanceMutationError::Unsettled);
+                }
+                total_bytes = total_bytes.checked_add(bytes.len()).ok_or(PerformanceMutationError::Unsettled)?;
+                check_pending_budget(pending.len() + 1, total_bytes)?;
+                let instance = row.get_ref(0)?.as_str().map_err(|_| PerformanceMutationError::Unsettled)?;
+                let operation = row.get_ref(1)?.as_str().map_err(|_| PerformanceMutationError::Unsettled)?;
+                pending.push(decode_pending(instance, operation, bytes)?);
+            }
+            Ok(pending)
         })
     }
     fn begin(&self, pending: &PendingOperation) -> Result<(), PerformanceMutationError> {
         let bytes = serde_json::to_vec(pending).map_err(|_| PerformanceMutationError::Unsettled)?;
         self.storage.transaction(|tx| {
+            let (count, total_bytes) = pending_inventory(tx)?;
+            check_pending_budget(count + 1, total_bytes.checked_add(bytes.len()).ok_or(PerformanceMutationError::Unsettled)?)?;
             let command = pending_command(tx, pending)?;
             if command.is_none() && !matches!(pending.expected, ExpectedComposition::Inspection) {
                 return Err(PerformanceMutationError::Unsettled);
@@ -1836,24 +1912,29 @@ impl PerformanceService {
                 || pending_command(tx, pending)? != command {
                 return Err(PerformanceMutationError::Unsettled);
             }
+            pending_inventory(tx)?;
             Ok(())
         })
     }
     fn save(&self, pending: &PendingOperation) -> Result<(), PerformanceMutationError> {
         let bytes = serde_json::to_vec(pending).map_err(|_| PerformanceMutationError::Unsettled)?;
         self.storage.transaction(|tx| {
+            let (count, total_bytes) = pending_inventory(tx)?;
             let previous = read_pending(tx, &pending.instance_id)?.ok_or(PerformanceMutationError::Unsettled)?;
             if !same_preparation(&previous, pending)
                 || (previous.target_effect_started && !pending.target_effect_started)
                 || (previous.result.is_some() && previous.result != pending.result) {
                 return Err(PerformanceMutationError::Unsettled);
             }
+            let previous_bytes: usize = tx.query_row("SELECT length(payload) FROM performance_operations WHERE instance_id=?1", [pending.instance_id.as_str()], |row| row.get(0))?;
+            check_pending_budget(count, total_bytes.checked_sub(previous_bytes).and_then(|size| size.checked_add(bytes.len())).ok_or(PerformanceMutationError::Unsettled)?)?;
             let command = pending_command(tx, pending)?.ok_or(PerformanceMutationError::Unsettled)?;
             if tx.execute("UPDATE performance_operations SET payload=?1 WHERE instance_id=?2 AND operation_id=?3", params![bytes, pending.instance_id.as_str(), pending.operation_id])? != 1 { return Err(PerformanceMutationError::Unsettled); }
             if read_pending(tx, &pending.instance_id)?.as_ref() != Some(pending)
                 || pending_command(tx, pending)?.as_ref() != Some(&command) {
                 return Err(PerformanceMutationError::Unsettled);
             }
+            pending_inventory(tx)?;
             Ok(())
         })
     }
@@ -1956,6 +2037,533 @@ fn validate_target(
 mod tests {
     use super::*;
 
+    async fn budget_checkpoint(service: &PerformanceService) -> PendingOperation {
+        use crate::instances::create::{CreateTarget, InstanceService, tests::request};
+        let mut request = request(&format!("Pending budget {}", uuid::Uuid::new_v4()));
+        request.selection_id = "fixture-fabric".into();
+        let instance = InstanceService::new(service.instances.clone(), service.tasks.clone())
+            .create(
+                request,
+                CreateTarget {
+                    selection_id: "fixture-fabric".into(),
+                    version_id: "fixture-fabric".into(),
+                    minecraft_version: "1.21.4".into(),
+                    loader_key: "fabric".into(),
+                },
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        let admitted = service.instances.admit(&instance.id).unwrap();
+        PendingOperation {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: instance.id,
+            directory_receipt: admitted.directory().receipt().unwrap(),
+            before: None,
+            expected: ExpectedComposition::Inspection,
+            target_effect_started: false,
+            result: None,
+        }
+    }
+
+    fn restore_budget_service(
+        service: &PerformanceService,
+    ) -> Result<PerformanceService, PerformanceMutationError> {
+        PerformanceService::new(
+            service.storage.clone(),
+            service.instances.clone(),
+            service.tasks.clone(),
+            service.content.clone(),
+            service.transfers.clone(),
+        )
+    }
+
+    fn padded_checkpoint(
+        service: &PerformanceService,
+        pending: &PendingOperation,
+        length: usize,
+    ) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(pending).unwrap();
+        assert!(bytes.len() <= length);
+        bytes.resize(length, b' ');
+        service
+            .storage
+            .transaction(|tx| {
+                assert_eq!(
+                    tx.execute(
+                        "UPDATE performance_operations SET payload=?1 WHERE instance_id=?2",
+                        params![bytes, pending.instance_id.as_str()]
+                    )?,
+                    1
+                );
+                Ok::<_, StorageError>(())
+            })
+            .unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn pending_budget_count_is_inclusive_and_oversized_restore_is_preserved() {
+        let (_root, service, admitted) = launch_fixture().await;
+        drop(admitted);
+        for _ in 0..MAX_PENDING_OPERATIONS {
+            service.begin(&budget_checkpoint(&service).await).unwrap();
+        }
+        assert_eq!(service.pending().unwrap().len(), MAX_PENDING_OPERATIONS);
+        let restored = restore_budget_service(&service).unwrap();
+        assert_eq!(
+            restored.retained.lock().unwrap().len(),
+            MAX_PENDING_OPERATIONS
+        );
+        drop(restored);
+        let extra = budget_checkpoint(&service).await;
+        assert!(matches!(
+            service.begin(&extra),
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        assert!(!has_pending(&service.storage, &extra.instance_id).unwrap());
+        service
+            .storage
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO performance_operations VALUES(?1,?2,?3)",
+                    params![
+                        extra.instance_id.as_str(),
+                        extra.operation_id,
+                        serde_json::to_vec(&extra).unwrap()
+                    ],
+                )?;
+                Ok::<_, StorageError>(())
+            })
+            .unwrap();
+        let before: Vec<(String, Vec<u8>)> = service.storage.read(|db| {
+            Ok::<_, StorageError>(db.prepare("SELECT operation_id,payload FROM performance_operations ORDER BY instance_id")?.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<_, _>>()?)
+        }).unwrap();
+        assert!(matches!(
+            service.pending(),
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        assert!(matches!(
+            restore_budget_service(&service),
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        let after: Vec<(String, Vec<u8>)> = service.storage.read(|db| {
+            Ok::<_, StorageError>(db.prepare("SELECT operation_id,payload FROM performance_operations ORDER BY instance_id")?.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<_, _>>()?)
+        }).unwrap();
+        assert_eq!(after, before);
+        service.finish(&extra, None).unwrap();
+        assert_eq!(service.pending().unwrap().len(), MAX_PENDING_OPERATIONS);
+    }
+
+    #[tokio::test]
+    async fn pending_budget_bytes_are_inclusive_and_exact_settlement_can_reduce_overflow() {
+        let (_root, service, admitted) = launch_fixture().await;
+        drop(admitted);
+        let mut fillers = Vec::new();
+        for _ in 0..4 {
+            let pending = budget_checkpoint(&service).await;
+            service.begin(&pending).unwrap();
+            fillers.push(pending);
+        }
+        let extra = budget_checkpoint(&service).await;
+        let extra_bytes = serde_json::to_vec(&extra).unwrap();
+        for filler in &fillers[..3] {
+            padded_checkpoint(&service, filler, MAX_PENDING_ROW_BYTES);
+        }
+        padded_checkpoint(
+            &service,
+            &fillers[3],
+            MAX_PENDING_ROW_BYTES - extra_bytes.len(),
+        );
+        service.begin(&extra).unwrap();
+        assert_eq!(
+            service.storage.read(pending_inventory).unwrap(),
+            (5, MAX_PENDING_BYTES)
+        );
+        assert_eq!(service.pending().unwrap().len(), 5);
+        service.finish(&extra, None).unwrap();
+        padded_checkpoint(
+            &service,
+            &fillers[3],
+            MAX_PENDING_ROW_BYTES - extra_bytes.len() + 1,
+        );
+        assert!(matches!(
+            service.begin(&extra),
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        service
+            .storage
+            .transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO performance_operations VALUES(?1,?2,?3)",
+                    params![extra.instance_id.as_str(), extra.operation_id, extra_bytes],
+                )?;
+                Ok::<_, StorageError>(())
+            })
+            .unwrap();
+        assert!(matches!(
+            service.pending(),
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        assert!(matches!(
+            restore_budget_service(&service),
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        assert_eq!(
+            service
+                .storage
+                .read(|db| {
+                    Ok::<_, StorageError>(db.query_row(
+                        "SELECT sum(length(payload)) FROM performance_operations",
+                        [],
+                        |row| row.get::<_, usize>(0),
+                    )?)
+                })
+                .unwrap(),
+            MAX_PENDING_BYTES + 1
+        );
+        service.finish(&extra, None).unwrap();
+        let restored = restore_budget_service(&service).unwrap();
+        assert_eq!(restored.recover_pending().await.unwrap(), 4);
+        assert_eq!(restored.pending_count().unwrap(), 0);
+        assert!(!restored.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn pending_budget_rechecks_trigger_growth_before_acknowledging_admission() {
+        let (_root, service, admitted) = launch_fixture().await;
+        drop(admitted);
+        let mut fillers = Vec::new();
+        for _ in 0..4 {
+            let pending = budget_checkpoint(&service).await;
+            service.begin(&pending).unwrap();
+            fillers.push(pending);
+        }
+        let extra = budget_checkpoint(&service).await;
+        for filler in &fillers[..3] {
+            padded_checkpoint(&service, filler, MAX_PENDING_ROW_BYTES);
+        }
+        let before = padded_checkpoint(
+            &service,
+            &fillers[3],
+            MAX_PENDING_ROW_BYTES - serde_json::to_vec(&extra).unwrap().len(),
+        );
+        service.storage.transaction(|tx| {
+            tx.execute_batch(&format!("CREATE TRIGGER inflate_pending AFTER INSERT ON performance_operations BEGIN UPDATE performance_operations SET payload=CAST(CAST(payload AS TEXT)||' ' AS BLOB) WHERE instance_id='{}'; END;", fillers[3].instance_id))?;
+            Ok::<_, StorageError>(())
+        }).unwrap();
+        assert!(matches!(
+            service.begin(&extra),
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        assert!(!has_pending(&service.storage, &extra.instance_id).unwrap());
+        let after: Vec<u8> = service
+            .storage
+            .read(|db| {
+                Ok::<_, StorageError>(db.query_row(
+                    "SELECT payload FROM performance_operations WHERE instance_id=?1",
+                    [fillers[3].instance_id.as_str()],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn pending_budget_failed_result_publication_preserves_prior_proof_and_reservation() {
+        for boundary in ["before", "after"] {
+            let (_root, service, admitted) = launch_fixture().await;
+            let before = super::super::duplicate::seed_managed(&admitted).await;
+            let id = admitted.record().instance.id.clone();
+            let receipt = admitted.directory().receipt().unwrap();
+            let path = admitted.directory().read_projection().unwrap();
+            std::fs::write(path.join("mods/user.jar"), b"untouched user file").unwrap();
+            drop(admitted);
+            let mut fillers = Vec::new();
+            for _ in 0..4 {
+                let pending = budget_checkpoint(&service).await;
+                service.begin(&pending).unwrap();
+                fillers.push(pending);
+            }
+            for filler in &fillers[..3] {
+                padded_checkpoint(&service, filler, MAX_PENDING_ROW_BYTES);
+            }
+            let filler_before =
+                padded_checkpoint(&service, &fillers[3], MAX_PENDING_ROW_BYTES - 32768);
+            let (predicate, over) = if boundary == "before" {
+                ("IS NULL", 0)
+            } else {
+                ("IS NOT NULL", 1)
+            };
+            service.storage.transaction(|tx| {
+                tx.execute_batch(&format!("CREATE TRIGGER fill_pending AFTER UPDATE ON performance_operations WHEN NEW.instance_id='{id}' AND json_extract(CAST(NEW.payload AS TEXT),'$.target_effect_started')=1 AND json_extract(CAST(NEW.payload AS TEXT),'$.result') {predicate} BEGIN UPDATE performance_operations SET payload=CAST(CAST(payload AS TEXT)||printf('%*s',{}-length(NEW.payload)+{over}-length(payload),'') AS BLOB) WHERE instance_id='{}'; END;", MAX_PENDING_ROW_BYTES, fillers[3].instance_id))?;
+                Ok::<_, StorageError>(())
+            }).unwrap();
+            assert!(matches!(
+                service.remove(&id).await,
+                Err(PerformanceMutationError::Unsettled)
+            ));
+            wait_for_mutation_tasks(&service).await;
+            let command = service.instance_operation(&id).unwrap().unwrap();
+            assert_eq!(command.state, "unsettled");
+            let expected = PendingOperation {
+                operation_id: command.id,
+                instance_id: id.clone(),
+                directory_receipt: receipt,
+                before: Some(before),
+                expected: ExpectedComposition::Absent,
+                target_effect_started: true,
+                result: None,
+            };
+            let persisted: Vec<u8> = service
+                .storage
+                .read(|db| {
+                    Ok::<_, StorageError>(db.query_row(
+                        "SELECT payload FROM performance_operations WHERE instance_id=?1",
+                        [id.as_str()],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(persisted, serde_json::to_vec(&expected).unwrap());
+            assert!(!path.join("mods/current.jar").exists());
+            assert_eq!(
+                std::fs::read(path.join("mods/user.jar")).unwrap(),
+                b"untouched user file"
+            );
+            assert!(service.instances.admit(&id).is_err());
+            assert!(service.has_unsettled_effects());
+            if boundary == "after" {
+                let saved: Vec<u8> = service
+                    .storage
+                    .read(|db| {
+                        Ok::<_, StorageError>(db.query_row(
+                            "SELECT payload FROM performance_operations WHERE instance_id=?1",
+                            [fillers[3].instance_id.as_str()],
+                            |row| row.get(0),
+                        )?)
+                    })
+                    .unwrap();
+                assert_eq!(saved, filler_before);
+            } else {
+                assert_eq!(
+                    service.storage.read(pending_inventory).unwrap().1,
+                    MAX_PENDING_BYTES
+                );
+            }
+            service
+                .storage
+                .transaction(|tx| {
+                    tx.execute_batch("DROP TRIGGER fill_pending")?;
+                    Ok::<_, StorageError>(())
+                })
+                .unwrap();
+            for filler in &fillers {
+                service.finish(filler, None).unwrap();
+            }
+            // This Remove has independently verifiable absence; a lost rollback
+            // result would not acquire settlement proof merely by freeing bytes.
+            assert_eq!(service.recover_pending().await.unwrap(), 1);
+            assert_eq!(service.pending_count().unwrap(), 0);
+            assert!(!service.has_unsettled_effects());
+            service.instances.library().try_preserve().unwrap();
+        }
+    }
+
+    fn budget_command(instance: &InstanceId) -> PerformanceOperationStatus {
+        PerformanceOperationStatus {
+            id: uuid::Uuid::new_v4().to_string(),
+            instance_id: instance.to_string(),
+            action: "remove".into(),
+            state: "queued".into(),
+            error: None,
+            created_at: "2026-09-28T00:00:00Z".into(),
+            updated_at: "2026-09-28T00:00:00Z".into(),
+            history: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_budget_active_admission_preserves_transitions_and_rolls_back_growth() {
+        let (_root, service, admitted) = launch_fixture().await;
+        let id = admitted.record().instance.id.clone();
+        let mut commands: Vec<_> = (0..MAX_ACTIVE_COMMANDS)
+            .map(|_| budget_command(&id))
+            .collect();
+        service
+            .storage
+            .transaction(|tx| {
+                for command in &commands {
+                    write_command(tx, command)?;
+                }
+                Ok::<_, PerformanceMutationError>(())
+            })
+            .unwrap();
+        commands[0].state = "running".into();
+        service
+            .storage
+            .transaction(|tx| write_command(tx, &commands[0]))
+            .unwrap();
+        let extra = budget_command(&id);
+        assert!(matches!(
+            service.storage.transaction(|tx| write_command(tx, &extra)),
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        assert!(service.operation(&extra.id).unwrap().is_none());
+        commands[0].state = "unsettled".into();
+        service
+            .storage
+            .transaction(|tx| write_command(tx, &commands[0]))
+            .unwrap();
+        service
+            .storage
+            .transaction(|tx| write_command(tx, &extra))
+            .unwrap();
+        commands[0].state = "running".into();
+        assert!(matches!(
+            service
+                .storage
+                .transaction(|tx| write_command(tx, &commands[0])),
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        assert_eq!(
+            service.operation(&commands[0].id).unwrap().unwrap().state,
+            "unsettled"
+        );
+        commands[1].state = "failed".into();
+        service
+            .storage
+            .transaction(|tx| write_command(tx, &commands[1]))
+            .unwrap();
+        service
+            .storage
+            .transaction(|tx| write_command(tx, &commands[0]))
+            .unwrap();
+        commands[0].state = "complete".into();
+        service
+            .storage
+            .transaction(|tx| write_command(tx, &commands[0]))
+            .unwrap();
+        let injected = budget_command(&id);
+        let candidate = budget_command(&id);
+        service.storage.transaction(|tx| {
+            tx.execute_batch(&format!("CREATE TRIGGER inflate_active AFTER INSERT ON performance_commands WHEN NEW.id='{}' BEGIN INSERT INTO performance_commands VALUES('{}','{}','queued',CAST('{}' AS BLOB)); END;", candidate.id, injected.id, injected.instance_id, serde_json::to_string(&injected).unwrap()))?;
+            Ok::<_, StorageError>(())
+        }).unwrap();
+        assert!(matches!(
+            service
+                .storage
+                .transaction(|tx| write_command(tx, &candidate)),
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        assert!(service.operation(&candidate.id).unwrap().is_none());
+        assert!(service.operation(&injected.id).unwrap().is_none());
+        assert_eq!(
+            service.storage.read(active_command_count).unwrap(),
+            MAX_ACTIVE_COMMANDS - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_budget_active_restore_validates_the_whole_inventory_before_updates() {
+        let (_root, service, admitted) = launch_fixture().await;
+        let id = admitted.record().instance.id.clone();
+        drop(admitted);
+        let commands: Vec<_> = (0..=MAX_ACTIVE_COMMANDS)
+            .map(|_| budget_command(&id))
+            .collect();
+        service
+            .storage
+            .transaction(|tx| {
+                for command in &commands[..MAX_ACTIVE_COMMANDS] {
+                    write_command(tx, command)?;
+                }
+                let extra = &commands[MAX_ACTIVE_COMMANDS];
+                tx.execute(
+                    "INSERT INTO performance_commands VALUES(?1,?2,?3,?4)",
+                    params![
+                        extra.id,
+                        extra.instance_id,
+                        extra.state,
+                        serde_json::to_vec(extra).unwrap()
+                    ],
+                )?;
+                Ok::<_, PerformanceMutationError>(())
+            })
+            .unwrap();
+        assert!(matches!(
+            restore_budget_service(&service),
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        for command in &commands {
+            assert_eq!(
+                service.operation(&command.id).unwrap().as_ref(),
+                Some(command)
+            );
+        }
+        let mut extra = commands[MAX_ACTIVE_COMMANDS].clone();
+        extra.state = "failed".into();
+        service
+            .storage
+            .transaction(|tx| write_command(tx, &extra))
+            .unwrap();
+        let restored = restore_budget_service(&service).unwrap();
+        assert_eq!(service.storage.read(active_command_count).unwrap(), 0);
+        for command in &commands[..MAX_ACTIVE_COMMANDS] {
+            assert_eq!(
+                restored.operation(&command.id).unwrap().unwrap().state,
+                "interrupted"
+            );
+        }
+        assert_eq!(
+            restored.operation(&extra.id).unwrap().as_ref(),
+            Some(&extra)
+        );
+    }
+
+    #[test]
+    fn pending_budget_v2_indexes_active_reads_without_rewriting_v1_records() {
+        let storage = MetadataStore::in_memory_with_limits(crate::storage::StorageLimits {
+            max_vm_instructions: 10_000,
+            ..Default::default()
+        })
+        .unwrap();
+        storage.migrate(&[MIGRATION]).unwrap();
+        let command = budget_command(&InstanceId::new());
+        storage
+            .transaction(|tx| write_command(tx, &command))
+            .unwrap();
+        storage.migrate(&[MIGRATION, MIGRATION_V2]).unwrap();
+        for _ in 0..64 {
+            storage
+                .transaction(|tx| {
+                    for _ in 0..64 {
+                        let mut terminal = budget_command(&InstanceId::new());
+                        terminal.state = "complete".into();
+                        write_command(tx, &terminal)?;
+                    }
+                    Ok::<_, PerformanceMutationError>(())
+                })
+                .unwrap();
+        }
+        assert_eq!(storage.read(active_command_count).unwrap(), 1);
+        storage.read(|db| {
+            let bytes: Vec<u8> = db.query_row("SELECT payload FROM performance_commands WHERE id=?1", [&command.id], |row| row.get(0))?;
+            assert_eq!(bytes, serde_json::to_vec(&command).unwrap());
+            for sql in [
+                "EXPLAIN QUERY PLAN SELECT count(*) FROM (SELECT 1 FROM performance_commands WHERE state IN ('queued','running') LIMIT 129)",
+                "EXPLAIN QUERY PLAN SELECT id,instance_id,state,payload FROM performance_commands WHERE state IN ('queued','running') LIMIT 129",
+            ] {
+                let plan: Vec<String> = db.prepare(sql)?.query_map([], |row| row.get(3))?.collect::<Result<_, _>>()?;
+                assert!(plan.iter().any(|line| line.contains("performance_commands_active")), "{plan:?}");
+            }
+            Ok::<_, StorageError>(())
+        }).unwrap();
+    }
+
     fn restart_service(
         root: &std::path::Path,
         library_id: crate::library::LibraryId,
@@ -1978,6 +2586,7 @@ mod tests {
                 crate::instances::create::DUPLICATE_WITNESS_MIGRATION,
                 crate::content::install::MIGRATION,
                 MIGRATION,
+                MIGRATION_V2,
                 super::super::rules::MIGRATION,
             ])
             .unwrap();
@@ -2791,7 +3400,7 @@ mod tests {
     #[test]
     fn historical_command_batch_checks_ignored_writes_collisions_and_indexed_evidence() {
         let store = MetadataStore::in_memory().unwrap();
-        store.migrate(&[MIGRATION]).unwrap();
+        store.migrate(&[MIGRATION, MIGRATION_V2]).unwrap();
         let id = InstanceId::new();
         let first = historical(&id, 1);
         let second = historical(&id, 2);
@@ -2933,6 +3542,7 @@ mod tests {
                 crate::instances::create::DUPLICATE_WITNESS_MIGRATION,
                 crate::content::install::MIGRATION,
                 MIGRATION,
+                MIGRATION_V2,
                 super::super::rules::MIGRATION,
             ])
             .unwrap();

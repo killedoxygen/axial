@@ -43,7 +43,7 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::watch;
+use tokio::{sync::watch, task::JoinSet};
 
 pub const MIGRATION: Migration = Migration {
     id: "install.v1",
@@ -161,6 +161,12 @@ struct Inner {
     latest: watch::Sender<InstallQueueStateResponse>,
     events_closed: AtomicBool,
     scheduling: AtomicBool,
+    observers: Mutex<Observers>,
+    observer_join: tokio::sync::Mutex<()>,
+}
+struct Observers {
+    closed: bool,
+    tasks: JoinSet<()>,
 }
 struct State {
     epoch: String,
@@ -277,6 +283,11 @@ impl InstallQueue {
                 latest,
                 events_closed: AtomicBool::new(false),
                 scheduling: AtomicBool::new(false),
+                observers: Mutex::new(Observers {
+                    closed: false,
+                    tasks: JoinSet::new(),
+                }),
+                observer_join: tokio::sync::Mutex::new(()),
             }),
             telemetry: None,
             content: None,
@@ -334,6 +345,48 @@ impl InstallQueue {
     pub fn close_events(&self) {
         self.inner.events_closed.store(true, Ordering::Release);
         self.inner.latest.send_replace(self.snapshot());
+    }
+
+    /// Join notification and scheduling waiters after accepted work has joined.
+    /// Cancellation leaves their handles here for the next shutdown caller.
+    pub async fn join_observers(&self) -> Result<(), InstallError> {
+        let _joining = self.inner.observer_join.lock().await;
+        {
+            let state = self.inner.state.lock().expect("install queue lock");
+            if !state.closed || self.inner.owner.shutdown_receipt().is_none() {
+                return Err(InstallError::Busy);
+            }
+            self.inner
+                .observers
+                .lock()
+                .expect("install observers lock")
+                .closed = true;
+        }
+        std::future::poll_fn(|context| {
+            let mut observers = self.inner.observers.lock().expect("install observers lock");
+            loop {
+                match observers.tasks.poll_join_next(context) {
+                    std::task::Poll::Ready(Some(result)) => observer_finished(result),
+                    std::task::Poll::Ready(None) => return std::task::Poll::Ready(()),
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            }
+        })
+        .await;
+        Ok(())
+    }
+
+    // Retain this guard through work acceptance and waiter registration so a
+    // just-completed worker cannot be missed by shutdown.
+    fn observers(&self) -> Result<std::sync::MutexGuard<'_, Observers>, InstallError> {
+        let mut observers = self.inner.observers.lock().expect("install observers lock");
+        if observers.closed {
+            return Err(InstallError::Closed);
+        }
+        while let Some(result) = observers.tasks.try_join_next() {
+            observer_finished(result);
+        }
+        Ok(observers)
     }
     /// Call after the shared task owner joins. Queued intents remain durable for
     /// restart; their pins can be released because they never began effects.
@@ -1028,91 +1081,125 @@ impl InstallQueue {
         };
         let queue = self.clone();
         let worker_id = id.clone();
-        let task = self.inner.owner.try_spawn(
-            (pin.clone(), lease, operation.clone()),
-            move |_| async move {
-                let retained = queue
-                    .inner
-                    .state
-                    .lock()
-                    .expect("install queue lock")
-                    .entries
-                    .get_mut(&worker_id)
-                    .and_then(|entry| entry.retained.take());
-                let result = queue
-                    .recover_publication(&worker_id, &pin, &operation, &item, retained, reconstruct)
-                    .await;
-                let result = match result {
-                    Ok(RecoveryAction::Requeue) => return queue.requeue_recovered(&worker_id),
-                    Ok(RecoveryAction::Complete) => Ok(()),
-                    Ok(RecoveryAction::Continue(continuation)) => {
-                        match continue_loader(operation.clone(), continuation, worker_id.clone())
-                            .await
-                        {
-                            Ok(receipt) => {
-                                queue
-                                    .settle_receipt(&worker_id, &pin, operation.clone(), receipt)
-                                    .await
+        let receiver = (|| -> Result<_, InstallError> {
+            let mut observers = self.observers()?;
+            let task = self
+                .inner
+                .owner
+                .try_spawn(
+                    (pin.clone(), lease, operation.clone()),
+                    move |_| async move {
+                        let retained = queue
+                            .inner
+                            .state
+                            .lock()
+                            .expect("install queue lock")
+                            .entries
+                            .get_mut(&worker_id)
+                            .and_then(|entry| entry.retained.take());
+                        let result = queue
+                            .recover_publication(
+                                &worker_id,
+                                &pin,
+                                &operation,
+                                &item,
+                                retained,
+                                reconstruct,
+                            )
+                            .await;
+                        let result = match result {
+                            Ok(RecoveryAction::Requeue) => {
+                                return queue.requeue_recovered(&worker_id);
                             }
-                            Err(LoaderInstallError::PublicationIndeterminate(recovery)) => {
-                                Err(WorkFailure::Unsettled(RetainedInstall::LoaderPublication(
-                                    recovery,
-                                )))
+                            Ok(RecoveryAction::Complete) => Ok(()),
+                            Ok(RecoveryAction::Continue(continuation)) => {
+                                match continue_loader(
+                                    operation.clone(),
+                                    continuation,
+                                    worker_id.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(receipt) => {
+                                        queue
+                                            .settle_receipt(
+                                                &worker_id,
+                                                &pin,
+                                                operation.clone(),
+                                                receipt,
+                                            )
+                                            .await
+                                    }
+                                    Err(LoaderInstallError::PublicationIndeterminate(recovery)) => {
+                                        Err(WorkFailure::Unsettled(
+                                            RetainedInstall::LoaderPublication(recovery),
+                                        ))
+                                    }
+                                    Err(error) => {
+                                        log_loader_failure(&error);
+                                        queue
+                                            .classify_failure(
+                                                &worker_id,
+                                                &operation,
+                                                &item.version_id,
+                                                error,
+                                            )
+                                            .await
+                                    }
+                                }
                             }
-                            Err(error) => {
-                                log_loader_failure(&error);
-                                queue
-                                    .classify_failure(
-                                        &worker_id,
-                                        &operation,
-                                        &item.version_id,
-                                        error,
-                                    )
-                                    .await
+                            Err(failure) => Err(failure),
+                        };
+                        match result {
+                            Ok(())
+                                if queue.complete(&worker_id, InstallOutcome::Succeeded, None) =>
+                            {
+                                Ok(())
+                            }
+                            Err(WorkFailure::Failed(error))
+                                if queue.complete(
+                                    &worker_id,
+                                    InstallOutcome::Failed,
+                                    Some(error),
+                                ) =>
+                            {
+                                Ok(())
+                            }
+                            Err(WorkFailure::Unsettled(retained)) => {
+                                queue.retain_unsettled(&worker_id, retained);
+                                Err(InstallError::SettlementRequired)
+                            }
+                            _ => {
+                                queue.retain_unsettled(&worker_id, RetainedInstall::Retry);
+                                Err(InstallError::Storage)
                             }
                         }
-                    }
-                    Err(failure) => Err(failure),
-                };
-                match result {
-                    Ok(()) if queue.complete(&worker_id, InstallOutcome::Succeeded, None) => Ok(()),
-                    Err(WorkFailure::Failed(error))
-                        if queue.complete(&worker_id, InstallOutcome::Failed, Some(error)) =>
-                    {
-                        Ok(())
-                    }
-                    Err(WorkFailure::Unsettled(retained)) => {
-                        queue.retain_unsettled(&worker_id, retained);
-                        Err(InstallError::SettlementRequired)
-                    }
-                    _ => {
-                        queue.retain_unsettled(&worker_id, RetainedInstall::Retry);
-                        Err(InstallError::Storage)
-                    }
-                }
-            },
-        );
-        match task {
-            Ok(task) => {
-                let queue = self.clone();
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                // Joining and rescheduling survive the disposable recovery
-                // caller, just as they do for an ordinary install worker.
-                tokio::spawn(async move {
-                    let result = task
-                        .join()
-                        .await
-                        .unwrap_or(Err(InstallError::SettlementRequired));
-                    queue.recovery_finished(&id, result.is_ok());
-                    let _ = sender.send(result);
-                });
-                receiver
+                    },
+                )
+                .map_err(|_| InstallError::Busy)?;
+            let queue = self.clone();
+            let id = id.clone();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            // Joining and rescheduling survive the disposable recovery
+            // caller, just as they do for an ordinary install worker.
+            observers.tasks.spawn(async move {
+                let result = task
+                    .join()
                     .await
-                    .unwrap_or(Err(InstallError::SettlementRequired))
-            }
-            Err(_) => {
+                    .unwrap_or(Err(InstallError::SettlementRequired));
+                queue.recovery_finished(&id, result.is_ok());
+                drop(queue);
+                let _ = sender.send(result);
+            });
+            Ok(receiver)
+        })();
+        match receiver {
+            Ok(receiver) => receiver
+                .await
+                .unwrap_or(Err(InstallError::SettlementRequired)),
+            Err(error) => {
                 self.recovery_finished(&id, false);
-                Err(InstallError::Busy)
+                Err(error)
             }
         }
     }
@@ -1528,7 +1615,11 @@ impl InstallQueue {
         }
         let queue = self.clone();
         let mut queue_changes = self.inner.latest.subscribe();
-        tokio::spawn(async move {
+        let Ok(mut observers) = self.observers() else {
+            self.inner.scheduling.store(false, Ordering::Release);
+            return;
+        };
+        observers.tasks.spawn(async move {
             loop {
                 {
                     let state = queue.inner.state.lock().expect("install queue lock");
@@ -1603,6 +1694,9 @@ impl InstallQueue {
         if state.closed || state.active.is_some() || self.inner.owner.status().closing {
             return;
         }
+        let Ok(mut observers) = self.observers() else {
+            return;
+        };
         let Some(id) = state.queued.front().cloned() else {
             return;
         };
@@ -1701,7 +1795,7 @@ impl InstallQueue {
             let queue = self.clone();
             // This waiter owns no effects. Every new worker is accepted by the
             // task owner only after the previous one has fully joined.
-            tokio::spawn(async move {
+            observers.tasks.spawn(async move {
                 queue.join_worker(&id, handle).await;
             });
         }
@@ -2095,75 +2189,84 @@ impl InstallQueue {
             .with_progress(self.content_progress(id));
         let queue = self.clone();
         let worker_id = id.to_owned();
-        let task = self.inner.owner.try_spawn(
-            (pin, lease.clone(), setup.clone()),
-            move |cancel| async move {
-                if let Some((outcome, error)) = settled {
-                    queue.finish_content(
-                        &worker_id,
-                        lease,
-                        match error {
-                            Some(error) => Err(WorkFailure::Failed(error)),
-                            None => Ok(outcome),
-                        },
-                    );
-                    return;
-                }
-                let pending = crate::content::install::has_pending(&queue.inner.storage, &instance)
-                    .unwrap_or(true);
-                let result = if pending {
-                    let result = match mutations.resume(&instance) {
-                        Ok(task) => task
-                            .join()
-                            .await
-                            .map_err(|_| MutationError::Pending)
-                            .and_then(|result| result)
-                            .map(|_| ()),
-                        Err(error) => Err(error),
-                    };
-                    let result = queue.content_outcome(&instance, result, &cancel);
-                    if matches!(result, Ok(InstallOutcome::Succeeded)) && setup.is_some() {
-                        queue
-                            .run_content(&worker_id, &instance_id, action, &cancel)
-                            .await
-                    } else {
-                        result
-                    }
-                } else if setup.is_some() {
-                    queue
-                        .run_content(&worker_id, &instance_id, action, &cancel)
-                        .await
-                } else if retained {
-                    Err(WorkFailure::Unsettled(RetainedInstall::Content(None)))
+        let receiver = (|| -> Result<_, InstallError> {
+            let mut observers = self.observers()?;
+            let task = self
+                .inner
+                .owner
+                .try_spawn(
+                    (pin, lease.clone(), setup.clone()),
+                    move |cancel| async move {
+                        if let Some((outcome, error)) = settled {
+                            queue.finish_content(
+                                &worker_id,
+                                lease,
+                                match error {
+                                    Some(error) => Err(WorkFailure::Failed(error)),
+                                    None => Ok(outcome),
+                                },
+                            );
+                            return;
+                        }
+                        let pending =
+                            crate::content::install::has_pending(&queue.inner.storage, &instance)
+                                .unwrap_or(true);
+                        let result = if pending {
+                            let result = match mutations.resume(&instance) {
+                                Ok(task) => task
+                                    .join()
+                                    .await
+                                    .map_err(|_| MutationError::Pending)
+                                    .and_then(|result| result)
+                                    .map(|_| ()),
+                                Err(error) => Err(error),
+                            };
+                            let result = queue.content_outcome(&instance, result, &cancel);
+                            if matches!(result, Ok(InstallOutcome::Succeeded)) && setup.is_some() {
+                                queue
+                                    .run_content(&worker_id, &instance_id, action, &cancel)
+                                    .await
+                            } else {
+                                result
+                            }
+                        } else if setup.is_some() {
+                            queue
+                                .run_content(&worker_id, &instance_id, action, &cancel)
+                                .await
+                        } else if retained {
+                            Err(WorkFailure::Unsettled(RetainedInstall::Content(None)))
+                        } else {
+                            Err(WorkFailure::Failed(InstallError::ContentInterrupted))
+                        };
+                        queue.finish_content(&worker_id, lease, result);
+                    },
+                )
+                .map_err(|_| InstallError::Closed)?;
+            let queue = self.clone();
+            let id = id.to_owned();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            observers.tasks.spawn(async move {
+                let joined = task.join().await.is_ok();
+                let settled = joined && queue.status(&id).is_ok_and(|status| status.done);
+                queue.recovery_finished(&id, settled);
+                drop(queue);
+                let _ = sender.send(if settled {
+                    Ok(())
                 } else {
-                    Err(WorkFailure::Failed(InstallError::ContentInterrupted))
-                };
-                queue.finish_content(&worker_id, lease, result);
-            },
-        );
-        let task = match task {
-            Ok(task) => task,
-            Err(_) => {
-                self.recovery_finished(id, false);
-                return Err(InstallError::Closed);
-            }
-        };
-        let queue = self.clone();
-        let id = id.to_owned();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let joined = task.join().await.is_ok();
-            let settled = joined && queue.status(&id).is_ok_and(|status| status.done);
-            queue.recovery_finished(&id, settled);
-            let _ = sender.send(if settled {
-                Ok(())
-            } else {
-                Err(InstallError::SettlementRequired)
+                    Err(InstallError::SettlementRequired)
+                });
             });
-        });
-        receiver
-            .await
-            .map_err(|_| InstallError::SettlementRequired)?
+            Ok(receiver)
+        })();
+        match receiver {
+            Ok(receiver) => receiver
+                .await
+                .map_err(|_| InstallError::SettlementRequired)?,
+            Err(error) => {
+                self.recovery_finished(id, false);
+                Err(error)
+            }
+        }
     }
 
     async fn classify_failure<E: Send + 'static>(
@@ -2486,6 +2589,16 @@ struct DownloadFailureDiagnostic {
     is_connect: Option<bool>,
     is_decode: Option<bool>,
     runtime_source_kind: Option<&'static str>,
+}
+
+fn observer_finished(result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result {
+        tracing::warn!(
+            panicked = error.is_panic(),
+            cancelled = error.is_cancelled(),
+            "Install queue observer did not finish normally."
+        );
+    }
 }
 
 fn log_loader_failure(error: &LoaderInstallError) {
@@ -3201,6 +3314,77 @@ pub(crate) mod tests {
         (root, storage, library, exclusions, owner, queue)
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn queue_shutdown_releases_unpolled_observer_before_profile_reopen() {
+        for schedule_observer in [false, true] {
+            let (root, storage, library, exclusions, owner, isolated_queue) = fixture();
+            drop(isolated_queue);
+            let runtime = library.runtime_cache().unwrap();
+            let queue = InstallQueue::new(
+                storage,
+                library.clone(),
+                exclusions.clone(),
+                owner.clone(),
+                runtime.clone(),
+            )
+            .unwrap();
+            assert_eq!(queue.join_observers().await, Err(InstallError::Busy));
+            let pin = library.admit().unwrap();
+            let blocker = exclusions
+                .try_acquire(
+                    std::iter::empty::<String>(),
+                    [library_artifact(&pin.library_id().to_string())],
+                )
+                .unwrap();
+            if schedule_observer {
+                queue
+                    .enqueue(InstallQueueRequest::Vanilla {
+                        version_id: "1.21.4".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(queue.inner.scheduling.load(Ordering::Acquire));
+            }
+            queue.close_admission();
+            library.close_admission();
+            assert_eq!(queue.join_observers().await, Err(InstallError::Busy));
+            owner
+                .shutdown(std::time::Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(owner.status().is_idle());
+            assert_eq!(
+                queue.inner.scheduling.load(Ordering::Acquire),
+                schedule_observer
+            );
+            if schedule_observer {
+                let mut first_join = Box::pin(queue.join_observers());
+                assert!(futures_util::poll!(&mut first_join).is_pending());
+                let mut second_join = Box::pin(queue.join_observers());
+                assert!(futures_util::poll!(&mut second_join).is_pending());
+                drop(first_join);
+                second_join.await.unwrap();
+            } else {
+                queue.join_observers().await.unwrap();
+            }
+            assert!(matches!(queue.observers(), Err(InstallError::Closed)));
+            assert!(queue.inner.observers.lock().unwrap().tasks.is_empty());
+            drop(blocker);
+            drop(pin);
+            queue.shutdown_queued().unwrap();
+            runtime.settle().unwrap();
+            library.try_preserve().unwrap();
+            drop(queue);
+            drop(runtime);
+            drop(library);
+            let reopened = LibraryLifecycle::open(root.path());
+            assert!(
+                matches!(reopened, LibraryOpenOutcome::Ready(_)),
+                "queue observer={schedule_observer}: {reopened:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn loader_queue_labels_preserve_identity_across_queued_active_and_failed_views() {
         use axial_minecraft::loaders::{build_id_for, installed_version_id_for};
@@ -3871,6 +4055,7 @@ pub(crate) mod tests {
                     crate::instances::delete::MIGRATION,
                     crate::content::install::MIGRATION,
                     crate::performance::mutation::MIGRATION,
+                    crate::performance::mutation::MIGRATION_V2,
                 ])
                 .unwrap();
             let directories = InstanceDirectories::new(

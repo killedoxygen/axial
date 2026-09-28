@@ -290,6 +290,15 @@ impl ServerHandle {
             .map_err(|_| {
                 "Application work has not settled. The local API remains available.".to_string()
             })?;
+        if !matches!(
+            tokio::time::timeout(DOMAIN_SHUTDOWN_TIMEOUT, self.installs.join_observers()).await,
+            Ok(Ok(()))
+        ) {
+            return Err(
+                "Installation status workers have not joined. The local API remains available."
+                    .into(),
+            );
+        }
         self.settle_files().await?;
         self.installs.close_events();
         self.shutdown.send_replace(true);
@@ -533,7 +542,8 @@ async fn start_profile_inner(
             axial_app::install::queue::MIGRATION, axial_app::install::queue::MIGRATION_V2,
             axial_app::content::install::MIGRATION, axial_app::performance::rules::MIGRATION,
             axial_app::performance::rules::IMPORT_MIGRATION,
-            axial_app::performance::mutation::MIGRATION, axial_app::performance::benchmarks::MIGRATION,
+            axial_app::performance::mutation::MIGRATION, axial_app::performance::mutation::MIGRATION_V2,
+            axial_app::performance::benchmarks::MIGRATION,
             axial_app::performance::benchmarks::MIGRATION_V2,
             axial_app::skins::store::MIGRATION, axial_app::skins::store::IMPORT_MIGRATION,
             axial_app::launch::coordinator::INTENT_MIGRATION,

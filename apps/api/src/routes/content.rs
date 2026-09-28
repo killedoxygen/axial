@@ -514,6 +514,7 @@ mod tests {
                     axial_app::instances::delete::MIGRATION,
                     axial_app::content::install::MIGRATION,
                     axial_app::performance::mutation::MIGRATION,
+                    axial_app::performance::mutation::MIGRATION_V2,
                     axial_app::install::queue::MIGRATION,
                     axial_app::install::queue::MIGRATION_V2,
                 ])

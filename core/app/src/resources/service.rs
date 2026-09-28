@@ -721,6 +721,7 @@ mod tests {
                 crate::instances::delete::MIGRATION,
                 crate::content::install::MIGRATION,
                 crate::performance::mutation::MIGRATION,
+                crate::performance::mutation::MIGRATION_V2,
                 crate::performance::rules::MIGRATION,
             ])
             .unwrap();

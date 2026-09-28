@@ -2205,6 +2205,7 @@ mod tests {
                 axial_app::instances::delete::MIGRATION,
                 axial_app::content::install::MIGRATION,
                 axial_app::performance::mutation::MIGRATION,
+                axial_app::performance::mutation::MIGRATION_V2,
             ])
             .unwrap();
         fixture

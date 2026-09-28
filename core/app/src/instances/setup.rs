@@ -515,6 +515,7 @@ impl SetupService {
                 }
                 Err(_) => Err(InstanceError::SettlementRequired),
             };
+            drop(installs);
             let _ = sender.send(result);
         });
         let (instance, snapshot, view_model) = receiver

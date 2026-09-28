@@ -84,6 +84,7 @@ impl Fixture {
                 crate::instances::delete::MIGRATION,
                 crate::content::install::MIGRATION,
                 crate::performance::mutation::MIGRATION,
+                crate::performance::mutation::MIGRATION_V2,
             ])
             .unwrap();
         let tasks = TaskOwner::new(16).unwrap();

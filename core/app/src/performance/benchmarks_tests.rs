@@ -312,6 +312,7 @@ fn service_with_directories(
             crate::install::queue::MIGRATION_V2,
             crate::performance::rules::MIGRATION,
             crate::performance::mutation::MIGRATION,
+            crate::performance::mutation::MIGRATION_V2,
             crate::skins::store::MIGRATION,
             crate::launch::coordinator::INTENT_MIGRATION,
             crate::launch::coordinator::INTENT_TERMINAL_MIGRATION,

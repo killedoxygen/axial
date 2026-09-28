@@ -37,6 +37,7 @@ fn fixture() -> (tempfile::TempDir, SetupService, Arc<AccountDirectory>) {
             super::super::delete::MIGRATION,
             crate::content::install::MIGRATION,
             crate::performance::mutation::MIGRATION,
+            crate::performance::mutation::MIGRATION_V2,
             crate::accounts::directory::MIGRATION,
             crate::install::queue::MIGRATION,
             crate::install::queue::MIGRATION_V2,

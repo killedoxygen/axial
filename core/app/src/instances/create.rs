@@ -1327,6 +1327,7 @@ pub(crate) mod tests {
                 super::super::delete::MIGRATION,
                 crate::content::install::MIGRATION,
                 crate::performance::mutation::MIGRATION,
+                crate::performance::mutation::MIGRATION_V2,
                 crate::launch::reports::REPORT_MIGRATION,
                 crate::performance::benchmarks::MIGRATION,
                 crate::performance::benchmarks::MIGRATION_V2,
