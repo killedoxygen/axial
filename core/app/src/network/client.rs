@@ -399,7 +399,7 @@ async fn decode_zlib(
 ) -> Result<Vec<u8>, DownloadError> {
     let mut decoder = flate2::Decompress::new(true);
     let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         check_cancelled(cancellation)?;
         let previous_in = decoder.total_in();
@@ -443,7 +443,7 @@ async fn decode_reader(
     cancellation: &CancellationToken,
 ) -> Result<Vec<u8>, DownloadError> {
     let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         check_cancelled(cancellation)?;
         let read = reader

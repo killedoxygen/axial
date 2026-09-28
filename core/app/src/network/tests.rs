@@ -364,6 +364,96 @@ fn deflate(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn provider_fetch_futures_leave_room_for_the_setup_call_chain() {
+    let client = client();
+    let cancel = CancellationToken::new();
+    let request = || public_request("https://example.com/artifact");
+    for (name, size) in [
+        (
+            "fetch",
+            std::mem::size_of_val(&client.fetch(request(), &cancel)),
+        ),
+        (
+            "fetch_public",
+            std::mem::size_of_val(&client.fetch_public(request(), &cancel)),
+        ),
+    ] {
+        assert!(
+            size <= 64 * 1024,
+            "provider {name} future retains {size} bytes before setup/queue nesting"
+        );
+    }
+}
+
+#[test]
+fn provider_fetch_decoding_fits_default_worker_stack() {
+    const CHILD: &str = "AXIAL_PROVIDER_STACK_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "network::tests::provider_fetch_decoding_fits_default_worker_stack",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "provider worker failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // Use Tokio's normal worker budget, including future construction and polling.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_stack_size(2 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::spawn(async {
+            for (encoding, body) in [
+                ("identity", b"abc".to_vec()),
+                ("gzip", gzip(b"abc")),
+                ("deflate", deflate(b"abc")),
+            ] {
+                let encoded_bytes = body.len() as u64;
+                let fixture = Fixture::serve(vec![response(
+                    200,
+                    &format!("Content-Encoding: {encoding}\r\n"),
+                    &body,
+                )])
+                .await;
+                let result = client()
+                    .fetch(
+                        fixture.request(
+                            bounded(),
+                            IntegrityPolicy::Checksum {
+                                checksum: Checksum::from_hex(HashAlgorithm::Sha256, ABC_SHA256)
+                                    .unwrap(),
+                                expected_size: Some(3),
+                            },
+                        ),
+                        &CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.bytes(), b"abc");
+                assert_eq!(result.evidence().encoded_bytes, encoded_bytes);
+                assert_eq!(result.evidence().decoded_bytes, 3);
+                assert_eq!(fixture.finish().await.len(), 1);
+            }
+        })
+        .await
+        .unwrap();
+    });
+}
+
+#[test]
 fn production_policy_requires_explicit_https_origins() {
     let policy =
         OriginPolicy::https(["https://example.com", "https://cdn.example.com:8443"], 3).unwrap();
