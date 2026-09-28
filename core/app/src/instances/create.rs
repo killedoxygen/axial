@@ -804,6 +804,12 @@ impl InstanceService {
                 if completed != 1 {
                     return Err(InstanceError::Conflict);
                 }
+                if let Some(history) = &history {
+                    history
+                        .reports
+                        .verify_in(tx)
+                        .map_err(super::import::report_error)?;
+                }
                 Ok(committed)
             })?;
         self.emit_created(&committed.instance);
@@ -1100,6 +1106,9 @@ impl InstanceService {
                     )?;
                     if completed != 1 {
                         return Err(InstanceError::Conflict);
+                    }
+                    if let Some(history) = &history {
+                        history.reports.verify_in(tx).map_err(super::import::report_error)?;
                     }
                     Ok(committed)
                 })?;

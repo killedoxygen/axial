@@ -186,6 +186,178 @@ fn malformed_other_instance_history_blocks_import_without_losing_preview() {
 }
 
 #[test]
+fn archived_reports_share_publication_with_survivors_and_keep_pruned_comparisons() {
+    let fixture = Fixture::new();
+    write(&fixture, "session-a.json", &report());
+    let mut archived = report();
+    archived["session_id"] = json!("session-b");
+    archived["instance_id"] = json!(SECOND);
+    archived["comparison"] = json!({"baseline_session_id":"session-pruned","baseline_recorded_at":"2025-12-31T00:00:00.000Z",
+        "baseline":{"performance_mode":"vanilla","version_id":"1.21.1","requested_memory_mb":1024,"device_tier":"mid"},
+        "matched_sample_count":3,"metric_name":"boot_duration_ms","current_value_ms":1000,"baseline_value_ms":2000,"delta_ms":-1000,"delta_percent":-50.0});
+    write(&fixture, "session-b.json", &archived);
+    let before = crate::import::tests::snapshot(&fixture.baseline);
+    let inventory = fixture.capture();
+    let source = inventory.source_identity().unwrap();
+    let batch = prepare_archived_reports(&inventory).unwrap();
+    assert_eq!(batch.completion_proof(&source).unwrap().count(), 1);
+    let history = prepare_history(&inventory).unwrap();
+    assert_eq!(history.supported_records().len(), 2);
+    let destination = InstanceId::new();
+    let bound = history
+        .for_instance(INSTANCE)
+        .unwrap()
+        .bind_instance(&destination)
+        .unwrap();
+    let metadata = Arc::new(MetadataStore::in_memory().unwrap());
+    let reports = LaunchReportStore::new(metadata.clone()).unwrap();
+    metadata
+        .transaction(|tx| bound.reports.insert_in(tx))
+        .unwrap();
+    let archived_id = imported_id(&source, "session-b");
+    let saved = reports.get(&archived_id).unwrap().unwrap();
+    assert_eq!(saved.instance_id, format!("archived-{source}-{SECOND}"));
+    assert_eq!(
+        saved.comparison.as_ref().unwrap().baseline_session_id,
+        imported_id(&source, "session-pruned")
+    );
+    assert!(
+        reports
+            .get(&saved.comparison.as_ref().unwrap().baseline_session_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        reports
+            .get(&imported_id(&source, "session-a"))
+            .unwrap()
+            .unwrap()
+            .instance_id,
+        destination.as_str()
+    );
+    metadata.transaction(|tx| batch.insert_in(tx)).unwrap();
+    assert_eq!(reports.get(&archived_id).unwrap(), Some(saved));
+    assert_eq!(reports.list_recent(25).unwrap().len(), 2);
+    assert_eq!(crate::import::tests::snapshot(&fixture.baseline), before);
+}
+
+#[test]
+fn archived_reports_require_original_registry_identity_evidence() {
+    for variant in [
+        "schema",
+        "missing_pending",
+        "missing_last",
+        "null_last",
+        "duplicate_outer",
+        "duplicate_id_field",
+        "too_many_pending",
+        "dangling_selection",
+    ] {
+        let fixture = Fixture::new();
+        let path = fixture.baseline.join("instances.json");
+        let mut registry: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        match variant {
+            "schema" => registry["schema_version"] = json!(4),
+            "missing_pending" => {
+                registry
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("pending_deletions");
+            }
+            "missing_last" => {
+                registry.as_object_mut().unwrap().remove("last_instance_id");
+            }
+            "null_last" => registry["last_instance_id"] = Value::Null,
+            "too_many_pending" => registry["pending_deletions"] = json!([{}, {}]),
+            "dangling_selection" => registry["last_instance_id"] = json!(SECOND),
+            _ => {}
+        }
+        let mut raw = serde_json::to_string(&registry).unwrap();
+        if variant == "duplicate_outer" {
+            raw.insert_str(1, "\"instances\":[],");
+        } else if variant == "duplicate_id_field" {
+            raw = raw.replacen(
+                &format!("\"id\":\"{INSTANCE}\""),
+                &format!("\"id\":\"{SECOND}\",\"id\":\"{INSTANCE}\""),
+                1,
+            );
+        }
+        fs::write(path, raw).unwrap();
+        let mut archived = report();
+        archived["instance_id"] = json!(SECOND);
+        write(&fixture, "session-a.json", &archived);
+        let inventory = fixture.capture();
+        let result = prepare_archived_reports(&inventory);
+        if variant == "dangling_selection" {
+            assert_eq!(
+                result
+                    .unwrap()
+                    .completion_proof(&inventory.source_identity().unwrap())
+                    .unwrap()
+                    .count(),
+                1
+            );
+        } else {
+            assert!(result.is_err(), "{variant}");
+            assert!(inventory.preview().metadata_import_available, "{variant}");
+        }
+    }
+}
+
+#[test]
+fn archived_reports_do_not_waive_live_reports_suites_or_unsettled_journals() {
+    for obligation in ["live_report", "archived_suite", "journal", "bad_archive"] {
+        let fixture = Fixture::new();
+        let mut archived = report();
+        archived["instance_id"] = json!(SECOND);
+        if obligation == "bad_archive" {
+            archived["outcome"] = json!("running");
+        }
+        write(&fixture, "session-a.json", &archived);
+        match obligation {
+            "live_report" => {
+                let mut live = report();
+                live["session_id"] = json!("session-live");
+                live["outcome"] = json!("running");
+                write(&fixture, "session-live.json", &live);
+            }
+            "archived_suite" => {
+                let mut archived_suite = suite();
+                archived_suite["instance_id"] = json!(SECOND);
+                write_benchmark(&fixture, "suites", SUITE, &archived_suite);
+            }
+            "journal" => {
+                let mut journal = crate::import::tests::successful_install_journal();
+                journal["entries"][0]["status"] = json!("Running");
+                let path = fixture.baseline.join("state/operation-journals.json");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+            }
+            _ => {}
+        }
+        let inventory = fixture.capture();
+        assert!(prepare_history(&inventory).is_err(), "{obligation}");
+        assert!(
+            !inventory.preview().instances[0].ordinary_import_available,
+            "{obligation}"
+        );
+        let batch = prepare_archived_reports(&inventory);
+        if obligation == "bad_archive" {
+            assert!(batch.is_err());
+        } else {
+            assert_eq!(
+                batch
+                    .unwrap()
+                    .completion_proof(&inventory.source_identity().unwrap())
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
 fn terminal_conversion_preserves_neutral_fields_comparison_and_source_bytes() {
     let fixture = Fixture::new();
     let mut value = report();
@@ -297,7 +469,7 @@ fn malformed_nonterminal_ambiguous_and_lossy_reports_remain_blocked() {
         ("outcome", json!("running")),
         ("outcome", json!("degraded")),
         ("outcome", json!("stopped")),
-        ("instance_id", json!("0000000000000002")),
+        ("instance_id", json!("not-an-instance")),
         ("session_id", json!("another-session")),
         ("launched_at", json!("2026-01-01T00:00:00Z")),
         ("recorded_at", json!("2025-01-01T00:00:00.000Z")),

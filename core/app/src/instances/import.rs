@@ -1212,6 +1212,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_creation_write_cannot_acknowledge_corrupted_report_history() {
+        for phase in ["initial", "ready", "published"] {
+            let source = Fixture::new();
+            add_history(&source, "0000000000000001", "session-a");
+            let (root, service) = super::super::create::tests::fixture();
+            let imported = prepared(&source);
+            let id = if phase == "initial" {
+                imported.instance().id.clone()
+            } else {
+                interrupted(&service, &imported, phase)
+            };
+            service.registry().storage().transaction(|tx| -> InstanceResult<()> {
+                tx.execute_batch("CREATE TRIGGER corrupt_final_report AFTER UPDATE OF phase ON instance_creations WHEN NEW.phase='complete' BEGIN DELETE FROM launch_reports; END;")?;
+                Ok(())
+            }).unwrap();
+            assert!(
+                matches!(
+                    service
+                        .import_instance(imported)
+                        .unwrap()
+                        .join()
+                        .await
+                        .unwrap(),
+                    Err(InstanceError::Conflict)
+                ),
+                "{phase}"
+            );
+            assert!(service.registry().list().unwrap().is_empty());
+            assert_eq!(service.pending().unwrap()[0].instance_id, id);
+            assert!(reports(root.path()).is_empty());
+            service
+                .registry()
+                .storage()
+                .transaction(|tx| -> InstanceResult<()> {
+                    tx.execute_batch("DROP TRIGGER corrupt_final_report")?;
+                    Ok(())
+                })
+                .unwrap();
+            let recovered = service
+                .import_instance(prepared(&source))
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.id, id);
+            assert_eq!(reports(root.path()).len(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn history_and_visibility_roll_back_together_then_recover_with_reserved_id() {
         for phase in ["initial", "ready", "published"] {
             let source = Fixture::new();

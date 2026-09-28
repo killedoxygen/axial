@@ -56,6 +56,7 @@ pub(crate) struct PreparedHistory {
     drivers: Vec<BenchmarkSuiteDriverStatus>,
     operations: Vec<HistoricalOperation>,
     global_installs: Arc<[PreparedInstallOperation]>,
+    archived_reports: Arc<PreparedReportImport>,
     content: Vec<PreparedInstallOperation>,
     rules: Option<CompletedRulesImport>,
 }
@@ -109,9 +110,13 @@ impl PreparedHistory {
         for operation in &mut operations {
             operation.instance_id = instance.clone();
         }
+        let mut reports =
+            PreparedReportImport::prepare(reports).map_err(|_| ImportError::InvalidData)?;
+        reports
+            .append(&self.archived_reports)
+            .map_err(|_| ImportError::InvalidData)?;
         Ok(BoundHistory {
-            reports: PreparedReportImport::prepare(reports)
-                .map_err(|_| ImportError::InvalidData)?,
+            reports,
             benchmarks: PreparedBenchmarkImport::prepare(suites, self.drivers.clone())
                 .map_err(|_| ImportError::InvalidData)?,
             operations: PreparedOperationImport::prepare(operations)
@@ -143,6 +148,11 @@ pub(super) fn prepare_history_with_rules(
         inventory.validate_rules_completion(rules)?;
     }
     let source = inventory.source_identity()?;
+    source_instance_ids(inventory)?;
+    let empty_archived = Arc::new(
+        PreparedReportImport::prepare_archived(&source, Vec::new())
+            .map_err(|_| ImportError::InvalidData)?,
+    );
     let mut prepared = PreparedSourceHistory {
         instances: inventory
             .instances()
@@ -157,6 +167,7 @@ pub(super) fn prepare_history_with_rules(
                         drivers: Vec::new(),
                         operations: Vec::new(),
                         global_installs: Arc::from([]),
+                        archived_reports: Arc::clone(&empty_archived),
                         content: Vec::new(),
                         rules: rules.cloned(),
                     },
@@ -242,6 +253,7 @@ pub(super) fn prepare_history_with_rules(
         history.global_installs = global_installs.clone();
     }
     let mut reports = BTreeMap::new();
+    let mut archived_reports = Vec::new();
     let mut suites = BTreeMap::new();
     let mut drivers = Vec::new();
     for obligation in inventory
@@ -268,10 +280,7 @@ pub(super) fn prepare_history_with_rules(
             tests::record_preparation();
             let legacy: LegacyReport =
                 serde_json::from_slice(&raw).map_err(|_| ImportError::InvalidData)?;
-            let selected = prepared
-                .instances
-                .get_mut(&legacy.instance_id)
-                .ok_or(ImportError::InvalidData)?;
+            let legacy_instance = legacy.instance_id.clone();
             let session = legacy.session_id.clone();
             let (original_state, terminal_state) = crate::launch::reports::imported_suite_states(
                 &legacy.outcome,
@@ -285,13 +294,16 @@ pub(super) fn prepare_history_with_rules(
                 terminal_state,
             };
             let report = legacy.convert(&source, filename)?;
-            // Validate every waived obligation, including other instances' evidence.
-            PreparedReportImport::prepare(vec![report.clone()])
-                .map_err(|_| ImportError::InvalidData)?;
             if reports.insert(session, proof).is_some() {
                 return Err(ImportError::InvalidData);
             }
-            selected.records.push(report);
+            if let Some(selected) = prepared.instances.get_mut(&legacy_instance) {
+                PreparedReportImport::prepare(vec![report.clone()])
+                    .map_err(|_| ImportError::InvalidData)?;
+                selected.records.push(report);
+            } else {
+                archived_reports.push((legacy_instance, report));
+            }
         } else if let Some(filename) = path.strip_prefix(SUITE_PREFIX) {
             if raw.len() > MAX_BENCHMARK_BYTES {
                 return Err(ImportError::LimitExceeded);
@@ -346,7 +358,12 @@ pub(super) fn prepare_history_with_rules(
             .drivers
             .push(driver.convert(&source, suite, &reports)?);
     }
-    for history in prepared.instances.values() {
+    let archived_reports = Arc::new(
+        PreparedReportImport::prepare_archived(&source, archived_reports)
+            .map_err(|_| ImportError::InvalidData)?,
+    );
+    for history in prepared.instances.values_mut() {
+        history.archived_reports = Arc::clone(&archived_reports);
         PreparedBenchmarkImport::prepare(history.suites.clone(), history.drivers.clone())
             .map_err(|_| ImportError::InvalidData)?;
         PreparedOperationImport::prepare(history.operations.clone())
@@ -361,6 +378,128 @@ pub(super) fn prepare_history_with_rules(
         }
     }
     Ok(prepared)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceRegistry {
+    schema_version: u32,
+    #[serde(rename = "last_instance_id")]
+    _last_instance_id: String,
+    pending_deletions: Vec<serde::de::IgnoredAny>,
+    instances: Vec<SourceInstanceIdentity>,
+}
+
+struct SourceInstanceIdentity(String);
+
+impl<'de> Deserialize<'de> for SourceInstanceIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct IdentityVisitor;
+        impl<'de> serde::de::Visitor<'de> for IdentityVisitor {
+            type Value = SourceInstanceIdentity;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a recorded instance with a unique identity field")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut fields = BTreeSet::new();
+                let mut id = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if !fields.insert(key.clone()) {
+                        return Err(serde::de::Error::custom("duplicate instance field"));
+                    }
+                    if key == "id" {
+                        id = Some(map.next_value::<String>()?);
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(SourceInstanceIdentity(
+                    id.ok_or_else(|| serde::de::Error::missing_field("id"))?,
+                ))
+            }
+        }
+        deserializer.deserialize_map(IdentityVisitor)
+    }
+}
+
+fn source_instance_ids(inventory: &Inventory) -> ImportResult<BTreeSet<String>> {
+    // Original v3 registry limits; capture itself admits a broader record set.
+    if inventory
+        .file_manifests()
+        .find(|file| file.relative == "profile/instances.json")
+        .is_none_or(|file| file.size > 1024 * 1024)
+    {
+        return Err(ImportError::InvalidData);
+    }
+    let registry: SourceRegistry =
+        serde_json::from_slice(&inventory.record_bytes("profile/instances.json")?)
+            .map_err(|_| ImportError::InvalidData)?;
+    if registry.schema_version != 3
+        || registry
+            .instances
+            .len()
+            .saturating_add(registry.pending_deletions.len())
+            > 1024
+        || registry.pending_deletions.len() > 1
+    {
+        return Err(ImportError::InvalidData);
+    }
+    let mut ids = BTreeSet::new();
+    for SourceInstanceIdentity(id) in registry.instances {
+        if !super::model::legacy_id(&id) || !ids.insert(id) {
+            return Err(ImportError::InvalidData);
+        }
+    }
+    if ids
+        != inventory
+            .instances()
+            .iter()
+            .map(|instance| instance.legacy_id.clone())
+            .collect()
+    {
+        return Err(ImportError::InvalidData);
+    }
+    Ok(ids)
+}
+
+/// Metadata can preserve archived reports even when unrelated retained work is
+/// unsupported. This does not waive any instance, journal or suite obligation.
+pub(super) fn prepare_archived_reports(
+    inventory: &Inventory,
+) -> ImportResult<Arc<PreparedReportImport>> {
+    let instances = source_instance_ids(inventory)?;
+    let source = inventory.source_identity()?;
+    let mut archived = Vec::new();
+    let mut bytes = 0usize;
+    let mut count = 0usize;
+    for file in inventory.file_manifests() {
+        let Some(filename) = file.relative.strip_prefix(REPORT_PREFIX) else {
+            continue;
+        };
+        count += 1;
+        if count > MAX_HISTORY_RECORDS || file.size > MAX_REPORT_BYTES as u64 {
+            return Err(ImportError::LimitExceeded);
+        }
+        let raw = inventory.record_bytes(&file.relative)?;
+        bytes = bytes
+            .checked_add(raw.len())
+            .ok_or(ImportError::LimitExceeded)?;
+        if bytes > MAX_HISTORY_BYTES {
+            return Err(ImportError::LimitExceeded);
+        }
+        let report: LegacyReport =
+            serde_json::from_slice(&raw).map_err(|_| ImportError::InvalidData)?;
+        if !instances.contains(&report.instance_id) {
+            let instance = report.instance_id.clone();
+            archived.push((instance, report.convert(&source, filename)?));
+        }
+    }
+    PreparedReportImport::prepare_archived(&source, archived)
+        .map(Arc::new)
+        .map_err(|_| ImportError::InvalidData)
 }
 
 #[derive(Deserialize)]

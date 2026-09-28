@@ -59,7 +59,9 @@ fn stores(path: &Path) -> (SettingsStore, AccountDirectory) {
             METADATA_IMPORT_MIGRATION,
             METADATA_IMPORT_IDENTITIES_MIGRATION,
             METADATA_IMPORT_HISTORY_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
             install_history::MIGRATION,
+            crate::launch::reports::REPORT_MIGRATION,
         ])
         .unwrap();
     let settings = SettingsStore::new_with_telemetry_identity(Arc::clone(&store), true).unwrap();
@@ -97,6 +99,255 @@ fn global_journal(source: &Fixture, change: impl FnOnce(&mut Value)) {
     let path = source.baseline.join("state/operation-journals.json");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+}
+
+fn archived_report(source: &Fixture, change: impl FnOnce(&mut Value)) {
+    let mut report = json!({
+        "schema":"axial.launch.proof","schema_version":3,"session_id":"session-archived",
+        "instance_id":"0000000000000002","version_id":"1.21.1",
+        "launched_at":"2026-01-01T00:00:00.000Z","recorded_at":"2026-01-01T00:00:02.000Z",
+        "outcome":"exited","session_outcome":{"reason":"clean_exit","kind":"clean","summary":"Minecraft exited cleanly."},
+        "scenario":{"scenario_id":"vanilla_launch","performance_mode":"vanilla","requested_memory_mb":1024,"version_id":"1.21.1"},
+        "device":{"tier":"mid","total_memory_mb":8192,"cpu_threads":8},"exit_code":0,"stages":[]
+    });
+    change(&mut report);
+    let path = source
+        .baseline
+        .join("benchmarks/launch/session-archived.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec(&report).unwrap()).unwrap();
+}
+
+fn archived_rows(destination: &Destination) -> Vec<(String, String, Vec<u8>)> {
+    destination
+        .settings
+        .metadata()
+        .read(|db| -> Result<_, StorageError> {
+            Ok(db
+                .prepare(
+                    "SELECT session_id,instance_id,payload FROM launch_reports ORDER BY session_id",
+                )?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+        .unwrap()
+}
+
+#[test]
+fn archived_reports_old_receipt_completion_preserves_edits_and_reopen() {
+    let source = Fixture::new();
+    archived_report(&source, |_| {});
+    let before = snapshot(&source.baseline);
+    let (prepared, request) = prepare(&source);
+    let destination = Destination::new();
+    let mut metadata_only = prepared.clone();
+    metadata_only.archived_reports = None;
+    let original = destination
+        .commit(&metadata_only, &request)
+        .unwrap()
+        .response
+        .receipt;
+    assert_eq!(original.archived_launch_report_count, None);
+    assert!(
+        !serde_json::to_value(&original)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("archived_launch_report_count")
+    );
+    destination.accounts.select(SECOND).unwrap();
+    let accounts = destination.accounts.snapshot().unwrap();
+    let config = destination
+        .settings
+        .update(ConfigPatch {
+            expected_revision: 1,
+            theme: Some(ConfigTheme::Birch),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    let changes = destination.settings.subscribe().unwrap();
+    let completed = destination.commit(&prepared, &request).unwrap();
+    let mut expected = original;
+    expected.archived_launch_report_count = Some(1);
+    assert!(completed.response.already_imported);
+    assert_eq!(completed.response.receipt, expected);
+    assert_eq!(completed.settings.config, config);
+    assert_eq!(destination.accounts.snapshot().unwrap(), accounts);
+    assert!(!changes.has_changed().unwrap());
+    let rows = archived_rows(&destination);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1,
+        format!("archived-{}-0000000000000002", prepared.source_id)
+    );
+    assert_eq!(
+        destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt,
+        expected
+    );
+    let (reopened, _) = stores(&destination._root.path().join("metadata.sqlite"));
+    assert_eq!(
+        metadata_status(&reopened, &request.metadata_import_id)
+            .unwrap()
+            .receipt,
+        Some(expected)
+    );
+    assert_eq!(archived_rows(&destination), rows);
+    assert_eq!(snapshot(&source.baseline), before);
+}
+
+#[test]
+fn archived_reports_optional_conversion_never_claims_unsupported_completion() {
+    for variant in [
+        "empty",
+        "unsupported_registry",
+        "nonterminal",
+        "unknown",
+        "live_only",
+    ] {
+        let source = Fixture::new();
+        if variant != "empty" {
+            archived_report(&source, |report| match variant {
+                "nonterminal" => report["outcome"] = json!("running"),
+                "unknown" => report["future_field"] = json!(true),
+                "live_only" => report["instance_id"] = json!("0000000000000001"),
+                _ => {}
+            });
+        }
+        if variant == "unsupported_registry" {
+            let path = source.baseline.join("instances.json");
+            let mut registry: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            registry["schema_version"] = json!(4);
+            fs::write(path, serde_json::to_vec(&registry).unwrap()).unwrap();
+        }
+        let before = snapshot(&source.baseline);
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        let receipt = destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt;
+        let expected = matches!(variant, "empty" | "live_only").then_some(0);
+        assert_eq!(receipt.archived_launch_report_count, expected, "{variant}");
+        assert_eq!(
+            serde_json::to_value(&receipt)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("archived_launch_report_count"),
+            expected.is_some()
+        );
+        assert!(archived_rows(&destination).is_empty());
+        assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
+        assert_eq!(snapshot(&source.baseline), before);
+    }
+}
+
+#[test]
+fn archived_reports_publication_and_late_settings_write_are_atomic() {
+    for old in [false, true] {
+        for effect in [
+            "ignore_report",
+            "ignore_receipt",
+            "rewrite_receipt",
+            "rewrite_report",
+            "late_settings",
+        ] {
+            if old && effect == "late_settings" {
+                continue;
+            }
+            let source = Fixture::new();
+            archived_report(&source, |_| {});
+            let (prepared, request) = prepare(&source);
+            let destination = Destination::new();
+            if old {
+                let mut metadata_only = prepared.clone();
+                metadata_only.archived_reports = None;
+                destination.commit(&metadata_only, &request).unwrap();
+            }
+            let before_config = destination.settings.current().unwrap();
+            let before_accounts = destination.accounts.snapshot().unwrap();
+            let before_receipt =
+                metadata_status(&destination.settings, &request.metadata_import_id)
+                    .unwrap()
+                    .receipt;
+            let changes = destination.settings.subscribe().unwrap();
+            let action = if old {
+                "UPDATE OF archived_launch_report_proof"
+            } else {
+                "INSERT"
+            };
+            let trigger = match effect {
+                "ignore_report" => "BEFORE INSERT ON launch_reports BEGIN SELECT RAISE(IGNORE); END;".to_owned(),
+                "ignore_receipt" => format!("BEFORE {action} ON profile_metadata_imports BEGIN SELECT RAISE(IGNORE); END;"),
+                "rewrite_receipt" => format!("AFTER {action} ON profile_metadata_imports BEGIN UPDATE profile_metadata_imports SET archived_launch_report_proof=NULL; END;"),
+                "rewrite_report" => format!("AFTER {action} ON profile_metadata_imports BEGIN UPDATE launch_reports SET payload=CAST('{{}}' AS BLOB); END;"),
+                _ => "AFTER UPDATE ON settings_config BEGIN UPDATE launch_reports SET payload=CAST('{}' AS BLOB); END;".to_owned(),
+            };
+            destination
+                .settings
+                .metadata()
+                .transaction(|tx| -> Result<(), StorageError> {
+                    tx.execute_batch(&format!("CREATE TRIGGER corrupt_archive {trigger}"))?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                destination.commit(&prepared, &request).is_err(),
+                "{old}/{effect}"
+            );
+            assert_eq!(destination.settings.current().unwrap(), before_config);
+            assert_eq!(destination.accounts.snapshot().unwrap(), before_accounts);
+            assert_eq!(
+                metadata_status(&destination.settings, &request.metadata_import_id)
+                    .unwrap()
+                    .receipt,
+                before_receipt
+            );
+            assert!(archived_rows(&destination).is_empty());
+            assert!(!changes.has_changed().unwrap());
+        }
+    }
+}
+
+#[test]
+fn archived_reports_completed_proof_is_never_repaired_or_rebound() {
+    for corruption in ["missing", "payload", "index", "source", "proof"] {
+        let source = Fixture::new();
+        archived_report(&source, |_| {});
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        destination.commit(&prepared, &request).unwrap();
+        destination
+            .settings
+            .metadata()
+            .transaction(|tx| -> Result<(), StorageError> {
+                tx.execute_batch(match corruption {
+                    "missing" => "DELETE FROM launch_reports;",
+                    "payload" => "UPDATE launch_reports SET payload=CAST('{}' AS BLOB);",
+                    "index" => "UPDATE launch_reports SET instance_id='another-instance';",
+                    "source" => "UPDATE profile_metadata_imports SET source_id=printf('%064d',0);",
+                    _ => "UPDATE profile_metadata_imports SET archived_launch_report_proof='{}';",
+                })?;
+                Ok(())
+            })
+            .unwrap();
+        let before = archived_rows(&destination);
+        assert!(
+            metadata_status(&destination.settings, &request.metadata_import_id).is_err(),
+            "{corruption}"
+        );
+        assert!(
+            destination.commit(&prepared, &request).is_err(),
+            "{corruption}"
+        );
+        assert_eq!(archived_rows(&destination), before);
+        assert_eq!(destination.settings.current().unwrap().revision, 1);
+    }
 }
 
 #[test]
@@ -945,6 +1196,7 @@ fn v1_receipts_keep_historical_meaning_and_new_mapping_corruption_is_rejected() 
         .migrate(&[
             METADATA_IMPORT_IDENTITIES_MIGRATION,
             METADATA_IMPORT_HISTORY_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
         ])
         .unwrap();
     let receipt = metadata_status(&old_settings, &old_id)
@@ -956,6 +1208,7 @@ fn v1_receipts_keep_historical_meaning_and_new_mapping_corruption_is_rejected() 
     assert_eq!(receipt.account_id_mapping, None);
     assert_eq!(receipt.settings_revision, 3);
     assert_eq!(receipt.global_install_history_count, None);
+    assert_eq!(receipt.archived_launch_report_count, None);
 
     let destination = Destination::new();
     let source = Fixture::new();

@@ -485,10 +485,12 @@ pub(super) mod tests {
                     axial_app::instances::create::DUPLICATE_WITNESS_MIGRATION,
                     axial_app::instances::import::MIGRATION,
                     axial_app::install::history::MIGRATION,
+                    axial_app::launch::reports::REPORT_MIGRATION,
                     axial_app::settings::SETTINGS_MIGRATION,
                     axial_app::import::METADATA_IMPORT_MIGRATION,
                     axial_app::import::METADATA_IMPORT_IDENTITIES_MIGRATION,
                     axial_app::import::METADATA_IMPORT_HISTORY_MIGRATION,
+                    axial_app::import::METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
                     axial_app::performance::rules::MIGRATION,
                     axial_app::performance::rules::IMPORT_MIGRATION,
                 ])
@@ -2218,6 +2220,7 @@ pub(super) mod tests {
         assert_eq!(response["cutover_available"], false);
         assert_eq!(response["receipt"]["imported_offline_account_count"], 2);
         assert_eq!(response["receipt"]["global_install_history_count"], 0);
+        assert_eq!(response["receipt"]["archived_launch_report_count"], 0);
         assert_eq!(
             response["receipt"]["metadata_import_id"],
             request["metadata_import_id"]
@@ -3067,6 +3070,377 @@ pub(super) mod tests {
         assert_eq!(snapshot(&baseline), before);
         assert!(!baseline.join(".axial-root.lease").exists());
         reopened.server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn composed_metadata_import_retains_deleted_instance_reports_with_a_survivor() {
+        for import_before_metadata in [true, false] {
+            composed_deleted_instance_report_import(Some(import_before_metadata)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn composed_metadata_import_retains_deleted_instance_reports_without_instances() {
+        composed_deleted_instance_report_import(None).await;
+    }
+
+    async fn composed_deleted_instance_report_import(import_before_metadata: Option<bool>) {
+        let has_survivor = import_before_metadata.is_some();
+        let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let baseline = root.path().join("baseline");
+        fs::create_dir(&baseline).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../acceptance/fixtures/profiles/offline-vanilla");
+        if has_survivor {
+            copy_fixture(&fixture, &baseline);
+        } else {
+            for leaf in ["config.json", "accounts.json"] {
+                fs::copy(fixture.join(leaf), baseline.join(leaf)).unwrap();
+            }
+            fs::write(
+                baseline.join("instances.json"),
+                serde_json::to_vec(&json!({
+                    "schema_version":3,"last_instance_id":"","pending_deletions":[],"instances":[]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let mut report = json!({
+            "schema":"axial.launch.proof","schema_version":3,
+            "session_id":"session-deleted","instance_id":"0000000000000002","version_id":"1.21.1",
+            "launched_at":"2026-01-01T00:00:00.000Z","recorded_at":"2026-01-01T00:00:02.000Z",
+            "outcome":"exited","session_outcome":{"reason":"clean_exit","kind":"clean","summary":"Minecraft exited cleanly."},
+            "scenario":{"scenario_id":"vanilla_launch","performance_mode":"vanilla","requested_memory_mb":1024,"version_id":"1.21.1"},
+            "device":{"tier":"mid","total_memory_mb":8192,"cpu_threads":8},
+            "pid":4321,"exit_code":0,"boot_duration_ms":1000,
+            "stages":[{"stage":"starting","label":"Starting process","started_at_ms":10,"ended_at_ms":510,"duration_ms":500,
+                "result":"complete","warnings":[],"fallback_reason":null,"evidence":[
+                    {"id":"command_prepared","system":"execution","summary":"Command prepared","details":["arg_count:3"]}
+                ]}]
+        });
+        let mut prior = report.clone();
+        prior["session_id"] = json!("session-deleted-before");
+        prior["launched_at"] = json!("2025-12-31T00:00:00.000Z");
+        prior["recorded_at"] = json!("2025-12-31T00:00:02.000Z");
+        prior["boot_duration_ms"] = json!(2000);
+        report["comparison"] = json!({
+            "baseline_session_id":"session-deleted-before","baseline_recorded_at":prior["recorded_at"],
+            "baseline":{"performance_mode":"vanilla","version_id":"1.21.1","requested_memory_mb":1024,"device_tier":"mid"},
+            "matched_sample_count":1,"metric_name":"boot_duration_ms","current_value_ms":1000,
+            "baseline_value_ms":2000,"delta_ms":-1000,"delta_percent":-50.0
+        });
+        let report_directory = baseline.join("benchmarks/launch");
+        fs::create_dir_all(&report_directory).unwrap();
+        for record in [&report, &prior] {
+            fs::write(
+                report_directory.join(format!("{}.json", record["session_id"].as_str().unwrap())),
+                serde_json::to_vec(record).unwrap(),
+            )
+            .unwrap();
+        }
+        let mut source_files = vec![
+            "config.json",
+            "accounts.json",
+            "instances.json",
+            "benchmarks/launch/session-deleted.json",
+            "benchmarks/launch/session-deleted-before.json",
+        ];
+        if has_survivor {
+            source_files.extend([
+                "instances/0000000000000001/options.txt",
+                "instances/0000000000000001/mods/user-file.keep",
+                "instances/0000000000000001/saves/Fixture World/user-note.txt",
+            ]);
+        }
+        let source_snapshot = || {
+            source_files
+                .iter()
+                .map(|path| {
+                    (
+                        fs::read(baseline.join(path)).unwrap(),
+                        fs::metadata(baseline.join(path))
+                            .unwrap()
+                            .modified()
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let unchanged = source_snapshot();
+        let profile = root.path().join("replacement");
+        let services = crate::start_in_profile(profile.clone(), None)
+            .await
+            .unwrap();
+        let source = ReadOnlySource::from_native_selection(
+            services.library.admit_application_root().unwrap(),
+            &baseline,
+        )
+        .unwrap();
+        let preview = services
+            .imports
+            .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
+            .unwrap();
+        assert_eq!(preview.instances.len(), usize::from(has_survivor));
+        assert!(
+            preview
+                .instances
+                .iter()
+                .all(|instance| instance.legacy_id == FIRST)
+        );
+        assert!(preview.metadata_import_available);
+        let input = json!({
+            "metadata_import_id":preview.metadata_import_id,"fingerprint":preview.fingerprint,
+            "expected_settings_revision":services.settings.current().unwrap().revision,
+            "expected_account_selection_revision":services.accounts.selection_revision().unwrap()
+        });
+        let bootstrap = services.server.bootstrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let request = |method, path: &str| {
+            client
+                .request(method, format!("{}{path}", bootstrap.base_url))
+                .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
+        };
+        let status_path = format!("/api/v1/import/metadata/{}", preview.metadata_import_id);
+        let import_survivor = || async {
+            let response = request(Method::POST, "/api/v1/import/instances")
+                .json(&json!({"fingerprint":preview.fingerprint,"legacy_id":FIRST}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let imported: Value = response.json().await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{imported}");
+            assert_eq!(imported["legacy_id"], FIRST);
+            assert_eq!(imported["instance"]["name"], "Vanilla Fixture");
+            assert_eq!(imported["cutover_available"], false);
+            let id = imported["instance"]["id"].as_str().unwrap().to_owned();
+            assert!(uuid::Uuid::parse_str(&id).is_ok());
+            id
+        };
+        let mut survivor_id = if import_before_metadata == Some(true) {
+            Some(import_survivor().await)
+        } else {
+            None
+        };
+        let mut saved = if survivor_id.is_some() {
+            let history: Value = request(Method::GET, "/api/v1/launch/reports")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(history["reports"].as_array().unwrap().len(), 2);
+            Some(history)
+        } else {
+            None
+        };
+        let mut receipt = None;
+        for replay in [false, true] {
+            if replay {
+                services
+                    .imports
+                    .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
+                    .unwrap();
+            }
+            let response = request(Method::POST, "/api/v1/import/metadata")
+                .json(&input)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let imported: Value = response.json().await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{imported}");
+            assert_eq!(imported["already_imported"], replay);
+            assert_eq!(imported["cutover_available"], false);
+            assert_eq!(imported["receipt"]["imported_offline_account_count"], 2);
+            assert_eq!(imported["receipt"]["archived_launch_report_count"], 2);
+            assert_eq!(services.accounts.snapshot().unwrap().accounts.len(), 2);
+            assert_eq!(
+                services.settings.current().unwrap().username,
+                "FixturePlayer"
+            );
+            if let Some(receipt) = &receipt {
+                assert_eq!(&imported["receipt"], receipt);
+            } else {
+                receipt = Some(imported["receipt"].clone());
+            }
+            services.imports.forget().unwrap();
+            let recorded: Value = request(Method::GET, &status_path)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(
+                recorded,
+                json!({"receipt":imported["receipt"],"cutover_available":false})
+            );
+            let history: Value = request(Method::GET, "/api/v1/launch/reports")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let records = history["reports"].as_array().unwrap();
+            assert_eq!(
+                records.len(),
+                2,
+                "metadata import lost the deleted instance's terminal reports"
+            );
+            let current = records
+                .iter()
+                .find(|row| row["recorded_at"] == report["recorded_at"])
+                .unwrap();
+            let previous = records
+                .iter()
+                .find(|row| row["recorded_at"] == prior["recorded_at"])
+                .unwrap();
+            assert_eq!(current["instance_id"], previous["instance_id"]);
+            assert_ne!(current["instance_id"], FIRST);
+            for (retained, original) in [(current, &report), (previous, &prior)] {
+                assert!(uuid::Uuid::parse_str(retained["instance_id"].as_str().unwrap()).is_err());
+                for field in [
+                    "version_id",
+                    "launched_at",
+                    "recorded_at",
+                    "boot_duration_ms",
+                    "exit_code",
+                    "scenario",
+                    "device",
+                ] {
+                    assert_eq!(retained[field], original[field], "{field}");
+                }
+                assert_eq!(retained["session_outcome"]["reason"], "clean_exit");
+                assert_eq!(retained["logs"], json!([]));
+                assert!(retained.get("pid").is_none());
+                let id = retained["session_id"].as_str().unwrap();
+                assert!(id.starts_with("legacy-"));
+                assert!(uuid::Uuid::parse_str(id).is_err());
+                let detail: Value = request(Method::GET, &format!("/api/v1/launch/reports/{id}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(&detail, retained);
+                for (method, suffix) in [(Method::GET, "status"), (Method::POST, "kill")] {
+                    assert_eq!(
+                        request(method, &format!("/api/v1/launch/{id}/{suffix}"))
+                            .send()
+                            .await
+                            .unwrap()
+                            .status(),
+                        StatusCode::BAD_REQUEST
+                    );
+                }
+            }
+            let mut comparison = report["comparison"].clone();
+            comparison["baseline_session_id"] = previous["session_id"].clone();
+            assert_eq!(current["comparison"], comparison);
+            if let Some(saved) = &saved {
+                assert_eq!(&history, saved);
+            } else {
+                saved = Some(history.clone());
+            }
+            if !replay && import_before_metadata == Some(false) {
+                services
+                    .imports
+                    .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
+                    .unwrap();
+                survivor_id = Some(import_survivor().await);
+                services.imports.forget().unwrap();
+                let after: Value = request(Method::GET, "/api/v1/launch/reports")
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(after, history);
+            }
+        }
+        let assert_inert = |services: &crate::DesktopServices| {
+            let instances = services.instances.registry().list().unwrap();
+            assert_eq!(instances.len(), usize::from(has_survivor));
+            if let Some(id) = &survivor_id {
+                assert_eq!(instances[0].instance.id.as_str(), id);
+                assert_eq!(instances[0].instance.name, "Vanilla Fixture");
+            }
+            assert!(services.instances.pending().unwrap().is_empty());
+            assert!(services.sessions.snapshots().is_empty());
+            assert!(services.installs.snapshot().active.is_none());
+            assert!(services.installs.snapshot().items.is_empty());
+            services.settings.metadata().read::<_, StorageError>(|db| {
+                let counts: (u64, u64, u64, u64) = db.query_row(
+                    "SELECT (SELECT COUNT(*) FROM launch_intents),(SELECT COUNT(*) FROM benchmark_suites),
+                     (SELECT COUNT(*) FROM benchmark_drivers),(SELECT COUNT(*) FROM installed_versions)",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+                assert_eq!(counts, (0, 0, 0, 0));
+                Ok(())
+            }).unwrap();
+        };
+        assert_inert(&services);
+        assert_eq!(source_snapshot(), unchanged);
+        drop(source);
+        services.server.shutdown().await.unwrap();
+        services.server.wait().await.unwrap();
+        drop(services);
+        let reopened = crate::start_in_profile(profile, None).await.unwrap();
+        let bootstrap = reopened.server.bootstrap();
+        let saved = saved.unwrap();
+        let mut reads = vec![
+            ("/api/v1/launch/reports".to_owned(), saved.clone()),
+            (
+                status_path,
+                json!({"receipt":receipt.unwrap(),"cutover_available":false}),
+            ),
+        ];
+        for record in saved["reports"].as_array().unwrap() {
+            reads.push((
+                format!(
+                    "/api/v1/launch/reports/{}",
+                    record["session_id"].as_str().unwrap()
+                ),
+                record.clone(),
+            ));
+        }
+        for (path, expected) in reads {
+            let actual: Value = client
+                .get(format!("{}{path}", bootstrap.base_url))
+                .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert_inert(&reopened);
+        assert_eq!(source_snapshot(), unchanged);
+        reopened.server.shutdown().await.unwrap();
+        reopened.server.wait().await.unwrap();
     }
 
     #[tokio::test]
