@@ -1,0 +1,23 @@
+{
+  "schema": "axial.accounts",
+  "schema_version": 1,
+  "active_account_id": "offline-92d74dda76fe332cb669d0daddfb7952",
+  "accounts": [
+    {
+      "account_id": "offline-92d74dda76fe332cb669d0daddfb7952",
+      "kind": "offline",
+      "display_name": "FixturePlayer",
+      "offline_uuid": "92d74dda76fe332cb669d0daddfb7952",
+      "created_at": "2026-09-08T00:00:00Z",
+      "updated_at": "2026-09-08T00:00:00Z"
+    },
+    {
+      "account_id": "offline-761ba00914be3766a1c04a87a961857c",
+      "kind": "offline",
+      "display_name": "OtherPlayer",
+      "offline_uuid": "761ba00914be3766a1c04a87a961857c",
+      "created_at": "2026-09-08T00:01:00Z",
+      "updated_at": "2026-09-08T00:01:00Z"
+    }
+  ]
+}

@@ -1,8 +1,10 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { api } from '../../api';
 import {
   applySavedSkin,
+  captureWardrobeContext,
   endLookupPreview,
+  isWardrobeContextCurrent,
   previewLookupSkin,
   refreshWardrobe,
   runWardrobeOp,
@@ -22,6 +24,9 @@ export function useSavedSkinLookupWorkflow() {
   const [lookupState, setLookupState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [lookupError, setLookupError] = useState<string | null>(null);
   const [lookupVariant, setLookupVariant] = useState<SkinVariant>('classic');
+  const lookupRequest = useRef(0);
+
+  useEffect(() => () => { lookupRequest.current += 1; }, []);
 
   const lookupBusy = wardrobeOp.value?.kind === 'lookup';
   const trimmedLookupUsername = lookupUsername.trim();
@@ -42,17 +47,21 @@ export function useSavedSkinLookupWorkflow() {
     }
 
     await runWardrobeOp({ kind: 'lookup' }, async () => {
+      const requestId = ++lookupRequest.current;
+      const capture = captureWardrobeContext();
       setLookupState('loading');
       setLookupError(null);
       setLookupProfile(null);
       setWardrobeNotice(null);
       try {
         const profile = await lookupMinecraftSkin(trimmedLookupUsername);
+        if (requestId !== lookupRequest.current || !isWardrobeContextCurrent(capture)) return;
         setLookupProfile(profile);
         setLookupState('ready');
         setLookupVariant(profile.variant);
         previewLookupSkin();
       } catch (err) {
+        if (requestId !== lookupRequest.current || !isWardrobeContextCurrent(capture)) return;
         setLookupState('error');
         setLookupError(skinActionErrorMessage(err, 'Could not find that player skin.'));
       }
@@ -60,6 +69,7 @@ export function useSavedSkinLookupWorkflow() {
   };
 
   const resetLookupForm = (): void => {
+    lookupRequest.current += 1;
     setLookupProfile(null);
     setLookupState('idle');
     setLookupError(null);
@@ -79,6 +89,7 @@ export function useSavedSkinLookupWorkflow() {
     }
 
     await runWardrobeOp({ kind: 'lookup' }, async () => {
+      const capture = captureWardrobeContext();
       setWardrobeNotice(null);
       try {
         const request: { username: string; variant?: SkinVariant } = {
@@ -87,27 +98,33 @@ export function useSavedSkinLookupWorkflow() {
         };
         const payload = await api('POST', '/skins/from-username', request);
         const saved = savedSkinRecord(payload);
+        if (!saved) throw new Error('Player skin save returned an invalid response.');
+        if (!isWardrobeContextCurrent(capture)) {
+          void refreshWardrobe();
+          return;
+        }
         resetLookupForm();
         endLookupPreview();
-        if (saved) selectSavedSkin(saved.texture_key);
-        if (saved && applyAfterSave) {
+        selectSavedSkin(saved.texture_key);
+        if (applyAfterSave) {
           try {
-            toast(await applySavedSkin(saved.texture_key));
+            toast(await applySavedSkin(saved.texture_key, { capture }));
           } catch (err) {
             void refreshWardrobe();
-            setWardrobeNotice(savedSkinApplyErrorMessage(err));
+            if (isWardrobeContextCurrent(capture)) setWardrobeNotice(savedSkinApplyErrorMessage(err));
           }
         } else {
           void refreshWardrobe();
           toast(`${request.username}'s skin added to your library`);
         }
       } catch (err) {
-        setWardrobeNotice(skinActionErrorMessage(err, 'Could not save player skin.'));
+        if (isWardrobeContextCurrent(capture)) setWardrobeNotice(skinActionErrorMessage(err, 'Could not save player skin.'));
       }
     });
   };
 
   const handleLookupUsernameChange = (value: string): void => {
+    lookupRequest.current += 1;
     setLookupUsername(clampPlayerNameInput(value));
     setLookupVariant('classic');
     setLookupProfile(null);

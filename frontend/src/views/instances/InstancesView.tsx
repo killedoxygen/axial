@@ -17,6 +17,7 @@ import { instanceMenuItems } from '../instance/instance-menu';
 import { deleteInstancesFlow } from '../instance/instance-actions';
 import { fmtRelativeCompact } from '../../format';
 import type { EnrichedInstance } from '../../types-instance';
+import { PendingRemovalsNotice } from './PendingRemovalsNotice';
 
 const LIST_COLS = '28px 52px 2.4fr 1fr 1fr 1fr 140px';
 
@@ -46,13 +47,24 @@ function ListRow({
         ? 'download'
         : 'alert';
   const actionLabel = launchAction.primary_action === 'launch' ? 'Play' : launchAction.label;
-  const showModsCount = inst.version_display.supports_mods;
+  const showModsCount = inst.version_display.supports_mods && inst.counts_available === true;
+  const open = (): void => navigate({ name: 'instance', id: inst.id });
+  const onKeyDown = (e: KeyboardEvent): void => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    open();
+  };
   return (
     <div
       class="cp-table-row cp-selection-row"
       style={{ gridTemplateColumns: LIST_COLS }}
+      role="button"
+      tabIndex={0}
+      aria-label={installing ? `Open ${inst.name}. ${installLabel}` : `Open ${inst.name}`}
       data-selected={selected}
-      onClick={() => navigate({ name: 'instance', id: inst.id })}
+      onClick={open}
+      onKeyDown={onKeyDown}
       onContextMenu={onContextMenu}
     >
       <SelectionCheckbox
@@ -88,7 +100,7 @@ function ListRow({
           title={launchAction.primary_action === 'blocked' ? launchAction.disabled_reason : undefined}
           onClick={(e) => {
             e.stopPropagation();
-            navigate({ name: 'instance', id: inst.id });
+            open();
           }}
         >
           {installing ? installLabel : actionLabel}
@@ -96,6 +108,7 @@ function ListRow({
         <IconButton
           icon="dots"
           size={28}
+          tooltip={`Actions for ${inst.name}`}
           onClick={(e: any) => {
             e.stopPropagation();
             onContextMenu(e);
@@ -137,7 +150,10 @@ export function InstancesView(): JSX.Element {
         <div>
           <h1>Instances</h1>
           <div class="cp-page-sub">
-            {all.length} total, {all.reduce((s, i) => s + (i.mods_count ?? 0), 0)} mods across all
+            {all.length} total
+            {all.every((inst) => inst.counts_available === true)
+              ? `, ${all.reduce((sum, inst) => sum + inst.mods_count, 0)} mods across all`
+              : null}
           </div>
         </div>
         <div style={{ flex: 1 }} />
@@ -156,6 +172,7 @@ export function InstancesView(): JSX.Element {
         </Button>
       </div>
 
+      <PendingRemovalsNotice />
       {filtered.length === 0 ? (
         <div class="cp-empty">
           <Icon name="stack" size={36} color="var(--text-mute)" />

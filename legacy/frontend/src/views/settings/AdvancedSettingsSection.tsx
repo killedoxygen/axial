@@ -1,0 +1,171 @@
+import type { JSX } from 'preact';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { api } from '../../api';
+import { configResponse } from '../../dto-core';
+import { hasNativeDesktopRuntime, requestNativeAppReset } from '../../native';
+import { exportBrowserPreferences } from '../../preferences-export';
+import { Button, Toggle } from '../../ui/Atoms';
+import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
+import { navigate } from '../../ui-state';
+import { config, devMode } from '../../store';
+import { toast } from '../../toast';
+import { errMessage } from '../../utils';
+
+type PerformanceLabCardComponent = (typeof import('./PerformanceLabCard'))['PerformanceLabCard'];
+
+const loadPerformanceLabCard = __AXIAL_ENABLE_DEV_LAB__
+  ? async (): Promise<PerformanceLabCardComponent> => (await import('./PerformanceLabCard')).PerformanceLabCard
+  : null;
+
+function PerformanceLabSlot(): JSX.Element | null {
+  const isDev = devMode.value;
+  const [Lab, setLab] = useState<PerformanceLabCardComponent | null>(null);
+
+  useEffect(() => {
+    if (!isDev || !loadPerformanceLabCard) {
+      setLab(null);
+      return;
+    }
+
+    let alive = true;
+    void loadPerformanceLabCard().then((component) => {
+      if (alive) setLab(() => component);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [isDev]);
+
+  if (!loadPerformanceLabCard || !isDev || !Lab) return null;
+  return <Lab />;
+}
+
+export function AdvancedSettingsSection(): JSX.Element {
+  const cfg = config.value;
+  const isDev = devMode.value;
+  const savedTelemetry = cfg?.telemetry_enabled === true;
+  const [telemetryEnabled, setTelemetryEnabled] = useState(savedTelemetry);
+  const [savingTelemetry, setSavingTelemetry] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const resetInFlight = useRef(false);
+
+  useEffect(() => {
+    setTelemetryEnabled(savedTelemetry);
+  }, [savedTelemetry]);
+
+  const toggleTelemetry = async (): Promise<void> => {
+    if (savingTelemetry) return;
+    const next = !telemetryEnabled;
+    setTelemetryEnabled(next);
+    setSavingTelemetry(true);
+    try {
+      config.value = configResponse(await api('PUT', '/config', { telemetry_enabled: next }));
+      toast('Saved');
+    } catch (err) {
+      setTelemetryEnabled(savedTelemetry);
+      toast(`Could not save anonymous usage stats setting: ${errMessage(err)}`, 'error');
+    } finally {
+      setSavingTelemetry(false);
+    }
+  };
+
+  const downloadPreferences = (): void => {
+    try {
+      const exported = exportBrowserPreferences(window.localStorage);
+      const blob = new Blob([exported], { type: 'application/json' });
+      const anchor = document.createElement('a');
+      const objectUrl = URL.createObjectURL(blob);
+      try {
+        anchor.href = objectUrl;
+        anchor.download = 'axial-browser-preferences.json';
+        anchor.style.display = 'none';
+        document.body.append(anchor);
+        anchor.click();
+      } finally {
+        anchor.remove();
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30_000);
+      }
+    } catch {
+      toast('Could not export browser preferences. Stored values may be invalid, too large, or unavailable.', 'error');
+    }
+  };
+
+  const resetLauncher = async (): Promise<void> => {
+    if (resetInFlight.current) return;
+    resetInFlight.current = true;
+    try {
+      const { showConfirm } = await import('../../ui/Dialog');
+      const confirmed = await showConfirm(
+        'Delete startup-detected Axial launcher files and the default managed library, then restart? External libraries and your saved Microsoft system credential are preserved.',
+        {
+          destructive: true,
+          confirmText: 'Reset',
+        },
+      );
+      if (!confirmed) {
+        resetInFlight.current = false;
+        return;
+      }
+
+      setResetting(true);
+      const requested = await requestNativeAppReset();
+      if (!requested) throw new Error('desktop runtime unavailable');
+      toast('Reset complete. Restarting Axial.');
+    } catch (err) {
+      resetInFlight.current = false;
+      setResetting(false);
+      toast(`Reset could not complete: ${errMessage(err)}`, 'error');
+    }
+  };
+
+  return (
+    <SettingsSection>
+      <SettingRow
+        title="Anonymous usage stats"
+        description="Shares anonymous usage and launch stats to improve Axial. Never includes names, files, or personal data."
+        control={<Toggle on={telemetryEnabled} onChange={() => void toggleTelemetry()} />}
+      />
+      <SettingRow
+        title="Reload launcher"
+        description="Restarts the interface if something looks stuck or out of date."
+        control={
+          <Button variant="secondary" icon="refresh" onClick={() => location.reload()}>
+            Reload
+          </Button>
+        }
+      />
+      <SettingRow
+        title="Browser preferences"
+        description="Save appearance, shortcuts, and the last page as a file to import into the new launcher."
+        control={
+          <Button variant="secondary" icon="download" onClick={downloadPreferences}>
+            Export browser preferences
+          </Button>
+        }
+      />
+      {__AXIAL_ENABLE_DEV_LAB__ && isDev && (
+        <SettingRow
+          title="Dev lab"
+          description="Developer workbench: feature flags, live state inspector, and UI playgrounds."
+          control={
+            <Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>
+              Open lab
+            </Button>
+          }
+        />
+      )}
+      {__AXIAL_ENABLE_DEV_LAB__ && isDev && <PerformanceLabSlot />}
+      {isDev && hasNativeDesktopRuntime() && (
+        <SettingRow
+          title="Reset launcher"
+          description="Deletes startup-detected launcher files and the default managed library. External libraries and the saved Microsoft system credential are preserved."
+          control={
+            <Button variant="danger" icon="trash" disabled={resetting} onClick={() => void resetLauncher()}>
+              {resetting ? 'Resetting…' : 'Reset'}
+            </Button>
+          }
+        />
+      )}
+    </SettingsSection>
+  );
+}

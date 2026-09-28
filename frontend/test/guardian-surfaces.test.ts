@@ -16,19 +16,9 @@ import {
   type CreateNotice,
   type CreateResultPresentationSource,
 } from '../src/create-presenters';
-import {
-  clearDownloadFailure,
-  clearDownloadFailureForItem,
-  downloadFailure,
-  recordDownloadFailure,
-} from '../src/machines/downloads';
-import {
-  installFailureViewModel,
-  installQueueNoticePresentation,
-  unresolvedFailureViewModel,
-} from '../src/machines/download-view-models';
+import { installQueueNoticePresentation } from '../src/machines/download-view-models';
+import { installStatusResponse } from '../src/dto-install';
 import { backendLaunchNotice, createBackendLaunchNoticeTracker } from '../src/launch-notice-tracker';
-import { establishNativeLaunchTransport, type LaunchLiveHandle } from '../src/launch-live-transport';
 import {
   launchActionPresentation,
   launchNoticePresentation,
@@ -40,10 +30,9 @@ import {
 import { launchProofGuardianEvidence } from '../src/launch-proof-presenters';
 import { launchSessionOutcome, launchStatusUpdate, launchStatusViewModel } from '../src/launch-response-adapters';
 import { performanceHealthNotice } from '../src/performance-presenters';
-import { GUARDIAN_OPTIONS, guardianModeFrom } from '../src/guardian-settings';
 import { launchNotices, launchSessions } from '../src/store';
 import { startupWarningMessages } from '../src/startup-warnings';
-import type { InstallFailureViewModel, InstallItem, InstallQueueNoticeViewModel } from '../src/types-install';
+import type { InstallFailureViewModel, InstallQueueNoticeViewModel } from '../src/types-install';
 import type { LaunchNotice, LaunchSession, LaunchStatusViewModel } from '../src/types-launch';
 
 const sensitiveFragments = [
@@ -114,6 +103,14 @@ function failureFixture(stateId: string, retryEnabled: boolean): InstallFailureV
     },
     dismiss_action: { action: 'dismiss', label: 'Dismiss', enabled: true, disabled_reason: null },
     raw_error: sensitiveFragments.join(' '),
+  };
+}
+
+function failureStatus(failure: unknown) {
+  return {
+    revision: 1, queue_id: 'queue-1', install_id: 'install-1', operation_id: 'operation-1',
+    outcome: 'failed', done: true, allowed_actions: [], failure_view_model: failure,
+    view_model: { phase_id: 'failed', label: 'Install failed', progress_pct: 0, terminal: true, failed: true },
   };
 }
 
@@ -569,24 +566,8 @@ test('launch session convergence rejects stale, malformed, and replacement-sessi
   launchSessions.value = {};
 });
 
-test('native launch bridge failure closes native listeners but preserves polling convergence', async () => {
-  const closed: string[] = [];
-  const handle = (name: string): LaunchLiveHandle => ({
-    close(): void {
-      closed.push(name);
-    },
-  });
-  const transport = await establishNativeLaunchTransport({
-    startPoll: () => handle('poll'),
-    subscribeStatus: async () => handle('status'),
-    subscribeLog: async () => handle('log'),
-    startBridge: async () => false,
-  });
-
-  assert.deepEqual(closed, ['status', 'log']);
-  transport.close();
-  assert.deepEqual(closed, ['status', 'log', 'poll']);
-});
+// Transport failure/polling and operation-scoped failure dismissal are exercised
+// against the API owners in rewrite/session-download-recovery.test.ts.
 
 test('install failure adapters cover every backend state and action without reading raw fields', () => {
   const states = [
@@ -594,13 +575,12 @@ test('install failure adapters cover every backend state and action without read
     ['failed_retryable', true],
     ['failed_blocked', false],
     ['failed_suppressed', false],
-    ['failed_guardian_recorded', true],
     ['failed_instance_removed', false],
   ] as const;
 
   for (const [stateId, retryEnabled] of states) {
     const fixture = failureFixture(stateId, retryEnabled);
-    const view = installFailureViewModel(fixture);
+    const view = installStatusResponse(failureStatus(fixture)).failure_view_model;
     assert.ok(view);
     assert.equal(view.state_id, stateId);
     assert.equal(view.summary, fixture.summary);
@@ -614,14 +594,13 @@ test('install failure adapters cover every backend state and action without read
   }
 });
 
-test('unresolved install failures use fixed safe copy instead of raw transport, path, token, or stack detail', () => {
+test('unresolved install failure payloads are rejected without exposing raw transport, path, token, or stack detail', () => {
   const raw = sensitiveFragments.join('\n');
-  const view = unresolvedFailureViewModel(raw);
-  assert.equal(view.state_id, 'failure_details_unavailable');
-  assert.equal(view.summary, 'Install failed before Axial received safe error details.');
-  assert.equal(view.retry_action.enabled, false);
-  assert.equal(view.dismiss_action.enabled, true);
-  assertExcludesSensitive(view);
+  assert.throws(() => installStatusResponse(failureStatus(raw)), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assertExcludesSensitive(error.message);
+    return true;
+  });
 });
 
 test('install queue notices render backend copy and backend action tone for every current notice state', () => {
@@ -649,26 +628,7 @@ test('install queue notices render backend copy and backend action tone for ever
   assert.equal(installQueueNoticePresentation({ state_id: 'idle', tone: 'info', message: '   ' }), null);
 });
 
-test('install failure dismissal and item transitions are scoped to the matching install', () => {
-  clearDownloadFailure();
-  const item: InstallItem = { versionId: '1.21.6' };
-  const other: InstallItem = { versionId: '1.20.1' };
-  const view = installFailureViewModel(failureFixture('failed_suppressed', false));
-  assert.ok(view);
-
-  recordDownloadFailure(item, 'Minecraft 1.21.6', view);
-  assert.equal(downloadFailure.value?.viewModel, view);
-  clearDownloadFailureForItem(other);
-  assert.equal(downloadFailure.value?.viewModel, view);
-  clearDownloadFailureForItem(item);
-  assert.equal(downloadFailure.value, null);
-
-  recordDownloadFailure(item, 'Minecraft 1.21.6', view);
-  clearDownloadFailure();
-  assert.equal(downloadFailure.value, null);
-});
-
-test('create surfaces preserve backend Guardian copy and map every rendered notice tone', () => {
+test('create surfaces preserve backend display copy and ignore deferred Guardian details', () => {
   const createResult: CreateResultPresentationSource & Record<string, unknown> = {
     view_model: { summary: 'Instance created.', detail: 'Install queued.' },
     guardian_notice: { message: 'Guardian adjusted the preset.', detail: 'Automatic preset selected.' },
@@ -676,7 +636,7 @@ test('create surfaces preserve backend Guardian copy and map every rendered noti
   };
   assert.equal(
     createResultToastMessage(createResult),
-    'Instance created. Guardian adjusted the preset. Install queued. Automatic preset selected.',
+    'Instance created. Install queued.',
   );
   assert.equal(createToastKind('error'), 'error');
   assert.equal(createToastKind('warn'), 'info');
@@ -687,7 +647,7 @@ test('create surfaces preserve backend Guardian copy and map every rendered noti
     warn: ['warned', 'alert'],
     warned: ['warned', 'alert'],
     error: ['error', 'alert'],
-    intervened: ['intervened', 'shield-check'],
+    intervened: ['info', 'info'],
     success: ['success', 'check-circle'],
   } as const;
   for (const [tone, [normalized, icon]] of Object.entries(tones)) {
@@ -696,7 +656,7 @@ test('create surfaces preserve backend Guardian copy and map every rendered noti
   }
 });
 
-test('performance health, Guardian settings, and proof evidence remain backend-authored display contracts', () => {
+test('performance health and retained proof evidence remain backend-authored display contracts', () => {
   const warningHealth: PerformanceHealthFixture = {
     health: 'healthy',
     view_model: {
@@ -713,18 +673,6 @@ test('performance health, Guardian settings, and proof evidence remain backend-a
   });
   assert.equal(performanceHealthNotice({ view_model: { tone: 'ok' } }), null);
 
-  assert.equal(guardianModeFrom('managed'), 'managed');
-  assert.equal(guardianModeFrom('custom'), 'custom');
-  assert.equal(guardianModeFrom('disabled'), 'disabled');
-  assert.deepEqual(
-    GUARDIAN_OPTIONS.map(({ value, label }) => [value, label]),
-    [
-      ['managed', 'Managed'],
-      ['custom', 'Custom'],
-      ['disabled', 'Disabled'],
-    ],
-  );
-
   const proofRecord: LaunchProofFixture = {
     guardian: { message: sensitiveFragments.join(' ') },
     healing: { warnings: [sensitiveFragments.join(' ')] },
@@ -740,3 +688,5 @@ test('performance health, Guardian settings, and proof evidence remain backend-a
   });
   assertExcludesSensitive(evidence);
 });
+
+test.todo('Guardian mode controls are deliberately deferred from the clean rewrite');

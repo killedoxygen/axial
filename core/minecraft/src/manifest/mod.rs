@@ -152,6 +152,15 @@ pub(crate) async fn fetch_fresh_install_version_manifest() -> Result<VersionMani
     fetch_manifest_live().await
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) async fn fetch_fresh_install_version_manifest_at_test_endpoint(
+    endpoints: &crate::download::InstallTestEndpoints,
+) -> Result<VersionManifest, String> {
+    let body =
+        fetch_manifest_live_body_with_policy(endpoints.version_manifest(), false, true).await?;
+    parse_manifest_body(&body)
+}
+
 pub async fn fetch_version_manifest_cached(
     operation: &ManagedLibraryOperation,
 ) -> Result<VersionManifest, String> {
@@ -432,6 +441,36 @@ fn read_persistent_manifest_cache(
 ) -> Result<VersionManifest, String> {
     let cache = open_manifest_cache(operation)?;
     read_persistent_manifest_cache_from(&cache)
+}
+
+/// Read the exact admitted cache bytes and their freshness independently of live I/O.
+/// Invalid JSON remains observable to the caller rather than silently becoming an empty catalog.
+pub fn read_cached_manifest_bytes(
+    operation: &ManagedLibraryOperation,
+) -> Result<(Vec<u8>, bool), String> {
+    let cache = open_manifest_cache(operation)?;
+    let guard = cache
+        .inspect_regular_file(MANIFEST_CACHE_NAME)
+        .map_err(|error| format!("reading cached version manifest: {error}"))?
+        .ok_or_else(|| "reading cached version manifest: cache is missing".to_string())?;
+    let fresh = manifest_cache_timestamp_is_fresh(
+        guard.modified_at_ns().map_err(|error| error.to_string())?,
+        SystemTime::now(),
+    );
+    let bytes = cache
+        .read_guarded_file_bounded(MANIFEST_CACHE_NAME, &guard, MAX_MANIFEST_BYTES)
+        .map_err(|error| format!("reading cached version manifest: {error}"))?;
+    Ok((bytes, fresh))
+}
+
+/// Validate and publish a manifest cache through the admitted library capability.
+pub async fn cache_version_manifest(
+    operation: &ManagedLibraryOperation,
+    bytes: &[u8],
+) -> Result<(), String> {
+    write_persistent_manifest_cache(operation, bytes).await?;
+    update_manifest_cache(parse_manifest_body(bytes)?);
+    Ok(())
 }
 
 fn read_persistent_manifest_cache_from(cache: &ManagedDir) -> Result<VersionManifest, String> {
@@ -973,7 +1012,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or_default();
-        std::env::temp_dir().join(format!(
+        crate::test_temp_root().join(format!(
             "axial-manifest-cache-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))

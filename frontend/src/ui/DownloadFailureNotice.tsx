@@ -1,5 +1,4 @@
 import type { ComponentChildren, JSX } from 'preact';
-import './download-failure-notice.css';
 import { Button, IconButton, Pill } from './Atoms';
 import { Icon } from './Icons';
 import type { DownloadFailure } from '../machines/downloads';
@@ -56,7 +55,7 @@ export function DownloadFailureNotice({
           size="sm"
           icon="refresh"
           onClick={onRetry}
-          disabled={retryAction ? !retryAction.enabled : false}
+          disabled={retryAction?.enabled !== true}
           title={retryAction?.disabled_reason || undefined}
         >
           {retryAction?.label || 'Retry install'}
@@ -68,7 +67,7 @@ export function DownloadFailureNotice({
             size={28}
             tooltip={dismissAction?.label || 'Dismiss failed install'}
             onClick={onDismiss}
-            disabled={dismissAction ? !dismissAction.enabled : false}
+            disabled={dismissAction?.enabled !== true}
           />
         )}
       </div>

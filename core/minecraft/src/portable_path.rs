@@ -142,6 +142,9 @@ pub struct PortablePathKey(String);
 
 impl PortablePathKey {
     fn from_normalized(value: &str) -> Self {
+        if value.is_ascii() {
+            return Self(value.to_ascii_lowercase());
+        }
         let folded = value.case_fold().collect::<String>();
         Self(folded.as_str().nfc().collect())
     }
@@ -176,6 +179,9 @@ pub fn managed_content_name_key(name: &PortableFileName) -> PortablePathKey {
 }
 
 fn nfc(value: &str) -> String {
+    if value.is_ascii() {
+        return value.to_owned();
+    }
     value.nfc().collect()
 }
 
@@ -232,6 +238,26 @@ fn split_last_char(value: &str) -> Option<(&str, char)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_fast_paths_match_unicode_normalization_and_case_folding() {
+        fn assert_equivalent(value: &str) {
+            assert_eq!(nfc(value), value.nfc().collect::<String>());
+            let folded = value.case_fold().collect::<String>();
+            assert_eq!(
+                PortablePathKey::from_normalized(value).as_str(),
+                folded.nfc().collect::<String>()
+            );
+        }
+
+        assert_equivalent("");
+        for first in 0_u8..=127 {
+            assert_equivalent(std::str::from_utf8(&[first]).unwrap());
+            for second in 0_u8..=127 {
+                assert_equivalent(std::str::from_utf8(&[first, second]).unwrap());
+            }
+        }
+    }
 
     #[test]
     fn normalizes_spelling_and_builds_full_case_folded_keys() {

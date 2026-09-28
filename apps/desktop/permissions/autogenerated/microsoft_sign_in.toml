@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-microsoft-sign-in"
+description = "Enables the microsoft_sign_in command without any pre-configured scope."
+commands.allow = ["microsoft_sign_in"]
+
+[[permission]]
+identifier = "deny-microsoft-sign-in"
+description = "Denies the microsoft_sign_in command without any pre-configured scope."
+commands.deny = ["microsoft_sign_in"]

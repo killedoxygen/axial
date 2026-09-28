@@ -368,13 +368,6 @@ fn validate_applied_publication(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    windows,
-    expect(
-        dead_code,
-        reason = "Windows represents unsupported transient files with an uninhabited type, so no publication state can be constructed"
-    )
-)]
 pub(crate) enum TransientPublicationState {
     Unpublished,
     Published,
@@ -565,6 +558,7 @@ mod native {
         handle: DirectoryHandle,
         identity: Identity,
         bindings: Vec<AbsoluteDirectoryBinding>,
+        ancestry_complete: bool,
     }
 
     struct AbsoluteDirectoryBinding {
@@ -647,10 +641,21 @@ mod native {
         inode: u64,
     }
 
+    pub(crate) fn identity_witness(identity: Identity) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"axial-fs-unix-identity-v1");
+        digest.update((identity.device as u64).to_le_bytes());
+        digest.update(identity.inode.to_le_bytes());
+        digest.finalize().into()
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) enum CreateTransientFileError {
         NoEffect(io::Error),
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) enum DiscardTransientFileError {
         Retained {
             error: io::Error,
@@ -663,9 +668,6 @@ mod native {
         file: File,
         proc_path: PathBuf,
     }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) enum TransientFile {}
 
     #[derive(Clone, Copy, Eq, PartialEq)]
     pub(crate) struct FileStamp {
@@ -952,6 +954,7 @@ mod native {
             handle: current,
             identity,
             bindings,
+            ancestry_complete: true,
         };
         validate_absolute_directory_guard(&guard)?;
         Ok(guard)
@@ -1023,6 +1026,7 @@ mod native {
             handle: clone_directory_handle(child)?,
             identity: child_identity,
             bindings,
+            ancestry_complete: !root.bindings.is_empty(),
         };
         validate_absolute_directory_guard(&guard)?;
         Ok(guard)
@@ -1030,6 +1034,44 @@ mod native {
 
     pub(crate) fn absolute_directory_identity(guard: &AbsoluteDirectoryGuard) -> Identity {
         guard.identity
+    }
+
+    pub(crate) fn absolute_directory_anchor_is_ancestor(
+        guard: &AbsoluteDirectoryGuard,
+        ancestor: Identity,
+    ) -> io::Result<bool> {
+        let identity = match guard.bindings.first() {
+            Some(binding) => directory_identity(&binding.parent)?,
+            None => guard.identity,
+        };
+        if identity == ancestor {
+            return Ok(true);
+        }
+        if !guard.ancestry_complete {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "directory capability has incomplete retained ancestry",
+            ));
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn root_has_physical_ancestor(
+        root: &RootGuard,
+        ancestor: Identity,
+    ) -> io::Result<bool> {
+        let first = root.bindings.first().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "root capability has no retained ancestry",
+            )
+        })?;
+        Ok(root.identity == ancestor
+            || root
+                .bindings
+                .iter()
+                .any(|binding| binding.identity == ancestor)
+            || directory_identity(&first.parent)? == ancestor)
     }
 
     pub(crate) fn absolute_directory_has_ancestor(
@@ -1861,6 +1903,7 @@ mod native {
         root: &RootGuard,
         lease: &LeaseHandle,
         lease_name: &OsStr,
+        preserved: &[(&OsStr, Identity)],
     ) -> io::Result<()> {
         validate_lease_binding(
             root,
@@ -1869,14 +1912,18 @@ mod native {
             lease.identity,
             &lease.name_class_revision,
         )?;
-        clear_directory_children(&root.handle, Some((lease_name, lease.identity)))?;
+        let anchors: Vec<_> = std::iter::once((lease_name, lease.identity))
+            .chain(preserved.iter().copied())
+            .collect();
+        prove_root_anchors(root, &anchors)?;
+        clear_directory_children(&root.handle, &anchors)?;
         sync_directory(&root.handle)?;
-        prove_root_children_cleared(root, lease, lease_name)
+        prove_root_children_cleared(root, lease, &anchors)
     }
 
     fn clear_directory_children(
         root: &DirectoryHandle,
-        preserved_root_entry: Option<(&OsStr, Identity)>,
+        preserved_root_entries: &[(&OsStr, Identity)],
     ) -> io::Result<()> {
         struct ClearFrame {
             directory: DirectoryHandle,
@@ -1905,13 +1952,14 @@ mod native {
         }];
         while let Some(frame) = stack.last_mut() {
             if let Some((name, kind)) = frame.entries.pop() {
-                if frame.depth == 0
-                    && preserved_root_entry.is_some_and(|(preserved, _)| name == preserved)
-                {
-                    let (_, identity) =
-                        preserved_root_entry.expect("preserved root entry remains available");
-                    if entry_observation(&frame.directory, &name)? != Some((kind, identity)) {
-                        return Err(binding_changed("preserved root lease entry changed"));
+                if let Some((_, identity)) = preserved_root_entries.iter().find(|(preserved, _)| {
+                    frame.depth == 0 && super::leaf_names_equal(&name, preserved)
+                }) {
+                    if kind != EntryKind::File
+                        || entry_observation(&frame.directory, &name)?
+                            != Some((EntryKind::File, *identity))
+                    {
+                        return Err(binding_changed("preserved root entry changed"));
                     }
                     continue;
                 }
@@ -2041,31 +2089,54 @@ mod native {
     fn prove_root_children_cleared(
         root: &RootGuard,
         lease: &LeaseHandle,
-        lease_name: &OsStr,
+        anchors: &[(&OsStr, Identity)],
     ) -> io::Result<()> {
-        let mut listing = entries(&root.handle, 2)?;
-        if !listing.complete {
+        let listing = entries(&root.handle, anchors.len() + 1)?;
+        if !listing.complete || listing.entries.len() != anchors.len() {
             return Err(binding_changed("reset root final listing is incomplete"));
         }
-        if listing.entries.len() == 1 && listing.entries[0].0 == lease_name {
-            match entry_observation(&root.handle, lease_name)? {
-                Some((EntryKind::File, entry_identity)) if entry_identity == lease.identity => {
-                    listing.entries.clear();
-                }
-                _ => return Err(binding_changed("reset root lease binding changed")),
+        prove_root_anchors(root, anchors)?;
+        validate_root(root)?;
+        validate_lease(lease)
+    }
+
+    fn prove_root_anchors(root: &RootGuard, anchors: &[(&OsStr, Identity)]) -> io::Result<()> {
+        for (name, identity) in anchors {
+            if entry_observation(&root.handle, name)? != Some((EntryKind::File, *identity)) {
+                return Err(binding_changed("reset preserved entry changed"));
             }
         }
-        if !listing.entries.is_empty() {
-            return Err(binding_changed("reset root is not empty after clear"));
-        }
+        Ok(())
+    }
+
+    pub(crate) fn lease_identity_witness(lease: &LeaseHandle) -> [u8; 32] {
+        identity_witness(lease.identity)
+    }
+
+    pub(crate) fn finish_root_reset(
+        root: &RootGuard,
+        lease: &LeaseHandle,
+        marker: (&OsStr, Identity),
+        intent: (&OsStr, Identity, &File),
+    ) -> io::Result<()> {
         validate_root(root)?;
-        validate_lease_binding(
-            root,
-            lease_name,
-            &lease.handle,
-            lease.identity,
-            &lease.name_class_revision,
-        )
+        validate_lease(lease)?;
+        let anchors = [(lease.name.as_os_str(), lease.identity), marker];
+        match entry_observation(&root.handle, intent.0)? {
+            Some((EntryKind::File, identity)) if identity == intent.1 => {
+                prove_root_children_cleared(
+                    root,
+                    lease,
+                    &[anchors[0], anchors[1], (intent.0, intent.1)],
+                )?;
+                sync_directory(&root.handle)?;
+                remove_tree_leaf(&root.handle, intent.0, EntryKind::File, intent.1)?;
+            }
+            None if retained_file_identity(intent.2)? == (intent.1, 0) => {}
+            _ => return Err(binding_changed("reset intent changed before completion")),
+        }
+        sync_directory(&root.handle)?;
+        prove_root_children_cleared(root, lease, &anchors)
     }
 
     pub(crate) fn directory_identity(handle: &DirectoryHandle) -> io::Result<Identity> {
@@ -2421,84 +2492,8 @@ mod native {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn unsupported_transient() -> io::Error {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "managed transient files require durable namespace authority on this Unix target",
-        )
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn create_transient_file(
-        _parent: &DirectoryHandle,
-    ) -> Result<(TransientFile, Identity), CreateTransientFileError> {
-        Err(CreateTransientFileError::NoEffect(unsupported_transient()))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn read_transient_at(
-        _transient: &TransientFile,
-        _bytes: &mut [u8],
-        _offset: u64,
-    ) -> io::Result<usize> {
-        Err(unsupported_transient())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn write_transient_at(
-        _transient: &TransientFile,
-        _bytes: &[u8],
-        _offset: u64,
-    ) -> io::Result<usize> {
-        Err(unsupported_transient())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn seal_transient_file(
-        _transient: &mut TransientFile,
-        _expected: Identity,
-        _size: u64,
-    ) -> io::Result<()> {
-        Err(unsupported_transient())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn link_transient_file(
-        _transient: &mut TransientFile,
-        _destination_parent: &DirectoryHandle,
-        _destination_name: &OsStr,
-    ) -> io::Result<()> {
-        Err(unsupported_transient())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn transient_publication_state(
-        _transient: &TransientFile,
-        _destination_parent: &DirectoryHandle,
-        _destination_name: &OsStr,
-        _expected: Identity,
-    ) -> io::Result<TransientPublicationState> {
-        Err(unsupported_transient())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn transient_file_evidence(
-        _transient: &TransientFile,
-    ) -> io::Result<(Identity, u64)> {
-        Err(unsupported_transient())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn into_published_file(transient: TransientFile) -> File {
-        match transient {}
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(crate) fn discard_transient_file(
-        transient: TransientFile,
-        _expected: Identity,
-    ) -> Result<(), DiscardTransientFileError> {
-        match transient {}
+    pub(crate) fn named_stage_evidence(file: &File) -> io::Result<(Identity, u64)> {
+        retained_file_identity(file)
     }
 
     pub(crate) fn clone_stage_cleanup(
@@ -3644,7 +3639,7 @@ mod native {
                 "parked directory tree changed before removal",
             ));
         }
-        clear_directory_children(&parked.0, None)?;
+        clear_directory_children(&parked.0, &[])?;
         if directory_identity(&parked.0)? != expected
             || directory_binding_state(parent, park_name, expected)? != BindingState::Exact
         {
@@ -4458,6 +4453,7 @@ mod native {
         handle: DirectoryHandle,
         identity: Identity,
         bindings: Vec<AbsoluteDirectoryBinding>,
+        ancestry_complete: bool,
     }
 
     struct AbsoluteDirectoryBinding {
@@ -4566,21 +4562,13 @@ mod native {
         id: [u8; 16],
     }
 
-    pub(crate) enum TransientFile {}
-
-    pub(crate) enum CreateTransientFileError {
-        NoEffect(io::Error),
-    }
-
-    pub(crate) enum DiscardTransientFileError {
-        #[expect(
-            dead_code,
-            reason = "Windows transient files are an uninhabited unsupported type, preserving the shared retained-error shape without a constructible value"
-        )]
-        Retained {
-            error: io::Error,
-            file: TransientFile,
-        },
+    pub(crate) fn identity_witness(identity: Identity) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"axial-fs-windows-identity-v1");
+        digest.update(identity.volume.to_le_bytes());
+        digest.update(identity.id);
+        digest.finalize().into()
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]
@@ -4798,6 +4786,7 @@ mod native {
             handle: current,
             identity,
             bindings,
+            ancestry_complete: true,
         };
         validate_absolute_directory_guard(&guard)?;
         Ok(guard)
@@ -4868,6 +4857,7 @@ mod native {
             handle: clone_directory_handle(child)?,
             identity: child_identity,
             bindings,
+            ancestry_complete: !root.bindings.is_empty(),
         };
         validate_absolute_directory_guard(&guard)?;
         Ok(guard)
@@ -4875,6 +4865,44 @@ mod native {
 
     pub(crate) fn absolute_directory_identity(guard: &AbsoluteDirectoryGuard) -> Identity {
         guard.identity
+    }
+
+    pub(crate) fn absolute_directory_anchor_is_ancestor(
+        guard: &AbsoluteDirectoryGuard,
+        ancestor: Identity,
+    ) -> io::Result<bool> {
+        let identity = match guard.bindings.first() {
+            Some(binding) => directory_identity(&binding.parent)?,
+            None => guard.identity,
+        };
+        if identity == ancestor {
+            return Ok(true);
+        }
+        if !guard.ancestry_complete {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "directory capability has incomplete retained ancestry",
+            ));
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn root_has_physical_ancestor(
+        root: &RootGuard,
+        ancestor: Identity,
+    ) -> io::Result<bool> {
+        let first = root.bindings.first().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "root capability has no retained ancestry",
+            )
+        })?;
+        Ok(root.identity == ancestor
+            || root
+                .bindings
+                .iter()
+                .any(|binding| binding.identity == ancestor)
+            || directory_identity(&first.parent)? == ancestor)
     }
 
     pub(crate) fn absolute_directory_has_ancestor(
@@ -5253,75 +5281,8 @@ mod native {
         Ok(handle)
     }
 
-    pub(crate) fn create_transient_file(
-        _parent: &DirectoryHandle,
-    ) -> Result<(TransientFile, Identity), CreateTransientFileError> {
-        Err(CreateTransientFileError::NoEffect(unsupported_transient()))
-    }
-
-    fn unsupported_transient() -> io::Error {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "managed transient files require a documented Windows publication primitive",
-        )
-    }
-
-    pub(crate) fn write_transient_at(
-        _transient: &TransientFile,
-        _bytes: &[u8],
-        _offset: u64,
-    ) -> io::Result<usize> {
-        Err(unsupported_transient())
-    }
-
-    pub(crate) fn read_transient_at(
-        _transient: &TransientFile,
-        _bytes: &mut [u8],
-        _offset: u64,
-    ) -> io::Result<usize> {
-        Err(unsupported_transient())
-    }
-
-    pub(crate) fn seal_transient_file(
-        _transient: &mut TransientFile,
-        _expected: Identity,
-        _size: u64,
-    ) -> io::Result<()> {
-        Err(unsupported_transient())
-    }
-
-    pub(crate) fn link_transient_file(
-        _transient: &mut TransientFile,
-        _parent: &DirectoryHandle,
-        _destination_name: &OsStr,
-    ) -> io::Result<()> {
-        Err(unsupported_transient())
-    }
-
-    pub(crate) fn transient_publication_state(
-        _transient: &TransientFile,
-        _parent: &DirectoryHandle,
-        _destination_name: &OsStr,
-        _expected: Identity,
-    ) -> io::Result<TransientPublicationState> {
-        Err(unsupported_transient())
-    }
-
-    pub(crate) fn transient_file_evidence(
-        _transient: &TransientFile,
-    ) -> io::Result<(Identity, u64)> {
-        Err(unsupported_transient())
-    }
-
-    pub(crate) fn into_published_file(transient: TransientFile) -> File {
-        match transient {}
-    }
-
-    pub(crate) fn discard_transient_file(
-        transient: TransientFile,
-        _expected: Identity,
-    ) -> Result<(), DiscardTransientFileError> {
-        match transient {}
+    pub(crate) fn named_stage_evidence(file: &File) -> io::Result<(Identity, u64)> {
+        retained_file_identity(file).map(|(identity, links)| (identity, u64::from(links)))
     }
 
     impl RootConstructionError {
@@ -5760,6 +5721,7 @@ mod native {
         root: &RootGuard,
         lease: &LeaseHandle,
         lease_name: &OsStr,
+        preserved: &[(&OsStr, Identity)],
     ) -> io::Result<()> {
         validate_windows_lease_binding(
             root,
@@ -5768,14 +5730,18 @@ mod native {
             lease.identity,
             &lease.name_class_revision,
         )?;
-        clear_directory_children(&root.handle, Some((lease_name, lease.identity)))?;
+        let anchors: Vec<_> = std::iter::once((lease_name, lease.identity))
+            .chain(preserved.iter().copied())
+            .collect();
+        prove_root_anchors(root, &anchors)?;
+        clear_directory_children(&root.handle, &anchors)?;
         sync_directory(&root.handle)?;
-        prove_root_children_cleared(root, lease, lease_name)
+        prove_root_children_cleared(root, lease, &anchors)
     }
 
     fn clear_directory_children(
         root: &DirectoryHandle,
-        preserved_root_entry: Option<(&OsStr, Identity)>,
+        preserved_root_entries: &[(&OsStr, Identity)],
     ) -> io::Result<()> {
         struct ClearFrame {
             directory: DirectoryHandle,
@@ -5804,10 +5770,13 @@ mod native {
         }];
         while let Some(frame) = stack.last_mut() {
             if let Some((name, kind)) = frame.entries.pop() {
-                if frame.depth == 0
-                    && preserved_root_entry.is_some_and(|(preserved, _)| name == preserved)
-                {
-                    if kind != EntryKind::File {
+                if let Some((_, identity)) = preserved_root_entries.iter().find(|(preserved, _)| {
+                    frame.depth == 0 && super::leaf_names_equal(&name, preserved)
+                }) {
+                    if kind != EntryKind::File
+                        || entry_observation(&frame.directory, &name)?
+                            != Some((EntryKind::File, *identity))
+                    {
                         return Err(binding_changed("preserved directory tree entry changed"));
                     }
                     continue;
@@ -5931,30 +5900,54 @@ mod native {
     fn prove_root_children_cleared(
         root: &RootGuard,
         lease: &LeaseHandle,
-        lease_name: &OsStr,
+        anchors: &[(&OsStr, Identity)],
     ) -> io::Result<()> {
-        let mut listing = entries(&root.handle, 2)?;
-        if !listing.complete {
+        let listing = entries(&root.handle, anchors.len() + 1)?;
+        if !listing.complete || listing.entries.len() != anchors.len() {
             return Err(binding_changed("reset root final listing is incomplete"));
         }
-        if listing.entries.len() == 1
-            && listing.entries[0].0 == lease_name
-            && listing.entries[0].1 == EntryKind::File
-        {
-            listing.entries.clear();
+        prove_root_anchors(root, anchors)?;
+        validate_root(root)?;
+        validate_lease(lease)
+    }
+
+    fn prove_root_anchors(root: &RootGuard, anchors: &[(&OsStr, Identity)]) -> io::Result<()> {
+        for (name, identity) in anchors {
+            if entry_observation(&root.handle, name)? != Some((EntryKind::File, *identity)) {
+                return Err(binding_changed("reset preserved entry changed"));
+            }
         }
-        if !listing.entries.is_empty() {
-            return Err(binding_changed("reset root is not empty after clear"));
-        }
+        Ok(())
+    }
+
+    pub(crate) fn lease_identity_witness(lease: &LeaseHandle) -> [u8; 32] {
+        identity_witness(lease.identity)
+    }
+
+    pub(crate) fn finish_root_reset(
+        root: &RootGuard,
+        lease: &LeaseHandle,
+        marker: (&OsStr, Identity),
+        intent: (&OsStr, Identity, &File),
+    ) -> io::Result<()> {
         validate_root(root)?;
         validate_lease(lease)?;
-        validate_windows_lease_binding(
-            root,
-            lease_name,
-            &lease.handle,
-            lease.identity,
-            &lease.name_class_revision,
-        )
+        let anchors = [(lease.name.as_os_str(), lease.identity), marker];
+        match entry_observation(&root.handle, intent.0)? {
+            Some((EntryKind::File, identity)) if identity == intent.1 => {
+                prove_root_children_cleared(
+                    root,
+                    lease,
+                    &[anchors[0], anchors[1], (intent.0, intent.1)],
+                )?;
+                sync_directory(&root.handle)?;
+                remove_tree_entry(&root.handle, intent.0, intent.2, intent.1)?;
+            }
+            None if retained_file_identity(intent.2)? == (intent.1, 0) => {}
+            _ => return Err(binding_changed("reset intent changed before completion")),
+        }
+        sync_directory(&root.handle)?;
+        prove_root_children_cleared(root, lease, &anchors)
     }
 
     pub(crate) fn directory_identity(handle: &DirectoryHandle) -> io::Result<Identity> {
@@ -7311,7 +7304,7 @@ mod native {
                 "parked directory tree changed before removal",
             ));
         }
-        clear_directory_children(&parked.observation, None)?;
+        clear_directory_children(&parked.observation, &[])?;
         if directory_identity(&parked.observation)? != expected
             || directory_binding_state(parent, park_name, expected)? != BindingState::Exact
         {

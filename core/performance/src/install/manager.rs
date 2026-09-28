@@ -40,9 +40,10 @@ pub struct ManagedCompositionAuthority {
         Arc<Mutex<HashMap<String, WeakManagedInstanceEffectAuthority>>>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ManagedInstanceIdentity {
     instance_id: Arc<str>,
+    pub(super) admitted_directory: Option<Directory>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +62,7 @@ impl ManagedCompositionAuthority {
         }
         Ok(ManagedInstanceIdentity {
             instance_id: Arc::from(instance_id),
+            admitted_directory: None,
         })
     }
 
@@ -83,6 +85,89 @@ fn is_canonical_instance_id(value: &str) -> bool {
 }
 
 impl PerformanceManager {
+    /// The identifier labels effects; the already admitted directory grants access.
+    /// Callers retain registry admission until every effect and receipt settles.
+    pub fn bind_admitted_instance(
+        self: &Arc<Self>,
+        instance_id: &str,
+        directory: Directory,
+    ) -> Result<(ManagedCompositionAuthority, ManagedInstanceIdentity), std::io::Error> {
+        directory.identity()?;
+        axial_fs::LeafName::new(instance_id).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid managed instance label",
+            )
+        })?;
+        Ok((
+            ManagedCompositionAuthority {
+                manager: self.clone(),
+                instances_root_directory: Arc::new(directory.clone()),
+                instance_effect_authorities: Arc::new(Mutex::new(HashMap::new())),
+            },
+            ManagedInstanceIdentity {
+                instance_id: Arc::from(instance_id),
+                admitted_directory: Some(directory),
+            },
+        ))
+    }
+
+    pub fn from_cached_rules(
+        bytes: Option<&[u8]>,
+        remote_rules_url: Option<String>,
+        remote_rules_public_key: Option<String>,
+    ) -> Result<Self, InstallError> {
+        let mut manager = Self::new()?;
+        manager.remote_rules_url = normalize_remote_rules_url(remote_rules_url);
+        manager.remote_rules_verifier = if manager.remote_rules_url.is_some() {
+            RemoteRulesVerifier::from_public_key_hex(remote_rules_public_key)
+        } else {
+            RemoteRulesVerifier::disabled()
+        };
+        manager.hardware = detect_hardware();
+        manager.rules_cache_startup_source = RulesCacheStartupSource::Missing;
+        if let Some(bytes) = bytes {
+            let cached = (bytes.len() as u64 <= crate::RULES_CACHE_MAX_BYTES)
+                .then(|| serde_json::from_slice::<crate::RulesCacheSnapshot>(bytes).ok())
+                .flatten();
+            let verified = cached.as_ref().and_then(|snapshot| {
+                crate::rules_cache::remote_snapshot_manifest(
+                    snapshot,
+                    &manager.remote_rules_verifier,
+                )
+                .ok()
+            });
+            if let (Some(snapshot), Some(manifest)) = (cached, verified) {
+                *manager.active.write().expect(ACTIVE_RULES_LOCK_INVARIANT) = ActiveRules {
+                    manifest,
+                    rule_source: RuleSource::Remote,
+                    rule_channel: RuleChannel::Remote,
+                    rules_cache: RulesCacheStatus::from_snapshot(
+                        &snapshot,
+                        crate::RulesCacheState::Recorded,
+                    ),
+                    remote_refresh: manager.remote_rules_url.is_some(),
+                    last_refresh_at: Some(snapshot.updated_at),
+                    validation: RulesValidation::Valid,
+                };
+                manager.rules_cache_startup_source =
+                    RulesCacheStartupSource::Accepted(bytes.to_vec());
+            } else {
+                manager.rules_mutation_allowed = false;
+                manager.rules_cache_startup_source = RulesCacheStartupSource::Rejected;
+                let mut active = manager.active.write().expect(ACTIVE_RULES_LOCK_INVARIANT);
+                active.rules_cache.state = crate::RulesCacheState::Invalid;
+                active.rules_cache.warning =
+                    Some("Rules cache is invalid; previously stored bytes are preserved.".into());
+            }
+        }
+        manager
+            .active
+            .write()
+            .expect(ACTIVE_RULES_LOCK_INVARIANT)
+            .remote_refresh = manager.remote_rules_url.is_some();
+        Ok(manager)
+    }
     pub fn new() -> Result<Self, InstallError> {
         let manifest = builtin_manifest()?;
         Ok(Self {

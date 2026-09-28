@@ -1573,7 +1573,7 @@ mod runtime_tree_shape_tests {
 
     #[test]
     fn accepts_entries_returned_from_the_platform_filesystem_root() {
-        let root = tempfile::tempdir().expect("runtime tree root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("runtime tree root");
         std::fs::create_dir(root.path().join("bin")).expect("runtime bin directory");
         std::fs::write(root.path().join("bin/java.exe"), b"java").expect("runtime executable");
         std::fs::write(
@@ -1986,19 +1986,68 @@ pub(super) async fn install_ephemeral_processor_runtime(
     max_bytes: u64,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
 ) -> Result<(), JavaRuntimeLookupError> {
-    let admission = validate_ephemeral_processor_manifest(source, max_entries, max_bytes)?;
+    let admission = validate_ephemeral_processor_manifest(source, max_entries, max_bytes)
+        .inspect_err(|error| {
+            trace_ephemeral_processor_runtime_failure("manifest_validation", error);
+        })?;
     let projection = dest_dir.path();
     dest_dir
         .validate_absolute_projection(projection)
-        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+        .map_err(|error| ephemeral_processor_filesystem_failure("tree_projection_before", error))?;
     let materialized = materialize_runtime_tree_with_concurrency(
         component, dest_dir, projection, source, observer, admission,
     )
-    .await;
+    .await
+    .inspect_err(|error| {
+        trace_ephemeral_processor_runtime_failure("tree_materialization", error);
+    });
     dest_dir
         .validate_absolute_projection(projection)
-        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+        .map_err(|error| ephemeral_processor_filesystem_failure("tree_projection_after", error))?;
     materialized
+}
+
+pub(super) fn trace_ephemeral_processor_runtime_failure(
+    stage: &'static str,
+    error: &JavaRuntimeLookupError,
+) {
+    let category = match error {
+        JavaRuntimeLookupError::NotFound { .. } => "not_found",
+        JavaRuntimeLookupError::Install(_) => "install",
+        JavaRuntimeLookupError::RuntimeSource(_) => "runtime_source",
+        JavaRuntimeLookupError::UnsupportedPlatform { .. } => "unsupported_platform",
+        JavaRuntimeLookupError::RosettaRequired { .. } => "rosetta_required",
+        JavaRuntimeLookupError::ProbeTimedOut => "probe_timed_out",
+        JavaRuntimeLookupError::Probe(_) => "probe",
+        JavaRuntimeLookupError::ManagedMutationRefused => "managed_mutation_refused",
+    };
+    let source_kind = match error {
+        JavaRuntimeLookupError::RuntimeSource(failure) => Some(failure.kind().as_str()),
+        _ => None,
+    };
+    tracing::warn!(
+        stage,
+        category,
+        source_kind,
+        "Ephemeral processor runtime preparation failed"
+    );
+}
+
+pub(super) fn ephemeral_processor_filesystem_failure(
+    stage: &'static str,
+    error: crate::loaders::types::LoaderError,
+) -> JavaRuntimeLookupError {
+    let io_kind = match &error {
+        crate::loaders::types::LoaderError::Io(error) => Some(error.kind()),
+        _ => None,
+    };
+    tracing::warn!(
+        stage,
+        category = "install",
+        ?io_kind,
+        "Ephemeral processor runtime preparation failed"
+    );
+    JavaRuntimeLookupError::Install(error.to_string())
 }
 
 async fn materialize_runtime_tree_with_concurrency(
@@ -2816,7 +2865,7 @@ pub(super) async fn install_runtime_manifest_file(
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let (_cancellation_sender, cancellation) = runtime_cancellation_channel();
     let mut cancellation = RuntimeCancellationSet::single(cancellation);
-    install_runtime_manifest_file_until_cancelled(
+    Box::pin(install_runtime_manifest_file_until_cancelled(
         component,
         &managed,
         temp_dir,
@@ -2824,7 +2873,7 @@ pub(super) async fn install_runtime_manifest_file(
         file,
         client,
         &mut cancellation,
-    )
+    ))
     .await
 }
 

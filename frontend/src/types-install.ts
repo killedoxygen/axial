@@ -47,6 +47,10 @@ export interface InstallFailureViewModel {
 }
 
 export interface InstallStatusResponse {
+  revision: number;
+  queue_id: string;
+  outcome: 'succeeded' | 'failed' | 'cancelled' | 'removed' | null;
+  allowed_actions: InstallActionViewModel[];
   install_id: string;
   operation_id: string;
   done: boolean;
@@ -142,6 +146,7 @@ export interface InstallQueueActiveViewModel {
   summary: string;
   install_item: InstallQueueInstallItemViewModel;
   progress: InstallProgressViewModel;
+  retry_action?: InstallActionViewModel;
 }
 
 export interface InstallQueueViewModel {
@@ -167,10 +172,24 @@ export interface InstallQueueNoticeViewModel {
 }
 
 export interface InstallQueueStateResponse {
+  queue_epoch: string;
+  revision: number;
+  registry_revision: number;
+  latest_failure?: InstallQueueFailureViewModel | null;
   active?: InstallQueueActiveViewModel | null;
   items: InstallQueuedItemViewModel[];
   view_model: InstallQueueViewModel;
   notice?: InstallQueueNoticeViewModel | null;
   started_install?: InstallStartResponse | null;
   removed_instance_id?: string | null;
+}
+
+export interface InstallQueueFailureViewModel {
+  failed_at_ms: number;
+  queue_id: string;
+  install_id: string;
+  operation_id: string;
+  label: string;
+  install_item: InstallQueueInstallItemViewModel;
+  failure_view_model: InstallFailureViewModel;
 }

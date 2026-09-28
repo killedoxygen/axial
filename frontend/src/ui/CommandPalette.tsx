@@ -5,7 +5,8 @@ import { Kbd } from './Atoms';
 import { commandPaletteOpen, navigate, type Route, openCreate, openAccountSwitcher } from '../ui-state';
 import { instances, launchSessions } from '../store';
 import { Music } from '../music';
-import { local, saveLocalState } from '../state';
+import { local, saveLocalState, canEditPreferences } from '../state';
+import { reloadApplication } from '../preferences/persistence';
 import { Sound } from '../sound';
 import { applyTheme } from '../theme';
 import { useDraggableOverlay } from '../hooks/use-draggable-overlay';
@@ -128,6 +129,7 @@ function buildCommands(): Command[] {
       icon: 'headphones',
       label: local.sounds ? 'Turn UI sounds off' : 'Turn UI sounds on',
       perform: () => {
+        if (!canEditPreferences()) return;
         local.sounds = !local.sounds;
         Sound.enabled = local.sounds;
         saveLocalState();
@@ -152,7 +154,7 @@ function buildCommands(): Command[] {
       label: 'Reload launcher',
       hint: 'F5',
       perform: () => {
-        location.reload();
+        void reloadApplication();
       },
     },
   );

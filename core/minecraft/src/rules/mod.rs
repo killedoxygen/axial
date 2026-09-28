@@ -32,7 +32,8 @@ pub fn default_environment() -> Environment {
     let mut features = HashMap::new();
     features.insert("is_demo_user".to_string(), false);
     features.insert("has_custom_resolution".to_string(), false);
-    features.insert("has_quick_plays_support".to_string(), true);
+    // Quick Play needs a launcher-provided log path and launch target support.
+    features.insert("has_quick_plays_support".to_string(), false);
     features.insert("is_quick_play_singleplayer".to_string(), false);
     features.insert("is_quick_play_multiplayer".to_string(), false);
     features.insert("is_quick_play_realms".to_string(), false);

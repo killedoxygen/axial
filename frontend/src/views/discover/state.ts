@@ -121,10 +121,3 @@ export function traySelections(): ContentSelection[] {
     ...(item.version_id ? { version_id: item.version_id } : {}),
   }));
 }
-
-export function markInstalled(canonicalIds: string[]): void {
-  const installed = new Set(canonicalIds);
-  results.value = results.value.map((hit) =>
-    installed.has(hit.canonical_id) ? { ...hit, install_state: 'installed' } : hit,
-  );
-}

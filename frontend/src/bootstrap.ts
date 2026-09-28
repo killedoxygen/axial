@@ -3,17 +3,19 @@ import { preloadDeferredViews } from './App';
 import { dtoError } from './dto-contract';
 import {
   configResponse,
-  instancesResponse,
   launcherStatusResponse,
   musicStatusResponse,
   systemInfoResponse,
-  versionsResponse,
 } from './dto-core';
 import { refreshInstallQueue } from './machines/downloads';
+import { reconnectLaunchSession } from './launch';
+import { launchSessionsResponse } from './launch-response-adapters';
 import { Music } from './music';
-import { getNativeAppVersion } from './native';
+import { getNativeAppVersion, hasNativeDesktopRuntime } from './native';
+import { initializeNativePreferences, nativePreferencesHydrated } from './preferences/persistence';
+import { local, localStateVersion } from './state';
+import { Sound, bindButtonSounds } from './sound';
 import { refreshAccountSkin } from './player-skin';
-import { local } from './state';
 import {
   appVersion,
   bootstrapError,
@@ -21,19 +23,19 @@ import {
   config,
   devMode,
   instances,
-  lastInstanceId,
+  launchSessions,
   systemInfo,
-  versions,
 } from './store';
 import { startupWarningMessages } from './startup-warnings';
-import { applyTheme } from './theme';
+import { applyConfigTheme, applyTheme } from './theme';
 import { toast } from './toast';
-import { showOnboardingOverlay } from './ui-state';
+import { route, showOnboardingOverlay } from './ui-state';
 import { scheduleAutoUpdateCheck } from './updater';
 import { errMessage } from './utils';
 
 let apiInitialized = false;
 let activeAttempt: Promise<void> | null = null;
+let nativeInterfaceReady = false;
 
 export function startApplicationBootstrap(): Promise<void> {
   if (activeAttempt) return activeAttempt;
@@ -72,6 +74,21 @@ async function runApplicationBootstrap(): Promise<void> {
   if (nativeVersion) appVersion.value = nativeVersion;
 
   config.value = configRes;
+  if (hasNativeDesktopRuntime() && !nativeInterfaceReady) {
+    if (!nativePreferencesHydrated()) {
+      const saved = await initializeNativePreferences(configRes);
+      Object.assign(local, saved.preferences);
+      route.value = saved.route ?? { name: 'home' };
+      localStateVersion.value += 1;
+    }
+    applyTheme(local.theme, local.customHue, {
+      silent: true, vibrancy: local.customVibrancy, lightness: local.lightness,
+    });
+    Sound.enabled = local.sounds;
+    void Sound.warmup();
+    bindButtonSounds();
+    nativeInterfaceReady = true;
+  }
   systemInfo.value = systemRes;
   devMode.value = statusRes.dev_mode;
   Music.setTrackCount(musicStatusRes?.count);
@@ -82,24 +99,16 @@ async function runApplicationBootstrap(): Promise<void> {
     statusRes = { ...statusRes, setup_required: false };
   }
 
-  const [versionsRes, instancesRes] = await Promise.all([
-    api('GET', '/versions').then(versionsResponse),
-    api('GET', '/instances').then(instancesResponse),
+  const [sessionsRes] = await Promise.all([
+    api('GET', '/launch/sessions').then(launchSessionsResponse),
+    refreshInstallQueue({ connectActive: true, requireInstalledState: true }),
   ]);
-  versions.value = versionsRes.versions;
-  instances.value = instancesRes.instances;
-  lastInstanceId.value = instancesRes.last_instance_id;
-  await refreshInstallQueue({ connectActive: true }).catch((error: unknown) => {
-    console.error('Failed to hydrate the install queue', error);
-  });
-
-  if (configRes.theme && local.theme === 'obsidian' && configRes.theme !== 'obsidian') {
-    applyTheme(configRes.theme, configRes.custom_hue ?? local.customHue, {
-      silent: true,
-      vibrancy: configRes.custom_vibrancy ?? local.customVibrancy,
-      lightness: configRes.lightness ?? local.lightness,
-    });
+  launchSessions.value = sessionsRes;
+  for (const instanceId of Object.keys(sessionsRes)) {
+    reconnectLaunchSession(instanceId, instances.value.find((instance) => instance.id === instanceId)?.name ?? instanceId);
   }
+
+  applyConfigTheme(configRes);
 
   Music.applyConfig(configRes);
   bootstrapError.value = null;

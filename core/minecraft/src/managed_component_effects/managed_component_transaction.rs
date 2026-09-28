@@ -4338,7 +4338,7 @@ mod settlement_resource_tests {
 
     #[test]
     fn maximum_settlement_shard_frontier_retains_constant_handles() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         for shard_index in 0..MAX_COMPONENT_TABLE_SHARDS {
             fs::create_dir(
                 temporary

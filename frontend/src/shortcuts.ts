@@ -4,7 +4,7 @@ import { instances, launchSessions, launchState, selectedInstance } from './stor
 import { selectInstance } from './actions';
 import { launchGame } from './launch';
 import { Sound } from './sound';
-import { local, saveLocalState } from './state';
+import { local, saveLocalState, canEditPreferences } from './state';
 import type { ShortcutBinding } from './types-ui';
 
 export type ShortcutId = 'open-settings' | 'new-instance' | 'command-palette' | 'launch-selected' | 'dismiss';
@@ -92,6 +92,7 @@ export function shortcutOverride(id: ShortcutId): ShortcutBinding | null {
 }
 
 export function setShortcutOverride(id: ShortcutId, combo: ShortcutBinding | null): void {
+  if (!canEditPreferences()) return;
   const overrides = { ...local.shortcuts };
   if (combo) overrides[id] = combo;
   else delete overrides[id];

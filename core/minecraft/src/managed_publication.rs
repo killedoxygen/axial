@@ -1131,7 +1131,7 @@ mod tests {
     fn library_root(label: &str) -> TempDir {
         let temporary = tempfile::Builder::new()
             .prefix(&format!("axial-managed-publication-{label}-"))
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary root");
         fs::create_dir(temporary.path().join("library")).expect("library root");
         temporary

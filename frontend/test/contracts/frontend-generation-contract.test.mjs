@@ -79,6 +79,9 @@ const budgetKeys = [
 /** @param {unknown} value */
 const json = (value) => `${JSON.stringify(value, null, 2)}\n`;
 
+/** @param {GenerationManifest} value */
+const generationJson = (value) => (value.schema_version === 1 ? json(value) : `${JSON.stringify(value)}\n`);
+
 /** @param {number} [maximum] */
 function budgets(maximum = 100_000) {
   return {
@@ -198,6 +201,11 @@ test('asset and budget manifests are canonical closed inputs', () => {
     () => parseBundleBudgets(json({ schema_version: 1, maximum_bytes: reversedMaximum })),
     /noncanonical_bundle_budget/,
   );
+  assert.throws(
+    () => parsePublicAssetManifest(`${JSON.stringify({ schema_version: 1, files: ['a'] })}\n`),
+    /noncanonical_public_asset_manifest/,
+  );
+  assert.throws(() => parseBundleBudgets(`${JSON.stringify(budgets())}\n`), /noncanonical_bundle_budget/);
 });
 
 test('graph projection deduplicates imports with static reachability winning', () => {
@@ -348,53 +356,106 @@ test('clean, repeated, failed, and residue-heavy builds retain one exact generat
   }
 });
 
-test('verification rejects authority, graph, and generation identity tampering', async () => {
+test('generation versions bind exact encoding and hashes while counting actual receipt bytes', async () => {
   const { root, outputRoot } = await fixture();
   try {
     await buildFixture(root, outputRoot);
     const manifestPath = path.join(outputRoot, 'generation.json');
-    const original = await readFile(manifestPath, 'utf8');
-
+    const source = await readFile(manifestPath, 'utf8');
     /** @type {GenerationManifest} */
-    let tampered = JSON.parse(original);
-    assert.ok(!('metrics' in tampered));
-    assert.ok(!('maximum_bytes' in tampered));
-    tampered.graph.pop();
-    tampered.generation_id = computeFrontendGenerationId(tampered);
-    await writeFile(manifestPath, json(tampered));
-    await assert.rejects(() => verifyFrontendGeneration(outputRoot), /generation_file_authority_drift/);
+    const built = JSON.parse(source);
+    assert.equal(built.schema_version, 2);
+    assert.equal(source, `${JSON.stringify(built)}\n`);
+    assert.ok(Buffer.byteLength(source) < Buffer.byteLength(json(built)));
+    for (const schema_version of /** @type {const} */ ([1, 2])) {
+      const identity = {
+        schema_version,
+        document_entry: built.document_entry,
+        script_entry: built.script_entry,
+        files: built.files,
+        graph: built.graph,
+      };
+      const identitySource = schema_version === 1 ? json(identity) : `${JSON.stringify(identity)}\n`;
+      const expectedId = createHash('sha256').update(identitySource).digest('hex');
+      assert.equal(computeFrontendGenerationId(identity), expectedId);
+      const manifest = { ...built, schema_version, generation_id: expectedId };
+      const encoded = generationJson(manifest);
+      await writeFile(manifestPath, encoded);
+      const verified = await verifyFrontendGeneration(outputRoot);
+      assert.equal(verified.generation_id, expectedId);
+      assert.deepEqual(verified.files, built.files);
+      assert.deepEqual(verified.graph, built.graph);
+      assert.equal(
+        verified.metrics.packaged_payload,
+        built.files.reduce((total, file) => total + file.bytes, 0) + Buffer.byteLength(encoded),
+      );
+      for (const wrongEncoding of [
+        schema_version === 1 ? `${JSON.stringify(manifest)}\n` : json(manifest),
+        `${encoded}\n`,
+      ]) {
+        await writeFile(manifestPath, wrongEncoding);
+        await assert.rejects(() => verifyFrontendGeneration(outputRoot), /noncanonical_generation_manifest/);
+      }
+    }
+    await writeFile(manifestPath, JSON.stringify({ ...built, schema_version: 3 }));
+    await assert.rejects(() => verifyFrontendGeneration(outputRoot), /invalid_generation_manifest/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
-    tampered = JSON.parse(original);
-    tampered.graph[0].css_bundle = 'missing.css';
-    tampered.generation_id = computeFrontendGenerationId(tampered);
-    await writeFile(manifestPath, json(tampered));
-    await assert.rejects(() => verifyFrontendGeneration(outputRoot), /invalid_generation_css_bundle/);
+test('both generation versions reject authority, graph, and identity tampering', async () => {
+  const { root, outputRoot } = await fixture();
+  try {
+    await buildFixture(root, outputRoot);
+    const manifestPath = path.join(outputRoot, 'generation.json');
+    const built = JSON.parse(await readFile(manifestPath, 'utf8'));
+    for (const schema_version of /** @type {const} */ ([1, 2])) {
+      const manifest = { ...built, schema_version };
+      manifest.generation_id = computeFrontendGenerationId(manifest);
+      const original = generationJson(manifest);
 
-    const zeroPublic = budgets();
-    zeroPublic.maximum_bytes.public_assets = 0;
-    await writeFile(path.join(root, 'bundle-budgets.json'), json(zeroPublic));
-    await writeFile(manifestPath, original);
-    await assert.rejects(() => verifyFrontendGeneration(outputRoot), /public_assets_budget_exceeded/);
-    await writeFile(path.join(root, 'bundle-budgets.json'), json(budgets()));
+      /** @type {GenerationManifest} */
+      let tampered = JSON.parse(original);
+      assert.ok(!('metrics' in tampered));
+      assert.ok(!('maximum_bytes' in tampered));
+      tampered.graph.pop();
+      tampered.generation_id = computeFrontendGenerationId(tampered);
+      await writeFile(manifestPath, generationJson(tampered));
+      await assert.rejects(() => verifyFrontendGeneration(outputRoot), /generation_file_authority_drift/);
 
-    tampered = JSON.parse(original);
-    tampered.generation_id = '0'.repeat(64);
-    await writeFile(manifestPath, json(tampered));
-    await assert.rejects(() => verifyFrontendGeneration(outputRoot), /generation_identity_drift/);
+      tampered = JSON.parse(original);
+      tampered.graph[0].css_bundle = 'missing.css';
+      tampered.generation_id = computeFrontendGenerationId(tampered);
+      await writeFile(manifestPath, generationJson(tampered));
+      await assert.rejects(() => verifyFrontendGeneration(outputRoot), /invalid_generation_css_bundle/);
 
-    tampered = JSON.parse(original);
-    const firstFile = tampered.files[0];
-    tampered.files[0] = {
-      sha256: firstFile.sha256,
-      bytes: firstFile.bytes,
-      path: firstFile.path,
-    };
-    tampered.generation_id = computeFrontendGenerationId(tampered);
-    await writeFile(manifestPath, json(tampered));
-    await assert.rejects(() => verifyFrontendGeneration(outputRoot), /noncanonical_generation_manifest/);
+      const zeroPublic = budgets();
+      zeroPublic.maximum_bytes.public_assets = 0;
+      await writeFile(path.join(root, 'bundle-budgets.json'), json(zeroPublic));
+      await writeFile(manifestPath, original);
+      await assert.rejects(() => verifyFrontendGeneration(outputRoot), /public_assets_budget_exceeded/);
+      await writeFile(path.join(root, 'bundle-budgets.json'), json(budgets()));
 
-    await writeFile(manifestPath, original);
-    await verifyFrontendGeneration(outputRoot);
+      tampered = JSON.parse(original);
+      tampered.generation_id = '0'.repeat(64);
+      await writeFile(manifestPath, generationJson(tampered));
+      await assert.rejects(() => verifyFrontendGeneration(outputRoot), /generation_identity_drift/);
+
+      tampered = JSON.parse(original);
+      const firstFile = tampered.files[0];
+      tampered.files[0] = {
+        sha256: firstFile.sha256,
+        bytes: firstFile.bytes,
+        path: firstFile.path,
+      };
+      tampered.generation_id = computeFrontendGenerationId(tampered);
+      await writeFile(manifestPath, generationJson(tampered));
+      await assert.rejects(() => verifyFrontendGeneration(outputRoot), /noncanonical_generation_manifest/);
+
+      await writeFile(manifestPath, original);
+      await verifyFrontendGeneration(outputRoot);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -437,26 +498,39 @@ test('independent staged verification rejects malformed output before replacemen
   }
 });
 
-test('capability proof rebuilds a stale valid generation before attestation', async () => {
+test('the build and verification entrypoints attest a fresh generation and reject tampering', async () => {
   const existing = await fixture();
-  const repository = await mkdtemp(path.join(os.tmpdir(), 'axial-frontend-generation-capability-'));
+  const repository = await mkdtemp(path.join(os.tmpdir(), 'axial-frontend-generation-entrypoints-'));
   const frontendRoot = path.join(repository, 'frontend');
   try {
     await renameFile(existing.root, frontendRoot);
     const outputRoot = path.join(frontendRoot, 'dist');
     const stale = await buildFixture(frontendRoot, outputRoot);
     await writeFile(path.join(frontendRoot, 'src/lazy.js'), "export const value = 'fresh';\n");
-    let buildInvoked = false;
-    const scenarioModule = await import(
-      pathToFileURL(path.join(repositoryRoot, 'scripts/capabilities/scenarios/frontend-generation.mjs')).href
+    await copyFile(path.join(frontendRoot, 'src/app.js'), path.join(frontendRoot, 'src/main.tsx'));
+    await mkdir(path.join(repository, 'scripts'));
+    for (const script of ['build-config.mjs', 'build-generation.mjs', 'esbuild.mjs', 'verify-generation.mjs']) {
+      await copyFile(path.join(frontendDependencyRoot, script), path.join(frontendRoot, script));
+    }
+    await copyFile(
+      path.join(repositoryRoot, 'scripts/loopback-lease.mjs'),
+      path.join(repository, 'scripts/loopback-lease.mjs'),
     );
-    const receipt = await scenarioModule.rebuildAndProveFrontend(repository, async () => {
-      buildInvoked = true;
-      await buildFixture(frontendRoot, outputRoot);
-    });
-    assert.equal(buildInvoked, true);
+    await symlink(
+      path.join(frontendDependencyRoot, 'node_modules'),
+      path.join(frontendRoot, 'node_modules'),
+      'junction',
+    );
+    await execFile(process.execPath, [path.join(frontendRoot, 'esbuild.mjs')], { cwd: repository });
+    const receipt = await verifyFrontendGeneration(outputRoot);
     assert.notEqual(receipt.generation_id, stale.generation_id);
-    assert.equal(receipt.generation_id, (await verifyFrontendGeneration(outputRoot)).generation_id);
+    const verified = await execFile(process.execPath, [path.join(frontendRoot, 'verify-generation.mjs')]);
+    assert.match(verified.stdout, new RegExp(`verified frontend generation ${receipt.generation_id.slice(0, 12)}`));
+    await writeFile(path.join(outputRoot, 'app.js'), 'unverified replacement bytes');
+    await assert.rejects(
+      execFile(process.execPath, [path.join(frontendRoot, 'verify-generation.mjs')]),
+      (error) => error instanceof Error && 'code' in error && error.code === 1,
+    );
   } finally {
     await rm(repository, { recursive: true, force: true });
     await rm(existing.root, { recursive: true, force: true });
@@ -691,10 +765,16 @@ test('hard exits at both promotion boundaries reconcile without a partial tree',
   }
 });
 
-test('crash residue is reconciled before a failing rebuild can return', async () => {
+test('a schema1 backup is restored byte-exactly before a failing schema2 rebuild can return', async () => {
   const { root, outputRoot } = await fixture();
   try {
     await buildFixture(root, outputRoot);
+    const manifestPath = path.join(outputRoot, 'generation.json');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+    manifest.schema_version = 1;
+    manifest.generation_id = computeFrontendGenerationId(manifest);
+    await writeFile(manifestPath, json(manifest));
+    const inventory = await fileInventory(outputRoot);
     const previous = `${outputRoot}.previous-crash`;
     const stage = `${outputRoot}.stage-crash`;
     await renameFile(outputRoot, previous);
@@ -718,6 +798,7 @@ test('crash residue is reconciled before a failing rebuild can return', async ()
     );
     assert.equal(sawRecoveredGeneration, true);
     await verifyFrontendGeneration(outputRoot);
+    assert.deepEqual(await fileInventory(outputRoot), inventory);
     assert.deepEqual(
       (await readdir(root)).filter((name) => name.startsWith('dist.')),
       [],
@@ -754,6 +835,7 @@ test('reconciliation never promotes a linked previous generation', async (contex
 test('an asset-only watch event publishes the next exact generation', async () => {
   const { root, outputRoot } = await fixture();
   let watcher;
+  let deadline;
   try {
     const first = await buildFixture(root, outputRoot);
     /** @type {(value: GenerationReport) => void} */
@@ -773,12 +855,15 @@ test('an asset-only watch event publishes the next exact generation', async () =
     await writeFile(path.join(root, 'static/asset.txt'), 'asset changed\n');
     const second = await Promise.race([
       changed,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('asset watch timeout')), 5_000)),
+      new Promise((_, reject) => {
+        deadline = setTimeout(() => reject(new Error('asset watch timeout')), 5_000);
+      }),
     ]);
     assert.notEqual(second.generation_id, first.generation_id);
     assert.equal(second.metrics.public_assets, 114);
     await verifyFrontendGeneration(outputRoot);
   } finally {
+    clearTimeout(deadline);
     await watcher?.close();
     await rm(root, { recursive: true, force: true });
   }

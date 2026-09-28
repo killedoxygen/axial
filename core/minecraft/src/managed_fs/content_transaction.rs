@@ -36,7 +36,13 @@ const MAX_CONTENT_PLANNING_PATHS: usize = 8_704;
 const MAX_PACK_CONTENT_PATHS: usize = 100_000;
 const MAX_CONTENT_FILE_BYTES: u64 = 1 << 30;
 const MAX_CONTENT_TRANSACTION_BYTES: u64 = 4 << 30;
+#[cfg(target_os = "linux")]
 const MAX_TRANSIENT_STAGE_MEMBERS: usize = 512;
+// Named portable stages retain one native stage effect and one transient
+// reservation each. Keep their combined use inside the existing 512-effect
+// root budget; anonymous Linux stages still use one slot per member.
+#[cfg(not(target_os = "linux"))]
+const MAX_TRANSIENT_STAGE_MEMBERS: usize = 256;
 const MAX_CONTENT_PRIVATE_DIRECTORIES: usize = 16;
 const PRIVATE_STAGE_NAME: &str = "stage";
 const PRIVATE_BACKUP_NAME: &str = "backup";
@@ -4471,6 +4477,12 @@ fn drive_stage_cleanup(
 mod tests {
     use super::*;
 
+    fn test_tempdir() -> std::io::Result<tempfile::TempDir> {
+        // Root admission rejects symlink ancestry. Resolve only the ambient
+        // temporary parent so fixtures use its physical macOS path.
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir())?)
+    }
+
     fn content_root(
         temporary: &tempfile::TempDir,
     ) -> (super::super::ManagedTreeRoot, ManagedContentTransactionRoot) {
@@ -4722,7 +4734,7 @@ mod tests {
 
     #[test]
     fn manifest_first_planning_is_incremental_and_selects_one_inspected_subset() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
         std::fs::write(temporary.path().join(MANIFEST_NAME), b"manifest").expect("manifest");
         std::fs::write(temporary.path().join("mods/first.jar"), b"first").expect("first");
@@ -4794,7 +4806,7 @@ mod tests {
 
     #[test]
     fn deferred_manifest_refusal_retains_complete_transaction_for_exact_binding() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let path = PortableRelativePath::new_exact("mods/deferred.jar").expect("path");
         let session = transaction_session(root, vec![path.clone()]);
@@ -4831,7 +4843,7 @@ mod tests {
 
     #[test]
     fn external_reader_and_late_manifest_share_one_transaction_owner() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let root = root.for_pack();
         let path = PortableRelativePath::new_exact("config/nested/external.toml").expect("path");
@@ -4903,9 +4915,13 @@ mod tests {
 
     #[test]
     fn pack_transfers_publish_private_stages_across_effect_windows() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
-        let paths = (0..=MAX_TRANSIENT_STAGE_MEMBERS)
+        // Preserve the original 513-member regression on every platform. This
+        // crosses two Linux windows and three portable named-stage windows.
+        const PAYLOAD_COUNT: usize = 513;
+        assert!(PAYLOAD_COUNT > MAX_TRANSIENT_STAGE_MEMBERS);
+        let paths = (0..PAYLOAD_COUNT)
             .map(|index| {
                 PortableRelativePath::new_exact(&format!("config/bulk/file-{index}.toml"))
                     .expect("pack path")
@@ -4960,7 +4976,7 @@ mod tests {
                 ManagedContentTransferStep::Complete(complete) => break complete,
             }
         };
-        assert_eq!(complete.reports().len(), MAX_TRANSIENT_STAGE_MEMBERS + 1);
+        assert_eq!(complete.reports().len(), PAYLOAD_COUNT);
         assert!(!temporary.path().join("config").exists());
         assert!(matches!(
             complete.cancel(),
@@ -4971,7 +4987,7 @@ mod tests {
 
     #[test]
     fn pack_planning_preserves_indexed_bytes_above_the_managed_budget() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let paths = (0..5)
             .map(|index| {
@@ -5014,7 +5030,7 @@ mod tests {
 
     #[test]
     fn pack_rollback_removes_the_exact_created_parent_chain() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let effect =
             PortableRelativePath::new_exact("config/nested/rollback.toml").expect("effect path");
@@ -5089,7 +5105,7 @@ mod tests {
 
     #[test]
     fn unbound_deferred_manifest_unwinds_without_namespace_effects() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let root = root.for_pack();
         let path = PortableRelativePath::new_exact("config/nested/unbound.toml").expect("path");
@@ -5109,7 +5125,7 @@ mod tests {
 
     #[test]
     fn pack_observation_rejects_portable_parent_aliases_before_effects() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let upper = PortableRelativePath::new_exact("Config/first.toml").expect("upper path");
         let lower = PortableRelativePath::new_exact("config/second.toml").expect("lower path");
@@ -5130,8 +5146,8 @@ mod tests {
 
     #[test]
     fn planning_binding_matches_only_its_exact_planning_flow() {
-        let first = tempfile::tempdir().expect("first instance");
-        let second = tempfile::tempdir().expect("second instance");
+        let first = test_tempdir().expect("first instance");
+        let second = test_tempdir().expect("second instance");
         let (_first_tree, first_root) = content_root(&first);
         let (_second_tree, second_root) = content_root(&second);
         let first_planning = first_root.observe_manifest().expect("first planning");
@@ -5151,7 +5167,7 @@ mod tests {
             ("case-alias", "EXAMPLE.JAR"),
             ("disabled-case-alias", "example.jar.DISABLED"),
         ] {
-            let temporary = tempfile::tempdir().expect("temporary instance");
+            let temporary = test_tempdir().expect("temporary instance");
             std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
             std::fs::write(
                 temporary.path().join("mods").join(alias),
@@ -5174,7 +5190,7 @@ mod tests {
 
     #[test]
     fn exact_enabled_and_disabled_variants_are_allowed_but_late_aliases_are_not() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
         std::fs::write(temporary.path().join("mods/example.jar"), b"enabled").expect("enabled");
         std::fs::write(
@@ -5207,7 +5223,7 @@ mod tests {
 
     #[test]
     fn failed_manifest_observation_returns_the_no_effect_root() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         std::fs::write(
             temporary.path().join(MANIFEST_NAME),
             vec![0_u8; MAX_MANIFEST_BYTES + 1],
@@ -5235,7 +5251,7 @@ mod tests {
 
     #[test]
     fn plan_from_an_aliased_session_cannot_bind_a_later_exact_guard() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let lower = PortableRelativePath::new_exact("mods/dependency.jar").expect("lower path");
         let upper = PortableRelativePath::new_exact("mods/DEPENDENCY.jar").expect("upper path");
         let (tree, root) = content_root(&temporary);
@@ -5288,7 +5304,7 @@ mod tests {
 
     #[test]
     fn late_batch_failure_retains_successful_observations_and_budget() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
         std::fs::write(temporary.path().join("mods/first.jar"), b"first").expect("first");
         let (_tree, root) = content_root(&temporary);
@@ -5320,7 +5336,7 @@ mod tests {
 
     #[test]
     fn prepared_cancel_removes_its_reserved_namespace() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let path = PortableRelativePath::new_exact("mods/cancelled.jar").expect("path");
         let session = transaction_session(root, vec![path.clone()]);
@@ -5343,7 +5359,7 @@ mod tests {
 
     #[test]
     fn transfer_batch_issues_only_the_next_exact_slot() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let paths = vec![
             PortableRelativePath::new_exact("mods/first.jar").expect("first path"),
@@ -5366,7 +5382,7 @@ mod tests {
 
     #[test]
     fn local_transfer_rejects_source_drift_and_unwinds_without_publication() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let source = PortableRelativePath::new_exact("mods/source.jar").expect("source path");
         let target =
             PortableRelativePath::new_exact("mods/source.jar.disabled").expect("target path");
@@ -5435,7 +5451,7 @@ mod tests {
 
     #[test]
     fn complete_unstarted_batch_drives_transaction_cancellation() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let paths = vec![
             PortableRelativePath::new_exact("mods/first.jar").expect("first path"),
@@ -5460,7 +5476,7 @@ mod tests {
 
     #[test]
     fn unsettled_slot_progresses_after_the_exact_root_can_settle() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let paths = vec![
             PortableRelativePath::new_exact("mods/first.jar").expect("first path"),
@@ -5515,7 +5531,7 @@ mod tests {
 
     #[test]
     fn uninstall_commit_removes_observed_file_and_publishes_manifest() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         std::fs::create_dir_all(temporary.path().join("mods")).expect("mods");
         std::fs::write(temporary.path().join("mods/remove.jar"), b"old").expect("old content");
         let (_tree, root) = content_root(&temporary);
@@ -5550,7 +5566,7 @@ mod tests {
 
     #[test]
     fn manifest_only_transaction_publishes_without_pseudo_mutations() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let enabled = PortableRelativePath::new_exact("mods/missing.jar").expect("enabled path");
         let disabled =
@@ -5581,7 +5597,7 @@ mod tests {
 
     #[test]
     fn more_than_effect_limit_read_preconditions_remain_non_effects() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let effect = PortableRelativePath::new_exact("mods/effect.jar").expect("effect path");
         let mut observed_paths = vec![effect.clone()];
@@ -5610,7 +5626,7 @@ mod tests {
 
     #[test]
     fn read_precondition_drift_is_rejected_before_the_first_effect() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let effect = PortableRelativePath::new_exact("mods/remove.jar").expect("effect path");
         let dependency =
@@ -5655,7 +5671,7 @@ mod tests {
 
     #[test]
     fn read_precondition_drift_after_an_effect_rolls_back_before_manifest() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let effect = PortableRelativePath::new_exact("mods/remove.jar").expect("effect path");
         let dependency =
@@ -5700,7 +5716,7 @@ mod tests {
 
     #[test]
     fn final_effect_drift_blocks_manifest_and_recovery_ignores_read_preconditions() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let effect = PortableRelativePath::new_exact("mods/remove.jar").expect("effect path");
         let dependency =
@@ -5755,7 +5771,7 @@ mod tests {
 
     #[test]
     fn drift_before_commit_rolls_back_without_touching_foreign_file() {
-        let temporary = tempfile::tempdir().expect("temporary instance");
+        let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let path = PortableRelativePath::new_exact("mods/foreign.jar").expect("path");
         let session = transaction_session(root, vec![path.clone()]);

@@ -23,7 +23,6 @@ import { hashStr } from '../../tokens';
 import { Sound } from '../../sound';
 import { createInstance } from '../../instance-create';
 import { createNoticePresentation, type CreateNotice } from '../../create-presenters';
-import type { LoaderComponentId } from '../../types-loader';
 import {
   defaultIconFor,
   defaultNameFor,
@@ -36,13 +35,7 @@ import {
 } from './defaults';
 import { LoaderLogo } from './loader-logos';
 import { Modal, ModalContent } from '../../ui/Modal';
-import {
-  CHANNEL_ORDER,
-  CHANNEL_LABEL,
-  type VersionDownloadState,
-  type VersionRowModel,
-  type VersionRowTagModel,
-} from './view-model';
+import { CHANNEL_ORDER, CHANNEL_LABEL, type VersionDownloadState, type VersionRowModel } from './view-model';
 import {
   buildWindowPresets,
   detectMaxScreenSize,
@@ -50,267 +43,24 @@ import {
   type ScreenSize,
   type WindowPresetSpec,
 } from '../../ui/screen-presets';
-import { dtoArray, dtoBoolean, dtoEnum, dtoNumber, dtoOptionalString, dtoRecord, dtoString } from '../../dto-contract';
+import {
+  createBackendViewResponse,
+  createLoaderBuildsResponse,
+  createLoaderSelection,
+  type CreateBackendViewResponse,
+  type CreateLoaderBuildsResponse,
+  type CreateOption,
+  type CreatePresetOption,
+  type CreateSourceId,
+  type CreateVersionRow,
+} from './contract';
+export { createBackendViewResponse, createLoaderBuildsResponse } from './contract';
 
 type CreateStep = 'version' | 'details';
 
 /* Last good create-view response per source, kept across dialog opens so the
    version list renders immediately while a fresh copy loads in the background. */
-type CreateSourceId = 'vanilla' | LoaderComponentId;
-
-const LOADER_SOURCE_IDS = [
-  'net.fabricmc.fabric-loader',
-  'org.quiltmc.quilt-loader',
-  'net.minecraftforge',
-  'net.neoforged',
-] as const;
-const CREATE_SOURCE_IDS = ['vanilla', ...LOADER_SOURCE_IDS] as const;
-
 const createViewCache = new Map<CreateSourceId, CreateBackendViewResponse>();
-
-interface CreatePresetOption {
-  id: string;
-  label: string;
-  detail: string;
-  default: boolean;
-  disabled_reason?: string | null;
-}
-
-interface CreateOption<T extends string = string> {
-  id: T;
-  label: string;
-  enabled: boolean;
-  disabled_reason?: string | null;
-}
-
-interface CreateVersionRow {
-  source_id: CreateSourceId;
-  selection_id: string;
-  minecraft_version_id: string;
-  loader_build?: CreateLoaderBuildIdentity | null;
-  display_name: string;
-  hint?: string | null;
-  channel: string;
-  tags?: CreateVersionTag[];
-  download_state: string;
-  create_enabled: boolean;
-  disabled_reason?: string | null;
-}
-
-interface CreateVersionTag {
-  id?: string;
-  label?: string;
-}
-
-interface CreateLoaderBuildIdentity {
-  component_id: LoaderComponentId;
-  build_id: string;
-  target_version_id: string;
-  minecraft_version_id: string;
-  loader_version: string;
-  installability: string;
-  availability: {
-    fresh: boolean;
-    stale: boolean;
-    cache_hit: boolean;
-    checked_at_ms: number;
-    last_success_at_ms?: number | null;
-    last_error?: string | null;
-    last_failure_kind?: string | null;
-  };
-}
-
-interface CreateOptimizeOption {
-  id: string;
-  label: string;
-  detail: string;
-  default_enabled: boolean;
-}
-
-interface CreateLoaderAutoOption {
-  selection_id: string;
-  label: string;
-  detail: string;
-}
-
-interface CreateLoaderBuildOption {
-  selection_id: string;
-  build_id: string;
-  label: string;
-  channel_id: string;
-  channel_label: string;
-  recommended: boolean;
-  installed: boolean;
-  enabled: boolean;
-  disabled_reason?: string | null;
-}
-
-interface CreateLoaderBuildsResponse {
-  source_id: string;
-  minecraft_version_id: string;
-  auto: CreateLoaderAutoOption;
-  builds: CreateLoaderBuildOption[];
-}
-
-interface CreateBackendViewResponse {
-  sources: CreateOption<CreateSourceId>[];
-  channels: CreateOption[];
-  versions: CreateVersionRow[];
-  preset_options: CreatePresetOption[];
-  optimize_option: CreateOptimizeOption;
-  notices: CreateNotice[];
-  defaults: {
-    source_id?: string;
-    channel_id?: string;
-    jvm_preset_id?: string;
-    max_memory_mb?: number | null;
-    window_width?: number | null;
-    window_height?: number | null;
-  };
-}
-
-function createSourceId(value: unknown, label: string): CreateSourceId {
-  return dtoEnum(value, label, CREATE_SOURCE_IDS);
-}
-
-export function createBackendViewResponse(value: unknown): CreateBackendViewResponse {
-  const record = dtoRecord(value, 'Create view');
-  const option = (item: unknown, label: string): CreateOption => {
-    const entry = dtoRecord(item, label);
-    return {
-      id: dtoString(entry.id, `${label} id`),
-      label: dtoString(entry.label, `${label} label`),
-      enabled: dtoBoolean(entry.enabled, `${label} enabled`),
-      disabled_reason:
-        entry.disabled_reason == null ? null : dtoString(entry.disabled_reason, `${label} disabled reason`),
-    };
-  };
-  const defaults = dtoRecord(record.defaults, 'Create defaults');
-  const optimize = dtoRecord(record.optimize_option, 'Create optimize option');
-  return {
-    sources: dtoArray(record.sources, 'Create sources').map((item) => {
-      const parsed = option(item, 'Create source');
-      return { ...parsed, id: createSourceId(parsed.id, 'Create source id') };
-    }),
-    channels: dtoArray(record.channels, 'Create channels').map((item) => option(item, 'Create channel')),
-    versions: dtoArray(record.versions, 'Create versions').map(createVersionRowResponse),
-    preset_options: dtoArray(record.preset_options, 'Create presets').map((item) => {
-      const entry = dtoRecord(item, 'Create preset');
-      return {
-        id: dtoString(entry.id, 'Create preset id'),
-        label: dtoString(entry.label, 'Create preset label'),
-        detail: dtoString(entry.detail, 'Create preset detail'),
-        default: dtoBoolean(entry.default, 'Create preset default'),
-        disabled_reason:
-          entry.disabled_reason == null ? null : dtoString(entry.disabled_reason, 'Create preset disabled reason'),
-      };
-    }),
-    optimize_option: {
-      id: dtoString(optimize.id, 'Create optimize id'),
-      label: dtoString(optimize.label, 'Create optimize label'),
-      detail: dtoString(optimize.detail, 'Create optimize detail'),
-      default_enabled: dtoBoolean(optimize.default_enabled, 'Create optimize default'),
-    },
-    notices: (record.notices == null ? [] : dtoArray(record.notices, 'Create notices')).map((item) => {
-      const entry = dtoRecord(item, 'Create notice');
-      return {
-        state_id: dtoString(entry.state_id, 'Create notice state'),
-        tone: dtoString(entry.tone, 'Create notice tone'),
-        message: dtoString(entry.message, 'Create notice message'),
-        detail: entry.detail == null ? null : dtoString(entry.detail, 'Create notice detail'),
-      };
-    }),
-    defaults: {
-      source_id: defaults.source_id == null ? undefined : createSourceId(defaults.source_id, 'Create default source'),
-      channel_id: dtoOptionalString(defaults.channel_id, 'Create default channel'),
-      jvm_preset_id: dtoOptionalString(defaults.jvm_preset_id, 'Create default preset'),
-      max_memory_mb: defaults.max_memory_mb == null ? null : dtoNumber(defaults.max_memory_mb, 'Create default memory'),
-      window_width: defaults.window_width == null ? null : dtoNumber(defaults.window_width, 'Create default width'),
-      window_height: defaults.window_height == null ? null : dtoNumber(defaults.window_height, 'Create default height'),
-    },
-  };
-}
-
-function createVersionRowResponse(value: unknown): CreateVersionRow {
-  const record = dtoRecord(value, 'Create version');
-  return {
-    source_id: createSourceId(record.source_id, 'Create version source'),
-    selection_id: dtoString(record.selection_id, 'Create version selection'),
-    minecraft_version_id: dtoString(record.minecraft_version_id, 'Create Minecraft version'),
-    loader_build: record.loader_build == null ? null : createLoaderBuildIdentity(record.loader_build),
-    display_name: dtoString(record.display_name, 'Create version display name'),
-    hint: record.hint == null ? null : dtoString(record.hint, 'Create version hint'),
-    channel: dtoString(record.channel, 'Create version channel'),
-    tags: (record.tags == null ? [] : dtoArray(record.tags, 'Create version tags')).map((item) => {
-      const tag = dtoRecord(item, 'Create version tag');
-      return {
-        id: dtoString(tag.id, 'Create version tag id'),
-        label: dtoString(tag.label, 'Create version tag label'),
-      };
-    }),
-    download_state: dtoString(record.download_state, 'Create version download state'),
-    create_enabled: dtoBoolean(record.create_enabled, 'Create version enabled'),
-    disabled_reason:
-      record.disabled_reason == null ? null : dtoString(record.disabled_reason, 'Create disabled reason'),
-  };
-}
-
-function createLoaderBuildIdentity(value: unknown): CreateLoaderBuildIdentity {
-  const record = dtoRecord(value, 'Create loader build identity');
-  const availability = dtoRecord(record.availability, 'Create loader availability');
-  return {
-    component_id: dtoEnum(record.component_id, 'Create loader component', LOADER_SOURCE_IDS),
-    build_id: dtoString(record.build_id, 'Create loader build id'),
-    target_version_id: dtoString(record.target_version_id, 'Create loader target version'),
-    minecraft_version_id: dtoString(record.minecraft_version_id, 'Create loader Minecraft version'),
-    loader_version: dtoString(record.loader_version, 'Create loader version'),
-    installability: dtoString(record.installability, 'Create loader installability'),
-    availability: {
-      fresh: dtoBoolean(availability.fresh, 'Create loader availability fresh'),
-      stale: dtoBoolean(availability.stale, 'Create loader availability stale'),
-      cache_hit: dtoBoolean(availability.cache_hit, 'Create loader availability cache'),
-      checked_at_ms: dtoNumber(availability.checked_at_ms, 'Create loader check time'),
-      last_success_at_ms:
-        availability.last_success_at_ms == null
-          ? null
-          : dtoNumber(availability.last_success_at_ms, 'Create loader success time'),
-      last_error: availability.last_error == null ? null : dtoString(availability.last_error, 'Create loader error'),
-      last_failure_kind:
-        availability.last_failure_kind == null
-          ? null
-          : dtoString(availability.last_failure_kind, 'Create loader failure kind'),
-    },
-  };
-}
-
-export function createLoaderBuildsResponse(value: unknown): CreateLoaderBuildsResponse {
-  const record = dtoRecord(value, 'Create loader builds');
-  const auto = dtoRecord(record.auto, 'Create loader automatic option');
-  return {
-    source_id: dtoEnum(record.source_id, 'Create loader source', LOADER_SOURCE_IDS),
-    minecraft_version_id: dtoString(record.minecraft_version_id, 'Create loader Minecraft version'),
-    auto: {
-      selection_id: dtoString(auto.selection_id, 'Create loader automatic selection'),
-      label: dtoString(auto.label, 'Create loader automatic label'),
-      detail: dtoString(auto.detail, 'Create loader automatic detail'),
-    },
-    builds: dtoArray(record.builds, 'Create loader builds').map((item) => {
-      const build = dtoRecord(item, 'Create loader build');
-      return {
-        selection_id: dtoString(build.selection_id, 'Create loader selection'),
-        build_id: dtoString(build.build_id, 'Create loader build id'),
-        label: dtoString(build.label, 'Create loader build label'),
-        channel_id: dtoString(build.channel_id, 'Create loader channel'),
-        channel_label: dtoString(build.channel_label, 'Create loader channel label'),
-        recommended: dtoBoolean(build.recommended, 'Create loader recommended'),
-        installed: dtoBoolean(build.installed, 'Create loader installed'),
-        enabled: dtoBoolean(build.enabled, 'Create loader enabled'),
-        disabled_reason:
-          build.disabled_reason == null ? null : dtoString(build.disabled_reason, 'Create loader disabled reason'),
-      };
-    }),
-  };
-}
 
 export function CreateView(): JSX.Element {
   return (
@@ -363,16 +113,6 @@ function normalizeChannel(value: string | undefined): Channel {
 
 function normalizeDownloadState(value: string | undefined): VersionDownloadState {
   return value === 'base' || value === 'full' ? value : 'none';
-}
-
-function normalizeVersionTags(tags: CreateVersionTag[] | undefined): VersionRowTagModel[] {
-  return Array.isArray(tags)
-    ? tags
-        .filter((tag): tag is Required<CreateVersionTag> => {
-          return typeof tag.id === 'string' && typeof tag.label === 'string';
-        })
-        .map((tag) => ({ id: tag.id, label: tag.label }))
-    : [];
 }
 
 function rowSearchText(row: VersionRowModel): string {
@@ -534,6 +274,7 @@ function CreateCard(): JSX.Element {
   const [viewLoading, setViewLoading] = useState(Boolean(createDraft.value));
   const [backendView, setBackendView] = useState<CreateBackendViewResponse | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const versionWellRef = useRef<HTMLDivElement | null>(null);
   const loadRequestRef = useRef(0);
   const loadedCreateViewSourceRef = useRef<string | null>(null);
@@ -643,12 +384,7 @@ function CreateCard(): JSX.Element {
   const applyCreateView = (source: string, res: CreateBackendViewResponse, applyMutableDefaults = true): void => {
     loadedCreateViewSourceRef.current = source;
     setBackendView(res);
-    const options = Array.isArray(res.preset_options)
-      ? res.preset_options.filter(
-          (option): option is CreatePresetOption =>
-            typeof option.id === 'string' && typeof option.label === 'string' && typeof option.detail === 'string',
-        )
-      : [];
+    const options = res.preset_options;
     setPresetOptions(options);
     const selectableOptions = options.filter((option) => !option.disabled_reason);
     const defaultPresetId = res.defaults?.jvm_preset_id;
@@ -757,15 +493,7 @@ function CreateCard(): JSX.Element {
 
   const backendRows = useMemo<CreateVersionRow[]>(() => backendView?.versions ?? [], [backendView]);
 
-  const createNotices = useMemo<CreateNotice[]>(() => {
-    return Array.isArray(backendView?.notices)
-      ? backendView.notices.filter((notice): notice is CreateNotice => {
-          return (
-            typeof notice.state_id === 'string' && typeof notice.tone === 'string' && typeof notice.message === 'string'
-          );
-        })
-      : [];
-  }, [backendView]);
+  const createNotices = useMemo<CreateNotice[]>(() => backendView?.notices ?? [], [backendView]);
 
   const availableForSource = useMemo(
     () => backendRows.filter((row) => row.source_id === sourceId),
@@ -798,14 +526,13 @@ function CreateCard(): JSX.Element {
     const q = query.trim().toLowerCase();
     return compatibleForSource
       .map((row) => {
-        const tags = normalizeVersionTags(row.tags);
         return {
           id: row.minecraft_version_id,
           selectionId: row.selection_id,
           displayName: row.display_name,
           hint: row.hint ?? null,
           channel: normalizeChannel(row.channel),
-          tags,
+          tags: row.tags,
           downloadState: normalizeDownloadState(row.download_state),
           createEnabled: row.create_enabled,
           disabledReason: row.disabled_reason ?? null,
@@ -887,12 +614,12 @@ function CreateCard(): JSX.Element {
 
   const draftReady = !draft || draftCandidates !== null;
   const versionReady = pack ? true : Boolean(selectionId && selectedVersionRow?.createEnabled === true) && draftReady;
+  const currentLoaderBuilds =
+    loaderBuilds?.source_id === sourceId && loaderBuilds.minecraft_version_id === mcVersionId ? loaderBuilds : null;
   const createSelectionId = pack
     ? pack.selection_id
-    : sourceKey === 'vanilla'
-      ? selectionId
-      : (loaderChoice ?? selectionId);
-  const canCreate = versionReady && name.trim().length > 0 && !submitting;
+    : createLoaderSelection(currentLoaderBuilds, sourceId, mcVersionId, selectionId, loaderChoice);
+  const canCreate = versionReady && Boolean(createSelectionId) && name.trim().length > 0 && !submitting;
 
   useEffect(() => {
     if (step === 'details' && !versionReady) setStep('version');
@@ -908,7 +635,7 @@ function CreateCard(): JSX.Element {
       'GET',
       `/instances/create-view/loader-builds?source=${encodeURIComponent(sourceId)}&minecraft_version=${encodeURIComponent(mcVersionId)}`,
     )
-      .then(createLoaderBuildsResponse)
+      .then((value) => createLoaderBuildsResponse(value, { sourceId, minecraftVersionId: mcVersionId }))
       .then((res) => {
         if (cancelled) return;
         setLoaderBuilds(res);
@@ -930,9 +657,10 @@ function CreateCard(): JSX.Element {
   const autoOptimize = optimizeChoice ?? optimizeOption?.default_enabled ?? false;
 
   const submit = async (): Promise<void> => {
-    if (submitting || !canCreate) return;
+    if (submittingRef.current || !canCreate) return;
     const trimmed = name.trim();
     if (!trimmed || !createSelectionId) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       const keptSelections = draft
@@ -991,6 +719,7 @@ function CreateCard(): JSX.Element {
       }
       closeCreate();
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };
@@ -1064,12 +793,16 @@ function CreateCard(): JSX.Element {
   const currentSourceLabel = pack
     ? pack.loader_label
     : (sourceOptions.find((option) => option.id === sourceId)?.label ?? LOADER_LABELS[sourceKey]);
-  const loaderSelection = loaderChoice ?? loaderBuilds?.auto.selection_id ?? '';
+  const loaderSelection = loaderChoice ?? currentLoaderBuilds?.auto.selection_id ?? '';
   const loaderOptions = useMemo(() => {
-    if (!loaderBuilds) return [];
+    if (!currentLoaderBuilds) return [];
     return [
-      { value: loaderBuilds.auto.selection_id, label: loaderBuilds.auto.label },
-      ...loaderBuilds.builds.map((build) => {
+      {
+        value: currentLoaderBuilds.auto.selection_id,
+        label: currentLoaderBuilds.auto.label,
+        disabled: !currentLoaderBuilds.auto.enabled,
+      },
+      ...currentLoaderBuilds.builds.map((build) => {
         const extras = [
           build.channel_label,
           build.recommended ? 'Recommended' : null,
@@ -1082,7 +815,7 @@ function CreateCard(): JSX.Element {
         };
       }),
     ];
-  }, [loaderBuilds]);
+  }, [currentLoaderBuilds]);
 
   return (
     <>
@@ -1359,13 +1092,16 @@ function CreateCard(): JSX.Element {
                 {versionRows.length} version{versionRows.length === 1 ? '' : 's'}
               </span>
               {sourceKey !== 'vanilla' && mcVersionId != null && (
-                <div class="cp-cr-loader-pick">
+                <div
+                  class="cp-cr-loader-pick"
+                  title={!loaderChoice ? currentLoaderBuilds?.auto.disabled_reason || undefined : undefined}
+                >
                   <span class="cp-cr-loader-pick-label">Loader</span>
-                  {loaderBuilds ? (
+                  {currentLoaderBuilds ? (
                     <SelectField
                       value={loaderSelection}
                       onChange={(next) => {
-                        setLoaderChoice(next === loaderBuilds.auto.selection_id ? null : next);
+                        setLoaderChoice(next === currentLoaderBuilds.auto.selection_id ? null : next);
                       }}
                       options={loaderOptions}
                       ariaLabel="Loader version"

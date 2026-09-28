@@ -6,7 +6,6 @@ import { addInstance } from './actions';
 import { applyInstallQueueResponse } from './machines/downloads';
 import { createResultToastMessage, createToastKind, type CreateResultPresentationSource } from './create-presenters';
 import type { EnrichedInstance } from './types-instance';
-import type { InstallQueueStateResponse } from './types-install';
 import { dtoError, dtoOptionalString, dtoRecord, dtoString } from './dto-contract';
 import { enrichedInstanceResponse } from './dto-core';
 import { installQueueStateResponse } from './dto-install';
@@ -39,7 +38,6 @@ export interface CreateInstanceResult {
 interface CreateResponse extends CreateResultPresentationSource {
   id?: string;
   error?: string;
-  install_queue?: InstallQueueStateResponse;
 }
 
 export async function createInstance(args: CreateInstanceArgs): Promise<CreateInstanceResult> {
@@ -49,6 +47,7 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
   if (!selectionId) return { ok: false, error: 'Version is required' };
 
   let res: CreateResponse & EnrichedInstance;
+  let queueSnapshot: unknown;
   try {
     const endpoint = args.modpack ? '/instances/modpack' : args.setupPlanId ? '/instances/setup' : '/instances';
     const payload = await api('POST', endpoint, {
@@ -64,8 +63,6 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
     if (responseError) throw new Error(responseError);
     const record = dtoRecord(payload, 'Create instance');
     const view = dtoRecord(record.view_model, 'Create instance view');
-    const guardian =
-      record.guardian_notice == null ? null : dtoRecord(record.guardian_notice, 'Create Guardian notice');
     res = {
       ...enrichedInstanceResponse(record),
       view_model: {
@@ -75,16 +72,8 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
         summary: dtoString(view.summary, 'Create result summary'),
         detail: view.detail == null ? null : dtoString(view.detail, 'Create result detail'),
       },
-      guardian_notice: guardian
-        ? {
-            state_id: dtoOptionalString(guardian.state_id, 'Create Guardian state'),
-            tone: dtoOptionalString(guardian.tone, 'Create Guardian tone'),
-            message: dtoOptionalString(guardian.message, 'Create Guardian message'),
-            detail: guardian.detail == null ? null : dtoString(guardian.detail, 'Create Guardian detail'),
-          }
-        : undefined,
-      install_queue: record.install_queue == null ? undefined : installQueueStateResponse(record.install_queue),
     };
+    queueSnapshot = record.install_queue;
   } catch (err: unknown) {
     const message = errMessage(err);
     toast(`Failed to create instance: ${message}`, 'error');
@@ -93,10 +82,18 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
 
   const created = res;
   addInstance(created);
-  if (res.install_queue) {
-    await applyInstallQueueResponse(res.install_queue, { connectActive: true });
+  let queueError: string | null = null;
+  if (queueSnapshot != null) {
+    try {
+      await applyInstallQueueResponse(installQueueStateResponse(queueSnapshot), { connectActive: true });
+    } catch (error: unknown) {
+      // Creation is already confirmed. A progress connection failure must not
+      // leave the create form available to repeat the accepted mutation.
+      queueError = errMessage(error);
+    }
   }
-  toast(createResultToastMessage(res), createToastKind(res.view_model?.tone ?? res.guardian_notice?.tone));
+  toast(createResultToastMessage(res), createToastKind(res.view_model?.tone));
+  if (queueError) toast(`Instance created, but download status could not be refreshed: ${queueError}`, 'error');
   navigate({ name: 'instance', id: created.id });
 
   return { ok: true, instance: created };

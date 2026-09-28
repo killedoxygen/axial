@@ -462,7 +462,7 @@ impl Drop for SuccessorOwner {
 
 #[derive(Debug)]
 pub(crate) struct RecoveryJournal {
-    lane_nonce: [u8; 16],
+    pub(crate) lane_nonce: [u8; 16],
     slots: [Option<RecoveryFrame>; RECOVERY_SLOT_COUNT],
     physical: [[Option<RecoveryFrameReceipt>; RECOVERY_FRAMES_PER_SLOT]; RECOVERY_SLOT_COUNT],
     successors: [Option<SelectedSuccessorFrame>; successor::SUCCESSOR_SLOT_COUNT],
@@ -3018,7 +3018,7 @@ mod tests {
 
     #[test]
     fn successor_owner_retries_uncertainty_and_releases_the_exact_pin() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = crate::test_tempdir().unwrap();
         let mut outcome = crate::RootSession::acquire(temporary.path());
         let session = loop {
             match outcome {

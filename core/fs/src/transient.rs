@@ -12,9 +12,36 @@ use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+#[cfg(not(target_os = "linux"))]
+mod named;
+#[cfg(not(target_os = "linux"))]
+use named::{
+    DiscardTransientFileError, TransientFile, discard_transient_file, into_published_file,
+    link_transient_file, read_transient_at, seal_transient_file, transient_file_evidence,
+    write_transient_at,
+};
+#[cfg(target_os = "linux")]
+use platform::{
+    DiscardTransientFileError, TransientFile, discard_transient_file, into_published_file,
+    link_transient_file, read_transient_at, seal_transient_file, transient_file_evidence,
+    write_transient_at,
+};
+
 // Unicode folding and canonical decomposition can expand one admitted input
 // unit into several UTF-8 scalars.
 const MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES: usize = 1 + MAX_LEAF_UNITS * 16;
+const MAX_DESTINATION_INVENTORY_SCANS: usize = 8;
+#[cfg(test)]
+std::thread_local! {
+    static DESTINATION_INVENTORY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(target_os = "linux")]
+const MAX_TRANSIENT_BATCH: usize = MAX_OUTSTANDING_EFFECTS;
+// Named members retain both the destination reservation and the existing
+// native stage receipt. Keep the total native effect bound unchanged.
+#[cfg(not(target_os = "linux"))]
+const MAX_TRANSIENT_BATCH: usize = MAX_OUTSTANDING_EFFECTS / 2;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum TransientEffectPhase {
@@ -36,10 +63,26 @@ pub(super) struct TransientEffectRecord {
     pub(super) directory: Directory,
     pub(super) destination: LeafName,
     pub(super) identity: Option<platform::Identity>,
-    pub(super) retained: Option<platform::TransientFile>,
+    pub(super) retained: Option<TransientFile>,
+    #[cfg(not(target_os = "linux"))]
+    pub(super) stage_id: Option<u64>,
     pub(super) checked_out: bool,
     pub(super) phase: TransientEffectPhase,
     pub(super) disposition: TransientEffectDisposition,
+}
+
+pub(super) fn stage_retained_for_drain(state: &crate::OperationState, stage_id: u64) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    return state.transients.values().any(|record| {
+        record.stage_id == Some(stage_id)
+            && record.phase == TransientEffectPhase::Abandoned
+            && record.retained.is_some()
+    });
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (state, stage_id);
+        false
+    }
 }
 
 struct TransientEffectToken {
@@ -63,14 +106,7 @@ impl TransientDestinationToken {
             .expect("destination token guard retains its effect token")
     }
 
-    #[cfg(test)]
-    #[cfg_attr(
-        windows,
-        expect(
-            dead_code,
-            reason = "Windows cannot construct a transient stage, so grouped token validation has no reachable caller"
-        )
-    )]
+    #[cfg(all(test, target_os = "linux"))]
     fn token(&self) -> &TransientEffectToken {
         self.token
             .as_ref()
@@ -105,7 +141,7 @@ enum DestinationCollisionPolicy {
 
 impl DestinationBatchPlan {
     fn new(names: Vec<LeafName>) -> io::Result<Self> {
-        if names.is_empty() || names.len() > MAX_OUTSTANDING_EFFECTS {
+        if names.is_empty() || names.len() > MAX_TRANSIENT_BATCH {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "transient destination batch size is outside the supported range",
@@ -146,6 +182,8 @@ impl TransientEffectToken {
                 destination: name.clone(),
                 identity: None,
                 retained: None,
+                #[cfg(not(target_os = "linux"))]
+                stage_id: None,
                 checked_out: false,
                 phase: TransientEffectPhase::Reserved,
                 disposition: TransientEffectDisposition::Reserved,
@@ -340,7 +378,11 @@ impl TransientEffectToken {
         Ok(())
     }
 
-    fn mark_live(&self, identity: platform::Identity) -> io::Result<()> {
+    fn mark_live(
+        &self,
+        identity: platform::Identity,
+        #[cfg(not(target_os = "linux"))] stage_id: u64,
+    ) -> io::Result<()> {
         let mut state =
             self.authority.operations.lock().map_err(|_| {
                 io::Error::other("filesystem capability operation lock was poisoned")
@@ -354,6 +396,10 @@ impl TransientEffectToken {
         }
         record.phase = TransientEffectPhase::Live;
         record.identity = Some(identity);
+        #[cfg(not(target_os = "linux"))]
+        {
+            record.stage_id = Some(stage_id);
+        }
         record.disposition = TransientEffectDisposition::Staged;
         Ok(())
     }
@@ -401,6 +447,10 @@ impl TransientEffectToken {
             return Err(stale_capability());
         }
         record.identity = None;
+        #[cfg(not(target_os = "linux"))]
+        {
+            record.stage_id = None;
+        }
         record.phase = TransientEffectPhase::Reserved;
         record.disposition = TransientEffectDisposition::Reserved;
         Ok(())
@@ -419,7 +469,7 @@ impl TransientEffectToken {
 
     fn abandon_with_retained(
         &mut self,
-        retained: platform::TransientFile,
+        retained: TransientFile,
         disposition: TransientEffectDisposition,
     ) {
         assert!(
@@ -522,6 +572,10 @@ impl CapabilityAuthority {
     }
 
     pub(super) fn cleanup_abandoned_transient(self: &Arc<Self>, id: u64) -> io::Result<()> {
+        // Only the root's internal abandoned-carrier settlement may re-enter
+        // native receipt APIs while draining. No caller receives this scope.
+        #[cfg(not(target_os = "linux"))]
+        let _settlement = crate::TerminalEffectSettlementScope::begin(self, 0)?;
         let (record, operation) = {
             let mut state = self.operations.lock().map_err(|_| {
                 io::Error::other("filesystem capability operation lock was poisoned")
@@ -551,6 +605,8 @@ impl CapabilityAuthority {
                 destination: header.destination.clone(),
                 identity: header.identity,
                 retained: header.retained.take(),
+                #[cfg(not(target_os = "linux"))]
+                stage_id: header.stage_id,
                 checked_out: true,
                 phase: header.phase,
                 disposition: header.disposition,
@@ -563,6 +619,17 @@ impl CapabilityAuthority {
                 },
             )
         };
+        #[cfg(not(target_os = "linux"))]
+        let mut record = record;
+        #[cfg(not(target_os = "linux"))]
+        if let (Some(identity), Some(retained)) = (record.identity, record.retained.take()) {
+            match discard_transient_file(retained, identity) {
+                Ok(()) => record.disposition = TransientEffectDisposition::NoEffect,
+                Err(DiscardTransientFileError::Retained { file, .. }) => {
+                    record.retained = Some(file);
+                }
+            }
+        }
         let result = match (
             record.disposition,
             record.identity,
@@ -609,7 +676,7 @@ impl CapabilityAuthority {
 
 fn validate_terminal_publication(
     record: &TransientEffectRecord,
-    retained: &platform::TransientFile,
+    retained: &TransientFile,
     identity: platform::Identity,
     operation: &CapabilityOperation,
 ) -> io::Result<()> {
@@ -620,7 +687,7 @@ fn validate_terminal_publication(
     };
     let validate = || {
         record.directory.validate(operation)?;
-        if platform::transient_file_evidence(retained)? != (identity, 1)
+        if transient_file_evidence(retained)? != (identity, 1)
             || platform::file_binding_state(
                 &record.directory.inner.handle,
                 record.destination.as_os_str(),
@@ -668,7 +735,7 @@ impl TransientDestination {
         &self.directory
     }
 
-    pub fn create_stage(mut self) -> TransientStageCreateOutcome {
+    pub fn create_stage(self) -> TransientStageCreateOutcome {
         let authority = match self.directory.authority() {
             Ok(authority) => authority,
             Err(error) => {
@@ -693,15 +760,20 @@ impl TransientDestination {
                 destination: self,
             };
         }
-        match platform::create_transient_file(&self.directory.inner.handle) {
+        #[cfg(not(target_os = "linux"))]
+        return named::create_stage(self);
+        #[cfg(target_os = "linux")]
+        let mut destination = self;
+        #[cfg(target_os = "linux")]
+        match platform::create_transient_file(&destination.directory.inner.handle) {
             Ok((file, identity)) => {
-                let token = self
+                let token = destination
                     .token
                     .take()
                     .expect("admitted transient destination retains its effect token")
                     .into_effect_token();
                 let stage = TransientStage {
-                    destination: Some(self),
+                    destination: Some(destination),
                     file: Some(file),
                     identity,
                     position: 0,
@@ -721,10 +793,7 @@ impl TransientDestination {
                 TransientStageCreateOutcome::Created(stage)
             }
             Err(platform::CreateTransientFileError::NoEffect(error)) => {
-                TransientStageCreateOutcome::NoEffect {
-                    error,
-                    destination: self,
-                }
+                TransientStageCreateOutcome::NoEffect { error, destination }
             }
         }
     }
@@ -949,6 +1018,11 @@ impl std::fmt::Debug for TransientStageCreateOutcome {
 
 enum TransientCreationState {
     Stage(TransientStage),
+    #[cfg(not(target_os = "linux"))]
+    Named {
+        destination: TransientDestination,
+        obligation: crate::FileCreateObligation,
+    },
 }
 
 #[must_use = "pending transient creation authority must be reconciled"]
@@ -981,7 +1055,11 @@ impl TransientCreationObligation {
                     .token
                     .as_ref()
                     .expect("created transient stage retains its effect token")
-                    .mark_live(stage.identity);
+                    .mark_live(
+                        stage.identity,
+                        #[cfg(not(target_os = "linux"))]
+                        stage.file.as_ref().expect("stage retains file").stage_id,
+                    );
                 match result {
                     Ok(()) => TransientStageCreateOutcome::Created(stage),
                     Err(error) => TransientStageCreateOutcome::Pending(Self {
@@ -990,6 +1068,11 @@ impl TransientCreationObligation {
                     }),
                 }
             }
+            #[cfg(not(target_os = "linux"))]
+            TransientCreationState::Named {
+                destination,
+                obligation,
+            } => named::reconcile_creation(destination, obligation),
         }
     }
 }
@@ -997,7 +1080,7 @@ impl TransientCreationObligation {
 #[must_use = "a transient stage must be sealed or explicitly discarded"]
 pub struct TransientStage {
     destination: Option<TransientDestination>,
-    file: Option<platform::TransientFile>,
+    file: Option<TransientFile>,
     identity: platform::Identity,
     position: u64,
     token: Option<TransientEffectToken>,
@@ -1028,7 +1111,7 @@ impl TransientStage {
     pub fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
         let file = self.file.as_ref().ok_or_else(stale_capability)?;
         while !bytes.is_empty() {
-            let written = platform::write_transient_at(file, bytes, self.position)?;
+            let written = write_transient_at(file, bytes, self.position)?;
             if written == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -1053,7 +1136,7 @@ impl TransientStage {
             .file
             .as_mut()
             .expect("live transient stage retains its file");
-        if let Err(error) = platform::seal_transient_file(file, self.identity, self.position) {
+        if let Err(error) = seal_transient_file(file, self.identity, self.position) {
             return Err(TransientStageSealFailure {
                 error,
                 stage: Some(self),
@@ -1065,14 +1148,6 @@ impl TransientStage {
         })
     }
 
-    #[cfg_attr(
-        windows,
-        expect(
-            unreachable_code,
-            unused_variables,
-            reason = "Windows models unsupported transient files as uninhabited while retaining the shared linear API"
-        )
-    )]
     pub fn discard(mut self) -> TransientDiscardOutcome {
         let _operation = match enter_transient_operation(self.destination()) {
             Ok(operation) => operation,
@@ -1087,7 +1162,7 @@ impl TransientStage {
             .file
             .take()
             .expect("live transient stage retains its file");
-        match platform::discard_transient_file(file, self.identity) {
+        match discard_transient_file(file, self.identity) {
             Ok(()) => {
                 let token = self
                     .token
@@ -1096,7 +1171,7 @@ impl TransientStage {
                 let destination = self.take_destination();
                 restore_discarded_destination(destination, token)
             }
-            Err(platform::DiscardTransientFileError::Retained { error, file }) => {
+            Err(DiscardTransientFileError::Retained { error, file }) => {
                 self.file = Some(file);
                 TransientDiscardOutcome::Pending(TransientDiscardObligation {
                     error,
@@ -1122,14 +1197,14 @@ impl Drop for TransientStage {
         #[cfg(target_os = "linux")]
         let discard = platform::discard_transient_file_preallocated(file, self.identity);
         #[cfg(not(target_os = "linux"))]
-        let discard = platform::discard_transient_file(file, self.identity);
+        let discard = discard_transient_file(file, self.identity);
         match discard {
             Ok(()) => {
                 if let Some(token) = self.token.as_ref() {
                     token.mark_disposition_on_drop(TransientEffectDisposition::NoEffect);
                 }
             }
-            Err(platform::DiscardTransientFileError::Retained { file, .. }) => {
+            Err(DiscardTransientFileError::Retained { file, .. }) => {
                 let disposition = match topology {
                     Ok(platform::TransientPublicationState::Published) => {
                         TransientEffectDisposition::Published
@@ -1213,7 +1288,7 @@ impl Read for TransientStageSealed {
             .file
             .as_ref()
             .expect("sealed transient stage retains its file");
-        let read = platform::read_transient_at(file, &mut bytes[..allowed], self.read_position)?;
+        let read = read_transient_at(file, &mut bytes[..allowed], self.read_position)?;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1269,7 +1344,7 @@ fn validate_linked_publication(
 #[cfg(all(test, target_os = "linux"))]
 fn validate_exact_destination(
     destination: &TransientDestination,
-    retained: &platform::TransientFile,
+    retained: &TransientFile,
     identity: platform::Identity,
     operation: &CapabilityOperation,
 ) -> io::Result<()> {
@@ -1285,7 +1360,7 @@ fn validate_exact_destination(
 
 fn validate_exact_destination_binding(
     destination: &TransientDestination,
-    retained: &platform::TransientFile,
+    retained: &TransientFile,
     identity: platform::Identity,
     directory_buffer: Option<&mut [MaybeUninit<u8>]>,
     operation: &CapabilityOperation,
@@ -1310,7 +1385,7 @@ fn validate_exact_destination_binding(
 
 fn validate_unpublished_destination(
     destination: &TransientDestination,
-    retained: &platform::TransientFile,
+    retained: &TransientFile,
     identity: platform::Identity,
     directory_buffer: Option<&mut [MaybeUninit<u8>]>,
     operation: &CapabilityOperation,
@@ -1326,9 +1401,11 @@ fn validate_unpublished_destination(
         destination.name.as_os_str(),
         identity,
     )?;
-    if transient_file_evidence_for_publication(retained)? != (identity, 0)
-        || binding == platform::BindingState::Exact
-    {
+    #[cfg(target_os = "linux")]
+    let unpublished = transient_file_evidence_for_publication(retained)? == (identity, 0);
+    #[cfg(not(target_os = "linux"))]
+    let unpublished = named::validate_unpublished(retained, identity).is_ok();
+    if !unpublished || binding == platform::BindingState::Exact {
         return Err(io::ErrorKind::WouldBlock.into());
     }
     validate_publication_directory(&destination.directory, operation, directory_buffer)
@@ -1388,7 +1465,7 @@ fn directory_revision_for_publication(
 }
 
 fn transient_publication_state_for_publication(
-    transient: &platform::TransientFile,
+    transient: &TransientFile,
     parent: &platform::DirectoryHandle,
     destination_name: &std::ffi::OsStr,
     expected: platform::Identity,
@@ -1401,16 +1478,16 @@ fn transient_publication_state_for_publication(
         expected,
     );
     #[cfg(not(target_os = "linux"))]
-    platform::transient_publication_state(transient, parent, destination_name, expected)
+    named::transient_publication_state(transient, parent, destination_name, expected)
 }
 
 fn transient_file_evidence_for_publication(
-    transient: &platform::TransientFile,
+    transient: &TransientFile,
 ) -> io::Result<(platform::Identity, u64)> {
     #[cfg(target_os = "linux")]
     return platform::transient_file_evidence_preallocated(transient);
     #[cfg(not(target_os = "linux"))]
-    platform::transient_file_evidence(transient)
+    transient_file_evidence(transient)
 }
 
 fn validate_portable_destination_with_operation(
@@ -1485,6 +1562,23 @@ fn validate_mixed_destination_batch_with_operation(
     inventory: &mut DestinationBatchInventory<'_>,
     operation: &CapabilityOperation,
 ) -> io::Result<()> {
+    // Sibling scratch creation/removal can invalidate a read-only inventory.
+    // Keep the same reservations and operation; never retry a namespace effect.
+    for _ in 0..MAX_DESTINATION_INVENTORY_SCANS {
+        if observe_destination_inventory(directory, plan, inventory, operation)? {
+            return Ok(());
+        }
+    }
+    Err(io::ErrorKind::WouldBlock.into())
+}
+
+/// Returns false when the directory changed during a complete scan.
+fn observe_destination_inventory(
+    directory: &Directory,
+    plan: &DestinationBatchPlan,
+    inventory: &mut DestinationBatchInventory<'_>,
+    operation: &CapabilityOperation,
+) -> io::Result<bool> {
     let DestinationBatchInventory {
         expected_exact,
         exact,
@@ -1573,17 +1667,20 @@ fn validate_mixed_destination_batch_with_operation(
             &mut visit_entry,
         )
     };
+    #[cfg(test)]
+    DESTINATION_INVENTORY_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
     validate_publication_directory(directory, operation, directory_buffer.as_deref_mut())?;
     let revision_after =
         directory_revision_for_publication(directory, directory_buffer.as_deref_mut())?;
     let completion = visit?;
-    if revision_after != revision_before {
-        return Err(io::ErrorKind::WouldBlock.into());
-    }
-    // Equal stamps never replace the complete inventory; they only fail a
-    // proof when an observable namespace revision changed around the scan.
+    // Observed collisions and native failures are terminal even during churn.
+    // Equal stamps never replace a complete inventory.
     match completion {
-        platform::VisitCompletion::Complete => Ok(()),
+        platform::VisitCompletion::Complete => Ok(revision_after == revision_before),
         platform::VisitCompletion::Stopped => {
             Err(conflict
                 .expect("transient destination inventory stops only for a decisive conflict"))
@@ -1688,7 +1785,7 @@ impl std::fmt::Debug for TransientPublicationBatchOutcome {
 struct TransientPublicationTransition {
     stage: Option<TransientStageSealed>,
     identity: platform::Identity,
-    retained: Option<platform::TransientFile>,
+    retained: Option<TransientFile>,
     token: Option<TransientEffectToken>,
 }
 
@@ -1758,14 +1855,6 @@ impl TransientPublicationTransition {
             .expect("publication transition retains its sealed stage")
     }
 
-    #[cfg_attr(
-        windows,
-        expect(
-            unreachable_code,
-            unused_variables,
-            reason = "Windows cannot construct the retained transient file required by this conversion"
-        )
-    )]
     fn into_file_capability(mut self) -> FileCapability {
         assert!(
             !self
@@ -1802,7 +1891,7 @@ impl TransientPublicationTransition {
             .expect("publication transition retains its native file");
         drop(self.token.take());
         FileCapability::new(
-            platform::into_published_file(retained),
+            into_published_file(retained),
             self.identity,
             directory,
             name,
@@ -1910,7 +1999,7 @@ impl TransientPublicationBatch {
     pub fn new(
         stages: Vec<TransientStageSealed>,
     ) -> Result<Self, TransientPublicationBatchCreateFailure> {
-        if stages.is_empty() || stages.len() > MAX_OUTSTANDING_EFFECTS {
+        if stages.is_empty() || stages.len() > MAX_TRANSIENT_BATCH {
             return Err(TransientPublicationBatchCreateFailure {
                 error: io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -2056,7 +2145,7 @@ impl TransientPublicationBatch {
             let file = file
                 .as_mut()
                 .expect("sealed transient stage retains its file");
-            let link = platform::link_transient_file(
+            let link = link_transient_file(
                 file,
                 &destination.directory.inner.handle,
                 destination.name.as_os_str(),
@@ -2473,9 +2562,119 @@ mod tests {
             .expect("singleton transient reservation is nonempty"))
     }
 
+    fn with_inventory_hook<T>(hook: impl FnMut() + 'static, action: impl FnOnce() -> T) -> T {
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                DESTINATION_INVENTORY_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+            }
+        }
+        DESTINATION_INVENTORY_TEST_HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+        });
+        let _clear = ClearHook;
+        action()
+    }
+
+    fn create_and_remove_sibling_fixture(root: &std::path::Path) {
+        let path = root.join("inventory-sibling-scratch");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn cancel_test_destination(destination: TransientDestination) {
+        assert!(matches!(
+            destination.cancel(),
+            TransientDestinationCancelOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn destination_inventory_rescans_after_sibling_stage_cleanup() {
+        let temporary = crate::test_tempdir().unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let mut sibling = Some(temporary.path().to_path_buf());
+        let batch = with_inventory_hook(
+            move || {
+                if let Some(sibling) = sibling.take() {
+                    create_and_remove_sibling_fixture(&sibling);
+                }
+            },
+            || {
+                root.admit_transient_destinations(vec![
+                    LeafName::new("first.bin").unwrap(),
+                    LeafName::new("second.bin").unwrap(),
+                ])
+            },
+        )
+        .expect("unrelated scratch cleanup must not fail destination admission");
+        for destination in batch.into_destinations() {
+            cancel_test_destination(destination);
+        }
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn destination_inventory_bounds_churn_and_releases_failed_reservations() {
+        let temporary = crate::test_tempdir().unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let sibling = temporary.path().to_path_buf();
+        let names = vec![
+            LeafName::new("first.bin").unwrap(),
+            LeafName::new("second.bin").unwrap(),
+        ];
+        let error = with_inventory_hook(
+            move || create_and_remove_sibling_fixture(&sibling),
+            || root.admit_transient_destinations(names.clone()),
+        )
+        .expect_err("continuous namespace churn must remain bounded");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let batch = root
+            .admit_transient_destinations(names)
+            .expect("failed inventory must settle every destination reservation");
+        for destination in batch.into_destinations() {
+            cancel_test_destination(destination);
+        }
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn destination_inventory_rescan_preserves_portable_collision_during_churn() {
+        let temporary = crate::test_tempdir().unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let alias = temporary.path().join("ARTIFACT.BIN");
+        let mut introduce_alias = Some(alias.clone());
+        let sibling = temporary.path().to_path_buf();
+        let error = with_inventory_hook(
+            move || {
+                if let Some(alias) = introduce_alias.take() {
+                    std::fs::write(alias, b"external contents").unwrap();
+                }
+                create_and_remove_sibling_fixture(&sibling);
+            },
+            || root.admit_transient_destination(LeafName::new("artifact.bin").unwrap()),
+        )
+        .expect_err("a newly observed portable alias must not be hidden by churn");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(alias).unwrap(), b"external contents");
+        cancel_test_destination(
+            root.admit_transient_destination(LeafName::new("other.bin").unwrap())
+                .unwrap(),
+        );
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
     #[test]
     fn batch_aliases_are_rejected_before_effect_reservation() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let error = root
@@ -2500,7 +2699,7 @@ mod tests {
 
     #[test]
     fn external_batch_collision_settles_every_reservation() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         std::fs::write(temporary.path().join("Occupied.bin"), b"occupied")
             .expect("external occupied file");
         let session = acquire_test_root(temporary.path());
@@ -2527,7 +2726,7 @@ mod tests {
 
     #[test]
     fn held_destination_blocks_batch_until_explicit_cancellation() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let held = root
@@ -2570,7 +2769,7 @@ mod tests {
 
     #[test]
     fn batch_admission_reserves_every_destination_atomically() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let batch = root
@@ -2612,7 +2811,7 @@ mod tests {
 
     #[test]
     fn explicit_destination_cancellation_releases_its_reservation() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let destination = root
@@ -2644,7 +2843,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn discarded_stage_reuses_the_exact_destination_reservation() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let Some(first) = test_stage(&root, "retry.bin") else {
@@ -2717,7 +2916,7 @@ mod tests {
 
     #[test]
     fn reserved_token_unwind_is_root_cleanable_no_effect() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let authority = session.authority.clone();
@@ -2746,7 +2945,7 @@ mod tests {
 
     #[test]
     fn move_and_transient_reservations_reject_conflicts_in_either_order() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let authority = session.authority.clone();
@@ -2824,7 +3023,7 @@ mod tests {
 
     #[test]
     fn unrelated_sibling_tree_reservations_proceed_together() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         std::fs::create_dir(temporary.path().join("move-tree")).expect("move tree");
         std::fs::create_dir(temporary.path().join("transient-tree")).expect("transient tree");
         let session = acquire_test_root(temporary.path());
@@ -2865,7 +3064,7 @@ mod tests {
 
     #[test]
     fn simultaneous_move_and_transient_reservations_admit_exactly_one() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let authority = session.authority.clone();
@@ -2991,7 +3190,7 @@ mod tests {
 
     #[test]
     fn dropped_pending_carriers_remain_root_owned_until_terminal_cleanup() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
 
@@ -3049,7 +3248,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn anonymous_stage_publishes_exact_single_link_content() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let Some(mut stage) = test_stage(&root, "published.bin") else {
@@ -3098,7 +3297,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn grouped_publication_releases_every_file_after_one_terminal_outcome() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let mut first = test_stage(&root, "group-first.bin").expect("first transient stage");
@@ -3144,7 +3343,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn grouped_partial_publication_preserves_original_member_order() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let first = test_stage(&root, "partial-first.bin").expect("first transient stage");
@@ -3274,7 +3473,7 @@ mod tests {
                 true,
             ),
         ] {
-            let temporary = tempfile::tempdir().expect("temporary transient root");
+            let temporary = crate::test_tempdir().expect("temporary transient root");
             let session = acquire_test_root(temporary.path());
             let root = session.root().expect("root directory");
             let first_name = format!("{case}-published.bin");
@@ -3360,7 +3559,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn dropped_mixed_pending_batch_retains_root_cleanable_authority() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let first = test_stage(&root, "pending-first.bin").expect("first transient stage");
@@ -3420,7 +3619,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn grouped_zero_publication_returns_the_intact_no_effect_batch() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let first = test_stage(&root, "zero-first.bin").expect("first transient stage");
@@ -3495,7 +3694,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sealed_stage_reads_and_seeks_within_its_admitted_size_before_publication() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let Some(mut stage) = test_stage(&root, "readable.bin") else {
@@ -3551,7 +3750,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn dropped_published_obligation_transfers_exact_handle_to_root() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let (sealed, id) = linked_test_stage(&root, "root-retained.bin");
@@ -3571,7 +3770,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn publication_transition_unwind_after_carrier_extraction_retains_root_authority() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let (sealed, id) = linked_test_stage(&root, "extraction-unwind.bin");
@@ -3589,7 +3788,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn publication_batch_unwind_after_partial_link_retains_root_authority() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let (sealed, id) = linked_test_stage(&root, "classification-unwind.bin");
@@ -3608,7 +3807,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn held_transient_rejects_replacement_then_discards_unlinked_payload() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let mut stage = test_stage(&root, "aba.bin").expect("transient platform");
@@ -3672,7 +3871,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn prepublication_collision_is_deferred_to_publish_and_preserves_the_stage() {
-        let temporary = tempfile::tempdir().expect("temporary transient root");
+        let temporary = crate::test_tempdir().expect("temporary transient root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root directory");
         let destination = root

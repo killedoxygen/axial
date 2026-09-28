@@ -1,7 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { api } from '../../api';
-import { configResponse } from '../../dto-core';
+import { saveConfigPatch } from '../../hooks/use-autosave';
 import { hasNativeDesktopRuntime, requestNativeAppReset } from '../../native';
 import { Button, Toggle } from '../../ui/Atoms';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
@@ -9,6 +8,8 @@ import { navigate } from '../../ui-state';
 import { config, devMode } from '../../store';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
+import { InstanceImportRow } from './InstanceImportRow';
+import { reloadApplication } from '../../preferences/persistence';
 
 type PerformanceLabCardComponent = (typeof import('./PerformanceLabCard'))['PerformanceLabCard'];
 
@@ -27,9 +28,13 @@ function PerformanceLabSlot(): JSX.Element | null {
     }
 
     let alive = true;
-    void loadPerformanceLabCard().then((component) => {
-      if (alive) setLab(() => component);
-    });
+    void loadPerformanceLabCard()
+      .then((component) => {
+        if (alive) setLab(() => component);
+      })
+      .catch((err: unknown) => {
+        if (alive) toast(`Could not load Performance Lab: ${errMessage(err)}`, 'error');
+      });
     return () => {
       alive = false;
     };
@@ -58,7 +63,7 @@ export function AdvancedSettingsSection(): JSX.Element {
     setTelemetryEnabled(next);
     setSavingTelemetry(true);
     try {
-      config.value = configResponse(await api('PUT', '/config', { telemetry_enabled: next }));
+      await saveConfigPatch({ telemetry_enabled: next });
       toast('Saved');
     } catch (err) {
       setTelemetryEnabled(savedTelemetry);
@@ -69,12 +74,13 @@ export function AdvancedSettingsSection(): JSX.Element {
   };
 
   const resetLauncher = async (): Promise<void> => {
+    if (!devMode.value || !hasNativeDesktopRuntime()) return;
     if (resetInFlight.current) return;
     resetInFlight.current = true;
     try {
       const { showConfirm } = await import('../../ui/Dialog');
       const confirmed = await showConfirm(
-        'Delete startup-detected Axial launcher files and the default managed library, then restart? External libraries and your saved Microsoft system credential are preserved.',
+        'Stop active work, delete this isolated Axial rewrite development profile and its managed library, then restart? The window will close while cleanup finishes. If cleanup is delayed, Axial will keep retrying before restarting. If the process stops before cleanup finishes, Axial will ask before continuing at the next startup. Other Axial profiles, external libraries and saved Microsoft system credentials are preserved.',
         {
           destructive: true,
           confirmText: 'Reset',
@@ -88,7 +94,7 @@ export function AdvancedSettingsSection(): JSX.Element {
       setResetting(true);
       const requested = await requestNativeAppReset();
       if (!requested) throw new Error('desktop runtime unavailable');
-      toast('Reset complete. Restarting Axial.');
+      toast('Reset requested. Axial will close, finish cleanup, then restart.');
     } catch (err) {
       resetInFlight.current = false;
       setResetting(false);
@@ -107,11 +113,12 @@ export function AdvancedSettingsSection(): JSX.Element {
         title="Reload launcher"
         description="Restarts the interface if something looks stuck or out of date."
         control={
-          <Button variant="secondary" icon="refresh" onClick={() => location.reload()}>
+          <Button variant="secondary" icon="refresh" onClick={reloadApplication}>
             Reload
           </Button>
         }
       />
+      <InstanceImportRow />
       {__AXIAL_ENABLE_DEV_LAB__ && isDev && (
         <SettingRow
           title="Dev lab"
@@ -127,7 +134,7 @@ export function AdvancedSettingsSection(): JSX.Element {
       {isDev && hasNativeDesktopRuntime() && (
         <SettingRow
           title="Reset launcher"
-          description="Deletes startup-detected launcher files and the default managed library. External libraries and the saved Microsoft system credential are preserved."
+          description="Stops active work and deletes this isolated rewrite development profile and its managed library. Other profiles, external libraries and saved Microsoft system credentials are preserved."
           control={
             <Button variant="danger" icon="trash" disabled={resetting} onClick={() => void resetLauncher()}>
               {resetting ? 'Resetting…' : 'Reset'}

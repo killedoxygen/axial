@@ -10,6 +10,8 @@ mod model;
 mod path_safety;
 mod plan;
 mod runtime;
+#[cfg(feature = "test-support")]
+mod test_support;
 mod transfer;
 mod transient_transfer;
 
@@ -73,7 +75,11 @@ pub use model::{
     VerifiedManagedInstallCheckpointReceipt, VerifiedManagedInstallReceipt,
     VerifiedRegisteredKnownGoodBootstrap,
 };
-pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
+#[cfg(feature = "test-support")]
+pub use test_support::InstallTestEndpoints;
+pub(crate) use transfer::{AuthenticatedSelectedArtifactSource, acquire_processor_mappings};
+#[cfg(test)]
+pub(crate) use transfer::{TestProcessorMappingsTransport, acquire_test_processor_mappings};
 pub use transient_transfer::{
     CreateOnlyTransferTarget, ExpectedTransferDigests, MAX_MANAGED_TRANSFER_BYTES,
     ManagedTransferAuthority, ManagedTransferEffectAuthority, ManagedTransferTerminalAuthority,

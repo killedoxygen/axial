@@ -1,10 +1,10 @@
 import { signal } from '@preact/signals';
-import { api, apiResourceUrl } from './api';
+import { apiResourceUrl } from './api';
 import { DEFAULT_SKINS } from './default-skins';
-import { local, saveLocalState } from './state';
+import { accountsSnapshot, activeAccount } from './machines/accounts-state';
+import { local, saveLocalState, canEditPreferences } from './state';
 import { config } from './store';
-import { authStatusResponse, launcherAccountsResponse } from './views/accounts/api';
-import type { AuthStatusRecord, MinecraftProfile } from './views/accounts/types';
+import type { MinecraftProfile } from './views/accounts/types';
 
 export const accountSkinSrc = signal<string | null>(null);
 export const accountDisplayName = signal('Player');
@@ -12,10 +12,8 @@ export const accountDisplayName = signal('Player');
 const DEFAULT_SELECTED_SKIN = 'default:steve';
 export const FALLBACK_SKIN_ACCOUNT_KEY = 'account:fallback';
 
-let accountSkinRequestId = 0;
-
 export function launcherSkinAccountKey(accountId: string): string {
-  const normalized = accountId.trim().toLowerCase();
+  const normalized = accountId.trim();
   return `account:${normalized || 'unknown'}`;
 }
 
@@ -38,7 +36,7 @@ export function selectedSkinTextureSrc(value = selectedSkinForAccount()): string
   }
   if (value.startsWith('saved:')) {
     const textureKey = value.slice('saved:'.length);
-    return textureKey ? apiResourceUrl(`/skins/${textureKey}/file`) : null;
+    return textureKey ? apiResourceUrl(`/skins/${encodeURIComponent(textureKey)}/file`) : null;
   }
   return null;
 }
@@ -55,6 +53,7 @@ export function minecraftProfileSkinTextureSrc(profile: MinecraftProfile | undef
 }
 
 export function setSelectedSkin(value: string, accountKey?: string): void {
+  if (!canEditPreferences()) return;
   const next = validSelectedSkin(value);
   if (accountKey) {
     if (local.selectedSkinsByAccount[accountKey] !== next) {
@@ -75,28 +74,16 @@ export function resetSelectedSkin(accountKey?: string): void {
 }
 
 export function refreshAccountSkin(): void {
-  const requestId = ++accountSkinRequestId;
   const fallbackName = config.value?.username || 'Player';
-
-  void applyAccountSkinFromAccounts(requestId, fallbackName).catch(() => {
-    if (requestId === accountSkinRequestId) applyNoAccountHead(fallbackName);
-  });
-}
-
-async function applyAccountSkinFromAccounts(requestId: number, fallbackName: string): Promise<void> {
-  const response = await api('GET', '/accounts');
-  if (requestId !== accountSkinRequestId) return;
-  const payload = launcherAccountsResponse(response);
-  if (!payload) throw new Error('Launcher accounts response was invalid.');
-  const activeAccount = payload.accounts.find((account) => account.active);
-  if (!activeAccount) {
-    await applyAccountSkinFromAuthStatus(requestId, fallbackName);
+  const account = activeAccount(accountsSnapshot.value);
+  if (!account) {
+    applyNoAccountHead(fallbackName);
     return;
   }
 
-  const displayName = activeAccount.display_name.trim() || fallbackName;
-  if (activeAccount.kind === 'microsoft') {
-    const profile = activeAccount.minecraft_profile;
+  const displayName = account.display_name.trim() || fallbackName;
+  if (account.kind === 'microsoft') {
+    const profile = account.minecraft_profile;
     if (profile) {
       accountDisplayName.value = profile.name.trim() || displayName;
       accountSkinSrc.value = minecraftProfileSkinTextureSrc(profile);
@@ -104,10 +91,10 @@ async function applyAccountSkinFromAccounts(requestId: number, fallbackName: str
     }
   }
 
-  if (activeAccount.kind === 'offline') {
+  if (account.kind === 'offline') {
     accountDisplayName.value = displayName;
     accountSkinSrc.value = selectedSkinTextureSrc(
-      selectedSkinForAccount(launcherSkinAccountKey(activeAccount.account_id)),
+      selectedSkinForAccount(launcherSkinAccountKey(account.account_id)),
     );
     return;
   }
@@ -115,30 +102,9 @@ async function applyAccountSkinFromAccounts(requestId: number, fallbackName: str
   applyNoAccountHead(fallbackName);
 }
 
-async function applyAccountSkinFromAuthStatus(requestId: number, fallbackName: string): Promise<void> {
-  const response = await api('GET', '/auth/status');
-  if (requestId !== accountSkinRequestId) return;
-  const status = authStatusResponse(response);
-  if (!status) throw new Error('Authentication status response was invalid.');
-
-  const profile = status.minecraft_profile;
-  if (status.launch_auth_mode === 'online' && profile) {
-    const profileName = profile.name.trim() || fallbackName;
-    accountDisplayName.value = profileName;
-    accountSkinSrc.value = minecraftProfileSkinTextureSrc(profile);
-    return;
-  }
-
-  applyNoAccountHead(authStatusDisplayName(status, fallbackName));
-}
-
 function applyNoAccountHead(displayName = 'Player'): void {
   accountDisplayName.value = displayName.trim() || 'Player';
   accountSkinSrc.value = selectedSkinTextureSrc(selectedSkinForAccount(FALLBACK_SKIN_ACCOUNT_KEY));
-}
-
-function authStatusDisplayName(status: AuthStatusRecord, fallbackName: string): string {
-  return status.username.trim() || fallbackName;
 }
 
 function validSelectedSkin(value: string | undefined): string {

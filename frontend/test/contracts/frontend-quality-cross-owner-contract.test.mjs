@@ -58,6 +58,6 @@ test('the local static-check gate runs semantic lint once without duplicating it
   assert.equal((checkTask.match(/task: frontend:lint:semantic/g) ?? []).length, 1);
   assert.equal((checkTask.match(/task: frontend:test/g) ?? []).length, 1);
   assert.doesNotMatch(checkTask, /\btsc\b|pnpm --dir frontend run lint(?:\s|$)/);
-  assert.match(semanticTask, /^    internal: true\n    cmds:\n      - pnpm --dir frontend run lint:semantic\n\n$/);
+  assert.equal((semanticTask.match(/^[ \t]+- pnpm --dir frontend run lint:semantic[ \t]*$/gm) ?? []).length, 1);
   assert.doesNotMatch(semanticTask, /\btsc\b|task: frontend:test/);
 });

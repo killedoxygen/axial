@@ -54,6 +54,24 @@ export function hasNativeDesktopRuntime(): boolean {
   return isTauriRuntime();
 }
 
+export async function pickNativeImportProfile(): Promise<unknown> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) throw new Error('Instance import is available in the desktop app.');
+  return tauri.core.invoke('pick_import_profile');
+}
+
+export async function pickNativeImportInstanceSource(fingerprint: string, legacyId: string): Promise<unknown> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) throw new Error('Instance import is available in the desktop app.');
+  return tauri.core.invoke('pick_import_instance_source', { fingerprint, legacyId });
+}
+
+export async function forgetNativeImportProfile(): Promise<void> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return;
+  await tauri.core.invoke('forget_import_profile');
+}
+
 export type DesktopPlatform = 'browser' | 'linux' | 'macos' | 'unknown' | 'windows';
 export type DesktopChromeMode = 'browser' | 'custom-frameless' | 'mac-overlay' | 'native-decorated';
 
@@ -126,6 +144,34 @@ export function nativeLaunchLogEventName(sessionId: string): string {
 }
 
 export const nativeDesktopCloseBlockedEventName = 'axial:desktop:close-blocked';
+export const nativePreferencesEventName = 'axial:desktop:preferences';
+
+export interface NativePreferencesRequest {
+  request_id: string;
+  phase: 'flush' | 'discard' | 'release';
+}
+
+export function nativePreferencesRequest(value: unknown): NativePreferencesRequest {
+  const record = dtoRecord(value, 'Desktop preference request');
+  const request_id = dtoString(record.request_id, 'Desktop preference request id');
+  if (!request_id || !['flush', 'discard', 'release'].includes(String(record.phase))) {
+    throw new Error('Invalid desktop preference request.');
+  }
+  return { request_id, phase: record.phase as NativePreferencesRequest['phase'] };
+}
+
+export async function pendingNativePreferences(): Promise<NativePreferencesRequest | null> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) throw new Error('Desktop preference coordination is unavailable.');
+  const value = await tauri.core.invoke('pending_interface_preferences');
+  return value === null ? null : nativePreferencesRequest(value);
+}
+
+export async function completeNativePreferences(requestId: string, saved: boolean): Promise<void> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) throw new Error('Desktop preference coordination is unavailable.');
+  await tauri.core.invoke('complete_interface_preferences', { requestId, saved });
+}
 
 export async function onNativeEvent(
   eventName: string,

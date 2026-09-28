@@ -161,7 +161,7 @@ impl ManagedRuntimeCache {
 }
 
 impl ManagedRuntimeComponent {
-    pub(crate) fn launch_receipt(
+    pub fn launch_receipt(
         &self,
     ) -> std::io::Result<super::layout::ManagedRuntimeLaunchReceipt> {
         self.validate_projection()?;
@@ -532,7 +532,7 @@ mod processor_runtime_tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let parent = std::env::temp_dir().join(format!("Packages-parent-{nonce}"));
+        let parent = crate::test_temp_root().join(format!("Packages-parent-{nonce}"));
         fs::create_dir_all(&parent).expect("cache root");
         let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
         let component = "java-runtime-delta";

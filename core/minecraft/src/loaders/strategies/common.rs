@@ -25,8 +25,9 @@ use crate::loaders::bound_processors::{
 use crate::loaders::compose::{LoaderProfileFragment, compose_loader_version};
 use crate::loaders::forge_installer::{
     AuthenticatedForgeInstallerPlan, AuthenticatedInstallerReconstructionInput,
-    BoundForgeInstallExecution, PendingForgeInstallExecution, PendingForgeNetworkInstall,
-    VerifiedInstallerClientBytes, bind_authenticated_installer_plan, plan_authenticated_installer,
+    BoundForgeInstallExecution, ForgeInstallerError, PendingForgeInstallExecution,
+    PendingForgeNetworkInstall, VerifiedInstallerClientBytes, bind_authenticated_installer_plan,
+    plan_authenticated_installer,
 };
 #[cfg(not(test))]
 use crate::loaders::http::fetch_bytes;
@@ -469,6 +470,9 @@ async fn reconstruct_installer_authority_with_downloader(
             runtime_source,
         )
         .map_err(|error| LoaderError::ProcessorFailed(error.to_string()))?;
+        #[cfg(test)]
+        let processor_sources = processor_sources
+            .with_test_mappings_transport(downloader.test_processor_mappings_transport());
         let result = spawn_reconstruction_processor_execution(
             sources,
             plan.record.version_id.clone(),
@@ -746,6 +750,10 @@ where
         &execution,
         BoundForgeInstallExecution::UnsupportedMissingOutputs
     ) {
+        tracing::warn!(
+            reason = "unsupported_missing_outputs",
+            "Loader installer plan rejected."
+        );
         return Err(LoaderError::InvalidProfile(
             "loader installer processors do not expose authenticated client outputs".to_string(),
         ));
@@ -1173,7 +1181,10 @@ where
         |fact| facts.push(fact),
     )
     .await
-    .map_err(|_| LoaderError::ArtifactDownloadFailed { facts })
+    .map_err(|error| {
+        log_library_download_failure("profile_libraries", &error);
+        LoaderError::ArtifactDownloadFailed { facts }
+    })
 }
 
 async fn download_installer_libraries_with_evidence<F>(
@@ -1200,7 +1211,46 @@ where
         |fact| facts.push(fact),
     )
     .await
-    .map_err(|_| LoaderError::ArtifactDownloadFailed { facts })
+    .map_err(|error| {
+        log_library_download_failure("installer_libraries", &error);
+        LoaderError::ArtifactDownloadFailed { facts }
+    })
+}
+
+fn log_library_download_failure(stage: &'static str, error: &crate::DownloadError) {
+    use crate::DownloadError;
+    let category = match error {
+        DownloadError::FileOperation(_) => "file_operation",
+        DownloadError::ResolveManifest(_) => "resolve_manifest",
+        DownloadError::Request(_) => "request",
+        DownloadError::ParseVersion(_) => "parse_version",
+        DownloadError::PrepareRuntime(_) => "prepare_runtime",
+        DownloadError::RuntimeSource(_) => "runtime_source",
+        DownloadError::RuntimeUnavailableForPlatform { .. } => "runtime_unavailable",
+        DownloadError::RuntimeRosettaRequired { .. } => "runtime_rosetta_required",
+        DownloadError::Integrity(_) => "integrity",
+        DownloadError::PublicationIndeterminate(_) => "publication_indeterminate",
+        DownloadError::LibraryPlan(_) => "library_plan",
+    };
+    let (io_kind, raw_os_error) = match error {
+        DownloadError::FileOperation(error) => (Some(error.kind()), error.raw_os_error()),
+        _ => (None, None),
+    };
+    let (http_status, is_timeout, is_connect) = match error {
+        DownloadError::Request(error) => (
+            error.status().map(|status| status.as_u16()),
+            Some(error.is_timeout()),
+            Some(error.is_connect()),
+        ),
+        _ => (None, None, None),
+    };
+    let library_plan = match error {
+        DownloadError::LibraryPlan(error) => Some(error),
+        _ => None,
+    };
+    tracing::warn!(stage, category, ?io_kind, raw_os_error, http_status, is_timeout, is_connect,
+        ?library_plan, file_failure_class = ?error.file_failure_class(),
+        "Loader library acquisition failed.");
 }
 
 fn parse_profile_json(
@@ -1452,7 +1502,16 @@ fn legacy_archive_entry_is_skipped(name: &str) -> bool {
         || upper.ends_with(".DSA")
 }
 
-fn installer_extract_error(component_name: &str, error: impl std::fmt::Display) -> LoaderError {
+fn installer_extract_error(component_name: &str, error: ForgeInstallerError) -> LoaderError {
+    let io_kind = match &error {
+        ForgeInstallerError::Io(error) => Some(error.kind()),
+        _ => None,
+    };
+    tracing::warn!(
+        reason = error.diagnostic_kind(),
+        ?io_kind,
+        "Loader installer plan rejected."
+    );
     LoaderError::InvalidProfile(format!("extracting {component_name} installer: {error}"))
 }
 
@@ -2243,7 +2302,7 @@ printf '%s' 'processor-terminal' > "$last"
         let runtime_manifest_bytes = serde_json::to_vec(&serde_json::json!({
             "files": {
                 "bin": {"type": "directory"},
-                "bin/java": {
+                (crate::runtime::runtime_java_relative_path()): {
                     "type": "file",
                     "executable": true,
                     "downloads": {"raw": {
@@ -2367,6 +2426,225 @@ printf '%s' 'processor-terminal' > "$last"
         ] {
             assert_processor_reconstruction_parity(shape).await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn derived_neoforge_pipeline_reconstructs_exact_publication_and_refuses_fresh_drift() {
+        use crate::download::{
+            TestProcessorMappingsTransport, verify_managed_install_reconstruction_checkpoint,
+        };
+        use crate::loaders::forge_installer::{
+            BoundProcessorDisposition, BoundProcessorOutputExpectation, BoundProcessorOutputRole,
+        };
+
+        let fixture_root = temp_dir("derived-neoforge-reconstruction");
+        let root = fixture_root.join("managed");
+        let drift_marker = fixture_root.join("change-patcher-output");
+        let library_root = test_library_operation(&root);
+        let runtime = TestProcessorRuntime::start_neoforge(&drift_marker);
+        let mappings = b"# fixture Mojang mappings\nExample -> a:\n";
+        let mappings_server = TestByteServer::start(mappings.to_vec());
+        let mapping_entry = crate::launch::DownloadEntry {
+            url: "https://fixture.invalid/client-mappings.txt".to_string(),
+            sha1: sha1_hex(mappings),
+            size: mappings.len() as i64,
+        };
+        let transport = TestProcessorMappingsTransport::new(
+            mapping_entry.url.clone(),
+            mappings_server.url.clone(),
+        );
+        let mut record = processor_fixture_record(ProcessorFixtureShape::NeoModern);
+        record.minecraft_version = "1.21.1".to_string();
+        record.loader_version = "21.1.252".to_string();
+        canonicalize_record_identity(&mut record);
+        let (base_receipt, manifest, client_server, version_server) = install_test_processor_base(
+            library_root.operation(),
+            &record,
+            &runtime.descriptor,
+            21,
+            Some(mapping_entry),
+        )
+        .await;
+        let installer_server = TestByteServer::start_with_sha1(derived_neoforge_installer_jar());
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: installer_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+        let source = verified_test_source_for(
+            &installer_server.url,
+            "loader installer",
+            &record.version_id,
+        )
+        .await;
+        let bound = bind_test_installer(source, &record);
+        let BoundProcessorDisposition::TypedRunnable(processors) = bound.processor_disposition()
+        else {
+            panic!("recognized six-step NeoForge recipe");
+        };
+        assert_eq!(processors.steps.len(), 6);
+        assert!(
+            processors
+                .steps
+                .iter()
+                .flat_map(|step| &step.outputs)
+                .all(|output| {
+                    matches!(
+                        output.expectation,
+                        BoundProcessorOutputExpectation::Derived(_)
+                    )
+                })
+        );
+        let terminals = processors
+            .steps
+            .iter()
+            .flat_map(|step| &step.outputs)
+            .filter(|output| matches!(output.role, BoundProcessorOutputRole::Terminal { .. }))
+            .map(|output| output.artifact.coordinate.as_str())
+            .collect::<Vec<_>>();
+        let terminal_coordinates = [
+            "net.minecraft:client:1.21.1-20240808.144430:extra",
+            "net.minecraft:client:1.21.1-20240808.144430:srg",
+            "net.neoforged:neoforge:21.1.252:client",
+        ];
+        assert_eq!(terminals, terminal_coordinates);
+        let intermediate_paths = processors
+            .steps
+            .iter()
+            .flat_map(|step| &step.outputs)
+            .filter(|output| matches!(output.role, BoundProcessorOutputRole::Intermediate))
+            .map(|output| output.artifact.relative_path.as_str().to_string())
+            .collect::<Vec<_>>();
+        let installed = finish_test_processor_installer_with_runtime(
+            library_root.operation(),
+            &plan,
+            bound,
+            base_receipt,
+            &runtime.descriptor,
+            Some(transport.clone()),
+        )
+        .await;
+        checkpoint_and_ack_version_bundle(library_root.operation(), &record.version_id).await;
+        let expected_contract = installed
+            .activation_contract_id()
+            .expect("installed contract");
+        let installed = installed.into_activation_source().into_parts();
+        let terminal_paths = terminal_coordinates.map(|coordinate| {
+            crate::launch::maven_to_path(coordinate)
+                .to_string_lossy()
+                .replace('\\', "/")
+        });
+        for path in &terminal_paths {
+            let entry = installed
+                .1
+                .entries()
+                .iter()
+                .find(|entry| entry.path().as_str() == path)
+                .expect("published derived runtime artifact");
+            assert!(
+                matches!(entry.integrity(), KnownGoodIntegrity::Sha1 { size, .. } if *size > 0)
+            );
+            assert!(root.join("libraries").join(path).is_file());
+        }
+        assert!(installed.1.entries().iter().all(|entry| {
+            !intermediate_paths
+                .iter()
+                .any(|path| path == entry.path().as_str())
+                && !entry.path().as_str().ends_with(".cache")
+        }));
+        assert!(
+            intermediate_paths
+                .iter()
+                .all(|path| !root.join("libraries").join(path).exists())
+        );
+        assert!(snapshot_tree(&root).keys().all(|path| {
+            path.extension()
+                .is_none_or(|extension| extension != "cache")
+        }));
+        seed_reconstruction_sentinels(&root);
+        let before = snapshot_tree(&root);
+        let counts = [
+            version_server.request_count(),
+            client_server.request_count(),
+            installer_server.request_count(),
+            runtime.manifest_server.request_count(),
+            runtime.file_server.request_count(),
+            mappings_server.request_count(),
+        ];
+        for drift in [false, true] {
+            if drift {
+                // The authenticated runtime/tool/input bytes stay identical; only this fixture tool's result changes.
+                fs::write(&drift_marker, b"drift").expect("switch fixture patcher result");
+            }
+            let reconstructed = reconstruct_installer_with_downloader(
+                &plan,
+                &test_downloader(library_root.operation(), manifest.clone())
+                    .with_test_runtime_source(runtime.descriptor.clone())
+                    .with_test_processor_mappings_transport(transport.clone()),
+            )
+            .await
+            .expect("execute fresh six-step reconstruction");
+            assert_eq!(snapshot_tree(&root), before);
+            let rounds = if drift { 2 } else { 1 };
+            assert_eq!(version_server.request_count(), counts[0] + rounds);
+            assert_eq!(client_server.request_count(), counts[1] + rounds);
+            assert_eq!(installer_server.request_count(), counts[2] + rounds * 2);
+            assert_eq!(runtime.manifest_server.request_count(), counts[3] + rounds);
+            assert_eq!(runtime.file_server.request_count(), counts[4] + rounds);
+            assert_eq!(mappings_server.request_count(), counts[5] + rounds);
+            let checkpoint =
+                verify_managed_install_reconstruction_checkpoint(&expected_contract, reconstructed);
+            if drift {
+                let refused = checkpoint
+                    .expect_err("fresh derived output mismatch must refuse activation")
+                    .into_receipt()
+                    .into_activation_source()
+                    .into_parts();
+                let entry = |inventory: &crate::known_good::KnownGoodInventory, path: &str| {
+                    inventory
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.path().as_str() == path)
+                        .expect("derived terminal")
+                        .clone()
+                };
+                assert_eq!(
+                    entry(&installed.1, &terminal_paths[0]),
+                    entry(&refused.1, &terminal_paths[0])
+                );
+                assert_eq!(
+                    entry(&installed.1, &terminal_paths[1]),
+                    entry(&refused.1, &terminal_paths[1])
+                );
+                assert_ne!(
+                    entry(&installed.1, &terminal_paths[2]),
+                    entry(&refused.1, &terminal_paths[2])
+                );
+            } else {
+                checkpoint
+                    .expect("fresh exact reconstruction checkpoint")
+                    .activate_with(|source| {
+                        assert_eq!(source.into_parts(), installed);
+                        async { Ok(()) }
+                    })
+                    .await
+                    .expect("accept matching reconstruction");
+            }
+        }
+        assert_eq!(snapshot_tree(&root), before);
+        for server in [
+            client_server,
+            version_server,
+            installer_server,
+            mappings_server,
+        ] {
+            server.stop();
+        }
+        runtime.stop();
+        drop(library_root);
+        fs::remove_dir_all(fixture_root).expect("remove isolated NeoForge fixture");
     }
 
     #[cfg(unix)]
@@ -4444,7 +4722,7 @@ printf '%s' 'processor-terminal' > "$last"
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or_default();
-        std::env::temp_dir().join(format!("axial-{prefix}-{nanos:x}"))
+        crate::test_temp_root().join(format!("axial-{prefix}-{nanos:x}"))
     }
 
     fn test_library_operation(path: &Path) -> ManagedLibraryTestAuthority {
@@ -5027,6 +5305,100 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[cfg(unix)]
+    fn derived_neoforge_installer_jar() -> Vec<u8> {
+        // Official 21.1.252 client schema with tiny authenticated tools/data.
+        // Unrelated libraries, Java tool classpaths and server-only processors are omitted.
+        let mut entries = vec![("data/client.lzma".to_string(), b"patches".to_vec())];
+        let mut libraries = Vec::new();
+        for (coordinate, main_class) in [
+            ("net.neoforged:neoforge:21.1.252:universal", "fixture.Root"),
+            (
+                "net.neoforged.installertools:installertools:2.1.2",
+                "fixture.Merge",
+            ),
+            (
+                "net.neoforged.installertools:jarsplitter:2.1.2",
+                "fixture.Split",
+            ),
+            ("net.neoforged:AutoRenamingTool:2.0.3:all", "fixture.Rename"),
+            (
+                "net.neoforged.installertools:binarypatcher:2.1.2:fatjar",
+                "fixture.Patch",
+            ),
+            ("net.neoforged:neoform:1.21.1-20240808.144430@zip", ""),
+            (
+                "net.neoforged.fancymodloader:loader:4.0.44",
+                "fixture.Loader",
+            ),
+        ] {
+            let bytes = if main_class.is_empty() {
+                zip_entries(&[
+                    ("config.json", br#"{"spec":4,"version":"1.21.1","data":{"mappings":"config/joined.tsrg"}}"#),
+                    ("config/joined.tsrg", b"tsrg2 obf srg\na Example\n"),
+                ])
+            } else {
+                let manifest = format!("Manifest-Version: 1.0\nMain-Class: {main_class}\n\n");
+                zip_entries(&[("META-INF/MANIFEST.MF", manifest.as_bytes())])
+            };
+            let path = crate::launch::maven_to_path(coordinate)
+                .to_string_lossy()
+                .replace('\\', "/");
+            libraries.push(serde_json::json!({
+                "name":coordinate,
+                "downloads":{"artifact":{"path":path,"url":"","sha1":sha1_hex(&bytes),"size":bytes.len()}}
+            }));
+            entries.push((format!("maven/{path}"), bytes));
+        }
+        let fml = libraries.pop().expect("FML runtime library");
+        let version = serde_json::json!({
+            "id":"neoforge-21.1.252","inheritsFrom":"1.21.1","type":"release",
+            "mainClass":"cpw.mods.bootstraplauncher.BootstrapLauncher","logging":{},
+            "libraries":[fml],
+            "arguments":{"game":["--fml.neoForgeVersion","21.1.252","--fml.fmlVersion","4.0.44","--fml.mcVersion","1.21.1","--fml.neoFormVersion","20240808.144430","--launchTarget","forgeclient"]}
+        });
+        let install = serde_json::json!({
+            "spec":1,"profile":"NeoForge","version":"neoforge-21.1.252","minecraft":"1.21.1",
+            "libraries":libraries,
+            "data":{
+                "MAPPINGS":{"client":"[net.neoforged:neoform:1.21.1-20240808.144430:mappings@txt]"},
+                "MOJMAPS":{"client":"[net.minecraft:client:1.21.1-20240808.144430:mappings@txt]"},
+                "MERGED_MAPPINGS":{"client":"[net.neoforged:neoform:1.21.1-20240808.144430:mappings-merged@txt]"},
+                "BINPATCH":{"client":"/data/client.lzma"},
+                "MC_UNPACKED":{"client":"[net.minecraft:client:1.21.1-20240808.144430:unpacked]"},
+                "MC_SLIM":{"client":"[net.minecraft:client:1.21.1-20240808.144430:slim]"},
+                "MC_EXTRA":{"client":"[net.minecraft:client:1.21.1-20240808.144430:extra]"},
+                "MC_SRG":{"client":"[net.minecraft:client:1.21.1-20240808.144430:srg]"},
+                "PATCHED":{"client":"[net.neoforged:neoforge:21.1.252:client]"},
+                "MCP_VERSION":{"client":"'1.21.1-20240808.144430'"}
+            },
+            "processors":[
+                {"jar":"net.neoforged.installertools:installertools:2.1.2","args":["--task","MCP_DATA","--input","[net.neoforged:neoform:1.21.1-20240808.144430@zip]","--output","{MAPPINGS}","--key","mappings"]},
+                {"jar":"net.neoforged.installertools:installertools:2.1.2","args":["--task","DOWNLOAD_MOJMAPS","--version","1.21.1","--side","{SIDE}","--output","{MOJMAPS}"]},
+                {"jar":"net.neoforged.installertools:installertools:2.1.2","args":["--task","MERGE_MAPPING","--left","{MAPPINGS}","--right","{MOJMAPS}","--output","{MERGED_MAPPINGS}","--classes","--fields","--methods","--reverse-right"]},
+                {"jar":"net.neoforged.installertools:jarsplitter:2.1.2","sides":["client"],"args":["--input","{MINECRAFT_JAR}","--slim","{MC_SLIM}","--extra","{MC_EXTRA}","--srg","{MERGED_MAPPINGS}"]},
+                {"jar":"net.neoforged:AutoRenamingTool:2.0.3:all","args":["--input","{MC_SLIM}","--output","{MC_SRG}","--names","{MERGED_MAPPINGS}","--ann-fix","--ids-fix","--src-fix","--record-fix"]},
+                {"jar":"net.neoforged.installertools:binarypatcher:2.1.2:fatjar","args":["--clean","{MC_SRG}","--output","{PATCHED}","--apply","{BINPATCH}"]}
+            ]
+        });
+        entries.extend([
+            (
+                "version.json".to_string(),
+                serde_json::to_vec(&version).unwrap(),
+            ),
+            (
+                "install_profile.json".to_string(),
+                serde_json::to_vec(&install).unwrap(),
+            ),
+        ]);
+        zip_entries(
+            &entries
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[cfg(unix)]
     struct TestProcessorRuntime {
         descriptor: TestRuntimeSourceDescriptor,
         manifest_server: TestByteServer,
@@ -5035,6 +5407,49 @@ printf '%s' 'processor-terminal' > "$last"
 
     #[cfg(unix)]
     impl TestProcessorRuntime {
+        fn start_neoforge(drift_marker: &Path) -> Self {
+            // Synthetic CLI tools stand in for Java algorithms, not binding, execution or output proof.
+            let script = format!(
+                r#"#!/bin/sh
+set -eu
+case "$*" in
+  *-version*) printf '%s\n' 'openjdk version "21.0.1"' >&2; exit 0 ;;
+esac
+tool=$3
+shift 3
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --task) task=$2; shift 2 ;;
+    --left) left=$2; shift 2 ;;
+    --right) right=$2; shift 2 ;;
+    --input|--clean) input=$2; shift 2 ;;
+    --output) output=$2; shift 2 ;;
+    --slim) slim=$2; shift 2 ;;
+    --extra) extra=$2; shift 2 ;;
+    --srg|--names) names=$2; shift 2 ;;
+    --apply) patch=$2; shift 2 ;;
+    --classes|--fields|--methods|--reverse-right|--ann-fix|--ids-fix|--src-fix|--record-fix) shift ;;
+    *) exit 9 ;;
+  esac
+done
+case "$tool" in
+  fixture.Merge) test "$task" = MERGE_MAPPING; cat "$left" "$right" > "$output" ;;
+  fixture.Split)
+    test -s "$names"
+    cp "$input" "$slim"; cp "$input" "$extra"
+    printf cache > "$slim.cache"; printf cache > "$extra.cache" ;;
+  fixture.Rename) test -s "$names"; cp "$input" "$output" ;;
+  fixture.Patch)
+    cat "$input" "$patch" > "$output"
+    if [ -e {drift_marker} ]; then printf drift >> "$output"; fi ;;
+  *) exit 9 ;;
+esac
+"#,
+                drift_marker = shell_quote_path(drift_marker)
+            );
+            Self::start_with_script(script.into_bytes())
+        }
+
         fn start() -> Self {
             let fake_java = br#"#!/bin/sh
 case "$*" in
@@ -5048,11 +5463,15 @@ case "$4" in
 esac
 "#
             .to_vec();
+            Self::start_with_script(fake_java)
+        }
+
+        fn start_with_script(fake_java: Vec<u8>) -> Self {
             let file_server = TestByteServer::start(fake_java.clone());
             let manifest_bytes = serde_json::to_vec(&serde_json::json!({
                 "files": {
                     "bin": {"type": "directory"},
-                    "bin/java": {
+                    (crate::runtime::runtime_java_relative_path()): {
                         "type": "file",
                         "executable": true,
                         "downloads": {"raw": {
@@ -5089,6 +5508,8 @@ esac
         library_root: &ManagedLibraryOperation,
         record: &LoaderBuildRecord,
         runtime: &TestRuntimeSourceDescriptor,
+        java_major: u32,
+        mappings: Option<crate::launch::DownloadEntry>,
     ) -> (
         KnownGoodInstallReceipt,
         VersionManifest,
@@ -5105,8 +5526,11 @@ esac
         .expect("base version");
         version["javaVersion"] = serde_json::json!({
             "component": "java-runtime-delta",
-            "majorVersion": 17
+            "majorVersion": java_major
         });
+        if let Some(mappings) = mappings {
+            version["downloads"]["client_mappings"] = serde_json::to_value(mappings).unwrap();
+        }
         let version_bytes = serde_json::to_vec(&version).expect("base version bytes");
         let version_server = TestByteServer::start(version_bytes.clone());
         let manifest = test_install_manifest(
@@ -5130,6 +5554,7 @@ esac
         installer_plan: BoundForgeInstallerPlan,
         base_receipt: KnownGoodInstallReceipt,
         runtime: &TestRuntimeSourceDescriptor,
+        mappings_transport: Option<crate::download::TestProcessorMappingsTransport>,
     ) -> KnownGoodInstallReceipt {
         let execution = retain_test_installer_network(
             library_root,
@@ -5152,7 +5577,8 @@ esac
             base_client_bytes,
             runtime_source,
         )
-        .expect("authenticated installed processor sources");
+        .expect("authenticated installed processor sources")
+        .with_test_mappings_transport(mappings_transport);
         let result = spawn_bound_processor_execution(
             *execution,
             plan.record.version_id.clone(),
@@ -5225,9 +5651,14 @@ esac
         let runtime = TestProcessorRuntime::start();
         let mut record = processor_fixture_record(shape);
         let library_root = test_library_operation(&root);
-        let (base_receipt, manifest, client_server, version_server) =
-            install_test_processor_base(library_root.operation(), &record, &runtime.descriptor)
-                .await;
+        let (base_receipt, manifest, client_server, version_server) = install_test_processor_base(
+            library_root.operation(),
+            &record,
+            &runtime.descriptor,
+            17,
+            None,
+        )
+        .await;
         let installer_server =
             TestByteServer::start_with_sha1(single_step_processor_installer_jar(&record));
         record.install_source = LoaderInstallSource::InstallerJar {
@@ -5248,6 +5679,7 @@ esac
             bind_test_installer(installer_source, &record),
             base_receipt,
             &runtime.descriptor,
+            None,
         )
         .await;
         seed_reconstruction_sentinels(&root);
@@ -5390,9 +5822,14 @@ esac
         let runtime = TestProcessorRuntime::start();
         let mut record = processor_fixture_record(ProcessorFixtureShape::ForgeModern);
         let library_root = test_library_operation(&root);
-        let (base_receipt, manifest, client_server, version_server) =
-            install_test_processor_base(library_root.operation(), &record, &runtime.descriptor)
-                .await;
+        let (base_receipt, manifest, client_server, version_server) = install_test_processor_base(
+            library_root.operation(),
+            &record,
+            &runtime.descriptor,
+            17,
+            None,
+        )
+        .await;
         let exact_input = zip_entries(&[("x/ExactInput.class", b"exact-input")]);
         let exact_non_input = zip_entries(&[("x/ExactNonInput.class", b"exact-non-input")]);
         let fresh_input = zip_entries(&[("x/FreshInput.class", b"fresh-input")]);
@@ -5471,6 +5908,7 @@ esac
             bind_test_installer(installer_source, &record),
             base_receipt,
             &runtime.descriptor,
+            None,
         )
         .await;
         assert_eq!(exact_input_server.request_count(), 1);
@@ -6391,6 +6829,47 @@ esac
         .expect("canonical installed version id");
     }
 
+    #[test]
+    fn byte_server_waits_for_fragmented_headers_and_records_path_before_response() {
+        let body = b"fragmented request fixture".to_vec();
+        let expected_proof = sha1_hex(&body);
+        let server = TestByteServer::start_with_sha1(body);
+        let url = reqwest::Url::parse(&server.url).expect("test server URL");
+        let address = url.socket_addrs(|| None).expect("test server address")[0];
+        let mut stream = TcpStream::connect(address).expect("connect fragmented request");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set incomplete request response timeout");
+        stream
+            .write_all(b"GET /legacy-client.zip.sha1 HTTP/1.1\r\nHost: local")
+            .expect("write first request fragment");
+        let error = stream
+            .read(&mut [0_u8; 1])
+            .expect_err("incomplete header must not receive a response");
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::WouldBlock | ErrorKind::TimedOut
+        ));
+        assert_eq!(server.request_count_for("/legacy-client.zip.sha1"), 0);
+        stream
+            .write_all(b"host\r\nConnection: close\r\n\r\n")
+            .expect("complete request header");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set complete response timeout");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read fragmented request response");
+        assert_eq!(
+            response.split_once("\r\n\r\n").expect("response header").1,
+            expected_proof
+        );
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(server.request_count_for("/legacy-client.zip.sha1"), 1);
+        server.stop();
+    }
+
     struct TestByteServer {
         url: String,
         request_count: Arc<AtomicUsize>,
@@ -6442,13 +6921,20 @@ esac
             let server = thread::spawn(move || {
                 loop {
                     match listener.accept() {
-                        Ok((stream, _)) => {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_nonblocking(false)
+                                .expect("set accepted test stream blocking");
+                            stream
+                                .set_write_timeout(Some(Duration::from_secs(5)))
+                                .expect("set test response timeout");
+                            let path = read_test_request_path(&mut stream);
                             server_request_count.fetch_add(1, Ordering::SeqCst);
-                            let path = respond(stream, status, &body, sha1_proof.as_deref());
                             server_request_paths
                                 .lock()
                                 .expect("record request path")
-                                .push(path);
+                                .push(path.clone());
+                            respond(stream, &path, status, &body, sha1_proof.as_deref());
                         }
                         Err(error) if error.kind() == ErrorKind::WouldBlock => {
                             if server_stopped.try_recv().is_ok() {
@@ -6489,21 +6975,44 @@ esac
         }
     }
 
+    fn read_test_request_path(stream: &mut TcpStream) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut buffer = [0_u8; 4096];
+        let mut used = 0;
+        while !buffer[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            assert!(used < buffer.len(), "test request header exceeds its bound");
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "test request header timed out");
+            stream
+                .set_read_timeout(Some(remaining))
+                .expect("set test request timeout");
+            let read = stream
+                .read(&mut buffer[used..])
+                .expect("read test request header");
+            assert!(read > 0, "test request ended before its complete header");
+            used += read;
+        }
+        let request = std::str::from_utf8(&buffer[..used]).expect("UTF-8 test request header");
+        let mut line = request
+            .lines()
+            .next()
+            .expect("test request line")
+            .split_whitespace();
+        assert_eq!(line.next(), Some("GET"), "test request method");
+        let path = line.next().expect("test request path");
+        assert!(path.starts_with('/'), "test request path must be absolute");
+        assert_eq!(line.next(), Some("HTTP/1.1"), "test request version");
+        assert!(line.next().is_none(), "unexpected test request line field");
+        path.to_string()
+    }
+
     fn respond(
         mut stream: TcpStream,
+        request_path: &str,
         status: &str,
         body: &[u8],
         sha1_proof: Option<&[u8]>,
-    ) -> String {
-        let mut buffer = [0_u8; 1024];
-        let read = stream.read(&mut buffer).unwrap_or_default();
-        let request = String::from_utf8_lossy(&buffer[..read]);
-        let request_path = request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("/")
-            .to_string();
+    ) {
         let body = if request_path.ends_with(".sha1") {
             sha1_proof.unwrap_or(body)
         } else {
@@ -6517,6 +7026,5 @@ esac
             .write_all(header.as_bytes())
             .expect("write response header");
         stream.write_all(body).expect("write response body");
-        request_path
     }
 }

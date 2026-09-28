@@ -1,270 +1,203 @@
 use super::transport::{
-    DiscordRpcError, OP_CLOSE, OP_FRAME, OP_HANDSHAKE, OP_PING, OP_PONG, connect_ipc, read_frame,
-    write_frame,
+    DiscordRpcError, IpcStream, OP_CLOSE, OP_FRAME, OP_HANDSHAKE, OP_PING, OP_PONG, connect_ipc,
+    read_frame, write_frame,
 };
 use serde_json::{Value, json};
+use std::time::Duration;
 
-const DISCORD_RPC_VERSION: u8 = 1;
-const COMMAND_RESPONSE_READ_LIMIT: usize = 8;
+pub(super) const RPC_TIMEOUT: Duration = Duration::from_secs(2);
+const RESPONSE_FRAME_LIMIT: usize = 16;
 
 pub(super) struct DiscordRpcClient {
-    stream: super::transport::IpcStream,
+    stream: IpcStream,
     nonce: u64,
 }
 
 impl DiscordRpcClient {
-    pub(super) fn connect(client_id: &str) -> Result<Self, DiscordRpcError> {
-        let stream = connect_ipc()?;
-        let mut client = Self { stream, nonce: 0 };
-        client.handshake(client_id)?;
-        Ok(client)
+    pub(super) async fn connect(client_id: &str) -> Result<Self, DiscordRpcError> {
+        bounded(async {
+            let mut client = Self {
+                stream: connect_ipc().await?,
+                nonce: 0,
+            };
+            client.handshake(client_id).await?;
+            Ok(client)
+        })
+        .await
     }
 
-    #[cfg(all(test, unix))]
-    fn from_stream(stream: super::transport::IpcStream) -> Self {
-        Self { stream, nonce: 0 }
-    }
-
-    pub(super) fn set_activity(&mut self, activity: &Value) -> Result<(), DiscordRpcError> {
-        self.set_activity_payload(activity)
-    }
-
-    pub(super) fn clear_activity(&mut self) -> Result<(), DiscordRpcError> {
-        self.set_activity_payload(&Value::Null)
-    }
-
-    pub(super) fn close(&mut self) -> Result<(), DiscordRpcError> {
-        self.send_frame(OP_CLOSE, &json!({}))
-    }
-
-    fn handshake(&mut self, client_id: &str) -> Result<(), DiscordRpcError> {
-        self.send_frame(
+    async fn handshake(&mut self, client_id: &str) -> Result<(), DiscordRpcError> {
+        write_frame(
+            &mut self.stream,
             OP_HANDSHAKE,
-            &json!({
-                "v": DISCORD_RPC_VERSION,
-                "client_id": client_id,
-            }),
-        )?;
-        let response = self.recv_rpc_payload()?;
-        if let Some(error) = rpc_error_message(&response) {
-            return Err(DiscordRpcError::Protocol(error));
-        }
-        if response.get("evt").and_then(Value::as_str) == Some("READY") {
-            Ok(())
-        } else {
-            Err(DiscordRpcError::Protocol(
-                "Discord RPC handshake did not return READY".to_string(),
-            ))
-        }
-    }
-
-    fn set_activity_payload(&mut self, activity: &Value) -> Result<(), DiscordRpcError> {
-        self.command(
-            "SET_ACTIVITY",
-            json!({
-                "pid": std::process::id(),
-                "activity": activity,
-            }),
+            &json!({ "v": 1, "client_id": client_id }),
         )
-        .map(|_| ())
+        .await?;
+        for _ in 0..RESPONSE_FRAME_LIMIT {
+            if let Some(payload) = self.receive().await? {
+                return if payload["evt"] == "READY" {
+                    Ok(())
+                } else {
+                    Err(DiscordRpcError::Protocol)
+                };
+            }
+        }
+        Err(DiscordRpcError::Protocol)
     }
 
-    fn command(&mut self, command: &str, args: Value) -> Result<Value, DiscordRpcError> {
-        let nonce = self.next_nonce();
-        self.send_frame(
+    pub(super) async fn set_activity(&mut self, activity: &Value) -> Result<(), DiscordRpcError> {
+        bounded(self.set_activity_inner(activity)).await
+    }
+
+    async fn set_activity_inner(&mut self, activity: &Value) -> Result<(), DiscordRpcError> {
+        self.nonce = self.nonce.checked_add(1).ok_or(DiscordRpcError::Protocol)?;
+        let nonce = format!("axial-{}-{}", std::process::id(), self.nonce);
+        write_frame(
+            &mut self.stream,
             OP_FRAME,
             &json!({
-                "cmd": command,
-                "args": args,
-                "nonce": nonce,
+                "cmd": "SET_ACTIVITY", "nonce": nonce,
+                "args": { "pid": std::process::id(), "activity": activity },
             }),
-        )?;
-
-        for _ in 0..COMMAND_RESPONSE_READ_LIMIT {
-            let response = self.recv_rpc_payload()?;
-            if let Some(error) = rpc_error_message(&response) {
-                return Err(DiscordRpcError::Protocol(error));
-            }
-            if response.get("nonce").and_then(Value::as_str) == Some(nonce.as_str()) {
-                return Ok(response);
+        )
+        .await?;
+        for _ in 0..RESPONSE_FRAME_LIMIT {
+            let Some(payload) = self.receive().await? else {
+                continue;
+            };
+            if payload["nonce"].as_str() == Some(nonce.as_str()) {
+                return if payload["evt"] == "ERROR" || payload["cmd"] == "ERROR" {
+                    Err(DiscordRpcError::Protocol)
+                } else {
+                    Ok(())
+                };
             }
         }
-
-        Err(DiscordRpcError::Protocol(format!(
-            "Discord RPC did not acknowledge {command}"
-        )))
+        Err(DiscordRpcError::Protocol)
     }
 
-    fn send_frame(&mut self, opcode: u32, payload: &Value) -> Result<(), DiscordRpcError> {
-        write_frame(&mut self.stream, opcode, payload)
-    }
-
-    fn recv_rpc_payload(&mut self) -> Result<Value, DiscordRpcError> {
-        loop {
-            let (opcode, payload) = read_frame(&mut self.stream)?;
-            match opcode {
-                OP_FRAME => return Ok(payload),
-                OP_PING => self.send_frame(OP_PONG, &payload)?,
-                OP_CLOSE => {
-                    return Err(DiscordRpcError::Protocol(
-                        "Discord RPC connection closed".to_string(),
-                    ));
-                }
-                _ => {
-                    return Err(DiscordRpcError::Protocol(format!(
-                        "unexpected Discord RPC opcode {opcode}"
-                    )));
-                }
+    async fn receive(&mut self) -> Result<Option<Value>, DiscordRpcError> {
+        let (opcode, payload) = read_frame(&mut self.stream).await?;
+        match opcode {
+            OP_FRAME => Ok(Some(payload)),
+            OP_PING => {
+                write_frame(&mut self.stream, OP_PONG, &payload).await?;
+                Ok(None)
             }
+            _ => Err(DiscordRpcError::Protocol),
         }
     }
 
-    fn next_nonce(&mut self) -> String {
-        self.nonce = self.nonce.saturating_add(1);
-        format!("axial-{}-{}", std::process::id(), self.nonce)
+    pub(super) async fn clear_and_close(mut self) {
+        let _ = self.set_activity(&Value::Null).await;
+        let _ = bounded(write_frame(&mut self.stream, OP_CLOSE, &json!({}))).await;
+        // Dropping the connection also invalidates any partially read command.
     }
 }
 
-fn rpc_error_message(payload: &Value) -> Option<String> {
-    let is_error = payload.get("evt").and_then(Value::as_str) == Some("ERROR")
-        || payload.get("cmd").and_then(Value::as_str) == Some("ERROR");
-    if !is_error {
-        return None;
-    }
-
-    let code = payload
-        .pointer("/data/code")
-        .and_then(Value::as_i64)
-        .map(|value| value.to_string());
-    let message = payload
-        .pointer("/data/message")
-        .and_then(Value::as_str)
-        .unwrap_or("Discord RPC returned an error");
-
-    Some(match code {
-        Some(code) => format!("{message} ({code})"),
-        None => message.to_string(),
-    })
+async fn bounded<T>(
+    future: impl std::future::Future<Output = Result<T, DiscordRpcError>>,
+) -> Result<T, DiscordRpcError> {
+    tokio::time::timeout(RPC_TIMEOUT, future)
+        .await
+        .map_err(|_| DiscordRpcError::Timeout)?
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use super::super::transport::{IpcStream, read_frame, write_frame};
     use super::*;
-    use std::thread;
-    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn ipc_pair() -> (DiscordRpcClient, IpcStream) {
-        let (client, server) =
-            std::os::unix::net::UnixStream::pair().expect("unix pair should be available");
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("client read timeout");
-        client
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .expect("client write timeout");
-        server
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("server read timeout");
-        server
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .expect("server write timeout");
+    fn pair() -> (DiscordRpcClient, tokio::io::DuplexStream) {
+        let (stream, server) = tokio::io::duplex(1024);
         (
-            DiscordRpcClient::from_stream(IpcStream::Unix(client)),
-            IpcStream::Unix(server),
+            DiscordRpcClient {
+                stream: Box::new(stream),
+                nonce: 0,
+            },
+            server,
         )
     }
 
-    fn assert_handshake(server: &mut IpcStream) {
-        let (opcode, payload) = read_frame(server).expect("handshake frame");
-        assert_eq!(opcode, OP_HANDSHAKE);
-        assert_eq!(payload["v"], DISCORD_RPC_VERSION);
-        assert_eq!(payload["client_id"], "123456789012345678");
-        write_frame(server, OP_FRAME, &json!({ "evt": "READY" })).expect("ready frame");
-    }
-
-    #[test]
-    fn handshake_accepts_ready_response() {
-        let (mut client, mut server) = ipc_pair();
-        let server = thread::spawn(move || assert_handshake(&mut server));
-
-        client
-            .handshake("123456789012345678")
-            .expect("handshake should succeed");
-        server.join().expect("server should join");
-    }
-
-    #[test]
-    fn set_activity_and_clear_activity_use_set_activity_command() {
-        let (mut client, mut server) = ipc_pair();
-        let server = thread::spawn(move || {
-            assert_handshake(&mut server);
-
-            let (opcode, payload) = read_frame(&mut server).expect("activity frame");
+    #[tokio::test]
+    async fn handshake_activity_ping_clear_and_close_follow_the_wire_contract() {
+        let (mut client, mut server) = pair();
+        let peer = tokio::spawn(async move {
+            let (opcode, payload) = read_frame(&mut server).await.unwrap();
+            assert_eq!(opcode, OP_HANDSHAKE);
+            assert_eq!(
+                payload,
+                json!({ "v": 1, "client_id": "123456789012345678" })
+            );
+            write_frame(&mut server, OP_FRAME, &json!({ "evt": "READY" }))
+                .await
+                .unwrap();
+            let (opcode, payload) = read_frame(&mut server).await.unwrap();
             assert_eq!(opcode, OP_FRAME);
             assert_eq!(payload["cmd"], "SET_ACTIVITY");
             assert_eq!(
                 payload["args"]["activity"]["details"],
                 "Minecraft is running"
             );
-            let nonce = payload["nonce"].as_str().expect("nonce");
-            write_frame(&mut server, OP_FRAME, &json!({ "nonce": nonce })).expect("activity ack");
-
-            let (opcode, payload) = read_frame(&mut server).expect("clear frame");
-            assert_eq!(opcode, OP_FRAME);
-            assert_eq!(payload["cmd"], "SET_ACTIVITY");
+            write_frame(&mut server, OP_PING, &json!({ "ping": 1 }))
+                .await
+                .unwrap();
+            assert_eq!(
+                read_frame(&mut server).await.unwrap(),
+                (OP_PONG, json!({ "ping": 1 }))
+            );
+            write_frame(&mut server, OP_FRAME, &json!({ "nonce": "unrelated" }))
+                .await
+                .unwrap();
+            write_frame(&mut server, OP_FRAME, &json!({ "nonce": payload["nonce"] }))
+                .await
+                .unwrap();
+            let (_, payload) = read_frame(&mut server).await.unwrap();
             assert!(payload["args"]["activity"].is_null());
-            let nonce = payload["nonce"].as_str().expect("nonce");
-            write_frame(&mut server, OP_FRAME, &json!({ "nonce": nonce })).expect("clear ack");
-
-            let (opcode, _) = read_frame(&mut server).expect("close frame");
-            assert_eq!(opcode, OP_CLOSE);
+            write_frame(&mut server, OP_FRAME, &json!({ "nonce": payload["nonce"] }))
+                .await
+                .unwrap();
+            assert_eq!(read_frame(&mut server).await.unwrap().0, OP_CLOSE);
         });
-
-        client
-            .handshake("123456789012345678")
-            .expect("handshake should succeed");
+        client.handshake("123456789012345678").await.unwrap();
         client
             .set_activity(&json!({ "details": "Minecraft is running" }))
-            .expect("activity should succeed");
-        client.clear_activity().expect("clear should succeed");
-        client.close().expect("close should succeed");
-        server.join().expect("server should join");
+            .await
+            .unwrap();
+        client.clear_and_close().await;
+        peer.await.unwrap();
     }
 
-    #[test]
-    fn command_error_response_is_returned_as_protocol_error() {
-        let (mut client, mut server) = ipc_pair();
-        let server = thread::spawn(move || {
-            assert_handshake(&mut server);
-            let (_, payload) = read_frame(&mut server).expect("activity frame");
-            let nonce = payload["nonce"].as_str().expect("nonce");
-            write_frame(
-                &mut server,
-                OP_FRAME,
-                &json!({
-                    "evt": "ERROR",
-                    "nonce": nonce,
-                    "data": {
-                        "code": 4000,
-                        "message": "bad activity",
-                    },
-                }),
-            )
-            .expect("error frame");
+    #[tokio::test]
+    async fn rejected_activity_is_failure_without_echoing_peer_text() {
+        let (mut client, mut server) = pair();
+        let peer = tokio::spawn(async move {
+            let (_, payload) = read_frame(&mut server).await.unwrap();
+            write_frame(&mut server, OP_FRAME, &json!({ "evt": "ERROR", "nonce": payload["nonce"], "data": { "message": "private-server.example bearer secret" } })).await.unwrap();
         });
+        let error = client.set_activity(&json!({})).await.unwrap_err();
+        assert_eq!(error.to_string(), "Discord IPC protocol failed");
+        peer.await.unwrap();
+    }
 
-        client
-            .handshake("123456789012345678")
-            .expect("handshake should succeed");
-        let error = client
-            .set_activity(&json!({ "details": "Minecraft is running" }))
-            .expect_err("activity should fail");
-
-        assert!(matches!(
-            error,
-            DiscordRpcError::Protocol(message) if message.contains("bad activity")
-        ));
-        server.join().expect("server should join");
+    #[tokio::test]
+    async fn partial_response_is_bounded_by_whole_command_deadline() {
+        let (mut client, mut server) = pair();
+        let command = async {
+            assert!(matches!(
+                client.set_activity(&json!({})).await,
+                Err(DiscordRpcError::Timeout)
+            ));
+        };
+        let peer = async {
+            read_frame(&mut server).await.unwrap();
+            server.write_all(&[1]).await.unwrap();
+            let mut byte = [0];
+            let _ = server.read(&mut byte).await;
+        };
+        tokio::select! {
+            _ = command => {}
+            _ = peer => panic!("peer unexpectedly ended"),
+        }
     }
 }

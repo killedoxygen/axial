@@ -3,7 +3,7 @@ import { useEffect, useState } from 'preact/hooks';
 import { Toggle } from '../../ui/Atoms';
 import { Slider } from '../../ui/Slider';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
-import { local, saveLocalState } from '../../state';
+import { local, saveLocalState, canEditPreferences } from '../../state';
 import { Sound } from '../../sound';
 import { Music, musicStateVersion } from '../../music';
 
@@ -19,6 +19,7 @@ export function AudioSection(): JSX.Element {
   }, [musicStateVersion.value]);
 
   const toggleSounds = (): void => {
+    if (!canEditPreferences()) return;
     const next = !soundsOn;
     setSoundsOn(next);
     local.sounds = next;

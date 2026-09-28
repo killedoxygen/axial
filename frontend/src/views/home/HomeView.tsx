@@ -48,8 +48,16 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const install = instanceInstallStatus(inst, version);
   const installing = install.installing;
   const installBadge = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
+  const launchAction = inst.launch_action;
+  const actionIcon =
+    launchAction.primary_action === 'launch'
+      ? 'play'
+      : launchAction.primary_action === 'install'
+        ? 'download'
+        : 'alert';
+  const actionLabel = launchAction.primary_action === 'launch' ? 'Play' : launchAction.label;
   const mods = inst.mods_count ?? 0;
-  const showModsCount = inst.version_display.supports_mods;
+  const showModsCount = inst.version_display.supports_mods && inst.counts_available === true;
   const open = (): void => navigate({ name: 'instance', id: inst.id });
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.target !== e.currentTarget) return;
@@ -98,8 +106,18 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
           {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installBadge}</Pill>}
           <Button
             size="lg"
-            icon={installing ? (install.state === 'queued' ? 'clock' : 'download') : session ? 'chevron-right' : 'play'}
-            title={installing ? installBadge : session ? `Open ${inst.name}` : `Play ${inst.name}`}
+            icon={
+              installing ? (install.state === 'queued' ? 'clock' : 'download') : session ? 'chevron-right' : actionIcon
+            }
+            title={
+              installing
+                ? installBadge
+                : session
+                  ? `Open ${inst.name}`
+                  : launchAction.primary_action === 'blocked'
+                    ? launchAction.disabled_reason
+                    : `${actionLabel} ${inst.name}`
+            }
             disabled={installing}
             onClick={(e) => {
               e.stopPropagation();
@@ -107,7 +125,7 @@ function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
             }}
             sound="launchPress"
           >
-            {installing ? installBadge : session ? 'Open' : 'Play'}
+            {installing ? installBadge : session ? 'Open' : actionLabel}
           </Button>
         </div>
       </div>

@@ -1654,7 +1654,7 @@ mod tests {
     }
 
     async fn assert_version_bundle_intent_retry(version_id: &str, inject: impl FnOnce(&str)) {
-        let managed = tempfile::tempdir().expect("managed root");
+        let managed = tempfile::tempdir_in(crate::test_temp_root()).expect("managed root");
         let authority =
             ManagedLibraryTestAuthority::open(managed.path()).expect("guard intent retry root");
         let guarded_root = authority
@@ -1714,7 +1714,7 @@ mod tests {
         const CLIENT_BYTES: &[u8] = b"expected-client";
         const LOG_ID: &str = "registered-log.xml";
         const LOG_BYTES: &[u8] = b"<Configuration/>";
-        let managed = tempfile::tempdir().expect("managed root");
+        let managed = tempfile::tempdir_in(crate::test_temp_root()).expect("managed root");
         let authority =
             ManagedLibraryTestAuthority::open(managed.path()).expect("guard exact bundle root");
         let version_json = registered_version_bundle_metadata(
@@ -1759,7 +1759,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_standalone_publication_retains_owner_through_settlement() {
         const VERSION_ID: &str = "standalone-publication-cancellation";
-        let managed = tempfile::tempdir().expect("managed root");
+        let managed = tempfile::tempdir_in(crate::test_temp_root()).expect("managed root");
         let authority =
             ManagedLibraryTestAuthority::open(managed.path()).expect("guard standalone root");
         let guarded_root = authority
@@ -1893,7 +1893,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_standalone_libraries_rebuild_retains_complete_owner() {
         const VERSION_ID: &str = "standalone-libraries-cancellation";
-        let managed = tempfile::tempdir().expect("managed root");
+        let managed = tempfile::tempdir_in(crate::test_temp_root()).expect("managed root");
         let guarded_root = crate::managed_fs::ManagedDir::open_root(managed.path())
             .expect("guard standalone Libraries root");
         let reconstruction = crate::known_good::managed_libraries_reconstruction_fixture_for_test(
@@ -1941,7 +1941,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_standalone_assets_rebuild_retains_complete_owner() {
         const VERSION_ID: &str = "standalone-assets-cancellation";
-        let managed = tempfile::tempdir().expect("managed root");
+        let managed = tempfile::tempdir_in(crate::test_temp_root()).expect("managed root");
         let guarded_root = crate::managed_fs::ManagedDir::open_root(managed.path())
             .expect("guard standalone Assets root");
         let reconstruction = crate::known_good::managed_assets_reconstruction_fixture_for_test(
@@ -1988,7 +1988,7 @@ mod tests {
         const CORRUPT_CLIENT_BYTES: &[u8] = b"tampered-client";
         const LOG_ID: &str = "registered-log.xml";
         const LOG_BYTES: &[u8] = b"<Configuration/>";
-        let managed = tempfile::tempdir().expect("managed root");
+        let managed = tempfile::tempdir_in(crate::test_temp_root()).expect("managed root");
         let authority =
             ManagedLibraryTestAuthority::open(managed.path()).expect("guard corrupt bundle root");
         let (client_url, requested_path) = serve_single_version_bundle_member(CLIENT_BYTES).await;
@@ -2052,7 +2052,7 @@ mod tests {
         const OTHER_CLIENT_BYTES: &[u8] = b"different-client";
         const LOG_ID: &str = "registered-log.xml";
         const LOG_BYTES: &[u8] = b"<Configuration/>";
-        let managed = tempfile::tempdir().expect("managed root");
+        let managed = tempfile::tempdir_in(crate::test_temp_root()).expect("managed root");
         let authority =
             ManagedLibraryTestAuthority::open(managed.path()).expect("guard drift bundle root");
         let drifted_client_sha1 = format!("{:x}", Sha1::digest(OTHER_CLIENT_BYTES));
@@ -2122,6 +2122,8 @@ mod tests {
         let client_sha1 = format!("{:x}", Sha1::digest(CLIENT_BYTES));
         let version_json = serde_json::to_vec(&serde_json::json!({
             "id": version_id.as_str(),
+            "axialMaterialized": true,
+            "inheritsFrom": "1.21.5",
             "type": "release",
             "mainClass": "org.axial.GuardianFixture",
             "downloads": {
@@ -2142,7 +2144,7 @@ mod tests {
             ),
         );
 
-        let matching_root = tempfile::tempdir().expect("matching loader root");
+        let matching_root = tempfile::tempdir_in(crate::test_temp_root()).expect("matching loader root");
         let matching_guard = crate::managed_fs::ManagedDir::open_root(matching_root.path())
             .expect("matching loader root guard");
         let matching = crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
@@ -2169,7 +2171,7 @@ mod tests {
         assert!(receipt.matches_known_good_inventory(&expected));
         assert!(receipt.revalidate().await);
 
-        let mismatched_root = tempfile::tempdir().expect("mismatched loader root");
+        let mismatched_root = tempfile::tempdir_in(crate::test_temp_root()).expect("mismatched loader root");
         let mismatched_guard = crate::managed_fs::ManagedDir::open_root(mismatched_root.path())
             .expect("mismatched loader root guard");
         let mismatched = crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
@@ -2308,7 +2310,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_ids_fail_at_the_public_boundary_without_durable_effects() {
-        let root = tempfile::tempdir().expect("sentinel root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("sentinel root");
         let sentinel = root.path().join("untouched");
         fs::write(&sentinel, b"untouched").expect("sentinel");
 
@@ -2334,7 +2336,7 @@ mod tests {
     async fn test_support_fixture_executes_the_committed_libraries_lifecycle() {
         const VERSION_ID: &str = "fixture-libraries-1.0.0";
         const CANONICAL_PATH: &str = "libraries/org/axial/fixture/1.0.0/fixture-1.0.0.jar";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
 
         let receipt = super::rebuild_managed_libraries_fixture_for_test(root.path(), VERSION_ID)
             .await
@@ -2359,7 +2361,7 @@ mod tests {
         const VERSION_ID: &str = "fixture-assets-1.0.0";
         const INDEX_PATH: &str = "assets/indexes/fixture-assets.json";
         const OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
 
         let receipt = super::rebuild_managed_assets_fixture_for_test(root.path(), VERSION_ID)
             .await
@@ -2400,10 +2402,10 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[tokio::test]
     async fn registered_component_receipts_bind_the_retained_library_authority() {
-        let root = tempfile::tempdir().expect("registered managed root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("registered managed root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("retain managed root");
-        let foreign_root = tempfile::tempdir().expect("foreign managed root");
+        let foreign_root = tempfile::tempdir_in(crate::test_temp_root()).expect("foreign managed root");
         let foreign = ManagedLibraryTestAuthority::open(foreign_root.path())
             .expect("retain foreign managed root");
 
@@ -2432,7 +2434,7 @@ mod tests {
         const VERSION_ID: &str = "fixture-version-bundle-1.0.0";
         const CLIENT_PATH: &str =
             "versions/fixture-version-bundle-1.0.0/fixture-version-bundle-1.0.0.jar";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard VersionBundle root");
         let user_sentinel = root.path().join("mods/user-owned.txt");
@@ -2449,7 +2451,7 @@ mod tests {
 
         assert_eq!(receipt.version_id(), VERSION_ID);
         assert!(receipt.matches_managed_library(authority.operation()));
-        let foreign_root = tempfile::tempdir().expect("foreign managed fixture root");
+        let foreign_root = tempfile::tempdir_in(crate::test_temp_root()).expect("foreign managed fixture root");
         let foreign_authority = ManagedLibraryTestAuthority::open(foreign_root.path())
             .expect("guard foreign VersionBundle root");
         assert!(!receipt.matches_managed_library(foreign_authority.operation()));
@@ -2467,7 +2469,7 @@ mod tests {
     #[tokio::test]
     async fn version_bundle_rebuild_recovery_retains_root_and_projection() {
         const VERSION_ID: &str = "fixture-version-bundle-recovery";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard recovery root");
         let lane = root.path().join(".axial-publication/version-bundle");
@@ -2523,7 +2525,7 @@ mod tests {
     #[tokio::test]
     async fn version_bundle_fixture_returns_settled_rollback_with_exact_effect() {
         const VERSION_ID: &str = "fixture-version-bundle-rollback";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard rollback root");
         let user_sentinel = root.path().join("saves/user-owned/level.dat");
@@ -2581,7 +2583,7 @@ mod tests {
     #[tokio::test]
     async fn version_bundle_receipts_bind_the_exact_activation_contract() {
         const COMMIT_VERSION: &str = "fixture-version-bundle-contract-commit";
-        let commit_root = tempfile::tempdir().expect("commit managed fixture root");
+        let commit_root = tempfile::tempdir_in(crate::test_temp_root()).expect("commit managed fixture root");
         let commit_authority = ManagedLibraryTestAuthority::open(commit_root.path())
             .expect("guard commit contract root");
         let commit_source = version_bundle_fixture_activation_source(COMMIT_VERSION);
@@ -2597,7 +2599,7 @@ mod tests {
         acknowledge_version_bundle(commit.acknowledge().await).await;
 
         const ROLLBACK_VERSION: &str = "fixture-version-bundle-contract-rollback";
-        let rollback_root = tempfile::tempdir().expect("rollback managed fixture root");
+        let rollback_root = tempfile::tempdir_in(crate::test_temp_root()).expect("rollback managed fixture root");
         let rollback_authority = ManagedLibraryTestAuthority::open(rollback_root.path())
             .expect("guard rollback contract root");
         let rollback_source = version_bundle_fixture_activation_source(ROLLBACK_VERSION);
@@ -2620,7 +2622,7 @@ mod tests {
     #[tokio::test]
     async fn source_bound_version_bundle_fixture_preserves_the_registered_contract() {
         const VERSION_ID: &str = "fixture-version-bundle-source-bound-contract";
-        let root = tempfile::tempdir().expect("source-bound managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("source-bound managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard source-bound root");
         let fixture_source = version_bundle_fixture_activation_source(VERSION_ID);
@@ -2648,7 +2650,7 @@ mod tests {
     #[tokio::test]
     async fn source_bound_version_bundle_rollback_preserves_the_registered_contract() {
         const VERSION_ID: &str = "fixture-version-bundle-source-bound-rollback";
-        let root = tempfile::tempdir().expect("source-bound rollback fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("source-bound rollback fixture root");
         let authority = ManagedLibraryTestAuthority::open(root.path())
             .expect("guard source-bound rollback root");
         let fixture_source = version_bundle_fixture_activation_source(VERSION_ID);
@@ -2675,7 +2677,7 @@ mod tests {
     #[tokio::test]
     async fn source_bound_version_bundle_fixture_rejects_foreign_projection() {
         const VERSION_ID: &str = "fixture-version-bundle-source-bound-mismatch";
-        let root = tempfile::tempdir().expect("source-bound mismatch fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("source-bound mismatch fixture root");
         let authority = ManagedLibraryTestAuthority::open(root.path())
             .expect("guard source-bound mismatch root");
         let foreign =
@@ -2702,7 +2704,7 @@ mod tests {
     #[tokio::test]
     async fn version_bundle_receipt_acknowledges_only_its_exact_settlement_marker() {
         const VERSION_ID: &str = "fixture-version-bundle-exact-acknowledgement";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard exact ack root");
         let receipt = super::rebuild_managed_version_bundle_fixture_for_test(
@@ -2728,7 +2730,7 @@ mod tests {
     #[tokio::test]
     async fn version_bundle_commit_restart_acknowledgement_reuses_lane() {
         const VERSION_ID: &str = "fixture-version-bundle-commit-restart";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard commit restart root");
         let source = version_bundle_fixture_activation_source(VERSION_ID);
@@ -2766,7 +2768,7 @@ mod tests {
     #[tokio::test]
     async fn version_bundle_rollback_restart_acknowledgement_reuses_lane() {
         const VERSION_ID: &str = "fixture-version-bundle-rollback-restart";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard rollback restart root");
         let source = version_bundle_fixture_activation_source(VERSION_ID);
@@ -2813,7 +2815,7 @@ mod tests {
     #[tokio::test]
     async fn guardian_version_bundle_orphan_commit_retains_lane_and_exact_evidence() {
         const VERSION_ID: &str = "fixture-version-bundle-orphan-commit";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard orphan commit root");
         let source = version_bundle_fixture_activation_source(VERSION_ID);
@@ -2868,7 +2870,7 @@ mod tests {
     #[tokio::test]
     async fn guardian_version_bundle_orphan_rollback_recovers_exact_effect_and_evidence() {
         const VERSION_ID: &str = "fixture-version-bundle-orphan-rollback";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard orphan rollback root");
         let source = version_bundle_fixture_activation_source(VERSION_ID);
@@ -2905,7 +2907,7 @@ mod tests {
     #[tokio::test]
     async fn guardian_version_bundle_orphan_rejects_install_and_foreign_markers() {
         const INSTALL_VERSION: &str = "fixture-version-bundle-install-owner";
-        let install_root = tempfile::tempdir().expect("install managed root");
+        let install_root = tempfile::tempdir_in(crate::test_temp_root()).expect("install managed root");
         let install_authority = ManagedLibraryTestAuthority::open(install_root.path())
             .expect("guard install managed root");
         let install_receipt = crate::download::publish_managed_install_fixture_for_test(
@@ -2956,7 +2958,7 @@ mod tests {
         drop(install_outcome);
 
         const GUARDIAN_VERSION: &str = "fixture-version-bundle-foreign-source";
-        let guardian_root = tempfile::tempdir().expect("Guardian managed root");
+        let guardian_root = tempfile::tempdir_in(crate::test_temp_root()).expect("Guardian managed root");
         let guardian_authority = ManagedLibraryTestAuthority::open(guardian_root.path())
             .expect("guard Guardian managed root");
         let exact_source = version_bundle_fixture_activation_source(GUARDIAN_VERSION);
@@ -3017,7 +3019,7 @@ mod tests {
     #[tokio::test]
     async fn guardian_version_bundle_orphan_distinguishes_empty_and_malformed_lanes() {
         const VERSION_ID: &str = "fixture-version-bundle-orphan-malformed";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard malformed orphan root");
         let source = version_bundle_fixture_activation_source(VERSION_ID);
@@ -3047,7 +3049,7 @@ mod tests {
     #[tokio::test]
     async fn guardian_version_bundle_acquisition_is_bounded_while_lane_is_held() {
         const VERSION_ID: &str = "fixture-version-bundle-held-lane";
-        let root = tempfile::tempdir().expect("held-lane fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("held-lane fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard held-lane root");
         let source = version_bundle_fixture_activation_source(VERSION_ID);
@@ -3119,7 +3121,7 @@ mod tests {
     #[tokio::test]
     async fn version_bundle_receipt_pins_retirement_until_acknowledgement() {
         const VERSION_ID: &str = "fixture-version-bundle-retirement-pin";
-        let root = tempfile::tempdir().expect("retirement fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("retirement fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard retirement root");
         let receipt = super::rebuild_managed_version_bundle_fixture_for_test(
@@ -3153,7 +3155,7 @@ mod tests {
     #[tokio::test]
     async fn version_bundle_acquire_recovery_pins_retirement_until_release() {
         const VERSION_ID: &str = "fixture-version-bundle-acquire-recovery-pin";
-        let root = tempfile::tempdir().expect("acquire recovery fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("acquire recovery fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard acquire recovery root");
         let source = version_bundle_fixture_activation_source(VERSION_ID);
@@ -3205,8 +3207,8 @@ mod tests {
     #[tokio::test]
     async fn version_bundle_restart_rejects_mismatch_and_proves_absent_root_binding() {
         const VERSION_ID: &str = "fixture-version-bundle-restart-mismatch";
-        let root = tempfile::tempdir().expect("managed fixture root");
-        let other_root = tempfile::tempdir().expect("other managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
+        let other_root = tempfile::tempdir_in(crate::test_temp_root()).expect("other managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard restart mismatch root");
         let other_authority = ManagedLibraryTestAuthority::open(other_root.path())
@@ -3294,7 +3296,7 @@ mod tests {
     #[tokio::test]
     async fn version_bundle_unsettled_move_reconciles_without_a_false_terminal() {
         const VERSION_ID: &str = "fixture-version-bundle-unsettled-move";
-        let root = tempfile::tempdir().expect("managed fixture root");
+        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("managed fixture root");
         let authority =
             ManagedLibraryTestAuthority::open(root.path()).expect("guard unsettled move root");
         crate::version_bundle_publication::report_first_move_unsettled_for_test(VERSION_ID);

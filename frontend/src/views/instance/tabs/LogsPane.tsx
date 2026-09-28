@@ -5,12 +5,14 @@ import { SelectField } from '../../../ui/Select';
 import { Icon } from '../../../ui/Icons';
 import { formatBytes, fmtRelative } from '../../../format';
 import { errMessage } from '../../../utils';
+import { launchSessions } from '../../../store';
 import type { EnrichedInstance, InstanceLogTail } from '../../../types-instance';
 import type { ResourceLoadState } from '../resources';
 import {
   LOG_FILTER_LABELS,
   LOG_TAIL_POLL_MS,
   fetchLogTail,
+  fetchSessionLog,
   isCompressedLogArchive,
   isCurrentLog,
   pickInitialLog,
@@ -21,39 +23,48 @@ import { openInstanceFolder } from '../instance-actions';
 import { ResourceEmpty, ResourceStatus } from '../components/resource-bits';
 import { LogLines } from '../components/log-line';
 
-export function LogsPane({
-  inst,
-  resources,
-  processLive,
-  onRefresh,
-}: {
+type LogsPaneProps = {
   inst: EnrichedInstance;
   resources: ResourceLoadState;
   processLive: boolean;
   onRefresh: () => void;
-}): JSX.Element {
+};
+
+export function LogsPane(props: LogsPaneProps): JSX.Element {
+  return <InstanceLogsPane key={props.inst.id} {...props} />;
+}
+
+function InstanceLogsPane({ inst, resources, processLive, onRefresh }: LogsPaneProps): JSX.Element {
   const logs = resources.data?.logs ?? [];
-  const [selected, setSelected] = useState<string>('');
+  const sessionId = launchSessions.value[inst.id]?.sessionId;
+  const sessionLog = sessionId ? `session:${sessionId}` : '';
+  const [selection, setSelected] = useState<string>(sessionLog);
   const [filter, setFilter] = useState<LogFilter>('all');
+  const [refreshRevision, setRefreshRevision] = useState(0);
   const [tail, setTail] = useState<{
+    name?: string;
     status: 'idle' | 'loading' | 'ready' | 'error';
-    data?: InstanceLogTail;
+    data?: Pick<InstanceLogTail, 'text' | 'truncated'> & { size?: number };
     error?: string;
   }>({ status: 'idle' });
   const sortedLogs = useMemo(() => sortLogs(logs), [logs]);
+  const selected =
+    (sessionLog && selection === sessionLog) || sortedLogs.some((log) => log.name === selection)
+      ? selection
+      : sessionLog || pickInitialLog(logs);
   const selectedEntry = sortedLogs.find((log) => log.name === selected);
-  const isLive = processLive && isCurrentLog(selected);
+  const sessionSelected = Boolean(sessionLog && selected === sessionLog);
+  const isLive = processLive && (sessionSelected || isCurrentLog(selected));
   const selectedIsCompressedArchive = isCompressedLogArchive(selected);
+  const currentTail = tail.name === selected ? tail : { status: 'loading' as const };
+  const refresh = (): void => {
+    setRefreshRevision((revision) => revision + 1);
+    onRefresh();
+  };
 
   useEffect(() => {
-    if (!logs.length) {
-      setSelected('');
-      return;
-    }
-    if (!selected || !logs.some((log) => log.name === selected)) {
-      setSelected(pickInitialLog(logs));
-    }
-  }, [logs, selected]);
+    if (sessionLog) setSelected(sessionLog);
+  }, [sessionLog]);
 
   useEffect(() => {
     if (!selected || selectedIsCompressedArchive) {
@@ -61,25 +72,33 @@ export function LogsPane({
       return;
     }
     let alive = true;
+    let inFlight = false;
+    const isCurrent = (): boolean => alive && launchSessions.value[inst.id]?.sessionId === sessionId;
     const load = (showLoading: boolean): void => {
+      if (inFlight) return;
+      inFlight = true;
       if (showLoading) {
-        setTail((current) => (current.data?.name === selected ? current : { status: 'loading' }));
+        setTail({ status: 'loading', name: selected });
       }
-      void fetchLogTail(inst.id, selected)
+      const request = sessionSelected && sessionId ? fetchSessionLog(sessionId) : fetchLogTail(inst.id, selected);
+      void request
         .then((data) => {
-          if (alive) setTail({ status: 'ready', data });
+          if (isCurrent()) setTail({ status: 'ready', name: selected, data });
         })
         .catch((err) => {
-          if (alive) setTail({ status: 'error', error: errMessage(err) });
+          if (isCurrent()) setTail({ status: 'error', name: selected, error: errMessage(err) });
+        })
+        .finally(() => {
+          inFlight = false;
         });
     };
     load(true);
-    const timer = processLive ? window.setInterval(() => load(false), LOG_TAIL_POLL_MS) : 0;
+    const timer = sessionSelected || isLive ? window.setInterval(() => load(false), LOG_TAIL_POLL_MS) : 0;
     return () => {
       alive = false;
       if (timer) window.clearInterval(timer);
     };
-  }, [inst.id, processLive, selected, selectedIsCompressedArchive]);
+  }, [inst.id, isLive, selected, selectedIsCompressedArchive, refreshRevision, sessionId, sessionSelected]);
 
   return (
     <div class="cp-instance-body cp-logs-pane">
@@ -100,7 +119,7 @@ export function LogsPane({
               </button>
             ))}
           </div>
-          <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>
+          <Button variant="secondary" size="sm" icon="refresh" onClick={refresh}>
             Refresh
           </Button>
           <Button variant="secondary" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'logs')}>
@@ -108,8 +127,8 @@ export function LogsPane({
           </Button>
         </div>
       </div>
-      <ResourceStatus state={resources} onRetry={onRefresh} />
-      {logs.length === 0 && resources.status !== 'loading' ? (
+      {!sessionSelected && <ResourceStatus state={resources} onRetry={refresh} />}
+      {!sessionLog && logs.length === 0 && resources.status === 'ready' ? (
         <ResourceEmpty
           icon="terminal"
           title="No logs yet"
@@ -125,10 +144,13 @@ export function LogsPane({
                 onChange={setSelected}
                 ariaLabel="Log file"
                 width={260}
-                options={sortedLogs.map((log) => ({
-                  value: log.name,
-                  label: isCurrentLog(log.name) ? `${log.name} (latest)` : log.name,
-                }))}
+                options={[
+                  ...(sessionLog ? [{ value: sessionLog, label: 'Session output' }] : []),
+                  ...sortedLogs.map((log) => ({
+                    value: log.name,
+                    label: isCurrentLog(log.name) ? `${log.name} (latest)` : log.name,
+                  })),
+                ]}
               />
               {isLive && (
                 <Pill tone="accent" icon="play">
@@ -149,21 +171,28 @@ export function LogsPane({
                 it, or select an uncompressed .log file.
               </div>
             )}
-            {!selectedIsCompressedArchive && tail.status === 'loading' && (
+            {!selectedIsCompressedArchive && currentTail.status === 'loading' && (
               <div class="cp-logview-note">Loading log…</div>
             )}
-            {!selectedIsCompressedArchive && tail.status === 'error' && (
-              <div class="cp-logview-note cp-logview-note--error">{tail.error}</div>
+            {!selectedIsCompressedArchive && currentTail.status === 'error' && (
+              <div class="cp-logview-note cp-logview-note--error">{currentTail.error}</div>
             )}
-            {!selectedIsCompressedArchive && tail.status === 'ready' && (
+            {!selectedIsCompressedArchive && currentTail.status === 'ready' && (
               <>
-                {tail.data?.truncated && (
+                {currentTail.data?.truncated && (
                   <div class="cp-logview-truncated">
-                    Showing the last {formatBytes(tail.data.size > 0 ? Math.min(tail.data.size, 128 * 1024) : 0)} of
-                    this log.
+                    {sessionSelected ? (
+                      'Some session output was truncated.'
+                    ) : (
+                      <>Showing the last {formatBytes(Math.min(currentTail.data.size ?? 0, 128 * 1024))} of this log.</>
+                    )}
                   </div>
                 )}
-                <LogLines text={tail.data?.text ?? ''} filter={filter} />
+                {sessionSelected && !currentTail.data?.text ? (
+                  <div class="cp-log-empty">No session output yet.</div>
+                ) : (
+                  <LogLines text={currentTail.data?.text ?? ''} filter={filter} />
+                )}
               </>
             )}
           </div>

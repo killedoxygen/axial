@@ -1,0 +1,46 @@
+.cp-selection-row[data-selected='true'] {
+  background: color-mix(in oklab, var(--surface-3) 72%, var(--surface));
+  color: var(--text);
+}
+
+.cp-selection-row[data-selected='true']:hover {
+  background: var(--surface-3);
+}
+
+.cp-selection-row[data-selected='true'][data-disabled='true'] {
+  opacity: 1;
+}
+
+.cp-select-check {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: var(--r-xs);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2);
+  color: transparent;
+  cursor: pointer;
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+  transition:
+    background 120ms,
+    color 120ms,
+    box-shadow 120ms;
+}
+
+.cp-select-check:hover {
+  background: var(--surface-3);
+  color: var(--text-dim);
+}
+
+.cp-select-check[data-selected='true'] {
+  background: var(--accent-fill);
+  color: var(--accent-on);
+  box-shadow: none;
+}
+
+.cp-select-check:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}

@@ -29,14 +29,15 @@ pub use ensure::{
     prepare_managed_runtime_rebuild_fixture_for_test, rebuild_managed_runtime_fixture_for_test,
     rebuild_managed_runtime_prepared_fixture_for_test,
 };
-pub(crate) use ensure::{
-    ProcessorRuntime, RuntimeMaterializationCancelHandle, materialize_ephemeral_processor_runtime,
-    materialize_preferred_runtime_source, runtime_materialization_control,
+pub(crate) use ensure::{ProcessorRuntime, materialize_ephemeral_processor_runtime};
+pub use ensure::{
+    RuntimeMaterializationCancelHandle, RuntimeMaterializationCancellation,
+    RuntimeMaterializationTaskControl, materialize_preferred_runtime_source,
+    runtime_materialization_control,
 };
 #[cfg(test)]
 pub(crate) use ensure::{
-    RuntimeMaterializationCancellation, block_runtime_before_publication_claim_for_test,
-    rebuild_managed_runtime_component_from_source,
+    block_runtime_before_publication_claim_for_test, rebuild_managed_runtime_component_from_source,
 };
 pub use ensure::{ensure_runtime_with_events, rebuild_managed_runtime_component};
 #[cfg(test)]
@@ -96,11 +97,12 @@ use layout::{java_executable, java_executable_for_os, runtime_os_arch_for};
 #[cfg(test)]
 pub(crate) use manifest::authenticated_runtime_source_from_manifest_for_test;
 pub(crate) use manifest::{
-    COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, RuntimeSourceReceipt,
-    component_manifest_proof_bytes,
+    COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, component_manifest_proof_bytes,
 };
 
-pub(crate) async fn acquire_preferred_runtime_source(
+pub use manifest::RuntimeSourceReceipt;
+
+pub async fn acquire_preferred_runtime_source(
     java_version: &crate::launch::JavaVersion,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
     let component = RuntimeId::from(preferred_runtime_component(java_version));
@@ -111,6 +113,26 @@ pub(crate) async fn acquire_preferred_runtime_source(
         ));
     }
     manifest::acquire_runtime_source(&component, &layout::runtime_os_arch()).await
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) async fn acquire_preferred_runtime_source_at_test_endpoint(
+    java_version: &crate::launch::JavaVersion,
+    endpoints: &crate::download::InstallTestEndpoints,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    let component = RuntimeId::from(preferred_runtime_component(java_version));
+    if !is_known_runtime_component(component.as_str()) {
+        return Err(JavaRuntimeLookupError::Install(
+            "preferred runtime component is not in the closed managed-runtime vocabulary"
+                .to_string(),
+        ));
+    }
+    manifest::acquire_runtime_source_at_test_endpoint(
+        &component,
+        &layout::runtime_os_arch(),
+        endpoints,
+    )
+    .await
 }
 
 #[cfg(test)]

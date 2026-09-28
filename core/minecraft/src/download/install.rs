@@ -110,10 +110,14 @@ pub struct Downloader {
     root: DownloaderRoot,
     client: reqwest::Client,
     asset_object_base_url: Arc<str>,
+    #[cfg(feature = "test-support")]
+    test_endpoints: Option<super::InstallTestEndpoints>,
     #[cfg(test)]
     install_manifest: Option<VersionManifest>,
     #[cfg(test)]
     runtime_source: Option<TestRuntimeSourceDescriptor>,
+    #[cfg(test)]
+    processor_mappings_transport: Option<super::TestProcessorMappingsTransport>,
     #[cfg(test)]
     acquisition_workers: Option<ManagedBlockingWorkers>,
     #[cfg(test)]
@@ -1491,10 +1495,14 @@ impl Downloader {
             },
             client: standard_minecraft_download_client(),
             asset_object_base_url: Arc::from(ASSET_OBJECT_BASE_URL),
+            #[cfg(feature = "test-support")]
+            test_endpoints: None,
             #[cfg(test)]
             install_manifest: None,
             #[cfg(test)]
             runtime_source: None,
+            #[cfg(test)]
+            processor_mappings_transport: None,
             #[cfg(test)]
             acquisition_workers: None,
             #[cfg(test)]
@@ -1507,10 +1515,14 @@ impl Downloader {
             root: DownloaderRoot::SourceOnly,
             client: standard_minecraft_download_client(),
             asset_object_base_url: Arc::from(ASSET_OBJECT_BASE_URL),
+            #[cfg(feature = "test-support")]
+            test_endpoints: None,
             #[cfg(test)]
             install_manifest: None,
             #[cfg(test)]
             runtime_source: None,
+            #[cfg(test)]
+            processor_mappings_transport: None,
             #[cfg(test)]
             acquisition_workers: None,
             #[cfg(test)]
@@ -1537,11 +1549,23 @@ impl Downloader {
             },
             client: standard_minecraft_download_client(),
             asset_object_base_url: Arc::from(ASSET_OBJECT_BASE_URL),
+            #[cfg(feature = "test-support")]
+            test_endpoints: None,
             install_manifest: Some(manifest),
             runtime_source: None,
+            processor_mappings_transport: None,
             acquisition_workers: None,
             wait_for_concurrent_terminals: false,
         }
+    }
+
+    /// Redirect only provider entrypoints; retain real source authentication,
+    /// managed runtime installation, publication and acknowledgement.
+    #[cfg(feature = "test-support")]
+    pub fn with_test_endpoints(mut self, endpoints: super::InstallTestEndpoints) -> Self {
+        self.asset_object_base_url = Arc::from(endpoints.asset_objects());
+        self.test_endpoints = Some(endpoints);
+        self
     }
 
     #[cfg(test)]
@@ -1557,6 +1581,22 @@ impl Downloader {
     ) -> Self {
         self.runtime_source = Some(descriptor);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_processor_mappings_transport(
+        mut self,
+        transport: super::TestProcessorMappingsTransport,
+    ) -> Self {
+        self.processor_mappings_transport = Some(transport);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_processor_mappings_transport(
+        &self,
+    ) -> Option<super::TestProcessorMappingsTransport> {
+        self.processor_mappings_transport.clone()
     }
 
     #[cfg(test)]
@@ -2824,6 +2864,14 @@ impl Downloader {
         &self,
         java_version: &crate::launch::JavaVersion,
     ) -> Result<RuntimeSourceReceipt, crate::runtime::JavaRuntimeLookupError> {
+        #[cfg(feature = "test-support")]
+        if let Some(endpoints) = &self.test_endpoints {
+            return crate::runtime::acquire_preferred_runtime_source_at_test_endpoint(
+                java_version,
+                endpoints,
+            )
+            .await;
+        }
         #[cfg(test)]
         if let Some(descriptor) = &self.runtime_source {
             return acquire_test_runtime_source(java_version, descriptor).await;
@@ -2906,6 +2954,13 @@ impl Downloader {
     }
 
     async fn fresh_install_manifest(&self) -> Result<VersionManifest, String> {
+        #[cfg(feature = "test-support")]
+        if let Some(endpoints) = &self.test_endpoints {
+            return crate::manifest::fetch_fresh_install_version_manifest_at_test_endpoint(
+                endpoints,
+            )
+            .await;
+        }
         #[cfg(test)]
         if let Some(manifest) = &self.install_manifest {
             return Ok(manifest.clone());
@@ -5399,8 +5454,8 @@ mod tests {
         const FINGERPRINT: &str =
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
-        let first = tempfile::tempdir().expect("first evidence root");
-        let second = tempfile::tempdir().expect("second evidence root");
+        let first = tempfile::tempdir_in(crate::test_temp_root()).expect("first evidence root");
+        let second = tempfile::tempdir_in(crate::test_temp_root()).expect("second evidence root");
         let first_authority = crate::managed_fs::ManagedLibraryRoot::open_for_test(first.path())
             .expect("open first managed root");
         let second_authority = crate::managed_fs::ManagedLibraryRoot::open_for_test(second.path())
@@ -5479,7 +5534,7 @@ mod tests {
                 );
             }));
         let setup_attempt = workers.attempt_guard();
-        let temporary = tempfile::tempdir().expect("reconstruction root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("reconstruction root");
         let managed_root = ManagedDir::open_root(temporary.path()).expect("managed root");
         let context = ManagedReconstructionContext {
             mode: ManagedReconstructionMode::Libraries(ManagedLibrariesReconstructionContext {

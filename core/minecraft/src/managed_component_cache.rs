@@ -264,7 +264,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_root_component_and_path_are_cache_misses() {
-        let temporary = tempfile::tempdir().expect("cache test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("cache test root");
         let missing_root = temporary.path().join("missing");
         let path = relative("objects/aa/aa01");
         let workers = ManagedBlockingWorkers::new();
@@ -289,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_sha1_proves_exact_corrupt_and_zero_files_under_guard() {
-        let temporary = tempfile::tempdir().expect("cache test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("cache test root");
         let directory = temporary.path().join("assets/objects/aa");
         std::fs::create_dir_all(&directory).expect("create object directory");
         let path = relative("objects/aa/aa01");
@@ -337,7 +337,7 @@ mod tests {
     async fn invalid_final_intermediate_and_alias_topology_fail_closed() {
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let final_directory = tempfile::tempdir().expect("final topology root");
+        let final_directory = tempfile::tempdir_in(crate::test_temp_root()).expect("final topology root");
         std::fs::create_dir_all(final_directory.path().join("assets/objects/aa/aa01"))
             .expect("create directory at final path");
         let cache = bind_cache(
@@ -351,7 +351,7 @@ mod tests {
             Err(ManagedComponentExactCacheError::Admission)
         );
 
-        let intermediate_file = tempfile::tempdir().expect("intermediate topology root");
+        let intermediate_file = tempfile::tempdir_in(crate::test_temp_root()).expect("intermediate topology root");
         std::fs::create_dir_all(intermediate_file.path().join("assets"))
             .expect("create Assets root");
         std::fs::write(
@@ -370,7 +370,7 @@ mod tests {
             Err(ManagedComponentExactCacheError::Admission)
         );
 
-        let alias = tempfile::tempdir().expect("alias topology root");
+        let alias = tempfile::tempdir_in(crate::test_temp_root()).expect("alias topology root");
         std::fs::create_dir_all(alias.path().join("assets/Objects"))
             .expect("create portable alias");
         let cache = bind_cache(alias.path(), ManagedComponentKind::Assets, &workers).await;

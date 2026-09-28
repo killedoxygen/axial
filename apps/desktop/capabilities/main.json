@@ -1,18 +1,30 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-capability",
-  "description": "Main desktop capability for the Axial rewrite shell",
+  "description": "Confined native actions for the local main Axial Rewrite window.",
+  "local": true,
   "windows": ["main"],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
-    {
-      "identifier": "opener:allow-open-url",
-      "allow": [
-        {
-          "url": "https://*"
-        }
-      ]
-    }
+    "allow-app-version",
+    "allow-microsoft-sign-in",
+    "allow-pick-skin-file",
+    "allow-consume-skin-drop",
+    "allow-pick-import-profile",
+    "allow-pick-import-instance-source",
+    "allow-forget-import-profile",
+    "allow-api-transport-bootstrap",
+    "allow-desktop-chrome",
+    "allow-window-minimize",
+    "allow-window-toggle-maximize",
+    "allow-window-is-maximized",
+    "allow-window-start-dragging",
+    "allow-window-set-resize-background",
+    "allow-window-close",
+    "allow-app-restart",
+    "allow-pending-interface-preferences",
+    "allow-complete-interface-preferences",
+    {"identifier": "opener:allow-open-url", "allow": [{"url": "https://*"}]}
   ]
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-desktop-chrome"
+description = "Enables the desktop_chrome command without any pre-configured scope."
+commands.allow = ["desktop_chrome"]
+
+[[permission]]
+identifier = "deny-desktop-chrome"
+description = "Denies the desktop_chrome command without any pre-configured scope."
+commands.deny = ["desktop_chrome"]

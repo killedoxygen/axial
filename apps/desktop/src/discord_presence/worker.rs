@@ -1,373 +1,262 @@
 use super::activity::discord_activity;
 use super::client::DiscordRpcClient;
+use super::snapshot::PresenceSnapshot;
 use super::transport::DiscordRpcError;
-use axial_api::state::presence::PresenceSnapshot;
 use serde_json::Value;
-use std::marker::PhantomData;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::{Duration, Instant};
-use tracing::debug;
+use std::future::Future;
+use std::time::Duration;
+use tokio::sync::watch;
+use tokio::time::Instant;
 
-const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
-const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
-const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
-const WORKER_IDLE_WAIT: Duration = Duration::from_secs(5 * 60);
+const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+// The one test seam is the actual IPC boundary; projection and lifecycle run
+// unchanged in tests and the native worker.
 pub(super) trait RpcConnection: Sized {
-    fn connect(client_id: &str) -> Result<Self, DiscordRpcError>;
-    fn set_activity(&mut self, activity: &Value) -> Result<(), DiscordRpcError>;
-    fn clear_activity(&mut self) -> Result<(), DiscordRpcError>;
-    fn close(&mut self) -> Result<(), DiscordRpcError>;
+    fn connect(client_id: &str) -> impl Future<Output = Result<Self, DiscordRpcError>>;
+    fn set_activity(
+        &mut self,
+        activity: &Value,
+    ) -> impl Future<Output = Result<(), DiscordRpcError>>;
+    fn clear_and_close(self) -> impl Future<Output = ()>;
 }
 
 impl RpcConnection for DiscordRpcClient {
-    fn connect(client_id: &str) -> Result<Self, DiscordRpcError> {
-        DiscordRpcClient::connect(client_id)
+    async fn connect(client_id: &str) -> Result<Self, DiscordRpcError> {
+        Self::connect(client_id).await
     }
-
-    fn set_activity(&mut self, activity: &Value) -> Result<(), DiscordRpcError> {
-        self.set_activity(activity)
+    async fn set_activity(&mut self, activity: &Value) -> Result<(), DiscordRpcError> {
+        self.set_activity(activity).await
     }
-
-    fn clear_activity(&mut self) -> Result<(), DiscordRpcError> {
-        self.clear_activity()
-    }
-
-    fn close(&mut self) -> Result<(), DiscordRpcError> {
-        self.close()
+    async fn clear_and_close(self) {
+        self.clear_and_close().await;
     }
 }
 
-#[derive(Clone, Copy)]
-struct WorkerTiming {
-    initial_reconnect_backoff: Duration,
-    max_reconnect_backoff: Duration,
-    presence_refresh_interval: Duration,
-    idle_wait: Duration,
-}
-
-impl Default for WorkerTiming {
-    fn default() -> Self {
-        Self {
-            initial_reconnect_backoff: INITIAL_RECONNECT_BACKOFF,
-            max_reconnect_backoff: MAX_RECONNECT_BACKOFF,
-            presence_refresh_interval: PRESENCE_REFRESH_INTERVAL,
-            idle_wait: WORKER_IDLE_WAIT,
-        }
-    }
-}
-
-pub(super) struct DiscordPresenceWorker<C = DiscordRpcClient> {
-    client_id: String,
-    commands: Receiver<PresenceCommand>,
-    timing: WorkerTiming,
-    _client: PhantomData<C>,
-}
-
-pub(super) enum PresenceCommand {
+#[derive(Clone)]
+pub(super) enum Command {
     Snapshot(PresenceSnapshot),
     Shutdown,
 }
 
-impl DiscordPresenceWorker<DiscordRpcClient> {
-    pub(super) fn new(client_id: String, commands: Receiver<PresenceCommand>) -> Self {
+#[derive(Clone, Copy)]
+pub(super) struct Timing {
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    refresh_interval: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
         Self {
-            client_id,
-            commands,
-            timing: WorkerTiming::default(),
-            _client: PhantomData,
+            initial_backoff: INITIAL_BACKOFF,
+            max_backoff: MAX_BACKOFF,
+            refresh_interval: REFRESH_INTERVAL,
         }
     }
 }
 
-impl<C: RpcConnection> DiscordPresenceWorker<C> {
-    pub(super) fn run(self) {
-        let mut current = match self.commands.recv() {
-            Ok(PresenceCommand::Snapshot(snapshot)) => snapshot,
-            Ok(PresenceCommand::Shutdown) => return,
-            Err(_) => return,
+pub(super) async fn run<C: RpcConnection>(
+    client_id: String,
+    mut commands: watch::Receiver<Command>,
+    timing: Timing,
+) {
+    let mut client: Option<C> = None;
+    let mut last_activity: Option<Value> = None;
+    let mut next_attempt = Instant::now();
+    let mut backoff = timing.initial_backoff;
+    loop {
+        let command = commands.borrow_and_update().clone();
+        let Command::Snapshot(snapshot) = command else {
+            break;
         };
-        let mut client: Option<C> = None;
-        let mut last_activity: Option<Value> = None;
-        let mut last_success: Option<Instant> = None;
-        let mut reconnect_at = Instant::now();
-        let mut reconnect_backoff = self.timing.initial_reconnect_backoff;
-
-        loop {
-            if current.enabled {
-                let connected = ensure_connected(
-                    &self.client_id,
-                    &mut client,
-                    &mut reconnect_at,
-                    &mut reconnect_backoff,
-                    self.timing,
-                );
-                if connected {
-                    apply_snapshot(
-                        &current,
-                        &mut client,
-                        &mut last_activity,
-                        &mut last_success,
-                        &mut reconnect_at,
-                        &mut reconnect_backoff,
-                        self.timing,
-                    );
-                }
-            } else {
-                clear_connected_activity(client.take());
-                last_activity = None;
-                last_success = None;
-                reconnect_backoff = self.timing.initial_reconnect_backoff;
-                reconnect_at = Instant::now();
+        if !snapshot.enabled {
+            if let Some(connected) = client.take() {
+                connected.clear_and_close().await;
             }
+            last_activity = None;
+            next_attempt = Instant::now();
+            backoff = timing.initial_backoff;
+            if commands.changed().await.is_err() {
+                break;
+            }
+            continue;
+        }
 
-            let wait = next_wait(current.enabled, client.is_some(), reconnect_at, self.timing);
-            match self.commands.recv_timeout(wait) {
-                Ok(PresenceCommand::Snapshot(snapshot)) => current = snapshot,
-                Ok(PresenceCommand::Shutdown) => {
-                    clear_connected_activity(client);
-                    return;
+        if client.is_none() && Instant::now() >= next_attempt {
+            match C::connect(&client_id).await {
+                Ok(connected) => {
+                    client = Some(connected);
+                    // A disable or shutdown accepted during connection must win
+                    // before a new activity can be sent.
+                    if commands.has_changed().unwrap_or(true) {
+                        continue;
+                    }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    clear_connected_activity(client);
-                    return;
+                Err(error) => {
+                    tracing::debug!(error = %error, "Discord connection unavailable; retry scheduled");
+                    next_attempt = Instant::now() + backoff;
+                    backoff = (backoff * 2).min(timing.max_backoff);
                 }
             }
         }
-    }
-}
-
-fn ensure_connected<C: RpcConnection>(
-    client_id: &str,
-    client: &mut Option<C>,
-    reconnect_at: &mut Instant,
-    reconnect_backoff: &mut Duration,
-    timing: WorkerTiming,
-) -> bool {
-    if client.is_some() {
-        return true;
-    }
-    if Instant::now() < *reconnect_at {
-        return false;
-    }
-
-    match C::connect(client_id) {
-        Ok(next) => {
-            *client = Some(next);
-            *reconnect_backoff = timing.initial_reconnect_backoff;
-            true
-        }
-        Err(error) => {
-            schedule_retry(reconnect_at, reconnect_backoff, "connect", &error, timing);
-            false
-        }
-    }
-}
-
-fn apply_snapshot<C: RpcConnection>(
-    current: &PresenceSnapshot,
-    client: &mut Option<C>,
-    last_activity: &mut Option<Value>,
-    last_success: &mut Option<Instant>,
-    reconnect_at: &mut Instant,
-    reconnect_backoff: &mut Duration,
-    timing: WorkerTiming,
-) {
-    let Some(connected) = client.as_mut() else {
-        return;
-    };
-
-    let activity = discord_activity(current);
-    let stale = last_success
-        .map(|sent_at| sent_at.elapsed() >= timing.presence_refresh_interval)
-        .unwrap_or(true);
-    if last_activity.as_ref() == Some(&activity) && !stale {
-        return;
-    }
-
-    match connected.set_activity(&activity) {
-        Ok(()) => {
-            *last_activity = Some(activity);
-            *last_success = Some(Instant::now());
-            *reconnect_backoff = timing.initial_reconnect_backoff;
-        }
-        Err(error) => {
-            debug!(error = %error, "Discord RPC update failed; will retry");
-            if let Some(mut connected) = client.take() {
-                let _ = connected.close();
+        let activity = discord_activity(&snapshot);
+        if let Some(connected) = client.as_mut()
+            && (last_activity.as_ref() != Some(&activity) || Instant::now() >= next_attempt)
+        {
+            match connected.set_activity(&activity).await {
+                Ok(()) => {
+                    last_activity = Some(activity);
+                    backoff = timing.initial_backoff;
+                    next_attempt = Instant::now() + timing.refresh_interval;
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "Discord presence update failed; retry scheduled");
+                    // Partial frame reads cannot be resumed safely. Dropping the
+                    // old connection clears its association; retry uses fresh IPC.
+                    client = None;
+                    last_activity = None;
+                    next_attempt = Instant::now() + backoff;
+                    backoff = (backoff * 2).min(timing.max_backoff);
+                }
             }
-            *last_activity = None;
-            *last_success = None;
-            schedule_retry(reconnect_at, reconnect_backoff, "update", &error, timing);
+        }
+        tokio::select! {
+            changed = commands.changed() => { if changed.is_err() { break; } }
+            _ = tokio::time::sleep_until(next_attempt) => {}
         }
     }
-}
-
-fn clear_connected_activity<C: RpcConnection>(client: Option<C>) {
-    if let Some(mut connected) = client {
-        let _ = connected.clear_activity();
-        let _ = connected.close();
+    if let Some(connected) = client {
+        connected.clear_and_close().await;
     }
-}
-
-fn next_wait(
-    enabled: bool,
-    connected: bool,
-    reconnect_at: Instant,
-    timing: WorkerTiming,
-) -> Duration {
-    if enabled && !connected {
-        reconnect_at.saturating_duration_since(Instant::now())
-    } else {
-        timing.idle_wait
-    }
-}
-
-fn schedule_retry(
-    reconnect_at: &mut Instant,
-    reconnect_backoff: &mut Duration,
-    action: &str,
-    error: &DiscordRpcError,
-    timing: WorkerTiming,
-) {
-    debug!(action, error = %error, "Discord RPC attempt failed");
-    *reconnect_at = Instant::now() + *reconnect_backoff;
-    *reconnect_backoff = (*reconnect_backoff * 2).min(timing.max_reconnect_backoff);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axial_api::state::presence::{PresenceActivity, PresenceActivityKind};
-    use std::sync::Mutex;
-    use std::thread;
+    use std::sync::{Arc, Mutex};
 
-    struct FakeRpc;
-
-    #[derive(Clone, Copy)]
-    struct FakeRpcState {
-        connect_attempts: usize,
-        failures_remaining: usize,
-        set_activity_count: usize,
-        clear_activity_count: usize,
-        close_count: usize,
+    #[derive(Default)]
+    struct State {
+        attempts: usize,
+        connect_failures: usize,
+        update_failures: usize,
+        activities: Vec<Value>,
+        clears: usize,
     }
-
-    static FAKE_RPC_STATE: Mutex<FakeRpcState> = Mutex::new(FakeRpcState {
-        connect_attempts: 0,
-        failures_remaining: 0,
-        set_activity_count: 0,
-        clear_activity_count: 0,
-        close_count: 0,
-    });
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    impl RpcConnection for FakeRpc {
-        fn connect(_client_id: &str) -> Result<Self, DiscordRpcError> {
-            let mut state = FAKE_RPC_STATE.lock().expect("fake state lock");
-            state.connect_attempts += 1;
-            if state.failures_remaining > 0 {
-                state.failures_remaining -= 1;
-                return Err(DiscordRpcError::Connect("not ready".to_string()));
+    tokio::task_local! { static PEER: Arc<Mutex<State>>; }
+    struct Peer(Arc<Mutex<State>>);
+    impl RpcConnection for Peer {
+        async fn connect(_: &str) -> Result<Self, DiscordRpcError> {
+            PEER.with(|shared| {
+                let mut state = shared.lock().unwrap();
+                state.attempts += 1;
+                if state.connect_failures > 0 {
+                    state.connect_failures -= 1;
+                    Err(DiscordRpcError::Absent)
+                } else {
+                    Ok(Self(shared.clone()))
+                }
+            })
+        }
+        async fn set_activity(&mut self, activity: &Value) -> Result<(), DiscordRpcError> {
+            let mut state = self.0.lock().unwrap();
+            if state.update_failures > 0 {
+                state.update_failures -= 1;
+                return Err(DiscordRpcError::Protocol);
             }
-            Ok(Self)
-        }
-
-        fn set_activity(&mut self, _activity: &Value) -> Result<(), DiscordRpcError> {
-            FAKE_RPC_STATE
-                .lock()
-                .expect("fake state lock")
-                .set_activity_count += 1;
+            state.activities.push(activity.clone());
             Ok(())
         }
-
-        fn clear_activity(&mut self) -> Result<(), DiscordRpcError> {
-            FAKE_RPC_STATE
-                .lock()
-                .expect("fake state lock")
-                .clear_activity_count += 1;
-            Ok(())
-        }
-
-        fn close(&mut self) -> Result<(), DiscordRpcError> {
-            FAKE_RPC_STATE.lock().expect("fake state lock").close_count += 1;
-            Ok(())
+        async fn clear_and_close(self) {
+            self.0.lock().unwrap().clears += 1;
         }
     }
 
-    fn reset_fake_rpc(failures_remaining: usize) {
-        *FAKE_RPC_STATE.lock().expect("fake state lock") = FakeRpcState {
-            connect_attempts: 0,
-            failures_remaining,
-            set_activity_count: 0,
-            clear_activity_count: 0,
-            close_count: 0,
-        };
-    }
-
-    fn fake_state() -> FakeRpcState {
-        *FAKE_RPC_STATE.lock().expect("fake state lock")
-    }
-
-    fn playing_snapshot() -> PresenceSnapshot {
-        PresenceSnapshot {
-            enabled: true,
-            activity: PresenceActivity {
-                kind: PresenceActivityKind::Playing,
-                details: "Minecraft is running".to_string(),
-                state: "Fabric 1.21.1 - Managed".to_string(),
-                active_count: 1,
-                started_at_unix_seconds: Some(1_781_350_000),
-            },
+    fn timing() -> Timing {
+        Timing {
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(20),
+            refresh_interval: Duration::from_secs(60),
         }
     }
 
-    fn test_timing() -> WorkerTiming {
-        WorkerTiming {
-            initial_reconnect_backoff: Duration::from_millis(5),
-            max_reconnect_backoff: Duration::from_millis(5),
-            presence_refresh_interval: Duration::from_secs(60),
-            idle_wait: Duration::from_millis(20),
-        }
-    }
-
-    fn wait_until(mut predicate: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if predicate() {
-                return;
+    async fn until(mut ready: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !ready() {
+                tokio::task::yield_now().await;
             }
-            thread::sleep(Duration::from_millis(5));
-        }
-        panic!("condition was not reached before deadline");
+        })
+        .await
+        .expect("expected worker state before deadline");
     }
 
-    #[test]
-    fn worker_reconnects_after_failed_connect_and_clears_on_shutdown() {
-        let _guard = TEST_LOCK.lock().expect("test lock");
-        reset_fake_rpc(1);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = DiscordPresenceWorker::<FakeRpc> {
-            client_id: "123456789012345678".to_string(),
-            commands: rx,
-            timing: test_timing(),
-            _client: PhantomData,
-        };
-        let join = thread::spawn(move || worker.run());
+    #[tokio::test]
+    async fn absent_discord_retries_and_shutdown_clears_successful_connection() {
+        let state = Arc::new(Mutex::new(State {
+            connect_failures: 1,
+            ..State::default()
+        }));
+        let (tx, rx) = watch::channel(Command::Snapshot(PresenceSnapshot::from_sessions(
+            true,
+            &[],
+        )));
+        let worker =
+            tokio::spawn(PEER.scope(state.clone(), run::<Peer>("123456".into(), rx, timing())));
+        until(|| state.lock().unwrap().activities.len() == 1).await;
+        tx.send_replace(Command::Shutdown);
+        worker.await.unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.attempts, 2);
+        assert_eq!(state.clears, 1);
+    }
 
-        tx.send(PresenceCommand::Snapshot(playing_snapshot()))
-            .expect("snapshot should send");
-        wait_until(|| fake_state().set_activity_count == 1);
+    #[tokio::test]
+    async fn disabling_clears_without_reconnecting_and_reenabling_republishes() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let idle = PresenceSnapshot::from_sessions(true, &[]);
+        let (tx, rx) = watch::channel(Command::Snapshot(idle.clone()));
+        let worker =
+            tokio::spawn(PEER.scope(state.clone(), run::<Peer>("123456".into(), rx, timing())));
+        until(|| state.lock().unwrap().activities.len() == 1).await;
+        tx.send_replace(Command::Snapshot(idle.clone()));
+        tokio::task::yield_now().await;
+        assert_eq!(state.lock().unwrap().activities.len(), 1);
+        tx.send_replace(Command::Snapshot(PresenceSnapshot::from_sessions(
+            false,
+            &[],
+        )));
+        until(|| state.lock().unwrap().clears == 1).await;
+        assert_eq!(state.lock().unwrap().attempts, 1);
+        tx.send_replace(Command::Snapshot(idle));
+        until(|| state.lock().unwrap().activities.len() == 2).await;
+        drop(tx);
+        worker.await.unwrap();
+        assert_eq!(state.lock().unwrap().clears, 2);
+    }
 
-        tx.send(PresenceCommand::Shutdown)
-            .expect("shutdown should send");
-        join.join().expect("worker should join");
-
-        let state = fake_state();
-        assert_eq!(state.connect_attempts, 2);
-        assert_eq!(state.set_activity_count, 1);
-        assert_eq!(state.clear_activity_count, 1);
-        assert_eq!(state.close_count, 1);
+    #[tokio::test]
+    async fn failed_update_reconnects_and_publishes_only_latest_snapshot() {
+        let state = Arc::new(Mutex::new(State {
+            update_failures: 1,
+            ..State::default()
+        }));
+        let (tx, rx) = watch::channel(Command::Snapshot(PresenceSnapshot::from_sessions(
+            true,
+            &[],
+        )));
+        let worker =
+            tokio::spawn(PEER.scope(state.clone(), run::<Peer>("123456".into(), rx, timing())));
+        until(|| state.lock().unwrap().update_failures == 0).await;
+        tx.send_replace(Command::Snapshot(PresenceSnapshot::from_sessions(
+            false,
+            &[],
+        )));
+        tx.send_replace(Command::Shutdown);
+        worker.await.unwrap();
+        assert_eq!(state.lock().unwrap().attempts, 1);
+        assert!(state.lock().unwrap().activities.is_empty());
     }
 }

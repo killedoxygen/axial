@@ -3,27 +3,25 @@ name = "axial-desktop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-authors.workspace = true
-
-[build-dependencies]
-tauri-build.workspace = true
-serde_json.workspace = true
 
 [dependencies]
-tauri.workspace = true
-tauri-plugin-dialog.workspace = true
-tauri-plugin-opener.workspace = true
+axial-api = { path = "../api", default-features = false }
+axial-app.workspace = true
+axial-fs.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-serde_json.workspace = true
-uuid.workspace = true
-axial-api = { path = "../api", default-features = false }
-axial-config = { path = "../../core/config" }
-axial-fs = { path = "../../core/fs" }
-axial-performance = { path = "../../core/performance" }
-axial-resource.workspace = true
+tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+tauri-plugin-opener.workspace = true
+tauri-plugin-updater.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
 
 [dev-dependencies]
+tauri = { workspace = true, features = ["test"] }
+tempfile.workspace = true
 png.workspace = true

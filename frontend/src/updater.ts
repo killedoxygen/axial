@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { local, saveLocalState } from './state';
+import { local, saveLocalState, canEditPreferences } from './state';
 import { api } from './api';
 import { toast } from './toast';
 import { hasNativeDesktopRuntime, openExternalURL, requestNativeAppRestart } from './native';
@@ -36,6 +36,7 @@ function updaterSurfaceAvailable(): boolean {
 }
 
 function stampUpdateCheck(): void {
+  if (!canEditPreferences()) return;
   local.lastUpdateCheckAt = new Date().toISOString();
   saveLocalState();
 }
@@ -65,6 +66,7 @@ export function canInstallUpdateInApp(): boolean {
 }
 
 export function dismissAvailableUpdate(): void {
+  if (!canEditPreferences()) return;
   const info = updateInfo.value;
   if (!info?.available) return;
   local.dismissedUpdateVersion = info.latest_version;
@@ -222,6 +224,7 @@ async function pollUpdateFlow(): Promise<void> {
   try {
     const res = await api('GET', '/update/flow');
     setUpdateFlow(updateFlowFromResponse(res));
+    await restartInstalledUpdate();
   } catch {}
   if (updateFlowPollActive(updateFlow.value.phase)) scheduleUpdateFlowPoll();
 }
@@ -272,6 +275,15 @@ export async function applyUpdateAndRestart(): Promise<void> {
     void pollUpdateFlow();
     return;
   }
+  if (updateFlowPollActive(updateFlow.value.phase)) {
+    scheduleUpdateFlowPoll();
+    return;
+  }
+  await restartInstalledUpdate();
+}
+
+async function restartInstalledUpdate(): Promise<void> {
+  if (updateFlow.value.phase !== 'restart-pending' || updateRestartRequested.value) return;
   if (!hasNativeDesktopRuntime()) {
     toast('Update applied. Restart Axial to finish.');
     return;
@@ -292,7 +304,7 @@ export async function checkForUpdates(options: { force?: boolean; silent?: boole
       const res = updateInfoResponse(await api('GET', force ? '/update?force=1' : '/update'));
       if (checkSeq === pendingCheckSeq) {
         updateInfo.value = res;
-        if (res.available && local.dismissedUpdateVersion && local.dismissedUpdateVersion !== res.latest_version) {
+        if (canEditPreferences() && res.available && local.dismissedUpdateVersion && local.dismissedUpdateVersion !== res.latest_version) {
           local.dismissedUpdateVersion = '';
         }
         updateCheckState.value = 'ready';

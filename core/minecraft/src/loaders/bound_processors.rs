@@ -1,6 +1,7 @@
 use super::forge_installer::{
     BoundForgeInstallExecution, BoundForgeInstallerContinuation, BoundForgeProcessorExecution,
-    BoundProcessorArgument, BoundProcessorArgumentPart, BoundProcessorArtifact, BoundProcessorData,
+    BoundProcessorAction, BoundProcessorArgument, BoundProcessorArgumentPart,
+    BoundProcessorArtifact, BoundProcessorData, BoundProcessorOutputExpectation,
     BoundProcessorOutputRole, BoundProcessorPlan, BoundProcessorStep, ProcessorBuiltinToken,
 };
 use super::workspace::cleanup::{ProcessorWorkspace, ProcessorWorkspaceOwner};
@@ -31,6 +32,8 @@ use zip::ZipArchive;
 
 const MAX_MANIFEST_BYTES: u64 = 64 << 10;
 const MAX_PROCESSOR_JAR_ENTRIES: usize = 4096;
+const MAX_MCP_CONFIG_BYTES: u64 = 1 << 20;
+const MAX_MAPPING_BYTES: u64 = 64 << 20;
 const MAX_MAIN_CLASS_BYTES: usize = 256;
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1 << 20;
 const MAX_PROCESS_OUTPUT_TOTAL_BYTES: usize = 2 << 20;
@@ -540,6 +543,7 @@ pub(crate) struct VerifiedProcessorOutput {
     bytes: Vec<u8>,
     size: u64,
     sha1: [u8; 20],
+    expectation: BoundProcessorOutputExpectation,
 }
 
 struct VerifiedStepOutput {
@@ -547,6 +551,7 @@ struct VerifiedStepOutput {
     size: u64,
     sha1: [u8; 20],
     terminal: bool,
+    expectation: BoundProcessorOutputExpectation,
 }
 
 pub(crate) struct BoundProcessorExecutionResult {
@@ -561,6 +566,8 @@ pub(crate) struct AuthenticatedProcessorSources {
     base_version: VersionJson,
     client: ProcessorClientSource,
     runtime_source: Option<RuntimeSourceReceipt>,
+    #[cfg(test)]
+    mappings_transport: Option<crate::download::TestProcessorMappingsTransport>,
 }
 
 enum ProcessorClientSource {
@@ -579,6 +586,8 @@ impl AuthenticatedProcessorSources {
             base_version,
             client: ProcessorClientSource::Installed(client_bytes),
             runtime_source: Some(runtime_source),
+            #[cfg(test)]
+            mappings_transport: None,
         })
     }
 
@@ -601,7 +610,18 @@ impl AuthenticatedProcessorSources {
             base_version,
             client: ProcessorClientSource::Reconstructed(client_source),
             runtime_source: Some(runtime_source),
+            #[cfg(test)]
+            mappings_transport: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_mappings_transport(
+        mut self,
+        transport: Option<crate::download::TestProcessorMappingsTransport>,
+    ) -> Self {
+        self.mappings_transport = transport;
+        self
     }
 
     fn client_bytes(&self) -> &[u8] {
@@ -718,7 +738,10 @@ pub(crate) fn spawn_bound_processor_execution(
             &target_version_id,
             &minecraft_version,
         )
-        .map_err(|_| BoundProcessorError::Stage)?;
+        .map_err(|_| BoundProcessorError::Stage)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "workspace_prepare", %error, "Forge processor execution failed");
+        })?;
         run_owned_execution(
             continuation,
             plan,
@@ -751,7 +774,10 @@ pub(crate) fn spawn_reconstruction_processor_execution(
             &target_version_id,
             &minecraft_version,
         )
-        .map_err(|_| BoundProcessorError::Stage)?;
+        .map_err(|_| BoundProcessorError::Stage)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "reconstruction_workspace_prepare", %error, "Forge processor execution failed");
+        })?;
         let execution = if let Err(error) = check_cancel(&mut cancel_rx) {
             Err(error)
         } else {
@@ -775,12 +801,19 @@ pub(crate) fn spawn_reconstruction_processor_execution(
                 return match workspace.cleanup() {
                     Ok(()) => Err(BoundProcessorError::Authority),
                     Err(_) => Err(BoundProcessorError::Cleanup),
-                };
+                }
+                .inspect_err(|error| {
+                    tracing::warn!(stage = "reconstruction_execution_admission", %error, "Forge processor execution failed");
+                });
             }
             Err(error) => {
+                tracing::warn!(stage = "reconstruction_sources", %error, "Forge processor execution failed");
                 return match workspace.cleanup() {
                     Ok(()) => Err(error),
-                    Err(_) => Err(BoundProcessorError::Cleanup),
+                    Err(_) => {
+                        tracing::warn!(stage = "reconstruction_source_settlement", error = %BoundProcessorError::Cleanup, "Forge processor execution failed");
+                        Err(BoundProcessorError::Cleanup)
+                    }
                 };
             }
         };
@@ -819,7 +852,10 @@ async fn run_owned_execution(
         return match workspace_owner.cleanup() {
             Ok(()) => Err(BoundProcessorError::Authority),
             Err(_) => Err(BoundProcessorError::Cleanup),
-        };
+        }
+        .inspect_err(|error| {
+            tracing::warn!(stage = "execution_identity", %error, "Forge processor execution failed");
+        });
     }
     let execution = execute_in_workspace(
         &continuation,
@@ -830,7 +866,10 @@ async fn run_owned_execution(
         &mut cancel,
         &progress,
     )
-    .await;
+    .await
+    .inspect_err(|error| {
+        tracing::warn!(stage = "workspace_execution", %error, "Forge processor execution failed");
+    });
     if matches!(execution, Err(BoundProcessorError::Unreaped)) {
         workspace_owner.quarantine();
         return execution.map(|outputs| BoundProcessorExecutionResult {
@@ -842,7 +881,10 @@ async fn run_owned_execution(
     }
     workspace_owner
         .cleanup()
-        .map_err(|_| BoundProcessorError::Cleanup)?;
+        .map_err(|_| BoundProcessorError::Cleanup)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "workspace_cleanup", %error, "Forge processor execution failed");
+        })?;
     execution.map(|outputs| BoundProcessorExecutionResult {
         sources,
         continuation,
@@ -861,7 +903,11 @@ async fn execute_in_workspace(
     progress: &mpsc::UnboundedSender<BoundProcessorProgress>,
 ) -> Result<VerifiedProcessorOutputs, BoundProcessorError> {
     check_cancel(cancel)?;
-    let mut authority = stage_inputs(continuation, plan, workspace, sources, cancel).await?;
+    let mut authority = stage_inputs(continuation, plan, workspace, sources, cancel)
+        .await
+        .inspect_err(|error| {
+            tracing::warn!(stage = "stage_inputs", %error, "Forge processor execution failed");
+        })?;
     workspace
         .clear_scratch()
         .map_err(|_| BoundProcessorError::Stage)?;
@@ -895,11 +941,16 @@ async fn execute_in_workspace(
             plan,
             workspace,
             &runtime,
-            &sources.base_version.id,
+            &sources.base_version,
+            #[cfg(test)]
+            sources.mappings_transport.as_ref(),
             &mut authority,
             cancel,
         )
-        .await?;
+        .await
+        .inspect_err(|error| {
+            tracing::warn!(stage = "processor_step", step = index + 1, %error, "Forge processor execution failed");
+        })?;
         for (path, output) in outputs {
             authority.libraries.insert(
                 path.clone(),
@@ -916,6 +967,7 @@ async fn execute_in_workspace(
                         bytes,
                         size: output.size,
                         sha1: output.sha1,
+                        expectation: output.expectation,
                     },
                 );
             }
@@ -927,7 +979,10 @@ async fn execute_in_workspace(
         &sources.base_version.id,
         &authority,
         &initial_stage,
-    )?;
+    )
+    .inspect_err(|error| {
+        tracing::warn!(stage = "final_rescan", %error, "Forge processor execution failed");
+    })?;
     sources.runtime_source = Some(runtime.into_source_receipt());
     Ok(VerifiedProcessorOutputs { entries: verified })
 }
@@ -952,13 +1007,16 @@ async fn stage_inputs(
     cancel: &mut oneshot::Receiver<()>,
 ) -> Result<StagedAuthority, BoundProcessorError> {
     let mut libraries = BTreeMap::new();
-    for (path, contract) in &plan.input_artifacts {
+    for (index, (path, contract)) in plan.input_artifacts.iter().enumerate() {
         check_cancel(cancel)?;
         let authenticated = match contract.source {
             super::forge_installer::BoundProcessorInputSource::Download => {
                 match continuation
                     .network_input_source(path)
-                    .map_err(|_| BoundProcessorError::Authority)?
+                    .map_err(|_| BoundProcessorError::Authority)
+                    .inspect_err(|error| {
+                        tracing::warn!(stage = "input_source_admission", input = index + 1, %error, "Forge processor execution failed");
+                    })?
                 {
                     super::forge_installer::BoundProcessorNetworkInput::Retained(source) => {
                         let (reader, size, sha1) = source.into_parts();
@@ -970,13 +1028,19 @@ async fn stage_inputs(
                         workspace
                             .import_library_authenticated(path, reader, size, sha1)
                             .await
-                            .map_err(|_| BoundProcessorError::Stage)?;
+                            .map_err(|_| BoundProcessorError::Stage)
+                            .inspect_err(|error| {
+                                tracing::warn!(stage = "input_library_import", input = index + 1, %error, "Forge processor execution failed");
+                            })?;
                         AuthenticatedBytes { size, sha1 }
                     }
                     super::forge_installer::BoundProcessorNetworkInput::ReconstructionWorkspace => {
                         let bytes = workspace
                             .read_library_authenticated(path, contract.size, &contract.sha1)
-                            .map_err(|_| BoundProcessorError::Authority)?;
+                            .map_err(|_| BoundProcessorError::Authority)
+                            .inspect_err(|error| {
+                                tracing::warn!(stage = "input_library_reconstruction", input = index + 1, %error, "Forge processor execution failed");
+                            })?;
                         AuthenticatedBytes {
                             size: bytes.len() as u64,
                             sha1: contract.sha1,
@@ -992,7 +1056,10 @@ async fn stage_inputs(
                 workspace
                     .write_library_exact(path, &bytes)
                     .await
-                    .map_err(|_| BoundProcessorError::Stage)?;
+                    .map_err(|_| BoundProcessorError::Stage)
+                    .inspect_err(|error| {
+                        tracing::warn!(stage = "input_embedded_stage", input = index + 1, %error, "Forge processor execution failed");
+                    })?;
                 AuthenticatedBytes {
                     size: bytes.len() as u64,
                     sha1: contract.sha1,
@@ -1084,35 +1151,275 @@ async fn run_step(
     plan: &BoundProcessorPlan,
     workspace: &ProcessorWorkspace,
     runtime: &ProcessorRuntime,
-    minecraft_version: &str,
+    base_version: &VersionJson,
+    #[cfg(test)] mappings_transport: Option<&crate::download::TestProcessorMappingsTransport>,
     authority: &mut StagedAuthority,
     cancel: &mut oneshot::Receiver<()>,
 ) -> Result<BTreeMap<PortableRelativePath, VerifiedStepOutput>, BoundProcessorError> {
     check_cancel(cancel)?;
     workspace
         .clear_scratch()
-        .map_err(|_| BoundProcessorError::Stage)?;
+        .map_err(|_| BoundProcessorError::Stage)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "step_scratch_prepare", %error, "Forge processor execution failed");
+        })?;
     for output in &step.outputs {
         workspace
             .ensure_library_parent(&output.artifact.relative_path)
-            .map_err(|_| BoundProcessorError::Stage)?;
+            .map_err(|_| BoundProcessorError::Stage)
+            .inspect_err(|error| {
+                tracing::warn!(stage = "step_output_parent", %error, "Forge processor execution failed");
+            })?;
     }
     let before_root = workspace
         .snapshot_root()
-        .map_err(|_| BoundProcessorError::Stage)?;
+        .map_err(|_| BoundProcessorError::Stage)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "step_root_before", %error, "Forge processor execution failed");
+        })?;
     let before_stage = workspace
         .snapshot_stage()
+        .map_err(|_| BoundProcessorError::Stage)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "step_stage_before", %error, "Forge processor execution failed");
+        })?;
+    if !matches!(
+        &step.action,
+        BoundProcessorAction::Java | BoundProcessorAction::SplitJar
+    ) {
+        reauthenticate_step_dependencies(step, plan, workspace, authority, &base_version.id)?;
+    }
+    match &step.action {
+        BoundProcessorAction::Java | BoundProcessorAction::SplitJar => {
+            if matches!(&step.action, BoundProcessorAction::SplitJar) {
+                for output in &step.outputs {
+                    workspace
+                        .ensure_temp_parent(&output.artifact.relative_path)
+                        .map_err(|_| BoundProcessorError::Stage)?;
+                }
+            }
+            run_java_step(
+                step,
+                plan,
+                workspace,
+                runtime,
+                &base_version.id,
+                authority,
+                cancel,
+            )
+            .await?;
+            if matches!(&step.action, BoundProcessorAction::SplitJar) {
+                promote_split_outputs(step, workspace, cancel).await?;
+            }
+        }
+        BoundProcessorAction::ExtractMcpMappings { input } => {
+            let archive = staged_artifact_bytes(workspace, input, &authority.libraries)?;
+            let bytes = extract_mcp_mappings(&archive, &base_version.id)?;
+            write_native_output(step, workspace, &bytes, cancel).await?;
+        }
+        BoundProcessorAction::DownloadMojmaps => {
+            let acquire = async {
+                #[cfg(test)]
+                if let Some(transport) = mappings_transport {
+                    return crate::download::acquire_test_processor_mappings(
+                        base_version,
+                        transport,
+                    )
+                    .await;
+                }
+                crate::download::acquire_processor_mappings(base_version).await
+            };
+            let source = tokio::select! {
+                result = acquire => {
+                    result.map_err(|_| BoundProcessorError::Source)?
+                }
+                _ = &mut *cancel => return Err(BoundProcessorError::Cancelled),
+            };
+            validate_mapping_source(base_version, &source)?;
+            write_native_output(step, workspace, source.bytes(), cancel).await?;
+        }
+    }
+    check_cancel(cancel)?;
+    settle_step_outputs(step, workspace, &before_root, &before_stage)
+}
+
+fn settle_step_outputs(
+    step: &BoundProcessorStep,
+    workspace: &ProcessorWorkspace,
+    before_root: &ManagedTreeSnapshot,
+    before_stage: &ManagedTreeSnapshot,
+) -> Result<BTreeMap<PortableRelativePath, VerifiedStepOutput>, BoundProcessorError> {
+    workspace
+        .revalidate()
+        .map_err(|_| BoundProcessorError::Stage)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "step_settle_revalidate", %error, "Forge processor execution failed");
+        })?;
+    let after_stage = workspace
+        .snapshot_stage()
+        .map_err(|_| BoundProcessorError::Stage)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "step_stage_after", %error, "Forge processor execution failed");
+        })?;
+    let after_root = workspace
+        .snapshot_root()
+        .map_err(|_| BoundProcessorError::Stage)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "step_root_after", %error, "Forge processor execution failed");
+        })?;
+    verify_step_diff(step, before_root, &after_root, before_stage, &after_stage)?;
+
+    let mut outputs = BTreeMap::new();
+    for output in &step.outputs {
+        let fact = after_root
+            .files()
+            .get(&library_root_path(&output.artifact.relative_path)?)
+            .ok_or(BoundProcessorError::Stage)?;
+        if fact.size() == 0
+            || matches!(&output.expectation, BoundProcessorOutputExpectation::ProviderSha1(sha1) if fact.sha1() != sha1)
+        {
+            return Err(BoundProcessorError::Authority);
+        }
+        let bytes = workspace
+            .read_library_authenticated(
+                &output.artifact.relative_path,
+                Some(fact.size()),
+                fact.sha1(),
+            )
+            .map_err(|_| BoundProcessorError::Authority)?;
+        if matches!(
+            &output.expectation,
+            BoundProcessorOutputExpectation::Derived(_)
+        ) && output.artifact.relative_path.as_str().ends_with(".txt")
+        {
+            validate_mapping_text(&bytes)?;
+        }
+        let expected_size = match output.role {
+            BoundProcessorOutputRole::Intermediate => None,
+            BoundProcessorOutputRole::Terminal { expected_size } => expected_size,
+        };
+        if expected_size.is_some_and(|size| size != fact.size()) {
+            return Err(BoundProcessorError::Authority);
+        }
+        let terminal = matches!(output.role, BoundProcessorOutputRole::Terminal { .. });
+        outputs.insert(
+            output.artifact.relative_path.clone(),
+            VerifiedStepOutput {
+                size: fact.size(),
+                sha1: *fact.sha1(),
+                bytes: terminal.then_some(bytes),
+                terminal,
+                expectation: output.expectation.clone(),
+            },
+        );
+    }
+    workspace
+        .clear_scratch()
+        .map_err(|_| BoundProcessorError::Stage)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "step_scratch_cleanup", %error, "Forge processor execution failed");
+        })?;
+    let settled = workspace
+        .snapshot_stage()
+        .map_err(|_| BoundProcessorError::Stage)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "step_stage_settled", %error, "Forge processor execution failed");
+        })?;
+    verify_clean_stage_diff(step, before_stage, &settled)?;
+    Ok(outputs)
+}
+
+async fn promote_split_outputs(
+    step: &BoundProcessorStep,
+    workspace: &ProcessorWorkspace,
+    cancel: &mut oneshot::Receiver<()>,
+) -> Result<(), BoundProcessorError> {
+    workspace
+        .validate_live_bounds()
         .map_err(|_| BoundProcessorError::Stage)?;
+    let before = workspace
+        .snapshot_root()
+        .map_err(|_| BoundProcessorError::Stage)?;
+    let settled = workspace
+        .snapshot_stage()
+        .map_err(|_| BoundProcessorError::Stage)?;
+    let mut verified = Vec::with_capacity(step.outputs.len());
+    for output in &step.outputs {
+        check_cancel(cancel)?;
+        validate_fresh_output_target(step, &output.artifact, &before)?;
+        let temporary_path = PortableRelativePath::new_exact(&format!(
+            "tmp/{}",
+            output.artifact.relative_path.as_str()
+        ))
+        .map_err(|_| BoundProcessorError::Authority)?;
+        let fact = settled
+            .files()
+            .get(&temporary_path)
+            .ok_or(BoundProcessorError::Authority)?;
+        let expected_size = match output.role {
+            BoundProcessorOutputRole::Intermediate => None,
+            BoundProcessorOutputRole::Terminal { expected_size } => expected_size,
+        };
+        if fact.size() == 0
+            || expected_size.is_some_and(|size| size != fact.size())
+            || matches!(&output.expectation, BoundProcessorOutputExpectation::ProviderSha1(sha1) if fact.sha1() != sha1)
+        {
+            return Err(BoundProcessorError::Authority);
+        }
+        // Observed hashes bind the scratch reread, not a provider expectation.
+        let bytes = workspace
+            .read_temp_authenticated(
+                &output.artifact.relative_path,
+                Some(fact.size()),
+                fact.sha1(),
+            )
+            .map_err(|_| BoundProcessorError::Authority)?;
+        verified.push((&output.artifact.relative_path, bytes));
+    }
+    check_cancel(cancel)?;
+    workspace
+        .clear_scratch()
+        .map_err(|_| BoundProcessorError::Stage)?;
+    for (path, bytes) in verified {
+        check_cancel(cancel)?;
+        workspace
+            .write_library_exact(path, &bytes)
+            .await
+            .map_err(|_| BoundProcessorError::Stage)?;
+    }
+    Ok(())
+}
+
+async fn run_java_step(
+    step: &BoundProcessorStep,
+    plan: &BoundProcessorPlan,
+    workspace: &ProcessorWorkspace,
+    runtime: &ProcessorRuntime,
+    minecraft_version: &str,
+    authority: &StagedAuthority,
+    cancel: &mut oneshot::Receiver<()>,
+) -> Result<(), BoundProcessorError> {
     let jar_bytes = staged_artifact_bytes(workspace, &step.jar, &authority.libraries)?;
     let main_class = processor_main_class(&jar_bytes)?;
     let classpath = render_classpath(step, workspace)?;
     let arguments = step
         .args
         .iter()
-        .map(|argument| render_argument(argument, plan, workspace, minecraft_version))
+        .map(|argument| {
+            render_argument(
+                argument,
+                plan,
+                workspace,
+                minecraft_version,
+                matches!(&step.action, BoundProcessorAction::SplitJar),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let bootstrap_environment = processor_bootstrap_environment()?;
-    reauthenticate_step_dependencies(step, plan, workspace, authority, minecraft_version)?;
+    reauthenticate_step_dependencies(step, plan, workspace, authority, minecraft_version)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "step_java_dependencies", %error, "Forge processor execution failed");
+        })?;
     let mut command = Command::new(runtime.cli_executable_path());
     command
         .env_clear()
@@ -1126,6 +1433,7 @@ async fn run_step(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     set_processor_environment(&mut command, workspace, &bootstrap_environment);
+    check_cancel(cancel)?;
     let mut child = spawn_contained_child(&mut command, Some(runtime)).await?;
     let stdout = match child.child.stdout.take() {
         Some(stdout) => stdout,
@@ -1162,59 +1470,186 @@ async fn run_step(
     runtime
         .validate_program(runtime.cli_executable_path())
         .map_err(|_| BoundProcessorError::Runtime)?;
-    workspace
-        .revalidate()
-        .map_err(|_| BoundProcessorError::Stage)?;
-    let after_stage = workspace
-        .snapshot_stage()
-        .map_err(|_| BoundProcessorError::Stage)?;
-    let after_root = workspace
-        .snapshot_root()
-        .map_err(|_| BoundProcessorError::Stage)?;
-    verify_step_diff(step, &before_root, &after_root, &before_stage, &after_stage)?;
+    Ok(())
+}
 
-    let mut outputs = BTreeMap::new();
-    for output in &step.outputs {
-        let fact = after_root
-            .files()
-            .get(&library_root_path(&output.artifact.relative_path)?)
-            .ok_or(BoundProcessorError::Stage)?;
-        if fact.sha1() != &output.sha1 {
-            return Err(BoundProcessorError::Authority);
-        }
-        let bytes = workspace
-            .read_library_authenticated(
-                &output.artifact.relative_path,
-                Some(fact.size()),
-                &output.sha1,
-            )
-            .map_err(|_| BoundProcessorError::Authority)?;
-        let expected_size = match output.role {
-            BoundProcessorOutputRole::Intermediate => None,
-            BoundProcessorOutputRole::Terminal { expected_size } => expected_size,
-        };
-        if expected_size.is_some_and(|size| size != fact.size()) {
-            return Err(BoundProcessorError::Authority);
-        }
-        let terminal = matches!(output.role, BoundProcessorOutputRole::Terminal { .. });
-        outputs.insert(
-            output.artifact.relative_path.clone(),
-            VerifiedStepOutput {
-                size: fact.size(),
-                sha1: output.sha1,
-                bytes: terminal.then_some(bytes),
-                terminal,
-            },
-        );
-    }
+async fn write_native_output(
+    step: &BoundProcessorStep,
+    workspace: &ProcessorWorkspace,
+    bytes: &[u8],
+    cancel: &mut oneshot::Receiver<()>,
+) -> Result<(), BoundProcessorError> {
+    check_cancel(cancel)?;
+    let [output] = step.outputs.as_slice() else {
+        return Err(BoundProcessorError::Authority);
+    };
+    validate_mapping_text(bytes)?;
+    validate_fresh_output_target(
+        step,
+        &output.artifact,
+        &workspace
+            .snapshot_root()
+            .map_err(|_| BoundProcessorError::Stage)?,
+    )?;
     workspace
-        .clear_scratch()
+        .write_library_exact(&output.artifact.relative_path, bytes)
+        .await
         .map_err(|_| BoundProcessorError::Stage)?;
-    let settled = workspace
-        .snapshot_stage()
-        .map_err(|_| BoundProcessorError::Stage)?;
-    verify_clean_stage_diff(step, &before_stage, &settled)?;
-    Ok(outputs)
+    check_cancel(cancel)
+}
+
+fn validate_mapping_source(
+    base_version: &VersionJson,
+    source: &AuthenticatedSelectedArtifactSource,
+) -> Result<(), BoundProcessorError> {
+    let mappings = base_version
+        .downloads
+        .client_mappings
+        .as_ref()
+        .ok_or(BoundProcessorError::Authority)?;
+    let expected = ExpectedIntegrity::from_mojang(mappings.size, &mappings.sha1);
+    if source.kind() != crate::download::SelectedDownloadArtifactKind::ClientMappings
+        || source.logical_identity() != base_version.id
+        || source.provider_url() != mappings.url
+        || source.expected() != &expected
+    {
+        return Err(BoundProcessorError::Authority);
+    }
+    validate_mapping_bytes(base_version, source.bytes())
+}
+
+fn validate_mapping_bytes(
+    base_version: &VersionJson,
+    bytes: &[u8],
+) -> Result<(), BoundProcessorError> {
+    let mappings = base_version
+        .downloads
+        .client_mappings
+        .as_ref()
+        .ok_or(BoundProcessorError::Authority)?;
+    if u64::try_from(mappings.size).ok() != Some(bytes.len() as u64)
+        || !mappings
+            .sha1
+            .eq_ignore_ascii_case(&format!("{:x}", Sha1::digest(bytes)))
+    {
+        return Err(BoundProcessorError::Authority);
+    }
+    validate_mapping_text(bytes)
+}
+
+fn validate_mapping_text(bytes: &[u8]) -> Result<(), BoundProcessorError> {
+    if bytes.is_empty()
+        || bytes.len() as u64 > MAX_MAPPING_BYTES
+        || bytes.contains(&0)
+        || std::str::from_utf8(bytes).is_err()
+    {
+        return Err(BoundProcessorError::Authority);
+    }
+    Ok(())
+}
+
+fn extract_mcp_mappings(
+    bytes: &[u8],
+    minecraft_version: &str,
+) -> Result<Vec<u8>, BoundProcessorError> {
+    #[derive(serde::Deserialize)]
+    struct McpConfig {
+        spec: u32,
+        version: String,
+        data: McpData,
+    }
+    #[derive(serde::Deserialize)]
+    struct McpData {
+        mappings: String,
+    }
+    let mut archive =
+        ZipArchive::new(Cursor::new(bytes)).map_err(|_| BoundProcessorError::Authority)?;
+    if archive.len() > MAX_PROCESSOR_JAR_ENTRIES {
+        return Err(BoundProcessorError::Authority);
+    }
+    let mut files = BTreeMap::new();
+    let mut spellings = BTreeMap::new();
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|_| BoundProcessorError::Authority)?;
+        let name = entry.name().strip_suffix('/').unwrap_or(entry.name());
+        let path =
+            PortableRelativePath::new_exact(name).map_err(|_| BoundProcessorError::Authority)?;
+        let kind = entry.unix_mode().unwrap_or_default() & 0o170000;
+        if (entry.is_dir() && !matches!(kind, 0 | 0o040000))
+            || (!entry.is_dir() && !matches!(kind, 0 | 0o100000))
+        {
+            return Err(BoundProcessorError::Authority);
+        }
+        let mut prefix = String::new();
+        for component in path.as_str().split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            let ancestor = PortableRelativePath::new_exact(&prefix)
+                .map_err(|_| BoundProcessorError::Authority)?;
+            if spellings
+                .insert(ancestor.key(), ancestor.clone())
+                .is_some_and(|prior| prior != ancestor)
+            {
+                return Err(BoundProcessorError::Authority);
+            }
+        }
+        if files.insert(path, (index, entry.is_dir())).is_some() {
+            return Err(BoundProcessorError::Authority);
+        }
+    }
+    for path in files.keys() {
+        let mut parent = path.as_str();
+        while let Some((prefix, _)) = parent.rsplit_once('/') {
+            let prefix_path = PortableRelativePath::new_exact(prefix)
+                .map_err(|_| BoundProcessorError::Authority)?;
+            if matches!(files.get(&prefix_path), Some((_, false))) {
+                return Err(BoundProcessorError::Authority);
+            }
+            parent = prefix;
+        }
+    }
+    let config_path = PortableRelativePath::new_exact("config.json")
+        .map_err(|_| BoundProcessorError::Authority)?;
+    let config_bytes = read_mcp_entry(&mut archive, &files, &config_path, MAX_MCP_CONFIG_BYTES)?;
+    let config: McpConfig =
+        serde_json::from_slice(&config_bytes).map_err(|_| BoundProcessorError::Authority)?;
+    if config.spec != 4 || config.version != minecraft_version {
+        return Err(BoundProcessorError::Authority);
+    }
+    let mappings_path = PortableRelativePath::new_exact(&config.data.mappings)
+        .map_err(|_| BoundProcessorError::Authority)?;
+    let mappings = read_mcp_entry(&mut archive, &files, &mappings_path, MAX_MAPPING_BYTES)?;
+    validate_mapping_text(&mappings)?;
+    Ok(mappings)
+}
+
+fn read_mcp_entry(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    files: &BTreeMap<PortableRelativePath, (usize, bool)>,
+    path: &PortableRelativePath,
+    limit: u64,
+) -> Result<Vec<u8>, BoundProcessorError> {
+    let &(index, directory) = files.get(path).ok_or(BoundProcessorError::Authority)?;
+    let mut entry = archive
+        .by_index(index)
+        .map_err(|_| BoundProcessorError::Authority)?;
+    if directory || entry.size() == 0 || entry.size() > limit {
+        return Err(BoundProcessorError::Authority);
+    }
+    let mut bytes = Vec::new();
+    entry
+        .by_ref()
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| BoundProcessorError::Authority)?;
+    if bytes.len() as u64 != entry.size() || bytes.len() as u64 > limit {
+        return Err(BoundProcessorError::Authority);
+    }
+    Ok(bytes)
 }
 
 fn staged_artifact_bytes(
@@ -1358,11 +1793,19 @@ fn render_argument(
     plan: &BoundProcessorPlan,
     workspace: &ProcessorWorkspace,
     minecraft_version: &str,
+    temporary_outputs: bool,
 ) -> Result<OsString, BoundProcessorError> {
+    let output_root = if temporary_outputs {
+        workspace.temp_path()
+    } else {
+        workspace.libraries_path()
+    };
     match argument {
-        BoundProcessorArgument::Artifact(artifact)
-        | BoundProcessorArgument::OutputArtifact(artifact) => Ok(workspace
+        BoundProcessorArgument::Artifact(artifact) => Ok(workspace
             .libraries_path()
+            .join(artifact.relative_path.as_str())
+            .into_os_string()),
+        BoundProcessorArgument::OutputArtifact(artifact) => Ok(output_root
             .join(artifact.relative_path.as_str())
             .into_os_string()),
         BoundProcessorArgument::Template(parts) => {
@@ -1370,9 +1813,15 @@ fn render_argument(
             for part in parts {
                 match part {
                     BoundProcessorArgumentPart::Literal(value) => rendered.push(value),
-                    BoundProcessorArgumentPart::DataToken(token)
-                    | BoundProcessorArgumentPart::OutputToken(token) => {
+                    BoundProcessorArgumentPart::DataToken(token) => {
                         push_data_value(&mut rendered, token, plan, workspace)?;
+                    }
+                    BoundProcessorArgumentPart::OutputToken(token) => {
+                        let Some(BoundProcessorData::Artifact(artifact)) = plan.data.get(token)
+                        else {
+                            return Err(BoundProcessorError::Authority);
+                        };
+                        rendered.push(output_root.join(artifact.relative_path.as_str()));
                     }
                     BoundProcessorArgumentPart::BuiltinToken(token) => {
                         push_builtin(&mut rendered, *token, workspace, minecraft_version)?;
@@ -1638,7 +2087,14 @@ async fn wait_for_contained_child(
                 .validate_live_bounds()
             {
                 Ok(()) => continue,
-                Err(_) => Err(BoundProcessorError::Stage),
+                Err(source) => {
+                    let io_kind = match source {
+                        super::types::LoaderError::Io(error) => Some(error.kind()),
+                        _ => None,
+                    };
+                    tracing::warn!(stage = "step_live_bounds", ?io_kind, error = %BoundProcessorError::Stage, "Forge processor execution failed");
+                    Err(BoundProcessorError::Stage)
+                },
             },
             status = child.child.wait() => match status {
                 Ok(status) if status.success() => Ok(()),
@@ -1739,7 +2195,12 @@ fn verify_step_diff(
         .map(|path| PortableRelativePath::new(&format!("root/{}", path.as_str())))
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(|_| BoundProcessorError::Stage)?;
-    exact_added_files(before_root, after_root, &expected_root)?;
+    exact_added_files(
+        before_root,
+        after_root,
+        &expected_root,
+        "step_output_root_diff",
+    )?;
     let diff = before_stage.diff(after_stage);
     let root_additions = diff
         .added_files()
@@ -1766,6 +2227,18 @@ fn verify_step_diff(
             .any(|path| !scratch_directory(path))
         || !diff.removed_directories().is_empty()
     {
+        tracing::warn!(
+            stage = "step_output_stage_diff",
+            expected_outputs = expected_stage.len(),
+            root_additions = root_additions.len(),
+            added_files = diff.added_files().len(),
+            modified_files = diff.modified_files().len(),
+            removed_files = diff.removed_files().len(),
+            added_directories = diff.added_directories().len(),
+            removed_directories = diff.removed_directories().len(),
+            error = %BoundProcessorError::Stage,
+            "Forge processor execution failed"
+        );
         return Err(BoundProcessorError::Stage);
     }
     Ok(())
@@ -1787,13 +2260,14 @@ fn verify_clean_stage_diff(
             .map_err(|_| BoundProcessorError::Authority)
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
-    exact_added_files(before, settled, &expected)
+    exact_added_files(before, settled, &expected, "step_clean_stage_diff")
 }
 
 fn exact_added_files(
     before: &ManagedTreeSnapshot,
     after: &ManagedTreeSnapshot,
     expected: &BTreeSet<PortableRelativePath>,
+    stage: &'static str,
 ) -> Result<(), BoundProcessorError> {
     let diff = before.diff(after);
     let added = diff.added_files().keys().cloned().collect::<BTreeSet<_>>();
@@ -1803,6 +2277,19 @@ fn exact_added_files(
         || !diff.added_directories().is_empty()
         || !diff.removed_directories().is_empty()
     {
+        tracing::warn!(
+            stage,
+            expected_files = expected.len(),
+            added_files = added.len(),
+            missing_expected = expected.difference(&added).count(),
+            unexpected_added = added.difference(expected).count(),
+            modified_files = diff.modified_files().len(),
+            removed_files = diff.removed_files().len(),
+            added_directories = diff.added_directories().len(),
+            removed_directories = diff.removed_directories().len(),
+            error = %BoundProcessorError::Stage,
+            "Forge processor execution failed"
+        );
         return Err(BoundProcessorError::Stage);
     }
     Ok(())
@@ -1910,13 +2397,41 @@ impl VerifiedProcessorOutputs {
 
     #[cfg(test)]
     pub(crate) fn from_test_terminal(entries: Vec<(PortableRelativePath, Vec<u8>)>) -> Self {
+        Self::from_test_terminal_with_expectations(
+            entries
+                .into_iter()
+                .map(|(path, bytes)| {
+                    let expectation =
+                        BoundProcessorOutputExpectation::ProviderSha1(Sha1::digest(&bytes).into());
+                    (path, bytes, expectation)
+                })
+                .collect(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_terminal_with_expectations(
+        entries: Vec<(
+            PortableRelativePath,
+            Vec<u8>,
+            BoundProcessorOutputExpectation,
+        )>,
+    ) -> Self {
         Self {
             entries: entries
                 .into_iter()
-                .map(|(path, bytes)| {
+                .map(|(path, bytes, expectation)| {
                     let size = bytes.len() as u64;
                     let sha1 = Sha1::digest(&bytes).into();
-                    (path, VerifiedProcessorOutput { bytes, size, sha1 })
+                    (
+                        path,
+                        VerifiedProcessorOutput {
+                            bytes,
+                            size,
+                            sha1,
+                            expectation,
+                        },
+                    )
                 })
                 .collect(),
         }
@@ -1924,8 +2439,16 @@ impl VerifiedProcessorOutputs {
 }
 
 impl VerifiedProcessorOutput {
-    pub(crate) fn into_parts(self) -> (Vec<u8>, u64, [u8; 20]) {
-        (self.bytes, self.size, self.sha1)
+    pub(crate) fn into_parts_for_expectation(
+        self,
+        expected: &BoundProcessorOutputExpectation,
+    ) -> Result<(Vec<u8>, u64, [u8; 20]), BoundProcessorError> {
+        if &self.expectation != expected
+            || matches!(expected, BoundProcessorOutputExpectation::ProviderSha1(sha1) if sha1 != &self.sha1)
+        {
+            return Err(BoundProcessorError::Authority);
+        }
+        Ok((self.bytes, self.size, self.sha1))
     }
 }
 
@@ -1938,9 +2461,10 @@ mod tests {
     };
     use super::{spawn_contained_child, wait_for_contained_child};
     use crate::loaders::forge_installer::{
-        BoundProcessorArgument, BoundProcessorArgumentPart, BoundProcessorArtifact,
-        BoundProcessorData, BoundProcessorOutput, BoundProcessorOutputRole, BoundProcessorPlan,
-        BoundProcessorStep, ProcessorBuiltinToken,
+        BoundProcessorAction, BoundProcessorArgument, BoundProcessorArgumentPart,
+        BoundProcessorArtifact, BoundProcessorData, BoundProcessorOutput,
+        BoundProcessorOutputExpectation, BoundProcessorOutputRole, BoundProcessorPlan,
+        BoundProcessorStep, ProcessorBuiltinToken, ProcessorDerivation,
     };
     use crate::loaders::workspace::cleanup::prepare_ephemeral_processor_workspace;
     use crate::portable_path::PortableRelativePath;
@@ -2015,6 +2539,575 @@ mod tests {
         assert!(processor_main_class(&jar).is_err());
     }
 
+    fn mcp_archive(config: &[u8], entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in std::iter::once(("config.json", config)).chain(entries.iter().copied())
+        {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .expect("entry");
+            writer.write_all(bytes).expect("entry bytes");
+        }
+        writer.finish().expect("archive").into_inner()
+    }
+
+    const MCP_CONFIG: &[u8] =
+        br#"{"spec":4,"version":"1.20.1","data":{"mappings":"config/joined.tsrg"}}"#;
+    const MCP_MAPPINGS: &[u8] = b"tsrg2 obf srg id\na example/Class 1\n";
+
+    #[test]
+    fn extracts_mcp_exact_configured_entry_with_matching_schema_and_version() {
+        let archive = mcp_archive(MCP_CONFIG, &[("config/joined.tsrg", MCP_MAPPINGS)]);
+        assert_eq!(
+            super::extract_mcp_mappings(&archive, "1.20.1").expect("mappings"),
+            MCP_MAPPINGS
+        );
+        assert!(super::extract_mcp_mappings(&archive, "1.20.2").is_err());
+        for config in [
+            br#"{"spec":3,"version":"1.20.1","data":{"mappings":"config/joined.tsrg"}}"#.as_slice(),
+            br#"{"spec":4,"version":"1.20.1","data":{"mappings":"../joined.tsrg"}}"#.as_slice(),
+            br#"{"spec":4,"version":"1.20.1","data":{"mappings":"CONFIG/joined.tsrg"}}"#.as_slice(),
+            br#"{"spec":4,"version":"1.20.1","data":{"mappings":"config/missing.tsrg"}}"#.as_slice(),
+            br#"{"spec":4,"version":"1.20.1","data":{"mappings":"config/joined.tsrg","mappings":"config/other.tsrg"}}"#.as_slice(),
+        ] {
+            let archive = mcp_archive(config, &[("config/joined.tsrg", MCP_MAPPINGS)]);
+            assert!(super::extract_mcp_mappings(&archive, "1.20.1").is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_mcp_unsafe_alias_empty_nontext_and_oversized_entries() {
+        for entries in [
+            vec![
+                ("config/joined.tsrg", MCP_MAPPINGS),
+                ("Config/unrelated", b"other".as_slice()),
+            ],
+            vec![
+                ("config/joined.tsrg", MCP_MAPPINGS),
+                ("CONFIG.JSON", b"{}".as_slice()),
+            ],
+            vec![
+                ("config/joined.tsrg", MCP_MAPPINGS),
+                ("config", b"not a directory".as_slice()),
+            ],
+            vec![("../config/joined.tsrg", MCP_MAPPINGS)],
+            vec![("config/joined.tsrg", b"".as_slice())],
+            vec![("config/joined.tsrg", b"\xff".as_slice())],
+            vec![("config/joined.tsrg", b"a\0b".as_slice())],
+        ] {
+            assert!(
+                super::extract_mcp_mappings(&mcp_archive(MCP_CONFIG, &entries), "1.20.1").is_err()
+            );
+        }
+        let oversized = vec![b' '; (super::MAX_MCP_CONFIG_BYTES + 1) as usize];
+        assert!(super::extract_mcp_mappings(&mcp_archive(&oversized, &[]), "1.20.1").is_err());
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("config.json", SimpleFileOptions::default())
+            .expect("config");
+        writer.write_all(MCP_CONFIG).expect("config bytes");
+        writer
+            .add_symlink(
+                "config/joined.tsrg",
+                "elsewhere",
+                SimpleFileOptions::default(),
+            )
+            .expect("symlink");
+        let archive = writer.finish().expect("archive").into_inner();
+        assert!(super::extract_mcp_mappings(&archive, "1.20.1").is_err());
+    }
+
+    #[test]
+    fn mapping_bytes_require_retained_base_size_hash_and_text() {
+        let mut base: crate::launch::VersionJson =
+            serde_json::from_value(serde_json::json!({"id": "1.20.1"})).expect("base version");
+        base.downloads.client_mappings = Some(crate::launch::DownloadEntry {
+            url: "https://piston-data.mojang.com/client.txt".to_string(),
+            sha1: format!("{:x}", Sha1::digest(MCP_MAPPINGS)),
+            size: MCP_MAPPINGS.len() as i64,
+            ..Default::default()
+        });
+        super::validate_mapping_bytes(&base, MCP_MAPPINGS).expect("authenticated mapping bytes");
+        assert!(super::validate_mapping_bytes(&base, b"changed").is_err());
+        base.downloads
+            .client_mappings
+            .as_mut()
+            .expect("mapping")
+            .size += 1;
+        assert!(super::validate_mapping_bytes(&base, MCP_MAPPINGS).is_err());
+        base.downloads
+            .client_mappings
+            .as_mut()
+            .expect("mapping")
+            .size -= 1;
+        base.downloads
+            .client_mappings
+            .as_mut()
+            .expect("mapping")
+            .sha1 = "0".repeat(40);
+        assert!(super::validate_mapping_bytes(&base, MCP_MAPPINGS).is_err());
+        base.downloads.client_mappings = None;
+        assert!(super::validate_mapping_bytes(&base, MCP_MAPPINGS).is_err());
+    }
+
+    fn native_mapping_step() -> BoundProcessorStep {
+        let artifact = |coordinate: &str, path: &str| BoundProcessorArtifact {
+            coordinate: coordinate.to_string(),
+            relative_path: PortableRelativePath::new_exact(path).expect("path"),
+        };
+        let input = artifact("de.oceanlabs.mcp:mcp_config:1@zip", "mcp/config.zip");
+        let output = artifact(
+            "de.oceanlabs.mcp:mcp_config:1:mappings@txt",
+            "mcp/mappings.txt",
+        );
+        BoundProcessorStep {
+            action: BoundProcessorAction::ExtractMcpMappings {
+                input: input.clone(),
+            },
+            jar: artifact(
+                "net.minecraftforge:installertools:1.4.1",
+                "forge/installertools.jar",
+            ),
+            classpath: Vec::new(),
+            args: vec![
+                BoundProcessorArgument::Artifact(input),
+                BoundProcessorArgument::OutputArtifact(output.clone()),
+            ],
+            outputs: vec![BoundProcessorOutput {
+                artifact: output,
+                expectation: BoundProcessorOutputExpectation::Derived(
+                    super::super::forge_installer::ProcessorDerivation::from_test(),
+                ),
+                role: BoundProcessorOutputRole::Intermediate,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn native_output_settlement_preserves_intermediate_provenance_and_exact_diff() {
+        let owner =
+            prepare_ephemeral_processor_workspace("forge-test", "1.20.1").expect("workspace");
+        let workspace = owner.workspace();
+        let step = native_mapping_step();
+        let path = &step.outputs[0].artifact.relative_path;
+        workspace
+            .ensure_library_parent(path)
+            .expect("output parent");
+        let before_root = workspace.snapshot_root().expect("root snapshot");
+        let before_stage = workspace.snapshot_stage().expect("stage snapshot");
+        let (_cancel_tx, mut cancel) = oneshot::channel();
+        super::write_native_output(&step, workspace, MCP_MAPPINGS, &mut cancel)
+            .await
+            .expect("write mappings");
+        let mut settled = super::settle_step_outputs(&step, workspace, &before_root, &before_stage)
+            .expect("settled mappings");
+        let output = settled.remove(path).expect("mapping output");
+        assert!(!output.terminal);
+        assert!(output.bytes.is_none());
+        assert_eq!(output.expectation, step.outputs[0].expectation);
+        assert_eq!(output.sha1, <[u8; 20]>::from(Sha1::digest(MCP_MAPPINGS)));
+        assert!(
+            super::write_native_output(&step, workspace, MCP_MAPPINGS, &mut cancel)
+                .await
+                .is_err()
+        );
+        fs::write(workspace.root_path().join("unexpected"), b"unexpected")
+            .expect("unexpected file");
+        assert!(super::settle_step_outputs(&step, workspace, &before_root, &before_stage).is_err());
+        owner.cleanup().expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn native_output_cancellation_and_wrong_provider_hash_fail_closed() {
+        let owner =
+            prepare_ephemeral_processor_workspace("forge-test", "1.20.1").expect("workspace");
+        let workspace = owner.workspace();
+        let mut step = native_mapping_step();
+        workspace
+            .ensure_library_parent(&step.outputs[0].artifact.relative_path)
+            .expect("output parent");
+        let before_root = workspace.snapshot_root().expect("root snapshot");
+        let before_stage = workspace.snapshot_stage().expect("stage snapshot");
+        let (cancel_tx, mut cancel) = oneshot::channel();
+        cancel_tx.send(()).expect("cancel");
+        assert!(matches!(
+            super::write_native_output(&step, workspace, MCP_MAPPINGS, &mut cancel).await,
+            Err(BoundProcessorError::Cancelled)
+        ));
+        assert_eq!(
+            workspace.snapshot_root().expect("root snapshot"),
+            before_root
+        );
+        let (_cancel_tx, mut cancel) = oneshot::channel();
+        super::write_native_output(&step, workspace, MCP_MAPPINGS, &mut cancel)
+            .await
+            .expect("write mappings");
+        step.outputs[0].expectation = BoundProcessorOutputExpectation::ProviderSha1([0; 20]);
+        assert!(matches!(
+            super::settle_step_outputs(&step, workspace, &before_root, &before_stage),
+            Err(BoundProcessorError::Authority)
+        ));
+        owner.cleanup().expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn final_rescan_reauthenticates_derived_outputs_and_original_inputs() {
+        let owner =
+            prepare_ephemeral_processor_workspace("forge-test", "1.20.1").expect("workspace");
+        let workspace = owner.workspace();
+        let version_path = PortableRelativePath::new_exact("1.20.1.jar").expect("version path");
+        workspace
+            .write_version_exact(&version_path, b"client")
+            .await
+            .expect("client");
+        let initial = workspace.snapshot_stage().expect("initial snapshot");
+        let step = native_mapping_step();
+        let path = step.outputs[0].artifact.relative_path.clone();
+        workspace
+            .ensure_library_parent(&path)
+            .expect("output parent");
+        let (_cancel_tx, mut cancel) = oneshot::channel();
+        super::write_native_output(&step, workspace, MCP_MAPPINGS, &mut cancel)
+            .await
+            .expect("output");
+        let facts = |bytes: &[u8]| AuthenticatedBytes {
+            size: bytes.len() as u64,
+            sha1: Sha1::digest(bytes).into(),
+        };
+        let authority = StagedAuthority {
+            libraries: BTreeMap::from([(path.clone(), facts(MCP_MAPPINGS))]),
+            version: facts(b"client"),
+            processor_data: BTreeMap::new(),
+            installer: None,
+        };
+        let plan = BoundProcessorPlan {
+            steps: vec![step],
+            data: BTreeMap::new(),
+            installer_data: BTreeMap::new(),
+            input_artifacts: BTreeMap::new(),
+        };
+        super::final_rescan(workspace, &plan, "1.20.1", &authority, &initial)
+            .expect("settled tree");
+        fs::write(workspace.libraries_path().join(path.as_str()), b"replaced")
+            .expect("replace output");
+        assert!(super::final_rescan(workspace, &plan, "1.20.1", &authority, &initial).is_err());
+        workspace
+            .write_library_exact(&path, MCP_MAPPINGS)
+            .await
+            .expect("restore output");
+        fs::write(
+            workspace.version_path().join(version_path.as_str()),
+            b"changed",
+        )
+        .expect("replace client");
+        assert!(super::final_rescan(workspace, &plan, "1.20.1", &authority, &initial).is_err());
+        owner.cleanup().expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    async fn split_test_runtime(
+        owner: &super::ProcessorWorkspaceOwner,
+        base: &crate::launch::VersionJson,
+    ) -> super::ProcessorRuntime {
+        let program = br#"#!/bin/sh
+case "$*" in
+  *-version*) printf '%s\n' 'openjdk version "17.0.1"' >&2; exit 0 ;;
+esac
+/bin/cp "$5" "$6"
+if [ "$4" != derived-missing ]; then
+  /bin/cp "$5" "$7"
+fi
+if [ "$4" != generic ]; then
+  printf 'cache' > "$6.cache"
+  printf 'cache' > "$7.cache"
+fi
+case "$4" in
+  wrong) printf 'invalid' > "$7" ;;
+  derived-empty) : > "$7" ;;
+  unexpected|derived-unexpected) printf 'unexpected' > unexpected ;;
+esac
+"#
+        .to_vec();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let url = format!(
+            "http://{}/java",
+            listener.local_addr().expect("fixture address")
+        );
+        let manifest = serde_json::from_value(serde_json::json!({
+            "files": {
+                "bin": {"type": "directory"},
+                (crate::runtime::runtime_java_relative_path()): {
+                    "type": "file", "executable": true,
+                    "downloads": {"raw": {
+                        "url": url,
+                        "sha1": format!("{:x}", Sha1::digest(&program)),
+                        "size": program.len()
+                    }}
+                }
+            }
+        }))
+        .expect("fixture runtime manifest");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("fixture connection");
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                assert!(header.len() < 4096, "bounded fixture request");
+                header.push(
+                    tokio::io::AsyncReadExt::read_u8(&mut stream)
+                        .await
+                        .expect("request byte"),
+                );
+            }
+            assert!(header.starts_with(b"GET /java HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        program.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("response header");
+            stream.write_all(&program).await.expect("runtime bytes");
+        });
+        let source = crate::runtime::authenticated_runtime_source_from_manifest_for_test(
+            crate::runtime::RuntimeId::from("java-runtime-delta"),
+            manifest,
+        )
+        .expect("authenticated runtime fixture");
+        let runtime = owner
+            .materialize_runtime(&base.java_version, source)
+            .await
+            .expect("materialize fixture runtime");
+        server.await.expect("runtime fixture served");
+        runtime
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn split_jar_executes_with_disposable_caches_and_preserves_exact_outputs() {
+        for mode in [
+            "split",
+            "wrong",
+            "unexpected",
+            "generic",
+            "derived",
+            "derived-empty",
+            "derived-missing",
+            "derived-size",
+            "derived-unexpected",
+        ] {
+            let owner =
+                prepare_ephemeral_processor_workspace("split-test", "1.20.1").expect("workspace");
+            let base: crate::launch::VersionJson = serde_json::from_value(serde_json::json!({
+                "id": "1.20.1",
+                "javaVersion": {"component": "java-runtime-delta", "majorVersion": 17}
+            }))
+            .expect("base version");
+            let workspace = owner.workspace();
+            let artifact = |coordinate: &str, path: &str| BoundProcessorArtifact {
+                coordinate: coordinate.to_string(),
+                relative_path: PortableRelativePath::new_exact(path).expect("artifact path"),
+            };
+            let jar = artifact("example:processor:1", "example/processor/1/processor-1.jar");
+            let input = artifact("example:input:1", "example/input/1/input-1.jar");
+            let slim = artifact("example:slim:1", "example/slim/output.jar");
+            let extra = artifact("example:extra:1", "example/extra/output.jar");
+            let bytes = mcp_archive(
+                MCP_CONFIG,
+                &[("META-INF/MANIFEST.MF", b"Main-Class: example.Processor\n\n")],
+            );
+            let sha1: [u8; 20] = Sha1::digest(&bytes).into();
+            workspace
+                .write_library_exact(&jar.relative_path, &bytes)
+                .await
+                .expect("processor jar");
+            workspace
+                .write_library_exact(&input.relative_path, &bytes)
+                .await
+                .expect("input jar");
+            let mut authority = StagedAuthority {
+                libraries: [jar.relative_path.clone(), input.relative_path.clone()]
+                    .into_iter()
+                    .map(|path| {
+                        (
+                            path,
+                            AuthenticatedBytes {
+                                size: bytes.len() as u64,
+                                sha1,
+                            },
+                        )
+                    })
+                    .collect(),
+                version: AuthenticatedBytes {
+                    size: 0,
+                    sha1: [0; 20],
+                },
+                processor_data: BTreeMap::new(),
+                installer: None,
+            };
+            let plan = BoundProcessorPlan {
+                steps: Vec::new(),
+                data: BTreeMap::from([(
+                    "EXTRA".to_string(),
+                    BoundProcessorData::Artifact(extra.clone()),
+                )]),
+                installer_data: BTreeMap::new(),
+                input_artifacts: BTreeMap::new(),
+            };
+            let derived = mode.starts_with("derived");
+            let expectation = if derived {
+                BoundProcessorOutputExpectation::Derived(ProcessorDerivation::from_test())
+            } else {
+                BoundProcessorOutputExpectation::ProviderSha1(sha1)
+            };
+            let step = BoundProcessorStep {
+                action: if mode == "generic" {
+                    BoundProcessorAction::Java
+                } else {
+                    BoundProcessorAction::SplitJar
+                },
+                jar,
+                classpath: Vec::new(),
+                args: vec![
+                    BoundProcessorArgument::Template(vec![BoundProcessorArgumentPart::Literal(
+                        mode.to_string(),
+                    )]),
+                    BoundProcessorArgument::Artifact(input),
+                    BoundProcessorArgument::OutputArtifact(slim.clone()),
+                    BoundProcessorArgument::Template(vec![
+                        BoundProcessorArgumentPart::OutputToken("EXTRA".to_string()),
+                    ]),
+                ],
+                outputs: [slim, extra]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, artifact)| BoundProcessorOutput {
+                        artifact,
+                        expectation: expectation.clone(),
+                        role: if derived && index == 0 {
+                            BoundProcessorOutputRole::Intermediate
+                        } else {
+                            BoundProcessorOutputRole::Terminal {
+                                expected_size: if mode == "derived-size" {
+                                    Some(bytes.len() as u64 + 1)
+                                } else {
+                                    (!derived).then_some(bytes.len() as u64)
+                                },
+                            }
+                        },
+                    })
+                    .collect(),
+            };
+            let runtime = split_test_runtime(&owner, &base).await;
+            let (_cancel_tx, mut cancel) = oneshot::channel();
+            let result = super::run_step(
+                &step,
+                &plan,
+                workspace,
+                &runtime,
+                &base,
+                None,
+                &mut authority,
+                &mut cancel,
+            )
+            .await;
+            match mode {
+                "wrong" | "derived-empty" | "derived-missing" | "derived-size" => {
+                    assert!(
+                        matches!(result, Err(BoundProcessorError::Authority)),
+                        "{mode} must refuse before promotion"
+                    );
+                    let (cancel_tx, mut cancelled) = oneshot::channel();
+                    cancel_tx.send(()).expect("cancel promotion");
+                    assert!(matches!(
+                        super::promote_split_outputs(&step, workspace, &mut cancelled).await,
+                        Err(BoundProcessorError::Cancelled)
+                    ));
+                    for output in &step.outputs {
+                        assert!(
+                            !workspace
+                                .libraries_path()
+                                .join(output.artifact.relative_path.as_str())
+                                .exists()
+                        );
+                    }
+                }
+                "unexpected" | "derived-unexpected" => {
+                    assert!(matches!(result, Err(BoundProcessorError::Stage)))
+                }
+                _ => {
+                    let outputs = result.expect("settled processor outputs");
+                    assert_eq!(outputs.len(), 2);
+                    for output in &step.outputs {
+                        let observed = outputs
+                            .get(&output.artifact.relative_path)
+                            .expect("exact output");
+                        let terminal =
+                            matches!(output.role, BoundProcessorOutputRole::Terminal { .. });
+                        assert_eq!(
+                            observed.bytes.as_deref(),
+                            terminal.then_some(bytes.as_slice())
+                        );
+                        assert_eq!(observed.size, bytes.len() as u64);
+                        assert_eq!(observed.sha1, sha1);
+                        assert_eq!(observed.expectation, output.expectation);
+                        assert_eq!(observed.terminal, terminal);
+                    }
+                    if derived {
+                        let terminal = outputs
+                            .values()
+                            .find(|output| output.terminal)
+                            .expect("terminal output");
+                        let consume = |expected: &BoundProcessorOutputExpectation| {
+                            super::VerifiedProcessorOutput {
+                                bytes: terminal.bytes.clone().expect("terminal bytes"),
+                                size: terminal.size,
+                                sha1: terminal.sha1,
+                                expectation: terminal.expectation.clone(),
+                            }
+                            .into_parts_for_expectation(expected)
+                        };
+                        assert_eq!(
+                            consume(&expectation).expect("original derivation"),
+                            (bytes.clone(), bytes.len() as u64, sha1)
+                        );
+                        for foreign in [
+                            BoundProcessorOutputExpectation::Derived(
+                                ProcessorDerivation::from_test(),
+                            ),
+                            BoundProcessorOutputExpectation::ProviderSha1(sha1),
+                        ] {
+                            assert!(matches!(
+                                consume(&foreign),
+                                Err(BoundProcessorError::Authority)
+                            ));
+                        }
+                    }
+                    assert!(
+                        fs::read_dir(workspace.temp_path())
+                            .expect("scratch directory")
+                            .next()
+                            .is_none()
+                    );
+                    assert_eq!(
+                        workspace
+                            .snapshot_root()
+                            .expect("root snapshot")
+                            .files()
+                            .len(),
+                        4
+                    );
+                }
+            }
+            drop(runtime);
+            owner.cleanup().expect("cleanup");
+        }
+    }
+
     #[test]
     fn processor_errors_are_closed_static_and_redacted() {
         for error in [
@@ -2083,6 +3176,7 @@ mod tests {
             relative_path: jar,
         };
         let step = BoundProcessorStep {
+            action: BoundProcessorAction::Java,
             jar: artifact,
             classpath: Vec::new(),
             args: vec![BoundProcessorArgument::Template(vec![
@@ -2165,6 +3259,7 @@ mod tests {
             relative_path: output_path.clone(),
         };
         let output_step = BoundProcessorStep {
+            action: BoundProcessorAction::Java,
             jar: BoundProcessorArtifact {
                 coordinate: "example:processor:1".to_string(),
                 relative_path: PortableRelativePath::new("example/processor.jar")
@@ -2179,7 +3274,9 @@ mod tests {
             ],
             outputs: vec![BoundProcessorOutput {
                 artifact: output_artifact.clone(),
-                sha1: Sha1::digest(b"generated").into(),
+                expectation: BoundProcessorOutputExpectation::ProviderSha1(
+                    Sha1::digest(b"generated").into(),
+                ),
                 role: BoundProcessorOutputRole::Terminal {
                     expected_size: Some(9),
                 },

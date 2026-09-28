@@ -281,6 +281,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or_default();
-        std::env::temp_dir().join(format!("axial-{prefix}-{nanos:x}"))
+        crate::test_temp_root().join(format!("axial-{prefix}-{nanos:x}"))
     }
 }

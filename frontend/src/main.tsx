@@ -15,29 +15,43 @@ import {
 import { toast } from './toast';
 import { restoreRoute } from './ui-state';
 import { dtoRecord } from './dto-contract';
+import { nativePreferencesHydrated, reloadApplication } from './preferences/persistence';
 
 async function init(): Promise<void> {
+  if (hasNativeDesktopRuntime()) Sound.enabled = false;
   initErrorReporting();
   await applyDesktopChromeAttributes();
 
   // Theme before anything else so the first paint is tinted correctly
-  applyTheme(local.theme, local.customHue, {
-    silent: true,
-    vibrancy: local.customVibrancy,
-    lightness: local.lightness,
-  });
+  if (!hasNativeDesktopRuntime()) {
+    applyTheme(local.theme, local.customHue, {
+      silent: true, vibrancy: local.customVibrancy, lightness: local.lightness,
+    });
+  }
 
   render(<App />, document.getElementById('app')!);
   restoreRoute();
   registerNativeCloseBlockedToast();
 
-  Sound.enabled = local.sounds;
-  void Sound.warmup();
-  bindButtonSounds();
+  if (!hasNativeDesktopRuntime()) {
+    Sound.enabled = local.sounds;
+    void Sound.warmup();
+    bindButtonSounds();
+  }
+
+  window.addEventListener('keydown', (event) => {
+    if (!hasNativeDesktopRuntime()) return;
+    if (event.key === 'F5' || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'r')) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void reloadApplication();
+    }
+  }, true);
 
   await startApplicationBootstrap();
 
   const activateSound = (): void => {
+    if (hasNativeDesktopRuntime() && !nativePreferencesHydrated()) return;
     Sound.activate();
   };
   window.addEventListener('pointerdown', activateSound, { once: true, capture: true });

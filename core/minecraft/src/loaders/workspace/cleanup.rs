@@ -43,14 +43,16 @@ impl ProcessorWorkspaceOwner {
         java_version: &crate::launch::JavaVersion,
         source: crate::runtime::RuntimeSourceReceipt,
     ) -> Result<crate::runtime::ProcessorRuntime, crate::runtime::JavaRuntimeLookupError> {
-        self.temporary_root.revalidate().map_err(|_| {
+        self.temporary_root.revalidate().map_err(|error| {
+            trace_runtime_workspace_error("root_before", &error);
             crate::runtime::JavaRuntimeLookupError::Install(
                 "processor temporary root identity changed".to_string(),
             )
         })?;
         self.temporary_root
             .validate_exact_child_directories(&["processor-stage"])
-            .map_err(|_| {
+            .map_err(|error| {
+                trace_runtime_workspace_error("children_before", &error);
                 crate::runtime::JavaRuntimeLookupError::Install(
                     "processor temporary root identity changed".to_string(),
                 )
@@ -59,7 +61,8 @@ impl ProcessorWorkspaceOwner {
             .workspace
             .stage
             .validate_tree_usage_no_links(ManagedTreeLimits::processor_stage())
-            .map_err(|_| {
+            .map_err(|error| {
+                trace_runtime_workspace_error("stage_usage", &error);
                 crate::runtime::JavaRuntimeLookupError::Install(
                     "processor temporary root exceeds its admitted bound".to_string(),
                 )
@@ -67,19 +70,30 @@ impl ProcessorWorkspaceOwner {
         let remaining_entries = 4096_usize
             .checked_sub(usage.entries().saturating_add(1))
             .ok_or_else(|| {
+                tracing::warn!(
+                    stage = "entry_budget",
+                    "Processor runtime workspace validation failed"
+                );
                 crate::runtime::JavaRuntimeLookupError::Install(
                     "processor temporary root exceeds its entry bound".to_string(),
                 )
             })?;
         let remaining_bytes = (512_u64 << 20).checked_sub(usage.bytes()).ok_or_else(|| {
+            tracing::warn!(
+                stage = "byte_budget",
+                "Processor runtime workspace validation failed"
+            );
             crate::runtime::JavaRuntimeLookupError::Install(
                 "processor temporary root exceeds its byte bound".to_string(),
             )
         })?;
-        let runtime_directory = self
-            .temporary_root
-            .create_child_new("runtime")
-            .map_err(|error| crate::runtime::JavaRuntimeLookupError::Install(error.to_string()))?;
+        let runtime_directory =
+            self.temporary_root
+                .create_child_new("runtime")
+                .map_err(|error| {
+                    trace_runtime_workspace_error("runtime_directory", &error);
+                    crate::runtime::JavaRuntimeLookupError::Install(error.to_string())
+                })?;
         let runtime = crate::runtime::materialize_ephemeral_processor_runtime(
             java_version,
             source,
@@ -92,16 +106,19 @@ impl ProcessorWorkspaceOwner {
             self.temporary_root
                 .remove_child_tree("runtime", runtime_directory)
                 .map_err(|error| {
+                    trace_runtime_workspace_error("failed_runtime_cleanup", &error);
                     crate::runtime::JavaRuntimeLookupError::Install(error.to_string())
                 })?;
         }
         let runtime = runtime?;
-        self.temporary_root.revalidate().map_err(|_| {
+        self.temporary_root.revalidate().map_err(|error| {
+            trace_runtime_workspace_error("root_after", &error);
             crate::runtime::JavaRuntimeLookupError::Install(
                 "processor temporary root identity changed".to_string(),
             )
         })?;
-        self.workspace.validate_live_bounds().map_err(|_| {
+        self.workspace.validate_live_bounds().map_err(|error| {
+            trace_runtime_workspace_error("live_bounds", &error);
             crate::runtime::JavaRuntimeLookupError::Install(
                 "processor runtime destination identity changed".to_string(),
             )
@@ -134,6 +151,18 @@ impl ProcessorWorkspaceOwner {
         drop(temporary_root);
         let _ = temporary.keep();
     }
+}
+
+fn trace_runtime_workspace_error(stage: &'static str, error: &LoaderError) {
+    let io_kind = match error {
+        LoaderError::Io(error) => Some(error.kind()),
+        _ => None,
+    };
+    tracing::warn!(
+        stage,
+        ?io_kind,
+        "Processor runtime workspace validation failed"
+    );
 }
 
 impl ProcessorWorkspace {
@@ -234,6 +263,24 @@ impl ProcessorWorkspace {
     ) -> Result<(), LoaderError> {
         let _ = self.libraries.open_or_create_relative_parent(relative)?;
         self.libraries.revalidate()
+    }
+
+    pub(crate) fn ensure_temp_parent(
+        &self,
+        relative: &PortableRelativePath,
+    ) -> Result<(), LoaderError> {
+        let _ = self.temp.open_or_create_relative_parent(relative)?;
+        self.temp.revalidate()
+    }
+
+    pub(crate) fn read_temp_authenticated(
+        &self,
+        relative: &PortableRelativePath,
+        expected_size: Option<u64>,
+        expected_sha1: &[u8; 20],
+    ) -> Result<Vec<u8>, LoaderError> {
+        self.temp
+            .read_relative_authenticated(relative, expected_size, expected_sha1)
     }
 
     pub(crate) async fn write_version_exact(
@@ -363,10 +410,7 @@ pub(crate) fn prepare_ephemeral_processor_workspace(
 ) -> Result<ProcessorWorkspaceOwner, LoaderError> {
     validate_version_id(version_id, "installer workspace version id")?;
     validate_version_id(minecraft_version, "processor stage Minecraft version")?;
-    let temporary = tempfile::Builder::new()
-        .prefix("axial-loader-processor-")
-        .tempdir()
-        .map_err(LoaderError::Io)?;
+    let temporary = create_processor_temporary_in(&std::env::temp_dir())?;
     let temporary_root = ManagedDir::open_root(temporary.path())?;
     let stage = temporary_root.open_or_create_child("processor-stage")?;
     let root = stage.open_or_create_child("root")?;
@@ -396,12 +440,229 @@ pub(crate) fn prepare_ephemeral_processor_workspace(
     })
 }
 
+fn create_processor_temporary_in(parent: &Path) -> Result<TempDir, LoaderError> {
+    // Resolve the OS-selected parent before allocating our fresh directory;
+    // strict admission still validates the new root and its physical ancestry.
+    let parent = std::fs::canonicalize(parent).map_err(LoaderError::Io)?;
+    tempfile::Builder::new()
+        .prefix("axial-loader-processor-")
+        .tempdir_in(parent)
+        .map_err(LoaderError::Io)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::prepare_ephemeral_processor_workspace;
+    use super::{create_processor_temporary_in, prepare_ephemeral_processor_workspace};
+    use crate::loaders::types::LoaderError;
     use crate::portable_path::PortableRelativePath;
     use sha1::{Digest as _, Sha1};
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn processor_temporary_resolves_parent_alias_before_strict_admission() {
+        let fixture =
+            tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let physical_parent = fixture.path().join("physical");
+        fs::create_dir(&physical_parent).unwrap();
+        let alias = fixture.path().join("alias");
+        std::os::unix::fs::symlink(&physical_parent, &alias).unwrap();
+
+        let temporary = create_processor_temporary_in(&alias).unwrap();
+        let path = temporary.path().to_path_buf();
+        assert_eq!(path.parent(), Some(physical_parent.as_path()));
+        let managed = crate::managed_fs::ManagedDir::open_root(&path)
+            .expect("fresh temporary root has strictly admissible physical ancestry");
+        managed.revalidate().unwrap();
+        drop(managed);
+        temporary.close().unwrap();
+        assert!(!path.exists());
+        assert!(
+            fs::symlink_metadata(alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(physical_parent.is_dir());
+    }
+
+    #[test]
+    fn processor_temporary_reports_unavailable_parent_without_creating_it() {
+        let fixture =
+            tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let missing = fixture.path().join("missing");
+        assert!(matches!(
+            create_processor_temporary_in(&missing),
+            Err(LoaderError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn live_bounds_accepts_changing_contents_with_stable_identity_and_size() {
+        use std::io::{Seek, Write};
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let owner = prepare_ephemeral_processor_workspace("forge-version", "1.21.5")
+            .expect("processor workspace");
+        drop(
+            owner
+                .temporary_root
+                .create_child_new("runtime")
+                .expect("empty runtime"),
+        );
+        let temporary = owner.path().to_path_buf();
+        let output_path = owner.workspace().temp_path().join("output.bin");
+        let mut output = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&output_path)
+            .expect("stable scratch output");
+        output.write_all(&[0_u8; 4096]).expect("initial output");
+        owner
+            .workspace()
+            .validate_live_bounds()
+            .expect("initial bounds");
+
+        let stop = AtomicBool::new(false);
+        let writes = AtomicUsize::new(0);
+        let ready = Barrier::new(2);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (writer, failure, overlapping_observations) = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| -> std::io::Result<()> {
+                ready.wait();
+                for generation in 0..65_536 {
+                    if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        break;
+                    }
+                    output.rewind()?;
+                    output.write_all(&[(generation & 1) as u8])?;
+                    writes.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            });
+            ready.wait();
+            let mut failure = None;
+            let mut overlapping_observations = 0;
+            for _ in 0..128 {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                let before = writes.load(Ordering::Relaxed);
+                let observed = owner.workspace().validate_live_bounds();
+                if writes.load(Ordering::Relaxed) > before {
+                    overlapping_observations += 1;
+                }
+                if let Err(error) = observed {
+                    failure = Some(error);
+                    break;
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            (writer.join(), failure, overlapping_observations)
+        });
+        drop(output);
+        let final_size = fs::metadata(&output_path).map(|metadata| metadata.len());
+        let cleanup = owner.cleanup();
+
+        writer
+            .expect("joined scratch writer")
+            .expect("scratch writes");
+        cleanup.expect("ephemeral cleanup after live observation");
+        assert!(!temporary.exists());
+        assert_eq!(final_size.expect("final output size"), 4096);
+        assert!(
+            overlapping_observations > 0,
+            "observe active content writes"
+        );
+        assert!(
+            failure.is_none(),
+            "in-bounds content writes were rejected: {failure:?}"
+        );
+    }
+
+    #[test]
+    fn live_bounds_preserves_file_and_total_byte_limits() {
+        for (count, size) in [(1, (128_u64 << 20) + 1), (5, 128_u64 << 20)] {
+            let owner = prepare_ephemeral_processor_workspace("forge-version", "1.21.5")
+                .expect("processor workspace");
+            drop(
+                owner
+                    .temporary_root
+                    .create_child_new("runtime")
+                    .expect("empty runtime"),
+            );
+            let mut paths = Vec::new();
+            for index in 0..count {
+                let path = owner
+                    .workspace()
+                    .temp_path()
+                    .join(format!("large-{index}.bin"));
+                fs::File::create(&path)
+                    .expect("bounded fixture file")
+                    .set_len(size)
+                    .expect("sparse oversized fixture");
+                paths.push(path);
+            }
+            let observed = owner.workspace().validate_live_bounds();
+            for path in paths {
+                fs::remove_file(path).expect("remove sparse fixture");
+            }
+            owner.cleanup().expect("ephemeral cleanup");
+            assert!(observed.is_err(), "oversized live tree must be rejected");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_bounds_refuses_symbolic_and_hard_links() {
+        for symbolic in [true, false] {
+            let owner = prepare_ephemeral_processor_workspace("forge-version", "1.21.5")
+                .expect("processor workspace");
+            drop(
+                owner
+                    .temporary_root
+                    .create_child_new("runtime")
+                    .expect("empty runtime"),
+            );
+            let target = owner.workspace().home_path().join("target.bin");
+            let alias = owner.workspace().temp_path().join("alias.bin");
+            fs::write(&target, b"scratch").expect("link target");
+            if symbolic {
+                std::os::unix::fs::symlink(&target, &alias).expect("symbolic alias");
+            } else {
+                fs::hard_link(&target, &alias).expect("hard-linked alias");
+            }
+            let observed = owner.workspace().validate_live_bounds();
+            fs::remove_file(alias).expect("remove alias before cleanup");
+            owner.cleanup().expect("ephemeral cleanup");
+            assert!(observed.is_err(), "linked live tree must be rejected");
+        }
+    }
+
+    #[test]
+    fn live_bounds_refuses_replaced_stage_directory() {
+        let owner = prepare_ephemeral_processor_workspace("forge-version", "1.21.5")
+            .expect("processor workspace");
+        drop(
+            owner
+                .temporary_root
+                .create_child_new("runtime")
+                .expect("empty runtime"),
+        );
+        let displaced = tempfile::tempdir_in(crate::test_temp_root()).expect("displaced stage");
+        let original = owner.path().join("processor-stage");
+        let saved = displaced.path().join("stage");
+        fs::rename(&original, &saved).expect("move bound stage");
+        fs::create_dir(&original).expect("replacement stage at original name");
+        let observed = owner.workspace().validate_live_bounds();
+        fs::remove_dir(&original).expect("remove empty replacement stage");
+        fs::rename(saved, original).expect("restore bound stage for cleanup");
+        owner.cleanup().expect("ephemeral cleanup");
+        assert!(observed.is_err(), "replaced bound stage must be rejected");
+    }
 
     #[tokio::test]
     async fn ephemeral_processor_workspace_has_canonical_authenticated_layout() {
@@ -443,6 +704,29 @@ mod tests {
             .expect("installer write");
         fs::write(processor.home_path().join("home-state"), b"scratch").expect("home scratch");
         fs::write(processor.temp_path().join("temp-state"), b"scratch").expect("temp scratch");
+
+        processor
+            .ensure_temp_parent(&library)
+            .expect("output parent");
+        fs::write(processor.temp_path().join(library.as_str()), b"output")
+            .expect("processor output");
+        let output_sha1: [u8; 20] = Sha1::digest(b"output").into();
+        assert_eq!(
+            processor
+                .read_temp_authenticated(&library, Some(6), &output_sha1)
+                .unwrap(),
+            b"output"
+        );
+        assert!(
+            processor
+                .read_temp_authenticated(&library, Some(5), &output_sha1)
+                .is_err()
+        );
+        assert!(
+            processor
+                .read_temp_authenticated(&library, Some(6), &[0; 20])
+                .is_err()
+        );
 
         let library_sha1: [u8; 20] = Sha1::digest(b"library").into();
         assert_eq!(

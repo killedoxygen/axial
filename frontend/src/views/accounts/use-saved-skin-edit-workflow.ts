@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { api } from '../../api';
 import {
   applySavedSkin,
+  captureWardrobeContext,
+  isWardrobeContextCurrent,
   refreshWardrobe,
   runWardrobeOp,
   selectSavedSkin,
@@ -241,6 +243,7 @@ export function useSavedSkinEditWorkflow() {
     }
 
     await runWardrobeOp({ kind: 'edit', key: textureKey }, async () => {
+      const capture = captureWardrobeContext();
       setWardrobeNotice(null);
       try {
         const skinActionsEnabled = wardrobeContext.value.skinActionsEnabled;
@@ -262,7 +265,7 @@ export function useSavedSkinEditWorkflow() {
             capeId: nextCapeId === previousCapeId ? undefined : nextCapeId,
           });
           savedTextureKey = saved.texture_key;
-          selectSavedSkin(saved.texture_key);
+          if (isWardrobeContextCurrent(capture)) selectSavedSkin(saved.texture_key);
         } else {
           const payload: { name: string; variant: SkinVariant; cape_id?: string | null } = {
             name: trimmedEditName,
@@ -271,24 +274,28 @@ export function useSavedSkinEditWorkflow() {
           if (skin && editCapeId !== (skin.cape_id ?? NO_CAPE_VALUE)) {
             payload.cape_id = editCapeId === NO_CAPE_VALUE ? null : editCapeId;
           }
-          const updated = savedSkinRecord(await api('PUT', `/skins/${textureKey}`, payload));
+          const updated = savedSkinRecord(await api('PUT', `/skins/${encodeURIComponent(textureKey)}`, payload));
           if (!updated) throw new Error('Skin details update returned an invalid response.');
           savedTextureKey = updated.texture_key;
+        }
+        if (!isWardrobeContextCurrent(capture)) {
+          void refreshWardrobe();
+          return;
         }
         cancelEdit();
         if (shouldApplyEditedSkin) {
           try {
-            toast(await applySavedSkin(savedTextureKey));
+            toast(await applySavedSkin(savedTextureKey, { capture }));
           } catch (err) {
             void refreshWardrobe();
-            setWardrobeNotice(skinActionErrorMessage(err, 'Minecraft profile apply failed.'));
+            if (isWardrobeContextCurrent(capture)) setWardrobeNotice(skinActionErrorMessage(err, 'Minecraft profile apply failed.'));
           }
         } else {
           void refreshWardrobe();
           toast(savedMessage);
         }
       } catch (err) {
-        setWardrobeNotice(skinActionErrorMessage(err, 'Could not update skin details.'));
+        if (isWardrobeContextCurrent(capture)) setWardrobeNotice(skinActionErrorMessage(err, 'Could not update skin details.'));
       }
     });
   };

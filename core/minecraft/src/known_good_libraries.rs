@@ -10,7 +10,7 @@ use crate::launch::{Library, VersionJson, effective_java_version_for, library_me
 use crate::loaders::providers::ProfileInstallProof;
 use crate::loaders::{
     AuthenticatedEmbeddedMavenArtifact, AuthenticatedInstallerLibraryInputs,
-    AuthenticatedInstallerLibraryParts, VerifiedProcessorOutputs,
+    AuthenticatedInstallerLibraryParts, BoundProcessorOutputExpectation, VerifiedProcessorOutputs,
 };
 use crate::loaders::{LoaderProfileFragment, types::LoaderComponentId};
 use crate::portable_path::PortableRelativePath;
@@ -72,7 +72,7 @@ struct InstallerLibraryStructure {
 
 struct InstallerTerminalOutputContract {
     path: PortableRelativePath,
-    sha1: [u8; 20],
+    expectation: BoundProcessorOutputExpectation,
     size: Option<u64>,
 }
 
@@ -246,7 +246,13 @@ pub(crate) fn bind_installer_library_declarations(
     } = inputs.into_parts();
     let terminal_contracts = terminal_outputs
         .into_iter()
-        .map(|(path, sha1, size)| InstallerTerminalOutputContract { path, sha1, size })
+        .map(
+            |(path, expectation, size)| InstallerTerminalOutputContract {
+                path,
+                expectation,
+                size,
+            },
+        )
         .collect::<Vec<_>>();
     let plans = library_artifact_plans_for(&libraries, &environment)
         .map_err(|_| SealedLibraryDeclarationError::InvalidSelectedPlan)?;
@@ -305,7 +311,7 @@ pub(crate) fn bind_installer_library_declarations(
                 return Err(SealedLibraryDeclarationError::DuplicateDeclaration);
             }
             (Some(contract), None) => {
-                validate_plan_contract_optional(&plan, contract.sha1, contract.size)?;
+                validate_plan_contract_optional(&plan, &contract.expectation, contract.size)?;
                 InstallerLibraryProducer::Terminal(contract)
             }
             (None, Some(artifact)) => {
@@ -376,18 +382,21 @@ fn insert_exact_declaration(
 
 fn validate_plan_contract_optional(
     plan: &LibraryArtifactPlan,
-    sha1: [u8; 20],
+    expectation: &BoundProcessorOutputExpectation,
     size: Option<u64>,
 ) -> Result<(), SealedLibraryDeclarationError> {
     if size.is_some_and(|size| size == 0)
         || matches!((plan.expected.size, size), (Some(expected), Some(actual)) if expected != actual)
-        || plan
-            .expected
-            .sha1
-            .as_deref()
-            .is_some_and(|expected| !decode_sha1(expected).is_ok_and(|expected| expected == sha1))
     {
         return Err(SealedLibraryDeclarationError::ContractDrift);
+    }
+    if let Some(expected) = plan.expected.sha1.as_deref() {
+        let BoundProcessorOutputExpectation::ProviderSha1(sha1) = expectation else {
+            return Err(SealedLibraryDeclarationError::ContractDrift);
+        };
+        if !decode_sha1(expected).is_ok_and(|expected| expected == *sha1) {
+            return Err(SealedLibraryDeclarationError::ContractDrift);
+        }
     }
     Ok(())
 }
@@ -668,11 +677,14 @@ impl PendingInstallerReconstructionTerminalDeclarations {
             let InstallerLibraryProducer::Terminal(contract) = &selected.producer else {
                 continue;
             };
+            let BoundProcessorOutputExpectation::ProviderSha1(sha1) = &contract.expectation else {
+                return Err(SealedLibraryDeclarationError::MissingDeclaration);
+            };
             let size = contract
                 .size
                 .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
-            validate_plan_contract(&selected.plan, contract.sha1, size)?;
-            insert_exact_declaration(&mut entries, &selected.plan, contract.sha1, size, false)?;
+            validate_plan_contract(&selected.plan, *sha1, size)?;
+            insert_exact_declaration(&mut entries, &selected.plan, *sha1, size, false)?;
         }
         if entries.len() != self.selected.len() {
             return Err(SealedLibraryDeclarationError::MissingDeclaration);
@@ -699,18 +711,7 @@ impl PendingInstallerReconstructionTerminalDeclarations {
         ),
         SealedLibraryDeclarationError,
     > {
-        let mut outputs = outputs
-            .into_entries()
-            .into_iter()
-            .map(|(path, output)| {
-                let (bytes, size, sha1) = output.into_parts();
-                let observed_sha1: [u8; 20] = Sha1::digest(&bytes).into();
-                if size == 0 || size != bytes.len() as u64 || sha1 != observed_sha1 {
-                    return Err(SealedLibraryDeclarationError::ContractDrift);
-                }
-                Ok((path, (bytes, size, sha1)))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let mut outputs = outputs.into_entries();
         let mut entries = self.entries;
         let mut sources = Vec::new();
         for (path, selected) in &self.selected {
@@ -719,8 +720,15 @@ impl PendingInstallerReconstructionTerminalDeclarations {
             };
             let (bytes, size, sha1) = outputs
                 .remove(path)
-                .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
-            if sha1 != contract.sha1 || contract.size.is_some_and(|expected| expected != size) {
+                .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?
+                .into_parts_for_expectation(&contract.expectation)
+                .map_err(|_| SealedLibraryDeclarationError::ContractDrift)?;
+            let observed_sha1: [u8; 20] = Sha1::digest(&bytes).into();
+            if size == 0
+                || size != bytes.len() as u64
+                || sha1 != observed_sha1
+                || contract.size.is_some_and(|expected| expected != size)
+            {
                 return Err(SealedLibraryDeclarationError::ContractDrift);
             }
             validate_plan_contract(&selected.plan, sha1, size)?;
@@ -864,29 +872,24 @@ impl PendingInstallerTerminalDeclarations {
         self,
         outputs: VerifiedProcessorOutputs,
     ) -> Result<SealedInstallerLibrarySources, SealedLibraryDeclarationError> {
-        let mut outputs = outputs
-            .into_entries()
-            .into_iter()
-            .map(|(path, output)| {
-                let (bytes, size, sha1) = output.into_parts();
-                let actual_sha1: [u8; 20] = Sha1::digest(&bytes).into();
-                if size == 0 || size != bytes.len() as u64 || sha1 != actual_sha1 {
-                    return Err(SealedLibraryDeclarationError::ContractDrift);
-                }
-                Ok((path, (bytes, size, sha1)))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let mut outputs = outputs.into_entries();
         let mut entries = self.entries;
         let mut sources = self.network_sources;
         for (path, selected) in &self.selected {
             let InstallerLibraryProducer::Terminal(contract) = &selected.producer else {
                 continue;
             };
-            let output = outputs
+            let (bytes, size, sha1) = outputs
                 .remove(path)
-                .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
-            let (bytes, size, sha1) = output;
-            if sha1 != contract.sha1 || contract.size.is_some_and(|expected| expected != size) {
+                .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?
+                .into_parts_for_expectation(&contract.expectation)
+                .map_err(|_| SealedLibraryDeclarationError::ContractDrift)?;
+            let actual_sha1: [u8; 20] = Sha1::digest(&bytes).into();
+            if size == 0
+                || size != bytes.len() as u64
+                || sha1 != actual_sha1
+                || contract.size.is_some_and(|expected| expected != size)
+            {
                 return Err(SealedLibraryDeclarationError::ContractDrift);
             }
             validate_plan_contract(&selected.plan, sha1, size)?;
@@ -1676,6 +1679,7 @@ mod tests {
     use super::*;
     use crate::download::ExpectedIntegrity;
     use crate::launch::{LibraryArtifact, LibraryDownload};
+    use crate::loaders::ProcessorDerivation;
     use crate::loaders::providers::{ProfileInstallProof, ProfileLibraryProof};
     use std::collections::HashMap;
 
@@ -2899,5 +2903,256 @@ mod tests {
             sealed.get(&path),
             Some((SealedLibraryKind::Library, sha1, bytes.len() as u64, None,))
         );
+    }
+
+    fn generated_runtime_declarations(
+        derivation: ProcessorDerivation,
+    ) -> (
+        BoundInstallerLibraryDeclarations,
+        Vec<(
+            PortableRelativePath,
+            Vec<u8>,
+            BoundProcessorOutputExpectation,
+        )>,
+    ) {
+        let generated = [
+            (
+                "net.minecraft:client:1.20.1-20230612.114412:srg",
+                "net/minecraft/client/1.20.1-20230612.114412/client-1.20.1-20230612.114412-srg.jar",
+                b"execution-sealed SRG".to_vec(),
+            ),
+            (
+                "net.minecraft:client:1.20.1-20230612.114412:extra",
+                "net/minecraft/client/1.20.1-20230612.114412/client-1.20.1-20230612.114412-extra.jar",
+                b"provider-verified EXTRA".to_vec(),
+            ),
+            (
+                "net.minecraftforge:forge:1.20.1-47.4.10:client",
+                "net/minecraftforge/forge/1.20.1-47.4.10/forge-1.20.1-47.4.10-client.jar",
+                b"provider-verified PATCHED".to_vec(),
+            ),
+        ];
+        let mut libraries = Vec::new();
+        let mut terminals = Vec::new();
+        let mut outputs = Vec::new();
+        for (index, (coordinate, path, bytes)) in generated.into_iter().enumerate() {
+            let sha1 = Sha1::digest(&bytes).into();
+            let (expected_sha1, expectation) = if index == 0 {
+                (
+                    String::new(),
+                    BoundProcessorOutputExpectation::Derived(derivation.clone()),
+                )
+            } else {
+                (
+                    encode_sha1(sha1),
+                    BoundProcessorOutputExpectation::ProviderSha1(sha1),
+                )
+            };
+            libraries.push(without_download_source(profile_library(
+                coordinate,
+                path,
+                &expected_sha1,
+                bytes.len() as i64,
+            )));
+            let path = PortableRelativePath::new(path).unwrap();
+            terminals.push((path.clone(), expectation.clone(), Some(bytes.len() as u64)));
+            outputs.push((path, bytes, expectation));
+        }
+        let declarations = bind_installer_library_declarations(
+            AuthenticatedInstallerLibraryInputs::from_test_with_expectations(
+                libraries,
+                Vec::new(),
+                terminals,
+            ),
+            crate::rules::default_environment(),
+        )
+        .expect("explicit generated runtime declarations");
+        (declarations, outputs)
+    }
+
+    #[test]
+    fn generated_runtime_sealing_requires_the_complete_execution_bound_inventory() {
+        let (declarations, outputs) =
+            generated_runtime_declarations(ProcessorDerivation::from_test());
+        let expected = outputs
+            .iter()
+            .map(|(path, bytes, _)| {
+                (
+                    path.clone(),
+                    (Sha1::digest(bytes).into(), bytes.len() as u64),
+                )
+            })
+            .collect::<BTreeMap<_, ([u8; 20], u64)>>();
+        let (pending, jobs) = declarations.into_network_jobs().unwrap();
+        assert!(jobs.is_empty());
+        let (sealed, sources) = pending
+            .complete_network(Vec::new())
+            .unwrap()
+            .seal_terminal_outputs(
+                VerifiedProcessorOutputs::from_test_terminal_with_expectations(outputs),
+            )
+            .expect("all three generated runtime outputs")
+            .into_parts();
+        assert_eq!(sealed.len(), 3);
+        assert_eq!(sealed.installer_contract().unwrap().0.len(), 3);
+        assert_eq!(sources.len(), 3);
+        for source in sources {
+            let (sha1, size) = expected[source.relative_path()];
+            assert_eq!(source.observed_sha1(), sha1);
+            assert_eq!(source.observed_size(), size);
+            assert_eq!(
+                sealed.get(source.relative_path()),
+                Some((SealedLibraryKind::Library, sha1, size, None))
+            );
+        }
+    }
+
+    #[test]
+    fn generated_runtime_sealing_rejects_missing_extra_changed_and_foreign_outputs() {
+        for failure in [
+            "missing",
+            "extra",
+            "extra hash",
+            "patched hash",
+            "foreign proof",
+            "empty",
+        ] {
+            let (declarations, mut outputs) =
+                generated_runtime_declarations(ProcessorDerivation::from_test());
+            match failure {
+                "missing" => {
+                    outputs.remove(0);
+                }
+                "extra" => outputs.push((
+                    PortableRelativePath::new("example/unselected/1/unselected-1.jar").unwrap(),
+                    b"undeclared runtime".to_vec(),
+                    BoundProcessorOutputExpectation::ProviderSha1([7; 20]),
+                )),
+                "extra hash" => outputs[1].1[0] ^= 1,
+                "patched hash" => outputs[2].1[0] ^= 1,
+                "foreign proof" => {
+                    outputs[0].2 =
+                        BoundProcessorOutputExpectation::Derived(ProcessorDerivation::from_test());
+                }
+                "empty" => outputs[0].1.clear(),
+                _ => unreachable!(),
+            }
+            let (pending, _) = declarations.into_network_jobs().unwrap();
+            let result = pending
+                .complete_network(Vec::new())
+                .unwrap()
+                .seal_terminal_outputs(
+                    VerifiedProcessorOutputs::from_test_terminal_with_expectations(outputs),
+                );
+            let expected_error = match failure {
+                "missing" => SealedLibraryDeclarationError::MissingDeclaration,
+                "extra" => SealedLibraryDeclarationError::ExtraDeclaration,
+                _ => SealedLibraryDeclarationError::ContractDrift,
+            };
+            assert!(
+                matches!(result, Err(error) if error == expected_error),
+                "{failure}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_runtime_observation_cannot_supply_derived_execution_authority() {
+        for reconstruction in [false, true] {
+            let (declarations, outputs) =
+                generated_runtime_declarations(ProcessorDerivation::from_test());
+            let observed = VerifiedProcessorOutputs::from_test_terminal(
+                outputs
+                    .into_iter()
+                    .map(|(path, bytes, _)| (path, bytes))
+                    .collect(),
+            );
+            if reconstruction {
+                let (pending, _) = declarations.into_reconstruction_jobs();
+                assert!(matches!(
+                    pending
+                        .complete_network(Vec::new())
+                        .unwrap()
+                        .seal_observed_terminal_outputs(observed, true),
+                    Err(SealedLibraryDeclarationError::ContractDrift)
+                ));
+            } else {
+                let (pending, _) = declarations.into_network_jobs().unwrap();
+                assert!(matches!(
+                    pending
+                        .complete_network(Vec::new())
+                        .unwrap()
+                        .seal_terminal_outputs(observed),
+                    Err(SealedLibraryDeclarationError::ContractDrift)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn generated_runtime_reconstruction_requires_fresh_matching_execution() {
+        let (declarations, _) = generated_runtime_declarations(ProcessorDerivation::from_test());
+        let (pending, _) = declarations.into_reconstruction_jobs();
+        assert!(matches!(
+            pending
+                .complete_network(Vec::new())
+                .unwrap()
+                .seal_declared_terminal_outputs(false),
+            Err(SealedLibraryDeclarationError::MissingDeclaration)
+        ));
+
+        for same_execution in [false, true] {
+            let (declarations, mut outputs) =
+                generated_runtime_declarations(ProcessorDerivation::from_test());
+            if !same_execution {
+                outputs[0].2 =
+                    BoundProcessorOutputExpectation::Derived(ProcessorDerivation::from_test());
+            }
+            let (pending, jobs) = declarations.into_reconstruction_jobs();
+            assert!(jobs.is_empty());
+            let result = pending
+                .complete_network(Vec::new())
+                .unwrap()
+                .seal_observed_terminal_outputs(
+                    VerifiedProcessorOutputs::from_test_terminal_with_expectations(outputs),
+                    true,
+                );
+            if same_execution {
+                let (sealed, sources) = result.expect("current execution proof");
+                assert_eq!(sealed.len(), 3);
+                assert_eq!(sources.len(), 3);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(SealedLibraryDeclarationError::ContractDrift)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn derived_terminal_cannot_replace_a_provider_hash_declaration() {
+        let path = PortableRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
+        let result = bind_installer_library_declarations(
+            AuthenticatedInstallerLibraryInputs::from_test_with_expectations(
+                vec![without_download_source(profile_library(
+                    "example:terminal:1",
+                    path.as_str(),
+                    &encode_sha1([3; 20]),
+                    8,
+                ))],
+                Vec::new(),
+                vec![(
+                    path,
+                    BoundProcessorOutputExpectation::Derived(ProcessorDerivation::from_test()),
+                    Some(8),
+                )],
+            ),
+            crate::rules::default_environment(),
+        );
+        assert!(matches!(
+            result,
+            Err(SealedLibraryDeclarationError::ContractDrift)
+        ));
     }
 }

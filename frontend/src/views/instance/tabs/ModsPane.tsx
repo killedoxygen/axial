@@ -13,7 +13,8 @@ import type { EnrichedInstance, InstanceMod } from '../../../types-instance';
 import { modBaseName } from '../../../utils';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
-import { ResourceStatus } from '../components/resource-bits';
+import { ResourceMutationStatus, ResourceStatus } from '../components/resource-bits';
+import { resourceMutationState } from '../bulk-actions';
 import {
   applyModUpdates,
   cachedModProvenance,
@@ -36,17 +37,22 @@ export function ModsPane({
   onRefresh: () => void;
 }): JSX.Element {
   const [q, setQ] = useState('');
+  const busy = resourceMutationState(inst.id).status === 'pending';
   const [filter, setFilter] = useState<ModFilter>('all');
   const [provenance, setProvenance] = useState<ModProvenance | null>(() => cachedModProvenance(inst.id));
+  const [provenanceError, setProvenanceError] = useState('');
   const [provenanceStamp, setProvenanceStamp] = useState(0);
   const resourceRevision = useRef({ instanceId: inst.id, revision: contentRevision.value });
 
   useEffect(() => {
     let alive = true;
     setProvenance(cachedModProvenance(inst.id));
+    setProvenanceError('');
     void fetchModProvenance(inst.id, (data) => {
       if (alive) setProvenance(data);
-    }).catch(() => {});
+    }).catch(() => {
+      if (alive) setProvenanceError('Could not load mod details. Refresh to try again.');
+    });
     return () => {
       alive = false;
     };
@@ -145,13 +151,19 @@ export function ModsPane({
             {pendingUpdates.length} update{pendingUpdates.length === 1 ? '' : 's'} available
           </span>
           <span class="cp-mods-updates-action">
-            <Button size="sm" onClick={() => void applyModUpdates(inst, pendingUpdates)}>
+            <Button size="sm" disabled={busy} onClick={() => void applyModUpdates(inst, pendingUpdates)}>
               Update all
             </Button>
           </span>
         </div>
       )}
       <ResourceStatus state={resources} onRetry={onRefresh} />
+      <ResourceMutationStatus instanceId={inst.id} />
+      {provenanceError || provenance?.updateError ? (
+        <div class="cp-resource-note cp-resource-note--error" role="alert">
+          {provenanceError || provenance?.updateError}
+        </div>
+      ) : null}
       <div class="cp-mods-table">
         <div class="cp-mods-table-head" aria-hidden="true">
           <span />
@@ -163,7 +175,7 @@ export function ModsPane({
           <span>State</span>
           <span />
         </div>
-        {resources.status !== 'loading' && filteredMods.length === 0 ? (
+        {resources.status === 'ready' && filteredMods.length === 0 ? (
           <div class="cp-mods-empty-row">
             <strong>{mods.length === 0 ? 'No mods installed in this instance' : 'No mods match this filter'}</strong>
             {mods.length === 0 ? (
@@ -219,6 +231,7 @@ export function ModsPane({
                       type="button"
                       class="cp-mod-update"
                       title={`Update to ${update.latest_version_number}`}
+                      disabled={busy}
                       onClick={(e) => {
                         e.stopPropagation();
                         void applyModUpdates(inst, [update]);
@@ -247,20 +260,21 @@ export function ModsPane({
           {
             label: 'Enable',
             icon: 'play',
-            disabled: allSelectedEnabled,
-            onClick: () => void setModsEnabled(inst, selectedMods, true, clearAndRefresh),
+            disabled: busy || allSelectedEnabled,
+            onClick: () => void setModsEnabled(inst, selectedMods, true, clearAndRefresh, refreshAll),
           },
           {
             label: 'Disable',
             icon: 'stop',
-            disabled: allSelectedDisabled,
-            onClick: () => void setModsEnabled(inst, selectedMods, false, clearAndRefresh),
+            disabled: busy || allSelectedDisabled,
+            onClick: () => void setModsEnabled(inst, selectedMods, false, clearAndRefresh, refreshAll),
           },
           {
             label: 'Delete',
             icon: 'trash',
             danger: true,
-            onClick: () => void deleteMods(inst, selectedMods, clearAndRefresh, provenance?.entries),
+            disabled: busy,
+            onClick: () => void deleteMods(inst, selectedMods, clearAndRefresh, provenance?.entries, refreshAll),
           },
         ]}
       />

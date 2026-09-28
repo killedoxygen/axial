@@ -1,6 +1,42 @@
 import { showChoice } from '../../ui/Dialog';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
+import { signal } from '@preact/signals';
+
+export type ResourceMutationState =
+  | { status: 'idle' }
+  | { status: 'pending'; label: string }
+  | { status: 'error'; error: string };
+
+const mutations = signal<ReadonlyMap<string, ResourceMutationState>>(new Map());
+const idleMutation: ResourceMutationState = { status: 'idle' };
+
+export function resourceMutationState(instanceId: string): ResourceMutationState {
+  return mutations.value.get(instanceId) ?? idleMutation;
+}
+
+/** Owns only the in-flight UI intent. Backend admission remains authoritative. */
+export async function runResourceMutation(
+  instanceId: string,
+  label: string,
+  action: () => Promise<void>,
+): Promise<void> {
+  if (resourceMutationState(instanceId).status === 'pending') {
+    toast('Wait for the current file action to finish.', 'info');
+    return;
+  }
+  mutations.value = new Map(mutations.value).set(instanceId, { status: 'pending', label });
+  try {
+    await action();
+    const next = new Map(mutations.value);
+    next.delete(instanceId);
+    mutations.value = next;
+  } catch (err) {
+    const error = `${label}: ${errMessage(err)}`;
+    mutations.value = new Map(mutations.value).set(instanceId, { status: 'error', error });
+    toast(error, 'error');
+  }
+}
 
 export async function confirmDeleteItems({
   count,
@@ -27,12 +63,14 @@ export async function runBulkMutation<T>({
   success,
   partial,
   onDone,
+  onFailure,
 }: {
   items: T[];
   action: (item: T) => Promise<void>;
   success: (count: number) => string;
   partial: (done: number, total: number, err: unknown) => string;
   onDone: () => void;
+  onFailure?: () => void;
 }): Promise<void> {
   if (items.length === 0) return;
   let done = 0;
@@ -41,12 +79,12 @@ export async function runBulkMutation<T>({
       await action(item);
       done += 1;
     }
-    toast(success(done));
-    onDone();
   } catch (err) {
-    toast(partial(done, items.length, err), 'error');
-    onDone();
+    onFailure?.();
+    throw new Error(partial(done, items.length, err));
   }
+  toast(success(done));
+  onDone();
 }
 
 export function partialFailureMessage(action: string, done: number, total: number, err: unknown): string {

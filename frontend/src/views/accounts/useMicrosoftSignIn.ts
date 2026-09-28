@@ -1,5 +1,6 @@
 import { useRef, useState } from 'preact/hooks';
-import { signInWithMicrosoft, type NativeMicrosoftSignInResult } from '../../native';
+import { accountsNotice, accountsOp, signInWithMicrosoftAccount } from '../../machines/accounts';
+import type { NativeMicrosoftSignInResult } from '../../native';
 import { boundedMessage } from './api';
 
 export type MicrosoftSignInMessage = { tone: 'ok' | 'err'; text: string } | null;
@@ -21,23 +22,16 @@ export function useMicrosoftSignIn(options: MicrosoftSignInOptions = {}): {
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
-  const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<MicrosoftSignInMessage>(null);
 
   const startLogin = async (): Promise<void> => {
-    if (busy || optionsRef.current.canStart === false) return;
-    setBusy(true);
+    if (accountsOp.value !== null || optionsRef.current.canStart === false) return;
     setMessage(null);
 
     try {
-      const result = await signInWithMicrosoft();
+      const result = await signInWithMicrosoftAccount();
       if (!result) {
-        setMessage({ tone: 'err', text: 'Microsoft sign-in is available in the desktop app.' });
-        return;
-      }
-      if (result.status === 'cancelled') return;
-      if (result.status !== 'authenticated') {
-        setMessage({ tone: 'err', text: 'Microsoft sign-in returned an unexpected response.' });
+        if (accountsNotice.value) setMessage({ tone: 'err', text: accountsNotice.value });
         return;
       }
 
@@ -64,13 +58,11 @@ export function useMicrosoftSignIn(options: MicrosoftSignInOptions = {}): {
         tone: 'err',
         text: boundedMessage(errorText(err), 'Microsoft sign-in could not be completed.'),
       });
-    } finally {
-      setBusy(false);
     }
   };
 
   return {
-    busy,
+    busy: accountsOp.value !== null,
     message,
     setMessage,
     clearMessage: () => setMessage(null),

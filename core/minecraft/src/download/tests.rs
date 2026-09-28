@@ -647,7 +647,8 @@ async fn behavior_contract_reconstruction_derives_runtime_inventory_without_runt
         root.join("versions/runtime-reconstruction/untouched.sentinel"),
         root.join("runtime/jre-legacy/.axial-runtime-manifest.json"),
         root.join("runtime/jre-legacy/.axial-ready"),
-        root.join("runtime/jre-legacy/bin/java"),
+        root.join("runtime/jre-legacy")
+            .join(crate::runtime::runtime_java_relative_path()),
         root.join("runtime/jre-legacy/lib/data"),
         root.join("runtime/jre-legacy/java-link"),
     ];
@@ -3481,7 +3482,7 @@ fn temp_dir(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_nanos())
         .unwrap_or_default();
-    std::env::temp_dir().join(format!(
+    crate::test_temp_root().join(format!(
         "axial-download-{prefix}-{}-{nanos:x}",
         std::process::id()
     ))
@@ -4353,10 +4354,11 @@ async fn spawn_runtime_reconstruction_server(
     let (request_tx, request_rx) = mpsc::unbounded_channel();
     let client = b"runtime-reconstruction-client".to_vec();
     let runtime_file = b"java".to_vec();
+    let java_path = crate::runtime::runtime_java_relative_path();
     let runtime_manifest = serde_json::json!({
         "files": {
             "bin": { "type": "directory" },
-            "bin/java": {
+            (java_path): {
                 "type": "file",
                 "executable": true,
                 "downloads": { "raw": {
@@ -4374,7 +4376,7 @@ async fn spawn_runtime_reconstruction_server(
                     "size": runtime_file.len()
                 }}
             },
-            "java-link": { "type": "link", "target": "bin/java" }
+            "java-link": { "type": "link", "target": java_path }
         }
     })
     .to_string()

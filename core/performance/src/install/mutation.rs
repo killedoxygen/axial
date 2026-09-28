@@ -100,6 +100,16 @@ pub struct ManagedArtifactWitnessProof {
 }
 
 impl ManagedArtifactWitnessProof {
+    /// Ownership protection does not disappear when a file is modified or
+    /// renamed to its disabled spelling. Callers must not mutate either alias.
+    pub fn protects_filename(&self, filename: &str) -> bool {
+        let enabled = filename
+            .rsplit_once('.')
+            .filter(|(_, extension)| extension.eq_ignore_ascii_case("disabled"))
+            .map_or(filename, |(enabled, _)| enabled);
+        PortableFileName::new_exact(enabled).is_ok_and(|filename| filename.key() == self.filename)
+    }
+
     pub fn matches_observation(&self, filename: &str, sha512: &str) -> bool {
         PortableFileName::new_exact(filename).is_ok_and(|filename| filename.key() == self.filename)
             && self.sha512.eq_ignore_ascii_case(sha512)
@@ -473,6 +483,21 @@ impl ManagedCompositionAuthority {
         &self,
         identity: &ManagedInstanceIdentity,
     ) -> Result<Directory, ManagedMutationError> {
+        if let Some(directory) = identity.admitted_directory.as_ref() {
+            let current = directory
+                .identity()
+                .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
+            let bound = self
+                .instances_root_directory()
+                .identity()
+                .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
+            if current != bound {
+                return Err(ManagedMutationError::reconciliation_required(
+                    "admitted_instance_mismatch",
+                ));
+            }
+            return Ok(directory.clone());
+        }
         let instances_root = self.instances_root_directory().clone();
         let instance_id = identity.instance_id().to_string();
         run_managed_blocking(PhysicalIoClass::Metadata, move || {
@@ -1122,4 +1147,22 @@ fn rollback_managed_transaction(
     let snapshot =
         load_rollback_snapshot(instance_mods)?.ok_or(InstallError::NoRollbackSnapshot)?;
     Ok(restore_rollback_snapshot(instance_mods, &snapshot)?)
+}
+
+#[cfg(test)]
+mod witness_tests {
+    use super::*;
+
+    #[test]
+    fn ownership_protects_enabled_and_disabled_aliases_even_when_bytes_changed() {
+        let proof = ManagedArtifactWitnessProof {
+            filename: PortableFileName::new_exact("Sodium.jar").unwrap().key(),
+            sha512: "a".repeat(128),
+        };
+        assert!(proof.protects_filename("sodium.jar"));
+        assert!(proof.protects_filename("SODIUM.JAR.DISABLED"));
+        assert!(!proof.matches_observation("sodium.jar", &"b".repeat(128)));
+        assert!(!proof.protects_filename("other.jar"));
+        assert!(!proof.protects_filename("../Sodium.jar"));
+    }
 }

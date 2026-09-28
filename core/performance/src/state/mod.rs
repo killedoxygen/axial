@@ -1,10 +1,10 @@
 use crate::MANAGED_ARTIFACT_MAX_BYTES;
 use crate::storage::{
-    ManagedStorageDirectory, ManagedStorageFile, settle_parked_directory_removal,
-    settle_parked_file_removal,
+    ManagedInstanceEffectAuthority, ManagedStorageDirectory, ManagedStorageFile,
+    settle_parked_directory_removal, settle_parked_file_removal,
 };
 use crate::types::{CompositionState, CompositionTier, InstalledMod, OwnershipClass};
-use axial_fs::{DirectoryEntry, DirectoryListingState, EntryKind};
+use axial_fs::{Directory, DirectoryEntry, DirectoryListingState, EntryKind};
 use axial_minecraft::portable_path::{PortableFileName, PortablePathKey};
 use axial_resource::{
     PhysicalIoClass, PhysicalWorkError, PhysicalWorkRequest, process_physical_work,
@@ -51,6 +51,7 @@ const ROLLBACK_TRANSIENT_MAX_BYTES: u64 =
 pub(crate) const RECOVERY_ENTRY_LIMIT: usize = 1024;
 const ADDITION_MARKER_SCHEMA_VERSION: i32 = 1;
 const CANDIDATE_INTENT_SCHEMA_VERSION: i32 = 1;
+const DUPLICATE_WITNESS_PREFIX: &str = "performance-duplicate-v1:";
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -122,6 +123,7 @@ struct AdmittedPersistedCompositionState {
     snapshot: PersistedCompositionState,
     file: ManagedStorageFile,
     sha256: [u8; 32],
+    sha512: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +180,306 @@ pub(crate) struct RollbackArtifact {
     pub ownership_class: OwnershipClass,
     pub size: u64,
     pub sha512: String,
+}
+
+/// Settled logical records only. The caller retains source admission and owns
+/// fresh destination effects; this value never recovers or mutates the source.
+pub struct ManagedDuplicatePayload {
+    instance: Directory,
+    mods: Option<ManagedStorageDirectory>,
+    files: Vec<ManagedDuplicateFile>,
+    current_artifacts: Vec<(String, u64, String)>,
+}
+
+pub struct ManagedDuplicateFile {
+    source_directory: Directory,
+    relative_components: Vec<String>,
+    size: u64,
+    sha512: String,
+}
+
+impl ManagedDuplicateFile {
+    pub fn source_directory(&self) -> &Directory {
+        &self.source_directory
+    }
+
+    /// Portable components relative to the admitted instance directory.
+    pub fn relative_components(&self) -> &[String] {
+        &self.relative_components
+    }
+
+    pub fn filename(&self) -> &str {
+        self.relative_components
+            .last()
+            .expect("admitted file has a name")
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.relative_components == other.relative_components
+            && self.size == other.size
+            && self.sha512 == other.sha512
+    }
+}
+
+impl ManagedDuplicatePayload {
+    pub fn admit(instance: &Directory) -> Result<Self, StateError> {
+        let effects = ManagedInstanceEffectAuthority::bind(instance)?;
+        let root = ManagedStorageDirectory::bind_instance_root(instance.clone(), effects)?;
+        let mods = root.open_child("mods")?;
+        let mut files = Vec::new();
+        let mut current_artifacts = Vec::new();
+        if let Some(mods) = &mods {
+            validate_duplicate_namespace(mods)?;
+            let state = read_state_snapshot_if_present(mods, LOCK_FILE_NAME)?;
+            #[cfg(test)]
+            if state.is_some() {
+                duplicate_metadata_read_hook();
+            }
+            prove_managed_storage_recovered(
+                mods,
+                state.as_ref().map(|value| &value.snapshot.state),
+            )?;
+            if let Some(state) = state {
+                state.file.validate()?;
+                current_artifacts = state
+                    .snapshot
+                    .state
+                    .installed_mods
+                    .iter()
+                    .map(|artifact| {
+                        (
+                            artifact.filename.clone(),
+                            artifact.size,
+                            artifact.integrity.sha512.to_ascii_lowercase(),
+                        )
+                    })
+                    .collect();
+                files.push(ManagedDuplicateFile {
+                    source_directory: mods.directory().clone(),
+                    relative_components: vec!["mods".into(), LOCK_FILE_NAME.into()],
+                    size: state.file.size(),
+                    sha512: state.sha512,
+                });
+            }
+            for record in load_retained_rollback_snapshots(mods)? {
+                let snapshot = record.snapshot;
+                let directory = rollback_snapshot_directory(mods, &snapshot.id)?;
+                let components = [
+                    "mods",
+                    STATE_DIR_NAME,
+                    ROLLBACK_DIR_NAME,
+                    ROLLBACK_HISTORY_DIR_NAME,
+                    &snapshot.id,
+                ];
+                let mut relative_components = components
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect::<Vec<_>>();
+                relative_components.push(ROLLBACK_METADATA_FILE_NAME.into());
+                record.metadata.file.validate()?;
+                files.push(ManagedDuplicateFile {
+                    source_directory: directory.directory().clone(),
+                    relative_components,
+                    size: record.metadata.file.size(),
+                    sha512: record.metadata.sha512,
+                });
+                for artifact in snapshot.artifacts {
+                    let mut relative_components = components
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect::<Vec<_>>();
+                    relative_components.push(artifact.stored_filename);
+                    files.push(ManagedDuplicateFile {
+                        source_directory: directory.directory().clone(),
+                        relative_components,
+                        size: artifact.size,
+                        sha512: artifact.sha512.to_ascii_lowercase(),
+                    });
+                }
+            }
+        }
+        files.sort_by(|left, right| left.relative_components.cmp(&right.relative_components));
+        current_artifacts.sort();
+        Ok(Self {
+            instance: instance.clone(),
+            mods,
+            files,
+            current_artifacts,
+        })
+    }
+
+    pub fn files(&self) -> &[ManagedDuplicateFile] {
+        &self.files
+    }
+
+    /// Bounded content evidence. It contains no paths or filesystem authority.
+    pub fn witness(&self) -> String {
+        let records = self
+            .files
+            .iter()
+            .map(|file| (&file.relative_components, file.size, &file.sha512))
+            .collect::<Vec<_>>();
+        let manifest = serde_json::to_vec(&(records, &self.current_artifacts))
+            .expect("managed duplicate manifest contains only strings and integers");
+        format!(
+            "{DUPLICATE_WITNESS_PREFIX}{}",
+            hex::encode(Sha512::digest(manifest))
+        )
+    }
+
+    pub fn verify_recovered(
+        destination: &Directory,
+        witness: Option<&str>,
+    ) -> Result<(), StateError> {
+        if witness.is_some_and(|value| {
+            value
+                .strip_prefix(DUPLICATE_WITNESS_PREFIX)
+                .is_none_or(|digest| {
+                    digest.len() != 128
+                        || !digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        }) {
+            return Err(StateError::InvalidState(
+                "managed duplicate recovery witness is invalid".into(),
+            ));
+        }
+        let current = Self::admit(destination)?;
+        let matches = match witness {
+            Some(witness) => witness == current.witness(),
+            None => current.files.is_empty(),
+        };
+        if !matches {
+            return Err(StateError::InvalidState(
+                "managed duplicate recovery witness does not match".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_reserved_mod_entry(name: &str) -> bool {
+        let Ok(name) = PortableFileName::new(name) else {
+            return false;
+        };
+        let key = name.key();
+        key.as_str() == STATE_DIR_NAME
+            || key.as_str() == LOCK_FILE_NAME
+            || key.as_str().starts_with(".axial-lock.json.")
+    }
+
+    /// Revalidate both ends before the containing instance becomes publishable.
+    pub fn verify_staged(&self, destination: &Directory) -> Result<(), StateError> {
+        if let Some(mods) = &self.mods {
+            mods.directory().identity()?;
+        }
+        let current = Self::admit(&self.instance)?;
+        let staged = Self::admit(destination)?;
+        if !self.matches(&current) || !self.matches(&staged) {
+            return Err(StateError::InvalidState(
+                "managed duplicate payload changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.current_artifacts == other.current_artifacts
+            && self.files.len() == other.files.len()
+            && self
+                .files
+                .iter()
+                .zip(&other.files)
+                .all(|(left, right)| left.matches(right))
+    }
+}
+
+fn validate_duplicate_namespace(mods: &ManagedStorageDirectory) -> Result<(), StateError> {
+    let listing = mods.entries(axial_fs::MAX_DIRECTORY_LIST_ENTRIES)?;
+    if listing.state() != DirectoryListingState::Complete {
+        return Err(StateError::InvalidState(
+            "managed duplicate mods listing is incomplete".into(),
+        ));
+    }
+    for entry in listing.entries() {
+        let name = entry_name(entry, "managed duplicate entry")?;
+        if ManagedDuplicatePayload::is_reserved_mod_entry(&name)
+            && !matches!(name.as_str(), LOCK_FILE_NAME | STATE_DIR_NAME)
+        {
+            return Err(StateError::InvalidState(
+                "managed duplicate contains a reserved alias or obligation".into(),
+            ));
+        }
+    }
+    let Some(internal) = mods.open_child(STATE_DIR_NAME)? else {
+        return Ok(());
+    };
+    for entry in complete_entries(&internal, "managed duplicate namespace")? {
+        let name = entry_name(&entry, "managed duplicate namespace")?;
+        let child = internal.open_observed_child(&entry)?;
+        match name.as_str() {
+            MUTATION_DIR_NAME => {
+                for entry in complete_entries(&child, "managed duplicate mutations")? {
+                    let name = entry_name(&entry, "managed duplicate mutation")?;
+                    if !matches!(
+                        name.as_str(),
+                        REMOVAL_DIR_NAME
+                            | ADDITION_DIR_NAME
+                            | CANDIDATE_INTENT_DIR_NAME
+                            | CANDIDATE_DIR_NAME
+                    ) {
+                        return Err(StateError::InvalidState(
+                            "managed duplicate contains an unknown mutation entry".into(),
+                        ));
+                    }
+                    require_duplicate_empty(&child.open_observed_child(&entry)?)?;
+                }
+            }
+            QUARANTINE_DIR_NAME => require_duplicate_empty(&child)?,
+            ROLLBACK_DIR_NAME => {
+                for entry in complete_entries(&child, "managed duplicate rollback")? {
+                    match entry.utf8_name() {
+                        Some(ROLLBACK_HISTORY_DIR_NAME) if entry.kind() == EntryKind::Directory => {
+                            let history = child.open_observed_child(&entry)?;
+                            let mut names = HashSet::new();
+                            for entry in complete_entries(&history, "managed duplicate history")? {
+                                let name = entry_name(&entry, "managed duplicate snapshot")?;
+                                if !names.insert(portable_filename_key(&name)?) {
+                                    return Err(StateError::InvalidRollback(
+                                        "managed duplicate contains colliding snapshot names"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                        }
+                        Some(ROLLBACK_TMP_DIR_NAME) => {
+                            require_duplicate_empty(&child.open_observed_child(&entry)?)?
+                        }
+                        _ => {
+                            return Err(StateError::InvalidRollback(
+                                "managed duplicate contains an unknown rollback entry".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {
+                return Err(StateError::InvalidState(
+                    "managed duplicate contains an unknown internal entry".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_duplicate_empty(directory: &ManagedStorageDirectory) -> Result<(), StateError> {
+    if !complete_entries(directory, "managed duplicate obligations")?.is_empty() {
+        return Err(StateError::InvalidState(
+            "managed duplicate contains unsettled obligations".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -560,6 +862,7 @@ fn read_state_snapshot_if_present(
         snapshot,
         file: admitted.file,
         sha256: admitted.sha256,
+        sha512: admitted.sha512,
     }))
 }
 
@@ -1887,6 +2190,7 @@ fn rollback_publication_reconciliation_required(
 struct RetainedRollbackSnapshot {
     snapshot: RollbackSnapshot,
     storage_bytes: u64,
+    metadata: AdmittedFile,
 }
 
 fn load_retained_rollback_snapshots(
@@ -1916,11 +2220,12 @@ fn load_retained_rollback_snapshots(
         }
         validate_rollback_snapshot_id(&id)?;
         let directory = history.open_observed_child(&entry)?;
-        let snapshot = read_snapshot_directory(&directory, &id)?;
-        let storage_bytes = rollback_directory_storage_bytes(&directory, &snapshot)?;
+        let (snapshot, metadata) = read_snapshot_directory_with_metadata(&directory, &id)?;
+        let storage_bytes = rollback_snapshot_storage_bytes(&snapshot, metadata.file.size())?;
         records.push(RetainedRollbackSnapshot {
             snapshot,
             storage_bytes,
+            metadata,
         });
     }
     records.sort_by(|left, right| {
@@ -1947,13 +2252,40 @@ fn read_snapshot_directory(
     directory: &ManagedStorageDirectory,
     expected_id: &str,
 ) -> Result<RollbackSnapshot, StateError> {
-    let snapshot = read_rollback_candidate(directory, expected_id)?;
-    if complete_entries(directory, "rollback snapshot")?.len() != snapshot.artifacts.len() + 1 {
+    read_snapshot_directory_with_metadata(directory, expected_id).map(|(snapshot, _)| snapshot)
+}
+
+fn read_snapshot_directory_with_metadata(
+    directory: &ManagedStorageDirectory,
+    expected_id: &str,
+) -> Result<(RollbackSnapshot, AdmittedFile), StateError> {
+    let revision = directory.directory().revision()?;
+    let (snapshot, metadata) = read_rollback_metadata_file(directory, expected_id)?;
+    #[cfg(test)]
+    duplicate_metadata_read_hook();
+    if validate_rollback_candidate(directory, &snapshot)?.len() != snapshot.artifacts.len() + 1 {
         return Err(StateError::InvalidRollback(
             "rollback snapshot is incomplete".to_string(),
         ));
     }
-    Ok(snapshot)
+    metadata.file.validate()?;
+    directory.directory().validate_revision(&revision)?;
+    Ok((snapshot, metadata))
+}
+
+#[cfg(test)]
+thread_local! {
+    static DUPLICATE_METADATA_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn duplicate_metadata_read_hook() {
+    DUPLICATE_METADATA_READ_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 fn read_rollback_candidate(
@@ -1961,7 +2293,15 @@ fn read_rollback_candidate(
     expected_id: &str,
 ) -> Result<RollbackSnapshot, StateError> {
     let (snapshot, _) = read_rollback_metadata(directory, expected_id)?;
-    let present = rollback_candidate_entries(directory, &snapshot)?;
+    validate_rollback_candidate(directory, &snapshot)?;
+    Ok(snapshot)
+}
+
+fn validate_rollback_candidate(
+    directory: &ManagedStorageDirectory,
+    snapshot: &RollbackSnapshot,
+) -> Result<HashSet<String>, StateError> {
+    let present = rollback_candidate_entries(directory, snapshot)?;
     for artifact in &snapshot.artifacts {
         if !present.contains(&artifact.stored_filename) {
             continue;
@@ -1978,7 +2318,7 @@ fn read_rollback_candidate(
             )));
         }
     }
-    Ok(snapshot)
+    Ok(present)
 }
 
 fn rollback_candidate_entries(
@@ -2016,6 +2356,14 @@ fn read_rollback_metadata(
     directory: &ManagedStorageDirectory,
     expected_id: &str,
 ) -> Result<(RollbackSnapshot, u64), StateError> {
+    read_rollback_metadata_file(directory, expected_id)
+        .map(|(snapshot, metadata)| (snapshot, metadata.file.size()))
+}
+
+fn read_rollback_metadata_file(
+    directory: &ManagedStorageDirectory,
+    expected_id: &str,
+) -> Result<(RollbackSnapshot, AdmittedFile), StateError> {
     let metadata = read_bounded_file(
         directory,
         Path::new(ROLLBACK_METADATA_FILE_NAME),
@@ -2028,7 +2376,7 @@ fn read_rollback_metadata(
             "rollback snapshot id does not match its directory".to_string(),
         ));
     }
-    Ok((snapshot, metadata.file.size()))
+    Ok((snapshot, metadata))
 }
 
 fn complete_rollback_candidate(
@@ -2855,6 +3203,293 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_payload_restores_independent_artifacts_with_current_or_history_only_state() {
+        for current_present in [true, false] {
+            let root = test_root("duplicate-rollback");
+            let source_path = root.join("source");
+            let destination_path = root.join("destination");
+            fs::create_dir_all(source_path.join("mods")).unwrap();
+            fs::create_dir_all(destination_path.join("mods")).unwrap();
+            let storage = TestManagedStorage::new(&root);
+            let source = storage.directory().open_child("source").unwrap().unwrap();
+            let source_mods = source.open_child("mods").unwrap().unwrap();
+            let old_state = test_state(vec![test_installed("managed.jar", b"old managed bytes")]);
+            fs::write(source_path.join("mods/managed.jar"), b"old managed bytes").unwrap();
+            save_state(&source_mods, &old_state).unwrap();
+            let absent = save_absent_rollback_snapshot(&source_mods).unwrap();
+            let snapshot = save_rollback_snapshot(&source_mods, &old_state).unwrap();
+            if current_present {
+                fs::write(
+                    source_path.join("mods/managed.jar"),
+                    b"current managed bytes",
+                )
+                .unwrap();
+                save_state(
+                    &source_mods,
+                    &test_state(vec![test_installed(
+                        "managed.jar",
+                        b"current managed bytes",
+                    )]),
+                )
+                .unwrap();
+                fs::copy(
+                    source_path.join("mods/managed.jar"),
+                    destination_path.join("mods/managed.jar"),
+                )
+                .unwrap();
+            } else {
+                let artifact = &old_state.installed_mods[0];
+                stage_managed_artifact_removal(&source_mods, artifact).unwrap();
+                remove_state(&source_mods).unwrap();
+                settle_managed_artifact_removal(&source_mods, artifact).unwrap();
+                recover_managed_storage(&source_mods).unwrap();
+            }
+            fs::write(source_path.join("mods/user.jar"), b"unmanaged bytes").unwrap();
+            fs::copy(
+                source_path.join("mods/user.jar"),
+                destination_path.join("mods/user.jar"),
+            )
+            .unwrap();
+            let payload = ManagedDuplicatePayload::admit(source.directory()).unwrap();
+            copy_duplicate_fixture(&payload, &source_path, &destination_path);
+            let destination = storage
+                .directory()
+                .open_child("destination")
+                .unwrap()
+                .unwrap();
+            payload.verify_staged(destination.directory()).unwrap();
+            let effects = ManagedInstanceEffectAuthority::bind(destination.directory()).unwrap();
+            let destination = ManagedStorageDirectory::bind_instance_root(
+                destination.directory().clone(),
+                effects,
+            )
+            .unwrap();
+            let destination_mods = destination.open_child("mods").unwrap().unwrap();
+            let summaries = list_rollback_snapshots_admitted(&destination_mods).unwrap();
+            assert!(summaries.iter().any(|entry| entry.id == absent.id
+                && entry.target == RollbackSnapshotTarget::ManagedStateAbsent));
+            assert!(summaries.iter().any(|entry| entry.id == snapshot.id));
+            let copied_snapshot =
+                load_rollback_snapshot_by_id_admitted(&destination_mods, &snapshot.id)
+                    .unwrap()
+                    .unwrap();
+            restore_rollback_snapshot(&destination_mods, &copied_snapshot).unwrap();
+            assert_eq!(
+                fs::read(destination_path.join("mods/managed.jar")).unwrap(),
+                b"old managed bytes"
+            );
+            assert_eq!(
+                load_state_admitted(&destination_mods).unwrap(),
+                Some(old_state)
+            );
+            assert_eq!(
+                fs::read(destination_path.join("mods/user.jar")).unwrap(),
+                b"unmanaged bytes"
+            );
+            if current_present {
+                assert_eq!(
+                    fs::read(source_path.join("mods/managed.jar")).unwrap(),
+                    b"current managed bytes"
+                );
+            } else {
+                assert!(!source_path.join("mods/managed.jar").exists());
+                assert!(load_state_admitted(&source_mods).unwrap().is_none());
+            }
+            assert_eq!(
+                load_rollback_snapshot_by_id_admitted(&source_mods, &snapshot.id).unwrap(),
+                Some(snapshot)
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_payload_refuses_unknown_and_unsettled_records_without_recovery() {
+        for residue in [
+            ".axial-lock.json.delete.intent",
+            ".axial-lock.json.previous.tmp",
+            ".AXIAL-LOCK.JSON",
+            ".axial-performance/unknown",
+            ".axial-performance/mutations/unknown",
+            ".axial-performance/mutations/candidates/unfinished",
+            ".axial-performance/quarantine/digest/parked",
+            ".axial-performance/rollback/tmp/candidate-unfinished/snapshot.json",
+            ".axial-performance/rollback/unknown",
+        ] {
+            let root = test_root("duplicate-refusal");
+            let residue_path = root.join("mods").join(residue);
+            fs::create_dir_all(residue_path.parent().unwrap()).unwrap();
+            fs::write(&residue_path, b"preserve exact residue").unwrap();
+            let storage = TestManagedStorage::new(&root);
+            assert!(
+                ManagedDuplicatePayload::admit(storage.directory().directory()).is_err(),
+                "{residue}"
+            );
+            assert_eq!(fs::read(&residue_path).unwrap(), b"preserve exact residue");
+        }
+    }
+
+    #[test]
+    fn duplicate_payload_rechecks_current_and_historical_bytes_before_publication() {
+        let root = test_root("duplicate-drift");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(source_path.join("mods")).unwrap();
+        fs::create_dir_all(destination_path.join("mods")).unwrap();
+        let storage = TestManagedStorage::new(&root);
+        let source = storage.directory().open_child("source").unwrap().unwrap();
+        let mods = source.open_child("mods").unwrap().unwrap();
+        let state = test_state(vec![test_installed("managed.jar", b"managed bytes")]);
+        fs::write(source_path.join("mods/managed.jar"), b"managed bytes").unwrap();
+        save_state(&mods, &state).unwrap();
+        let snapshot = save_rollback_snapshot(&mods, &state).unwrap();
+        let payload = ManagedDuplicatePayload::admit(source.directory()).unwrap();
+        copy_duplicate_fixture(&payload, &source_path, &destination_path);
+        fs::copy(
+            source_path.join("mods/managed.jar"),
+            destination_path.join("mods/managed.jar"),
+        )
+        .unwrap();
+        let destination = storage
+            .directory()
+            .open_child("destination")
+            .unwrap()
+            .unwrap();
+        payload.verify_staged(destination.directory()).unwrap();
+        fs::write(source_path.join("mods/managed.jar"), b"changed bytes").unwrap();
+        assert!(payload.verify_staged(destination.directory()).is_err());
+        fs::write(source_path.join("mods/managed.jar"), b"managed bytes").unwrap();
+        fs::write(
+            rollback_history_path(&destination_path.join("mods"))
+                .join(&snapshot.id)
+                .join("artifact-000.bin"),
+            b"corrupt history",
+        )
+        .unwrap();
+        assert!(payload.verify_staged(destination.directory()).is_err());
+        assert_eq!(
+            fs::read(source_path.join("mods/managed.jar")).unwrap(),
+            b"managed bytes"
+        );
+    }
+
+    #[test]
+    fn duplicate_payload_rejects_metadata_changed_between_parse_and_fingerprint() {
+        for history in [false, true] {
+            let root = test_root("duplicate-metadata-race");
+            fs::create_dir_all(root.join("mods")).unwrap();
+            let storage = TestManagedStorage::new(&root);
+            let mods = storage.directory().open_child("mods").unwrap().unwrap();
+            let state = test_state(Vec::new());
+            save_state(&mods, &state).unwrap();
+            let path = if history {
+                let snapshot = save_rollback_snapshot(&mods, &state).unwrap();
+                fs::remove_file(root.join("mods").join(LOCK_FILE_NAME)).unwrap();
+                rollback_history_path(&root.join("mods"))
+                    .join(snapshot.id)
+                    .join(ROLLBACK_METADATA_FILE_NAME)
+            } else {
+                root.join("mods").join(LOCK_FILE_NAME)
+            };
+            let mut changed = fs::read(&path).unwrap();
+            changed.push(b'\n');
+            let replacement = changed.clone();
+            let target = path.clone();
+            DUPLICATE_METADATA_READ_HOOK.with(|hook| {
+                *hook.borrow_mut() =
+                    Some(Box::new(move || fs::write(target, replacement).unwrap()));
+            });
+            assert!(ManagedDuplicatePayload::admit(storage.directory().directory()).is_err());
+            assert_eq!(fs::read(path).unwrap(), changed);
+        }
+    }
+
+    #[test]
+    fn duplicate_recovery_rechecks_witness_and_current_artifacts_without_the_source() {
+        let root = test_root("duplicate-recovery-witness");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(source_path.join("mods")).unwrap();
+        fs::create_dir_all(destination_path.join("mods")).unwrap();
+        let storage = TestManagedStorage::new(&root);
+        let source = storage.directory().open_child("source").unwrap().unwrap();
+        let source_mods = source.open_child("mods").unwrap().unwrap();
+        let state = test_state(vec![test_installed(
+            "managed.jar",
+            b"original managed bytes",
+        )]);
+        fs::write(
+            source_path.join("mods/managed.jar"),
+            b"original managed bytes",
+        )
+        .unwrap();
+        save_state(&source_mods, &state).unwrap();
+        let snapshot = save_rollback_snapshot(&source_mods, &state).unwrap();
+        let payload = ManagedDuplicatePayload::admit(source.directory()).unwrap();
+        let witness = payload.witness();
+        assert!(witness.len() < 256);
+        copy_duplicate_fixture(&payload, &source_path, &destination_path);
+        fs::copy(
+            source_path.join("mods/managed.jar"),
+            destination_path.join("mods/managed.jar"),
+        )
+        .unwrap();
+        drop(payload);
+        fs::rename(&source_path, root.join("source-moved")).unwrap();
+        let destination = storage
+            .directory()
+            .open_child("destination")
+            .unwrap()
+            .unwrap();
+        ManagedDuplicatePayload::verify_recovered(destination.directory(), Some(&witness)).unwrap();
+        assert!(ManagedDuplicatePayload::verify_recovered(destination.directory(), None).is_err());
+        fs::write(
+            destination_path.join("mods/managed.jar"),
+            b"changed managed bytes",
+        )
+        .unwrap();
+        assert!(
+            ManagedDuplicatePayload::verify_recovered(destination.directory(), Some(&witness))
+                .is_err()
+        );
+        fs::write(
+            destination_path.join("mods/managed.jar"),
+            b"original managed bytes",
+        )
+        .unwrap();
+        let metadata = rollback_history_path(&destination_path.join("mods"))
+            .join(&snapshot.id)
+            .join(ROLLBACK_METADATA_FILE_NAME);
+        let original = fs::read(&metadata).unwrap();
+        let mut changed = original.clone();
+        changed.push(b'\n');
+        fs::write(&metadata, changed).unwrap();
+        assert!(
+            ManagedDuplicatePayload::verify_recovered(destination.directory(), Some(&witness))
+                .is_err()
+        );
+        fs::write(&metadata, original).unwrap();
+        ManagedDuplicatePayload::verify_recovered(destination.directory(), Some(&witness)).unwrap();
+        fs::remove_file(destination_path.join("mods/.axial-lock.json")).unwrap();
+        assert!(
+            ManagedDuplicatePayload::verify_recovered(destination.directory(), Some(&witness))
+                .is_err()
+        );
+    }
+
+    fn copy_duplicate_fixture(
+        payload: &ManagedDuplicatePayload,
+        source: &Path,
+        destination: &Path,
+    ) {
+        for file in payload.files() {
+            let relative = file.relative_components().iter().collect::<PathBuf>();
+            let target = destination.join(&relative);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::copy(source.join(relative), target).unwrap();
+        }
+    }
+
+    #[test]
     fn capability_state_round_trip_and_removal() {
         let root = test_root("state-round-trip");
         fs::create_dir_all(&root).expect("create root");
@@ -3533,6 +4168,8 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir()
+            .canonicalize()
+            .expect("physical temporary parent")
             .join(format!(
                 "axial-performance-state-{name}-{}-{}",
                 std::process::id(),

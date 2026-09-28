@@ -1,0 +1,306 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/mateoltd/axial-linux-ci@sha256:c13788b4e92861ecec09652d88c220e8fe3ae5fd75ebda09820a219ff0c7091a
+    steps:
+      - name: Verify non-root container contract
+        run: |
+          test "$(id -u)" = 1001
+          test "$(id -g)" = 1001
+          test -w "$HOME"
+          test -w "$GITHUB_WORKSPACE"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Trust checkout as a safe git directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          version: 11.1.3
+          run_install: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.13.1
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.93.1
+          components: rustfmt, clippy
+
+      - uses: go-task/setup-task@01a4adf9db2d14c1de7a560f09170b6e0df736aa # v2.1.0
+        with:
+          version: 3.52.0
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Verify delivery toolchain
+        run: task toolchain:preflight
+
+      - name: Stage release publication contract
+        run: node scripts/release-contract.mjs stage-publication --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" --output "$RUNNER_TEMP/release-publication-contract"
+
+      - name: Upload release publication contract
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-publication-contract
+          path: ${{ runner.temp }}/release-publication-contract
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Install frontend dependencies
+        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
+
+      - name: Verify Linux delivery
+        env:
+          # Telemetry key is a public write-only PostHog project token; keyless builds never upload (docs/TELEMETRY.md).
+          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+        run: task verify:linux
+
+      - name: Upload frontend bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-frontend
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload linux release desktop binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-linux-amd64
+          path: target/release/axial-desktop
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-desktop:
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download linux release desktop binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-linux-amd64
+          path: target/release
+
+      - name: Package linux desktop binary
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/linux
+          cp target/release/axial-desktop dist/linux/axial
+          chmod +x dist/linux/axial
+          cp dist/linux/axial "dist/axial-linux-amd64-${VERSION}"
+          tar -C dist/linux -czf "dist/axial-linux-amd64-${VERSION}.tar.gz" axial
+          (
+            cd dist
+            sha256sum "axial-linux-amd64-${VERSION}" > "axial-linux-amd64-${VERSION}.sha256"
+            sha256sum "axial-linux-amd64-${VERSION}.tar.gz" > "axial-linux-amd64-${VERSION}.tar.gz.sha256"
+          )
+
+      - name: Upload linux release handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets-linux-amd64
+          path: dist/axial-linux-amd64-*
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-desktop:
+    needs: verify
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Download frontend bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-frontend
+          path: frontend/dist
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.13.1
+
+      - name: Verify frontend generation
+        run: node frontend/verify-generation.mjs
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.93.1
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Build release desktop binary
+        env:
+          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+        run: cargo build --locked -p axial-desktop --release
+
+      - name: Package windows desktop binary
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
+          Copy-Item target/release/axial-desktop.exe dist/windows/axial.exe
+          $executable = "dist/axial-windows-amd64-$version.exe"
+          Copy-Item dist/windows/axial.exe $executable
+          $archive = "dist/axial-windows-amd64-$version.zip"
+          Compress-Archive -Path dist/windows/axial.exe -DestinationPath $archive -Force
+          $executableHash = Get-FileHash -Algorithm SHA256 -Path $executable
+          [System.IO.File]::WriteAllText(
+            "$executable.sha256",
+            "$($executableHash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $executable)`n",
+            [System.Text.Encoding]::ASCII
+          )
+          $hash = Get-FileHash -Algorithm SHA256 -Path $archive
+          [System.IO.File]::WriteAllText(
+            "$archive.sha256",
+            "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $archive)`n",
+            [System.Text.Encoding]::ASCII
+          )
+
+      - name: Upload windows release handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets-windows-amd64
+          path: dist/axial-windows-amd64-*
+          if-no-files-found: error
+          retention-days: 1
+
+  macos-desktop:
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: amd64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Download frontend bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-frontend
+          path: frontend/dist
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.13.1
+
+      - name: Verify frontend generation
+        run: node frontend/verify-generation.mjs
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.93.1
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "=2.11.2" --locked
+
+      - name: Build macOS app and DMG
+        env:
+          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+        working-directory: apps/desktop
+        run: cargo tauri build --bundles dmg --config '{"build":{"beforeBuildCommand":""}}' -- --locked
+
+      - name: Package macOS release assets
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/macos
+          cp target/release/axial-desktop dist/macos/axial
+          chmod +x dist/macos/axial
+          tar -C dist/macos -czf "dist/axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" axial
+          set -- target/release/bundle/dmg/*.dmg
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "Expected exactly one macOS DMG, found $#" >&2
+            exit 1
+          fi
+          cp "$1" "dist/axial-macos-${{ matrix.arch }}-${VERSION}.dmg"
+          (
+            cd dist
+            shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}.dmg" > "axial-macos-${{ matrix.arch }}-${VERSION}.dmg.sha256"
+            shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" > "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz.sha256"
+          )
+
+      - name: Upload macOS release handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets-macos-${{ matrix.arch }}
+          path: dist/axial-macos-${{ matrix.arch }}-*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    needs: [linux-desktop, windows-desktop, macos-desktop]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.13.1
+          token: ""
+
+      - name: Download release publication contract
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-publication-contract
+          path: publication
+
+      - name: Download linux release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-linux-amd64
+          path: handoffs/linux-amd64
+
+      - name: Download windows release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-windows-amd64
+          path: handoffs/windows-amd64
+
+      - name: Download macOS amd64 release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-macos-amd64
+          path: handoffs/macos-amd64
+
+      - name: Download macOS arm64 release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-macos-arm64
+          path: handoffs/macos-arm64
+
+      - name: Publish complete release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node publication/release-contract.mjs publish --receipt publication/source.json --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" --assets handoffs

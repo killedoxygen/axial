@@ -378,6 +378,9 @@ mod tests {
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("set accepted test stream blocking");
                         server_request_count.fetch_add(1, Ordering::SeqCst);
                         respond_404(stream);
                     }
@@ -611,7 +614,17 @@ mod tests {
         stream
             .write_all(&vec![b' '; MAX_LOADER_JSON_BYTES + 1])
             .expect("write response body");
-        stream.write_all(b"\r\n0\r\n\r\n").expect("finish response");
+        if let Err(error) = stream.write_all(b"\r\n0\r\n\r\n") {
+            // The complete oversized payload was sent. Its consumer may now
+            // reject the body and close without reading the chunk terminator.
+            assert!(
+                matches!(
+                    error.kind(),
+                    ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                ),
+                "finish response: {error}"
+            );
+        }
     }
 
     fn respond(mut stream: TcpStream, response: &[u8]) {
@@ -651,6 +664,11 @@ mod tests {
                 loop {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            // Darwin inherits the nonblocking listener flag;
+                            // response helpers use blocking read/write_all.
+                            stream
+                                .set_nonblocking(false)
+                                .expect("set accepted test stream blocking");
                             server_request_count.fetch_add(1, Ordering::SeqCst);
                             respond(stream);
                         }
@@ -686,7 +704,11 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.stop_server.send(());
             if let Some(server) = self.server.take() {
-                server.join().expect("server thread");
+                if let Err(panic) = server.join() {
+                    if !thread::panicking() {
+                        std::panic::resume_unwind(panic);
+                    }
+                }
             }
         }
     }

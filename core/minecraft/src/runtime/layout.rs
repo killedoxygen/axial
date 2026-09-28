@@ -7,6 +7,46 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Admission(Arc<AtomicUsize>);
+    impl Drop for Admission {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn escaped_runtime_directory_retains_application_admission() {
+        let temporary =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let session = match axial_fs::RootSession::acquire(temporary.path()) {
+            axial_fs::RootSessionAcquireOutcome::Acquired(session) => session,
+            outcome => panic!("could not acquire fixture: {outcome:?}"),
+        };
+        let released = Arc::new(AtomicUsize::new(0));
+        let cache = ManagedRuntimeCache::from_directory_retaining(
+            session.root().unwrap(),
+            temporary.path().to_path_buf(),
+            Arc::new(Admission(Arc::clone(&released))),
+        )
+        .unwrap();
+        let escaped = cache.authority().unwrap();
+        drop(cache);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        escaped.revalidate().unwrap();
+        drop(escaped);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            session.revoke(),
+            axial_fs::RootRevokeOutcome::Revoked
+        ));
+    }
+}
+
 #[derive(Clone)]
 pub struct ManagedRuntimeCache {
     inner: Arc<ManagedRuntimeCacheInner>,
@@ -66,6 +106,21 @@ impl std::fmt::Debug for ManagedRuntimeCache {
 }
 
 impl ManagedRuntimeCache {
+    /// Keep the admitting application root alive through all cache clones,
+    /// components, installation work and launch receipts.
+    pub fn from_directory_retaining(
+        directory: Directory,
+        root_path: PathBuf,
+        retained: Arc<dyn Send + Sync>,
+    ) -> std::io::Result<Self> {
+        let mut cache = Self::from_directory(directory, root_path)?;
+        Arc::get_mut(&mut cache.inner)
+            .expect("new cache is exclusive")
+            .root
+            .retain_lifetime(retained);
+        Ok(cache)
+    }
+
     pub fn from_directory(directory: Directory, root_path: PathBuf) -> std::io::Result<Self> {
         if !root_path.is_absolute() {
             return Err(std::io::Error::new(
@@ -93,6 +148,12 @@ impl ManagedRuntimeCache {
         &self.inner.root_path
     }
 
+    /// Call after runtime producers have joined. Retain this cache on failure;
+    /// its root still owns the precise unsettled native effects.
+    pub fn settle(&self) -> std::io::Result<()> {
+        self.inner.root.settle().map_err(runtime_cache_io)
+    }
+
     pub fn shares_identity_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -101,7 +162,7 @@ impl ManagedRuntimeCache {
     pub fn isolated_for_test() -> std::io::Result<Self> {
         let test_root = tempfile::Builder::new()
             .prefix("axial-managed-runtime-")
-            .tempdir()?;
+            .tempdir_in(std::fs::canonicalize(std::env::temp_dir())?)?;
         let root_path = test_root.path().to_path_buf();
         let root = ManagedDir::open_root(&root_path).map_err(runtime_cache_io)?;
         Ok(Self {

@@ -4266,7 +4266,7 @@ mod settlement_tests {
     }
 
     async fn pending_settlement_fixture(test_hook: PublicationTestHook) -> SettlementFixture {
-        let temporary = tempfile::TempDir::new().expect("settlement retry root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("settlement retry root");
         let root_path = temporary.path().join("library");
         std::fs::create_dir(&root_path).expect("create settlement retry root");
         let root = ManagedDir::open_root(&root_path).expect("open settlement retry root");
@@ -4624,7 +4624,7 @@ mod settlement_tests {
 
     #[tokio::test]
     async fn two_candidate_classifier_reports_empty_lane_without_provider_work() {
-        let temporary = tempfile::tempdir().expect("empty candidate root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("empty candidate root");
         let root = ManagedDir::open_root(temporary.path()).expect("open empty candidate root");
         let lease = ManagedRootPublicationLease::acquire(root)
             .await
@@ -4734,7 +4734,7 @@ mod settlement_tests {
 
     #[tokio::test]
     async fn two_candidate_classifier_reports_committed_child_without_provider_work() {
-        let temporary = tempfile::tempdir().expect("committed candidate root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("committed candidate root");
         let root = ManagedDir::open_root(temporary.path()).expect("open committed candidate root");
         let reconstruction =
             crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
@@ -5007,7 +5007,7 @@ mod settlement_tests {
 
     #[tokio::test]
     async fn malformed_active_intent_returns_indeterminate_without_livelock() {
-        let temporary = tempfile::tempdir().expect("malformed intent root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("malformed intent root");
         let root =
             ManagedDir::open_root(temporary.path()).expect("open malformed intent managed root");
         let reconstruction =

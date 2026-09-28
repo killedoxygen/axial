@@ -146,12 +146,37 @@ pub(super) async fn acquire_runtime_source(
     component: &super::model::RuntimeId,
     primary_platform: &str,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
-    let catalog_bytes = fetch_bounded_runtime_bytes(
+    acquire_runtime_source_from_catalog(
         component,
+        primary_platform,
         RUNTIME_MANIFEST_URL,
         RuntimeSourceTransportPolicy::HttpsOnly,
     )
-    .await?;
+    .await
+}
+
+#[cfg(feature = "test-support")]
+pub(super) async fn acquire_runtime_source_at_test_endpoint(
+    component: &RuntimeId,
+    primary_platform: &str,
+    endpoints: &crate::download::InstallTestEndpoints,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    acquire_runtime_source_from_catalog(
+        component,
+        primary_platform,
+        endpoints.runtime_catalog(),
+        RuntimeSourceTransportPolicy::AllowHttpForTest,
+    )
+    .await
+}
+
+async fn acquire_runtime_source_from_catalog(
+    component: &RuntimeId,
+    primary_platform: &str,
+    catalog_url: &str,
+    policy: RuntimeSourceTransportPolicy,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    let catalog_bytes = fetch_bounded_runtime_bytes(component, catalog_url, policy).await?;
     let catalog = serde_json::from_slice::<RuntimeManifest>(&catalog_bytes).map_err(|error| {
         runtime_source_failure(
             component,
@@ -160,12 +185,7 @@ pub(super) async fn acquire_runtime_source(
         )
     })?;
     let expected = select_runtime_manifest(&catalog, component, primary_platform)?.clone();
-    acquire_runtime_source_from_descriptor(
-        component.clone(),
-        expected,
-        RuntimeSourceTransportPolicy::HttpsOnly,
-    )
-    .await
+    acquire_runtime_source_from_descriptor(component.clone(), expected, policy).await
 }
 
 async fn acquire_runtime_source_from_descriptor(
@@ -306,7 +326,7 @@ pub(super) struct RuntimeDownloadManifest {
 pub(super) type RuntimeManifest = HashMap<String, HashMap<String, Vec<RuntimeManifestEntry>>>;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RuntimeSourceReceipt {
+pub struct RuntimeSourceReceipt {
     component: super::model::RuntimeId,
     bytes: Arc<[u8]>,
     expected: RuntimeDownloadManifest,
@@ -314,19 +334,19 @@ pub(crate) struct RuntimeSourceReceipt {
 }
 
 impl RuntimeSourceReceipt {
-    pub(crate) fn component(&self) -> &super::model::RuntimeId {
+    pub fn component(&self) -> &super::model::RuntimeId {
         &self.component
     }
 
-    pub(crate) fn bytes(&self) -> &[u8] {
+    pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    pub(crate) fn expected_sha1(&self) -> &str {
+    pub fn expected_sha1(&self) -> &str {
         &self.expected.sha1
     }
 
-    pub(crate) fn expected_size(&self) -> u64 {
+    pub fn expected_size(&self) -> u64 {
         self.expected.size
     }
 
@@ -376,17 +396,31 @@ pub(super) async fn acquire_runtime_source_for_test(
 pub(super) fn authenticated_runtime_source_fixture_for_test(
     component: super::model::RuntimeId,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
-    const MANIFEST: &[u8] = br#"{"files":{"bin":{"type":"directory"},"bin/java":{"type":"file","executable":true,"downloads":{"raw":{"url":"https://fixtures.invalid/java","sha1":"11f6ad8ec52a2984abaafd7c3b516503785c2072","size":1}}}}}"#;
-    const MANIFEST_SHA1: &str = "2797f4f6a71abbbf22d8a8d4386f93135e46cf06";
+    let manifest = serde_json::json!({
+        "files": {
+            "bin": { "type": "directory" },
+            (super::layout::runtime_java_relative_path()): {
+                "type": "file",
+                "executable": true,
+                "downloads": { "raw": {
+                    "url": "https://fixtures.invalid/java",
+                    "sha1": "11f6ad8ec52a2984abaafd7c3b516503785c2072",
+                    "size": 1
+                }}
+            }
+        }
+    })
+    .to_string()
+    .into_bytes();
 
     authenticate_runtime_source_bytes(
         component,
         RuntimeDownloadManifest {
             url: "https://fixtures.invalid/runtime-manifest.json".to_string(),
-            sha1: MANIFEST_SHA1.to_string(),
-            size: MANIFEST.len() as u64,
+            sha1: format!("{:x}", Sha1::digest(&manifest)),
+            size: manifest.len() as u64,
         },
-        MANIFEST.to_vec(),
+        manifest,
         RuntimeSourceTransportPolicy::HttpsOnly,
     )
 }

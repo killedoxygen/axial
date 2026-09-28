@@ -16,12 +16,6 @@ export interface CreateResultPresentationSource {
     summary?: string;
     detail?: string | null;
   };
-  guardian_notice?: {
-    state_id?: string;
-    tone?: string;
-    message?: string;
-    detail?: string | null;
-  };
 }
 
 function trimmed(value: unknown): string {
@@ -42,21 +36,16 @@ function appendUnique(parts: string[], value: string): void {
 export function createResultToastMessage(source: CreateResultPresentationSource): string {
   const summary = trimmed(source.view_model?.summary);
   const detail = trimmed(source.view_model?.detail);
-  const guardianMessage = trimmed(source.guardian_notice?.message);
-  const guardianDetail = trimmed(source.guardian_notice?.detail);
   const parts: string[] = [];
 
   appendUnique(parts, summary);
-  appendUnique(parts, guardianMessage);
   appendUnique(parts, detail);
-  appendUnique(parts, guardianDetail);
   return parts.join(' ');
 }
 
 function noticeTone(value: string): string {
   if (value === 'warn' || value === 'warned') return 'warned';
   if (value === 'error') return 'error';
-  if (value === 'intervened') return 'intervened';
   if (value === 'success') return 'success';
   return 'info';
 }
@@ -64,7 +53,6 @@ function noticeTone(value: string): string {
 function noticeIcon(tone: string): IconName {
   if (tone === 'success') return 'check-circle';
   if (tone === 'error' || tone === 'warned') return 'alert';
-  if (tone === 'intervened') return 'shield-check';
   return 'info';
 }
 

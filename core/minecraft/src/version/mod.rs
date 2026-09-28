@@ -1175,7 +1175,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time ok")
             .as_nanos();
-        std::env::temp_dir().join(format!("axial-{name}-{unique}"))
+        crate::test_temp_root().join(format!("axial-{name}-{unique}"))
     }
 
     fn scan_versions(path: &Path) -> std::io::Result<Vec<crate::types::VersionEntry>> {

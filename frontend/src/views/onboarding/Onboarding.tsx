@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Input } from '../../ui/Atoms';
 import { Slider } from '../../ui/Slider';
 import { Icon } from '../../ui/Icons';
@@ -20,9 +20,17 @@ import { refreshAccountSkin } from '../../player-skin';
 import { fmtMem } from '../../format';
 import { errMessage, getMemoryRecommendation, validateUsername } from '../../utils';
 import { hasNativeDesktopRuntime } from '../../native';
-import { authStatusResponse, isRecord } from '../accounts/api';
-import type { AuthStatusRecord, AuthStatusState } from '../accounts/types';
+import type { AuthStatusRecord } from '../accounts/types';
 import { useMicrosoftSignIn } from '../accounts/useMicrosoftSignIn';
+import { saveConfigPatch } from '../../hooks/use-autosave';
+import {
+  accountsNotice,
+  accountsSnapshot,
+  activeAccount,
+  createOfflineAccount,
+  refreshAccountsData,
+  selectAccount,
+} from '../../machines/accounts';
 
 type Stage = 'name' | 'memory' | 'color' | 'music' | 'telemetry' | 'discord';
 const ORDER: Stage[] = ['name', 'memory', 'color', 'music', 'telemetry', 'discord'];
@@ -34,16 +42,6 @@ const STAGE_LABELS: Record<Stage, string> = {
   telemetry: 'Stats',
   discord: 'Activity',
 };
-
-async function readAuthStatus(): Promise<AuthStatusRecord> {
-  const response = await api('GET', '/auth/status');
-  if (isRecord(response) && typeof response.error === 'string') {
-    throw new Error(response.error);
-  }
-  const parsed = authStatusResponse(response);
-  if (!parsed) throw new Error('invalid auth status');
-  return parsed;
-}
 
 function statusOnlineReady(status: AuthStatusRecord | null): boolean {
   return status?.online_action?.state_id === 'online_ready';
@@ -154,35 +152,23 @@ export function Onboarding(): JSX.Element | null {
   const [discordRpcEnabled, setDiscordRpcEnabled] = useState<boolean>(config.value?.discord_rpc_enabled !== false);
   const [isWeirdo, setIsWeirdo] = useState<boolean>(local.lightness >= 50);
   const [saving, setSaving] = useState(false);
+  const saveInFlight = useRef(false);
   const [dissolving, setDissolving] = useState(false);
   // The focused input hint shows Enter because arrow keys move the text cursor.
   const [nameFocused, setNameFocused] = useState(false);
-  const [authStatus, setAuthStatus] = useState<AuthStatusRecord | null>(null);
-  const [authState, setAuthState] = useState<AuthStatusState>('loading');
-  const [onlineAfterOnboarding, setOnlineAfterOnboarding] = useState(false);
+  const { status: authStatus, state: authState } = accountsSnapshot.value;
+  const onlineAfterOnboarding = statusOnlineReady(authStatus);
   const microsoftSignInAvailable = hasNativeDesktopRuntime() || authStatus?.login_available !== false;
   const microsoftLogin = useMicrosoftSignIn({
     canStart: !saving && authState === 'ready' && microsoftSignInAvailable,
     onAuthenticated: async (result) => {
-      let refreshedStatus: AuthStatusRecord | null = null;
-      try {
-        refreshedStatus = await readAuthStatus();
-      } catch (err: unknown) {
-        console.warn('Could not refresh Microsoft sign-in status during onboarding.', err);
-        refreshedStatus = null;
-      }
-
-      if (refreshedStatus) {
-        setAuthStatus(refreshedStatus);
-        setAuthState('ready');
-      }
+      const refreshedStatus = accountsSnapshot.value.status;
       const profileName =
         refreshedStatus?.minecraft_profile?.name ?? result.profile_name ?? refreshedStatus?.username ?? '';
       const nextUsername = clampPlayerNameInput(profileName);
       if (nextUsername) setUsername(nextUsername);
 
       const backendOnlineReady = statusOnlineReady(refreshedStatus);
-      setOnlineAfterOnboarding(backendOnlineReady);
       if (backendOnlineReady && nextUsername && validateUsername(nextUsername) === null && stage === 'name') {
         setStage('memory');
         setMaxReached((m) => Math.max(m, 1));
@@ -222,6 +208,7 @@ export function Onboarding(): JSX.Element | null {
   };
 
   const jumpTo = (i: number): void => {
+    if (saveInFlight.current || dissolving) return;
     const target = ORDER[i];
     if (!target || i === idx) return;
     // Only stages reached through the validated path can be jump targets.
@@ -231,35 +218,18 @@ export function Onboarding(): JSX.Element | null {
   };
 
   useEffect(() => {
-    let active = true;
-    setAuthState('loading');
-    void readAuthStatus()
-      .then((status) => {
-        if (!active) return;
-        setAuthStatus(status);
-        setOnlineAfterOnboarding(statusOnlineReady(status));
-        setAuthState('ready');
-      })
-      .catch(() => {
-        if (!active) return;
-        setAuthStatus(null);
-        setAuthState('unavailable');
-      });
-
-    return () => {
-      active = false;
-    };
+    void refreshAccountsData();
   }, []);
 
   const commit = async (): Promise<void> => {
-    if (saving) return;
+    if (saveInFlight.current || dissolving) return;
     if (!nameValid) {
       setStage('name');
       return;
     }
     if (musicEnabled == null) return;
+    saveInFlight.current = true;
     setSaving(true);
-    const prevConfig = config.value;
     try {
       const patch: Record<string, unknown> = {
         max_memory_mb: Math.round(memory * 1024),
@@ -272,14 +242,24 @@ export function Onboarding(): JSX.Element | null {
       if (onlineAfterOnboarding) {
         patch.launch_auth_mode = 'online';
       } else {
-        const account = await api('POST', '/accounts/offline', { username: username.trim() });
-        if (isRecord(account) && typeof account.error === 'string') {
-          throw new Error(account.error);
+        await refreshAccountsData();
+        const snapshot = accountsSnapshot.value;
+        if (snapshot.state !== 'ready') throw new Error('Could not load accounts. Try again.');
+        const existing = snapshot.accounts.find(
+          (account) => account.kind === 'offline' && account.display_name === username.trim(),
+        );
+        if (existing) {
+          if (!existing.active) await selectAccount(existing);
+          if (activeAccount()?.account_id !== existing.account_id) {
+            throw new Error(accountsNotice.value ?? 'Could not select the offline account. Try again.');
+          }
+        } else if (!(await createOfflineAccount(username.trim()))) {
+          throw new Error(accountsNotice.value ?? 'Could not create the offline account. Try again.');
         }
         patch.username = username.trim();
         patch.launch_auth_mode = 'offline';
       }
-      config.value = configResponse(await api('PUT', '/config', patch));
+      await saveConfigPatch(patch);
       if (patch.launch_auth_mode === 'online') {
         try {
           await api('POST', '/skins/from-profile', { mark_current: true });
@@ -288,14 +268,18 @@ export function Onboarding(): JSX.Element | null {
         }
       }
       refreshAccountSkin();
-      const complete = async (): Promise<void> => {
-        const error = dtoError(await api('POST', '/onboarding/complete'));
-        if (error) throw new Error(error);
-      };
+      let completionError: unknown;
       try {
-        await complete();
-      } catch {
-        await complete();
+        const error = dtoError(
+          await api('POST', '/onboarding/complete', { expected_revision: config.value?.revision }),
+        );
+        if (error) throw new Error(error);
+      } catch (err) {
+        completionError = err;
+      }
+      config.value = configResponse(await api('GET', '/config'));
+      if (!config.value.onboarding_done) {
+        throw completionError ?? new Error('Onboarding progress was not saved. Try again.');
       }
       Music.applyConfig({ music_enabled: musicEnabled, music_volume: 5 });
       if (musicEnabled) void Music.play();
@@ -304,8 +288,14 @@ export function Onboarding(): JSX.Element | null {
         showOnboardingOverlay.value = false;
       }, 560);
     } catch (err) {
-      config.value = prevConfig;
-      toast(`Couldn't finish onboarding: ${errMessage(err)}`);
+      // Earlier commands may have committed even when a later step failed.
+      try {
+        config.value = configResponse(await api('GET', '/config'));
+      } catch {
+        // Keep the last acknowledged config when recovery is unavailable.
+      }
+      toast(`Couldn't finish onboarding: ${errMessage(err)}`, 'error');
+      saveInFlight.current = false;
       setSaving(false);
     }
   };
@@ -341,7 +331,7 @@ export function Onboarding(): JSX.Element | null {
     return () => {
       window.removeEventListener('keydown', h);
     };
-  }, [stage, nameValid, musicEnabled, discordRpcEnabled, saving, dissolving, idx, maxReached, microsoftLogin.busy]);
+  });
 
   let headline = '';
   let subline: JSX.Element | null = null;

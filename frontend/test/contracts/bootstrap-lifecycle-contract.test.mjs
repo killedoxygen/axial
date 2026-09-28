@@ -32,8 +32,8 @@ test('bootstrap-lifecycle frontend bootstrap gates Ready and retains an explicit
   assert.match(bootstrap, /refreshInstallQueue[\s\S]*?\.catch\(/);
   ordered(bootstrap, [
     "api('GET', '/status').then(launcherStatusResponse)",
-    "api('GET', '/versions').then(versionsResponse)",
-    'instances.value = instancesRes.instances',
+    'refreshInstallQueue({ connectActive: true, requireInstalledState: true })',
+    'launchSessions.value = sessionsRes',
     "bootstrapState.value = 'ready'",
   ]);
   assert.match(splash, /role=\{state === 'error' \? 'alert' : 'status'\}/);

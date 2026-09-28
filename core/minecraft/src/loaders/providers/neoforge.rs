@@ -1,8 +1,9 @@
 use super::common::{
     NEOFORGE_MAVEN_META, fetch_text, infer_loader_build_metadata, is_prerelease_loader_version,
-    neoforge_install_source, neoforge_to_minecraft_version, parse_maven_versions,
+    neoforge_install_source, parse_maven_versions,
     provider_installed_version_id,
 };
+pub use super::common::neoforge_to_minecraft_version;
 use crate::lifecycle::LifecycleMeta;
 use crate::loaders::api::build_id_for;
 use crate::loaders::types::{
@@ -18,7 +19,7 @@ pub async fn fetch_game_versions()
     Ok(parse_game_versions_from_maven_metadata(&xml))
 }
 
-fn parse_game_versions_from_maven_metadata(xml: &str) -> Vec<LoaderGameVersion> {
+pub fn parse_game_versions_from_maven_metadata(xml: &str) -> Vec<LoaderGameVersion> {
     let mut versions_by_stability = std::collections::HashMap::<String, bool>::new();
     for entry in parse_maven_versions(xml) {
         let Some(minecraft_version) = neoforge_to_minecraft_version(&entry) else {
@@ -49,10 +50,18 @@ pub async fn fetch_builds(
     minecraft_version: &str,
 ) -> Result<LoaderVersionIndex, crate::loaders::types::LoaderError> {
     let xml = fetch_text(NEOFORGE_MAVEN_META).await?;
+    parse_builds_from_maven_metadata(minecraft_version, &xml)
+}
+
+/// Normalize provider bytes without performing network or filesystem work.
+pub fn parse_builds_from_maven_metadata(
+    minecraft_version: &str,
+    xml: &str,
+) -> Result<LoaderVersionIndex, crate::loaders::types::LoaderError> {
     let component_id = LoaderComponentId::NeoForge;
     let mut builds = Vec::new();
 
-    for entry in parse_maven_versions(&xml) {
+    for entry in parse_maven_versions(xml) {
         let Some(resolved_minecraft_version) = neoforge_to_minecraft_version(&entry) else {
             continue;
         };

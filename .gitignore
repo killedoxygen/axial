@@ -7,6 +7,8 @@
 /dist/
 /evidence/
 node_modules
+__pycache__/
+*.py[cod]
 
 # Local environment
 .env
@@ -28,3 +30,22 @@ debug-builds
 
 # Generated tauri capability schemas (rebuilt per-platform on every compile)
 apps/desktop/gen/schemas/
+
+# Preserved local-only legacy outputs
+legacy/frontend/dist/
+legacy/frontend/static/app.js
+legacy/frontend/static/app.css
+legacy/frontend/static/chunks/
+legacy/frontend/dist.stage-*/
+legacy/frontend/dist.previous-*/
+legacy/apps/desktop/gen/schemas/
+legacy/plans/
+legacy/tmp/
+legacy/dist/
+legacy/evidence/
+legacy/assets/*.mp3
+legacy/assets/*.wav
+legacy/CHANGELOG-next.md
+
+# Replacement verification output
+.rewrite-logs/

@@ -33,6 +33,10 @@ function windowDimension(value: number | undefined, fallback: number): number {
 }
 
 export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
+  return <InstanceSettingsPane key={inst.id} inst={inst} />;
+}
+
+function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const cfg = config.value;
   const globalMode = globalPerformanceMode();
   const totalGb = systemInfo.value?.total_memory_mb
@@ -44,6 +48,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     send: (patch) => api('PUT', `/instances/${encodeURIComponent(inst.id)}`, patch).then(enrichedInstanceResponse),
     apply: (res) => updateInstanceInList(res),
     errorLabel: 'instance settings',
+    target: `/instances/${inst.id}`,
   });
 
   const [healthRefreshKey, setHealthRefreshKey] = useState(0);
@@ -78,14 +83,24 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
   const [jvmArgs, setJvmArgs] = useState(savedArgs);
   const argsTimer = useRef<number | null>(null);
   const pendingArgs = useRef<string | null>(null);
+  const flushArgs = useRef<() => void>(() => {});
 
   useEffect(() => {
     setMaxGb(savedMaxGb);
     setMinGb(savedMinGb);
+  }, [savedMaxGb, savedMinGb]);
+
+  useEffect(() => {
     setMode(savedMode);
+  }, [savedMode]);
+
+  useEffect(() => {
     setJavaPath(savedJavaPath);
-    setJvmArgs(savedArgs);
-  }, [inst.id, savedMaxGb, savedMinGb, savedMode, savedJavaPath, savedArgs]);
+  }, [savedJavaPath]);
+
+  useEffect(() => {
+    if (pendingArgs.current === null) setJvmArgs(savedArgs);
+  }, [savedArgs]);
 
   useEffect(() => {
     let cancelled = false;
@@ -131,8 +146,12 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     if (argsTimer.current !== null) window.clearTimeout(argsTimer.current);
     argsTimer.current = window.setTimeout(() => {
       argsTimer.current = null;
-      if (pendingArgs.current !== null) commitArgs(pendingArgs.current);
+      flushArgs.current();
     }, 600);
+  };
+
+  flushArgs.current = () => {
+    if (pendingArgs.current !== null) commitArgs(pendingArgs.current);
   };
 
   useEffect(() => {
@@ -141,7 +160,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
         window.clearTimeout(argsTimer.current);
         argsTimer.current = null;
       }
-      if (pendingArgs.current !== null) commitArgs(pendingArgs.current);
+      flushArgs.current();
     };
   }, [inst.id]);
 
@@ -214,7 +233,10 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
               <OverrideChip
                 onReset={() => {
                   setJavaPath('');
-                  commit({ jvm_preset: '', java_path: '' }, { label: 'runtime', onSuccess: bumpHealth });
+                  commit(
+                    { jvm_preset: '', java_path: '' },
+                    { label: 'runtime', revert: () => setJavaPath(savedJavaPath), onSuccess: bumpHealth },
+                  );
                 }}
               />
             )

@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { resolve } from 'node:path';
 import test from 'node:test';
+import vm from 'node:vm';
 import { toChildArray, type VNode } from 'preact';
+import * as Three from 'three';
 
 import brandMark from '../../assets/brand-mark.json';
 import { Sound } from '../src/sound';
 import { InstanceGlyph, type VisualInstance } from '../src/ui/InstanceVisual';
 import { Logo } from '../src/ui/Logo';
 import { MicrosoftMark } from '../src/ui/MicrosoftMark';
+import * as skinThree from '../src/views/accounts/three';
 import { LOADER_LABELS, type LoaderKey } from '../src/views/create/defaults';
 import { LoaderLogo, loaderLogoSrc } from '../src/views/create/loader-logos';
 
@@ -17,6 +22,48 @@ function functionalResult(vnode: VNode): VNode<LooseProps> {
   assert.equal(typeof vnode.type, 'function');
   return (vnode.type as (props: LooseProps) => VNode<LooseProps>)(vnode.props);
 }
+
+test('the skin renderer receives the original Three exports through its narrow boundary', () => {
+  assert.equal(Object.keys(skinThree).length, 18);
+  for (const [name, value] of Object.entries(skinThree)) {
+    assert.equal(value, Three[name as keyof typeof Three], name);
+  }
+});
+
+test('concurrent skin renderer loads share one promise and a failed load permits retry', async () => {
+  const filename = resolve('src/views/accounts/skin-three-loader.ts');
+  const ts: typeof import('typescript') = createRequire(resolve('package.json'))('typescript');
+  const output = ts.transpileModule(await readFile(filename, 'utf8'), {
+    fileName: filename,
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+  });
+  const exports = {} as typeof import('../src/views/accounts/skin-three-loader');
+  const failure = new Error('Skin renderer chunk unavailable');
+  let attempts = 0;
+  vm.runInNewContext(
+    output.outputText,
+    {
+      exports,
+      require(id: string) {
+        assert.equal(id, './three');
+        if (++attempts === 1) throw failure;
+        return skinThree;
+      },
+    },
+    { filename },
+  );
+  const first = exports.loadThree();
+  assert.equal(exports.loadThree(), first);
+  await assert.rejects(first, (error: unknown) => error === failure);
+  assert.equal(attempts, 1);
+
+  const retry = exports.loadThree();
+  assert.notEqual(retry, first);
+  assert.equal(exports.loadThree(), retry);
+  assert.equal(await retry, skinThree);
+  assert.equal(exports.loadThree(), retry);
+  assert.equal(attempts, 2);
+});
 
 test('Logo projects every path and viewBox directly from the sole brand manifest', () => {
   const logo = Logo({ size: 40 });

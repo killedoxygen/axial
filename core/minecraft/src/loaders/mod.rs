@@ -17,12 +17,14 @@ pub use api::{
     validate_materialized_loader_profile,
 };
 pub(crate) use bound_processors::VerifiedProcessorOutputs;
-pub(crate) use compose::{LoaderProfileFragment, compose_loader_version};
+pub use compose::{LoaderProfileFragment, compose_loader_version};
+#[cfg(test)]
+pub(crate) use forge_installer::ProcessorDerivation;
 pub(crate) use forge_installer::{
     AuthenticatedEmbeddedMavenArtifact, AuthenticatedInstallerLibraryInputs,
     AuthenticatedInstallerLibraryParts, AuthenticatedInstallerReceiptInput,
-    BoundForgeInstallExecution, PendingForgeInstallExecution, PendingForgeNetworkInstall,
-    PendingForgeReconstructionSources, VerifiedInstallerClientBytes,
+    BoundForgeInstallExecution, BoundProcessorOutputExpectation, PendingForgeInstallExecution,
+    PendingForgeNetworkInstall, PendingForgeReconstructionSources, VerifiedInstallerClientBytes,
     VerifiedInstallerReceiptSource,
 };
 pub use index::{
@@ -391,7 +393,7 @@ mod tests {
     }
 
     fn temp_library(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        crate::test_temp_root().join(format!(
             "axial-loader-{name}-{}-{}",
             std::process::id(),
             SystemTime::now()

@@ -6,6 +6,7 @@ import type {
   InstallQueueActiveViewModel,
   InstallQueueContentAction,
   InstallQueueContentItemViewModel,
+  InstallQueueFailureViewModel,
   InstallQueueInstallItemViewModel,
   InstallQueueNoticeViewModel,
   InstallQueueStateResponse,
@@ -22,6 +23,12 @@ const LOADER_IDS = [
   'net.minecraftforge',
   'net.neoforged',
 ] as const;
+
+function unsignedInteger(value: unknown, label: string): number {
+  const number = dtoNumber(value, label);
+  if (!Number.isSafeInteger(number) || number < 0) throw new Error(`${label} must be a safe unsigned integer.`);
+  return number;
+}
 
 function nullableString(value: unknown, label: string): string | null | undefined {
   if (value === undefined) return undefined;
@@ -123,7 +130,7 @@ function contentItemResponse(value: unknown): InstallQueueContentItemViewModel {
   };
 }
 
-function installItemResponse(value: unknown): InstallQueueInstallItemViewModel {
+export function installItemResponse(value: unknown): InstallQueueInstallItemViewModel {
   const record = dtoRecord(value, 'Install queue item');
   const loader = record.loader == null ? null : dtoRecord(record.loader, 'Install loader item');
   return {
@@ -150,8 +157,8 @@ function queuedItemResponse(value: unknown): InstallQueuedItemViewModel {
     label: dtoString(record.label, 'Queued install label'),
     summary: dtoString(record.summary, 'Queued install summary'),
     detail: dtoString(record.detail, 'Queued install detail'),
-    position: dtoNumber(record.position, 'Queued install position'),
-    total: dtoNumber(record.total, 'Queued install total'),
+    position: unsignedInteger(record.position, 'Queued install position'),
+    total: unsignedInteger(record.total, 'Queued install total'),
     install_item: installItemResponse(record.install_item),
     remove_action: actionResponse(record.remove_action),
   };
@@ -164,7 +171,7 @@ function queueViewResponse(value: unknown): InstallQueueViewModel {
     status_label: dtoString(record.status_label, 'Install queue status'),
     title: dtoString(record.title, 'Install queue title'),
     summary: dtoString(record.summary, 'Install queue summary'),
-    queued_count: dtoNumber(record.queued_count, 'Install queue count'),
+    queued_count: unsignedInteger(record.queued_count, 'Install queue count'),
     queued_count_label: dtoString(record.queued_count_label, 'Install queue count label'),
     queued_item_label: dtoString(record.queued_item_label, 'Install queue item label'),
     next_label: nullableString(record.next_label, 'Install queue next label'),
@@ -191,13 +198,14 @@ function activeResponse(value: unknown): InstallQueueActiveViewModel {
     install_id: nullableString(record.install_id, 'Active install id'),
     operation_id: nullableString(record.operation_id, 'Active operation id'),
     install_started_at_ms:
-      record.install_started_at_ms == null ? null : dtoNumber(record.install_started_at_ms, 'Install start time'),
+      record.install_started_at_ms == null ? null : unsignedInteger(record.install_started_at_ms, 'Install start time'),
     kind: dtoEnum(record.kind, 'Active install kind', ['vanilla', 'loader', 'content'] as const),
     title: dtoString(record.title, 'Active install title'),
     label: dtoString(record.label, 'Active install label'),
     summary: dtoString(record.summary, 'Active install summary'),
     install_item: installItemResponse(record.install_item),
     progress: installProgressViewModelResponse(record.progress),
+    ...(record.retry_action === undefined ? {} : { retry_action: actionResponse(record.retry_action) }),
   };
 }
 
@@ -213,7 +221,13 @@ function noticeResponse(value: unknown): InstallQueueNoticeViewModel {
 
 export function installQueueStateResponse(value: unknown): InstallQueueStateResponse {
   const record = dtoRecord(value, 'Install queue');
+  const epoch = dtoString(record.queue_epoch, 'Install queue epoch');
+  if (!epoch || epoch.length > 128) throw new Error('Install queue epoch was invalid.');
   return {
+    queue_epoch: epoch,
+    revision: unsignedInteger(record.revision, 'Install queue revision'),
+    registry_revision: unsignedInteger(record.registry_revision, 'Install registry revision'),
+    latest_failure: record.latest_failure == null ? null : queueFailureResponse(record.latest_failure),
     active: record.active == null ? null : activeResponse(record.active),
     items: dtoArray(record.items, 'Install queue items').map(queuedItemResponse),
     view_model: queueViewResponse(record.view_model),
@@ -223,9 +237,29 @@ export function installQueueStateResponse(value: unknown): InstallQueueStateResp
   };
 }
 
+function queueFailureResponse(value: unknown): InstallQueueFailureViewModel {
+  const record = dtoRecord(value, 'Install queue failure');
+  return {
+    failed_at_ms: unsignedInteger(record.failed_at_ms, 'Install failure time'),
+    queue_id: dtoString(record.queue_id, 'Failed queue id'),
+    install_id: dtoString(record.install_id, 'Failed install id'),
+    operation_id: dtoString(record.operation_id, 'Failed operation id'),
+    label: dtoString(record.label, 'Failed install label'),
+    install_item: installItemResponse(record.install_item),
+    failure_view_model: failureResponse(record.failure_view_model),
+  };
+}
+
 export function installStatusResponse(value: unknown): InstallStatusResponse {
   const record = dtoRecord(value, 'Install status');
   return {
+    revision: unsignedInteger(record.revision, 'Install status revision'),
+    queue_id: dtoString(record.queue_id, 'Install status queue id'),
+    outcome:
+      record.outcome === null
+        ? null
+        : dtoEnum(record.outcome, 'Install outcome', ['succeeded', 'failed', 'cancelled', 'removed'] as const),
+    allowed_actions: dtoArray(record.allowed_actions, 'Install allowed actions').map(actionResponse),
     install_id: dtoString(record.install_id, 'Install status id'),
     operation_id: dtoString(record.operation_id, 'Install status operation'),
     done: dtoBoolean(record.done, 'Install status done'),

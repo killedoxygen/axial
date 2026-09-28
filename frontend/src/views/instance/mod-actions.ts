@@ -8,7 +8,7 @@ import type { ContextMenuItem } from '../../ui/ContextMenu';
 import type { ContentUpdate, InstanceContentEntry } from '../../types-content';
 import type { EnrichedInstance, InstanceMod } from '../../types-instance';
 import { openInstanceFolder } from './instance-actions';
-import { confirmDeleteItems, partialFailureMessage, runBulkMutation } from './bulk-actions';
+import { confirmDeleteItems, partialFailureMessage, runBulkMutation, runResourceMutation } from './bulk-actions';
 import {
   beginModProvenanceRefresh,
   cacheModProvenance,
@@ -16,7 +16,7 @@ import {
   isCurrentModProvenanceRefresh,
   type ModProvenance,
 } from './mod-provenance-cache';
-import { dtoError } from '../../dto-contract';
+import { requireResourceCommandSuccess } from './resources';
 const CONTENT_INSTALL_BATCH_LIMIT = 40;
 
 export { cachedModProvenance, type ModProvenance } from './mod-provenance-cache';
@@ -54,55 +54,58 @@ export async function fetchModProvenance(
     const checked: ModProvenance = { entries, updates };
     cacheModProvenance(instanceId, checked);
     onData(checked);
-  } catch {
-    // A failed check reads as "no updates"; the list itself still works offline.
+  } catch (err) {
+    if (!isCurrentModProvenanceRefresh(instanceId, generation)) return;
+    const failed: ModProvenance = { ...listed, updateError: `Could not check mod updates: ${errMessage(err)}` };
+    cacheModProvenance(instanceId, failed);
+    onData(failed);
   }
 }
 
 export async function applyModUpdates(inst: EnrichedInstance, updates: ContentUpdate[]): Promise<void> {
   if (updates.length === 0) return;
-  const single = updates.length === 1 ? (updates[0].title ?? 'mod') : null;
-  const label = single ? `Updating ${single}` : `Updating ${updates.length} mods`;
-  toast(`${label}…`, 'info');
-  let queuedCount = 0;
-  try {
-    for (let offset = 0; offset < updates.length; offset += CONTENT_INSTALL_BATCH_LIMIT) {
-      const batch = updates.slice(offset, offset + CONTENT_INSTALL_BATCH_LIMIT);
-      const queue = await installContent(
-        inst.id,
-        batch.map((update) => ({
-          canonical_id: update.canonical_id,
-          kind: update.kind,
-          version_id: update.latest_version_id,
-        })),
-      );
-      queuedCount += batch.length;
-      const finalBatch = queuedCount === updates.length;
-      await applyInstallQueueResponse(queue, {
-        showNotice: finalBatch,
-        connectActive: finalBatch,
-      });
+  await runResourceMutation(inst.id, 'Queue mod updates', async () => {
+    const single = updates.length === 1 ? (updates[0].title ?? 'mod') : null;
+    const label = single ? `Updating ${single}` : `Updating ${updates.length} mods`;
+    toast(`${label}…`, 'info');
+    let queuedCount = 0;
+    try {
+      for (let offset = 0; offset < updates.length; offset += CONTENT_INSTALL_BATCH_LIMIT) {
+        const batch = updates.slice(offset, offset + CONTENT_INSTALL_BATCH_LIMIT);
+        const queue = await installContent(
+          inst.id,
+          batch.map((update) => ({
+            canonical_id: update.canonical_id,
+            kind: update.kind,
+            version_id: update.latest_version_id,
+          })),
+        );
+        queuedCount += batch.length;
+        const finalBatch = queuedCount === updates.length;
+        await applyInstallQueueResponse(queue, {
+          showNotice: finalBatch,
+          connectActive: finalBatch,
+        });
+      }
+      toast(single ? `${single} update queued` : `${updates.length} mod updates queued`);
+    } catch (err) {
+      const prefix = queuedCount > 0 ? `Queued ${queuedCount} of ${updates.length} updates. ` : '';
+      throw new Error(`${prefix}Could not queue the remaining updates: ${errMessage(err)}`);
     }
-    toast(single ? `${single} update queued` : `${updates.length} mod updates queued`);
-  } catch (err) {
-    const prefix = queuedCount > 0 ? `Queued ${queuedCount} of ${updates.length} updates. ` : '';
-    toast(`${prefix}Could not queue the remaining updates: ${errMessage(err)}`, 'error');
-  }
+  });
 }
 
 export async function removeManagedMod(inst: EnrichedInstance, entry: InstanceContentEntry): Promise<void> {
-  const confirmed = await confirmDeleteItems({
-    count: 1,
-    itemLabel: 'mod',
-    message: `Remove "${entry.title ?? entry.filename}" from this instance. This deletes the file and its install record.`,
-  });
-  if (!confirmed) return;
-  try {
+  await runResourceMutation(inst.id, 'Remove mod', async () => {
+    const confirmed = await confirmDeleteItems({
+      count: 1,
+      itemLabel: 'mod',
+      message: `Remove "${entry.title ?? entry.filename}" from this instance. This deletes the file and its install record.`,
+    });
+    if (!confirmed) return;
     await queueManagedModRemoval(inst, entry, true);
     toast('Mod removal queued');
-  } catch (err) {
-    toast(`Could not remove the mod: ${errMessage(err)}`, 'error');
-  }
+  });
 }
 
 async function queueManagedModRemoval(
@@ -129,25 +132,22 @@ async function updateModEnabled(inst: EnrichedInstance, modName: string, enabled
   const res = await api('PUT', `/instances/${encodeURIComponent(inst.id)}/mods/${encodeURIComponent(modName)}`, {
     enabled,
   });
-  const error = dtoError(res);
-  if (error) throw new Error(error);
+  requireResourceCommandSuccess(res, 'Mod update');
 }
 
 async function removeMod(inst: EnrichedInstance, modName: string): Promise<void> {
-  const error = dtoError(
+  requireResourceCommandSuccess(
     await api('DELETE', `/instances/${encodeURIComponent(inst.id)}/mods/${encodeURIComponent(modName)}`),
+    'Mod deletion',
   );
-  if (error) throw new Error(error);
 }
 
 export async function setModEnabled(inst: EnrichedInstance, mod: InstanceMod, onDone: () => void): Promise<void> {
-  try {
+  await runResourceMutation(inst.id, mod.enabled ? 'Disable mod' : 'Enable mod', async () => {
     await updateModEnabled(inst, mod.name, !mod.enabled);
     toast(!mod.enabled ? 'Mod enabled' : 'Mod disabled');
     onDone();
-  } catch (err) {
-    toast(`Could not update the mod: ${errMessage(err)}`, 'error');
-  }
+  });
 }
 
 export async function setModsEnabled(
@@ -155,19 +155,23 @@ export async function setModsEnabled(
   mods: InstanceMod[],
   enabled: boolean,
   onDone: () => void,
+  onFailure?: () => void,
 ): Promise<void> {
   const changed = mods.filter((mod) => mod.enabled !== enabled);
   if (changed.length === 0) {
     toast(enabled ? 'Selected mods are already enabled' : 'Selected mods are already disabled', 'info');
     return;
   }
-  await runBulkMutation({
-    items: changed,
-    action: (mod) => updateModEnabled(inst, mod.name, enabled),
-    success: (count) => (enabled ? `${count} mods enabled` : `${count} mods disabled`),
-    partial: (done, total, err) => partialFailureMessage('Updated', done, total, err),
-    onDone,
-  });
+  await runResourceMutation(inst.id, enabled ? 'Enable mods' : 'Disable mods', () =>
+    runBulkMutation({
+      items: changed,
+      action: (mod) => updateModEnabled(inst, mod.name, enabled),
+      success: (count) => (enabled ? `${count} mods enabled` : `${count} mods disabled`),
+      partial: (done, total, err) => partialFailureMessage('Updated', done, total, err),
+      onDone,
+      onFailure,
+    }),
+  );
 }
 
 export async function deleteMods(
@@ -175,38 +179,43 @@ export async function deleteMods(
   mods: InstanceMod[],
   onDone: () => void,
   managedEntries: ReadonlyMap<string, InstanceContentEntry> = new Map(),
+  onFailure?: () => void,
 ): Promise<void> {
-  const removals = mods.map((mod) => ({
-    mod,
-    entry: managedEntries.get(modBaseName(mod.name)),
-  }));
-  const managedCount = removals.filter(({ entry }) => entry !== undefined).length;
-  const confirmed = await confirmDeleteItems({
-    count: mods.length,
-    itemLabel: 'mod',
-    message:
-      mods.length === 1
-        ? `Remove "${mods[0]!.name}" from this instance. This deletes the mod file${managedCount ? ' and its install record' : ''}.`
-        : `Remove ${mods.length} mods from this instance. Managed mods are safely removed from the install record too.`,
+  if (mods.length === 0) return;
+  await runResourceMutation(inst.id, 'Delete mods', async () => {
+    const removals = mods.map((mod) => ({
+      mod,
+      entry: managedEntries.get(modBaseName(mod.name)),
+    }));
+    const managedCount = removals.filter(({ entry }) => entry !== undefined).length;
+    const confirmed = await confirmDeleteItems({
+      count: mods.length,
+      itemLabel: 'mod',
+      message:
+        mods.length === 1
+          ? `Remove "${mods[0]!.name}" from this instance. This deletes the mod file${managedCount ? ' and its install record' : ''}.`
+          : `Remove ${mods.length} mods from this instance. Managed mods are safely removed from the install record too.`,
+    });
+    if (!confirmed) return;
+    const managed = removals.flatMap(({ entry }) => (entry ? [entry] : []));
+    const unmanaged = removals.flatMap(({ mod, entry }) => (entry ? [] : [mod]));
+    let started = 0;
+    try {
+      if (managed.length > 0) {
+        await queueManagedModRemovals(inst, managed, false);
+        started += managed.length;
+      }
+      for (const mod of unmanaged) {
+        await removeMod(inst, mod.name);
+        started += 1;
+      }
+      toast(started === 1 ? 'Mod removal started' : `${started} mod removals started`);
+    } catch (err) {
+      onFailure?.();
+      throw new Error(partialFailureMessage('Started removal for', started, mods.length, err));
+    }
+    onDone();
   });
-  if (!confirmed) return;
-  const managed = removals.flatMap(({ entry }) => (entry ? [entry] : []));
-  const unmanaged = removals.flatMap(({ mod, entry }) => (entry ? [] : [mod]));
-  let started = 0;
-  try {
-    if (managed.length > 0) {
-      await queueManagedModRemovals(inst, managed, false);
-      started += managed.length;
-    }
-    for (const mod of unmanaged) {
-      await removeMod(inst, mod.name);
-      started += 1;
-    }
-    toast(started === 1 ? 'Mod removal started' : `${started} mod removals started`);
-  } catch (err) {
-    toast(partialFailureMessage('Started removal for', started, mods.length, err), 'error');
-  }
-  onDone();
 }
 
 export function modMenuItems(
@@ -244,7 +253,12 @@ export function modMenuItems(
     { divider: true, label: '', onSelect: () => undefined },
     entry
       ? { icon: 'trash', label: 'Remove', onSelect: () => void removeManagedMod(inst, entry), danger: true }
-      : { icon: 'trash', label: 'Delete', onSelect: () => void deleteMods(inst, [mod], onRefresh), danger: true },
+      : {
+          icon: 'trash',
+          label: 'Delete',
+          onSelect: () => void deleteMods(inst, [mod], onRefresh, undefined, onRefresh),
+          danger: true,
+        },
   );
   return items;
 }

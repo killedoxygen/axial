@@ -2,6 +2,8 @@ mod cache;
 mod normalize;
 mod query;
 
+pub use normalize::normalize_supported_versions;
+
 pub use query::{
     fetch_builds, fetch_cached_builds, fetch_components, fetch_supported_versions,
     resolve_build_record_for_install,

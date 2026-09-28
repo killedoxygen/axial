@@ -193,7 +193,25 @@ async function probePosixProcessGroup(processGroup) {
     process.kill(-processGroup, 0);
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ESRCH') return 'settled';
-    if (process.platform !== 'linux') return 'unprovable';
+    if (process.platform !== 'linux' && process.platform !== 'darwin') return 'unprovable';
+  }
+
+  // Darwin may return EPERM for a zombie-only group until launchd reaps it.
+  // Observe the kernel process list rather than treating that error as absence.
+  if (process.platform === 'darwin') {
+    const result = spawnSync('/bin/ps', ['-axo', 'pgid=,stat='], {
+      encoding: 'utf8',
+      timeout: 1_000,
+      maxBuffer: 8 * 1024 * 1024,
+      env: { ...process.env, LC_ALL: 'C' },
+    });
+    if (result.error || result.signal || result.status !== 0 || !result.stdout.trim()) return 'unprovable';
+    for (const line of result.stdout.trim().split('\n')) {
+      const row = /^\s*(\d+)\s+([A-Z][^\s]*)\s*$/.exec(line);
+      if (!row) return 'unprovable';
+      if (Number(row[1]) === processGroup && !['X', 'Z'].includes(row[2][0])) return 'active';
+    }
+    return 'settled';
   }
 
   if (process.platform !== 'linux') return 'active';
@@ -406,6 +424,9 @@ async function compileTests({ dependencyRoot, entries, frontendRoot, outputRoot,
     sourcemap: 'inline',
     tsconfig: tsconfigPath,
     ...semantics,
+    // Test entrypoints run as Node ESM and may await fixture setup. Keep the
+    // application transforms while allowing this Node-only harness syntax.
+    supported: { 'top-level-await': true },
     plugins: [
       ...(semantics.plugins ?? []),
       {
@@ -482,7 +503,7 @@ export async function runFrontendTests({
 
     const testEnvironment = { ...process.env };
     delete testEnvironment.NODE_TEST_CONTEXT;
-    const testRun = await runBoundedChild(process.execPath, ['--test', `--test-timeout=${testTimeoutMs}`, ...outputs], {
+    const testRun = await runBoundedChild(process.execPath, ['--experimental-vm-modules', '--test', `--test-timeout=${testTimeoutMs}`, ...outputs], {
       cwd: frontendRoot,
       env: testEnvironment,
       graceMs,

@@ -1,5 +1,3 @@
-import type { GuardianFact, GuardianMode, GuardianSummary } from './types-guardian';
-
 export type LaunchActionTone = 'ok' | 'warn' | 'err' | 'mute';
 export type LaunchPrimaryAction = 'launch' | 'install' | 'blocked';
 
@@ -18,6 +16,13 @@ export interface LaunchSession {
   launchedAt: string;
   viewModel: LaunchStatusViewModel;
   statusRevision: number;
+}
+
+export interface LaunchLogEntry {
+  sequence: number;
+  source: 'stdout' | 'stderr';
+  text: string;
+  truncated: boolean;
 }
 
 export type LaunchOverrideOrigin = 'global' | 'instance';
@@ -79,31 +84,10 @@ export interface LaunchReadiness {
 
 export interface LaunchPreflightResponse {
   status: 'ready';
-  guardian: GuardianSummary;
-  mode: GuardianMode;
   memory: LaunchPreflightMemory;
   overrides: LaunchPreflightOverrides;
   readiness: LaunchReadiness;
-  guardian_facts: GuardianFact[];
   resource_budget: LaunchPreflightResourceBudget;
-}
-
-export type HealingEventKind = 'runtime_bypassed' | 'preset_downgraded' | 'fallback_applied';
-
-export interface HealingEvent {
-  kind: HealingEventKind;
-  detail?: string;
-}
-
-export interface LaunchHealingSummary {
-  requested_preset?: string;
-  effective_preset?: string;
-  auth_mode?: string;
-  warnings?: string[];
-  fallback_applied?: string;
-  retry_count?: number;
-  failure_class?: string;
-  events?: HealingEvent[];
 }
 
 export interface InstanceLaunchDraft {
@@ -255,8 +239,6 @@ export interface LaunchProofRecord {
   boot_duration_ms?: number;
   failure_class?: string;
   failure_detail?: string;
-  guardian?: GuardianSummary | null;
-  healing?: LaunchHealingSummary | null;
   comparison?: LaunchProofComparison | null;
   view_model: LaunchProofViewModel;
   resource_budget?: LaunchProofResourceBudget | null;

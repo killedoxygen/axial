@@ -51,7 +51,7 @@ function accountDetailLabel(account: LauncherAccount): string {
   if (account.kind === 'microsoft') {
     return account.view_model?.detail ?? account.online_action?.detail ?? 'Microsoft account';
   }
-  return 'Offline identity';
+  return account.view_model?.detail ?? 'Offline identity';
 }
 
 function offlineAccountMenuItems(account: LauncherAccount): ContextMenuItem[] {
@@ -135,6 +135,7 @@ function SwitchRow({ account, busy }: { account: LauncherAccount; busy: boolean 
           icon="dots"
           size={26}
           tooltip="Account actions"
+          disabled={busy}
           onClick={(event) => {
             event.stopPropagation();
             openContextMenu(event, menuItems);
@@ -147,7 +148,7 @@ function SwitchRow({ account, busy }: { account: LauncherAccount; busy: boolean 
 
 export function AccountSwitcherPanel(): JSX.Element {
   const snapshot = accountsSnapshot.value;
-  const busy = accountsOp.value !== null;
+  const busy = accountsOp.value !== null || snapshot.state !== 'ready';
   const signingIn = accountsOp.value === 'sign-in';
   const active = activeAccount(snapshot);
   const others = snapshot.accounts.filter((account) => !account.active);

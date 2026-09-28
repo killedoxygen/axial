@@ -31,6 +31,7 @@ import type { ContextMenuItem } from '../../ui/ContextMenu';
 import {
   activeMinecraftCape,
   activeMinecraftSkin,
+  boundedMessage,
   capeFileUrl,
   DEFAULT_SKIN_SOURCE,
   skinVariantValue,
@@ -79,7 +80,10 @@ export function SavedSkinLibrary({
   const uploadWorkflow = useSavedSkinUploadWorkflow();
 
   const skins = data.skins;
-  const pendingApplyKey = data.pendingApplyKey;
+  const pendingApplyKey =
+    data.pendingApply?.phase === 'queued' || data.pendingApply?.phase === 'applying'
+      ? data.pendingApply.texture_key
+      : null;
   const profileSkin = activeMinecraftSkin(profile ?? undefined);
   const profileCape = activeMinecraftCape(profile ?? undefined);
   const availableCapes = profile?.capes ?? [];
@@ -232,7 +236,8 @@ export function SavedSkinLibrary({
     lookup.lookupUsernameError && lookup.lookupState !== 'error' ? lookup.lookupUsernameError : null,
     lookup.lookupState === 'error' ? lookup.lookupError : null,
     notice,
-    data.state === 'unavailable' ? (data.error ?? 'Saved skins are unavailable.') : null,
+    data.pendingApply?.error ? boundedMessage(data.pendingApply.error, 'Minecraft profile apply failed.') : null,
+    data.error ?? (data.state === 'unavailable' ? 'Saved skins are unavailable.' : null),
   ].filter((text): text is string => Boolean(text));
 
   const tileMenuItems = (skin: SavedSkinRecord): ContextMenuItem[] =>

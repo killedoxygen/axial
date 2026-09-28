@@ -1,6 +1,27 @@
-import { dtoArray, dtoBoolean, dtoNumber, dtoRecord, dtoString, isDtoRecord } from './dto-contract';
+import { dtoArray, dtoBoolean, dtoEnum, dtoNumber, dtoRecord, dtoString, isDtoRecord } from './dto-contract';
 import type { InstanceLogTail } from './types-instance';
-import type { LaunchProofRecord, LaunchReportsResponse } from './types-launch';
+import type { LaunchLogEntry, LaunchProofRecord, LaunchReportsResponse } from './types-launch';
+
+export function launchLogEntryResponse(value: unknown): LaunchLogEntry {
+  const record = dtoRecord(value, 'Launch log entry');
+  const sequence = dtoNumber(record.sequence, 'Launch log sequence');
+  if (!Number.isSafeInteger(sequence) || sequence < 1) throw new Error('Launch log sequence was invalid.');
+  return {
+    sequence,
+    source: dtoEnum(record.source, 'Launch log source', ['stdout', 'stderr'] as const),
+    text: dtoString(record.text, 'Launch log text'),
+    truncated: dtoBoolean(record.truncated, 'Launch log truncation'),
+  };
+}
+
+export function launchLogsResponse(value: unknown): LaunchLogEntry[] {
+  const record = dtoRecord(value, 'Launch logs');
+  const entries = dtoArray(record.entries, 'Launch log entries').map(launchLogEntryResponse);
+  if (entries.some((entry, index) => index > 0 && entry.sequence <= entries[index - 1].sequence)) {
+    throw new Error('Launch log history was not ordered.');
+  }
+  return entries;
+}
 
 export function launchReportsResponse(value: unknown): LaunchReportsResponse {
   const record = dtoRecord(value, 'Launch reports');

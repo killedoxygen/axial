@@ -1393,7 +1393,7 @@ mod tests {
             ManagedComponentKind::Libraries,
             ManagedComponentKind::Assets,
         ] {
-            let temporary = tempfile::tempdir().expect("test root");
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
             let (kind, _) = component_test_kinds(component);
             let path = match component {
                 ManagedComponentKind::Libraries => "org/example/exact.jar",
@@ -1435,7 +1435,7 @@ mod tests {
     async fn large_exact_projection_streams_without_a_publication_lane() {
         const ROWS: usize = 384;
 
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let sources = (0..ROWS)
             .map(|index| {
                 test_source(
@@ -1479,7 +1479,7 @@ mod tests {
             ManagedComponentKind::Libraries,
             ManagedComponentKind::Assets,
         ] {
-            let temporary = tempfile::tempdir().expect("test root");
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
             let other_component = match component {
                 ManagedComponentKind::Libraries => ManagedComponentKind::Assets,
                 ManagedComponentKind::Assets => ManagedComponentKind::Libraries,
@@ -1516,7 +1516,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_projection_rejects_same_size_mutation_between_hash_passes() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let source = test_source(
             "org/example/exact.jar",
             ManagedComponentArtifactKind::Library,
@@ -1563,7 +1563,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_projection_settles_prior_transaction_before_no_effect_return() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let source = test_source(
             "org/example/exact.jar",
             ManagedComponentArtifactKind::Library,
@@ -1629,7 +1629,7 @@ mod tests {
             ManagedComponentKind::Libraries,
             ManagedComponentKind::Assets,
         ] {
-            let temporary = tempfile::tempdir().expect("test root");
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
             let (kind, _) = component_test_kinds(component);
             let path = match component {
                 ManagedComponentKind::Libraries => "org/example/current.jar",
@@ -1682,7 +1682,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_settles_current_rollback_as_typed_outcome() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let source = test_source(
             "org/example/rollback.jar",
             ManagedComponentArtifactKind::Library,
@@ -1718,7 +1718,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_retries_crash_recovery_and_rolled_back_settlement() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let sources = vec![
             test_source(
                 "org/example/0.jar",
@@ -1760,7 +1760,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_classifies_before_promotion_as_preeffect() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let source = test_source(
             "org/example/preeffect.jar",
             ManagedComponentArtifactKind::Library,
@@ -1804,7 +1804,7 @@ mod tests {
             ManagedComponentKind::Libraries,
             ManagedComponentKind::Assets,
         ] {
-            let temporary = tempfile::tempdir().expect("test root");
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
             let (kind, _) = component_test_kinds(component);
             let path = match component {
                 ManagedComponentKind::Libraries => "org/example/replaced.jar",
@@ -1863,7 +1863,7 @@ mod tests {
 
     #[tokio::test]
     async fn sparse_sources_keep_projection_slots_across_shard_boundary() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let expected = (0_usize..257)
             .map(|index| {
                 test_source(
@@ -1921,7 +1921,7 @@ mod tests {
 
     #[tokio::test]
     async fn supplied_exact_source_is_dropped_while_replacement_is_staged() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let (exact, exact_events) = tracked_test_source(
             "org/example/a.jar",
             ManagedComponentArtifactKind::Library,
@@ -1977,7 +1977,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_inherited_projection_prepares_with_zero_sources() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let expected = vec![
             test_source(
                 "org/example/a.jar",
@@ -2026,7 +2026,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_non_exact_source_is_rejected_before_lane_creation() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let expected = vec![test_source(
             "org/example/missing.jar",
             ManagedComponentArtifactKind::Library,
@@ -2061,7 +2061,7 @@ mod tests {
             ManagedComponentKind::Libraries,
             ManagedComponentKind::Assets,
         ] {
-            let temporary = tempfile::tempdir().expect("test root");
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
             let (first_kind, second_kind) = component_test_kinds(component);
             let paths = match component {
                 ManagedComponentKind::Libraries => [
@@ -2120,7 +2120,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_component_publication_has_measured_target_hash_budget() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let inherited = test_source(
             "org/example/inherited.jar",
             ManagedComponentArtifactKind::Library,
@@ -2183,7 +2183,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepared_candidate_rejects_same_identity_same_size_content_mutation() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let (candidate, inherited_path, inherited_bytes) =
             prepared_mixed_candidate(&temporary).await;
         let canonical = inherited_path.join_under(&temporary.path().join("libraries"));
@@ -2208,7 +2208,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepared_candidate_rejects_exact_content_identity_replacement() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let (candidate, inherited_path, inherited_bytes) =
             prepared_mixed_candidate(&temporary).await;
         let canonical = inherited_path.join_under(&temporary.path().join("libraries"));
@@ -2235,7 +2235,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_byte_asset_source_uses_authenticated_create_new_staging() {
-        let temporary = tempfile::tempdir().expect("test root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let source = test_source(
             "objects/da/da39a3ee5e6b4b0d3255bfef95601890afd80709",
             ManagedComponentArtifactKind::AssetObject,
@@ -2279,7 +2279,7 @@ mod tests {
             ManagedComponentKind::Libraries,
             ManagedComponentKind::Assets,
         ] {
-            let temporary = tempfile::tempdir().expect("test root");
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
             let other_component = match component {
                 ManagedComponentKind::Libraries => ManagedComponentKind::Assets,
                 ManagedComponentKind::Assets => ManagedComponentKind::Libraries,
@@ -2350,7 +2350,7 @@ mod tests {
                 Mutation::Size,
                 Mutation::Sha1,
             ] {
-                let temporary = tempfile::tempdir().expect("test root");
+                let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
                 let (first_kind, second_kind) = component_test_kinds(component);
                 let paths = match component {
                     ManagedComponentKind::Libraries => [
@@ -2441,7 +2441,7 @@ mod tests {
                 ),
             ),
         ] {
-            let temporary = tempfile::tempdir().expect("test root");
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
             let known_good_kind = match source.identity.kind {
                 ManagedComponentArtifactKind::Library => KnownGoodArtifactKind::Library,
                 ManagedComponentArtifactKind::NativeLibrary => KnownGoodArtifactKind::NativeLibrary,
@@ -2490,7 +2490,7 @@ mod tests {
                 ),
             ),
         ] {
-            let temporary = tempfile::tempdir().expect("test root");
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
             let other = match component {
                 ManagedComponentKind::Libraries => ManagedComponentKind::Assets,
                 ManagedComponentKind::Assets => ManagedComponentKind::Libraries,

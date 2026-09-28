@@ -13,9 +13,10 @@ use super::discovery::{
 use super::install::{
     CachedManagedRuntimeVerification, ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError,
     RuntimeTreeVerificationReason, discard_staged_managed_runtime,
-    install_ephemeral_processor_runtime, publish_staged_managed_runtime,
-    publish_staged_managed_runtime_and_finalize, stage_managed_runtime,
-    stage_managed_runtime_until_cancelled, verify_cached_managed_runtime_until_cancelled,
+    ephemeral_processor_filesystem_failure, install_ephemeral_processor_runtime,
+    publish_staged_managed_runtime, publish_staged_managed_runtime_and_finalize,
+    stage_managed_runtime, stage_managed_runtime_until_cancelled,
+    trace_ephemeral_processor_runtime_failure, verify_cached_managed_runtime_until_cancelled,
 };
 use super::layout::{ManagedRuntimeCache, runtime_os_arch};
 use super::manifest::{RuntimeSourceReceipt, acquire_runtime_source};
@@ -39,22 +40,22 @@ const RUNTIME_MATERIALIZATION_SETTLING: u8 = 2;
 const RUNTIME_MATERIALIZATION_COMPLETE: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeMaterializationCancellation {
+pub enum RuntimeMaterializationCancellation {
     Cancelled,
     SettlementRequired,
 }
 
-pub(crate) struct RuntimeMaterializationCancelHandle {
+pub struct RuntimeMaterializationCancelHandle {
     phase: Arc<AtomicU8>,
     cancellation: RuntimeCancellationSender,
 }
 
-pub(crate) struct RuntimeMaterializationTaskControl {
+pub struct RuntimeMaterializationTaskControl {
     phase: Arc<AtomicU8>,
     cancellation: RuntimeCancellation,
 }
 
-pub(crate) fn runtime_materialization_control() -> (
+pub fn runtime_materialization_control() -> (
     RuntimeMaterializationCancelHandle,
     RuntimeMaterializationTaskControl,
 ) {
@@ -80,7 +81,7 @@ pub(crate) fn block_runtime_before_publication_claim_for_test(
 }
 
 impl RuntimeMaterializationCancelHandle {
-    pub(crate) fn cancel_before_publication(&self) -> RuntimeMaterializationCancellation {
+    pub fn cancel_before_publication(&self) -> RuntimeMaterializationCancellation {
         match self.phase.compare_exchange(
             RUNTIME_MATERIALIZATION_OPEN,
             RUNTIME_MATERIALIZATION_CANCELLED,
@@ -125,7 +126,7 @@ impl RuntimeMaterializationTaskControl {
         }
     }
 
-    pub(crate) fn finish(&self) -> bool {
+    pub fn finish(&self) -> bool {
         loop {
             match self.phase.load(Ordering::Acquire) {
                 RUNTIME_MATERIALIZATION_OPEN => {
@@ -239,7 +240,7 @@ where
 
 #[cfg(all(feature = "test-support", unix))]
 const MANAGED_RUNTIME_FIXTURE_JAVA_BYTES: &[u8] = br#"#!/bin/sh
-if [ "$1" = "-XshowSettings:property" ]; then
+if [ "$1" = "-XshowSettings:properties" ]; then
   echo 'openjdk version "21.0.3"' >&2
   exit 0
 fi
@@ -439,10 +440,12 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
     let requirement = runtime_requirement(java_version);
     let component = requirement.preferred_component;
     if source_receipt.component() != &component || !is_known_runtime_component(component.as_str()) {
-        return Err(JavaRuntimeLookupError::Install(
+        let error = JavaRuntimeLookupError::Install(
             "processor runtime source does not match the authenticated base requirement"
                 .to_string(),
-        ));
+        );
+        trace_ephemeral_processor_runtime_failure("source_requirement", &error);
+        return Err(error);
     }
     let mut observer = |_| {};
     install_ephemeral_processor_runtime(
@@ -457,27 +460,49 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
     let install_root = install_directory.path();
     install_directory
         .validate_absolute_projection(install_root)
-        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+        .map_err(|error| ephemeral_processor_filesystem_failure("installed_projection", error))?;
     let java_path = super::layout::java_executable(install_root);
-    admit_processor_program(install_directory, &java_path)?;
+    admit_processor_program(install_directory, &java_path).inspect_err(|error| {
+        trace_ephemeral_processor_runtime_failure("executable_admission", error);
+    })?;
     let probe_receipt = run_runtime_probe_work(
         "processor runtime probe task stopped unexpectedly",
         move || probe_java_runtime_receipt(&java_path, Some("ephemeral-processor-runtime")),
     )
-    .await?;
+    .await
+    .inspect_err(|error| {
+        trace_ephemeral_processor_runtime_failure("probe_worker", error);
+    })?;
     install_directory
         .validate_absolute_projection(install_root)
-        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-    let probe_receipt = probe_receipt?;
-    let program_path = probe_receipt.revalidate_cli_executable()?;
-    let program_guard = admit_processor_program(install_directory, &program_path)?;
-    if probe_receipt.validation().into_info().major
-        != u32::try_from(java_version.major_version).unwrap_or(u32::MAX)
-    {
-        return Err(JavaRuntimeLookupError::Probe(
+        .map_err(|error| ephemeral_processor_filesystem_failure("post_probe_projection", error))?;
+    let probe_receipt = probe_receipt.inspect_err(|error| {
+        trace_ephemeral_processor_runtime_failure("probe", error);
+    })?;
+    let program_path = probe_receipt
+        .revalidate_cli_executable()
+        .inspect_err(|error| {
+            trace_ephemeral_processor_runtime_failure("probe_receipt_validation", error);
+        })?;
+    let program_guard =
+        admit_processor_program(install_directory, &program_path).inspect_err(|error| {
+            trace_ephemeral_processor_runtime_failure("probed_executable_admission", error);
+        })?;
+    let observed_major = probe_receipt.validation().into_info().major;
+    let expected_major = u32::try_from(java_version.major_version).unwrap_or(u32::MAX);
+    if observed_major != expected_major {
+        let error = JavaRuntimeLookupError::Probe(
             "processor runtime Java major does not match the authenticated base requirement"
                 .to_string(),
-        ));
+        );
+        tracing::warn!(
+            stage = "probed_major_validation",
+            category = "probe",
+            expected_major,
+            observed_major,
+            "Ephemeral processor runtime preparation failed"
+        );
+        return Err(error);
     }
     let runtime = ProcessorRuntime {
         probe_receipt,
@@ -486,7 +511,11 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
         program_path,
         _source_receipt: source_receipt,
     };
-    runtime.validate_program(runtime.cli_executable_path())?;
+    runtime
+        .validate_program(runtime.cli_executable_path())
+        .inspect_err(|error| {
+            trace_ephemeral_processor_runtime_failure("final_validation", error);
+        })?;
     Ok(runtime)
 }
 
@@ -526,7 +555,7 @@ fn admit_processor_program(
     Ok(guard)
 }
 
-pub(crate) async fn materialize_preferred_runtime_source<F>(
+pub async fn materialize_preferred_runtime_source<F>(
     cache: &ManagedRuntimeCache,
     java_version: &JavaVersion,
     source_receipt: RuntimeSourceReceipt,

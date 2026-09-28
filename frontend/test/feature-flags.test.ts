@@ -18,6 +18,7 @@ test('production flag actions preserve the local default, override, reset, and i
   const originalFetch = globalThis.fetch;
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
   let failNextGet = true;
+  let revision = 7;
 
   context.after(() => {
     globalThis.fetch = originalFetch;
@@ -37,7 +38,9 @@ test('production flag actions preserve the local default, override, reset, and i
     }
 
     const payload = await mockApi(method, path, body);
-    return Response.json(payload);
+    assert.ok(payload && typeof payload === 'object' && !Array.isArray(payload));
+    if (method === 'PUT') revision += 1;
+    return Response.json({ ...payload, revision });
   }) as typeof fetch;
 
   featureFlags.value = null;
@@ -69,7 +72,7 @@ test('production flag actions preserve the local default, override, reset, and i
   assert.deepEqual(requests, [
     { method: 'GET', path: '/flags', body: undefined },
     { method: 'GET', path: '/flags', body: undefined },
-    { method: 'PUT', path: `/flags/${inspectorKey}`, body: { enabled: true } },
-    { method: 'PUT', path: `/flags/${inspectorKey}`, body: { enabled: null } },
+    { method: 'PUT', path: `/flags/${inspectorKey}`, body: { enabled: true, expected_revision: 7 } },
+    { method: 'PUT', path: `/flags/${inspectorKey}`, body: { enabled: null, expected_revision: 8 } },
   ]);
 });

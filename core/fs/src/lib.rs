@@ -2,8 +2,19 @@ mod control_frame;
 mod platform;
 mod recovery;
 mod recovery_runtime;
+mod reset;
 mod successor;
 mod transient;
+
+pub use reset::PendingRootReset;
+
+#[cfg(test)]
+fn test_tempdir() -> std::io::Result<tempfile::TempDir> {
+    // Root admission intentionally rejects symlink ancestry. macOS commonly
+    // spells its temporary parent through /var, so fixture roots must start at
+    // the physical parent. Individual alias/symlink tests still create theirs.
+    tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir())?)
+}
 
 pub use transient::{
     TransientCreationObligation, TransientDestination, TransientDestinationBatch,
@@ -232,6 +243,12 @@ impl fmt::Debug for DirectoryIdentity {
 }
 
 impl DirectoryIdentity {
+    /// Stable comparison evidence only. This never reconstructs a capability.
+    /// Reopen through retained authority before comparing a persisted witness.
+    pub fn filesystem_witness(self) -> [u8; 32] {
+        platform::identity_witness(self.physical)
+    }
+
     pub fn same_filesystem_object(self, other: Self) -> bool {
         self.physical == other.physical
     }
@@ -2360,6 +2377,11 @@ impl Drop for AdmittedRootSessionAcquireObligation {
 }
 
 impl AdmittedRootSession {
+    /// Close admission and drain this exact root before releasing its session.
+    pub fn revoke(self) -> RootRevokeOutcome {
+        self.session.revoke()
+    }
+
     pub fn identity(&self) -> DirectoryIdentity {
         self.session.identity()
     }
@@ -2850,28 +2872,25 @@ fn validate_terminal_registry_state(state: &OperationState) -> io::Result<()> {
             "filesystem session still has an externally owned park obligation",
         ));
     }
-    if state
-        .stages
+    if state.stages.iter().any(|(id, record)| {
+        record.carrier != StageCarrierState::Abandoned
+            && !transient::stage_retained_for_drain(state, *id)
+    }) || state.stage_creations.values().any(|record| {
+        !matches!(
+            record.phase,
+            StageCreatePhase::Abandoned | StageCreatePhase::CleanupAttempted
+        )
+    }) || state.directory_creations.values().any(|record| {
+        !matches!(
+            record.phase,
+            DirectoryCreateEffectPhase::Abandoned
+                | DirectoryCreateEffectPhase::CleanupAttempted
+                | DirectoryCreateEffectPhase::UnclassifiedAbandoned
+        )
+    }) || state
+        .transients
         .values()
-        .any(|record| record.carrier != StageCarrierState::Abandoned)
-        || state.stage_creations.values().any(|record| {
-            !matches!(
-                record.phase,
-                StageCreatePhase::Abandoned | StageCreatePhase::CleanupAttempted
-            )
-        })
-        || state.directory_creations.values().any(|record| {
-            !matches!(
-                record.phase,
-                DirectoryCreateEffectPhase::Abandoned
-                    | DirectoryCreateEffectPhase::CleanupAttempted
-                    | DirectoryCreateEffectPhase::UnclassifiedAbandoned
-            )
-        })
-        || state
-            .transients
-            .values()
-            .any(|record| record.phase != transient::TransientEffectPhase::Abandoned)
+        .any(|record| record.phase != transient::TransientEffectPhase::Abandoned)
     {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -5171,7 +5190,8 @@ impl CapabilityAuthority {
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
         if state.phase != AUTHORITY_LIVE
-            && !(state.phase == AUTHORITY_QUIESCING && terminal_effect_settlement_admits(self))
+            && !(matches!(state.phase, AUTHORITY_QUIESCING | AUTHORITY_DRAINING)
+                && terminal_effect_settlement_admits(self))
         {
             return Err(stale_capability());
         }
@@ -7798,6 +7818,17 @@ impl OperationState {
                     candidate_conflicts_with_subtree(identity, &movement.source.parent)
                 })
         }) || self.transients.values().any(|record| {
+            // The named transient's original reservation is handed to only
+            // its exact registered stage. No reservation is removed between
+            // validation and native no-replace promotion.
+            #[cfg(not(target_os = "linux"))]
+            if record.stage_id.is_some()
+                && record.stage_id == excluded_recovery_target_stage
+                && candidate_file.is_none()
+                && candidate_subtree.is_none()
+            {
+                return false;
+            }
             candidate_file.is_some() && candidate_file == record.identity
                 || candidate_conflicts_with_name(&record.directory, record.destination.as_os_str())
         }) || self.directory_creations.values().any(|record| {
@@ -7805,7 +7836,16 @@ impl OperationState {
                 || record.identity.is_some_and(|identity| {
                     candidate_conflicts_with_subtree(identity, &record.parent)
                 })
+                // A new child cannot contain its parent or physical ancestors.
+                // Keep unknown descendants and every subtree mutation reserved.
                 || record.identity.is_none()
+                    && (candidate_subtree.is_some()
+                        || candidate_leaves.iter().any(|(directory, _)| {
+                            !directory_has_physical_ancestor(
+                                &record.parent,
+                                directory.inner.identity.physical,
+                            )
+                        }))
         }) || self.stage_creations.iter().any(|(id, record)| {
             Some(*id) != excluded_stage_create
                 && (candidate_file.is_some() && candidate_file == record.identity
@@ -9198,6 +9238,39 @@ impl Directory {
         self.validate(&operation)
     }
 
+    /// Derive a read/process projection from retained parent bindings. Neither
+    /// the supplied spelling nor the returned path grants mutation authority.
+    pub fn project_from(
+        &self,
+        anchor: &Directory,
+        anchor_path: &Path,
+    ) -> io::Result<std::path::PathBuf> {
+        anchor.validate_absolute_projection(anchor_path)?;
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        anchor.validate(&operation)?;
+        let mut names = Vec::new();
+        let mut current = self.inner.as_ref();
+        while current.identity != anchor.inner.identity {
+            let binding = current.parent.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "directory is outside projection anchor",
+                )
+            })?;
+            names.push(binding.name.clone());
+            current = binding.directory.inner.as_ref();
+        }
+        let mut path = anchor_path.to_path_buf();
+        for name in names.into_iter().rev() {
+            path.push(name);
+        }
+        self.validate_absolute_projection(&path)?;
+        anchor.validate_absolute_projection(anchor_path)?;
+        Ok(path)
+    }
+
     pub fn create_effect_owner(&self) -> io::Result<EffectOwner> {
         let authority = self.authority()?;
         let operation = authority.enter()?;
@@ -9216,6 +9289,71 @@ impl Directory {
             }
             let Some(parent) = current.inner.parent.as_ref() else {
                 return false;
+            };
+            current = &parent.directory;
+        }
+    }
+
+    /// Validate both exact capability bindings and their retained ancestry.
+    pub fn validate_within(&self, anchor: &Directory) -> io::Result<()> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        anchor.validate(&operation)?;
+        if !self.is_within(anchor) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory capability is outside its retained scope",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compare retained physical ancestry across independently admitted directories.
+    /// Missing ancestry or changed bindings fail closed.
+    pub fn overlaps(&self, other: &Directory) -> io::Result<bool> {
+        let authority = self.authority()?;
+        let other_authority = other.authority()?;
+        let operation = authority.enter()?;
+        let other_operation = other_authority.enter()?;
+        self.validate(&operation)?;
+        other.validate(&other_operation)?;
+        let overlaps = if directory_has_physical_ancestor(self, other.inner.identity.physical)
+            || directory_has_physical_ancestor(other, self.inner.identity.physical)
+        {
+            true
+        } else {
+            let first = self.has_outer_physical_ancestor(&authority, other.inner.identity.physical);
+            let second =
+                other.has_outer_physical_ancestor(&other_authority, self.inner.identity.physical);
+            match (first, second) {
+                (Ok(true), _) | (_, Ok(true)) => true,
+                (first, second) => {
+                    first?;
+                    second?;
+                    false
+                }
+            }
+        };
+        platform::validate_root(&authority.root)?;
+        platform::validate_root(&other_authority.root)?;
+        self.validate(&operation)?;
+        other.validate(&other_operation)?;
+        Ok(overlaps)
+    }
+
+    fn has_outer_physical_ancestor(
+        &self,
+        authority: &CapabilityAuthority,
+        ancestor: platform::Identity,
+    ) -> io::Result<bool> {
+        let mut current = self;
+        loop {
+            if let Some(ancestry) = &current.inner.absolute_ancestry {
+                return platform::absolute_directory_anchor_is_ancestor(ancestry, ancestor);
+            }
+            let Some(parent) = &current.inner.parent else {
+                return platform::root_has_physical_ancestor(&authority.root, ancestor);
             };
             current = &parent.directory;
         }
@@ -11513,6 +11651,11 @@ impl fmt::Debug for FileCapability {
 }
 
 impl FileCapability {
+    pub fn validate_within(&self, anchor: &Directory) -> io::Result<()> {
+        self.parent.validate_within(anchor)?;
+        self.revision().map(|_| ())
+    }
+
     #[cfg(unix)]
     pub fn make_executable(&self) -> io::Result<()> {
         let authority = self.parent.authority()?;
@@ -14672,7 +14815,7 @@ pub enum RootClearOutcome {
     Failed(RootClearFailure),
 }
 
-#[must_use = "a cleared root receipt must release the retained root session and lease"]
+#[must_use = "a cleared root receipt must explicitly release its retained lease"]
 pub struct RootClearReceipt {
     authority: Option<RootResetAuthority>,
 }
@@ -14770,25 +14913,7 @@ impl RootResetAuthority {
     }
 
     pub fn clear_root(self) -> RootClearOutcome {
-        let result = (|| {
-            let session = self.session.as_ref().expect("reset session is retained");
-            let operation = session.authority.enter_reset_operation()?;
-            platform::validate_lease(&session.authority.lease)?;
-            platform::validate_root(&session.authority.root)?;
-            let lease_name = LeafName::new(ROOT_LEASE_NAME).expect("fixed lease name is valid");
-            platform::validate_process_image_outside_root(
-                &session.authority.process_image,
-                &session.authority.root,
-            )?;
-            platform::clear_root_children(
-                &session.authority.root,
-                &session.authority.lease,
-                lease_name.as_os_str(),
-            )?;
-            session
-                .authority
-                .retire_reset_pending_directory_creates(&operation)
-        })();
+        let result = self.try_clear_root(&[]);
         if let Err(error) = result {
             return RootClearOutcome::Failed(RootClearFailure {
                 error,
@@ -14798,6 +14923,27 @@ impl RootResetAuthority {
         RootClearOutcome::Cleared(RootClearReceipt {
             authority: Some(self),
         })
+    }
+
+    fn try_clear_root(&self, preserved: &[(&OsStr, platform::Identity)]) -> io::Result<()> {
+        let session = self.session.as_ref().expect("reset session is retained");
+        let operation = session.authority.enter_reset_operation()?;
+        platform::validate_lease(&session.authority.lease)?;
+        platform::validate_root(&session.authority.root)?;
+        let lease_name = LeafName::new(ROOT_LEASE_NAME).expect("fixed lease name is valid");
+        platform::validate_process_image_outside_root(
+            &session.authority.process_image,
+            &session.authority.root,
+        )?;
+        platform::clear_root_children(
+            &session.authority.root,
+            &session.authority.lease,
+            lease_name.as_os_str(),
+            preserved,
+        )?;
+        session
+            .authority
+            .retire_reset_pending_directory_creates(&operation)
     }
 
     pub fn acknowledge_preserved_directory_creates(mut self) -> Result<(), Self> {
@@ -15556,7 +15702,7 @@ mod tests {
 
     #[test]
     fn root_session_creates_a_missing_nested_root() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let root_path = temporary.path().join("missing").join("nested-root");
 
         let session = acquire_test_root(&root_path);
@@ -15568,7 +15714,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn cloned_root_capabilities_serialize_multipage_enumeration() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let expected = (0..384)
             .map(|index| format!("entry-{index:03}-{}", "x".repeat(180)))
             .collect::<std::collections::BTreeSet<_>>();
@@ -15615,7 +15761,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn absolute_projection_tolerates_one_harmless_sibling_change() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let root_path = temporary.path().join("projection-root");
         std::fs::create_dir(&root_path).expect("projection root");
         let session = acquire_test_root(&root_path);
@@ -15646,7 +15792,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn absolute_projection_tolerates_sustained_sibling_churn() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let root_path = temporary.path().join("projection-root");
         std::fs::create_dir(&root_path).expect("projection root");
         let session = acquire_test_root(&root_path);
@@ -15684,7 +15830,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn absolute_projection_refuses_case_alias_introduced_during_proof() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let root_path = temporary.path().join("projection-root");
         let alias_path = temporary.path().join("Projection-Root");
         std::fs::create_dir(&root_path).expect("projection root");
@@ -15721,7 +15867,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn owned_symlink_proves_a_parent_relative_target_beneath_its_root() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("bin")).expect("bin directory");
         std::fs::create_dir(temporary.path().join("lib")).expect("lib directory");
         std::fs::write(temporary.path().join("lib/runtime.bin"), b"runtime")
@@ -15752,7 +15898,7 @@ mod tests {
     fn owned_symlink_rejects_escape_missing_and_link_targets() {
         use std::os::unix::fs::symlink;
 
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("bin")).expect("bin directory");
         std::fs::create_dir(temporary.path().join("lib")).expect("lib directory");
         std::fs::write(temporary.path().join("lib/runtime.bin"), b"runtime")
@@ -15790,7 +15936,7 @@ mod tests {
 
     #[test]
     fn admitted_absolute_directory_retains_one_physical_binding() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
         let library = temporary.path().join("library");
         std::fs::create_dir(&app_root).expect("create app root");
@@ -15816,7 +15962,7 @@ mod tests {
 
     #[test]
     fn admitted_absolute_directory_supports_staged_file_effects() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
         let library = temporary.path().join("library");
         std::fs::create_dir(&app_root).expect("create app root");
@@ -15842,7 +15988,7 @@ mod tests {
 
     #[test]
     fn sealed_stage_promotes_across_directories() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("source")).expect("source directory");
         std::fs::create_dir(temporary.path().join("destination")).expect("destination directory");
         let session = acquire_test_root(temporary.path());
@@ -15869,7 +16015,7 @@ mod tests {
 
     #[test]
     fn sealed_stage_collision_is_no_effect() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("published.bin"), b"existing payload")
             .expect("collision destination");
         let session = acquire_test_root(temporary.path());
@@ -15896,7 +16042,7 @@ mod tests {
 
     #[test]
     fn sealed_stage_refuses_content_revision_drift() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let staged = test_sealed_stage(&root, b"sealed payload");
@@ -15924,7 +16070,7 @@ mod tests {
 
     #[test]
     fn sealed_stage_refuses_live_park_original_reservation() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let original_path = temporary.path().join("reserved.bin");
         std::fs::write(&original_path, b"original payload").expect("original file");
         let session = acquire_test_root(temporary.path());
@@ -15966,7 +16112,7 @@ mod tests {
 
     #[test]
     fn file_park_checkout_roundtrip_preserves_learned_revision() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("record.bin"), b"payload").expect("record file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -15995,7 +16141,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hardlink_aliases_cannot_hold_independent_file_parks() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("first.bin"), b"payload").expect("first file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -16058,7 +16204,7 @@ mod tests {
 
     #[test]
     fn file_move_handoff_occupies_only_its_exact_park_original() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
         std::fs::write(temporary.path().join("staged.bin"), b"new payload").expect("staged file");
         std::fs::write(temporary.path().join("unrelated.bin"), b"unrelated payload")
@@ -16129,7 +16275,7 @@ mod tests {
 
     #[test]
     fn file_move_handoff_link_survives_indeterminate_reconciliation() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
         std::fs::write(temporary.path().join("staged.bin"), b"new payload").expect("staged file");
         let session = acquire_test_root(temporary.path());
@@ -16229,7 +16375,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unsettled_file_move_blocks_hardlink_alias_park_ownership() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("source.bin"), b"payload").expect("source file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -16325,7 +16471,7 @@ mod tests {
 
     #[test]
     fn replacement_handoff_publishes_while_unrelated_park_stays_reserved() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
         std::fs::write(temporary.path().join("unrelated.bin"), b"unrelated payload")
             .expect("unrelated file");
@@ -16389,7 +16535,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replacement_handoff_link_survives_indeterminate_cleanup_until_no_effect() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -16494,7 +16640,7 @@ mod tests {
 
     #[test]
     fn dropped_replacement_obligation_settles_stage_before_linked_park() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -16569,7 +16715,7 @@ mod tests {
 
     #[test]
     fn absolute_descendant_admission_cannot_bypass_directory_park_reservation() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("tree")).expect("test tree");
         std::fs::create_dir(temporary.path().join("tree/child")).expect("test child");
         let session = acquire_test_root(temporary.path());
@@ -16605,7 +16751,7 @@ mod tests {
 
     #[test]
     fn directory_subtree_reservations_reject_nested_owners_in_both_orders() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("tree")).expect("test tree");
         std::fs::create_dir(temporary.path().join("tree/child")).expect("test child");
         std::fs::write(temporary.path().join("tree/child/owned.bin"), b"payload")
@@ -16769,7 +16915,7 @@ mod tests {
 
     #[test]
     fn directory_open_refuses_live_create_before_identity_attachment() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let authority = root.authority().expect("root authority");
@@ -16797,7 +16943,7 @@ mod tests {
 
     #[test]
     fn directory_open_rechecks_create_reservation_after_native_open() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("created")).expect("initial directory");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -16849,8 +16995,69 @@ mod tests {
     }
 
     #[test]
+    fn identity_pending_directory_create_allows_source_stages_in_ancestors() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        std::fs::create_dir(temporary.path().join("runtime")).expect("runtime parent");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let runtime = root
+            .open_directory(&LeafName::new("runtime").expect("runtime leaf"))
+            .expect("runtime capability");
+        let destinations = [&root, &runtime]
+            .into_iter()
+            .map(|directory| {
+                directory
+                    .admit_transient_destination(LeafName::new("source").expect("source leaf"))
+                    .expect("admit source before runtime directory creation")
+            })
+            .collect::<Vec<_>>();
+        let authority = root.authority().expect("root authority");
+        let operation = authority.enter().expect("directory create operation");
+        let name = LeafName::new("bin").expect("created leaf");
+        let mut token = authority
+            .reserve_directory_create(&operation, &runtime, &name)
+            .expect("directory create reservation");
+        let created = match platform::create_directory(&runtime.inner.handle, name.as_os_str()) {
+            Ok(created) => created,
+            Err(_) => panic!("native directory creation failed"),
+        };
+
+        let stages = destinations
+            .into_iter()
+            .map(TransientDestination::create_stage)
+            .collect::<Vec<_>>();
+        authority.attach_directory_create(&token, created);
+        let directory = finish_directory_create(&authority, &operation, &mut token)
+            .expect("finish directory creation");
+        let mut failures = Vec::new();
+        for outcome in stages {
+            let destination = match outcome {
+                TransientStageCreateOutcome::Created(stage) => match stage.discard() {
+                    TransientDiscardOutcome::Discarded(destination) => destination,
+                    outcome => panic!("source stage cleanup failed: {outcome:?}"),
+                },
+                TransientStageCreateOutcome::NoEffect { error, destination } => {
+                    failures.push(error);
+                    destination
+                }
+                outcome => panic!("source stage creation remained pending: {outcome:?}"),
+            };
+            assert!(matches!(
+                destination.cancel(),
+                TransientDestinationCancelOutcome::Cancelled
+            ));
+        }
+        drop((directory, operation, authority, runtime, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert!(
+            failures.is_empty(),
+            "a new child cannot contain source stages in its parent or ancestors: {failures:?}"
+        );
+    }
+
+    #[test]
     fn identity_pending_directory_create_blocks_nested_reservations() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let authority = root.authority().expect("root authority");
@@ -16919,7 +17126,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_observed_publication_runs_real_parent_barriers() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("destination")).expect("destination directory");
         let source_path = temporary.path().join("observed-stage.bin");
         let destination_path = temporary
@@ -16967,7 +17174,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_publication_destination_barrier_failure_is_permanently_poisoned() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let source_path = temporary.path().join("stage.bin");
         std::fs::write(&source_path, b"destination barrier payload").expect("stage payload");
         let staged_file = File::open(&source_path).expect("retained stage");
@@ -17040,7 +17247,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_publication_source_barrier_failure_is_permanently_poisoned() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("destination")).expect("destination directory");
         let source_path = temporary.path().join("stage.bin");
         std::fs::write(&source_path, b"source barrier payload").expect("stage payload");
@@ -17118,7 +17325,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn publication_receipt_rejects_reuse_for_another_mutation() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let source_path = temporary.path().join("stage.bin");
         let other_path = temporary.path().join("other-stage.bin");
         std::fs::write(&source_path, b"payload").expect("stage payload");
@@ -17248,7 +17455,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_publication_requires_reported_write_through_receipt() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let staged = test_sealed_stage(&root, b"unreported payload");
@@ -17296,7 +17503,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_committed_publication_receipt_rejects_cross_mutation() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("other-parent")).expect("other parent");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -17494,7 +17701,7 @@ mod tests {
 
     #[test]
     fn admitted_absolute_directories_retain_distinct_physical_bindings() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
         let library = temporary.path().join("library");
         let unrelated = temporary.path().join("unrelated");
@@ -17523,7 +17730,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn admitted_absolute_directory_accepts_the_filesystem_root() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
         std::fs::create_dir(&app_root).expect("create app root");
         let session = acquire_test_root(&app_root);
@@ -17548,7 +17755,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn admitted_absolute_directory_accepts_the_volume_root() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
         std::fs::create_dir(&app_root).expect("create app root");
         let volume_root = temporary
@@ -17579,7 +17786,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn admitted_absolute_directory_rejects_a_case_alias_leaf() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
         let library = temporary.path().join("library");
         let alias = temporary.path().join("Library");
@@ -17597,7 +17804,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn admitted_absolute_directory_refreshes_exact_name_after_parent_change() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
         let library = temporary.path().join("library");
         let alias = temporary.path().join("Library");
@@ -17624,7 +17831,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn admitted_absolute_directory_rejects_replaced_leaf_binding() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
         let library = temporary.path().join("library");
         let displaced = temporary.path().join("displaced-library");
@@ -17645,7 +17852,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn admitted_root_acquisition_never_creates_or_leases_a_path_replacement() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
         let library = temporary.path().join("library");
         let displaced = temporary.path().join("displaced-library");
@@ -17673,7 +17880,7 @@ mod tests {
 
     #[test]
     fn admitted_root_session_clones_its_detached_root_capability() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let app_root = temporary.path().join("app");
         let library = temporary.path().join("library");
         std::fs::create_dir(&app_root).expect("create app root");
@@ -17810,7 +18017,7 @@ mod tests {
 
     #[test]
     fn restored_park_refreshes_revision_and_classifies_current() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("current.bin"), b"current payload")
             .expect("current payload");
         let session = acquire_test_root(temporary.path());
@@ -17852,7 +18059,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restored_park_preserves_stable_digest_drift_without_delete_authority() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("changed.bin"), b"original payload")
             .expect("original payload");
         let session = acquire_test_root(temporary.path());
@@ -17890,7 +18097,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn restored_park_retains_racing_content_until_a_stable_preservation_proof() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("racing.bin"), b"original payload")
             .expect("original payload");
         let session = acquire_test_root(temporary.path());
@@ -17943,7 +18150,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn restored_park_retains_share_locked_content_until_settlement() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("locked.bin"), b"original payload")
             .expect("original payload");
         let session = acquire_test_root(temporary.path());
@@ -18552,7 +18759,7 @@ mod tests {
 
     #[test]
     fn effect_owner_rejects_sibling_anchor_and_returns_the_move_carrier() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("first")).expect("first anchor");
         std::fs::create_dir(temporary.path().join("second")).expect("second anchor");
         std::fs::write(temporary.path().join("second/source.bin"), b"source").expect("source file");
@@ -18590,7 +18797,7 @@ mod tests {
 
     #[test]
     fn dropped_move_receipts_remain_owned_until_explicit_settlement() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
         std::fs::write(temporary.path().join("domain/before.bin"), b"before").expect("before file");
         std::fs::write(temporary.path().join("domain/after.bin"), b"after").expect("after file");
@@ -18641,7 +18848,7 @@ mod tests {
 
     #[test]
     fn settlement_extraction_preserves_barriers_capacity_and_receipt_abandonment() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
         for index in 0..MAX_EFFECTS_PER_OWNER {
             std::fs::write(
@@ -18777,7 +18984,7 @@ mod tests {
 
     #[test]
     fn live_pending_move_receipt_blocks_terminal_drain_and_remains_claimable() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
         std::fs::write(temporary.path().join("domain/source.bin"), b"source").expect("source file");
         let session = acquire_test_root(temporary.path());
@@ -18812,7 +19019,7 @@ mod tests {
 
     #[test]
     fn live_terminal_move_receipt_blocks_drain_until_claimed() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
         std::fs::write(temporary.path().join("domain/source.bin"), b"source").expect("source file");
         let session = acquire_test_root(temporary.path());
@@ -18848,7 +19055,7 @@ mod tests {
 
     #[test]
     fn dropped_terminal_move_receipt_is_reclaimed_during_drain() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
         std::fs::write(temporary.path().join("domain/source.bin"), b"source").expect("source file");
         let session = acquire_test_root(temporary.path());
@@ -18878,7 +19085,7 @@ mod tests {
 
     #[test]
     fn live_empty_effect_owner_blocks_terminal_drain_until_dropped() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -18900,7 +19107,7 @@ mod tests {
 
     #[test]
     fn raw_file_and_directory_parks_refuse_drain_until_settled() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("record.bin"), b"payload").expect("test file");
         std::fs::create_dir(temporary.path().join("folder")).expect("test directory");
         let session = acquire_test_root(temporary.path());
@@ -18944,7 +19151,7 @@ mod tests {
 
     #[test]
     fn effect_owner_removes_a_nonempty_parked_directory_tree() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         create_test_directories(
             temporary.path(),
             &[
@@ -18999,7 +19206,7 @@ mod tests {
 
     #[test]
     fn parked_tree_removal_preserves_the_recreated_canonical_binding() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         create_test_directories(temporary.path(), &["victim", "victim/nested"]);
         std::fs::write(temporary.path().join("victim/nested/old.bin"), b"old")
             .expect("old payload");
@@ -19027,7 +19234,7 @@ mod tests {
 
     #[test]
     fn tree_removal_obligation_finishes_a_partially_cleared_root() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         create_test_directories(temporary.path(), &["victim", "victim/nested"]);
         std::fs::write(temporary.path().join("victim/removed.bin"), b"removed")
             .expect("first payload");
@@ -19059,7 +19266,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn parked_tree_destination_case_equivalent_collision_is_no_effect() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         create_test_directories(temporary.path(), &["victim", "victim/nested"]);
         std::fs::create_dir(temporary.path().join("VICTIM.DELETED"))
             .expect("case-equivalent collision");
@@ -19101,8 +19308,8 @@ mod tests {
     fn parked_tree_removal_unlinks_links_without_following_them() {
         use std::os::unix::fs::symlink;
 
-        let temporary = tempfile::tempdir().expect("temporary root");
-        let external = tempfile::tempdir().expect("external directory");
+        let temporary = crate::test_tempdir().expect("temporary root");
+        let external = crate::test_tempdir().expect("external directory");
         std::fs::write(external.path().join("sentinel.bin"), b"external")
             .expect("external sentinel");
         create_test_directories(temporary.path(), &["victim", "victim/nested"]);
@@ -19131,7 +19338,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn parked_tree_removal_preserves_a_replacement_root_binding() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         create_test_directories(temporary.path(), &["victim", "victim/nested"]);
         std::fs::write(
             temporary.path().join("victim/nested/original.bin"),
@@ -19188,7 +19395,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bounded_tree_removal_can_be_retained_and_retried() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let mut nested = temporary.path().join("victim");
         std::fs::create_dir(&nested).expect("tree root");
         for _ in 0..=platform::MAX_TREE_CLEAR_DEPTH {
@@ -19226,7 +19433,7 @@ mod tests {
 
     #[test]
     fn raw_applied_directory_create_refuses_drain_until_reconciled() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let authority = session.authority.clone();
@@ -19263,7 +19470,7 @@ mod tests {
 
     #[test]
     fn raw_live_stage_refuses_drain_and_remains_discardable() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let mut staged = match root.create_stage() {
@@ -19287,7 +19494,7 @@ mod tests {
 
     #[test]
     fn dropped_owner_settles_file_and_directory_restore_and_preservation_at_drain() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("restore.bin"), b"restore").expect("restore file");
         std::fs::write(temporary.path().join("preserve.bin"), b"preserve").expect("preserve file");
         std::fs::create_dir(temporary.path().join("folder")).expect("restore directory");
@@ -19339,7 +19546,7 @@ mod tests {
 
     #[test]
     fn effect_owner_settlement_is_fifo_and_stops_at_first_unresolved_move() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
         std::fs::write(temporary.path().join("domain/first.bin"), b"first").expect("first file");
         std::fs::write(temporary.path().join("domain/second.bin"), b"second").expect("second file");
@@ -19404,7 +19611,7 @@ mod tests {
 
     #[test]
     fn promotion_replace_and_directory_move_receipts_preserve_linear_outcomes() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("movable")).expect("movable directory");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -19493,7 +19700,7 @@ mod tests {
 
     #[test]
     fn retained_replacement_restores_during_terminal_settlement() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("destination.bin"), b"old").expect("destination file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -19580,7 +19787,7 @@ mod tests {
 
     #[test]
     fn effect_owner_counts_are_bounded_and_dead_handles_release_capacity() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -19607,7 +19814,7 @@ mod tests {
 
     #[test]
     fn effect_and_terminal_result_counts_share_one_bounded_capacity() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
         for index in 0..MAX_EFFECTS_PER_OWNER {
             std::fs::write(
@@ -19693,7 +19900,7 @@ mod tests {
 
     #[test]
     fn a_second_root_session_fails_without_waiting() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         assert!(matches!(
             RootSession::acquire(temporary.path()),
@@ -19705,7 +19912,7 @@ mod tests {
 
     #[test]
     fn file_capabilities_compare_private_physical_identity() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("first.bin"), b"first").expect("first file");
         std::fs::write(temporary.path().join("second.bin"), b"second").expect("second file");
         let session = acquire_test_root(temporary.path());
@@ -19756,7 +19963,7 @@ mod tests {
 
     #[test]
     fn unsettled_move_is_valid_pending_state_and_settlement_restores_drainability() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let authority = session.authority.clone();
         let mut token = {
@@ -19807,7 +20014,7 @@ mod tests {
 
     #[test]
     fn file_move_is_no_replace_and_collision_is_no_effect() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("source")).expect("source directory");
         std::fs::create_dir(temporary.path().join("destination")).expect("destination directory");
         std::fs::write(temporary.path().join("source/moved.bin"), b"moved").expect("moved source");
@@ -19866,9 +20073,73 @@ mod tests {
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_move_parent_barrier_failures_retain_receipt_until_reconciled() {
+        for fail_source in [false, true] {
+            let temporary = crate::test_tempdir().expect("temporary root");
+            std::fs::create_dir(temporary.path().join("source")).unwrap();
+            std::fs::create_dir(temporary.path().join("destination")).unwrap();
+            std::fs::write(temporary.path().join("source/payload.bin"), b"payload").unwrap();
+            let session = acquire_test_root(temporary.path());
+            let root = session.root().unwrap();
+            let source = root
+                .open_directory(&LeafName::new("source").unwrap())
+                .unwrap();
+            let destination = root
+                .open_directory(&LeafName::new("destination").unwrap())
+                .unwrap();
+            let owner = root.create_effect_owner().unwrap();
+            let file = source
+                .open_file(&LeafName::new("payload.bin").unwrap())
+                .unwrap();
+            let original_identity = file.identity;
+            let failures = if fail_source {
+                vec![Ok(()), Err(io::ErrorKind::Other)]
+            } else {
+                vec![Err(io::ErrorKind::Other)]
+            };
+            let obligation = {
+                let _fault =
+                    platform::install_publication_directory_sync_test_outcomes(failures.clone());
+                match file.move_no_replace(&destination, &LeafName::new("published.bin").unwrap()) {
+                    FileMoveOutcome::AppliedUnverified(obligation) => obligation,
+                    outcome => panic!("failed parent barrier became terminal: {outcome:?}"),
+                }
+            };
+            assert!(!temporary.path().join("source/payload.bin").exists());
+            assert_eq!(
+                std::fs::read(temporary.path().join("destination/published.bin")).unwrap(),
+                b"payload"
+            );
+            let receipt = owner.retain_file_move(obligation).unwrap();
+            {
+                let _fault = platform::install_publication_directory_sync_test_outcomes(failures);
+                owner.settle().unwrap();
+            }
+            let receipt = match receipt.claim() {
+                FileMoveReceiptOutcome::Pending(receipt) => receipt,
+                outcome => panic!("repeated parent barrier failure became terminal: {outcome:?}"),
+            };
+            assert!(owner.require_settled().is_err());
+
+            owner.settle().unwrap();
+            let moved = match receipt.claim() {
+                FileMoveReceiptOutcome::Applied(file) => file,
+                outcome => panic!("successful parent barriers did not settle: {outcome:?}"),
+            };
+            assert!(moved.identity == original_identity);
+            assert_eq!(moved.read_bounded(7).unwrap(), b"payload");
+            assert!(!temporary.path().join("source/payload.bin").exists());
+            assert!(owner.require_settled().is_ok());
+            drop((moved, owner, source, destination, root));
+            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        }
+    }
+
     #[test]
     fn directory_move_is_no_replace_and_collision_is_no_effect() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         for relative in [
             "source",
             "destination",
@@ -19926,7 +20197,7 @@ mod tests {
 
     #[test]
     fn clear_receipt_retains_the_root_lease_until_release() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("owned.bin"), b"owned").expect("owned file");
         let session = acquire_test_root(temporary.path());
         let reset = match session.begin_reset() {
@@ -19954,7 +20225,7 @@ mod tests {
     fn root_lease_is_a_retained_single_link_file_and_serializes_sessions() {
         use std::os::unix::fs::MetadataExt;
 
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let lease = temporary.path().join(ROOT_LEASE_NAME);
         let metadata = std::fs::symlink_metadata(&lease).expect("lease metadata");
@@ -19976,7 +20247,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn root_lease_rejects_a_noncanonical_portable_alias_before_acquisition() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let alias = temporary.path().join(".AXIAL-ROOT.LEASE");
         std::fs::write(&alias, b"user-owned alias").expect("portable lease alias");
 
@@ -19994,7 +20265,7 @@ mod tests {
 
     #[test]
     fn lease_name_class_scan_cache_invalidates_on_root_revision_change() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         platform::reset_lease_name_class_scan_count();
 
@@ -20059,7 +20330,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_root_lease_accepts_exact_and_rejects_noncanonical_spelling() {
-        let exact = tempfile::tempdir().expect("exact temporary root");
+        let exact = crate::test_tempdir().expect("exact temporary root");
         File::create(exact.path().join(ROOT_LEASE_NAME))
             .expect("create exact lease")
             .set_len(recovery::RECOVERY_CONTROL_BYTES)
@@ -20069,7 +20340,7 @@ mod tests {
             RootRevokeOutcome::Revoked
         ));
 
-        let noncanonical = tempfile::tempdir().expect("noncanonical temporary root");
+        let noncanonical = crate::test_tempdir().expect("noncanonical temporary root");
         let alias = noncanonical.path().join(".AXIAL-ROOT.LEASE");
         std::fs::write(&alias, b"user-owned alias").expect("noncanonical lease alias");
         assert!(matches!(
@@ -20086,7 +20357,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn retained_root_lease_rejects_a_new_portable_alias_before_control_io() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let alias = temporary.path().join(".AXIAL-ROOT.LEASE");
         std::fs::write(&alias, b"user-owned alias").expect("portable lease alias");
@@ -20103,7 +20374,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn recovery_control_refuses_a_displaced_root_and_replacement_lease() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let root = temporary.path().join("app");
         let displaced = temporary.path().join("displaced-app");
         std::fs::create_dir(&root).expect("application root");
@@ -20137,7 +20408,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_exclusive_recovery_control_prevents_root_displacement() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
+        let temporary = crate::test_tempdir().expect("temporary parent");
         let root = temporary.path().join("app");
         let displaced = temporary.path().join("displaced-app");
         std::fs::create_dir(&root).expect("application root");
@@ -20168,7 +20439,7 @@ mod tests {
             (recovery::RECOVERY_CONTROL_BYTES, true),
             (recovery::RECOVERY_CONTROL_BYTES + 1, false),
         ] {
-            let temporary = tempfile::tempdir().expect("temporary root");
+            let temporary = crate::test_tempdir().expect("temporary root");
             let lease_path = temporary.path().join(ROOT_LEASE_NAME);
             File::create(&lease_path)
                 .expect("create lease fixture")
@@ -20227,7 +20498,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_exclusive_recovery_control_prevents_binding_substitution() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let lease = temporary.path().join(ROOT_LEASE_NAME);
         let displaced = temporary.path().join("displaced-control");
@@ -20249,7 +20520,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_recovery_control_reports_short_native_eof() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let hook =
             platform::install_recovery_control_read_test_hook(recovery::RECOVERY_CONTROL_BYTES - 1);
@@ -20280,7 +20551,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn recovery_failure_preserves_root_artifacts_and_releases_the_lease() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let lease_path = temporary.path().join(ROOT_LEASE_NAME);
         let payload_path = temporary.path().join("owned.bin");
         let recovery_path = temporary
@@ -20346,7 +20617,7 @@ mod tests {
 
     #[test]
     fn root_recovery_control_is_reserved_only_at_the_physical_root() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let nested_path = temporary.path().join("nested");
         std::fs::create_dir(&nested_path).expect("nested directory");
         std::fs::write(nested_path.join(ROOT_LEASE_NAME), b"user-owned").expect("nested user file");
@@ -20381,7 +20652,7 @@ mod tests {
 
     #[test]
     fn bounded_recovery_stage_publishes_through_the_live_lifecycle() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let target = LeafName::new("published.bin").expect("target leaf");
@@ -20411,7 +20682,7 @@ mod tests {
 
     #[test]
     fn recoverable_state_stages_are_serialized_from_reservation_to_retirement() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let first_target = LeafName::new("first.json").expect("first target");
@@ -20438,7 +20709,7 @@ mod tests {
 
     #[test]
     fn live_state_successor_replaces_mixed_batch_in_input_order() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let target = LeafName::new("state.json").expect("target leaf");
@@ -20489,7 +20760,7 @@ mod tests {
 
     #[test]
     fn live_state_successor_reconciles_an_uncertain_create_before_handoff() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let target = LeafName::new("state.json").expect("target leaf");
@@ -20522,7 +20793,7 @@ mod tests {
 
     #[test]
     fn state_batch_second_member_failure_rolls_back_every_exact_input() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let destinations = ["first.json", "second.json"].map(|name| ReplaceDestination::Vacant {
@@ -20561,7 +20832,7 @@ mod tests {
 
     #[test]
     fn state_batch_partial_replay_retains_marker_and_retries_full_vector() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let replacements = ["first.json", "second.json"]
@@ -20631,7 +20902,7 @@ mod tests {
 
     #[test]
     fn state_batch_rejects_bounds_and_aliases_before_marker_or_io() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let request =
@@ -20710,7 +20981,7 @@ mod tests {
 
     #[test]
     fn uncertain_recovery_seal_becomes_read_only_and_reseals_idempotently() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let target = LeafName::new("uncertain-seal.bin").expect("target leaf");
@@ -20762,7 +21033,7 @@ mod tests {
 
     #[test]
     fn sealed_recovery_reserves_target_until_durable_cancellation() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let target = LeafName::new("reserved-target.bin").expect("target leaf");
@@ -20783,7 +21054,7 @@ mod tests {
 
     #[test]
     fn recovery_seal_refuses_an_existing_target_reservation() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let target = LeafName::new("reserved-before-seal.bin").expect("target leaf");
@@ -20823,7 +21094,7 @@ mod tests {
 
     #[test]
     fn prepared_recovery_replay_ignores_user_target_and_create_only_park() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let operation_id = [0x71; 16];
         let (registration, stage) = persist_test_recovery_fixture(
@@ -20890,7 +21161,7 @@ mod tests {
             (RecoveryPhase::StageSealed, 0x72),
             (RecoveryPhase::PublishPrepared, 0x73),
         ] {
-            let temporary = tempfile::tempdir().expect("temporary root");
+            let temporary = crate::test_tempdir().expect("temporary root");
             let first = acquire_test_root(temporary.path());
             let (registration, stage) = persist_test_recovery_fixture(
                 &first,
@@ -20954,7 +21225,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sealed_recovery_without_its_carrier_fails_closed_and_preserves_target() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let (_, stage) = persist_test_recovery_fixture(
             &first,
@@ -20991,7 +21262,7 @@ mod tests {
     #[test]
     fn recoverable_discard_releases_target_in_the_same_session() {
         for publish_prepared in [false, true] {
-            let temporary = tempfile::tempdir().expect("temporary root");
+            let temporary = crate::test_tempdir().expect("temporary root");
             let session = acquire_test_root(temporary.path());
             let root = session.root().expect("root capability");
             let target = LeafName::new("after-cancel.bin").expect("target leaf");
@@ -21056,7 +21327,7 @@ mod tests {
 
     #[test]
     fn publish_prepared_no_effect_can_retry_exactly() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let target = LeafName::new("retried.bin").expect("target leaf");
@@ -21113,7 +21384,7 @@ mod tests {
 
     #[test]
     fn reconciled_applied_publication_completes_recovery_before_disarm() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let target = LeafName::new("reconciled.bin").expect("target leaf");
@@ -21209,7 +21480,7 @@ mod tests {
 
     #[test]
     fn uncertain_startup_replay_retains_exclusive_stage_until_retry() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let operation_id = [0x5a; 16];
         let payload = b"restart payload";
@@ -21281,7 +21552,7 @@ mod tests {
 
     #[test]
     fn replay_transfer_preflight_failure_moves_neither_of_two_carriers() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         for (operation, destination, payload) in [
             (
@@ -21354,7 +21625,7 @@ mod tests {
 
     #[test]
     fn replacement_replay_completes_the_full_commit_sequence() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let old_payload = b"old replacement payload".as_slice();
         let new_payload = b"new replacement payload".as_slice();
@@ -21393,7 +21664,7 @@ mod tests {
 
     #[test]
     fn admitted_state_successor_replays_before_root_session_exposure() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let payload = b"State successor payload";
         let (registration, stage) = persist_test_recovery_fixture(
@@ -21448,7 +21719,7 @@ mod tests {
 
     #[test]
     fn cold_state_batch_replays_every_member_after_partial_physical_clear() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let first_payload = b"first cold State payload";
         let second_payload = b"second cold State payload";
@@ -21567,7 +21838,7 @@ mod tests {
 
     #[test]
     fn state_successor_retains_completed_effects_until_tombstone_retry() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let payload = b"retryable State successor payload";
         let (registration, stage) = persist_test_recovery_fixture(
@@ -21642,8 +21913,8 @@ mod tests {
             }
         }
 
-        let first = tempfile::tempdir().expect("first temporary root");
-        let second = tempfile::tempdir().expect("second temporary root");
+        let first = crate::test_tempdir().expect("first temporary root");
+        let second = crate::test_tempdir().expect("second temporary root");
         let first_obligation = prepare(first.path(), [0x91; 16]);
         let second_obligation = prepare(second.path(), [0x92; 16]);
         let first_token = first_obligation
@@ -21685,7 +21956,7 @@ mod tests {
 
     #[test]
     fn replacement_replay_cancels_without_touching_a_foreign_target() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let old_payload = b"expected old payload".as_slice();
         let new_payload = b"cancelled replacement payload".as_slice();
@@ -21718,7 +21989,7 @@ mod tests {
 
     #[test]
     fn replacement_prepared_stage_cleanup_ignores_the_user_target() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let old_payload = b"expected old payload".as_slice();
         let staged_payload = b"unsealed replacement payload".as_slice();
@@ -21751,7 +22022,7 @@ mod tests {
 
     #[test]
     fn replacement_replay_restores_an_interrupted_park() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let old_payload = b"restored old payload".as_slice();
         let new_payload = b"unpublished replacement payload".as_slice();
@@ -21784,7 +22055,7 @@ mod tests {
 
     #[test]
     fn equal_proof_replacement_prefers_the_stage_carrier() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let payload = b"equal proof payload".as_slice();
         let (registration, stage, park) = persist_test_replacement_fixture(
@@ -21821,7 +22092,7 @@ mod tests {
 
     #[test]
     fn replacement_replay_retries_settlement_after_park_removal() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let old_payload = b"removed park payload".as_slice();
         let new_payload = b"already published payload".as_slice();
@@ -21889,7 +22160,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replacement_publication_retries_a_poisoned_recovery_receipt() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let old_payload = b"parked publication payload".as_slice();
         let new_payload = b"published after retry payload".as_slice();
@@ -21963,7 +22234,7 @@ mod tests {
 
     #[test]
     fn remove_committed_replay_finishes_the_durable_desired_state() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let old_payload = b"durably superseded payload".as_slice();
         let new_payload = b"durable desired payload".as_slice();
@@ -22001,7 +22272,7 @@ mod tests {
 
     #[test]
     fn create_only_remove_committed_republishes_its_stage() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let payload = b"create-only durable payload".as_slice();
         let (registration, stage) = persist_test_recovery_fixture(
@@ -22036,7 +22307,7 @@ mod tests {
 
     #[test]
     fn create_only_and_replacement_replay_share_one_parent_snapshot() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let first = acquire_test_root(temporary.path());
         let create_payload = b"create-only payload".as_slice();
         let (create_registration, create_stage) = persist_test_recovery_fixture(
@@ -22103,7 +22374,7 @@ mod tests {
     fn unresolved_recovery_replay_drop_aborts() {
         const CHILD: &str = "AXIAL_TEST_DROP_ARMED_RECOVERY_REPLAY";
         if std::env::var_os(CHILD).is_some() {
-            let temporary = tempfile::tempdir().expect("temporary root");
+            let temporary = crate::test_tempdir().expect("temporary root");
             let first = acquire_test_root(temporary.path());
             persist_test_recovery_fixture(
                 &first,
@@ -22141,7 +22412,7 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn replay_parent_swap_after_planning_retains_the_record_until_binding_restoration() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let destination = temporary.path().join("destination").join("nested");
         let displaced = temporary.path().join("displaced-nested-destination");
         std::fs::create_dir(temporary.path().join("destination"))
@@ -22249,7 +22520,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         for fixture in ["symlink", "hardlink", "directory"] {
-            let temporary = tempfile::tempdir().expect("temporary root");
+            let temporary = crate::test_tempdir().expect("temporary root");
             let lease = temporary.path().join(ROOT_LEASE_NAME);
             match fixture {
                 "symlink" => {
@@ -22276,7 +22547,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn root_clear_refuses_a_replaced_lease_binding_before_deleting_children() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let owned = temporary.path().join("owned.bin");
         let lease = temporary.path().join(ROOT_LEASE_NAME);
         let displaced = temporary.path().join("displaced-lease");
@@ -22316,7 +22587,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_exclusive_lease_prevents_substitution_before_root_clear() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let owned = temporary.path().join("owned.bin");
         let lease = temporary.path().join(ROOT_LEASE_NAME);
         let displaced = temporary.path().join("displaced-lease");
@@ -22346,11 +22617,201 @@ mod tests {
     }
 
     #[test]
+    fn directory_overlaps_compares_independent_roots_and_retained_children() {
+        let temporary = crate::test_tempdir().expect("temporary parent");
+        let source = temporary.path().join("source");
+        let nested = source.join("nested");
+        let sibling = temporary.path().join("source-sibling");
+        std::fs::create_dir_all(nested.join("child")).expect("nested directories");
+        std::fs::create_dir(&sibling).expect("sibling directory");
+        let first = acquire_test_root(&source);
+        let second = acquire_test_root(&nested);
+        let root = first.root().expect("source root");
+        let nested = second.root().expect("independent nested root");
+        let same = second
+            .admit_absolute_directory(&source)
+            .expect("independently admitted source");
+        let sibling = first
+            .admit_absolute_directory(&sibling)
+            .expect("sibling admission");
+        let child = nested
+            .open_directory(&LeafName::new("child").expect("child name"))
+            .expect("retained child");
+
+        for (left, right) in [
+            (&root, &root),
+            (&root, &same),
+            (&root, &nested),
+            (&root, &child),
+        ] {
+            assert!(left.overlaps(right).expect("overlapping directories"));
+            assert!(right.overlaps(left).expect("symmetric overlap"));
+        }
+        for directory in [&root, &same, &nested, &child] {
+            assert!(!directory.overlaps(&sibling).expect("disjoint sibling"));
+            assert!(!sibling.overlaps(directory).expect("symmetric disjointness"));
+        }
+
+        drop((root, nested, same, sibling, child));
+        assert!(matches!(second.revoke(), RootRevokeOutcome::Revoked));
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn directory_overlaps_includes_the_filesystem_anchor() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("session root");
+        let absolute = session
+            .admit_absolute_directory(temporary.path())
+            .expect("absolute root admission");
+        let anchor_path = temporary
+            .path()
+            .ancestors()
+            .last()
+            .expect("filesystem anchor");
+        let anchor = session
+            .admit_absolute_directory(anchor_path)
+            .expect("filesystem anchor admission");
+
+        for directory in [&root, &absolute] {
+            assert!(directory.overlaps(&anchor).expect("anchor contains root"));
+            assert!(
+                anchor
+                    .overlaps(directory)
+                    .expect("symmetric anchor overlap")
+            );
+        }
+
+        drop((root, absolute, anchor));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_overlaps_rejects_replaced_admitted_ancestry() {
+        let temporary = crate::test_tempdir().expect("temporary parent");
+        let app = temporary.path().join("app");
+        let source = temporary.path().join("source");
+        let displaced = temporary.path().join("displaced-source");
+        std::fs::create_dir(&app).expect("application root");
+        std::fs::create_dir_all(source.join("child")).expect("source directories");
+        let session = acquire_test_root(&app);
+        let root = session.root().expect("application capability");
+        let child = session
+            .admit_absolute_directory(&source.join("child"))
+            .expect("source child admission");
+        std::fs::rename(&source, &displaced).expect("displace source ancestor");
+        std::fs::create_dir_all(source.join("child")).expect("replacement source directories");
+
+        assert!(child.overlaps(&root).is_err());
+        assert!(root.overlaps(&child).is_err());
+        assert!(child.overlaps(&child).is_err());
+
+        drop((root, child));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn directory_overlaps_rejects_either_revoked_authority() {
+        let first_path = crate::test_tempdir().expect("first root");
+        let second_path = crate::test_tempdir().expect("second root");
+        let first = acquire_test_root(first_path.path());
+        let second = acquire_test_root(second_path.path());
+        let first_root = first.root().expect("first capability");
+        let second_root = second.root().expect("second capability");
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+
+        assert!(first_root.overlaps(&second_root).is_err());
+        assert!(second_root.overlaps(&first_root).is_err());
+        assert!(first_root.overlaps(&first_root).is_err());
+
+        drop((first_root, second_root));
+        assert!(matches!(second.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_overlaps_rejects_reparented_session_root() {
+        let temporary = crate::test_tempdir().expect("temporary parent");
+        let parent = temporary.path().join("parent");
+        let displaced = temporary.path().join("displaced-parent");
+        let other_path = temporary.path().join("other");
+        std::fs::create_dir_all(parent.join("source")).expect("source root");
+        std::fs::create_dir(&other_path).expect("other root");
+        let first = acquire_test_root(&parent.join("source"));
+        let second = acquire_test_root(&other_path);
+        let source = first.root().expect("source capability");
+        let other = second.root().expect("other capability");
+        std::fs::rename(&parent, &displaced).expect("reparent source root");
+
+        assert!(source.overlaps(&other).is_err());
+        assert!(other.overlaps(&source).is_err());
+        assert!(source.overlaps(&source).is_err());
+
+        std::fs::rename(&displaced, &parent).expect("restore source ancestry");
+        assert!(!source.overlaps(&other).expect("restored disjoint roots"));
+        drop((source, other));
+        assert!(matches!(second.revoke(), RootRevokeOutcome::Revoked));
+        assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn directory_overlaps_refuses_disjointness_without_complete_ancestry() {
+        let temporary = crate::test_tempdir().expect("temporary parent");
+        let app = temporary.path().join("app");
+        let library = temporary.path().join("library");
+        std::fs::create_dir(&app).expect("application root");
+        std::fs::create_dir_all(library.join("child")).expect("library directories");
+        let session = acquire_test_root(&app);
+        let admitted = session
+            .admit_absolute_directory_authority(&library)
+            .expect("library admission");
+        let detached = match admitted.acquire_root_session().expect("acquire library") {
+            AdmittedRootSessionAcquireOutcome::Acquired(session) => session,
+            AdmittedRootSessionAcquireOutcome::NoEffect(error) => {
+                panic!("library acquisition: {error}")
+            }
+            AdmittedRootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                let error = obligation.error().to_string();
+                assert!(obligation.cleanup().is_ok());
+                panic!("unverified library acquisition: {error}");
+            }
+        };
+        let root = detached.root().expect("detached root");
+        let child_name = LeafName::new("child").expect("child name");
+        let child = root.open_directory(&child_name).expect("retained child");
+        let admitted_child = detached
+            .session
+            .admit_root_child_directory_authority(child.clone(), &child_name)
+            .expect("admitted detached root child");
+        let other = session.root().expect("unrelated application root");
+
+        assert!(root.overlaps(&root).expect("known detached equality"));
+        assert!(root.overlaps(&child).expect("known retained child"));
+        for directory in [&root, &child, &admitted_child.inner.directory] {
+            assert_eq!(
+                directory
+                    .overlaps(&other)
+                    .expect_err("unknown ancestry must fail closed")
+                    .kind(),
+                io::ErrorKind::Unsupported,
+            );
+            assert!(other.overlaps(directory).is_err());
+        }
+
+        drop((root, child, admitted_child, other));
+        assert!(matches!(detached.revoke(), RootRevokeOutcome::Revoked));
+        drop(admitted);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
     fn absolute_directory_containment_uses_retained_physical_ancestry() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let nested = temporary.path().join("user-library");
         std::fs::create_dir(&nested).expect("nested directory");
-        let external = tempfile::tempdir().expect("external directory");
+        let external = crate::test_tempdir().expect("external directory");
         let session = acquire_test_root(temporary.path());
 
         assert!(matches!(
@@ -22383,8 +22844,8 @@ mod tests {
     fn absolute_directory_containment_rejects_symlink_ancestry() {
         use std::os::unix::fs::symlink;
 
-        let temporary = tempfile::tempdir().expect("temporary root");
-        let external = tempfile::tempdir().expect("external directory");
+        let temporary = crate::test_tempdir().expect("temporary root");
+        let external = crate::test_tempdir().expect("external directory");
         let alias = temporary.path().join("external-alias");
         symlink(external.path(), &alias).expect("external alias");
         let session = acquire_test_root(temporary.path());
@@ -22398,7 +22859,7 @@ mod tests {
 
     #[test]
     fn revoked_capabilities_refuse_operations() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
@@ -22450,7 +22911,7 @@ mod tests {
 
     #[test]
     fn named_parks_reject_the_same_native_binding_without_registry_effects() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("World")).expect("test directory");
         std::fs::write(temporary.path().join("State.bin"), b"state").expect("test file");
         let session = acquire_test_root(temporary.path());
@@ -22507,7 +22968,7 @@ mod tests {
 
     #[test]
     fn preserved_file_acknowledgement_leaves_the_leaf_and_clears_ownership() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("record.bin"), b"payload").expect("test file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -22552,7 +23013,7 @@ mod tests {
 
     #[test]
     fn preserved_file_acknowledgement_restores_mismatched_park_authority() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("record.bin"), b"payload").expect("test file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -22606,7 +23067,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn preserved_file_acknowledgement_returns_mutated_park_authority() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("record.bin"), b"payload").expect("test file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -22644,7 +23105,7 @@ mod tests {
 
     #[test]
     fn revisions_and_bounded_ranges_are_exact() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("first")).expect("first directory");
         std::fs::create_dir(temporary.path().join("second")).expect("second directory");
         std::fs::write(temporary.path().join("sample.bin"), b"abcdef").expect("sample file");
@@ -22727,7 +23188,7 @@ mod tests {
 
     #[test]
     fn revision_reader_start_failures_retain_every_input() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("sample.bin"), b"abcdef").expect("sample file");
         std::fs::write(temporary.path().join("other.bin"), b"other").expect("other file");
         let session = acquire_test_root(temporary.path());
@@ -22771,7 +23232,7 @@ mod tests {
 
     #[test]
     fn revision_reader_operation_blocks_revocation_until_finish() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("sample.bin"), b"abcdef").expect("sample file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -22795,7 +23256,7 @@ mod tests {
 
     #[test]
     fn revision_reader_operation_blocks_reset_until_cancel() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("sample.bin"), b"abcdef").expect("sample file");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -22820,7 +23281,7 @@ mod tests {
 
     #[test]
     fn revision_reader_finish_failure_retains_the_reader() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         let path = temporary.path().join("sample.bin");
         std::fs::write(&path, b"abcdef").expect("sample file");
         let session = acquire_test_root(temporary.path());
@@ -22852,7 +23313,7 @@ mod tests {
 
     #[test]
     fn stable_park_header_reserves_names_during_file_record_checkout() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("file.parked"), b"payload").expect("parked file");
         std::fs::create_dir(temporary.path().join("directory.parked")).expect("parked directory");
         let session = acquire_test_root(temporary.path());
@@ -22942,7 +23403,7 @@ mod tests {
 
     #[test]
     fn stable_headers_reserve_checked_out_creates_and_directory_parks() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::create_dir(temporary.path().join("folder")).expect("parked directory");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
@@ -23018,7 +23479,7 @@ mod tests {
         )
         .expect_err("checked-out directory create must retain its leaf");
         assert_eq!(directory_conflict.kind(), io::ErrorKind::WouldBlock);
-        let unrelated = MoveEffectToken::reserve(
+        let mut unrelated = MoveEffectToken::reserve(
             &authority,
             &operation,
             NamespaceLeaf {
@@ -23033,8 +23494,8 @@ mod tests {
             None,
             None,
         )
-        .expect_err("identity-unknown directory create must fail closed globally");
-        assert_eq!(unrelated.kind(), io::ErrorKind::WouldBlock);
+        .expect("identity-unknown directory create must permit an unrelated sibling");
+        unrelated.settle(&operation).expect("settle sibling move");
         directory_guard.disarm(&mut directory_create, &operation);
         let mut unrelated = MoveEffectToken::reserve(
             &authority,

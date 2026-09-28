@@ -7,7 +7,7 @@ import { openCreateModpack } from '../../ui-state';
 import type { ContentSelection, ResolutionPlan } from '../../types-content';
 
 export interface AddOutcome {
-  status: 'installed' | 'needs-confirmation' | 'failed';
+  status: 'queued' | 'needs-confirmation' | 'failed' | 'superseded';
   plan?: ResolutionPlan;
   error?: string;
 }
@@ -52,7 +52,7 @@ export async function commitInstall(
   const extra = plan ? plan.items.filter((item) => item.reason === 'dependency' && !item.already_installed).length : 0;
   const suffix = extra > 0 ? ` with ${plural(extra, 'dependency', 'dependencies')}` : '';
   toast(`Queued ${label}${suffix}`, 'success');
-  return { status: 'installed', plan };
+  return { status: 'queued', plan };
 }
 
 export async function setUpModpack(canonicalId: string, versionId?: string, iconUrl?: string): Promise<boolean> {

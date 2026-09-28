@@ -113,6 +113,8 @@ interface CreateLoaderBuildsViewResponse {
     selection_id: string;
     label: string;
     detail: string;
+    enabled: boolean;
+    disabled_reason: string | null;
   };
   builds: Array<{
     selection_id: string;
@@ -175,6 +177,7 @@ const MOCK_FABRIC_LOADER_VERSION = '0.16.14';
 
 let configFixture: Config = {
   revision: 0,
+  account_selection_revision: 0,
   username: 'MockPlayer',
   launch_auth_mode: 'offline',
   max_memory_mb: 4096,
@@ -184,8 +187,6 @@ let configFixture: Config = {
   window_height: 720,
   jvm_preset: '',
   performance_mode: 'managed',
-  guardian_mode: 'managed',
-  guardian_idle_integrity_enabled: true,
   theme: 'obsidian',
   custom_hue: 140,
   custom_vibrancy: 100,
@@ -737,6 +738,9 @@ function mockContentUninstalls(instanceId: string, canonicalIds: string[]): Inst
 
 function mockEmptyInstallQueue(message?: string, detail?: string): InstallQueueStateResponse {
   return {
+    queue_epoch: 'mock-queue',
+    revision: 0,
+    registry_revision: 0,
     active: null,
     items: [],
     view_model: {
@@ -1272,6 +1276,8 @@ function createLoaderBuildsView(request: MockRequest | undefined): CreateLoaderB
       selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${minecraftVersion}`,
       label: 'Automatic',
       detail: 'Axial picks the newest stable Fabric build.',
+      enabled: true,
+      disabled_reason: null,
     },
     builds: [
       {
@@ -1494,6 +1500,7 @@ function versionDisplay(
 
 function flagsResponse(): FlagsResponse {
   return {
+    revision: configFixture.revision,
     flags: flagRegistry.map((flag): FeatureFlagViewModel => {
       const override = flagOverrides.get(flag.key);
       return {

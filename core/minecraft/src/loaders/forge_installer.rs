@@ -13,7 +13,7 @@ use crate::known_good_libraries::{
     SealedExactLibraryDeclarations, SealedInstallerLibrarySources,
     bind_installer_library_declarations,
 };
-use crate::launch::{Library, maven_to_path};
+use crate::launch::{Library, LibraryArtifact, LibraryDownload, maven_to_path};
 use crate::portable_path::{PortablePathKey, PortableRelativePath};
 use crate::rules::default_environment;
 use serde::{Deserialize, Deserializer, de};
@@ -23,13 +23,14 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::Arc;
 use thiserror::Error;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 #[cfg(not(test))]
 const MAX_INSTALLER_PROFILE_ENTRY_BYTES: u64 = 8 << 20;
 #[cfg(test)]
-const MAX_INSTALLER_PROFILE_ENTRY_BYTES: u64 = 1024;
+const MAX_INSTALLER_PROFILE_ENTRY_BYTES: u64 = 8192;
 #[cfg(not(test))]
 const MAX_INSTALLER_EMBEDDED_ENTRY_BYTES: u64 = 128 << 20;
 #[cfg(test)]
@@ -49,7 +50,7 @@ const MAX_FORGE_PROCESSORS: usize = 8;
 #[cfg(not(test))]
 const MAX_FORGE_PROCESSOR_DATA: usize = 256;
 #[cfg(test)]
-const MAX_FORGE_PROCESSOR_DATA: usize = 8;
+const MAX_FORGE_PROCESSOR_DATA: usize = 16;
 #[cfg(not(test))]
 const MAX_FORGE_PROCESSOR_OUTPUTS: usize = 1024;
 #[cfg(test)]
@@ -145,6 +146,45 @@ pub enum ForgeInstallerError {
     InvalidForgeProcessorFinalOutput,
     #[error("download failed: {0}")]
     Download(#[from] DownloadError),
+}
+
+impl ForgeInstallerError {
+    pub(super) fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            Self::Zip(_) => "zip",
+            Self::Io(_) => "io",
+            Self::Json(_) => "json",
+            Self::MissingVersionJson => "missing_version_json",
+            Self::InvalidEntryPath => "invalid_entry_path",
+            Self::EntryTooLarge { .. } => "entry_too_large",
+            Self::TooManyEntries => "too_many_entries",
+            Self::EmbeddedEntriesTooLarge => "embedded_entries_too_large",
+            Self::DuplicateEntry { .. } => "duplicate_entry",
+            Self::MissingDeclaredEntry { .. } => "missing_declared_entry",
+            Self::ConflictingEmbeddedArtifact => "conflicting_embedded_artifact",
+            Self::ConflictingLibraryDeclaration { .. } => "conflicting_library_declaration",
+            Self::UndeclaredEmbeddedArtifact { .. } => "undeclared_embedded_artifact",
+            Self::PortablePathAlias => "portable_path_alias",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::TooManyForgeProcessors => "too_many_processors",
+            Self::TooManyForgeProcessorData => "too_many_processor_data",
+            Self::TooManyForgeProcessorOutputs => "too_many_processor_outputs",
+            Self::ForgeProcessorDeclarationsTooLarge => "processor_declarations_too_large",
+            Self::InvalidForgeProcessor => "invalid_processor",
+            Self::InvalidForgeProcessorData => "invalid_processor_data",
+            Self::MissingForgeProcessorData => "missing_processor_data",
+            Self::ForgeProcessorDataEntryTooLarge => "processor_data_entry_too_large",
+            Self::ForgeProcessorDataTooLarge => "processor_data_too_large",
+            Self::MissingForgeProcessorOutputs => "missing_processor_outputs",
+            Self::InvalidForgeProcessorOutput => "invalid_processor_output",
+            Self::MultipleForgeProcessorProducers => "multiple_processor_producers",
+            Self::ForgeProcessorPortableAlias => "processor_portable_alias",
+            Self::ForgeProcessorDependencyCycle => "processor_dependency_cycle",
+            Self::InvalidForgeProcessorArtifactContract => "invalid_processor_artifact_contract",
+            Self::InvalidForgeProcessorFinalOutput => "invalid_processor_final_output",
+            Self::Download(_) => "download",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -401,10 +441,19 @@ pub(crate) struct BoundProcessorPlan {
 }
 
 pub(super) struct BoundProcessorStep {
+    pub(super) action: BoundProcessorAction,
     pub(super) jar: BoundProcessorArtifact,
     pub(super) classpath: Vec<BoundProcessorArtifact>,
     pub(super) args: Vec<BoundProcessorArgument>,
     pub(super) outputs: Vec<BoundProcessorOutput>,
+}
+
+#[derive(Clone)]
+pub(super) enum BoundProcessorAction {
+    Java,
+    ExtractMcpMappings { input: BoundProcessorArtifact },
+    DownloadMojmaps,
+    SplitJar,
 }
 
 pub(super) enum BoundProcessorArgument {
@@ -444,8 +493,32 @@ pub(super) enum BoundProcessorData {
 
 pub(super) struct BoundProcessorOutput {
     pub(super) artifact: BoundProcessorArtifact,
-    pub(super) sha1: [u8; 20],
+    pub(super) expectation: BoundProcessorOutputExpectation,
     pub(super) role: BoundProcessorOutputRole,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BoundProcessorOutputExpectation {
+    ProviderSha1([u8; 20]),
+    Derived(ProcessorDerivation),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProcessorDerivation(Arc<()>);
+
+impl PartialEq for ProcessorDerivation {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ProcessorDerivation {}
+
+#[cfg(test)]
+impl ProcessorDerivation {
+    pub(crate) fn from_test() -> Self {
+        Self(Arc::new(()))
+    }
 }
 
 #[derive(Clone)]
@@ -481,13 +554,21 @@ pub(crate) struct AuthenticatedEmbeddedMavenArtifact {
 pub(crate) struct AuthenticatedInstallerLibraryInputs {
     libraries: Vec<Library>,
     embedded_artifacts: Vec<AuthenticatedEmbeddedMavenArtifact>,
-    terminal_outputs: Vec<(PortableRelativePath, [u8; 20], Option<u64>)>,
+    terminal_outputs: Vec<(
+        PortableRelativePath,
+        BoundProcessorOutputExpectation,
+        Option<u64>,
+    )>,
 }
 
 pub(crate) struct AuthenticatedInstallerLibraryParts {
     pub(crate) libraries: Vec<Library>,
     pub(crate) embedded_artifacts: Vec<AuthenticatedEmbeddedMavenArtifact>,
-    pub(crate) terminal_outputs: Vec<(PortableRelativePath, [u8; 20], Option<u64>)>,
+    pub(crate) terminal_outputs: Vec<(
+        PortableRelativePath,
+        BoundProcessorOutputExpectation,
+        Option<u64>,
+    )>,
 }
 
 impl AuthenticatedInstallerLibraryInputs {
@@ -504,6 +585,32 @@ impl AuthenticatedInstallerLibraryInputs {
         libraries: Vec<Library>,
         embedded_artifacts: Vec<(PortableRelativePath, Vec<u8>)>,
         terminal_outputs: Vec<(PortableRelativePath, [u8; 20], Option<u64>)>,
+    ) -> Self {
+        Self::from_test_with_expectations(
+            libraries,
+            embedded_artifacts,
+            terminal_outputs
+                .into_iter()
+                .map(|(path, sha1, size)| {
+                    (
+                        path,
+                        BoundProcessorOutputExpectation::ProviderSha1(sha1),
+                        size,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_with_expectations(
+        libraries: Vec<Library>,
+        embedded_artifacts: Vec<(PortableRelativePath, Vec<u8>)>,
+        terminal_outputs: Vec<(
+            PortableRelativePath,
+            BoundProcessorOutputExpectation,
+            Option<u64>,
+        )>,
     ) -> Self {
         Self {
             libraries,
@@ -562,7 +669,7 @@ impl BoundForgeInstallerPlan {
                     BoundProcessorOutputRole::Intermediate => None,
                     BoundProcessorOutputRole::Terminal { expected_size } => Some((
                         output.artifact.relative_path.clone(),
-                        output.sha1,
+                        output.expectation.clone(),
                         expected_size,
                     )),
                 })
@@ -616,6 +723,14 @@ impl BoundForgeProcessorExecution {
     fn has_exact_terminal_declarations(&self) -> bool {
         let mut saw_terminal = false;
         for output in self.plan.steps.iter().flat_map(|step| &step.outputs) {
+            if matches!(output.role, BoundProcessorOutputRole::Terminal { .. })
+                && matches!(
+                    output.expectation,
+                    BoundProcessorOutputExpectation::Derived(_)
+                )
+            {
+                return false;
+            }
             match output.role {
                 BoundProcessorOutputRole::Intermediate => {}
                 BoundProcessorOutputRole::Terminal {
@@ -1413,23 +1528,28 @@ pub(crate) fn bind_authenticated_installer_plan(
             .as_ref()
             .ok_or(ForgeInstallerError::IdentityMismatch)?;
         validate_processor_disposition_bounds(profile)?;
-        let mut has_client_work = false;
+        let mut client_steps = 0;
         let mut has_missing_client_outputs = false;
         for processor in &profile.processors {
             if validate_processor_sides(&processor.sides)? {
-                has_client_work = true;
+                client_steps += 1;
                 has_missing_client_outputs |= processor.outputs.is_empty();
             }
         }
-        if !has_client_work {
+        if client_steps == 0 {
             BoundProcessorDisposition::EmptyClientWork
-        } else if record.component_id == LoaderComponentId::NeoForge && has_missing_client_outputs {
+        } else if record.component_id == LoaderComponentId::NeoForge
+            && has_missing_client_outputs
+            && client_steps != 6
+        {
             BoundProcessorDisposition::UnsupportedMissingOutputs
         } else {
             BoundProcessorDisposition::TypedRunnable(bind_forge_processor_plan(
                 authenticated.source.bytes(),
+                record,
+                &authenticated.version,
                 profile,
-                &authenticated.libraries,
+                &mut authenticated.libraries,
                 &authenticated.embedded_maven_artifacts,
             )?)
         }
@@ -1509,10 +1629,414 @@ fn processor_artifact_is_valid(artifact: &BoundProcessorArtifact) -> bool {
     !artifact.coordinate.is_empty() && !artifact.relative_path.as_str().is_empty()
 }
 
+struct ForgeRecipeStep {
+    action: BoundProcessorAction,
+    outputs: Vec<(BoundProcessorArtifact, BoundProcessorOutputExpectation)>,
+}
+
+fn bind_modern_client_recipe(
+    record: &LoaderBuildRecord,
+    version: &LoaderProfileFragment,
+    profile: &InstallProfileDeclarations,
+    data: &BTreeMap<String, BoundProcessorData>,
+    libraries: &mut Vec<Library>,
+) -> Result<Vec<ForgeRecipeStep>, ForgeInstallerError> {
+    let mut client = Vec::new();
+    for processor in &profile.processors {
+        if validate_processor_sides(&processor.sides)? {
+            client.push(processor);
+        }
+    }
+    if client.len() != 6 {
+        return Err(ForgeInstallerError::MissingForgeProcessorOutputs);
+    }
+    let Some(BoundProcessorData::Literal(mcp)) = data.get("MCP_VERSION") else {
+        return Err(ForgeInstallerError::InvalidForgeProcessorData);
+    };
+    let neoforge = match (record.component_id, record.strategy) {
+        (LoaderComponentId::Forge, LoaderInstallStrategy::ForgeModern) => false,
+        (LoaderComponentId::NeoForge, LoaderInstallStrategy::NeoForgeModern) => true,
+        _ => return Err(ForgeInstallerError::InvalidForgeProcessor),
+    };
+    let (minecraft_mcp, mcp_root, loader_root) = if neoforge {
+        validate_neoforge_runtime_arguments(version, record, mcp, libraries)?;
+        (
+            mcp.clone(),
+            format!("net.neoforged:neoform:{mcp}"),
+            format!("net.neoforged:neoforge:{}", record.loader_version),
+        )
+    } else {
+        validate_forge_runtime_arguments(version, record, mcp)?;
+        let minecraft_mcp = format!("{}-{mcp}", record.minecraft_version);
+        (
+            minecraft_mcp.clone(),
+            format!("de.oceanlabs.mcp:mcp_config:{minecraft_mcp}"),
+            format!(
+                "net.minecraftforge:forge:{}-{}",
+                record.minecraft_version, record.loader_version
+            ),
+        )
+    };
+    let minecraft_root = format!("net.minecraft:client:{minecraft_mcp}");
+    for (token, coordinate) in [
+        ("MAPPINGS", format!("{mcp_root}:mappings@txt")),
+        ("MOJMAPS", format!("{minecraft_root}:mappings@txt")),
+        ("MERGED_MAPPINGS", format!("{mcp_root}:mappings-merged@txt")),
+        ("MC_SLIM", format!("{minecraft_root}:slim")),
+        ("MC_EXTRA", format!("{minecraft_root}:extra")),
+        ("MC_SRG", format!("{minecraft_root}:srg")),
+        ("PATCHED", format!("{loader_root}:client")),
+    ] {
+        let artifact = resolve_processor_output_artifact(&format!("{{{token}}}"), data)?;
+        if artifact.coordinate != coordinate {
+            return Err(ForgeInstallerError::InvalidForgeProcessorOutput);
+        }
+    }
+    if !matches!(data.get("BINPATCH"), Some(BoundProcessorData::InstallerData(path))
+        if path.as_str() == "data/client.lzma")
+    {
+        return Err(ForgeInstallerError::InvalidForgeProcessorData);
+    }
+    let mcp_input = parse_processor_artifact(&format!("{mcp_root}@zip"))?;
+    let mcp_arg = format!("[{}]", mcp_input.coordinate);
+    let expected_args: [&[&str]; 6] = [
+        &[
+            "--task",
+            "MCP_DATA",
+            "--input",
+            &mcp_arg,
+            "--output",
+            "{MAPPINGS}",
+            "--key",
+            "mappings",
+        ],
+        &[
+            "--task",
+            "DOWNLOAD_MOJMAPS",
+            "--version",
+            &record.minecraft_version,
+            "--side",
+            "{SIDE}",
+            "--output",
+            "{MOJMAPS}",
+        ],
+        if neoforge {
+            &[
+                "--task",
+                "MERGE_MAPPING",
+                "--left",
+                "{MAPPINGS}",
+                "--right",
+                "{MOJMAPS}",
+                "--output",
+                "{MERGED_MAPPINGS}",
+                "--classes",
+                "--fields",
+                "--methods",
+                "--reverse-right",
+            ]
+        } else {
+            &[
+                "--task",
+                "MERGE_MAPPING",
+                "--left",
+                "{MAPPINGS}",
+                "--right",
+                "{MOJMAPS}",
+                "--output",
+                "{MERGED_MAPPINGS}",
+                "--classes",
+                "--reverse-right",
+            ]
+        },
+        &[
+            "--input",
+            "{MINECRAFT_JAR}",
+            "--slim",
+            "{MC_SLIM}",
+            "--extra",
+            "{MC_EXTRA}",
+            "--srg",
+            "{MERGED_MAPPINGS}",
+        ],
+        &[
+            "--input",
+            "{MC_SLIM}",
+            "--output",
+            "{MC_SRG}",
+            "--names",
+            "{MERGED_MAPPINGS}",
+            "--ann-fix",
+            "--ids-fix",
+            "--src-fix",
+            "--record-fix",
+        ],
+        &[
+            "--clean",
+            "{MC_SRG}",
+            "--output",
+            "{PATCHED}",
+            "--apply",
+            "{BINPATCH}",
+        ],
+    ];
+    let expected_tools = if neoforge {
+        [
+            ("net.neoforged.installertools", "installertools", None),
+            ("net.neoforged.installertools", "installertools", None),
+            ("net.neoforged.installertools", "installertools", None),
+            ("net.neoforged.installertools", "jarsplitter", None),
+            ("net.neoforged", "AutoRenamingTool", Some("all")),
+            (
+                "net.neoforged.installertools",
+                "binarypatcher",
+                Some("fatjar"),
+            ),
+        ]
+    } else {
+        [
+            ("net.minecraftforge", "installertools", None),
+            ("net.minecraftforge", "installertools", None),
+            ("net.minecraftforge", "installertools", None),
+            ("net.minecraftforge", "jarsplitter", None),
+            ("net.minecraftforge", "ForgeAutoRenamingTool", Some("all")),
+            ("net.minecraftforge", "binarypatcher", None),
+        ]
+    };
+    for ((processor, args), (group, tool, classifier)) in
+        client.iter().zip(expected_args).zip(expected_tools)
+    {
+        let artifact = parse_processor_artifact(&processor.jar)?;
+        let parts = artifact.coordinate.split(':').collect::<Vec<_>>();
+        if parts.first() != Some(&group)
+            || parts.get(1) != Some(&tool)
+            || parts.get(3).copied() != classifier
+            || parts.len() != if classifier.is_some() { 4 } else { 3 }
+            || artifact.coordinate.contains('@')
+            || processor
+                .args
+                .iter()
+                .map(String::as_str)
+                .ne(args.iter().copied())
+        {
+            return Err(ForgeInstallerError::InvalidForgeProcessor);
+        }
+    }
+    if client[0].jar != client[1].jar || client[0].jar != client[2].jar {
+        return Err(ForgeInstallerError::InvalidForgeProcessor);
+    }
+    let digest_key = |key| (!neoforge || data.contains_key(key)).then_some(key);
+    let output_specs: [&[(&str, Option<&str>)]; 6] = [
+        &[("MAPPINGS", None)],
+        &[("MOJMAPS", None)],
+        &[("MERGED_MAPPINGS", None)],
+        &[
+            ("MC_SLIM", digest_key("MC_SLIM_SHA")),
+            ("MC_EXTRA", digest_key("MC_EXTRA_SHA")),
+        ],
+        &[(
+            "MC_SRG",
+            data.contains_key("MC_SRG_SHA").then_some("MC_SRG_SHA"),
+        )],
+        &[("PATCHED", digest_key("PATCHED_SHA"))],
+    ];
+    let mut pending = Vec::new();
+    for (index, (processor, specs)) in client.iter().zip(output_specs).enumerate() {
+        let mut declared = BTreeMap::new();
+        for (target, digest) in &processor.outputs {
+            let artifact = resolve_processor_output_artifact(target, data)?;
+            let sha1 = resolve_processor_output_sha1(digest, data)?;
+            if declared.insert(artifact.relative_path, sha1).is_some() {
+                return Err(ForgeInstallerError::InvalidForgeProcessorOutput);
+            }
+        }
+        if !declared.is_empty() && declared.len() != specs.len() {
+            return Err(ForgeInstallerError::InvalidForgeProcessorOutput);
+        }
+        let authored_outputs = !declared.is_empty();
+        let mut outputs = Vec::new();
+        for (token, digest) in specs {
+            let artifact = resolve_processor_output_artifact(&format!("{{{token}}}"), data)?;
+            let mut sha1 = digest
+                .map(|digest| resolve_processor_output_sha1(&format!("{{{digest}}}"), data))
+                .transpose()?;
+            if authored_outputs {
+                let authored = declared
+                    .remove(&artifact.relative_path)
+                    .ok_or(ForgeInstallerError::InvalidForgeProcessorOutput)?;
+                if sha1.is_some_and(|expected| expected != authored) {
+                    return Err(ForgeInstallerError::InvalidForgeProcessorOutput);
+                }
+                sha1 = Some(authored);
+            }
+            if matches!(*token, "MC_SRG" | "MC_EXTRA" | "PATCHED") {
+                sha1 = bind_generated_runtime_library(libraries, &artifact, sha1)?;
+            }
+            outputs.push((artifact, sha1));
+        }
+        let action = match index {
+            0 => BoundProcessorAction::ExtractMcpMappings {
+                input: mcp_input.clone(),
+            },
+            1 => BoundProcessorAction::DownloadMojmaps,
+            3 => BoundProcessorAction::SplitJar,
+            _ => BoundProcessorAction::Java,
+        };
+        pending.push((action, outputs));
+    }
+    let derivation = ProcessorDerivation(Arc::new(()));
+    Ok(pending
+        .into_iter()
+        .map(|(action, outputs)| ForgeRecipeStep {
+            action,
+            outputs: outputs
+                .into_iter()
+                .map(|(artifact, sha1)| {
+                    (
+                        artifact,
+                        sha1.map(BoundProcessorOutputExpectation::ProviderSha1)
+                            .unwrap_or_else(|| {
+                                BoundProcessorOutputExpectation::Derived(derivation.clone())
+                            }),
+                    )
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+fn validate_forge_runtime_arguments(
+    version: &LoaderProfileFragment,
+    record: &LoaderBuildRecord,
+    mcp: &str,
+) -> Result<(), ForgeInstallerError> {
+    validate_recipe_runtime_arguments(
+        version,
+        &[
+            ("--launchTarget", "forgeclient"),
+            ("--fml.forgeVersion", record.loader_version.as_str()),
+            ("--fml.mcVersion", record.minecraft_version.as_str()),
+            ("--fml.forgeGroup", "net.minecraftforge"),
+            ("--fml.mcpVersion", mcp),
+        ],
+    )
+}
+
+fn validate_neoforge_runtime_arguments(
+    version: &LoaderProfileFragment,
+    record: &LoaderBuildRecord,
+    mcp: &str,
+    libraries: &[Library],
+) -> Result<(), ForgeInstallerError> {
+    let neoform = mcp
+        .strip_prefix(&format!("{}-", record.minecraft_version))
+        .filter(|suffix| !suffix.is_empty())
+        .ok_or(ForgeInstallerError::InvalidForgeProcessor)?;
+    let mut fml = libraries.iter().filter_map(|library| {
+        library
+            .name
+            .strip_prefix("net.neoforged.fancymodloader:loader:")
+    });
+    let fml = match (fml.next(), fml.next()) {
+        (Some(version), None) if !version.is_empty() && !version.contains([':', '@']) => version,
+        _ => return Err(ForgeInstallerError::InvalidForgeProcessor),
+    };
+    validate_recipe_runtime_arguments(
+        version,
+        &[
+            ("--launchTarget", "forgeclient"),
+            ("--fml.neoForgeVersion", record.loader_version.as_str()),
+            ("--fml.fmlVersion", fml),
+            ("--fml.mcVersion", record.minecraft_version.as_str()),
+            ("--fml.neoFormVersion", neoform),
+        ],
+    )
+}
+
+fn validate_recipe_runtime_arguments(
+    version: &LoaderProfileFragment,
+    expected: &[(&str, &str)],
+) -> Result<(), ForgeInstallerError> {
+    let arguments = version
+        .arguments
+        .as_ref()
+        .ok_or(ForgeInstallerError::InvalidForgeProcessor)?;
+    if version.main_class != "cpw.mods.bootstraplauncher.BootstrapLauncher"
+        || arguments.game.iter().any(|arg| !arg.rules.is_empty())
+    {
+        return Err(ForgeInstallerError::InvalidForgeProcessor);
+    }
+    let args = arguments
+        .game
+        .iter()
+        .flat_map(|arg| arg.value.iter())
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    for &(flag, expected) in expected {
+        let positions = args
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| **arg == flag)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if positions.len() != 1 || args.get(positions[0] + 1) != Some(&expected) {
+            return Err(ForgeInstallerError::InvalidForgeProcessor);
+        }
+    }
+    Ok(())
+}
+
+fn bind_generated_runtime_library(
+    libraries: &mut Vec<Library>,
+    artifact: &BoundProcessorArtifact,
+    mut sha1: Option<[u8; 20]>,
+) -> Result<Option<[u8; 20]>, ForgeInstallerError> {
+    if let Some(library) = libraries
+        .iter()
+        .find(|library| library.name == artifact.coordinate)
+    {
+        let plans =
+            library_artifact_plans_for(std::slice::from_ref(library), &default_environment())
+                .map_err(|_| ForgeInstallerError::InvalidForgeProcessorFinalOutput)?;
+        if plans.len() != 1
+            || plans[0].relative_path != artifact.relative_path
+            || plans[0].is_native
+        {
+            return Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput);
+        }
+        if let Some(declared) = plans[0].expected.sha1.as_deref() {
+            let declared = decode_sha1(declared)
+                .ok_or(ForgeInstallerError::InvalidForgeProcessorFinalOutput)?;
+            if sha1.is_some_and(|expected| expected != declared) {
+                return Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput);
+            }
+            sha1 = Some(declared);
+        }
+    } else {
+        libraries.push(Library {
+            name: artifact.coordinate.clone(),
+            downloads: Some(LibraryDownload {
+                artifact: Some(LibraryArtifact {
+                    path: artifact.relative_path.as_str().to_string(),
+                    sha1: sha1
+                        .map(|digest| digest.iter().map(|byte| format!("{byte:02x}")).collect())
+                        .unwrap_or_default(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+    Ok(sha1)
+}
+
 fn bind_forge_processor_plan(
     installer: &[u8],
+    record: &LoaderBuildRecord,
+    version: &LoaderProfileFragment,
     profile: &InstallProfileDeclarations,
-    libraries: &[Library],
+    libraries: &mut Vec<Library>,
     embedded: &[AuthenticatedEmbeddedMavenArtifact],
 ) -> Result<BoundProcessorPlan, ForgeInstallerError> {
     if profile.processors.len() > MAX_FORGE_PROCESSORS {
@@ -1532,10 +2056,33 @@ fn bind_forge_processor_plan(
         return Err(ForgeInstallerError::TooManyForgeProcessorOutputs);
     }
     validate_processor_declaration_bounds(profile)?;
-    let artifact_contracts = resolved_processor_artifact_contracts(libraries, embedded)?;
-
     validate_processor_data_keys(&profile.data)?;
-    let referenced_data = referenced_client_processor_data(profile)?;
+    let mut referenced_data = referenced_client_processor_data(profile)?;
+    let recipe_candidate = matches!(
+        (record.component_id, record.strategy),
+        (LoaderComponentId::Forge, LoaderInstallStrategy::ForgeModern)
+            | (
+                LoaderComponentId::NeoForge,
+                LoaderInstallStrategy::NeoForgeModern
+            )
+    ) && profile.processors.iter().any(|processor| {
+        (processor.sides.is_empty() || processor.sides.iter().any(|side| side == "client"))
+            && (processor.outputs.is_empty()
+                || processor.args.iter().any(|arg| arg == "DOWNLOAD_MOJMAPS"))
+    });
+    if recipe_candidate {
+        for key in [
+            "MCP_VERSION",
+            "MC_SLIM_SHA",
+            "MC_EXTRA_SHA",
+            "PATCHED_SHA",
+            "MC_SRG_SHA",
+        ] {
+            if profile.data.contains_key(key) {
+                referenced_data.insert(key.to_string());
+            }
+        }
+    }
     let data = referenced_data
         .into_iter()
         .map(|key| {
@@ -1546,6 +2093,14 @@ fn bind_forge_processor_plan(
             parse_processor_data(&declaration.client).map(|value| (key, value))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let recipe = if recipe_candidate {
+        Some(bind_modern_client_recipe(
+            record, version, profile, &data, libraries,
+        )?)
+    } else {
+        None
+    };
+    let artifact_contracts = resolved_processor_artifact_contracts(libraries, embedded)?;
     let requested_data = data
         .values()
         .filter_map(|value| match value {
@@ -1563,7 +2118,8 @@ fn bind_forge_processor_plan(
         if !is_client {
             continue;
         }
-        if declaration.outputs.is_empty() {
+        let recipe_step = recipe.as_ref().and_then(|recipe| recipe.get(steps.len()));
+        if declaration.outputs.is_empty() && recipe_step.is_none() {
             return Err(ForgeInstallerError::MissingForgeProcessorOutputs);
         }
 
@@ -1574,15 +2130,28 @@ fn bind_forge_processor_plan(
             .map(|coordinate| parse_processor_artifact(coordinate))
             .collect::<Result<Vec<_>, _>>()?;
         let step_index = steps.len();
-        let mut outputs = Vec::with_capacity(declaration.outputs.len());
+        let declared_outputs = match recipe_step {
+            Some(step) => step.outputs.clone(),
+            None => declaration
+                .outputs
+                .iter()
+                .map(|(target, sha1)| {
+                    Ok((
+                        resolve_processor_output_artifact(target, &data)?,
+                        BoundProcessorOutputExpectation::ProviderSha1(
+                            resolve_processor_output_sha1(sha1, &data)?,
+                        ),
+                    ))
+                })
+                .collect::<Result<Vec<_>, ForgeInstallerError>>()?,
+        };
+        let mut outputs = Vec::with_capacity(declared_outputs.len());
         let mut current_outputs = BTreeMap::new();
-        for (target, sha1) in &declaration.outputs {
-            let artifact = resolve_processor_output_artifact(target, &data)?;
-            let sha1 = resolve_processor_output_sha1(sha1, &data)?;
+        for (artifact, expectation) in declared_outputs {
             let portable = portable_path_key(&artifact.relative_path);
             let output = BoundProcessorOutput {
                 artifact,
-                sha1,
+                expectation,
                 role: BoundProcessorOutputRole::Intermediate,
             };
             match producers.get(&portable) {
@@ -1616,6 +2185,10 @@ fn bind_forge_processor_plan(
             .collect::<Result<Vec<_>, _>>()?;
         dependencies.push(consumed);
         steps.push(BoundProcessorStep {
+            action: match recipe_step {
+                Some(step) => step.action.clone(),
+                None => BoundProcessorAction::Java,
+            },
             jar,
             classpath,
             args,
@@ -1633,6 +2206,18 @@ fn bind_forge_processor_plan(
         &consumed_outputs,
         &artifact_contracts.final_inventory,
     )?;
+    if recipe.is_some() {
+        for (step_index, step) in steps.iter().enumerate() {
+            for (output_index, output) in step.outputs.iter().enumerate() {
+                let runtime_output = matches!((step_index, output_index), (3, 1) | (4, 0) | (5, 0));
+                if runtime_output
+                    != matches!(output.role, BoundProcessorOutputRole::Terminal { .. })
+                {
+                    return Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput);
+                }
+            }
+        }
+    }
     let plan = BoundProcessorPlan {
         steps,
         data,
@@ -2250,7 +2835,9 @@ fn classify_processor_outputs(
         let consumed_by_later_step = consumed_outputs.contains(&portable);
         if let Some(contract) = final_inventory.get(&portable) {
             if contract.path != output.artifact.relative_path
-                || contract.sha1.is_some_and(|sha1| sha1 != output.sha1)
+                || contract.sha1.is_some_and(|sha1| {
+                    output.expectation != BoundProcessorOutputExpectation::ProviderSha1(sha1)
+                })
             {
                 return Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput);
             }
@@ -2451,11 +3038,15 @@ fn validate_modern_install_profile(
     expected_path: Option<&str>,
 ) -> Result<(), ForgeInstallerError> {
     let profile = profile.ok_or(ForgeInstallerError::IdentityMismatch)?;
+    let valid_path = profile.path.as_deref() == expected_path
+        || (record.component_id == LoaderComponentId::Forge
+            && record.strategy == LoaderInstallStrategy::ForgeModern
+            && profile.path.is_none());
     if profile.spec != Some(expected_spec)
         || profile.profile.as_deref() != Some(expected_profile)
         || profile.version.as_deref() != Some(expected_version)
         || profile.minecraft.as_deref() != Some(record.minecraft_version.as_str())
-        || profile.path.as_deref() != expected_path
+        || !valid_path
     {
         return Err(ForgeInstallerError::IdentityMismatch);
     }
@@ -3158,8 +3749,578 @@ mod tests {
         .expect("authenticated Forge processor plan");
         let processor_plan = typed_plan(&bound);
         assert_eq!(processor_plan.steps.len(), 1);
+        assert!(matches!(
+            processor_plan.steps[0].action,
+            super::BoundProcessorAction::Java
+        ));
         assert_eq!(processor_plan.steps[0].outputs.len(), 1);
         assert_eq!(processor_plan.installer_data.len(), 1);
+    }
+
+    #[test]
+    fn official_forge_client_recipe_binds_native_preparation_and_all_runtime_outputs() {
+        let (record, version, install) = official_forge_client_fixture();
+        let bound = bind_modern_fixture_with_entries(
+            &record,
+            &version,
+            &install,
+            &[("data/client.lzma", b"patches")],
+        )
+        .expect("official client recipe");
+        let plan = typed_plan(&bound);
+        assert_eq!(plan.steps.len(), 6);
+        assert!(matches!(
+            plan.steps[0].action,
+            super::BoundProcessorAction::ExtractMcpMappings { .. }
+        ));
+        assert!(matches!(
+            plan.steps[1].action,
+            super::BoundProcessorAction::DownloadMojmaps
+        ));
+        assert!(matches!(
+            plan.steps[3].action,
+            super::BoundProcessorAction::SplitJar
+        ));
+        assert!(
+            [2, 4, 5]
+                .into_iter()
+                .all(|index| matches!(plan.steps[index].action, super::BoundProcessorAction::Java))
+        );
+        let terminals = plan
+            .steps
+            .iter()
+            .flat_map(|step| &step.outputs)
+            .filter(|output| {
+                matches!(
+                    output.role,
+                    super::BoundProcessorOutputRole::Terminal { .. }
+                )
+            })
+            .map(|output| (output.artifact.coordinate.as_str(), &output.expectation))
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 3);
+        assert_eq!(
+            terminals
+                .iter()
+                .map(|(coordinate, _)| *coordinate)
+                .collect::<Vec<_>>(),
+            [
+                "net.minecraft:client:1.20.1-20230612.114412:extra",
+                "net.minecraft:client:1.20.1-20230612.114412:srg",
+                "net.minecraftforge:forge:1.20.1-47.4.10:client",
+            ]
+        );
+        assert!(matches!(
+            terminals[0].1,
+            super::BoundProcessorOutputExpectation::ProviderSha1(_)
+        ));
+        assert!(matches!(
+            terminals[1].1,
+            super::BoundProcessorOutputExpectation::Derived(_)
+        ));
+        assert!(matches!(
+            terminals[2].1,
+            super::BoundProcessorOutputExpectation::ProviderSha1(_)
+        ));
+        assert_eq!(
+            plan.steps[0].outputs[0].expectation,
+            plan.steps[4].outputs[0].expectation
+        );
+        assert_eq!(
+            plan.steps[0].outputs[0].artifact.relative_path.as_str(),
+            "de/oceanlabs/mcp/mcp_config/1.20.1-20230612.114412/mcp_config-1.20.1-20230612.114412-mappings.txt"
+        );
+        assert!(plan.input_artifacts.keys().any(|path| {
+            path.as_str()
+                .ends_with("mcp_config-1.20.1-20230612.114412.zip")
+        }));
+        let BoundForgeInstallExecution::Run(execution) = bound
+            .into_install_execution()
+            .expect("terminal library declarations")
+        else {
+            panic!("runnable Forge client recipe");
+        };
+        assert!(execution.into_declared_reconstruction().is_err());
+    }
+
+    #[test]
+    fn official_forge_recipe_rejects_tool_argument_coordinate_and_output_drift() {
+        let (record, version, install) = official_forge_client_fixture();
+        let mut cases = Vec::new();
+        for (field, value) in [
+            ("jar", serde_json::json!("other:installertools:1.4.1")),
+            ("args", serde_json::json!(["--task", "UNKNOWN"])),
+            (
+                "outputs",
+                serde_json::json!({"[other:artifact:1]":"'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"}),
+            ),
+        ] {
+            let mut changed = install.clone();
+            changed["processors"][0][field] = value;
+            cases.push(changed);
+        }
+        for token in [
+            "MCP_VERSION",
+            "MAPPINGS",
+            "MOJMAPS",
+            "MERGED_MAPPINGS",
+            "MC_SLIM",
+            "MC_EXTRA",
+            "MC_SRG",
+            "PATCHED",
+            "BINPATCH",
+        ] {
+            let mut changed = install.clone();
+            changed["data"][token]["client"] = if token == "MCP_VERSION" {
+                "'wrong'".into()
+            } else {
+                "[other:artifact:1]".into()
+            };
+            cases.push(changed);
+        }
+        let mut changed = install.clone();
+        changed["processors"][5]["outputs"] = serde_json::json!({
+            "{PATCHED}":"'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'"
+        });
+        cases.push(changed);
+        let mut changed = install.clone();
+        changed["processors"][4]["outputs"] = serde_json::json!({
+            "{MC_SRG}":"'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+            "{PATCHED}":"{PATCHED_SHA}"
+        });
+        cases.push(changed);
+        let mut changed = install.clone();
+        changed["processors"].as_array_mut().unwrap().remove(2);
+        cases.push(changed);
+        let mut changed = install.clone();
+        changed["processors"].as_array_mut().unwrap().swap(2, 4);
+        cases.push(changed);
+        let mut changed = install.clone();
+        changed["libraries"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name":"net.minecraft:client:1.20.1-20230612.114412:extra",
+                "sha1":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }));
+        cases.push(changed);
+        for changed in cases {
+            assert!(
+                bind_modern_fixture_with_entries(
+                    &record,
+                    &version,
+                    &changed,
+                    &[("data/client.lzma", b"patches")],
+                )
+                .is_err()
+            );
+        }
+        let mut changed = version;
+        changed["arguments"]["game"][9] = "wrong-mcp".into();
+        assert!(
+            bind_modern_fixture_with_entries(
+                &record,
+                &changed,
+                &install,
+                &[("data/client.lzma", b"patches")],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn official_forge_recipe_rejects_source_listed_intermediates_as_runtime_libraries() {
+        let (record, version, install) = official_forge_client_fixture();
+        for coordinate in [
+            "de.oceanlabs.mcp:mcp_config:1.20.1-20230612.114412:mappings@txt",
+            "net.minecraft:client:1.20.1-20230612.114412:mappings@txt",
+            "de.oceanlabs.mcp:mcp_config:1.20.1-20230612.114412:mappings-merged@txt",
+            "net.minecraft:client:1.20.1-20230612.114412:slim",
+        ] {
+            let path = PortableRelativePath::from_path(&crate::launch::maven_to_path(coordinate))
+                .expect("portable intermediate path");
+            let mut changed = install.clone();
+            changed["libraries"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "name":coordinate,
+                    "downloads":{"artifact":{
+                        "path":path.as_str(),
+                        "url":""
+                    }}
+                }));
+            assert!(matches!(
+                bind_modern_fixture_with_entries(
+                    &record,
+                    &version,
+                    &changed,
+                    &[("data/client.lzma", b"patches")],
+                ),
+                Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput)
+            ));
+        }
+    }
+
+    #[test]
+    fn official_forge_recipe_preserves_provider_hashes_and_scopes_derivation_to_binding() {
+        let (record, version, install) = official_forge_client_fixture();
+        let bind = |install: &serde_json::Value| {
+            bind_modern_fixture_with_entries(
+                &record,
+                &version,
+                install,
+                &[("data/client.lzma", b"patches")],
+            )
+            .expect("official client recipe")
+        };
+        let first = bind(&install);
+        let second = bind(&install);
+        assert_ne!(
+            typed_plan(&first).steps[4].outputs[0].expectation,
+            typed_plan(&second).steps[4].outputs[0].expectation
+        );
+        let mut declared = install.clone();
+        declared["data"]["MC_SRG_SHA"] =
+            serde_json::json!({"client":"'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"});
+        let bound = bind(&declared);
+        assert_eq!(
+            typed_plan(&bound).steps[4].outputs[0].expectation,
+            super::BoundProcessorOutputExpectation::ProviderSha1([0xaa; 20])
+        );
+        declared["processors"][4]["outputs"] = serde_json::json!({
+            "{MC_SRG}":"'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'"
+        });
+        assert!(
+            bind_modern_fixture_with_entries(
+                &record,
+                &version,
+                &declared,
+                &[("data/client.lzma", b"patches")],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn official_neoforge_recipe_binds_derived_outputs_and_exact_runtime_inventory() {
+        let (record, version, install) = official_neoforge_client_fixture();
+        let bind = || {
+            bind_modern_fixture_with_entries(
+                &record,
+                &version,
+                &install,
+                &[("data/client.lzma", b"patches")],
+            )
+            .expect("official NeoForge recipe")
+        };
+        let bound = bind();
+        let plan = typed_plan(&bound);
+        assert_eq!(plan.steps.len(), 6);
+        assert!(matches!(
+            plan.steps[0].action,
+            super::BoundProcessorAction::ExtractMcpMappings { .. }
+        ));
+        assert!(matches!(
+            plan.steps[1].action,
+            super::BoundProcessorAction::DownloadMojmaps
+        ));
+        assert!(matches!(
+            plan.steps[3].action,
+            super::BoundProcessorAction::SplitJar
+        ));
+        assert!(
+            [2, 4, 5]
+                .into_iter()
+                .all(|index| matches!(plan.steps[index].action, super::BoundProcessorAction::Java))
+        );
+        let expected = &plan.steps[0].outputs[0].expectation;
+        assert!(matches!(
+            expected,
+            super::BoundProcessorOutputExpectation::Derived(_)
+        ));
+        assert!(
+            plan.steps
+                .iter()
+                .flat_map(|step| &step.outputs)
+                .all(|output| &output.expectation == expected)
+        );
+        assert_ne!(
+            expected,
+            &typed_plan(&bind()).steps[0].outputs[0].expectation
+        );
+        let terminals = plan
+            .steps
+            .iter()
+            .flat_map(|step| &step.outputs)
+            .filter(|output| {
+                matches!(
+                    output.role,
+                    super::BoundProcessorOutputRole::Terminal { .. }
+                )
+            })
+            .map(|output| output.artifact.coordinate.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminals,
+            [
+                "net.minecraft:client:1.21.1-20240808.144430:extra",
+                "net.minecraft:client:1.21.1-20240808.144430:srg",
+                "net.neoforged:neoforge:21.1.252:client",
+            ]
+        );
+        assert!(plan.input_artifacts.keys().any(|path| {
+            path.as_str()
+                .ends_with("neoform-1.21.1-20240808.144430.zip")
+        }));
+        let BoundForgeInstallExecution::Run(execution) = bound
+            .into_install_execution()
+            .expect("runtime declarations")
+        else {
+            panic!("runnable NeoForge recipe");
+        };
+        assert!(execution.into_declared_reconstruction().is_err());
+    }
+
+    #[test]
+    fn official_neoforge_recipe_rejects_cross_family_tools_arguments_and_data() {
+        let (record, version, install) = official_neoforge_client_fixture();
+        let (_, _, forge) = official_forge_client_fixture();
+        let mut cases = Vec::new();
+        for index in 0..6 {
+            let mut changed = install.clone();
+            changed["processors"][index]["jar"] = forge["processors"][index]["jar"].clone();
+            cases.push(changed);
+            let mut changed = install.clone();
+            changed["processors"][index]["args"]
+                .as_array_mut()
+                .unwrap()
+                .push("--unknown".into());
+            cases.push(changed);
+        }
+        for token in [
+            "MCP_VERSION",
+            "MAPPINGS",
+            "MOJMAPS",
+            "MERGED_MAPPINGS",
+            "MC_SLIM",
+            "MC_EXTRA",
+            "MC_SRG",
+            "PATCHED",
+            "BINPATCH",
+        ] {
+            let mut changed = install.clone();
+            changed["data"][token]["client"] = if token == "MCP_VERSION" {
+                "'20240808.144430'".into()
+            } else {
+                "[foreign:artifact:1]".into()
+            };
+            cases.push(changed);
+        }
+        let mut changed = install.clone();
+        changed["processors"][2]["args"] = forge["processors"][2]["args"].clone();
+        cases.push(changed);
+        let mut changed = install.clone();
+        changed["processors"][5]["jar"] = "net.neoforged.installertools:binarypatcher:2.1.2".into();
+        cases.push(changed);
+        let mut changed = install.clone();
+        changed["processors"][5]["outputs"] =
+            serde_json::json!({"{MC_SRG}":"'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"});
+        cases.push(changed);
+        let mut changed = install.clone();
+        changed["processors"].as_array_mut().unwrap().swap(2, 4);
+        cases.push(changed);
+        for (index, changed) in cases.into_iter().enumerate() {
+            assert!(
+                bind_modern_fixture_with_entries(
+                    &record,
+                    &version,
+                    &changed,
+                    &[("data/client.lzma", b"patches")]
+                )
+                .is_err(),
+                "case {index}"
+            );
+        }
+        let mut unsupported = install;
+        unsupported["processors"].as_array_mut().unwrap().remove(2);
+        let bound = bind_modern_fixture_with_entries(
+            &record,
+            &version,
+            &unsupported,
+            &[("data/client.lzma", b"patches")],
+        )
+        .expect("unsupported workload disposition");
+        assert!(matches!(
+            bound.processor_disposition,
+            BoundProcessorDisposition::UnsupportedMissingOutputs
+        ));
+    }
+
+    #[test]
+    fn official_neoforge_recipe_rejects_profile_and_runtime_identity_drift() {
+        let (record, version, install) = official_neoforge_client_fixture();
+        for (field, value) in [
+            ("profile", "forge"),
+            ("version", "neoforge-21.1.251"),
+            ("minecraft", "1.21"),
+            ("path", "net.neoforged:neoforge:21.1.252"),
+        ] {
+            let mut changed = install.clone();
+            changed[field] = value.into();
+            assert!(matches!(
+                bind_modern_fixture_with_entries(
+                    &record,
+                    &version,
+                    &changed,
+                    &[("data/client.lzma", b"patches")]
+                ),
+                Err(ForgeInstallerError::IdentityMismatch)
+            ));
+        }
+        let mut cases = Vec::new();
+        for index in [1, 3, 5, 7, 9] {
+            let mut changed = version.clone();
+            changed["arguments"]["game"][index] = "wrong".into();
+            cases.push(changed);
+        }
+        let mut changed = version.clone();
+        changed["arguments"]["game"]
+            .as_array_mut()
+            .unwrap()
+            .extend(["--fml.neoFormVersion".into(), "20240808.144430".into()]);
+        cases.push(changed);
+        let mut changed = version.clone();
+        changed["libraries"] = serde_json::json!([]);
+        cases.push(changed);
+        let mut changed = version.clone();
+        changed["libraries"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name":"net.neoforged.fancymodloader:loader:4.0.43"}));
+        cases.push(changed);
+        for field in ["id", "inheritsFrom", "mainClass"] {
+            let mut changed = version.clone();
+            changed[field] = "wrong".into();
+            cases.push(changed);
+        }
+        for changed in cases {
+            assert!(
+                bind_modern_fixture_with_entries(
+                    &record,
+                    &changed,
+                    &install,
+                    &[("data/client.lzma", b"patches")]
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn official_neoforge_recipe_rejects_intermediate_runtime_promotion() {
+        let (record, version, install) = official_neoforge_client_fixture();
+        for coordinate in [
+            "net.neoforged:neoform:1.21.1-20240808.144430:mappings@txt",
+            "net.minecraft:client:1.21.1-20240808.144430:mappings@txt",
+            "net.neoforged:neoform:1.21.1-20240808.144430:mappings-merged@txt",
+            "net.minecraft:client:1.21.1-20240808.144430:slim",
+        ] {
+            let path = PortableRelativePath::from_path(&crate::launch::maven_to_path(coordinate))
+                .expect("portable output path");
+            let mut changed = install.clone();
+            changed["libraries"].as_array_mut().unwrap().push(serde_json::json!({"name":coordinate,"downloads":{"artifact":{"path":path.as_str(),"url":""}}}));
+            assert!(matches!(
+                bind_modern_fixture_with_entries(
+                    &record,
+                    &version,
+                    &changed,
+                    &[("data/client.lzma", b"patches")]
+                ),
+                Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput)
+            ));
+        }
+    }
+
+    #[test]
+    fn official_neoforge_recipe_preserves_authored_hashes_without_bypassing_actions() {
+        let (record, version, mut install) = official_neoforge_client_fixture();
+        for (index, tokens) in [
+            vec!["MAPPINGS"],
+            vec!["MOJMAPS"],
+            vec!["MERGED_MAPPINGS"],
+            vec!["MC_SLIM", "MC_EXTRA"],
+            vec!["MC_SRG"],
+            vec!["PATCHED"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            install["processors"][index]["outputs"] = serde_json::Value::Object(
+                tokens
+                    .into_iter()
+                    .map(|token| {
+                        (
+                            format!("{{{token}}}"),
+                            "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'".into(),
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        let bound = bind_modern_fixture_with_entries(
+            &record,
+            &version,
+            &install,
+            &[("data/client.lzma", b"patches")],
+        )
+        .expect("provider-authored recipe outputs");
+        let plan = typed_plan(&bound);
+        assert!(matches!(
+            plan.steps[0].action,
+            super::BoundProcessorAction::ExtractMcpMappings { .. }
+        ));
+        assert!(matches!(
+            plan.steps[1].action,
+            super::BoundProcessorAction::DownloadMojmaps
+        ));
+        assert!(matches!(
+            plan.steps[3].action,
+            super::BoundProcessorAction::SplitJar
+        ));
+        assert!(
+            plan.steps
+                .iter()
+                .flat_map(|step| &step.outputs)
+                .all(|output| output.expectation
+                    == super::BoundProcessorOutputExpectation::ProviderSha1([0xaa; 20]))
+        );
+        install["data"]["PATCHED_SHA"] =
+            serde_json::json!({"client":"'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'"});
+        assert!(matches!(
+            bind_modern_fixture_with_entries(
+                &record,
+                &version,
+                &install,
+                &[("data/client.lzma", b"patches")]
+            ),
+            Err(ForgeInstallerError::InvalidForgeProcessorOutput)
+        ));
+        install["data"]["PATCHED_SHA"]["client"] =
+            "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'".into();
+        install["processors"][2]["args"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(matches!(
+            bind_modern_fixture_with_entries(
+                &record,
+                &version,
+                &install,
+                &[("data/client.lzma", b"patches")]
+            ),
+            Err(ForgeInstallerError::InvalidForgeProcessor)
+        ));
     }
 
     #[test]
@@ -3826,6 +4987,7 @@ mod tests {
     #[test]
     fn processor_binding_enforces_declaration_count_and_aggregate_data_bounds() {
         let (record, version, install) = forge_processor_fixture();
+        let parsed_version = serde_json::from_value(version.clone()).unwrap();
         let mut too_many = install.clone();
         too_many["processors"] = serde_json::Value::Array(
             (0..=super::MAX_FORGE_PROCESSORS)
@@ -3844,7 +5006,14 @@ mod tests {
             }))
             .expect("processor data declarations");
         assert!(matches!(
-            super::bind_forge_processor_plan(&[], &too_many_data, &[], &[]),
+            super::bind_forge_processor_plan(
+                &[],
+                &record,
+                &parsed_version,
+                &too_many_data,
+                &mut Vec::new(),
+                &[]
+            ),
             Err(ForgeInstallerError::TooManyForgeProcessorData)
         ));
         let too_many_outputs =
@@ -3863,7 +5032,14 @@ mod tests {
             }))
             .expect("processor output declarations");
         assert!(matches!(
-            super::bind_forge_processor_plan(&[], &too_many_outputs, &[], &[]),
+            super::bind_forge_processor_plan(
+                &[],
+                &record,
+                &parsed_version,
+                &too_many_outputs,
+                &mut Vec::new(),
+                &[]
+            ),
             Err(ForgeInstallerError::TooManyForgeProcessorOutputs)
         ));
         let too_many_args =
@@ -3875,7 +5051,14 @@ mod tests {
             }))
             .expect("processor argument declarations");
         assert!(matches!(
-            super::bind_forge_processor_plan(&[], &too_many_args, &[], &[]),
+            super::bind_forge_processor_plan(
+                &[],
+                &record,
+                &parsed_version,
+                &too_many_args,
+                &mut Vec::new(),
+                &[]
+            ),
             Err(ForgeInstallerError::ForgeProcessorDeclarationsTooLarge)
         ));
 
@@ -3971,6 +5154,68 @@ mod tests {
     }
 
     #[test]
+    fn modern_forge_binds_null_or_absent_path_with_exact_profile_and_root_identity() {
+        let record = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeModern,
+            "1.20.1",
+            "47.4.10",
+        );
+        // Forge 47.4.10 has a null path and declares its universal root only in
+        // install_profile.json. Processor admission remains a separate check.
+        let version = serde_json::json!({
+            "id": "1.20.1-forge-47.4.10",
+            "inheritsFrom": "1.20.1",
+            "type": "release",
+            "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "logging": {},
+            "libraries": []
+        });
+        let mut install = serde_json::json!({
+            "spec": 1,
+            "profile": "forge",
+            "version": "1.20.1-forge-47.4.10",
+            "minecraft": "1.20.1",
+            "path": null,
+            "libraries": [{"name":"net.minecraftforge:forge:1.20.1-47.4.10:universal"}],
+            "processors": []
+        });
+        for omit_path in [false, true] {
+            if omit_path {
+                install.as_object_mut().unwrap().remove("path");
+            }
+            assert!(bind_modern_fixture(&record, &version, &install).is_ok());
+
+            for (field, value) in [
+                ("minecraft", "1.20.2"),
+                ("version", "1.20.1-forge-47.4.11"),
+                ("path", "net.minecraftforge:forge:1.20.1-47.4.11:shim"),
+                ("path", ""),
+            ] {
+                let mut drift = install.clone();
+                drift[field] = value.into();
+                assert!(matches!(
+                    bind_modern_fixture(&record, &version, &drift),
+                    Err(ForgeInstallerError::IdentityMismatch)
+                ));
+            }
+            let mut drift = install.clone();
+            drift["libraries"][0]["name"] =
+                "net.minecraftforge:forge:1.20.1-47.4.11:universal".into();
+            assert!(matches!(
+                bind_modern_fixture(&record, &version, &drift),
+                Err(ForgeInstallerError::IdentityMismatch)
+            ));
+            let mut drift = version.clone();
+            drift["inheritsFrom"] = "1.20.2".into();
+            assert!(matches!(
+                bind_modern_fixture(&record, &drift, &install),
+                Err(ForgeInstallerError::IdentityMismatch)
+            ));
+        }
+    }
+
+    #[test]
     fn modern_binding_rejects_every_authored_install_identity_field_drift() {
         for record in [
             binding_record(
@@ -4003,17 +5248,12 @@ mod tests {
                 drift.as_object_mut().expect("install object").remove(field);
                 assert!(bind_modern_fixture(&record, &version, &drift).is_err());
             }
-            let mut path_presence_drift = install.clone();
-            if record.component_id == LoaderComponentId::Forge {
-                path_presence_drift
-                    .as_object_mut()
-                    .expect("install object")
-                    .remove("path");
-            } else {
+            if record.component_id == LoaderComponentId::NeoForge {
+                let mut path_presence_drift = install.clone();
                 path_presence_drift["path"] =
                     format!("net.neoforged:neoforge:{}:shim", record.loader_version).into();
+                assert!(bind_modern_fixture(&record, &version, &path_presence_drift).is_err());
             }
-            assert!(bind_modern_fixture(&record, &version, &path_presence_drift).is_err());
         }
     }
 
@@ -4278,7 +5518,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or_default();
-        let nonexistent = std::env::temp_dir().join(format!("axial-pure-installer-{nanos:x}"));
+        let nonexistent = crate::test_temp_root().join(format!("axial-pure-installer-{nanos:x}"));
         assert!(!nonexistent.exists());
 
         let version_json = br#"{
@@ -4572,6 +5812,107 @@ mod tests {
             "sides": ["client"],
             "outputs": {"{PATCHED}":"{PATCHED_SHA}"}
         }]);
+        (record, version, install)
+    }
+
+    fn official_forge_client_fixture() -> (LoaderBuildRecord, serde_json::Value, serde_json::Value)
+    {
+        let record = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeModern,
+            "1.20.1",
+            "47.4.10",
+        );
+        // Client declarations from official 47.4.10; unrelated download libraries
+        // and server-only processors are omitted from this bounded binding fixture.
+        let version = serde_json::json!({
+            "id":"1.20.1-forge-47.4.10", "inheritsFrom":"1.20.1", "type":"release",
+            "mainClass":"cpw.mods.bootstraplauncher.BootstrapLauncher", "logging":{}, "libraries":[],
+            "arguments":{"game":["--launchTarget","forgeclient","--fml.forgeVersion","47.4.10","--fml.mcVersion","1.20.1","--fml.forgeGroup","net.minecraftforge","--fml.mcpVersion","20230612.114412"]}
+        });
+        let install = serde_json::json!({
+            "spec":1,"profile":"forge","version":"1.20.1-forge-47.4.10","minecraft":"1.20.1","path":null,
+            "libraries":[
+                {"name":"net.minecraftforge:forge:1.20.1-47.4.10:universal","sha1":"41747347bacead85302e07082073fb46c2f69361"},
+                {"name":"net.minecraftforge:installertools:1.4.1","sha1":"e28bc43bc9bef8a1620460938effc5b12684d825"},
+                {"name":"net.minecraftforge:jarsplitter:1.1.4","sha1":"57ce2d6564c1176b23a911ef57127ff3c45bffb3"},
+                {"name":"net.minecraftforge:ForgeAutoRenamingTool:0.1.22:all","sha1":"0b337aca253a6fe63f9c39d4e6272ca1b2e7cfd8"},
+                {"name":"net.minecraftforge:binarypatcher:1.1.1","sha1":"23176c4f9fd7a8db961dc0b2ec32ad97ab08513c"},
+                {"name":"de.oceanlabs.mcp:mcp_config:1.20.1-20230612.114412@zip","sha1":"c7d29380ddb38becad7c0819b5b325e43bca23f0"}
+            ],
+            "data":{
+                "MAPPINGS":{"client":"[de.oceanlabs.mcp:mcp_config:1.20.1-20230612.114412:mappings@txt]"},
+                "MOJMAPS":{"client":"[net.minecraft:client:1.20.1-20230612.114412:mappings@txt]"},
+                "MERGED_MAPPINGS":{"client":"[de.oceanlabs.mcp:mcp_config:1.20.1-20230612.114412:mappings-merged@txt]"},
+                "BINPATCH":{"client":"/data/client.lzma"},
+                "MC_SLIM":{"client":"[net.minecraft:client:1.20.1-20230612.114412:slim]"},
+                "MC_SLIM_SHA":{"client":"'de86b035d2da0f78940796bb95c39a932ed84834'"},
+                "MC_EXTRA":{"client":"[net.minecraft:client:1.20.1-20230612.114412:extra]"},
+                "MC_EXTRA_SHA":{"client":"'8c5a95cbce940cfdb304376ae9fea47968d02587'"},
+                "MC_SRG":{"client":"[net.minecraft:client:1.20.1-20230612.114412:srg]"},
+                "PATCHED":{"client":"[net.minecraftforge:forge:1.20.1-47.4.10:client]"},
+                "PATCHED_SHA":{"client":"'4d8a9a63dc16a45d7fc5c54c627234f601d0cc17'"},
+                "MCP_VERSION":{"client":"'20230612.114412'"}
+            },
+            "processors":[
+                {"jar":"net.minecraftforge:installertools:1.4.1","args":["--task","MCP_DATA","--input","[de.oceanlabs.mcp:mcp_config:1.20.1-20230612.114412@zip]","--output","{MAPPINGS}","--key","mappings"]},
+                {"jar":"net.minecraftforge:installertools:1.4.1","args":["--task","DOWNLOAD_MOJMAPS","--version","1.20.1","--side","{SIDE}","--output","{MOJMAPS}"]},
+                {"jar":"net.minecraftforge:installertools:1.4.1","args":["--task","MERGE_MAPPING","--left","{MAPPINGS}","--right","{MOJMAPS}","--output","{MERGED_MAPPINGS}","--classes","--reverse-right"]},
+                {"jar":"net.minecraftforge:jarsplitter:1.1.4","sides":["client"],"args":["--input","{MINECRAFT_JAR}","--slim","{MC_SLIM}","--extra","{MC_EXTRA}","--srg","{MERGED_MAPPINGS}"],"outputs":{"{MC_SLIM}":"{MC_SLIM_SHA}","{MC_EXTRA}":"{MC_EXTRA_SHA}"}},
+                {"jar":"net.minecraftforge:ForgeAutoRenamingTool:0.1.22:all","args":["--input","{MC_SLIM}","--output","{MC_SRG}","--names","{MERGED_MAPPINGS}","--ann-fix","--ids-fix","--src-fix","--record-fix"]},
+                {"jar":"net.minecraftforge:binarypatcher:1.1.1","args":["--clean","{MC_SRG}","--output","{PATCHED}","--apply","{BINPATCH}"]}
+            ]
+        });
+        (record, version, install)
+    }
+
+    fn official_neoforge_client_fixture()
+    -> (LoaderBuildRecord, serde_json::Value, serde_json::Value) {
+        let record = binding_record(
+            LoaderComponentId::NeoForge,
+            LoaderInstallStrategy::NeoForgeModern,
+            "1.21.1",
+            "21.1.252",
+        );
+        // Official 21.1.252 client declarations: path, outputs and hashes are absent.
+        // Unrelated libraries, tool classpaths and server-only steps are omitted.
+        let version = serde_json::json!({
+            "id":"neoforge-21.1.252", "inheritsFrom":"1.21.1", "type":"release",
+            "mainClass":"cpw.mods.bootstraplauncher.BootstrapLauncher", "logging":{},
+            "libraries":[{"name":"net.neoforged.fancymodloader:loader:4.0.44","downloads":{"artifact":{"path":"net/neoforged/fancymodloader/loader/4.0.44/loader-4.0.44.jar","sha1":"63433608b68302a442e3dba87880e54f42ea0583","size":505708,"url":"https://maven.neoforged.net/releases/net/neoforged/fancymodloader/loader/4.0.44/loader-4.0.44.jar"}}}],
+            "arguments":{"game":["--fml.neoForgeVersion","21.1.252","--fml.fmlVersion","4.0.44","--fml.mcVersion","1.21.1","--fml.neoFormVersion","20240808.144430","--launchTarget","forgeclient"]}
+        });
+        let install = serde_json::json!({
+            "spec":1,"profile":"NeoForge","version":"neoforge-21.1.252","minecraft":"1.21.1",
+            "libraries":[
+                {"name":"net.neoforged:neoforge:21.1.252:universal","downloads":{"artifact":{"path":"net/neoforged/neoforge/21.1.252/neoforge-21.1.252-universal.jar","sha1":"46e02e17d558bad6b67a5a2985f6b3aaf5870bf0","size":3551386,"url":"https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.252/neoforge-21.1.252-universal.jar"}}},
+                {"name":"net.neoforged.installertools:installertools:2.1.2","downloads":{"artifact":{"path":"net/neoforged/installertools/installertools/2.1.2/installertools-2.1.2.jar","sha1":"72524c0362f812d8aa4cdb4c03e9b45e2b71ae3b","size":83543,"url":"https://maven.neoforged.net/releases/net/neoforged/installertools/installertools/2.1.2/installertools-2.1.2.jar"}}},
+                {"name":"net.neoforged.installertools:jarsplitter:2.1.2","downloads":{"artifact":{"path":"net/neoforged/installertools/jarsplitter/2.1.2/jarsplitter-2.1.2.jar","sha1":"8a7916be0a0e589897beab7c839072631067e48e","size":7790,"url":"https://maven.neoforged.net/releases/net/neoforged/installertools/jarsplitter/2.1.2/jarsplitter-2.1.2.jar"}}},
+                {"name":"net.neoforged:AutoRenamingTool:2.0.3:all","downloads":{"artifact":{"path":"net/neoforged/AutoRenamingTool/2.0.3/AutoRenamingTool-2.0.3-all.jar","sha1":"d9890c71b4366f886c2b1006782043a6a6816eb6","size":746919,"url":"https://maven.neoforged.net/releases/net/neoforged/AutoRenamingTool/2.0.3/AutoRenamingTool-2.0.3-all.jar"}}},
+                {"name":"net.neoforged.installertools:binarypatcher:2.1.2:fatjar","downloads":{"artifact":{"path":"net/neoforged/installertools/binarypatcher/2.1.2/binarypatcher-2.1.2-fatjar.jar","sha1":"759b63ef393ed80418ec1ea4d233cd6152d02637","size":624217,"url":"https://maven.neoforged.net/releases/net/neoforged/installertools/binarypatcher/2.1.2/binarypatcher-2.1.2-fatjar.jar"}}},
+                {"name":"net.neoforged:neoform:1.21.1-20240808.144430@zip","downloads":{"artifact":{"path":"net/neoforged/neoform/1.21.1-20240808.144430/neoform-1.21.1-20240808.144430.zip","sha1":"811e2bd86fa2cda2812e5e8e51d718ea8bd6d3f4","size":1683830,"url":"https://maven.neoforged.net/releases/net/neoforged/neoform/1.21.1-20240808.144430/neoform-1.21.1-20240808.144430.zip"}}}
+            ],
+            "data":{
+                "MAPPINGS":{"client":"[net.neoforged:neoform:1.21.1-20240808.144430:mappings@txt]"},
+                "MOJMAPS":{"client":"[net.minecraft:client:1.21.1-20240808.144430:mappings@txt]"},
+                "MERGED_MAPPINGS":{"client":"[net.neoforged:neoform:1.21.1-20240808.144430:mappings-merged@txt]"},
+                "BINPATCH":{"client":"/data/client.lzma"},
+                "MC_UNPACKED":{"client":"[net.minecraft:client:1.21.1-20240808.144430:unpacked]"},
+                "MC_SLIM":{"client":"[net.minecraft:client:1.21.1-20240808.144430:slim]"},
+                "MC_EXTRA":{"client":"[net.minecraft:client:1.21.1-20240808.144430:extra]"},
+                "MC_SRG":{"client":"[net.minecraft:client:1.21.1-20240808.144430:srg]"},
+                "PATCHED":{"client":"[net.neoforged:neoforge:21.1.252:client]"},
+                "MCP_VERSION":{"client":"'1.21.1-20240808.144430'"}
+            },
+            "processors":[
+                {"jar":"net.neoforged.installertools:installertools:2.1.2","args":["--task","MCP_DATA","--input","[net.neoforged:neoform:1.21.1-20240808.144430@zip]","--output","{MAPPINGS}","--key","mappings"]},
+                {"jar":"net.neoforged.installertools:installertools:2.1.2","args":["--task","DOWNLOAD_MOJMAPS","--version","1.21.1","--side","{SIDE}","--output","{MOJMAPS}"]},
+                {"jar":"net.neoforged.installertools:installertools:2.1.2","args":["--task","MERGE_MAPPING","--left","{MAPPINGS}","--right","{MOJMAPS}","--output","{MERGED_MAPPINGS}","--classes","--fields","--methods","--reverse-right"]},
+                {"jar":"net.neoforged.installertools:jarsplitter:2.1.2","sides":["client"],"args":["--input","{MINECRAFT_JAR}","--slim","{MC_SLIM}","--extra","{MC_EXTRA}","--srg","{MERGED_MAPPINGS}"]},
+                {"jar":"net.neoforged:AutoRenamingTool:2.0.3:all","args":["--input","{MC_SLIM}","--output","{MC_SRG}","--names","{MERGED_MAPPINGS}","--ann-fix","--ids-fix","--src-fix","--record-fix"]},
+                {"jar":"net.neoforged.installertools:binarypatcher:2.1.2:fatjar","args":["--clean","{MC_SRG}","--output","{PATCHED}","--apply","{BINPATCH}"]}
+            ]
+        });
         (record, version, install)
     }
 

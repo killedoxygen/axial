@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pick-import-profile"
+description = "Enables the pick_import_profile command without any pre-configured scope."
+commands.allow = ["pick_import_profile"]
+
+[[permission]]
+identifier = "deny-pick-import-profile"
+description = "Denies the pick_import_profile command without any pre-configured scope."
+commands.deny = ["pick_import_profile"]

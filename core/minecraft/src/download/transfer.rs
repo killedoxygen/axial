@@ -14,6 +14,123 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 const DOWNLOAD_RETRY_DELAY_MILLIS: [u64; 3] = [500, 1_500, 4_000];
+const MAX_PROCESSOR_MAPPINGS_BYTES: u64 = 64 << 20;
+
+pub(crate) async fn acquire_processor_mappings(
+    base: &crate::launch::VersionJson,
+) -> Result<AuthenticatedSelectedArtifactSource, DownloadError> {
+    let (entry, expected) = processor_mappings_contract(base)?;
+    let client = reqwest::Client::builder()
+        .user_agent("axial/0.3")
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(20))
+        .read_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()?;
+    acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+        client: &client,
+        kind: SelectedDownloadArtifactKind::ClientMappings,
+        url: &entry.url,
+        logical_identity: &base.id,
+        expected: &expected,
+        max_bytes: entry.size as usize,
+        target: "minecraft_client_mappings",
+        fact_tx: None,
+    })
+    .await
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestProcessorMappingsTransport {
+    provider_url: String,
+    loopback_url: String,
+}
+
+#[cfg(test)]
+impl TestProcessorMappingsTransport {
+    pub(crate) fn new(provider_url: String, loopback_url: String) -> Self {
+        let url = reqwest::Url::parse(&loopback_url).expect("mapping fixture transport URL");
+        assert_eq!(url.scheme(), "http");
+        assert!(url.host_str().is_some_and(|host| {
+            host.parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+        }));
+        assert!(url.port().is_some());
+        assert!(url.username().is_empty() && url.password().is_none());
+        assert!(url.fragment().is_none());
+        Self {
+            provider_url,
+            loopback_url,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn acquire_test_processor_mappings(
+    base: &crate::launch::VersionJson,
+    transport: &TestProcessorMappingsTransport,
+) -> Result<AuthenticatedSelectedArtifactSource, DownloadError> {
+    let (entry, expected) = processor_mappings_contract(base)?;
+    if entry.url != transport.provider_url {
+        return Err(source_artifact_metadata_error(
+            "minecraft_client_mappings",
+            "invalid",
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut source =
+        acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+            client: &client,
+            kind: SelectedDownloadArtifactKind::ClientMappings,
+            url: &transport.loopback_url,
+            logical_identity: &base.id,
+            expected: &expected,
+            max_bytes: entry.size as usize,
+            target: "minecraft_client_mappings",
+            fact_tx: None,
+        })
+        .await?;
+    // Only transport is substituted; the retained HTTPS declaration supplied every integrity bound.
+    source.provider_url = entry.url.clone();
+    Ok(source)
+}
+
+fn processor_mappings_contract(
+    base: &crate::launch::VersionJson,
+) -> Result<(&crate::launch::DownloadEntry, ExpectedIntegrity), DownloadError> {
+    let invalid = || source_artifact_metadata_error("minecraft_client_mappings", "invalid");
+    let entry = base
+        .downloads
+        .client_mappings
+        .as_ref()
+        .ok_or_else(invalid)?;
+    let size = u64::try_from(entry.size).map_err(|_| invalid())?;
+    let url = reqwest::Url::parse(&entry.url).map_err(|_| invalid())?;
+    if base.id.is_empty()
+        || size == 0
+        || size > MAX_PROCESSOR_MAPPINGS_BYTES
+        || !is_sha1_hex(&entry.sha1)
+        || url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok((
+        entry,
+        ExpectedIntegrity::from_mojang(entry.size, &entry.sha1),
+    ))
+}
 
 pub(crate) struct AuthenticatedSelectedArtifactSource {
     bytes: Arc<[u8]>,
@@ -373,4 +490,123 @@ fn default_download_retry_delays() -> [Duration; 3] {
 
 fn is_retryable_provider_status(status: u16) -> bool {
     status == 408 || status == 429 || (500..=599).contains(&status)
+}
+
+#[cfg(test)]
+mod processor_mappings_tests {
+    use super::*;
+
+    fn version() -> crate::launch::VersionJson {
+        serde_json::from_value(serde_json::json!({
+            "id": "1.20.1",
+            "downloads": {
+                "client": {"size": 1, "sha1": "0".repeat(40), "url": "https://example.invalid/client"},
+                "client_mappings": {
+                    "size": 3, "sha1": format!("{:x}", Sha1::digest(b"map")),
+                    "url": "https://example.invalid/client-mappings.txt"
+                }
+            }
+        })).unwrap()
+    }
+
+    #[test]
+    fn processor_mappings_use_the_retained_client_mapping_contract() {
+        let base = version();
+        let (entry, expected) = processor_mappings_contract(&base).unwrap();
+        assert_eq!(entry, base.downloads.client_mappings.as_ref().unwrap());
+        assert_eq!(expected.size, Some(3));
+        assert_eq!(expected.sha1, Some(format!("{:x}", Sha1::digest(b"map"))));
+    }
+
+    #[tokio::test]
+    async fn processor_mappings_reject_invalid_metadata_before_network() {
+        let source = serde_json::to_value(version()).unwrap();
+        for (field, value) in [
+            ("size", serde_json::json!(0)),
+            ("size", serde_json::json!(-1)),
+            ("size", serde_json::json!(MAX_PROCESSOR_MAPPINGS_BYTES + 1)),
+            ("sha1", serde_json::json!("")),
+            ("sha1", serde_json::json!("z".repeat(40))),
+            ("url", serde_json::json!("http://127.0.0.1:1/mappings")),
+            ("url", serde_json::json!("file:///mappings")),
+            (
+                "url",
+                serde_json::json!("https://user:password@example.invalid/mappings"),
+            ),
+            (
+                "url",
+                serde_json::json!("https://example.invalid/mappings#fragment"),
+            ),
+        ] {
+            let mut changed = source.clone();
+            changed["downloads"]["client_mappings"][field] = value;
+            let base = serde_json::from_value(changed).unwrap();
+            assert!(matches!(
+                acquire_processor_mappings(&base).await,
+                Err(DownloadError::Integrity(_))
+            ));
+            let transport = TestProcessorMappingsTransport::new(
+                base.downloads.client_mappings.as_ref().unwrap().url.clone(),
+                "http://127.0.0.1:1/mapping".to_string(),
+            );
+            assert!(matches!(
+                acquire_test_processor_mappings(&base, &transport).await,
+                Err(DownloadError::Integrity(_))
+            ));
+        }
+        let mut missing = version();
+        missing.downloads.client_mappings = None;
+        assert!(matches!(
+            acquire_processor_mappings(&missing).await,
+            Err(DownloadError::Integrity(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn processor_mapping_transfer_retains_exact_bytes_and_rejects_digest_drift() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for bytes in [b"map".as_slice(), b"bad".as_slice(), b"maps".as_slice()] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/mapping", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                stream.read(&mut request).await.unwrap();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            bytes.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                stream.write_all(bytes).await.unwrap();
+            });
+            let base = version();
+            let (_, expected) = processor_mappings_contract(&base).unwrap();
+            let mut transport = TestProcessorMappingsTransport::new(
+                "https://example.invalid/other-mappings.txt".to_string(),
+                url,
+            );
+            assert!(matches!(
+                acquire_test_processor_mappings(&base, &transport).await,
+                Err(DownloadError::Integrity(_))
+            ));
+            transport.provider_url = base.downloads.client_mappings.as_ref().unwrap().url.clone();
+            let result = acquire_test_processor_mappings(&base, &transport).await;
+            server.await.unwrap();
+            if bytes == b"map" {
+                let source = result.unwrap();
+                assert_eq!(source.bytes(), bytes);
+                assert_eq!(source.kind(), SelectedDownloadArtifactKind::ClientMappings);
+                assert_eq!(source.logical_identity(), base.id);
+                assert_eq!(source.expected(), &expected);
+                assert_eq!(source.provider_url(), transport.provider_url);
+            } else {
+                assert!(matches!(result, Err(DownloadError::Integrity(_))));
+            }
+        }
+    }
 }

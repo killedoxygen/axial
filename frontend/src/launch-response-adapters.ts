@@ -1,5 +1,6 @@
 import { backendLaunchNotice } from './launch-notice-tracker';
-import type { LaunchSessionOutcome, LaunchStatusUpdate, LaunchStatusViewModel } from './types-launch';
+import { dtoArray, dtoRecord, dtoString } from './dto-contract';
+import type { LaunchSession, LaunchSessionOutcome, LaunchStatusUpdate, LaunchStatusViewModel } from './types-launch';
 
 const LAUNCH_SESSION_EXIT_REASONS = new Set<LaunchSessionOutcome['reason']>([
   'clean_exit',
@@ -90,4 +91,36 @@ function launchStatusRevision(value: unknown): number | null {
   if (!value || typeof value !== 'object') return null;
   const revision = (value as { revision?: unknown }).revision;
   return Number.isSafeInteger(revision) && (revision as number) >= 0 ? (revision as number) : null;
+}
+
+/** Hydrates process controls from the current owner after a frontend reload. */
+export function launchSessionsResponse(value: unknown): Record<string, LaunchSession> {
+  const response = dtoRecord(value, 'Launch sessions');
+  const sessions: Record<string, LaunchSession> = {};
+  for (const value of dtoArray(response.sessions, 'Launch session list')) {
+    const record = dtoRecord(value, 'Launch session');
+    const instanceId = dtoString(record.instance_id, 'Launch instance id');
+    const sessionId = dtoString(record.session_id, 'Launch session id');
+    const launchedAt = dtoString(record.launched_at, 'Launch start time');
+    const status = launchStatusUpdate(record, sessionId);
+    if (!instanceId || !sessionId || !Number.isFinite(Date.parse(launchedAt)) || !status) {
+      throw new Error('Launch session snapshot was invalid.');
+    }
+    if (status.viewModel.terminal) continue;
+    if (Object.prototype.hasOwnProperty.call(sessions, instanceId)) {
+      throw new Error('Launch session snapshot repeated an active instance.');
+    }
+    Object.defineProperty(sessions, instanceId, {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: {
+        sessionId,
+        launchedAt,
+        viewModel: status.viewModel,
+        statusRevision: status.revision,
+      },
+    });
+  }
+  return sessions;
 }

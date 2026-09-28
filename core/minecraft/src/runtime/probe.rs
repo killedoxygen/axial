@@ -100,7 +100,7 @@ pub(super) fn probe_java_runtime_info(
     let requested_path = absolute_java_path(java_path)?;
     let exec_path = java_probe_executable(&requested_path);
     let mut command = Command::new(&exec_path);
-    command.args(["-XshowSettings:property", "-version"]);
+    command.args(["-XshowSettings:properties", "-version"]);
     let output =
         command_output_with_timeout(command, JAVA_RUNTIME_PROBE_TIMEOUT).map_err(|error| {
             if error.kind() == std::io::ErrorKind::TimedOut {
@@ -431,7 +431,20 @@ fn command_output_with_timeout(mut command: Command, timeout: Duration) -> std::
 pub(super) fn parse_java_version(text: &str) -> (u32, u32) {
     let Some(version) = text
         .lines()
-        .find_map(|line| line.split('"').nth(1))
+        .find_map(|line| {
+            let line = line.trim_start();
+            let version = line
+                .strip_prefix("openjdk ")
+                .or_else(|| line.strip_prefix("java "))?;
+            let version = version.strip_prefix("version ").unwrap_or(version);
+            let version = version.split_whitespace().next()?.trim_matches('"');
+            version
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_digit)
+                .then_some(version)
+        })
+        .or_else(|| text.lines().find_map(|line| line.split('"').nth(1)))
         .or_else(|| {
             text.split_whitespace()
                 .find(|token| token.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
@@ -552,12 +565,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn java_version_parser_prefers_banner_over_quoted_settings_notices() {
+        let notices = r#"Locale settings summary:
+    Use "-XshowSettings:locale" option for verbose locale settings options
+Security settings summary:
+    See "java -X" for verbose security settings options"#;
+        for (banner, expected) in [
+            (r#"openjdk version "17.0.15" 2025-04-15 LTS"#, (17, 15)),
+            (r#"java version "1.8.0_311""#, (8, 311)),
+            ("openjdk 21.0.8 2025-07-15", (21, 8)),
+            (r#"openjdk version "25-ea""#, (25, 0)),
+        ] {
+            assert_eq!(
+                parse_java_version(&format!("{notices}\n{banner}")),
+                expected,
+                "{banner}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_version_parser_ignores_help_lines_before_version_banner() {
+        assert_eq!(
+            parse_java_version("java -X\nopenjdk help\nopenjdk version \"17.0.15\""),
+            (17, 15)
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn receipt_revalidation_returns_the_fingerprinted_cli_sibling() {
         use crate::runtime::JavaRuntimeInfo;
 
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::test_temp_root().join(format!(
             "axial-java-probe-cli-sibling-{}",
             std::process::id()
         ));
@@ -592,8 +633,8 @@ mod tests {
     fn receipt_revalidation_never_reselects_a_raced_in_cli_sibling() {
         use crate::runtime::JavaRuntimeInfo;
 
-        let root =
-            std::env::temp_dir().join(format!("axial-java-probe-cli-race-{}", std::process::id()));
+        let root = crate::test_temp_root()
+            .join(format!("axial-java-probe-cli-race-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("CLI race root");
         let javaw = root.join("javaw.exe");
@@ -627,8 +668,8 @@ mod tests {
     fn java_probe_command_output_is_bounded_by_timeout() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root =
-            std::env::temp_dir().join(format!("axial-java-probe-timeout-{}", std::process::id()));
+        let root = crate::test_temp_root()
+            .join(format!("axial-java-probe-timeout-{}", std::process::id()));
         fs::create_dir_all(&root).expect("probe timeout test dir");
         let java_path = root.join("java");
         fs::write(&java_path, "#!/bin/sh\nsleep 60\n").expect("probe timeout script");
@@ -653,7 +694,7 @@ mod tests {
     fn receipt_binds_the_requested_alias_and_symlink_target() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::test_temp_root().join(format!(
             "axial-java-probe-receipt-alias-{}",
             std::process::id()
         ));

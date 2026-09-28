@@ -1,20 +1,7 @@
-export type FlagStage = 'experimental' | 'beta';
-export type FlagSource = 'default' | 'override';
-
-export interface FeatureFlagViewModel {
-  key: string;
-  title: string;
-  description: string;
-  stage: FlagStage;
-  dev_only: boolean;
-  default_enabled: boolean;
-  enabled: boolean;
-  source: FlagSource;
-}
-
-export interface FlagsResponse {
-  flags: FeatureFlagViewModel[];
-}
+export type { FlagStage } from './generated/FlagStage';
+export type { FlagSource } from './generated/FlagSource';
+export type { FlagViewModel as FeatureFlagViewModel } from './generated/FlagViewModel';
+export type { FlagsResponse } from './generated/FlagsResponse';
 
 export interface FeatureFlagsLoadState {
   status: 'idle' | 'loading' | 'ready' | 'error';

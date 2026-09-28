@@ -1,5 +1,8 @@
 import { signal } from '@preact/signals';
-import { api, apiResourceUrl } from './api';
+import { apiResourceUrl } from './api';
+import { saveConfigPatch } from './hooks/use-autosave';
+import { config } from './store';
+import { toast } from './toast';
 
 const DEFAULT_TRACK_COUNT = 2;
 let trackCount = DEFAULT_TRACK_COUNT;
@@ -12,9 +15,22 @@ let fadeTarget = 0;
 let fadeCallback: (() => void) | null = null;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let suppressed = false;
+let pendingPlay: Promise<void> | null = null;
+let pendingPlayVersion = 0;
+let playbackVersion = 0;
+let saveVersion = 0;
+let acceptedMusic = { enabled: false, volume: 5, track: 0 };
 
 const FADE_MS = 800;
 export const musicStateVersion = signal(0);
+export const musicError = signal<string | null>(null);
+
+function playbackFailed(): void {
+  if (!musicError.value) toast('Could not load background music. Try again.', 'error');
+  musicError.value = 'Could not load background music. Try again.';
+  Music.ready = false;
+  notifyMusicState();
+}
 
 function notifyMusicState(): void {
   musicStateVersion.value += 1;
@@ -87,10 +103,32 @@ export const Music = {
     return !!audio && !audio.paused;
   },
 
-  applyConfig(cfg: { music_enabled?: boolean | null; music_volume?: number | null; music_track?: number }): void {
+  applyConfig(
+    cfg: { music_enabled?: boolean | null; music_volume?: number | null; music_track?: number },
+    syncPlayback = false,
+  ): void {
+    const previousTrack = this.track;
+    if (syncPlayback) {
+      saveVersion += 1;
+      if (persistTimer) clearTimeout(persistTimer);
+      persistTimer = null;
+      this.enabled = cfg.music_enabled ?? false;
+      this.volume = 5;
+    }
     if (cfg.music_enabled != null) this.enabled = cfg.music_enabled;
-    if (cfg.music_volume != null) this.volume = Math.max(0, Math.min(100, cfg.music_volume));
+    if (cfg.music_volume != null && Number.isFinite(cfg.music_volume)) this.volume = Math.max(0, Math.min(100, cfg.music_volume));
     if (cfg.music_track != null) this.track = clampTrack(cfg.music_track);
+    acceptedMusic = { enabled: this.enabled, volume: this.volume, track: this.track };
+    if (syncPlayback) {
+      if (previousTrack !== this.track) {
+        playbackVersion += 1;
+        cancelFade();
+        audio?.pause();
+        this.ready = false;
+      }
+      if (this.enabled) void this.play();
+      else this.stop();
+    }
     this.syncUI();
   },
 
@@ -105,12 +143,42 @@ export const Music = {
   },
 
   persist(): void {
-    api('PUT', '/config', { music_enabled: this.enabled, music_volume: this.volume, music_track: this.track }).catch(
-      () => {},
-    );
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = null;
+    const version = ++saveVersion;
+    const preference = { enabled: this.enabled, volume: this.volume, track: this.track };
+    void (async () => {
+      try {
+        await saveConfigPatch({
+          music_enabled: preference.enabled, music_volume: preference.volume, music_track: preference.track,
+        }, () => version === saveVersion);
+        if (version === saveVersion) acceptedMusic = preference;
+      } catch {
+        if (version !== saveVersion) return;
+        const saved = config.value;
+        if (saved) acceptedMusic = {
+          enabled: saved.music_enabled ?? false,
+          volume: saved.music_volume ?? 5,
+          track: clampTrack(saved.music_track),
+        };
+        const trackChanged = this.track !== acceptedMusic.track;
+        Object.assign(this, acceptedMusic);
+        if (trackChanged && audio) {
+          cancelFade();
+          audio.pause();
+          this.ready = false;
+        }
+        if (this.enabled && !suppressed) void this.play();
+        else this.stop();
+        this.syncUI();
+        toast('Failed to save music preferences', 'error');
+      }
+    })();
   },
 
   debouncedPersist(): void {
+    // Pending slider edits must not be rolled back by an older failed request.
+    saveVersion += 1;
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
       this.persist();
@@ -127,6 +195,7 @@ export const Music = {
   },
 
   setVolume(v: number): void {
+    if (!Number.isFinite(v)) return;
     this.volume = Math.max(0, Math.min(100, v));
     if (audio && !suppressed) {
       if (fadeRaf) {
@@ -147,23 +216,47 @@ export const Music = {
       audio = new Audio();
       audio.loop = true;
       audio.preload = 'none';
+      audio.addEventListener('error', playbackFailed);
     }
     if (!this.ready) {
       audio.src = apiResourceUrl(`/music/track?t=${this.track}`);
       this.ready = true;
     }
-    if (!audio.paused) return;
-    try {
-      audio.volume = 0;
-      await audio.play();
-      startFade(this.targetVolume);
-      this.syncUI();
-    } catch {
-      /* Browser blocked playback before user interaction. */
+    if (pendingPlay) {
+      const superseded = pendingPlayVersion !== playbackVersion;
+      await pendingPlay;
+      if (superseded && this.enabled && !suppressed && audio.paused) return this.play();
+      return;
     }
+    if (!audio.paused) {
+      startFade(this.targetVolume);
+      return;
+    }
+    const version = playbackVersion;
+    pendingPlayVersion = version;
+    const player = audio;
+    musicError.value = null;
+    pendingPlay = (async () => {
+      try {
+        player.volume = 0;
+        await player.play();
+        if (version !== playbackVersion || !this.enabled || suppressed) {
+          player.pause();
+          return;
+        }
+        startFade(this.targetVolume);
+        this.syncUI();
+      } catch (error) {
+        // Autoplay denial is expected until the first user interaction.
+        if (version === playbackVersion && !(error instanceof DOMException && error.name === 'NotAllowedError')) playbackFailed();
+      }
+    })();
+    try { await pendingPlay; }
+    finally { pendingPlay = null; }
   },
 
   stop(): void {
+    playbackVersion += 1;
     if (!audio || audio.paused) return;
     startFade(0, () => {
       audio!.pause();
@@ -172,6 +265,7 @@ export const Music = {
   },
 
   nextTrack(): void {
+    playbackVersion += 1;
     this.track = (this.track + 1) % trackCount;
     this.ready = false;
     if (audio && !audio.paused) {
@@ -189,9 +283,9 @@ export const Music = {
   // Game-session suppression preserves the user's enabled preference.
 
   suppress(): void {
-    if (suppressed || !this.enabled) return;
+    if (suppressed) return;
     suppressed = true;
-    if (audio && !audio.paused) startFade(0);
+    this.stop();
     this.syncUI();
   },
 

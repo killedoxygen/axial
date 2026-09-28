@@ -12,6 +12,7 @@ let apiCapability = __AXIAL_TEST_API_CAPABILITY__.trim();
 let mediaTicket = '';
 let mediaTicketRefreshAt = 0;
 let mediaTicketRefreshTimer: number | undefined;
+let mediaTicketRefreshPromise: Promise<void> | null = null;
 let nativeTransport = false;
 let transportRecoveryPromise: Promise<void> | null = null;
 let apiBaseInitialized = false;
@@ -42,7 +43,7 @@ async function resolveApiBase(): Promise<void> {
     setApiBaseUrl(__AXIAL_WEB_API_BASE__ ?? '');
     apiCapability = __AXIAL_TEST_API_CAPABILITY__.trim();
     if (!apiCapability && !__AXIAL_MOCK_API__) {
-      const response = await fetch(apiUrl('/transport/bootstrap'), { method: 'POST' });
+      const response = await fetch(apiUrl('/transport/bootstrap'), { method: 'POST', redirect: 'error' });
       const payload = await readJsonPayload(response);
       if (!response.ok) throw makeApiError(response, payload);
       const bootstrap = dtoRecord(payload, 'API transport bootstrap');
@@ -52,7 +53,7 @@ async function resolveApiBase(): Promise<void> {
   }
   if (!__AXIAL_MOCK_API__) {
     requireApiCapability();
-    if (typeof window !== 'undefined') await refreshMediaTicket();
+    if (typeof window !== 'undefined') await refreshMediaTicketNow();
   }
   apiBaseInitialized = true;
 }
@@ -71,7 +72,7 @@ export function apiResourceUrl(path: string): string {
   if (isAbsoluteLikeUrl(trimmed)) {
     const apiPath = apiOwnedResourcePath(trimmed);
     if (apiPath !== null) return withMediaTicket(apiPath ? apiUrl(apiPath) : API);
-    return withMediaTicket(apiUrl(trimmed));
+    return 'about:blank';
   }
   if (trimmed === API_PATH) return withMediaTicket(API);
   if (trimmed.startsWith(`${API_PATH}/`)) return withMediaTicket(apiUrl(trimmed.slice(API_PATH.length)));
@@ -127,10 +128,11 @@ export async function apiFetch(input: string, init: RequestInit = {}): Promise<R
   }
   const headers = new Headers(init.headers);
   headers.set('X-Axial-Capability', requireApiCapability());
-  let response = await fetch(input, { ...init, headers });
-  if (response.status === 401 && (await recoverBrowserTransport())) {
+  let response = await fetch(input, { ...init, headers, redirect: 'error' });
+  const readOnly = ['GET', 'HEAD'].includes((init.method ?? 'GET').toUpperCase());
+  if (response.status === 401 && readOnly && (await recoverBrowserTransport())) {
     headers.set('X-Axial-Capability', requireApiCapability());
-    response = await fetch(input, { ...init, headers });
+    response = await fetch(input, { ...init, headers, redirect: 'error' });
   }
   return response;
 }
@@ -141,6 +143,12 @@ interface TicketGrant {
 }
 
 async function refreshMediaTicket(): Promise<void> {
+  if (mediaTicketRefreshPromise) return mediaTicketRefreshPromise;
+  mediaTicketRefreshPromise = refreshMediaTicketNow();
+  try { await mediaTicketRefreshPromise; } finally { mediaTicketRefreshPromise = null; }
+}
+
+async function refreshMediaTicketNow(): Promise<void> {
   const grant = await mintTicket('media');
   mediaTicket = grant.ticket;
   const refreshDelay = Math.max(1, grant.expires_in_seconds - 60) * 1000;
@@ -159,6 +167,7 @@ async function refreshMediaTicket(): Promise<void> {
 async function mintTicket(audience: 'media' | 'stream', target?: string): Promise<TicketGrant> {
   let response = await fetch(apiUrl('/transport/tickets'), {
     method: 'POST',
+    redirect: 'error',
     headers: {
       'Content-Type': 'application/json',
       'X-Axial-Capability': requireApiCapability(),
@@ -168,6 +177,7 @@ async function mintTicket(audience: 'media' | 'stream', target?: string): Promis
   if (response.status === 401 && (await recoverBrowserTransport())) {
     response = await fetch(apiUrl('/transport/tickets'), {
       method: 'POST',
+      redirect: 'error',
       headers: {
         'Content-Type': 'application/json',
         'X-Axial-Capability': requireApiCapability(),
@@ -218,6 +228,11 @@ function requireApiCapability(): string {
 function withMediaTicket(url: string): string {
   if (__AXIAL_MOCK_API__) return url;
   if (!mediaTicket) return 'about:blank';
+  const target = parseUrl(url);
+  const base = parseUrl(API);
+  if (!target || !base || target.origin !== base.origin || !target.pathname.startsWith(`${API_PATH}/`)) {
+    return 'about:blank';
+  }
   return appendTicket(url, mediaTicket);
 }
 
@@ -229,13 +244,25 @@ function appendTicket(value: string, ticket: string): string {
 
 function apiPath(path: string): string {
   const normalized = path.startsWith('/') ? path : `/${path}`;
-  return normalized.startsWith(API_PATH) ? normalized : `${API_PATH}${normalized}`;
+  const target = normalized.startsWith(`${API_PATH}/`) ? normalized : `${API_PATH}${normalized}`;
+  if (target.includes('?') || target.includes('#') || target.includes('\\') || target.includes('://')) {
+    throw new Error('API event target must be a local path without a query.');
+  }
+  return target;
 }
 
 function normalizeApiBaseUrl(baseUrl: string): string {
   const trimmed = baseUrl.trim().replace(/\/+$/, '');
-  if (trimmed.endsWith(API_PATH)) return trimmed.slice(0, -API_PATH.length);
-  return trimmed;
+  const base = trimmed.endsWith(API_PATH) ? trimmed.slice(0, -API_PATH.length) : trimmed;
+  if (!base) return '';
+  const parsed = new URL(base);
+  const loopback = parsed.hostname === 'localhost' || parsed.hostname === '[::1]'
+    || /^127(?:\.\d{1,3}){3}$/.test(parsed.hostname);
+  if (parsed.protocol !== 'http:' || !loopback || parsed.username || parsed.password
+      || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+    throw new Error('API base URL must be a loopback HTTP origin.');
+  }
+  return parsed.origin;
 }
 
 function isAbsoluteLikeUrl(value: string): boolean {

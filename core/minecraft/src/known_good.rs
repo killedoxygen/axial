@@ -1827,7 +1827,7 @@ pub(crate) fn managed_version_bundle_fixture_parts_for_test(
     const LOG_ID: &str = "guardian-version-bundle.xml";
     const LOG_BYTES: &[u8] = b"<Configuration/>";
     let client_sha1 = format!("{:x}", Sha1::digest(CLIENT_BYTES));
-    let version_json = serde_json::to_vec(&serde_json::json!({
+    let mut version_json = serde_json::json!({
         "id": version_id,
         "type": "release",
         "mainClass": "org.axial.GuardianFixture",
@@ -1838,7 +1838,12 @@ pub(crate) fn managed_version_bundle_fixture_parts_for_test(
                 "url": "https://example.invalid/managed-version-bundle-client"
             }
         }
-    }))?;
+    });
+    if let Ok(loader) = crate::loaders::api::decode_installed_version_id(version_id) {
+        version_json["axialMaterialized"] = serde_json::json!(true);
+        version_json["inheritsFrom"] = serde_json::json!(loader.minecraft_version());
+    }
+    let version_json = serde_json::to_vec(&version_json)?;
     let version_id = KnownGoodId::new(version_id).map_err(|_| {
         DownloadError::Integrity("managed VersionBundle fixture id is invalid".to_string())
     })?;
@@ -5263,7 +5268,7 @@ mod tests {
 
     #[test]
     fn physical_mapping_covers_library_and_managed_runtime_roots() {
-        let fixture = tempfile::tempdir().expect("physical mapping fixture");
+        let fixture = tempfile::tempdir_in(crate::test_temp_root()).expect("physical mapping fixture");
         let runtime_cache = crate::runtime::ManagedRuntimeCache::isolated_for_test()
             .expect("isolated runtime cache");
         let library_root = &fixture.path().join("library-root");

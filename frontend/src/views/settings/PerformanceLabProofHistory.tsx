@@ -8,7 +8,6 @@ import { fmtMem } from '../../format';
 import { errMessage } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
 import type { LaunchReportsState } from './PerformanceLabTypes';
-import { launchProofGuardianEvidence } from '../../launch-proof-presenters';
 import { formatDurationMs, formatProofDate, labelFromToken } from './PerformanceLabFormat';
 import { dtoError } from '../../dto-contract';
 
@@ -92,7 +91,7 @@ export function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }
             const viewModel = record.view_model;
             const comparison = viewModel.comparison;
             const budgetSummary = viewModel.resource_budget;
-            const evidenceSummary = launchProofGuardianEvidence(record);
+            const evidenceSummary = viewModel.evidence;
             const memory = scenario.requested_memory_mb ? fmtMem(scenario.requested_memory_mb / 1024) : null;
             const bootDuration = Number.isFinite(record.boot_duration_ms)
               ? `Boot ${formatDurationMs(record.boot_duration_ms as number)}`

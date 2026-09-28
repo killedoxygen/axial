@@ -1,0 +1,28 @@
+{
+  "schema_version": 3,
+  "last_instance_id": "0000000000000001",
+  "pending_deletions": [],
+  "instances": [
+    {
+      "id": "0000000000000001",
+      "name": "Vanilla Fixture",
+      "version_id": "1.20.1",
+      "created_at": "2026-09-08T00:00:00Z",
+      "last_played_at": "",
+      "art_seed": 13579,
+      "max_memory_mb": 2048,
+      "min_memory_mb": 512,
+      "java_path": "",
+      "window_width": 0,
+      "window_height": 0,
+      "jvm_preset": "",
+      "performance_mode": "vanilla",
+      "extra_jvm_args": "-Dfixture.marker=synthetic",
+      "auto_optimize": false,
+      "icon": "",
+      "accent": "",
+      "loader_key": "",
+      "minecraft_version": "1.20.1"
+    }
+  ]
+}

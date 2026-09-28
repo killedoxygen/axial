@@ -1,24 +1,62 @@
-use crate::application::{self, VersionsResponse};
-use crate::state::{AppState, RequestProducerHandoff};
-use axum::{
-    Json, Router,
-    extract::{Extension, State},
-    http::StatusCode,
-    routing::get,
+use axial_app::{
+    catalog::{Catalog, CatalogSnapshot, VersionsResponse, installed_versions},
+    library::LibraryLifecycle,
+    tasks::TaskOwner,
 };
+use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use serde_json::{Value, json};
+use std::sync::Arc;
 
-pub fn router() -> Router<AppState> {
-    Router::new().route("/api/v1/versions", get(handle_versions))
+#[derive(Clone)]
+struct Versions {
+    library: LibraryLifecycle,
+    catalog: Arc<Catalog>,
+    tasks: TaskOwner,
 }
-
-async fn handle_versions(
-    State(state): State<AppState>,
-    Extension(handoff): Extension<RequestProducerHandoff>,
-) -> Result<Json<VersionsResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = state
-        .try_claim_request_producer(&handoff)
-        .map_err(super::producer_claim_error_response)?;
-    application::installed_versions(&state, &producer)
+pub fn router(library: LibraryLifecycle, catalog: Arc<Catalog>, tasks: TaskOwner) -> Router {
+    Router::new()
+        .route("/api/v1/versions", get(installed))
+        .route("/api/v1/versions/catalog", get(catalog_snapshot))
+        .with_state(Versions {
+            library,
+            catalog,
+            tasks,
+        })
+}
+async fn installed(
+    State(state): State<Versions>,
+) -> Result<Json<VersionsResponse>, (StatusCode, Json<Value>)> {
+    let pin = state.library.admit().map_err(|_| unavailable())?;
+    let operation = pin.managed_library().map_err(|_| unavailable())?;
+    let task = state
+        .tasks
+        .try_spawn((pin, operation.clone()), move |_| async move {
+            let catalog = state.catalog.cached_snapshot(&operation).await;
+            installed_versions(&operation, Some(&catalog)).await
+        })
+        .map_err(|_| unavailable())?;
+    task.join()
         .await
+        .map_err(|_| unavailable())?
         .map(Json)
+        .map_err(|_| unavailable())
+}
+async fn catalog_snapshot(
+    State(state): State<Versions>,
+) -> Result<Json<CatalogSnapshot>, (StatusCode, Json<Value>)> {
+    let pin = state.library.admit().map_err(|_| unavailable())?;
+    let operation = pin.managed_library().map_err(|_| unavailable())?;
+    let task = state
+        .tasks
+        .try_spawn((pin, operation.clone()), move |cancel| async move {
+            state.catalog.snapshot(&operation, &cancel).await
+        })
+        .map_err(|_| unavailable())?;
+    task.join().await.map(Json).map_err(|_| unavailable())
+}
+fn unavailable() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error":"Minecraft versions are unavailable."})),
+    )
 }

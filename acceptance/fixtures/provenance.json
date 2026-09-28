@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "2bda9b42c29d02828dd5a2b91d9cf8c8a431ffb0",
+  "runtime_parity_verified": false,
+  "records": [
+    {
+      "path": "providers/fabric-1.20.1-0.16.14-proof.json",
+      "sha256": "466fb33232bc313ed3c290e4ba9635d1574194165f95f374668d43df63d9428e",
+      "url": "https://meta.fabricmc.net/v2/versions/loader/1.20.1/0.16.14",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "JSON indentation only; full response.",
+      "baseline_source": "legacy/core/minecraft/src/loaders/providers/fabric.rs"
+    },
+    {
+      "path": "providers/fabric-1.20.1-0.16.14-profile.json",
+      "sha256": "e24a698b9aa326bf98cbe31f1b74ce6c7a4ce72118ffcb506eb1fa711d3f3689",
+      "url": "https://meta.fabricmc.net/v2/versions/loader/1.20.1/0.16.14/profile/json",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "JSON indentation only; full response.",
+      "baseline_source": "legacy/core/minecraft/src/loaders/providers/fabric.rs"
+    },
+    {
+      "path": "providers/quilt-1.20.1-0.26.4-proof.json",
+      "sha256": "94c6cbe38080a4ae91f2f315aee0fc223b93bf90387f97ed736f738c847f31ef",
+      "url": "https://meta.quiltmc.org/v3/versions/loader/1.20.1/0.26.4",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "JSON indentation only; full response.",
+      "baseline_source": "legacy/core/minecraft/src/loaders/providers/quilt.rs"
+    },
+    {
+      "path": "providers/quilt-1.20.1-0.26.4-profile.json",
+      "sha256": "cc0ff8a4f98c20025f0d5a837be0f0992e0014b82643bbfeb5b934fd53903a22",
+      "url": "https://meta.quiltmc.org/v3/versions/loader/1.20.1/0.26.4/profile/json",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "JSON indentation only; full response.",
+      "baseline_source": "legacy/core/minecraft/src/loaders/providers/quilt.rs"
+    },
+    {
+      "path": "providers/forge-promotions.json",
+      "sha256": "e7880704ff662801557944e43b59ed6a6d5067422392e0f0a354918bf40cf76a",
+      "url": "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "JSON indentation only; full response.",
+      "baseline_source": "legacy/core/minecraft/src/loaders/providers/forge.rs"
+    },
+    {
+      "path": "providers/modrinth-sodium-project.json",
+      "sha256": "065c575cef3e8a7a463b7e4d278b601ffc650655a09b6af9c6c6e5a461b90175",
+      "url": "https://api.modrinth.com/v2/project/sodium",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "JSON indentation only; full response.",
+      "baseline_source": "legacy/core/content/src/provider.rs"
+    },
+    {
+      "path": "providers/mojang-version-index.json",
+      "sha256": "1eb4f1db35079374699b08655ff3a6c2b65a2f0ca0db0bdb12567d06bef991a1",
+      "url": "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "Versions filtered to fixed representative IDs; latest retained verbatim and may refer outside this subset.",
+      "source_sha256": "f371320e412e4fe1a33f10a43ead9b4c28539598ef58c60664e0472f1b6c3e09",
+      "baseline_source": "legacy/core/minecraft/src/manifest/mod.rs"
+    },
+    {
+      "path": "providers/mojang-runtime-catalog.json",
+      "sha256": "debdeb0d36f69f6d5f8c581381537051d50e86c4b836584d10ff1457f268f912",
+      "url": "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "JSON indentation only; full response.",
+      "source_sha256": "b490908c9bda7f4ed5220145dee8dd1ee9ad92a210080adec3c183b0f0a50a8b",
+      "baseline_source": "legacy/core/minecraft/src/runtime/manifest.rs"
+    },
+    {
+      "path": "providers/forge-maven-metadata.xml",
+      "sha256": "df74acc6364d17ddc58d20c5333a0c0d29484fa3ed7e4a301c086d301be3c625",
+      "url": "https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "Maven versions filtered to fixed representative builds in original order; unrelated fields omitted.",
+      "source_sha256": "39591349420073105e92808c0fb3bbb43b2b59712d483034716f73eaead8f1f7",
+      "baseline_source": "legacy/core/minecraft/src/loaders/providers/forge.rs"
+    },
+    {
+      "path": "providers/neoforge-maven-metadata.xml",
+      "sha256": "35f13028c6069807e80e7313d6c4c33d92b583d693b17db39c58b6917bb00b66",
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "Maven versions filtered to fixed representative builds in original order; unrelated fields omitted.",
+      "source_sha256": "806b90e59f63c39c7d4e0613b68729304d2188ed6238625f1be8ac7987939007",
+      "baseline_source": "legacy/core/minecraft/src/loaders/providers/neoforge.rs"
+    },
+    {
+      "path": "providers/mojang-1.20.1.json",
+      "sha256": "a571db2eba188cab10a72f6fd4982202538729b08b022662208ed594ffc207b0",
+      "url": "https://piston-meta.mojang.com/v1/packages/19f5ae58f9c31bd3b0923cb822e99e3162bd62ab/1.20.1.json",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "JSON indentation only; full response.",
+      "baseline_source": "legacy/core/minecraft/src/manifest/mod.rs"
+    },
+    {
+      "path": "providers/mojang-1.20.1.raw.base64",
+      "sha256": "f3cf01617a7eb6f6257509f61db9d8e15bfaa92bba24a6e2fc62841f7f990dbd",
+      "url": "https://piston-meta.mojang.com/v1/packages/19f5ae58f9c31bd3b0923cb822e99e3162bd62ab/1.20.1.json",
+      "captured_at_utc": "2026-09-08T00:58:00Z",
+      "kind": "captured-public-provider",
+      "transformation": "Base64 encoding of full unchanged response bytes. Decode before checksum/HTTP replay.",
+      "source_sha256": "802d49b1ca907c9dad7ee0bb7c65678e452acf963962eff3b6fe8ecb4dbb23c8",
+      "source_sha1": "19f5ae58f9c31bd3b0923cb822e99e3162bd62ab",
+      "baseline_source": "legacy/core/minecraft/src/manifest/mod.rs"
+    }
+  ]
+}

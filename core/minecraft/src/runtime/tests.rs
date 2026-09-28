@@ -3215,33 +3215,36 @@ fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
         .await
     };
 
+    let file_bytes = std::mem::size_of_val(&install_runtime_manifest_file(
+        &test_runtime_component(),
+        root,
+        "bin/java",
+        file.clone(),
+    ));
     assert!(
-        std::mem::size_of_val(&install_runtime_manifest_file(
-            &test_runtime_component(),
-            root,
-            "bin/java",
-            file.clone(),
-        )) < 4096,
-        "runtime manifest file install future should stay small"
+        file_bytes < 4096,
+        "runtime manifest file install future should stay small: {file_bytes} bytes"
     );
+    let spawned_bytes = std::mem::size_of_val(&spawned_future);
     assert!(
-        std::mem::size_of_val(&spawned_future) < 4096,
-        "spawned runtime manifest file install future should stay small"
+        spawned_bytes < 4096,
+        "spawned runtime manifest file install future should stay small: {spawned_bytes} bytes"
     );
+    let ensure_bytes = std::mem::size_of_val(&ensure_runtime_with_events(
+        &runtime_cache,
+        &JavaVersion {
+            component: "java-runtime-delta".to_string(),
+            major_version: 21,
+        },
+        "",
+        false,
+        None,
+        || Ok(()),
+        |_| {},
+    ));
     assert!(
-        std::mem::size_of_val(&ensure_runtime_with_events(
-            &runtime_cache,
-            &JavaVersion {
-                component: "java-runtime-delta".to_string(),
-                major_version: 21,
-            },
-            "",
-            false,
-            None,
-            || Ok(()),
-            |_| {},
-        )) < 4096,
-        "managed-runtime ensure future should stay small"
+        ensure_bytes < 4096,
+        "managed-runtime ensure future should stay small: {ensure_bytes} bytes"
     );
 }
 
@@ -3270,7 +3273,7 @@ fn write_persisted_runtime_source(root: &Path, manifest: &ComponentManifest) {
 }
 
 fn unique_temp_root(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+    crate::test_temp_root().join(format!(
         "{label}-{}-{}",
         std::process::id(),
         SystemTime::now()

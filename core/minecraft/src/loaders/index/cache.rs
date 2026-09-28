@@ -634,7 +634,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or_default();
-        std::env::temp_dir().join(format!(
+        crate::test_temp_root().join(format!(
             "axial-loader-cache-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))

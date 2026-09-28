@@ -111,7 +111,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        crate::test_temp_root().join(format!(
             "axial-asset-index-{label}-{}-{nanos}",
             std::process::id()
         ))

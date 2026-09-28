@@ -76,6 +76,12 @@ function canonicalJson(value) {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
+function generationJson(value) {
+  if (value.schema_version === 1) return canonicalJson(value);
+  if (value.schema_version === 2) return `${JSON.stringify(value)}\n`;
+  fail('invalid_generation_manifest');
+}
+
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
@@ -318,7 +324,7 @@ function canonicalGenerationManifest(manifest) {
 
 export function computeFrontendGenerationId(manifest) {
   const identity = canonicalGenerationIdentity(manifest);
-  return sha256(Buffer.from(canonicalJson(identity)));
+  return sha256(Buffer.from(generationJson(identity)));
 }
 
 async function listFiles(root, prefix = '') {
@@ -338,7 +344,7 @@ async function writeGeneration(stage, files, manifest) {
     await mkdir(path.dirname(destination), { recursive: true });
     await writeFile(destination, file.bytes, { flag: 'wx' });
   }
-  await writeFile(path.join(stage, GENERATION_MANIFEST), canonicalJson(manifest), { flag: 'wx' });
+  await writeFile(path.join(stage, GENERATION_MANIFEST), generationJson(manifest), { flag: 'wx' });
   const actual = await listFiles(stage);
   const expected = [...files.map(({ path: filePath }) => filePath), GENERATION_MANIFEST].sort();
   if (actual.join('\0') !== expected.join('\0')) fail('staged_generation_mismatch');
@@ -492,7 +498,7 @@ async function publishFrontendGenerationOwned({
     'packaged',
   );
   const manifestIdentity = {
-    schema_version: 1,
+    schema_version: 2,
     document_entry: 'index.html',
     script_entry: 'app.js',
     files: files.map((file) => ({
@@ -564,7 +570,7 @@ export async function verifyFrontendGeneration(
     'generation_manifest',
   );
   if (
-    manifest.schema_version !== 1 ||
+    ![1, 2].includes(manifest.schema_version) ||
     manifest.document_entry !== 'index.html' ||
     manifest.script_entry !== 'app.js' ||
     !/^[0-9a-f]{64}$/.test(manifest.generation_id) ||
@@ -666,7 +672,7 @@ export async function verifyFrontendGeneration(
   if (computeFrontendGenerationId(manifest) !== manifest.generation_id) {
     fail('generation_identity_drift');
   }
-  if (source !== canonicalJson(canonicalGenerationManifest(manifest))) {
+  if (source !== generationJson(canonicalGenerationManifest(manifest))) {
     fail('noncanonical_generation_manifest');
   }
   const derivedMetrics = deriveBundleMetrics({

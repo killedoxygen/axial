@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Icon, type IconName } from '../../ui/Icons';
 import { Button, IconButton, Pill } from '../../ui/Atoms';
 import { InstanceTile, guardedInstanceHue } from '../../ui/InstanceVisual';
@@ -12,7 +12,9 @@ import { handleInstallClick, retryFailedInstall } from '../../machines/downloads
 import { errMessage } from '../../utils';
 import { formatDate, fmtRelative } from '../../format';
 import { instanceInstallStatus } from '../../instance-install-status';
+import { resumeInstanceSetup } from '../../instance-setup';
 import {
+  launchActionPresentation,
   launchSessionActivityLabel,
   launchSessionCanStop,
   launchSessionHasLiveProcess,
@@ -56,11 +58,16 @@ function defaultTabFor(inst: EnrichedInstance | undefined): Tab {
 }
 
 export function InstanceDetailView({ id }: { id: string }): JSX.Element {
+  return <InstanceDetailContent key={id} id={id} />;
+}
+
+function InstanceDetailContent({ id }: { id: string }): JSX.Element {
   const theme = useTheme();
   const inst = instances.value.find((i) => i.id === id);
   const [selectedTab, setSelectedTab] = useState<TabSelection>(null);
   const selectedTabForCurrentInstance = selectedTab?.instanceId === id ? selectedTab.tab : null;
   const [resources, setResources] = useState<ResourceLoadState>({ status: 'loading', data: null });
+  const resourceRequest = useRef(0);
   const [now, setNow] = useState(() => Date.now());
   const session = inst ? launchSessions.value[inst.id] : undefined;
   const sessionActive = Boolean(session);
@@ -75,59 +82,31 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
     resetViewScroll();
   };
 
-  const reloadResources = (): void => {
+  const reloadResources = (quiet = false): void => {
     if (!inst) return;
-    setResources((current) => ({ status: 'loading', data: current.data ?? null }));
+    const request = ++resourceRequest.current;
+    if (!quiet) setResources((current) => ({ status: 'loading', data: current.data ?? null }));
     void fetchInstanceResources(inst.id)
-      .then((data) => setResources({ status: 'ready', data }))
-      .catch((err) =>
+      .then((data) => {
+        if (request === resourceRequest.current) setResources({ status: 'ready', data });
+      })
+      .catch((err) => {
+        if (request !== resourceRequest.current) return;
         setResources((current) => ({
           status: 'error',
           data: current.data ?? null,
           error: errMessage(err),
-        })),
-      );
+        }));
+      });
   };
 
   useEffect(() => {
     if (!inst) return;
-    let alive = true;
-    setResources({ status: 'loading', data: null });
-    void fetchInstanceResources(inst.id)
-      .then((data) => {
-        if (alive) setResources({ status: 'ready', data });
-      })
-      .catch((err) => {
-        if (alive) setResources({ status: 'error', data: null, error: errMessage(err) });
-      });
+    reloadResources();
+    const timer = processLive ? window.setInterval(() => reloadResources(true), LOG_RESOURCE_POLL_MS) : 0;
     return () => {
-      alive = false;
-    };
-  }, [inst?.id]);
-
-  useEffect(() => {
-    if (!inst || !processLive) return;
-    let alive = true;
-    const refreshQuietly = (): void => {
-      void fetchInstanceResources(inst.id)
-        .then((data) => {
-          if (alive) setResources({ status: 'ready', data });
-        })
-        .catch((err) => {
-          if (alive) {
-            setResources((current) => ({
-              status: 'error',
-              data: current.data ?? null,
-              error: errMessage(err),
-            }));
-          }
-        });
-    };
-    refreshQuietly();
-    const timer = window.setInterval(refreshQuietly, LOG_RESOURCE_POLL_MS);
-    return () => {
-      alive = false;
-      window.clearInterval(timer);
+      resourceRequest.current += 1;
+      if (timer) window.clearInterval(timer);
     };
   }, [inst?.id, processLive]);
 
@@ -169,12 +148,31 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const installLabel = installStatus.label;
   const installLocked =
     launchAction.primary_action === 'install' && (installStatus.installing || Boolean(matchingInstallFailure));
+  const launchPresentation = launchActionPresentation({
+    launchAction,
+    installQueued,
+    installQueuedView,
+    installProgress,
+    preparing,
+  });
+  const statusLabel = session
+    ? sessionLabel
+    : launchPresentation.progress || installQueued
+      ? launchPresentation.label
+      : launchAction.launchable
+        ? 'Ready'
+        : (launchAction.primary_action === 'install' && matchingInstallFailure?.viewModel.title) || launchAction.label;
 
   const onPlay = (): void => {
     selectInstance(inst.id);
     void launchGame();
   };
   const onInstall = (): void => {
+    if (launchAction.state_id === 'setup_pending') {
+      void resumeInstanceSetup(inst.id);
+      return;
+    }
+    if (!installStatus.item) return;
     selectInstance(inst.id);
     handleInstallClick(installStatus.item);
   };
@@ -233,7 +231,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             <h1 class="cp-instance-hero-title">{inst.name}</h1>
             <div class="cp-instance-hero-meta">
               <span class="cp-instance-status" data-running={playing}>
-                {session ? sessionLabel : 'Ready'}
+                {statusLabel}
               </span>
               <span>
                 Last played <b>{fmtRelative(inst.last_played_at)}</b>
@@ -251,7 +249,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
                     <span>{playing ? `${sessionLabel} - ${fmtElapsed(session?.launchedAt, now)}` : sessionLabel}</span>
                   </span>
                   {canStop && (
-                    <button class="cp-session-stop" type="button" onClick={onStop}>
+                    <button class="cp-session-stop" type="button" disabled={session?.stopping} onClick={onStop}>
                       <Icon name="stop" size={13} />
                       Stop
                     </button>

@@ -153,6 +153,7 @@ export type BenchmarkQualificationResponse = BenchmarkQualificationPreviewRespon
 export interface BenchmarkSuiteDriverStatus {
   id: string;
   state: string;
+  historical: boolean;
   suite_id?: string;
   mode?: string;
   interval_ms?: number;
@@ -186,6 +187,7 @@ export interface BenchmarkSuiteDriverResponse {
   suite: BenchmarkSuiteDriverSuiteStatus;
   view_model: BenchmarkSuiteDriverViewModel;
   resumed_from?: string;
+  resumed_driver_id?: string;
 }
 
 export interface BenchmarkSuiteDriversResponse {

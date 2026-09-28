@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import {
+  captureWardrobeContext,
+  isWardrobeContextCurrent,
   runWardrobeOp,
   setWardrobeNotice,
   uploadSkinPng,
@@ -62,19 +64,23 @@ export function useSavedSkinUploadWorkflow() {
     }
 
     await runWardrobeOp({ kind: 'upload' }, async () => {
+      const capture = captureWardrobeContext();
       setWardrobeNotice(null);
       try {
         const resolvedVariant = variantOverride ?? (await resolveUploadSkinVariant(file, uploadVariant));
+        if (!isWardrobeContextCurrent(capture)) return;
         await uploadSkinPng(file, {
           name,
           variant: resolvedVariant,
           capeId: capeIdOverride === NO_CAPE_VALUE ? undefined : capeIdOverride,
           applyAfterSave,
+          capture,
         });
+        if (!isWardrobeContextCurrent(capture)) return;
         setSkinName('');
         clearStagedUpload();
       } catch (err) {
-        setWardrobeNotice(skinActionErrorMessage(err, 'Could not save skin.'));
+        if (isWardrobeContextCurrent(capture)) setWardrobeNotice(skinActionErrorMessage(err, 'Could not save skin.'));
       } finally {
         if (fileInputRef.current) fileInputRef.current.value = '';
       }

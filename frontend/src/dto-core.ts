@@ -11,6 +11,7 @@ import {
 import type { EnrichedInstance, Instance, InstanceResourceSummary } from './types-instance';
 import type { Config, SystemInfo } from './types-settings';
 import type { Version } from './types-version';
+import { installItemResponse } from './dto-install';
 
 const JVM_PRESETS = [
   '',
@@ -23,7 +24,6 @@ const JVM_PRESETS = [
   'legacy_heavy',
 ] as const;
 const PERFORMANCE_MODES = ['managed', 'vanilla', 'custom'] as const;
-const GUARDIAN_MODES = ['managed', 'custom', 'disabled'] as const;
 const THEMES = ['', 'obsidian', 'deepslate', 'nether', 'end', 'birch', 'custom'] as const;
 const LOADER_IDS = [
   'net.fabricmc.fabric-loader',
@@ -58,8 +58,15 @@ function nullableBoolean(value: unknown, label: string): boolean | null {
 
 export function configResponse(value: unknown): Config {
   const record = dtoRecord(value, 'Config');
+  const revision = dtoNumber(record.revision, 'Config revision');
+  if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('Config revision was invalid.');
+  const accountSelectionRevision = dtoNumber(record.account_selection_revision, 'Config account selection revision');
+  if (!Number.isSafeInteger(accountSelectionRevision) || accountSelectionRevision < 0) {
+    throw new Error('Config account selection revision was invalid.');
+  }
   return {
-    revision: dtoNumber(record.revision, 'Config revision'),
+    revision,
+    account_selection_revision: accountSelectionRevision,
     username: dtoString(record.username, 'Config username'),
     launch_auth_mode: dtoEnum(record.launch_auth_mode, 'Config auth mode', ['offline', 'online'] as const),
     max_memory_mb: dtoNumber(record.max_memory_mb, 'Config maximum memory'),
@@ -69,8 +76,6 @@ export function configResponse(value: unknown): Config {
     window_height: dtoNumber(record.window_height, 'Config window height'),
     jvm_preset: dtoEnum(record.jvm_preset, 'Config JVM preset', JVM_PRESETS),
     performance_mode: dtoEnum(record.performance_mode, 'Config performance mode', PERFORMANCE_MODES),
-    guardian_mode: dtoEnum(record.guardian_mode, 'Config guardian mode', GUARDIAN_MODES),
-    guardian_idle_integrity_enabled: dtoBoolean(record.guardian_idle_integrity_enabled, 'Config Guardian integrity'),
     theme: dtoEnum(record.theme, 'Config theme', THEMES),
     custom_hue: nullableNumber(record.custom_hue, 'Config hue'),
     custom_vibrancy: nullableNumber(record.custom_vibrancy, 'Config vibrancy'),
@@ -160,11 +165,16 @@ export function enrichedInstanceResponse(value: unknown): EnrichedInstance {
     launch_action: launchActionResponse(record.launch_action),
     status_detail: dtoOptionalString(record.status_detail, 'Instance status detail'),
     needs_install: dtoOptionalString(record.needs_install, 'Instance install requirement'),
+    install_target: record.install_target == null ? record.install_target : installItemResponse(record.install_target),
     java_major: dtoOptionalNumber(record.java_major, 'Instance Java major'),
     saves_count: dtoNumber(record.saves_count, 'Instance saves count'),
     mods_count: dtoNumber(record.mods_count, 'Instance mods count'),
     resource_count: dtoNumber(record.resource_count, 'Instance resource count'),
     shader_count: dtoNumber(record.shader_count, 'Instance shader count'),
+    counts_available:
+      record.counts_available === undefined
+        ? false
+        : dtoBoolean(record.counts_available, 'Instance count availability'),
   };
 }
 

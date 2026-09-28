@@ -883,7 +883,7 @@ mod tests {
     }
 
     fn temp_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        crate::test_temp_root().join(format!(
             "axial-library-admission-{label}-{}-{}",
             std::process::id(),
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)

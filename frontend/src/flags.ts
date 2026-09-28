@@ -3,29 +3,44 @@ import { featureFlags, featureFlagsLoadState } from './store';
 import { toast } from './toast';
 import type { FlagsResponse, KnownFlagKey } from './types-flags';
 import { errMessage } from './utils';
-import { dtoArray, dtoBoolean, dtoEnum, dtoRecord, dtoString } from './dto-contract';
+import { dtoArray, dtoBoolean, dtoEnum, dtoNumber, dtoRecord, dtoString } from './dto-contract';
 
 let pendingFlagsRefresh: Promise<void> | null = null;
+let pendingFlagsAction: Promise<void> = Promise.resolve();
+let flagsRevision: number | null = null;
 
-export function refreshFlags(): Promise<void> {
-  if (pendingFlagsRefresh) return pendingFlagsRefresh;
+function acceptFlags(response: FlagsResponse): void {
+  flagsRevision = response.revision;
+  featureFlags.value = response.flags;
+  featureFlagsLoadState.value = { status: 'ready', error: null };
+}
 
-  featureFlagsLoadState.value = { status: 'loading', error: null };
-  pendingFlagsRefresh = api('GET', '/flags')
-    .then(flagsResponse)
-    .then((response) => {
-      featureFlags.value = response.flags;
-      featureFlagsLoadState.value = { status: 'ready', error: null };
-    })
-    .catch((err: unknown) => {
+async function loadFlags(): Promise<void> {
+  acceptFlags(flagsResponse(await api('GET', '/flags')));
+}
+
+function queueFlagsAction(action: () => Promise<void>): Promise<void> {
+  const request = pendingFlagsAction.then(action);
+  pendingFlagsAction = request.catch(() => undefined);
+  return request;
+}
+
+export function refreshFlags(options: { fresh?: boolean } = {}): Promise<void> {
+  if (pendingFlagsRefresh && !options.fresh) return pendingFlagsRefresh;
+
+  const pending = queueFlagsAction(async () => {
+    featureFlagsLoadState.value = { status: 'loading', error: null };
+    try {
+      await loadFlags();
+    } catch (err) {
       featureFlagsLoadState.value = { status: 'error', error: errMessage(err) };
       throw err;
-    })
-    .finally(() => {
-      pendingFlagsRefresh = null;
-    });
-
-  return pendingFlagsRefresh;
+    }
+  }).finally(() => {
+    if (pendingFlagsRefresh === pending) pendingFlagsRefresh = null;
+  });
+  pendingFlagsRefresh = pending;
+  return pending;
 }
 
 export function ensureFlags(): Promise<void> {
@@ -38,32 +53,37 @@ export function flagEnabled(key: KnownFlagKey): boolean {
 }
 
 export async function setFlagOverride(key: string, enabled: boolean | null): Promise<void> {
-  const previous = featureFlags.value;
-  if (previous) {
-    featureFlags.value = previous.map((flag) =>
-      flag.key === key
-        ? {
-            ...flag,
-            enabled: enabled ?? flag.default_enabled,
-            source: enabled === null ? 'default' : 'override',
-          }
-        : flag,
-    );
-  }
-
   try {
-    const response = flagsResponse(await api('PUT', `/flags/${encodeURIComponent(key)}`, { enabled }));
-    featureFlags.value = response.flags;
-    featureFlagsLoadState.value = { status: 'ready', error: null };
+    await queueFlagsAction(async () => {
+      if (flagsRevision === null) await loadFlags();
+      try {
+        const response = flagsResponse(
+          await api('PUT', `/flags/${encodeURIComponent(key)}`, { enabled, expected_revision: flagsRevision }),
+        );
+        acceptFlags(response);
+      } catch (err) {
+        // A rejected or uncertain write is reconciled with a read. Never replay
+        // a mutation merely to infer whether the previous request committed.
+        flagsRevision = null;
+        try {
+          await loadFlags();
+        } catch (refreshError) {
+          featureFlagsLoadState.value = { status: 'error', error: errMessage(refreshError) };
+        }
+        throw err;
+      }
+    });
   } catch (err) {
-    featureFlags.value = previous;
     toast(errMessage(err), 'error');
   }
 }
 
 export function flagsResponse(value: unknown): FlagsResponse {
   const record = dtoRecord(value, 'Feature flags');
+  const revision = dtoNumber(record.revision, 'Feature flags revision');
+  if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('Feature flags revision was invalid.');
   return {
+    revision,
     flags: dtoArray(record.flags, 'Feature flags list').map((flag) => {
       const entry = dtoRecord(flag, 'Feature flag');
       return {

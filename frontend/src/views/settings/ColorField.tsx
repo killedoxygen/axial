@@ -16,9 +16,16 @@ export function ColorField({
 }): JSX.Element {
   const fieldRef = useRef<HTMLDivElement>(null);
   const markerRef = useRef<HTMLDivElement>(null);
+  const handlers = useRef({ onChange, onEnd });
+  handlers.current = { onChange, onEnd };
 
   useEffect(() => {
-    initColorField(fieldRef.current, markerRef.current, onChange, onEnd);
+    initColorField(
+      fieldRef.current,
+      markerRef.current,
+      (nextHue, nextVibrancy) => handlers.current.onChange(nextHue, nextVibrancy),
+      () => handlers.current.onEnd?.(),
+    );
     positionFieldMarker(fieldRef.current, markerRef.current, hue, vibrancy);
     // Initial binding only, handler refs close over stable refs
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -160,6 +160,8 @@ struct ManagedRoot {
     publication_mutex: Arc<tokio::sync::Mutex<()>>,
     install_flights: Mutex<HashMap<PortablePathKey, Weak<tokio::sync::Mutex<()>>>>,
     _session: Option<ManagedRootSession>,
+    // Application admission outlives every descendant and native effect owner.
+    _retained: Option<Arc<dyn Send + Sync>>,
 }
 
 enum ManagedRootSession {
@@ -320,6 +322,7 @@ struct ManagedLibraryAdmissionState {
 
 enum ManagedLibraryAdmission {
     App(AdmittedAbsoluteDirectory),
+    Retained(Directory),
     #[cfg(any(test, feature = "test-support"))]
     Test {
         path: Arc<PathBuf>,
@@ -339,6 +342,7 @@ struct ManagedAuthorityLifecycleState {
 struct ManagedOperationPin {
     lifecycle: Arc<ManagedAuthorityLifecycle>,
     admission: Option<Arc<ManagedLibraryAdmissionVerifier>>,
+    _retained: Option<Arc<dyn Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -356,6 +360,7 @@ pub struct ManagedLibraryTestAuthority {
 #[derive(Clone)]
 pub struct ManagedLibraryWitness {
     authority: Weak<ManagedLibraryAuthority>,
+    retained: Option<Arc<dyn Send + Sync>>,
 }
 
 #[must_use = "retiring library authority must be drained and settled"]
@@ -519,6 +524,7 @@ impl ManagedAuthorityLifecycle {
         Ok(Arc::new(ManagedOperationPin {
             lifecycle: Arc::clone(self),
             admission,
+            _retained: None,
         }))
     }
 
@@ -1469,6 +1475,13 @@ fn exact_portable_entry_kind(
 }
 
 impl ManagedDir {
+    /// Used only while constructing an unshared application-owned cache root.
+    pub(crate) fn retain_lifetime(&mut self, retained: Arc<dyn Send + Sync>) {
+        let directory = Arc::get_mut(&mut self.inner).expect("new managed directory is exclusive");
+        let root = Arc::get_mut(&mut directory.root).expect("new managed root is exclusive");
+        root._retained = Some(retained);
+    }
+
     fn with_operation_pin(&self, pin: Arc<ManagedOperationPin>) -> Self {
         Self::from_directory_inner(
             self.inner.directory.clone(),
@@ -1561,6 +1574,7 @@ impl ManagedDir {
             install_flights: Mutex::new(HashMap::new()),
             // RootSession remains last so owner/capability fields are released first.
             _session: session,
+            _retained: None,
         });
         Ok(Self::from_directory_inner(
             directory, identity, root, None, path, true,
@@ -1608,6 +1622,7 @@ impl ManagedDir {
             install_flights: Mutex::new(HashMap::new()),
             // RootSession remains last so owner/capability fields are released first.
             _session: Some(ManagedRootSession::Direct(session)),
+            _retained: None,
         });
         registry.insert(requested_key.clone(), Arc::downgrade(&root));
         Ok(Self::from_directory_inner(
@@ -2113,11 +2128,10 @@ impl ManagedDir {
                 "managed directory listing bound is invalid".to_string(),
             ));
         }
+        // The root lease consumes an entry, but cannot enlarge the native bound.
         let requested = limit
-            .checked_add(usize::from(self.inner.is_root))
-            .ok_or_else(|| {
-                LoaderError::Verify("managed directory listing bound overflowed".to_string())
-            })?;
+            .saturating_add(usize::from(self.inner.is_root))
+            .min(axial_fs::MAX_DIRECTORY_LIST_ENTRIES);
         let listing = self.inner.directory.entries(requested)?;
         if listing.state() != DirectoryListingState::Complete {
             return Err(LoaderError::Verify(
@@ -2515,7 +2529,7 @@ impl ManagedDir {
         }
         let bytes = guard.identity.with_capability(|file| {
             file.validate_revision(&guard.revision)?;
-            let bytes = file.read_bounded(max_size)?;
+            let bytes = file.read_bounded(max_size.min(guard.size))?;
             file.validate_revision(&guard.revision)?;
             Ok(bytes)
         })?;
@@ -2540,7 +2554,15 @@ impl ManagedDir {
                 "managed guarded hash source is invalid or exceeds its bound".to_string(),
             ));
         }
-        let digest = guard.identity.with_capability(|file| {
+        // Callbacks may acquire the root transition lock, whose writers also
+        // acquire file-proof locks. Keep this read on its own matched capability.
+        let file = self.inner.directory.open_file(&leaf(name)?)?;
+        if !guard.identity.matches(&file)? {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source changed before hashing".to_string(),
+            ));
+        }
+        let digest = {
             file.validate_revision(&guard.revision)?;
             let mut reader = file.reader(max_size)?;
             let mut observed = 0_u64;
@@ -2558,13 +2580,14 @@ impl ManagedDir {
                 hasher.update(&chunk[..read]);
             }
             reader.finish()?;
+            file.validate_revision(&guard.revision)?;
             if observed != guard.size {
                 return Err(LoaderError::Verify(
                     "managed guarded hash source changed size".to_string(),
                 ));
             }
-            Ok(<[u8; 20]>::from(hasher.finalize()))
-        })?;
+            <[u8; 20]>::from(hasher.finalize())
+        };
         check()?;
         if !self.file_guard_matches(name, guard)? {
             return Err(LoaderError::Verify(
@@ -3216,14 +3239,10 @@ impl ManagedDir {
                 return Err(ManagedGuardedFileMoveFailure::AppliedUnsettled);
             }
         }
-        self.inner
-            .directory
-            .sync()
+        self.revalidate_locked(&transition)
             .map_err(|_| ManagedGuardedFileMoveFailure::AppliedUnsettled)?;
         destination
-            .inner
-            .directory
-            .sync()
+            .revalidate_locked(&transition)
             .map_err(|_| ManagedGuardedFileMoveFailure::AppliedUnsettled)?;
         Ok(())
     }
@@ -4256,30 +4275,35 @@ impl ManagedDir {
             }
             match entry.kind() {
                 EntryKind::File => {
-                    let guard = self.inspect_regular_file(name)?.ok_or_else(|| {
-                        LoaderError::Verify("managed tree file disappeared".to_string())
-                    })?;
-                    if guard.size > state.limits.max_file_bytes
-                        || guard.size > state.remaining_bytes
-                    {
+                    let (size, guard) = if snapshot.is_some() {
+                        let guard = self.inspect_regular_file(name)?.ok_or_else(|| {
+                            LoaderError::Verify("managed tree file disappeared".to_string())
+                        })?;
+                        (guard.size, Some(guard))
+                    } else {
+                        // Live usage samples size; only settled snapshots require
+                        // unchanged contents while a file is observed.
+                        self.revalidate()?;
+                        let file = self.inner.directory.open_file(&leaf(name)?)?;
+                        let size = file.revision()?.size();
+                        self.revalidate()?;
+                        (size, None)
+                    };
+                    if size > state.limits.max_file_bytes || size > state.remaining_bytes {
                         return Err(LoaderError::Verify(
                             "managed tree file exceeds its byte bound".to_string(),
                         ));
                     }
-                    state.remaining_bytes -= guard.size;
-                    if let Some(snapshot) = snapshot.as_deref_mut() {
+                    state.remaining_bytes -= size;
+                    if let (Some(snapshot), Some(guard)) = (snapshot.as_deref_mut(), guard) {
                         let sha1 = self.sha1_guarded_file_bytes(
                             name,
                             &guard,
                             state.limits.max_file_bytes,
                         )?;
-                        snapshot.files.insert(
-                            relative,
-                            ManagedFileFact {
-                                size: guard.size,
-                                sha1,
-                            },
-                        );
+                        snapshot
+                            .files
+                            .insert(relative, ManagedFileFact { size, sha1 });
                     }
                 }
                 EntryKind::Directory => {
@@ -4662,6 +4686,27 @@ fn settle_admitted_root_session_acquisition(
 }
 
 impl ManagedLibraryRoot {
+    /// Wrap an already admitted root without acquiring a second physical lease.
+    /// The lifecycle owner must retain this root and attach its generation pin
+    /// to every operation through `try_acquire_retaining`.
+    pub fn from_directory(directory: Directory) -> io::Result<Self> {
+        let effects = directory.create_effect_owner()?;
+        let root = ManagedDir::from_directory(directory.clone(), effects).map_err(loader_io)?;
+        root.settle().map_err(loader_io)?;
+        Self::finish_construction(root, ManagedLibraryAdmission::Retained(directory))
+    }
+
+    pub fn try_acquire_retaining(
+        &self,
+        retained: Arc<dyn Send + Sync>,
+    ) -> io::Result<ManagedLibraryOperation> {
+        let mut operation = self.try_acquire()?;
+        Arc::get_mut(&mut operation.pin)
+            .expect("newly acquired operation pin is exclusive")
+            ._retained = Some(retained);
+        Ok(operation)
+    }
+
     pub fn admitted_binding(
         admission: &AdmittedAbsoluteDirectory,
     ) -> io::Result<ManagedLibraryBinding> {
@@ -4746,7 +4791,25 @@ impl ManagedLibraryRoot {
     pub fn witness(&self) -> ManagedLibraryWitness {
         ManagedLibraryWitness {
             authority: Arc::downgrade(&self.authority),
+            retained: None,
         }
+    }
+
+    pub fn settle(&self) -> io::Result<()> {
+        self.authority.root.settle().map_err(loader_io)
+    }
+
+    /// The application lifecycle uses the retained create/settlement protocol
+    /// for its fixed runtime cache, independently from selected library work.
+    pub fn prepare_runtime_directory(&self) -> io::Result<Directory> {
+        self.revalidate()?;
+        let runtime = self
+            .authority
+            .root
+            .open_or_create_child("runtime")
+            .map_err(loader_io)?;
+        self.revalidate()?;
+        Ok(runtime.inner.directory.clone())
     }
 
     pub fn begin_retirement(self) -> ManagedLibraryRetirement {
@@ -4954,10 +5017,15 @@ impl ManagedLibraryAdmissionVerifier {
 
 impl ManagedLibraryWitness {
     pub fn try_acquire(&self) -> io::Result<ManagedLibraryOperation> {
-        self.authority
+        let mut operation = self
+            .authority
             .upgrade()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "managed library expired"))?
-            .try_acquire()
+            .try_acquire()?;
+        Arc::get_mut(&mut operation.pin)
+            .expect("new operation pin is exclusive")
+            ._retained = self.retained.clone();
+        Ok(operation)
     }
 
     pub fn prepare_admission_rebind(
@@ -4972,9 +5040,220 @@ impl ManagedLibraryWitness {
 }
 
 impl ManagedLibraryOperation {
+    /// Reuse one unchanged parent chain while observing related files. The
+    /// cursor owns no file descriptors beyond that chain and each returned file.
+    pub fn file_batch(&self) -> ManagedLibraryFileBatch {
+        ManagedLibraryFileBatch {
+            operation: self.clone(),
+            parent: None,
+            #[cfg(test)]
+            parent_walks: 0,
+        }
+    }
+
+    /// Publish a fresh native extraction owned by this generation. Every
+    /// post-creation failure returns its exact partial cleanup receipt.
+    pub async fn publish_native_directory(
+        &self,
+        files: Vec<(PortableFileName, Vec<u8>)>,
+    ) -> Result<ManagedNativeDirectory, ManagedNativePublicationFailure> {
+        self.publish_native_directory_inner(
+            files,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn publish_native_directory_inner(
+        &self,
+        mut files: Vec<(PortableFileName, Vec<u8>)>,
+        #[cfg(test)] fail_after_promotion: Option<usize>,
+    ) -> Result<ManagedNativeDirectory, ManagedNativePublicationFailure> {
+        const MANIFEST: &str = ".axial-native-manifest.json";
+        if files.is_empty() || files.len() > 4096 {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid native file count").into(),
+            );
+        }
+        let mut names = std::collections::HashSet::new();
+        let mut total = 0_u64;
+        let mut manifest_count = 0;
+        for (name, bytes) in &files {
+            total = total
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| io::Error::other("native payload size overflow"))?;
+            if !names.insert(name.key()) || bytes.len() > (128 << 20) || total > (512 << 20) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "native payload exceeds bounds or repeats a name",
+                )
+                .into());
+            }
+            manifest_count += usize::from(name.as_str() == MANIFEST);
+        }
+        if manifest_count != 1 {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "native manifest is required").into(),
+            );
+        }
+        files.sort_by(|(left, _), (right, _)| {
+            (left.as_str() == MANIFEST, left.as_str())
+                .cmp(&(right.as_str() == MANIFEST, right.as_str()))
+        });
+        self.revalidate()?;
+        let parent = self
+            .managed_directory()
+            .map_err(loader_io)?
+            .open_or_create_child("cache")
+            .map_err(loader_io)?
+            .open_or_create_child("natives")
+            .map_err(loader_io)?;
+        let name = format!("native-{}", uuid::Uuid::new_v4().simple());
+        let relative = PortableRelativePath::new_exact(&format!("cache/natives/{name}"))
+            .map_err(|_| io::Error::other("generated native path is invalid"))?;
+        let directory = parent.create_child_new(&name).map_err(loader_io)?;
+        let mut receipt = ManagedNativeDirectory {
+            operation: self.clone(),
+            relative,
+            cleanup: Mutex::new(ManagedNativeCleanup {
+                parent,
+                name,
+                directory,
+                guards: Vec::with_capacity(files.len()),
+                started: false,
+                complete: false,
+            }),
+        };
+        let publication = (|| -> io::Result<()> {
+            let cleanup = receipt
+                .cleanup
+                .get_mut()
+                .map_err(|_| io::Error::other("native cleanup lock was poisoned"))?;
+            for (index, (name, bytes)) in files.into_iter().enumerate() {
+                self.revalidate()?;
+                #[cfg(test)]
+                let result = if fail_after_promotion == Some(index) {
+                    cleanup.directory.write_new_exact_retained_with_fault(
+                        name.as_str(),
+                        &bytes,
+                        ManagedCreateOnlyWriteFault::Promotion,
+                    )
+                } else {
+                    cleanup
+                        .directory
+                        .write_new_exact_retained(name.as_str(), &bytes)
+                };
+                #[cfg(not(test))]
+                let result = {
+                    let _ = index;
+                    cleanup
+                        .directory
+                        .write_new_exact_retained(name.as_str(), &bytes)
+                };
+                match result {
+                    Ok(guard) => cleanup.guards.push((name, guard)),
+                    Err(ManagedCreateOnlyWriteFailure::BeforePromotion(error)) => {
+                        return Err(loader_io(error));
+                    }
+                    Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard }) => {
+                        if let Some(guard) = final_guard {
+                            cleanup.guards.push((name, guard));
+                        }
+                        return Err(io::Error::other(
+                            "native file publication remains unsettled",
+                        ));
+                    }
+                }
+            }
+            cleanup.directory.sync().map_err(loader_io)?;
+            cleanup.parent.sync().map_err(loader_io)
+        })()
+        .and_then(|()| receipt.revalidate());
+        if let Err(error) = publication {
+            return Err(ManagedNativePublicationFailure {
+                error,
+                receipt: Some(receipt),
+            });
+        }
+        Ok(receipt)
+    }
+
+    /// List portable regular-file names beneath a capability-relative directory.
+    /// Names are candidates, not read authority; observe_file must admit the selected file.
+    pub fn file_names(
+        &self,
+        relative: &PortableRelativePath,
+        max_entries: usize,
+    ) -> io::Result<Vec<String>> {
+        if max_entries == 0 || max_entries > MAX_MANAGED_DIRECTORY_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid directory entry bound",
+            ));
+        }
+        self.revalidate()?;
+        let mut directory = self.managed_directory().map_err(loader_io)?;
+        for segment in relative.as_str().split('/') {
+            directory = directory.open_child(segment).map_err(loader_io)?;
+        }
+        let mut names = Vec::new();
+        for name in directory.entries_bounded(max_entries).map_err(loader_io)? {
+            let name = name
+                .into_string()
+                .map_err(|_| io::Error::other("nonportable directory entry"))?;
+            PortableFileName::new_exact(&name)
+                .map_err(|_| io::Error::other("nonportable directory entry"))?;
+            if directory
+                .inspect_regular_file(&name)
+                .map_err(loader_io)?
+                .is_some()
+            {
+                names.push(name);
+            }
+        }
+        names.sort();
+        self.revalidate()?;
+        Ok(names)
+    }
+
+    /// Capture a regular file from this admitted generation without accepting an absolute path.
+    pub fn observe_file(
+        &self,
+        relative: &PortableRelativePath,
+    ) -> io::Result<Option<ManagedLibraryFile>> {
+        self.revalidate()?;
+        let mut directory = self.managed_directory().map_err(loader_io)?;
+        let mut segments = relative.as_str().split('/').peekable();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                return directory
+                    .inspect_regular_file(segment)
+                    .map(|guard| {
+                        guard.map(|guard| ManagedLibraryFile {
+                            operation: self.clone(),
+                            directory,
+                            name: segment.to_string(),
+                            guard,
+                        })
+                    })
+                    .map_err(loader_io);
+            }
+            directory = match directory.open_child_if_exists(segment).map_err(loader_io)? {
+                Some(directory) => directory,
+                None => return Ok(None),
+            };
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file path is empty",
+        ))
+    }
+
     pub fn witness(&self) -> ManagedLibraryWitness {
         ManagedLibraryWitness {
             authority: Arc::downgrade(&self.authority),
+            retained: self.pin._retained.clone(),
         }
     }
 
@@ -4997,25 +5276,12 @@ impl ManagedLibraryOperation {
 
     pub fn validate_read_projection(&self, path: &Path) -> io::Result<()> {
         self.revalidate()?;
-        let session = self
-            .authority
+        self.authority
             .root
             .inner
-            .root
-            ._session
-            .as_ref()
-            .ok_or_else(|| io::Error::other("managed library root session is absent"))?;
-        let projected = session.admit_absolute_directory(path)?;
-        let matches = projected
-            .identity()?
-            .same_filesystem_object(self.authority.root.inner.identity);
+            .directory
+            .validate_absolute_projection(path)?;
         self.revalidate()?;
-        if !matches {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "library read projection does not match its retained authority",
-            ));
-        }
         Ok(())
     }
 
@@ -5027,6 +5293,313 @@ impl ManagedLibraryOperation {
             .with_operation_pin(Arc::clone(&self.pin));
         directory.revalidate()?;
         Ok(directory)
+    }
+}
+
+/// A pinned, immutable observation of a single file in an admitted library generation.
+/// It grants bounded read authority only; it does not grant publication or deletion authority.
+pub struct ManagedLibraryFile {
+    operation: ManagedLibraryOperation,
+    directory: ManagedDir,
+    name: String,
+    guard: ManagedFileGuard,
+}
+
+/// A per-call observation cursor, not a readiness cache. Only the most recent
+/// parent chain is retained; portable path bounds limit its depth independently
+/// of the number of files. Namespace drift invalidates the entire chain.
+pub struct ManagedLibraryFileBatch {
+    operation: ManagedLibraryOperation,
+    parent: Option<FileBatchParent>,
+    #[cfg(test)]
+    parent_walks: usize,
+}
+
+struct FileBatchParent {
+    relative: String,
+    directory: ManagedDir,
+    revisions: Vec<(ManagedDir, DirectoryRevision)>,
+}
+
+impl FileBatchParent {
+    fn revalidate(&self) -> io::Result<()> {
+        for (directory, revision) in &self.revisions {
+            directory
+                .validate_passive_revision(revision)
+                .map_err(loader_io)?;
+        }
+        Ok(())
+    }
+}
+
+impl ManagedLibraryFileBatch {
+    pub fn observe_file(
+        &mut self,
+        relative: &PortableRelativePath,
+    ) -> io::Result<Option<ManagedLibraryFile>> {
+        let result = self.observe(relative);
+        if result.is_err() {
+            self.parent = None;
+        }
+        result
+    }
+
+    fn observe(
+        &mut self,
+        relative: &PortableRelativePath,
+    ) -> io::Result<Option<ManagedLibraryFile>> {
+        self.operation.revalidate()?;
+        let (parent_path, name) = relative
+            .as_str()
+            .rsplit_once('/')
+            .unwrap_or(("", relative.as_str()));
+        if self
+            .parent
+            .as_ref()
+            .is_none_or(|parent| parent.relative != parent_path)
+        {
+            self.parent = None;
+            let mut directory = self.operation.managed_directory().map_err(loader_io)?;
+            let mut revisions = Vec::new();
+            #[cfg(test)]
+            {
+                self.parent_walks += 1;
+            }
+            if !parent_path.is_empty() {
+                for segment in parent_path.split('/') {
+                    // Capture before the alias-checked listing. A later stamp
+                    // must never bless a namespace change during that walk.
+                    let revision = directory.passive_revision().map_err(loader_io)?;
+                    let child = directory.open_child_if_exists(segment).map_err(loader_io)?;
+                    directory
+                        .validate_passive_revision(&revision)
+                        .map_err(loader_io)?;
+                    revisions.push((directory, revision));
+                    let Some(child) = child else {
+                        return Ok(None);
+                    };
+                    directory = child;
+                }
+            }
+            let revision = directory.passive_revision().map_err(loader_io)?;
+            revisions.push((directory.clone(), revision));
+            self.parent = Some(FileBatchParent {
+                relative: parent_path.to_owned(),
+                directory,
+                revisions,
+            });
+        }
+        let parent = self.parent.as_ref().expect("observed parent chain");
+        parent.revalidate()?;
+        let guard = parent
+            .directory
+            .inspect_regular_file(name)
+            .map_err(loader_io)?;
+        parent.revalidate()?;
+        self.operation.revalidate()?;
+        Ok(guard.map(|guard| ManagedLibraryFile {
+            operation: self.operation.clone(),
+            directory: parent.directory.clone(),
+            name: name.to_owned(),
+            guard,
+        }))
+    }
+}
+
+/// Exact native extraction admitted only after every file and manifest was published.
+pub struct ManagedNativeDirectory {
+    operation: ManagedLibraryOperation,
+    relative: PortableRelativePath,
+    cleanup: Mutex<ManagedNativeCleanup>,
+}
+
+#[must_use = "a failed native publication may retain exact cleanup authority"]
+pub struct ManagedNativePublicationFailure {
+    error: io::Error,
+    receipt: Option<ManagedNativeDirectory>,
+}
+
+impl ManagedNativePublicationFailure {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn into_parts(self) -> (io::Error, Option<ManagedNativeDirectory>) {
+        (self.error, self.receipt)
+    }
+}
+
+impl From<io::Error> for ManagedNativePublicationFailure {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            receipt: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ManagedNativePublicationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedNativePublicationFailure")
+            .field("error", &self.error)
+            .field("retains_receipt", &self.receipt.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ManagedNativePublicationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for ManagedNativePublicationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+struct ManagedNativeCleanup {
+    parent: ManagedDir,
+    name: String,
+    directory: ManagedDir,
+    guards: Vec<(PortableFileName, ManagedFileGuard)>,
+    started: bool,
+    complete: bool,
+}
+
+impl ManagedNativeDirectory {
+    pub fn relative_path(&self) -> &PortableRelativePath {
+        &self.relative
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        let cleanup = self
+            .cleanup
+            .lock()
+            .map_err(|_| io::Error::other("native cleanup lock was poisoned"))?;
+        if cleanup.started {
+            return Err(io::Error::other("native directory cleanup has started"));
+        }
+        self.validate_contents(&cleanup)
+    }
+
+    fn validate_contents(&self, cleanup: &ManagedNativeCleanup) -> io::Result<()> {
+        self.operation.revalidate()?;
+        cleanup.directory.revalidate().map_err(loader_io)?;
+        if cleanup
+            .directory
+            .entries_bounded(cleanup.guards.len() + 1)
+            .map_err(loader_io)?
+            .len()
+            != cleanup.guards.len()
+        {
+            return Err(io::Error::other("native directory entries changed"));
+        }
+        for (name, guard) in &cleanup.guards {
+            if !cleanup
+                .directory
+                .file_guard_matches(name.as_str(), guard)
+                .map_err(loader_io)?
+            {
+                return Err(io::Error::other("native payload changed"));
+            }
+        }
+        self.operation.revalidate()
+    }
+
+    /// Settle only this fresh extraction after the process and output readers
+    /// have finished. A failure retains progress and native obligations in this
+    /// receipt, so its owner must keep it for retry. Blocking capability I/O.
+    pub fn settle(&self) -> io::Result<()> {
+        let mut cleanup = self
+            .cleanup
+            .lock()
+            .map_err(|_| io::Error::other("native cleanup lock was poisoned"))?;
+        if cleanup.complete {
+            return Ok(());
+        }
+        self.operation.authority.root.settle().map_err(loader_io)?;
+        if !cleanup.started {
+            self.validate_contents(&cleanup)?;
+            cleanup.started = true;
+        }
+        while let Some((name, guard)) = cleanup.guards.last() {
+            if let Err(error) = cleanup.directory.remove_guarded_file(name.as_str(), guard) {
+                // A retained park/removal may have completed despite its first
+                // error. Only a settled owner and exact absence advance it.
+                self.operation.authority.root.settle().map_err(loader_io)?;
+                if cleanup
+                    .directory
+                    .inspect_regular_file(name.as_str())
+                    .map_err(loader_io)?
+                    .is_some()
+                {
+                    return Err(loader_io(error));
+                }
+            }
+            cleanup.guards.pop();
+        }
+        match cleanup
+            .parent
+            .settle_remove_exact_empty_child(&cleanup.name, cleanup.directory.clone())
+        {
+            ManagedExactChildCleanup::Done => {
+                cleanup.complete = true;
+                Ok(())
+            }
+            ManagedExactChildCleanup::Known(directory) => {
+                cleanup.directory = directory;
+                Err(io::Error::other(
+                    "native directory cleanup remains unsettled or contains changed files",
+                ))
+            }
+        }
+    }
+}
+
+impl ManagedLibraryFile {
+    pub fn revision_observation(&self) -> axial_fs::FileRevisionObservation {
+        self.guard.revision.observation()
+    }
+
+    pub fn size(&self) -> u64 {
+        self.guard.size()
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.operation.revalidate()?;
+        if !self
+            .directory
+            .file_guard_matches(&self.name, &self.guard)
+            .map_err(loader_io)?
+        {
+            return Err(io::Error::other("admitted library file changed"));
+        }
+        self.operation.revalidate()
+    }
+
+    pub fn read_bounded(&self, max_size: u64) -> io::Result<Vec<u8>> {
+        self.revalidate()?;
+        let bytes = self
+            .directory
+            .read_guarded_file_bounded(&self.name, &self.guard, max_size)
+            .map_err(loader_io)?;
+        self.revalidate()?;
+        Ok(bytes)
+    }
+
+    pub fn sha1_bounded(&self, max_size: u64) -> io::Result<[u8; 20]> {
+        self.revalidate()?;
+        let digest = self
+            .directory
+            .sha1_guarded_file_bytes_with_check(&self.name, &self.guard, max_size, || {
+                self.operation.revalidate().map_err(LoaderError::Io)
+            })
+            .map_err(loader_io)?;
+        self.revalidate()?;
+        Ok(digest)
     }
 }
 
@@ -5153,6 +5726,9 @@ impl ManagedLibraryAdmission {
     ) -> io::Result<axial_fs::DirectoryFilesystemIdentity> {
         match self {
             Self::App(admission) => admission.filesystem_identity(),
+            Self::Retained(directory) => directory
+                .identity()
+                .map(|identity| identity.filesystem_identity()),
             #[cfg(any(test, feature = "test-support"))]
             Self::Test { .. } => {
                 self.revalidate(_root_identity, _test_root)?;
@@ -5167,6 +5743,15 @@ impl ManagedLibraryAdmission {
         _test_root: &Weak<ManagedRoot>,
     ) -> io::Result<()> {
         match self {
+            Self::Retained(directory) => {
+                if directory.identity()?.filesystem_identity() != root_identity {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "retained library identity changed",
+                    ));
+                }
+                Ok(())
+            }
             Self::App(admission) => {
                 if admission.filesystem_identity()? != root_identity {
                     return Err(io::Error::new(
@@ -6033,10 +6618,436 @@ mod library_lifecycle_tests {
     use super::*;
     use std::time::Duration;
 
+    fn file_batch_fixture() -> (
+        tempfile::TempDir,
+        ManagedLibraryRoot,
+        ManagedLibraryOperation,
+    ) {
+        let (temporary, root) = managed_library("file-batch");
+        std::fs::create_dir_all(temporary.path().join("assets/objects/aa")).unwrap();
+        std::fs::write(
+            temporary.path().join("assets/objects/aa/first"),
+            b"first payload",
+        )
+        .unwrap();
+        std::fs::write(
+            temporary.path().join("assets/objects/aa/second"),
+            b"second payload",
+        )
+        .unwrap();
+        let operation = root.try_acquire().unwrap();
+        (temporary, root, operation)
+    }
+
+    fn batch_path(name: &str) -> PortableRelativePath {
+        PortableRelativePath::new_exact(&format!("assets/objects/aa/{name}")).unwrap()
+    }
+
+    #[test]
+    fn guarded_sha1_allows_concurrent_manifest_publication() {
+        const CHILD_ROOT: &str = "AXIAL_GUARDED_SHA1_PUBLICATION_CHILD_ROOT";
+        let Some(path) = std::env::var_os(CHILD_ROOT) else {
+            let temporary = tempfile::Builder::new()
+                .prefix("axial-guarded-sha1-publication-")
+                .tempdir_in(crate::test_temp_root())
+                .unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "managed_fs::library_lifecycle_tests::guarded_sha1_allows_concurrent_manifest_publication",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, temporary.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let timed_out = loop {
+                if child.try_wait().unwrap().is_some() {
+                    break false;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child
+                        .kill()
+                        .expect("stop only the deadlocked fixture child");
+                    break true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !timed_out && output.status.success(),
+                "guarded SHA-1 publication fixture failed (timeout={timed_out}): {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let path = PathBuf::from(path);
+        let bytes = vec![0x5a; 128 * 1024];
+        std::fs::write(path.join("artifact.bin"), &bytes).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(&path).unwrap();
+        let operation = root.try_acquire().unwrap();
+        let directory = operation.managed_directory().unwrap();
+        directory
+            .write_exact_blocking("manifest.json", b"before")
+            .unwrap();
+        let file = operation
+            .observe_file(&PortableRelativePath::new_exact("artifact.bin").unwrap())
+            .unwrap()
+            .unwrap();
+        let mut checks = 0;
+        let digest = file
+            .directory
+            .sha1_guarded_file_bytes_with_check(&file.name, &file.guard, bytes.len() as u64, || {
+                checks += 1;
+                if checks == 2 {
+                    let writer = directory.clone();
+                    std::thread::spawn(move || {
+                        writer.write_exact_blocking("manifest.json", b"after")
+                    })
+                    .join()
+                    .unwrap()?;
+                }
+                operation.revalidate().map_err(LoaderError::Io)
+            })
+            .unwrap();
+        assert_eq!(digest, <[u8; 20]>::from(Sha1::digest(&bytes)));
+        assert!(checks >= 5, "every read chunk retains its admission check");
+        assert_eq!(std::fs::read(path.join("manifest.json")).unwrap(), b"after");
+        assert_eq!(file.sha1_bounded(bytes.len() as u64).unwrap(), digest);
+    }
+
+    #[test]
+    fn guarded_sha1_rejects_callback_failure_and_mid_read_source_changes() {
+        for failure in ["callback", "same-size rewrite", "replacement"] {
+            let (temporary, root) = managed_library("guarded-sha1-changes");
+            let bytes = vec![0x5a; 128 * 1024];
+            let path = temporary.path().join("artifact.bin");
+            std::fs::write(&path, &bytes).unwrap();
+            let operation = root.try_acquire().unwrap();
+            let file = operation
+                .observe_file(&PortableRelativePath::new_exact("artifact.bin").unwrap())
+                .unwrap()
+                .unwrap();
+            let mut checks = 0;
+            let result = file.directory.sha1_guarded_file_bytes_with_check(
+                &file.name,
+                &file.guard,
+                bytes.len() as u64,
+                || {
+                    checks += 1;
+                    if checks == 3 {
+                        match failure {
+                            "callback" => {
+                                return Err(LoaderError::Verify("cancelled fixture".to_string()));
+                            }
+                            "same-size rewrite" => {
+                                std::fs::write(&path, vec![0xa5; bytes.len()])?;
+                            }
+                            "replacement" => {
+                                std::fs::rename(
+                                    &path,
+                                    temporary.path().join("previous-artifact.bin"),
+                                )?;
+                                std::fs::write(&path, &bytes)?;
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    operation.revalidate().map_err(LoaderError::Io)
+                },
+            );
+            assert!(checks >= 3, "{failure} must occur after the first read");
+            assert!(result.is_err(), "accepted {failure} during guarded hashing");
+            if failure == "callback" {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn file_batch_reuses_one_parent_without_reusing_file_evidence() {
+        let (_temporary, _root, operation) = file_batch_fixture();
+        let mut batch = operation.file_batch();
+        for (name, bytes) in [
+            ("first", &b"first payload"[..]),
+            ("second", &b"second payload"[..]),
+        ] {
+            let file = batch.observe_file(&batch_path(name)).unwrap().unwrap();
+            assert_eq!(file.read_bounded(32).unwrap(), bytes);
+            assert_eq!(
+                file.sha1_bounded(32).unwrap(),
+                <[u8; 20]>::from(Sha1::digest(bytes))
+            );
+        }
+        assert!(
+            batch
+                .observe_file(&batch_path("missing"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(batch.parent_walks, 1);
+        assert!(
+            batch
+                .observe_file(&PortableRelativePath::new_exact("assets/missing").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(batch.parent_walks, 2);
+    }
+
+    #[test]
+    fn file_batch_refuses_namespace_addition_and_restarts_from_checked_walk() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        let mut batch = operation.file_batch();
+        batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        std::fs::write(temporary.path().join("assets/objects/aa/added"), b"added").unwrap();
+        assert!(batch.observe_file(&batch_path("second")).is_err());
+        assert_eq!(
+            batch
+                .observe_file(&batch_path("second"))
+                .unwrap()
+                .unwrap()
+                .read_bounded(32)
+                .unwrap(),
+            b"second payload"
+        );
+        assert_eq!(batch.parent_walks, 2);
+    }
+
+    #[test]
+    fn file_batch_refuses_renamed_ancestor_alias_on_sensitive_and_insensitive_hosts() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        let mut batch = operation.file_batch();
+        batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        std::fs::rename(
+            temporary.path().join("assets"),
+            temporary.path().join("Assets"),
+        )
+        .unwrap();
+        assert!(batch.observe_file(&batch_path("second")).is_err());
+        assert!(batch.observe_file(&batch_path("second")).is_err());
+        assert!(operation.observe_file(&batch_path("second")).is_err());
+        assert_eq!(
+            std::fs::read(temporary.path().join("Assets/objects/aa/second")).unwrap(),
+            b"second payload"
+        );
+    }
+
+    #[test]
+    fn file_batch_refuses_replaced_ancestor_and_preserves_both_trees() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        let mut batch = operation.file_batch();
+        batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        std::fs::rename(
+            temporary.path().join("assets/objects"),
+            temporary.path().join("assets/previous"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(temporary.path().join("assets/objects/aa")).unwrap();
+        std::fs::write(
+            temporary.path().join("assets/objects/aa/second"),
+            b"replacement",
+        )
+        .unwrap();
+        assert!(batch.observe_file(&batch_path("second")).is_err());
+        assert_eq!(
+            std::fs::read(temporary.path().join("assets/previous/aa/second")).unwrap(),
+            b"second payload"
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join("assets/objects/aa/second")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn file_batch_retains_in_place_file_revision_and_hash_checks() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        let mut batch = operation.file_batch();
+        let first = batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        let revision = first.revision_observation();
+        std::fs::write(
+            temporary.path().join("assets/objects/aa/first"),
+            b"other payload",
+        )
+        .unwrap();
+        assert!(first.read_bounded(32).is_err());
+        assert!(first.sha1_bounded(32).is_err());
+        let changed = batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        assert_ne!(changed.revision_observation(), revision);
+        assert_eq!(changed.read_bounded(32).unwrap(), b"other payload");
+        assert_eq!(batch.parent_walks, 1);
+    }
+
+    #[test]
+    fn file_batch_preserves_hardlink_and_nonregular_leaf_refusal() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        std::fs::hard_link(
+            temporary.path().join("assets/objects/aa/first"),
+            temporary.path().join("alias"),
+        )
+        .unwrap();
+        for path in [
+            batch_path("first"),
+            PortableRelativePath::new_exact("assets/objects/aa").unwrap(),
+        ] {
+            assert!(operation.observe_file(&path).is_err());
+            assert!(operation.file_batch().observe_file(&path).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_batch_preserves_symlink_leaf_refusal() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        std::os::unix::fs::symlink("first", temporary.path().join("assets/objects/aa/link"))
+            .unwrap();
+        assert!(operation.observe_file(&batch_path("link")).is_err());
+        assert!(
+            operation
+                .file_batch()
+                .observe_file(&batch_path("link"))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_publication_failure_retains_already_promoted_files_for_exact_cleanup() {
+        let temporary =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        let failure = match operation
+            .publish_native_directory_inner(
+                vec![
+                    (
+                        PortableFileName::new_exact("first.bin").unwrap(),
+                        b"first native".to_vec(),
+                    ),
+                    (
+                        PortableFileName::new_exact("second.bin").unwrap(),
+                        b"second native".to_vec(),
+                    ),
+                    (
+                        PortableFileName::new_exact(".axial-native-manifest.json").unwrap(),
+                        b"{}".to_vec(),
+                    ),
+                ],
+                Some(1),
+            )
+            .await
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("injected post-promotion failure was not observed"),
+        };
+        let (_, receipt) = failure.into_parts();
+        let receipt = receipt.expect("post-creation failure retains its exact directory");
+        let path = temporary.path().join(receipt.relative_path().as_str());
+        assert_eq!(
+            std::fs::read(path.join("first.bin")).unwrap(),
+            b"first native"
+        );
+        assert_eq!(
+            std::fs::read(path.join("second.bin")).unwrap(),
+            b"second native"
+        );
+        assert!(!path.join(".axial-native-manifest.json").exists());
+        receipt.settle().unwrap();
+        assert!(!path.exists());
+        drop((receipt, operation));
+        root.begin_retirement().drain_and_settle().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_native_publication_has_no_extraction_receipt() {
+        let temporary =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        let failure = match operation.publish_native_directory(Vec::new()).await {
+            Err(failure) => failure,
+            Ok(_) => panic!("empty extraction was accepted"),
+        };
+        let (error, receipt) = failure.into_parts();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(receipt.is_none());
+        assert!(!temporary.path().join("cache").exists());
+        drop(operation);
+        root.begin_retirement().drain_and_settle().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_extraction_cleanup_removes_only_its_guarded_directory() {
+        let temporary =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        let native = operation
+            .publish_native_directory(vec![
+                (
+                    PortableFileName::new_exact("native.bin").unwrap(),
+                    b"generated native".to_vec(),
+                ),
+                (
+                    PortableFileName::new_exact(".axial-native-manifest.json").unwrap(),
+                    b"{}".to_vec(),
+                ),
+            ])
+            .await
+            .unwrap();
+        let projection = temporary.path().join(native.relative_path().as_str());
+        assert!(projection.is_dir());
+        native.settle().unwrap();
+        native.settle().unwrap();
+        assert!(!projection.exists());
+        assert!(native.revalidate().is_err());
+        drop((native, operation));
+        root.begin_retirement().drain_and_settle().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_extraction_cleanup_preserves_replaced_payloads() {
+        let temporary =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        let native = operation
+            .publish_native_directory(vec![
+                (
+                    PortableFileName::new_exact("native.bin").unwrap(),
+                    b"generated native".to_vec(),
+                ),
+                (
+                    PortableFileName::new_exact(".axial-native-manifest.json").unwrap(),
+                    b"{}".to_vec(),
+                ),
+            ])
+            .await
+            .unwrap();
+        let projection = temporary.path().join(native.relative_path().as_str());
+        std::fs::rename(
+            projection.join("native.bin"),
+            temporary.path().join("preserved.bin"),
+        )
+        .unwrap();
+        std::fs::write(projection.join("native.bin"), b"user replacement").unwrap();
+        assert!(native.settle().is_err());
+        assert_eq!(
+            std::fs::read(projection.join("native.bin")).unwrap(),
+            b"user replacement"
+        );
+        assert!(projection.join(".axial-native-manifest.json").exists());
+        drop((native, operation));
+        root.begin_retirement().drain_and_settle().await.unwrap();
+    }
+
     fn managed_library(prefix: &str) -> (tempfile::TempDir, ManagedLibraryRoot) {
         let temporary = tempfile::Builder::new()
             .prefix(&format!("axial-managed-library-{prefix}-"))
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary managed library");
         let root =
             ManagedLibraryRoot::open_for_test(temporary.path()).expect("open managed library root");
@@ -6080,7 +7091,7 @@ mod library_lifecycle_tests {
     fn layout_preparation_creates_exact_children_and_refuses_aliases() {
         let temporary = tempfile::Builder::new()
             .prefix("axial-managed-library-layout-")
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary library");
         let root =
             ManagedLibraryRoot::open_for_test(temporary.path()).expect("managed library root");
@@ -6096,21 +7107,30 @@ mod library_lifecycle_tests {
 
         let aliased = tempfile::Builder::new()
             .prefix("axial-managed-library-layout-alias-")
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary aliased library");
         std::fs::create_dir(aliased.path().join("Versions")).expect("version alias");
         let root = ManagedLibraryRoot::open_for_test(aliased.path())
             .expect("aliased managed library root");
         let operation = root.try_acquire().expect("aliased library operation");
+        let entry_names = || {
+            let mut names = std::fs::read_dir(aliased.path())
+                .expect("aliased library entries")
+                .map(|entry| entry.expect("library entry").file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let before = entry_names();
         assert!(operation.prepare_layout().is_err());
-        assert!(!aliased.path().join("versions").exists());
+        assert_eq!(entry_names(), before);
     }
 
     #[tokio::test]
     async fn one_physical_root_cannot_open_an_independent_library_generation() {
         let temporary = tempfile::Builder::new()
             .prefix("axial-managed-library-alias-")
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary library");
         let library = temporary.path().join("library");
         let first_app = temporary.path().join("first-app-root");
@@ -6156,7 +7176,7 @@ mod library_lifecycle_tests {
 
         let temporary = tempfile::Builder::new()
             .prefix("axial-managed-library-rebind-")
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary parent");
         let library = temporary.path().join("library");
         let app = temporary.path().join("app-root");
@@ -6207,7 +7227,7 @@ mod library_lifecycle_tests {
     async fn clean_retirement_reports_lost_binding_without_touching_replacement() {
         let temporary = tempfile::Builder::new()
             .prefix("axial-managed-library-binding-loss-")
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary parent");
         let library = temporary.path().join("library");
         let displaced = temporary.path().join("displaced-library");
@@ -6265,7 +7285,7 @@ mod library_lifecycle_tests {
     async fn stale_admission_can_heal_to_the_same_retained_physical_root() {
         let temporary = tempfile::Builder::new()
             .prefix("axial-managed-library-heal-")
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary parent");
         let library = temporary.path().join("library");
         let displaced = temporary.path().join("displaced-library");
@@ -6324,7 +7344,7 @@ mod library_lifecycle_tests {
     async fn prepared_rebind_rejects_a_closed_generation_and_retains_candidate() {
         let temporary = tempfile::Builder::new()
             .prefix("axial-managed-library-closed-rebind-")
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary parent");
         let library = temporary.path().join("library");
         let app = temporary.path().join("app-root");
@@ -6476,7 +7496,7 @@ mod managed_tree_lifecycle_tests {
     fn managed_tree(prefix: &str) -> (tempfile::TempDir, RootSession, PathBuf, ManagedTreeRoot) {
         let temporary = tempfile::Builder::new()
             .prefix(&format!("axial-managed-tree-{prefix}-"))
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary managed tree parent");
         let authority_path = temporary.path().join("authority");
         let tree_path = authority_path.join("tree");
@@ -6836,10 +7856,35 @@ mod effect_transition_tests {
     fn managed_test_root(prefix: &str) -> (tempfile::TempDir, ManagedDir) {
         let temporary = tempfile::Builder::new()
             .prefix(&format!("axial-managed-fs-{prefix}-"))
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary managed root");
         let root = ManagedDir::open_root(temporary.path()).expect("open managed root");
         (temporary, root)
+    }
+
+    #[test]
+    fn root_listing_at_native_limit_excludes_lease_and_preserves_smaller_bounds() {
+        let temporary = tempfile::tempdir_in(
+            std::env::temp_dir()
+                .canonicalize()
+                .expect("physical temporary parent"),
+        )
+        .expect("temporary root");
+        let root = ManagedDir::open_root(temporary.path()).expect("managed root");
+        std::fs::write(temporary.path().join("options.txt"), b"settings").unwrap();
+        assert_eq!(
+            root.entries_bounded(MAX_MANAGED_TREE_OPERATION_ENTRIES)
+                .unwrap(),
+            vec![std::ffi::OsString::from("options.txt")],
+        );
+        assert_eq!(root.entries_bounded(1).unwrap().len(), 1);
+        std::fs::write(temporary.path().join("other.txt"), b"other").unwrap();
+        assert!(root.entries_bounded(1).is_err());
+        assert!(root.entries_bounded(0).is_err());
+        assert!(
+            root.entries_bounded(MAX_MANAGED_TREE_OPERATION_ENTRIES + 1)
+                .is_err()
+        );
     }
 
     #[test]
@@ -7120,7 +8165,7 @@ mod effect_transition_tests {
 
         let temporary = tempfile::Builder::new()
             .prefix("axial-managed-fs-root-replacement-")
-            .tempdir()
+            .tempdir_in(crate::test_temp_root())
             .expect("temporary parent");
         let root_path = temporary.path().join("root");
         let moved_path = temporary.path().join("moved-root");

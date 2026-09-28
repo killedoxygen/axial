@@ -1,0 +1,134 @@
+export interface AccentScale {
+  base: string;
+  strong: string;
+  hover: string;
+  fill: string;
+  fillHover: string;
+  soft: string;
+  softer: string;
+  ring: string;
+  line: string;
+  on: string;
+}
+
+export interface NeutralScale {
+  bg: string;
+  bgDeep: string;
+  surface: string;
+  surface2: string;
+  surface3: string;
+  line: string;
+  lineStrong: string;
+  text: string;
+  textDim: string;
+  textMute: string;
+  shadow: string;
+}
+
+export interface Radii {
+  xs: number;
+  sm: number;
+  md: number;
+  lg: number;
+  xl: number;
+}
+
+export interface Theme {
+  dark: boolean;
+  hue: number;
+  accent: AccentScale;
+  n: NeutralScale;
+  r: Radii;
+  ok: string;
+  warn: string;
+  err: string;
+  info: string;
+  font: { sans: string; mono: string };
+}
+
+export function buildAccent(hue: number, dark: boolean, vibrancy = 100): AccentScale {
+  const L = dark ? 0.78 : 0.62;
+  const clampedVibrancy = Math.max(0, Math.min(100, vibrancy));
+  const C = (0.14 * clampedVibrancy) / 100;
+  const Lf = dark ? 0.58 : 0.52;
+  const Cf = 0.15 * Math.max(0.6, clampedVibrancy / 100);
+  return {
+    base: `oklch(${L} ${C} ${hue})`,
+    strong: `oklch(${L - 0.08} ${C} ${hue})`,
+    hover: `oklch(${Math.min(0.99, L + 0.04)} ${C} ${hue})`,
+    fill: `oklch(${Lf} ${Cf} ${hue})`,
+    fillHover: `oklch(${Lf + 0.05} ${Cf} ${hue})`,
+    soft: `oklch(${L} ${C} ${hue} / 0.16)`,
+    softer: `oklch(${L} ${C} ${hue} / 0.08)`,
+    ring: `oklch(${L} ${C} ${hue} / 0.40)`,
+    line: `oklch(${L} ${C} ${hue} / 0.28)`,
+    on: `oklch(${dark ? 0.985 : 0.99} 0.015 ${hue})`,
+  };
+}
+
+export function buildNeutrals(dark: boolean, hue = 140): NeutralScale {
+  if (dark) {
+    return {
+      bg: `oklch(0.175 0.012 ${hue})`,
+      bgDeep: `oklch(0.14 0.012 ${hue})`,
+      surface: `oklch(0.24 0.014 ${hue})`,
+      surface2: `oklch(0.30 0.015 ${hue})`,
+      surface3: `oklch(0.35 0.016 ${hue})`,
+      line: 'oklch(1 0 0 / 0.07)',
+      lineStrong: 'oklch(1 0 0 / 0.14)',
+      text: `oklch(0.96 0.005 ${hue})`,
+      textDim: `oklch(0.74 0.010 ${hue})`,
+      textMute: `oklch(0.58 0.012 ${hue})`,
+      shadow: '0 24px 60px -20px rgba(0,0,0,0.6), 0 2px 6px rgba(0,0,0,0.3)',
+    };
+  }
+  return {
+    bg: `oklch(0.95 0.006 ${hue})`,
+    bgDeep: `oklch(0.92 0.008 ${hue})`,
+    surface: `oklch(0.995 0.003 ${hue})`,
+    surface2: `oklch(0.945 0.006 ${hue})`,
+    surface3: `oklch(0.905 0.008 ${hue})`,
+    line: 'oklch(0 0 0 / 0.07)',
+    lineStrong: 'oklch(0 0 0 / 0.14)',
+    text: `oklch(0.21 0.010 ${hue})`,
+    textDim: `oklch(0.45 0.010 ${hue})`,
+    textMute: `oklch(0.58 0.010 ${hue})`,
+    shadow: '0 24px 60px -20px rgba(0,0,0,0.25), 0 2px 6px rgba(0,0,0,0.08)',
+  };
+}
+
+export function buildTheme(opts: { dark?: boolean; hue?: number; vibrancy?: number } = {}): Theme {
+  const dark = opts.dark ?? true;
+  const hue = opts.hue ?? 140;
+  const vibrancy = opts.vibrancy ?? 100;
+  return {
+    dark,
+    hue,
+    accent: buildAccent(hue, dark, vibrancy),
+    n: buildNeutrals(dark, hue),
+    r: {
+      xs: 8,
+      sm: 12,
+      md: 16,
+      lg: 20,
+      xl: 28,
+    },
+    ok: 'oklch(0.78 0.14 150)',
+    warn: 'oklch(0.80 0.14 70)',
+    err: 'oklch(0.70 0.18 25)',
+    info: 'oklch(0.78 0.10 240)',
+    font: {
+      sans: '"Manrope", ui-sans-serif, system-ui, -apple-system, sans-serif',
+      mono: '"Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace',
+    },
+  };
+}
+
+export function hashStr(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}

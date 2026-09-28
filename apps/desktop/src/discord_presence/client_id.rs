@@ -1,41 +1,29 @@
-use tracing::warn;
-
 pub(super) fn configured_client_id() -> Option<String> {
-    match option_env!("AXIAL_DISCORD_APPLICATION_ID") {
-        Some(raw) => match sanitize_client_id(raw) {
-            Ok(value) => Some(value),
-            Err(error) => {
-                warn!(error = %error, "ignoring invalid Discord application id");
-                None
-            }
-        },
-        None => None,
+    let raw = option_env!("AXIAL_DISCORD_APPLICATION_ID")?;
+    let value = sanitize_client_id(raw);
+    if value.is_none() {
+        tracing::warn!("Discord application ID is invalid; presence is inactive");
     }
+    value
 }
 
-fn sanitize_client_id(raw: &str) -> Result<String, &'static str> {
+fn sanitize_client_id(raw: &str) -> Option<String> {
     let value = raw.trim();
-    if value.len() < 6 || value.len() > 32 {
-        return Err("expected 6 to 32 digits");
-    }
-    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("expected digits only");
-    }
-    Ok(value.to_string())
+    ((6..=32).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn client_id_must_be_numeric_application_id() {
+    fn only_bounded_numeric_application_ids_enable_integration() {
         assert_eq!(
-            sanitize_client_id(" 123456789012345678 "),
-            Ok("123456789012345678".to_string())
+            sanitize_client_id(" 123456789012345678 ").as_deref(),
+            Some("123456789012345678")
         );
-        assert!(sanitize_client_id("abc123").is_err());
-        assert!(sanitize_client_id("12345").is_err());
-        assert!(sanitize_client_id("123456789012345678901234567890123").is_err());
+        for invalid in ["", "12345", "abc123", "12345678901234567890123456789012345"] {
+            assert_eq!(sanitize_client_id(invalid), None);
+        }
     }
 }

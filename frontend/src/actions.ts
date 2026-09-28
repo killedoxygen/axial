@@ -106,8 +106,16 @@ export function clearLaunchNotice(instanceId: string): void {
   launchNotices.value = next;
 }
 
-export function setConfig(c: Config): void {
+export function setConfig(c: Config): boolean {
+  const current = config.value;
+  if (
+    current &&
+    (c.revision < current.revision || c.account_selection_revision < current.account_selection_revision)
+  ) {
+    return false;
+  }
   config.value = c;
+  return true;
 }
 
 export function addInstance(inst: EnrichedInstance): void {

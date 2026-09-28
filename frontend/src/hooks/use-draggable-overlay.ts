@@ -1,6 +1,6 @@
 import type { JSX, RefObject } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { local, saveLocalState } from '../state';
+import { local, saveLocalState, canEditPreferences } from '../state';
 import type { OverlayPosition } from '../types-ui';
 
 const DRAG_IGNORE_SELECTOR = 'input, textarea, select, button, a, [data-drag-ignore="true"]';
@@ -140,6 +140,7 @@ function positionsMatch(a: OverlayPosition, b: OverlayPosition): boolean {
 }
 
 function persistPosition(id: string, point: OverlayPosition): void {
+  if (!canEditPreferences()) return;
   const next: OverlayPosition = {
     x: Math.round(point.x),
     y: Math.round(point.y),

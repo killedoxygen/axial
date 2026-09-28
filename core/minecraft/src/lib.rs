@@ -1,4 +1,9 @@
 mod asset_index;
+#[cfg(test)]
+pub(crate) fn test_temp_root() -> std::path::PathBuf {
+    std::fs::canonicalize(std::env::temp_dir()).expect("canonical temporary test parent")
+}
+
 pub mod download;
 pub mod known_good;
 mod known_good_libraries;
@@ -37,7 +42,7 @@ pub mod managed_path {
         ManagedContentTransactionSession, ManagedContentTransferAdvance,
         ManagedContentTransferBatch, ManagedContentTransferSettlement, ManagedContentTransferStep,
         ManagedContentTransferTask, ManagedLibraryAdmissionRebindFailure, ManagedLibraryBinding,
-        ManagedLibraryOperation, ManagedLibraryRetirement, ManagedLibraryRetirementBinding,
+        ManagedLibraryFile, ManagedLibraryFileBatch, ManagedNativeDirectory, ManagedNativePublicationFailure, ManagedLibraryOperation, ManagedLibraryRetirement, ManagedLibraryRetirementBinding,
         ManagedLibraryRoot, ManagedLibraryWitness, ManagedTreeCopyFailure, ManagedTreeCopyLimits,
         ManagedTreeCopyOutcome, ManagedTreeDirectory, ManagedTreeOperation, ManagedTreeRetirement,
         ManagedTreeRoot, PreparedManagedLibraryAdmissionRebind,
@@ -109,7 +114,7 @@ pub use launch::{
     JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,
     client_jar_path, effective_java_version_for, java_component_for_major,
     java_major_for_component, load_version_json, offline_uuid, resolve_arguments,
-    resolve_libraries, resolve_version,
+    resolve_libraries, resolve_version, resolve_version_managed,
 };
 pub use lifecycle::{LifecycleChannel, LifecycleLabel, LifecycleMeta};
 pub use loaders::{

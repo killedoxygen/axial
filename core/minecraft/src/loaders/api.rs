@@ -23,22 +23,22 @@ pub fn is_canonical_installed_loader_id(version_id: &str) -> bool {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct InstalledLoaderIdentity {
+pub struct InstalledLoaderIdentity {
     component_id: LoaderComponentId,
     minecraft_version: String,
     loader_version: String,
 }
 
 impl InstalledLoaderIdentity {
-    pub(crate) fn component_id(&self) -> LoaderComponentId {
+    pub fn component_id(&self) -> LoaderComponentId {
         self.component_id
     }
 
-    pub(crate) fn minecraft_version(&self) -> &str {
+    pub fn minecraft_version(&self) -> &str {
         &self.minecraft_version
     }
 
-    pub(crate) fn loader_version(&self) -> &str {
+    pub fn loader_version(&self) -> &str {
         &self.loader_version
     }
 }
@@ -250,7 +250,9 @@ pub fn installed_version_id_for(
     Ok(version_id)
 }
 
-pub(crate) fn decode_installed_version_id(
+/// Decode the selected loader coordinate without conferring installation or
+/// filesystem authority. Installation still resolves and verifies its build.
+pub fn decode_installed_version_id(
     version_id: &str,
 ) -> Result<InstalledLoaderIdentity, LoaderError> {
     if version_id.len() > MAX_VERSION_ID_BYTES {
@@ -343,7 +345,7 @@ fn component_from_tag(tag: u8) -> Option<LoaderComponentId> {
     }
 }
 
-pub(crate) fn validate_loader_build_record_identity(
+pub fn validate_loader_build_record_identity(
     record: &LoaderBuildRecord,
 ) -> Result<(), LoaderError> {
     if record.build_id

@@ -110,15 +110,16 @@ fn main() {
         "frontend generation manifest must be a real file"
     );
     let (manifest_bytes, manifest): (Vec<u8>, GenerationManifest) =
-        read_canonical_json(&manifest_path, "frontend generation manifest");
+        read_json(&manifest_path, "frontend generation manifest");
+    assert_eq!(
+        manifest_bytes,
+        canonical_json(&manifest, manifest.schema_version),
+        "frontend generation manifest must be canonical JSON"
+    );
     let (_, budget_authority): (Vec<u8>, BundleBudgetAuthority) =
         read_canonical_json(&budget_path, "frontend bundle budget authority");
     let (_, public_authority): (Vec<u8>, PublicAssetAuthority) =
         read_canonical_json(&public_assets_path, "frontend public asset authority");
-    assert_eq!(
-        manifest.schema_version, 1,
-        "unsupported frontend generation schema"
-    );
     assert_eq!(
         manifest.document_entry, "index.html",
         "invalid frontend document entry"
@@ -192,22 +193,28 @@ fn main() {
         graph: &manifest.graph,
     };
     assert_eq!(
-        format!("{:x}", Sha256::digest(canonical_json(&identity))),
+        format!(
+            "{:x}",
+            Sha256::digest(canonical_json(&identity, manifest.schema_version))
+        ),
         manifest.generation_id
     );
     fs::write(destination.join("generation.json"), manifest_bytes)
         .expect("stage frontend generation manifest");
 }
 
-fn canonical_json<T: Serialize>(value: &T) -> Vec<u8> {
-    let mut bytes = serde_json::to_string_pretty(value)
-        .expect("serialize canonical frontend JSON")
-        .into_bytes();
+fn canonical_json<T: Serialize>(value: &T, schema_version: u64) -> Vec<u8> {
+    let mut bytes = match schema_version {
+        1 => serde_json::to_vec_pretty(value),
+        2 => serde_json::to_vec(value),
+        _ => panic!("unsupported frontend generation schema"),
+    }
+    .expect("serialize canonical frontend JSON");
     bytes.push(b'\n');
     bytes
 }
 
-fn read_canonical_json<T: DeserializeOwned + Serialize>(path: &Path, label: &str) -> (Vec<u8>, T) {
+fn read_json<T: DeserializeOwned>(path: &Path, label: &str) -> (Vec<u8>, T) {
     let metadata =
         fs::symlink_metadata(path).unwrap_or_else(|error| panic!("read {label}: {error}"));
     assert!(
@@ -217,9 +224,14 @@ fn read_canonical_json<T: DeserializeOwned + Serialize>(path: &Path, label: &str
     let bytes = fs::read(path).unwrap_or_else(|error| panic!("read {label}: {error}"));
     let value: T =
         serde_json::from_slice(&bytes).unwrap_or_else(|error| panic!("parse {label}: {error}"));
+    (bytes, value)
+}
+
+fn read_canonical_json<T: DeserializeOwned + Serialize>(path: &Path, label: &str) -> (Vec<u8>, T) {
+    let (bytes, value) = read_json(path, label);
     assert_eq!(
         bytes,
-        canonical_json(&value),
+        canonical_json(&value, 1),
         "{label} must be canonical JSON"
     );
     (bytes, value)

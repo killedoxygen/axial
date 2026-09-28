@@ -1,0 +1,29 @@
+[package]
+name = "axial-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+serde_json.workspace = true
+
+[dependencies]
+tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+tauri-plugin-opener.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+axial-api = { path = "../api", default-features = false }
+axial-config = { path = "../../core/config" }
+axial-fs = { path = "../../core/fs" }
+axial-performance = { path = "../../core/performance" }
+axial-resource.workspace = true
+
+[dev-dependencies]
+png.workspace = true

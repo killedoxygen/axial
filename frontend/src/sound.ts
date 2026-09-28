@@ -2,6 +2,7 @@ import { dtoNumber, dtoRecord } from './dto-contract';
 
 let lastMemorySoundAt = 0;
 let lastHueSoundAt = 0;
+let buttonSoundDocument: Document | null = null;
 
 interface SpriteEntry {
   start: number;
@@ -92,10 +93,11 @@ export const Sound = {
           fetch('sounds/snd01/audioSprite.json'),
           fetch('sounds/snd01/audioSprite.mp3'),
         ]);
+        if (!manifestRes.ok || !spriteRes.ok) return;
         const manifest: unknown = await manifestRes.json();
         const spriteArray = await spriteRes.arrayBuffer();
         const spriteMap = dtoRecord(dtoRecord(manifest, 'Sound manifest').spritemap, 'Sound sprite map');
-        this.spriteMap = Object.fromEntries(
+        const decodedMap = Object.fromEntries(
           Object.entries(spriteMap).map(([name, value]) => {
             const entry = dtoRecord(value, 'Sound sprite');
             return [
@@ -104,7 +106,10 @@ export const Sound = {
             ];
           }),
         );
-        this.spriteBuffer = await this.ctx!.decodeAudioData(spriteArray.slice(0));
+        const decodedBuffer = await this.ctx!.decodeAudioData(spriteArray.slice(0));
+        if (Object.values(decodedMap).some((entry) => entry.start < 0 || entry.end <= entry.start || entry.end > decodedBuffer.duration)) return;
+        this.spriteMap = decodedMap;
+        this.spriteBuffer = decodedBuffer;
       } catch {}
     })();
     return this.preloadPromise;
@@ -315,13 +320,20 @@ export function inferButtonSound(btn: HTMLElement): SoundKind | null {
   return 'click';
 }
 
+function buttonSoundClick(e: MouseEvent): void {
+  const target = e.target;
+  if (!(target instanceof Element)) return;
+  const btn = target.closest('button') as HTMLButtonElement | null;
+  if (!btn || btn.disabled) return;
+  const kind = inferButtonSound(btn);
+  if (kind) Sound.ui(kind);
+}
+
 export function bindButtonSounds(): void {
-  document.addEventListener('click', (e: MouseEvent) => {
-    const btn = (e.target as Element | null)?.closest('button') as HTMLButtonElement | null;
-    if (!btn || btn.disabled) return;
-    const kind = inferButtonSound(btn);
-    if (kind) Sound.ui(kind);
-  });
+  if (buttonSoundDocument === document) return;
+  buttonSoundDocument?.removeEventListener('click', buttonSoundClick);
+  buttonSoundDocument = document;
+  buttonSoundDocument.addEventListener('click', buttonSoundClick);
 }
 
 export function playSliderSound(value: number, family: string): void {

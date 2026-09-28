@@ -1,211 +1,163 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { basename, resolve } from 'node:path';
 import test from 'node:test';
+import vm from 'node:vm';
 
-import {
-  applyInstallStreamRecovery,
-  awaitOwnedInstallValue,
-  createInstallRecoveryCoordinator,
-  terminalInstallReconciliationNeedsRefresh,
-} from '../src/machines/downloads';
+// The rewrite has one authenticated API stream, not a native invoke bridge.
+// Exercise the same ownership/recovery guarantees against that actual owner.
+const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
+const requireDependency = createRequire(resolve(frontend, 'package.json'));
+const ts: typeof import('typescript') = requireDependency('typescript');
+const flush = (): Promise<void> => new Promise((done) => setImmediate(done));
 
-function deferred<T>(): {
-  promise: Promise<T>;
-  resolve(value: T): void;
-} {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((onResolve) => {
-    resolve = onResolve;
-  });
-  return { promise, resolve };
+function deferred<T>() {
+  let resolveValue!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolveValue = done; });
+  return { promise, resolve: resolveValue };
 }
 
-test('long silent native install with active status preserves its bridge without reinvoking', async () => {
-  let bridgeInvokes = 1;
-  let closes = 0;
-
-  await applyInstallStreamRecovery('active', {
-    preserveActiveSource: true,
-    closeSource: () => {
-      closes += 1;
+function harness() {
+  const sources: FakeEventSource[] = [];
+  const seen: number[] = [];
+  const errors: unknown[] = [];
+  const tickets: string[] = [];
+  const timers = new Map<number, { callback: () => void; delay: number }>();
+  let nextTimer = 0;
+  let ticketRead: () => Promise<string> = async () => `/read-ticket-${tickets.length}`;
+  class FakeEventSource {
+    readonly listeners = new Map<string, (event: { data: string }) => void>();
+    onopen?: () => void;
+    onerror?: () => void;
+    closes = 0;
+    constructor(readonly url: string) { sources.push(this); }
+    addEventListener(name: string, listener: (event: { data: string }) => void): void { this.listeners.set(name, listener); }
+    close(): void { this.closes++; }
+    emit(value: number): void { this.raw(JSON.stringify({ revision: value, value })); }
+    raw(data: string): void { this.listeners.get('queue')?.({ data }); }
+  }
+  const filename = resolve(frontend, 'src/backend/events.ts');
+  const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
+    fileName: filename, compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
+  });
+  const exports = {};
+  vm.runInNewContext(compiled.outputText, {
+    exports, Error, EventSource: FakeEventSource,
+    require(id: string): unknown {
+      assert.equal(id, '../api');
+      return { apiEventSourceUrl: async (path: string) => { tickets.push(path); return ticketRead(); } };
     },
-    restart: async () => {
-      bridgeInvokes += 1;
+    setTimeout(callback: () => void, delay: number): number {
+      const id = ++nextTimer; timers.set(id, { callback, delay }); return id;
     },
-  });
-
-  assert.equal(closes, 0);
-  assert.equal(bridgeInvokes, 1);
-});
-
-test('unavailable native install status closes and reconnects the bridge once', async () => {
-  let bridgeInvokes = 1;
-  let closes = 0;
-
-  await applyInstallStreamRecovery('unavailable', {
-    preserveActiveSource: true,
-    closeSource: () => {
-      closes += 1;
+    clearTimeout(id: number): void { timers.delete(id); },
+  }, { filename });
+  const events = exports as typeof import('../src/backend/events');
+  return {
+    sources, seen, errors, tickets, timers,
+    ticket(next: () => Promise<string>): void { ticketRead = next; },
+    connect(onError: (error: unknown) => void = (error) => errors.push(error)): () => void {
+      return events.subscribeApiEvents('/install/queue/events', {
+        events: ['queue'],
+        decode(value: unknown): number { assert.equal(typeof value, 'number'); return value as number; },
+        onValue: (value) => { seen.push(value); }, onError,
+      });
     },
-    restart: async () => {
-      bridgeInvokes += 1;
+    retry(): void {
+      const timer = timers.entries().next().value;
+      assert.ok(timer, 'expected a recovery timer');
+      timers.delete(timer[0]); timer[1].callback();
     },
-  });
+  };
+}
 
-  assert.equal(closes, 1);
-  assert.equal(bridgeInvokes, 2);
+test('a quiet connected install stream preserves its owner without replaying a command', async () => {
+  const h = harness(); const close = h.connect(); await flush();
+  h.sources[0].onopen?.(); h.sources[0].emit(1); await flush();
+  assert.equal(h.tickets.length, 1);
+  assert.equal(h.sources[0].closes, 0);
+  assert.equal(h.timers.size, 0);
+  close();
 });
 
-test('resolved install status leaves completion cleanup with the current owner', async () => {
-  let restarted = false;
-
-  await applyInstallStreamRecovery('resolved', {
-    preserveActiveSource: true,
-    closeSource: () => assert.fail('resolved status must not run recovery cleanup'),
-    restart: async () => {
-      restarted = true;
-    },
-  });
-
-  assert.equal(restarted, false);
+test('an interrupted install stream closes and obtains a fresh read ticket once', async () => {
+  const h = harness(); const close = h.connect(); await flush();
+  h.sources[0].onerror?.();
+  assert.equal(h.sources[0].closes, 1);
+  assert.equal(h.timers.size, 1);
+  h.retry(); await flush();
+  assert.equal(h.sources.length, 2);
+  assert.notEqual(h.sources[0].url, h.sources[1].url);
+  assert.deepEqual(h.tickets, ['/install/queue/events', '/install/queue/events']);
+  close();
 });
 
-test('SSE silence closes and reconnects when status remains active', async () => {
-  let closes = 0;
-  let reconnects = 0;
-
-  await applyInstallStreamRecovery('active', {
-    preserveActiveSource: false,
-    closeSource: () => {
-      closes += 1;
-    },
-    restart: async () => {
-      reconnects += 1;
-    },
-  });
-
-  assert.equal(closes, 1);
-  assert.equal(reconnects, 1);
+test('closing a recovering install owner cancels its pending reconnect', async () => {
+  const h = harness(); const close = h.connect(); await flush();
+  h.sources[0].onerror?.(); close();
+  assert.equal(h.timers.size, 0);
+  h.sources[0].onerror?.(); await flush();
+  assert.equal(h.sources.length, 1);
 });
 
-test('delayed status loses ownership before it can mutate a replacement install', async () => {
-  const response = deferred<{ progress: number }>();
-  let current = true;
-  let mutations = 0;
-  const pending = awaitOwnedInstallValue(
-    () => response.promise,
-    () => current,
-  );
-
-  current = false;
-  response.resolve({ progress: 90 });
-  const owned = await pending;
-  if (owned.current) mutations += 1;
-
-  assert.deepEqual(owned, { current: false });
-  assert.equal(mutations, 0);
+test('a delayed read ticket cannot resurrect a closed install owner', async () => {
+  const h = harness(); const ticket = deferred<string>(); h.ticket(() => ticket.promise);
+  const close = h.connect(); close(); ticket.resolve('/late-ticket'); await flush();
+  assert.equal(h.sources.length, 0);
+  assert.equal(h.timers.size, 0);
 });
 
-test('terminal queue reconciliation refreshes only active or unavailable status', () => {
-  assert.deepEqual(
-    (['active', 'unavailable', 'resolved', 'stale'] as const).map((status) => [
-      status,
-      terminalInstallReconciliationNeedsRefresh(status),
-    ]),
-    [
-      ['active', true],
-      ['unavailable', true],
-      ['resolved', false],
-      ['stale', false],
-    ],
-  );
+test('delayed events lose ownership before they can mutate a replacement stream', async () => {
+  const h = harness(); const close = h.connect(); await flush();
+  h.sources[0].emit(2); h.sources[0].onerror?.(); h.retry(); await flush();
+  h.sources[0].emit(100); h.sources[0].onerror?.(); h.sources[1].emit(3);
+  assert.deepEqual(h.seen, [2, 3]);
+  assert.equal(h.timers.size, 0);
+  close();
 });
 
-test('delayed completion queue response is not applied after replacement ownership begins', async () => {
-  const response = deferred<{ active: string }>();
-  let completionOwner = true;
-  let applied = 0;
-  const pending = awaitOwnedInstallValue(
-    () => response.promise,
-    () => completionOwner,
-  );
-
-  completionOwner = false;
-  response.resolve({ active: 'replacement' });
-  const owned = await pending;
-  if (owned.current) applied += 1;
-
-  assert.deepEqual(owned, { current: false });
-  assert.equal(applied, 0);
+test('malformed install snapshots immediately quarantine their source and recover', async () => {
+  const h = harness(); const close = h.connect(); await flush();
+  h.sources[0].raw('{'); h.sources[0].emit(10);
+  assert.equal(h.sources[0].closes, 1);
+  assert.deepEqual(h.seen, []);
+  assert.equal(h.errors.length, 1);
+  h.retry(); await flush(); h.sources[1].emit(11);
+  assert.deepEqual(h.seen, [11]);
+  close();
 });
 
-test('malformed source supersedes an in-flight silence reconciliation', async () => {
-  const coordinator = createInstallRecoveryCoordinator();
-  const source = {};
-  const releaseSilence = deferred<void>();
-  let staleSilencePreserves = 0;
-  let closes = 0;
-  let reconnects = 0;
-
-  const silence = coordinator.run('install-a', source, 'silence', async (isCurrent) => {
-    await releaseSilence.promise;
-    if (isCurrent()) staleSilencePreserves += 1;
-  });
-  const malformed = coordinator.run('install-a', source, 'replace', async (isCurrent) => {
-    assert.equal(isCurrent(), true);
-    closes += 1;
-    reconnects += 1;
-  });
-
-  await malformed;
-  releaseSilence.resolve();
-  await silence;
-
-  assert.equal(closes, 1);
-  assert.equal(reconnects, 1);
-  assert.equal(staleSilencePreserves, 0);
+test('same-source recovery requests join instead of multiplying reconnects', async () => {
+  const h = harness(); const close = h.connect(); await flush();
+  h.sources[0].onerror?.(); h.sources[0].onerror?.(); h.sources[0].raw('bad');
+  assert.equal(h.timers.size, 1); assert.equal(h.errors.length, 1);
+  h.retry(); await flush();
+  assert.equal(h.sources.length, 2); assert.equal(h.tickets.length, 2);
+  close();
 });
 
-test('malformed replacement source supersedes an older strong recovery', async () => {
-  const coordinator = createInstallRecoveryCoordinator();
-  const firstSource = {};
-  const replacementSource = {};
-  const releaseFirst = deferred<void>();
-  let firstRetainedOwnership = false;
-  let replacementRuns = 0;
-
-  const first = coordinator.run('install-a', firstSource, 'replace', async (isCurrent) => {
-    await releaseFirst.promise;
-    firstRetainedOwnership = isCurrent();
-  });
-  const replacement = coordinator.run('install-a', replacementSource, 'replace', async (isCurrent) => {
-    assert.equal(isCurrent(), true);
-    replacementRuns += 1;
-  });
-
-  await replacement;
-  releaseFirst.resolve();
-  await first;
-
-  assert.equal(replacementRuns, 1);
-  assert.equal(firstRetainedOwnership, false);
+test('failed ticket reads retry with backoff and do not multiply user-facing errors', async () => {
+  const h = harness(); h.ticket(async () => { throw new Error('Unavailable'); });
+  const close = h.connect(); await flush();
+  assert.equal([...h.timers.values()][0].delay, 250);
+  h.retry(); await flush();
+  assert.equal([...h.timers.values()][0].delay, 500);
+  assert.equal(h.sources.length, 0); assert.equal(h.errors.length, 1);
+  h.ticket(async () => '/recovered'); h.retry(); await flush(); h.sources[0].emit(1);
+  assert.deepEqual(h.seen, [1]); close();
 });
 
-test('same-source strong recovery joins instead of multiplying reconnects', async () => {
-  const coordinator = createInstallRecoveryCoordinator();
-  const source = {};
-  const release = deferred<void>();
-  let runs = 0;
+test('an error observer cannot interrupt recovery ownership', async () => {
+  const h = harness(); const close = h.connect(() => { throw new Error('Observer failed'); }); await flush();
+  h.sources[0].onerror?.(); assert.equal(h.timers.size, 1);
+  h.retry(); await flush(); h.sources[1].emit(1);
+  assert.deepEqual(h.seen, [1]); close();
+});
 
-  const first = coordinator.run('install-a', source, 'replace', async () => {
-    runs += 1;
-    await release.promise;
-  });
-  const joined = coordinator.run('install-a', source, 'replace', async () => {
-    runs += 1;
-  });
-
-  assert.equal(first, joined);
-  release.resolve();
-  await Promise.all([first, joined]);
-  assert.equal(runs, 1);
+test('a new connection delivers its full snapshot even when the backend revision restarts', async () => {
+  const h = harness(); const close = h.connect(); await flush();
+  h.sources[0].emit(80); h.sources[0].emit(79); h.sources[0].onerror?.();
+  h.retry(); await flush(); h.sources[1].emit(1); h.sources[1].emit(1);
+  assert.deepEqual(h.seen, [80, 1]); close();
 });

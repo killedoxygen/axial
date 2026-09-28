@@ -1,0 +1,41 @@
+{
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.1.3",
+  "engines": {
+    "node": "24.13.1"
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "clean": "node esbuild.mjs clean",
+    "dev": "node esbuild.mjs serve",
+    "dev:desktop": "node esbuild.mjs serve --strict-port",
+    "dev:mock": "node esbuild.mjs serve --strict-port --mock",
+    "watch": "node esbuild.mjs watch",
+    "test": "node test/run.mjs",
+    "verify": "pnpm run lint:semantic && pnpm run format:check && pnpm run test && pnpm run build",
+    "lint": "tsc --noEmit && pnpm run lint:semantic",
+    "lint:semantic": "biome lint src",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.4",
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.14",
+    "@types/three": "^0.184.1",
+    "esbuild": "^0.25.0",
+    "mime-types": "3.0.2",
+    "prettier": "^3.8.4",
+    "typescript": "^5.7.0",
+    "yaml": "2.9.0"
+  },
+  "dependencies": {
+    "@preact/signals": "^2.0.0",
+    "lucide-preact": "1.25.0",
+    "preact": "^10.25.0",
+    "react-markdown": "^9.1.0",
+    "remark-gfm": "^4.0.1",
+    "three": "^0.184.0"
+  }
+}

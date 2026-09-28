@@ -1,8 +1,12 @@
 pub(crate) mod common;
 mod fabric;
 mod forge;
-mod neoforge;
+pub mod neoforge;
 mod quilt;
+
+pub use common::{
+    apply_forge_promotion_selection, forge_install_source, infer_loader_build_metadata,
+};
 
 use crate::loaders::types::{
     LoaderBuildRecord, LoaderComponentId, LoaderError, LoaderGameVersion,

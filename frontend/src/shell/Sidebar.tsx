@@ -9,7 +9,7 @@ import { launchSessions, config, instances, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
 import { accountDisplayName, accountSkinSrc } from '../player-skin';
 import { Music, musicStateVersion } from '../music';
-import { local, saveLocalState } from '../state';
+import { local, saveLocalState, canEditPreferences } from '../state';
 import { Sound } from '../sound';
 import { openInstanceContextMenu } from '../views/instance/instance-menu';
 import type { Instance } from '../types-instance';
@@ -233,6 +233,7 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
   const soundsOn = local.sounds;
 
   const toggleSounds = (): void => {
+    if (!canEditPreferences()) return;
     const next = !soundsOn;
     local.sounds = next;
     Sound.enabled = next;

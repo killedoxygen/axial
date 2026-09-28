@@ -1,12 +1,10 @@
 use axum::{
     Json,
-    extract::{Extension, Request, State},
+    extract::{DefaultBodyLimit, Extension, Request, State, rejection::JsonRejection},
     http::{HeaderValue, Method, StatusCode, Uri, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -31,7 +29,6 @@ struct AuthorityInner {
     capability: String,
     allowed_origins: Vec<String>,
     tickets: Mutex<HashMap<String, Ticket>>,
-    bypass: bool,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize)]
@@ -52,7 +49,7 @@ enum TicketKind {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TicketRequest {
+pub struct TicketRequest {
     audience: TicketAudience,
     #[serde(default)]
     target: Option<String>,
@@ -66,7 +63,7 @@ enum TicketAudience {
 }
 
 #[derive(Serialize)]
-pub(crate) struct TicketResponse {
+pub struct TicketResponse {
     ticket: String,
     expires_in_seconds: u64,
 }
@@ -84,15 +81,12 @@ impl LocalApiAuthority {
                 allowed_origins.push(origin);
             }
         }
-        let mut secret = [0_u8; 32];
-        OsRng.fill_bytes(&mut secret);
         Ok(Self {
             inner: Arc::new(AuthorityInner {
                 base_url: format!("http://{addr}"),
-                capability: URL_SAFE_NO_PAD.encode(secret),
+                capability: fresh_capability(),
                 allowed_origins,
                 tickets: Mutex::new(HashMap::new()),
-                bypass: false,
             }),
         })
     }
@@ -104,7 +98,7 @@ impl LocalApiAuthority {
         }
     }
 
-    pub(crate) fn allows_origin(&self, origin: &HeaderValue) -> bool {
+    pub fn allows_origin(&self, origin: &HeaderValue) -> bool {
         origin.to_str().is_ok_and(|origin| {
             self.inner
                 .allowed_origins
@@ -114,27 +108,11 @@ impl LocalApiAuthority {
     }
 
     #[cfg(test)]
-    pub(crate) fn bypass_for_test() -> Self {
-        Self {
-            inner: Arc::new(AuthorityInner {
-                base_url: String::new(),
-                capability: String::new(),
-                allowed_origins: Vec::new(),
-                tickets: Mutex::new(HashMap::new()),
-                bypass: true,
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn capability_for_test(&self) -> &str {
+    pub fn capability_for_test(&self) -> &str {
         &self.inner.capability
     }
 
     fn authenticate(&self, request: &Request) -> bool {
-        if self.inner.bypass {
-            return true;
-        }
         if request
             .headers()
             .get(CAPABILITY_HEADER)
@@ -201,9 +179,7 @@ impl LocalApiAuthority {
             return Err("transport ticket capacity is exhausted");
         }
         let ticket = loop {
-            let mut bytes = [0_u8; 32];
-            OsRng.fill_bytes(&mut bytes);
-            let candidate = URL_SAFE_NO_PAD.encode(bytes);
+            let candidate = fresh_capability();
             if !tickets.contains_key(&candidate) {
                 break candidate;
             }
@@ -231,9 +207,9 @@ impl fmt::Debug for LocalApiAuthority {
     }
 }
 
-pub(crate) async fn authenticate_request(
+pub async fn authenticate_request(
     State(authority): State<LocalApiAuthority>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let origin_allowed = request
@@ -258,19 +234,54 @@ pub(crate) async fn authenticate_request(
     if !authority.authenticate(&request) {
         return transport_error(StatusCode::UNAUTHORIZED, "API capability is required");
     }
+    // Transport grants are not domain input. Strict feature query decoders
+    // must see only their own parameters after the grant is authenticated.
+    if let Some(uri) = without_ticket(request.uri()) {
+        *request.uri_mut() = uri;
+    }
     next.run(request).await
 }
 
-pub(crate) async fn create_bootstrap(
+fn without_ticket(uri: &Uri) -> Option<Uri> {
+    let query = uri.query()?;
+    let retained: Vec<_> = query
+        .split('&')
+        .filter(|part| {
+            !url::form_urlencoded::parse(part.as_bytes()).any(|(name, _)| name == TICKET_QUERY)
+        })
+        .collect();
+    if retained.len() == query.split('&').count() {
+        return None;
+    }
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(
+        if retained.is_empty() {
+            uri.path().to_owned()
+        } else {
+            format!("{}?{}", uri.path(), retained.join("&"))
+        }
+        .parse()
+        .ok()?,
+    );
+    Uri::from_parts(parts).ok()
+}
+
+pub async fn create_bootstrap(
     Extension(authority): Extension<LocalApiAuthority>,
 ) -> Json<ApiTransportBootstrap> {
     Json(authority.bootstrap())
 }
 
-pub(crate) async fn create_ticket(
+pub async fn create_ticket(
     Extension(authority): Extension<LocalApiAuthority>,
-    Json(request): Json<TicketRequest>,
+    request: Result<Json<TicketRequest>, JsonRejection>,
 ) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return transport_error(rejection.status(), "invalid transport ticket request");
+        }
+    };
     match authority.mint(request) {
         Ok(ticket) => Json(ticket).into_response(),
         Err(error) => transport_error(StatusCode::BAD_REQUEST, error),
@@ -324,6 +335,12 @@ fn canonical_origin(origin: &str) -> Result<String, String> {
 }
 
 fn is_stream_path(path: &str) -> bool {
+    if matches!(path, "/api/v1/install/queue/events" | "/api/v1/events") {
+        return true;
+    }
+    if !safe_segments(path) {
+        return false;
+    }
     let parts = path.split('/').collect::<Vec<_>>();
     matches!(parts.as_slice(), ["", "api", "v1", "install", _, "events"])
         || matches!(
@@ -334,6 +351,7 @@ fn is_stream_path(path: &str) -> bool {
 }
 
 fn is_media_path(path: &str) -> bool {
+    let parts = path.split('/').collect::<Vec<_>>();
     path == "/api/v1/music/track"
         || matches!(
             path,
@@ -344,9 +362,94 @@ fn is_media_path(path: &str) -> bool {
                 | "/api/v1/skin/lookup/head"
                 | "/api/v1/skin/lookup/cape"
         )
-        || (path.starts_with("/api/v1/skins/")
-            && (path.ends_with("/file") || path.contains("/texture")))
-        || (path.starts_with("/api/v1/instances/") && path.ends_with("/file"))
+        || matches!(parts.as_slice(), ["", "api", "v1", "skins", key, "file"] if media_segment(key))
+        || matches!(parts.as_slice(), ["", "api", "v1", "instances", id, "screenshots", name, "file"]
+            if media_segment(id) && media_segment(name))
+}
+
+fn media_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= 1024
+        && segment != "."
+        && segment != ".."
+        && !segment
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b'\\')
+        && !["%2f", "%5c", "%2e"]
+            .iter()
+            .any(|encoded| segment.to_ascii_lowercase().contains(encoded))
+}
+
+fn fresh_capability() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn safe_segments(path: &str) -> bool {
+    path.starts_with('/')
+        && path[1..].split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+}
+
+/// Wrap the completed route tree once, before a body extractor or domain handler runs.
+pub fn protected_router(routes: axum::Router, authority: LocalApiAuthority) -> axum::Router {
+    use axum::{
+        middleware,
+        routing::{any, post},
+    };
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+    let origins = authority.clone();
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            origins.allows_origin(origin)
+        }))
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static(CAPABILITY_HEADER),
+            header::HeaderName::from_static("x-axial-intent-key"),
+        ]);
+    routes
+        .route("/api", any(api_not_found))
+        .route("/api/", any(api_not_found))
+        .route("/api/{*path}", any(api_not_found))
+        .route("/api/v1/transport/bootstrap", post(create_bootstrap))
+        .route(
+            "/api/v1/transport/tickets",
+            post(create_ticket).layer(DefaultBodyLimit::max(4096)),
+        )
+        .method_not_allowed_fallback(api_method_not_allowed)
+        .layer(Extension(authority.clone()))
+        .layer(cors)
+        .layer(middleware::from_fn_with_state(
+            authority,
+            authenticate_request,
+        ))
+}
+
+async fn api_not_found() -> Response {
+    transport_error(StatusCode::NOT_FOUND, "API route was not found")
+}
+
+async fn api_method_not_allowed() -> Response {
+    transport_error(StatusCode::METHOD_NOT_ALLOWED, "API method is not allowed")
 }
 
 #[cfg(windows)]
@@ -370,6 +473,106 @@ mod tests {
 
     fn authority() -> LocalApiAuthority {
         LocalApiAuthority::new("127.0.0.1:43430".parse().unwrap(), None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn invalid_ticket_requests_use_bounded_json_errors_after_authentication() {
+        let authority = authority();
+        let routes = super::protected_router(Router::new(), authority.clone());
+        for (content_type, body, status) in [
+            (None, "{}".to_owned(), StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            (
+                Some("application/json"),
+                "{".to_owned(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some("application/json"),
+                r#"{"audience":"media","unexpected":"private-provider-value"}"#.to_owned(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                Some("application/json"),
+                "x".repeat(4097),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/transport/tickets")
+                .header(CAPABILITY_HEADER, authority.capability_for_test());
+            if let Some(content_type) = content_type {
+                request = request.header(header::CONTENT_TYPE, content_type);
+            }
+            let response = routes
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            let bytes = axum::body::to_bytes(response.into_body(), 128)
+                .await
+                .unwrap();
+            assert_eq!(
+                &bytes[..],
+                br#"{"error":"invalid transport ticket request"}"#
+            );
+        }
+
+        let response = routes
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/transport/tickets")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("x".repeat(4097)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticated_media_ticket_is_removed_before_strict_domain_query_decoding() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Parameters {
+            texture: String,
+        }
+        let authority = authority();
+        let ticket = authority
+            .mint(TicketRequest {
+                audience: TicketAudience::Media,
+                target: None,
+            })
+            .unwrap()
+            .ticket;
+        let routes = Router::new().route(
+            "/api/v1/skin/profile/file",
+            axum::routing::get(
+                |axum::extract::Query(parameters): axum::extract::Query<Parameters>| async move {
+                    parameters.texture
+                },
+            ),
+        );
+        let response = super::protected_router(routes, authority)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/v1/skin/profile/file?texture=a%2Bb&axial_ticket={ticket}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"a+b");
     }
 
     fn protected_router(authority: LocalApiAuthority, effects: Arc<AtomicUsize>) -> Router {

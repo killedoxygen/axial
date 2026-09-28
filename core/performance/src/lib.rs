@@ -45,7 +45,8 @@ pub use signature::{
     RemoteRulesVerifier, RulesSignatureError, RulesSignatureMetadata, canonical_manifest_payload,
 };
 pub use state::{
-    ManagedRollbackOutcome, RollbackSnapshotSummary, RollbackSnapshotTarget, StateError,
+    ManagedDuplicateFile, ManagedDuplicatePayload, ManagedRollbackOutcome, RollbackSnapshotSummary,
+    RollbackSnapshotTarget, StateError,
 };
 pub use status::{
     FamilyCoverage, PerformanceRulesStatus, RuleChannel, RuleSource, RulesValidation, rules_status,

@@ -3752,7 +3752,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_cancellation_returns_retained_terminal_authority() {
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let destination = root
@@ -3840,7 +3840,7 @@ mod tests {
     async fn source_transfer_verifies_replays_and_discards_without_publication() {
         const BODY: &[u8] = b"bounded managed source";
         let (url, server) = serve_once(BODY).await;
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let expected_sha1: [u8; 20] = Sha1::digest(BODY).into();
@@ -3898,7 +3898,7 @@ mod tests {
     async fn create_only_transfer_publishes_through_singleton_batch() {
         const BODY: &[u8] = b"bounded managed publication";
         let (url, server) = serve_once(BODY).await;
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let leaf = LeafName::new("published-artifact").expect("portable destination");
@@ -3958,7 +3958,7 @@ mod tests {
     async fn authenticated_terminal_failure_discards_stage_and_cancels_destination() {
         const BODY: &[u8] = b"authenticated terminal failure";
         let (url, server) = serve_once(BODY).await;
-        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("temporary root");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let leaf = LeafName::new("failed-reservation").expect("portable reservation");

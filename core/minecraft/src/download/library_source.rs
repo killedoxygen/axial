@@ -1997,7 +1997,7 @@ mod tests {
         };
         let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
         let (pool, _workers, _attempt) = source_pool_for_test();
-        let absent_destination = std::env::temp_dir().join(format!(
+        let absent_destination = crate::test_temp_root().join(format!(
             "axial-library-source-no-destination-{}",
             std::process::id()
         ));
@@ -2466,7 +2466,7 @@ mod tests {
         assert_eq!(source.observed_sha1(), sha1_bytes(&body));
         assert_eq!(source.kind(), ManagedComponentArtifactKind::NativeLibrary);
 
-        let temp = tempfile::tempdir().expect("component staging root");
+        let temp = tempfile::tempdir_in(crate::test_temp_root()).expect("component staging root");
         let root = ManagedDir::open_root(temp.path()).expect("managed component staging root");
         let lease = ManagedRootPublicationLease::acquire(root.clone())
             .await
@@ -2559,7 +2559,7 @@ mod tests {
         assert_eq!(pool.retained_available_bytes(), retained_budget);
         drop(replay);
 
-        let temp = tempfile::tempdir().expect("final component staging root");
+        let temp = tempfile::tempdir_in(crate::test_temp_root()).expect("final component staging root");
         let root = ManagedDir::open_root(temp.path()).expect("managed staging root");
         let lease = ManagedRootPublicationLease::acquire(root.clone())
             .await
@@ -2595,7 +2595,7 @@ mod tests {
         .expect("retained cancellation source");
         assert_eq!(pool.retained_available_bytes(), 0);
 
-        let temp = tempfile::tempdir().expect("cancelled staging root");
+        let temp = tempfile::tempdir_in(crate::test_temp_root()).expect("cancelled staging root");
         let root = ManagedDir::open_root(temp.path()).expect("managed cancellation root");
         let lease = ManagedRootPublicationLease::acquire(root.clone())
             .await

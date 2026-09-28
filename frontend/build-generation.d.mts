@@ -32,7 +32,7 @@ export interface GenerationGraphOutput {
 }
 
 export interface GenerationManifest {
-  schema_version: 1;
+  schema_version: 1 | 2;
   generation_id: string;
   document_entry: 'index.html';
   script_entry: 'app.js';

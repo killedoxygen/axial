@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import test from 'node:test';
@@ -172,7 +172,9 @@ test('lint policy stays narrow and the production source has no configured diagn
 });
 
 test('unchanged lint config rejects floating promises and conditional hooks by exact rule ID', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'axial-lint-contract-'));
+  // Biome resolves its cwd physically; match that path for config-relative globs
+  // on hosts where the temporary directory is an alias (for example /var on macOS).
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'axial-lint-contract-')));
   try {
     const configSource = await readFile(biomeConfigPath, 'utf8');
     await mkdir(resolve(root, 'src'));
@@ -200,7 +202,11 @@ test('unchanged lint config rejects floating promises and conditional hooks by e
     const categories = biomeReport(result)
       .diagnostics.map((diagnostic) => diagnostic.category)
       .sort();
-    assert.deepEqual(categories, ['lint/correctness/useHookAtTopLevel', 'lint/nursery/noFloatingPromises']);
+    assert.deepEqual(
+      categories,
+      ['lint/correctness/useHookAtTopLevel', 'lint/nursery/noFloatingPromises'],
+      `Unexpected lint diagnostics: ${result.stdout}\n${result.stderr}`,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

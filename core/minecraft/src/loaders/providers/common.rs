@@ -60,7 +60,7 @@ pub(crate) fn profile_proof_url(
     fixed_provider_url(base, &["loader", minecraft_version, loader_version])
 }
 
-pub(crate) fn forge_install_source(
+pub fn forge_install_source(
     minecraft_version: &str,
     loader_version: &str,
 ) -> Result<

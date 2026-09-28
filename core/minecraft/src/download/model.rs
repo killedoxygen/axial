@@ -1156,6 +1156,7 @@ pub struct ExecutionDownloadFact {
 pub enum SelectedDownloadArtifactKind {
     VersionJson,
     ClientJar,
+    ClientMappings,
     Library,
     AssetIndex,
     AssetObject,

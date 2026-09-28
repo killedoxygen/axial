@@ -2111,7 +2111,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_lane_has_only_the_closed_create_only_topology() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2160,7 +2160,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_lane_rejects_any_preintent_ancestor_residue() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2174,7 +2174,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_lane_completes_a_partial_empty_ancestor_scaffold() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2202,7 +2202,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_ancestor_scaffold_replacement_is_rejected() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2226,7 +2226,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_lane_rejects_unknown_or_retained_preintent_entries() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2255,7 +2255,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_residue_prevents_every_cleanup_including_temp_sweeping() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2288,7 +2288,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_sparse_bucket_residue_is_cleaned_and_retry_is_idempotent() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2345,7 +2345,7 @@ mod tests {
 
     #[tokio::test]
     async fn either_deterministic_park_is_recovered_before_fresh_preparation() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
 
@@ -2376,7 +2376,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_or_wrong_kind_slots_fail_without_cleanup_effects() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2412,7 +2412,7 @@ mod tests {
 
     #[tokio::test]
     async fn shard_bucket_creation_is_create_only_and_exactly_bounded() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2437,7 +2437,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_same_size_table_replacement_is_not_deleted() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2464,7 +2464,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_same_size_slot_replacement_is_not_deleted() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2493,7 +2493,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_same_size_temp_replacement_is_not_deleted() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2519,7 +2519,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_empty_bucket_replacement_is_not_deleted() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2544,7 +2544,7 @@ mod tests {
 
     #[tokio::test]
     async fn temp_added_after_admission_is_not_swept() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2567,7 +2567,7 @@ mod tests {
 
     #[tokio::test]
     async fn orphaned_lane_marker_temp_is_exactly_recovered() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2595,7 +2595,7 @@ mod tests {
 
     #[tokio::test]
     async fn replaced_lane_marker_temp_is_never_deleted() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -2627,7 +2627,7 @@ mod tests {
         assert_send::<ComponentIntentCandidate>();
         assert_send::<ComponentIntentPublished>();
         assert_send::<ComponentIntentPublishFailure>();
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
         let encoded = candidate.encoded_intent.clone();
         assert!(
@@ -2662,7 +2662,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_execution_commits_new_row_and_journaled_ancestors() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -2695,7 +2695,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_execution_commits_replacement_and_retains_exact_prior() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_replacement_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -2721,7 +2721,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_execution_rolls_back_rows_and_ancestors_after_live_failure() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -2754,7 +2754,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsettled_row_move_enters_recovery_without_rollback_terminal() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -2784,7 +2784,7 @@ mod tests {
 
     #[tokio::test]
     async fn component_settlement_returns_semantic_outcome_and_same_lease() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_replacement_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -2806,7 +2806,7 @@ mod tests {
         );
         assert_component_lane_settled(&temporary);
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -2845,7 +2845,7 @@ mod tests {
             ComponentSettlementFault::AfterIntentRemoval,
             ComponentSettlementFault::AfterSettlementRemoval,
         ] {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let published = single_replacement_row_candidate(&temporary)
                 .await
                 .publish_intent()
@@ -2881,7 +2881,7 @@ mod tests {
             ComponentSettlementFault::AfterAncestorBucket,
             ComponentSettlementFault::AfterAncestorRecord,
         ] {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let published = single_absent_row_candidate(&temporary)
                 .await
                 .publish_intent()
@@ -2904,7 +2904,7 @@ mod tests {
                 ComponentSettlementResult::Settled(ComponentSettledOutcome::Committed(_))
             ));
 
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let published = single_absent_row_candidate(&temporary)
                 .await
                 .publish_intent()
@@ -2943,7 +2943,7 @@ mod tests {
             ComponentSettlementFault::AfterOutcomeRemoval,
             ComponentSettlementFault::AfterIntentRemoval,
         ] {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let published = single_absent_row_candidate(&temporary)
                 .await
                 .publish_intent()
@@ -2979,7 +2979,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_rejects_outcome_only_settlement_suffix_without_cleanup() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3019,7 +3019,7 @@ mod tests {
 
     #[tokio::test]
     async fn settlement_admission_rejects_foreign_rows_before_ancestor_cleanup() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3062,7 +3062,7 @@ mod tests {
 
     #[tokio::test]
     async fn settlement_rejects_replaced_marker_and_nonempty_parked_ancestor() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3095,7 +3095,7 @@ mod tests {
         assert!(settlement.is_file());
         assert!(saved.is_file());
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3140,7 +3140,7 @@ mod tests {
 
     #[tokio::test]
     async fn attempted_outcome_publication_retains_recovery_guard() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3180,7 +3180,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_recovery_returns_lease_when_no_transaction_exists() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let lease =
             ManagedRootPublicationLease::acquire(ManagedDir::open_root(temporary.path()).unwrap())
                 .await
@@ -3213,14 +3213,14 @@ mod tests {
 
     #[tokio::test]
     async fn restart_recovery_accepts_a_coherently_copied_logical_transaction() {
-        let source = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&source)
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish source component intent"));
         drop(published);
 
-        let copied = tempfile::tempdir().unwrap();
+        let copied = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         copy_test_tree(source.path(), copied.path());
         let lease =
             ManagedRootPublicationLease::acquire(ManagedDir::open_root(copied.path()).unwrap())
@@ -3236,14 +3236,14 @@ mod tests {
 
     #[tokio::test]
     async fn restart_recovery_rejects_a_partial_copied_logical_transaction() {
-        let source = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&source)
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish source component intent"));
         drop(published);
 
-        let copied = tempfile::tempdir().unwrap();
+        let copied = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         copy_test_tree(source.path(), copied.path());
         let missing_stage = copied
             .path()
@@ -3277,7 +3277,7 @@ mod tests {
             crate::managed_component_publication::COMPONENT_OUTCOME_FILE,
             crate::managed_component_publication::COMPONENT_SETTLEMENT_FILE,
         ] {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let lease = ManagedRootPublicationLease::acquire(
                 ManagedDir::open_root(temporary.path()).unwrap(),
             )
@@ -3301,7 +3301,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_recovery_rolls_back_pristine_and_rejects_partial_new_rows() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3313,7 +3313,7 @@ mod tests {
         ));
         assert!(!temporary.path().join("libraries").exists());
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = two_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3351,7 +3351,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_recovery_reverses_partial_replacement() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_replacement_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3376,7 +3376,7 @@ mod tests {
             b"prior-library"
         );
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_replacement_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3415,7 +3415,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_recovery_completes_committed_intent_and_replays_outcomes() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3442,7 +3442,7 @@ mod tests {
             ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::Committed(_))
         ));
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3464,7 +3464,7 @@ mod tests {
 
     #[tokio::test]
     async fn ancestor_recovery_requires_live_identity_for_a_partial_canonical_prefix() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3483,7 +3483,7 @@ mod tests {
         ));
         assert!(!temporary.path().join("libraries").exists());
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3518,7 +3518,7 @@ mod tests {
                 .is_dir()
         );
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3553,7 +3553,7 @@ mod tests {
         assert!(fs::read_dir(&canonical).unwrap().next().is_none());
         assert!(saved.is_dir());
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3582,7 +3582,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_live_recovery_cleans_an_exact_unjournaled_ancestor_bucket() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3605,7 +3605,7 @@ mod tests {
         ));
         assert!(!bucket_path.exists());
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3627,7 +3627,7 @@ mod tests {
         ));
         assert!(bucket_path.is_dir());
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3654,7 +3654,7 @@ mod tests {
         );
 
         for park_slot in [true, false] {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let published = single_absent_row_candidate(&temporary)
                 .await
                 .publish_intent()
@@ -3693,7 +3693,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_recovery_cleans_authenticated_orphan_marker_temps() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let published = single_absent_row_candidate(&temporary)
             .await
             .publish_intent()
@@ -3716,7 +3716,7 @@ mod tests {
 
     #[tokio::test]
     async fn intent_publication_distinguishes_before_and_attempted_faults() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
         let lane_path = candidate.lane.lane.path().to_path_buf();
         let before = match candidate
@@ -3732,7 +3732,7 @@ mod tests {
         assert!(!lane_path.join(COMPONENT_INTENT_FILE).exists());
         drop(before);
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
         let lane_path = candidate.lane.lane.path().to_path_buf();
         let attempted = match candidate
@@ -3754,7 +3754,7 @@ mod tests {
             ComponentIntentPublishFault::AfterMarkerPromotion,
             ComponentIntentPublishFault::AfterLeaseRevalidated,
         ] {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let candidate = single_absent_row_candidate(&temporary).await;
             let lane_path = candidate.lane.lane.path().to_path_buf();
             let attempted = match candidate.publish_intent_with_fault(fault) {
@@ -3778,7 +3778,7 @@ mod tests {
             ));
         }
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
         let intent = candidate.lane.lane.path().join(COMPONENT_INTENT_FILE);
         let saved = temporary.path().join("saved-attempted-intent");
@@ -3805,7 +3805,7 @@ mod tests {
     #[tokio::test]
     async fn candidate_rejects_same_byte_table_and_stage_replacements_before_marker() {
         for replace_table in [true, false] {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let candidate = single_absent_row_candidate(&temporary).await;
             let target = if replace_table {
                 candidate.lane.table.path().join("000000.tbl")
@@ -3839,7 +3839,7 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_rejects_replaced_ancestor_scaffold_before_marker() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
         let records = candidate.lane.ancestor_records.path().to_path_buf();
         let lane_path = candidate.lane.lane.path().to_path_buf();
@@ -3861,7 +3861,7 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_rejects_canonical_sentinel_and_child_directory_drift() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
         fs::create_dir_all(temporary.path().join("libraries/new")).unwrap();
         fs::write(
@@ -3880,7 +3880,7 @@ mod tests {
         ));
         assert!(!lane_path.join(COMPONENT_INTENT_FILE).exists());
 
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
         let table = candidate.lane.table.path().to_path_buf();
         let saved_table = temporary.path().join("saved-table-directory");
@@ -3905,7 +3905,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn candidate_rejects_empty_root_replacement_before_marker() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
         let original_root = temporary.path().to_path_buf();
         let saved_root = original_root.with_extension("saved-component-root");
@@ -3934,7 +3934,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn streamed_candidate_authority_has_constant_fd_growth_across_shards() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let (lane, lease, manifest) = two_shard_empty_file_candidate(&temporary).await;
         let before = open_fds_beneath(temporary.path());
 
@@ -3957,7 +3957,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn maximum_bucket_admission_does_not_retain_per_bucket_handles() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let directory = ManagedDir::open_root(temporary.path()).unwrap();
         for index in 0..MAX_COMPONENT_TABLE_SHARDS {
             fs::create_dir(temporary.path().join(component_bucket_name(index).unwrap())).unwrap();
@@ -3981,7 +3981,7 @@ mod tests {
 
     #[test]
     fn canonical_walk_reports_exact_missing_depth_and_observes_a_stable_file() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         fs::create_dir_all(temporary.path().join("libraries/org/example")).unwrap();
         fs::write(
             temporary.path().join("libraries/org/example/library.jar"),
@@ -4062,7 +4062,7 @@ mod tests {
 
     #[test]
     fn canonical_walk_rejects_portable_ancestor_aliases() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         fs::create_dir_all(temporary.path().join("libraries/Org/example")).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         assert!(
@@ -4077,7 +4077,7 @@ mod tests {
 
     #[test]
     fn canonical_observation_rechecks_portable_leaf_aliases() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         fs::create_dir_all(temporary.path().join("libraries/org/example")).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let plan = plan_component_canonical_path(
@@ -4097,7 +4097,7 @@ mod tests {
 
     #[tokio::test]
     async fn table_publication_replays_create_new_and_parses_the_durable_bytes() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
@@ -4155,7 +4155,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_new_table_shard_is_guarded_removed_before_returning() {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();

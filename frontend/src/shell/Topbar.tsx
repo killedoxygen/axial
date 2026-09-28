@@ -161,8 +161,8 @@ function StatusPill(): JSX.Element {
     glyph = sessionGlyph(session);
     mod = ' cp-status-pill--running';
     onClick = () => navigate({ name: 'instance', id: inst.id });
-    title = `${label} · ${inst.name}`;
-    ariaLabel = `Open active instance. ${label} · ${inst.name}`;
+    title = `${label}: ${inst.name}`;
+    ariaLabel = `Open active instance. ${label}: ${inst.name}`;
     content = (
       <>
         <span class="cp-status-pill-label">{label}</span>
@@ -177,7 +177,7 @@ function StatusPill(): JSX.Element {
     glyph = 'downloading';
     mod = ' cp-status-pill--installing';
     onClick = () => navigate({ name: 'downloads' });
-    title = `${installName}: ${install.label} · ${installPct}%${queueView.active_queued_count_label || ''}`;
+    title = `${installName}: ${install.label}, ${installPct}%${queueView.active_queued_count_label || ''}`;
     ariaLabel = `Open downloads. ${title}`;
     style = { '--cp-install-ratio': String(installPct / 100) } as JSX.CSSProperties;
     content = (
@@ -192,7 +192,7 @@ function StatusPill(): JSX.Element {
     const prepTag = versionTag(li?.version_id);
     glyph = 'preparing';
     mod = ' cp-status-pill--preparing';
-    title = `${launch.label} · ${li?.name || 'launch'}`;
+    title = `${launch.label}: ${li?.name || 'launch'}`;
     content = (
       <>
         <span class="cp-status-pill-label">{flowLabel || launch.label}</span>

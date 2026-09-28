@@ -356,6 +356,77 @@ pub fn resolve_version(mc_dir: &Path, version_id: &str) -> Result<VersionJson, L
     resolve_inheritance(mc_dir, version, version_id, 0)
 }
 
+/// Resolve the existing inheritance algorithm using only admitted, bounded file reads.
+/// Callers that retain a command for later spawning must retain their own bundle read guard.
+pub fn resolve_version_managed(
+    operation: &crate::managed_path::ManagedLibraryOperation,
+    version_id: &str,
+) -> Result<VersionJson, LaunchModelError> {
+    let read_guard =
+        crate::version::VersionBundleReadGuard::acquire(operation).map_err(|source| {
+            LaunchModelError::ReadVersion {
+                version_id: version_id.into(),
+                source,
+            }
+        })?;
+    let mut load = |id: &str| -> Result<VersionJson, LaunchModelError> {
+        let read_error = |source| LaunchModelError::ReadVersion {
+            version_id: id.into(),
+            source,
+        };
+        crate::portable_path::PortableFileName::new_exact(id).map_err(|_| {
+            read_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid version identity",
+            ))
+        })?;
+        let relative = crate::portable_path::PortableRelativePath::new_exact(&format!(
+            "versions/{id}/{id}.json"
+        ))
+        .map_err(|_| {
+            read_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid version metadata path",
+            ))
+        })?;
+        let file = operation
+            .observe_file(&relative)
+            .map_err(read_error)?
+            .ok_or_else(|| {
+                read_error(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "version metadata missing",
+                ))
+            })?;
+        let bytes = file
+            .read_bounded(crate::known_good::MAX_KNOWN_GOOD_VERSION_JSON_BYTES as u64)
+            .map_err(read_error)?;
+        let mut version: VersionJson =
+            serde_json::from_slice(&bytes).map_err(|source| LaunchModelError::ParseVersion {
+                version_id: id.into(),
+                source,
+            })?;
+        if version.id != id {
+            return Err(read_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "version metadata identity mismatch",
+            )));
+        }
+        normalize_asset_index(&mut version);
+        read_guard.revalidate().map_err(read_error)?;
+        Ok(version)
+    };
+    let version = load(version_id)?;
+    let resolved = resolve_inheritance_with(&mut load, version, version_id, 0)?;
+    read_guard
+        .revalidate()
+        .map_err(|source| LaunchModelError::ReadVersion {
+            version_id: version_id.into(),
+            source,
+        })?;
+    Ok(resolved)
+}
+
 pub fn resolve_libraries(
     version: &VersionJson,
     mc_dir: &Path,
@@ -573,6 +644,20 @@ fn resolve_inheritance(
     expected_version_id: &str,
     depth: usize,
 ) -> Result<VersionJson, LaunchModelError> {
+    resolve_inheritance_with(
+        &mut |id| load_version_json(mc_dir, id),
+        child,
+        expected_version_id,
+        depth,
+    )
+}
+
+fn resolve_inheritance_with(
+    load: &mut impl FnMut(&str) -> Result<VersionJson, LaunchModelError>,
+    child: VersionJson,
+    expected_version_id: &str,
+    depth: usize,
+) -> Result<VersionJson, LaunchModelError> {
     if depth > 10 {
         return Err(LaunchModelError::InheritanceTooDeep {
             version_id: child.id.clone(),
@@ -605,14 +690,13 @@ fn resolve_inheritance(
     }
 
     let parent_id = child.inherits_from.clone();
-    let mut parent =
-        load_version_json(mc_dir, &parent_id).map_err(|source| LaunchModelError::LoadParent {
-            child_id: child.id.clone(),
-            parent_id: parent_id.clone(),
-            source: Box::new(source),
-        })?;
+    let mut parent = load(&parent_id).map_err(|source| LaunchModelError::LoadParent {
+        child_id: child.id.clone(),
+        parent_id: parent_id.clone(),
+        source: Box::new(source),
+    })?;
     if parent.materialized || !parent.inherits_from.is_empty() {
-        parent = resolve_inheritance(mc_dir, parent, &parent_id, depth + 1)?;
+        parent = resolve_inheritance_with(load, parent, &parent_id, depth + 1)?;
     }
 
     Ok(finalize_effective_version(merge_versions(&parent, &child)))
@@ -1155,6 +1239,88 @@ mod tests {
     }
 
     #[test]
+    fn vanilla_1_20_1_arguments_do_not_advertise_unsupported_quick_play() {
+        // Conditional argument records from Mojang's 1.20.1 manifest, not a
+        // feature-free synthetic launch fixture.
+        let version: VersionJson = serde_json::from_value(serde_json::json!({
+            "id": "1.20.1",
+            "arguments": {
+                "game": [
+                    "--username", "${auth_player_name}",
+                    "--version", "${version_name}",
+                    "--gameDir", "${game_directory}",
+                    {
+                        "rules": [{"action": "allow", "features": {"is_demo_user": true}}],
+                        "value": "--demo"
+                    },
+                    {
+                        "rules": [{"action": "allow", "features": {"has_custom_resolution": true}}],
+                        "value": ["--width", "${resolution_width}", "--height", "${resolution_height}"]
+                    },
+                    {
+                        "rules": [{"action": "allow", "features": {"has_quick_plays_support": true}}],
+                        "value": ["--quickPlayPath", "${quickPlayPath}"]
+                    },
+                    {
+                        "rules": [{"action": "allow", "features": {"is_quick_play_singleplayer": true}}],
+                        "value": ["--quickPlaySingleplayer", "${quickPlaySingleplayer}"]
+                    },
+                    {
+                        "rules": [{"action": "allow", "features": {"is_quick_play_multiplayer": true}}],
+                        "value": ["--quickPlayMultiplayer", "${quickPlayMultiplayer}"]
+                    },
+                    {
+                        "rules": [{"action": "allow", "features": {"is_quick_play_realms": true}}],
+                        "value": ["--quickPlayRealms", "${quickPlayRealms}"]
+                    }
+                ],
+                "jvm": ["-cp", "${classpath}"]
+            }
+        }))
+        .expect("real conditional argument shape");
+        let mut vars = default_launch_vars();
+        vars.version_name = version.id.clone();
+        vars.resolution_width = "1280".into();
+        vars.resolution_height = "720".into();
+        let mut environment = default_environment();
+        let (jvm, game) = resolve_arguments(&version, &environment, &vars);
+        assert_eq!(jvm, ["-cp", "client.jar"]);
+        assert_eq!(
+            game,
+            [
+                "--username",
+                "Player",
+                "--version",
+                "1.20.1",
+                "--gameDir",
+                "."
+            ]
+        );
+
+        environment
+            .features
+            .insert("has_custom_resolution".into(), true);
+        let (jvm, game) = resolve_arguments(&version, &environment, &vars);
+        assert_eq!(jvm, ["-cp", "client.jar"]);
+        assert_eq!(
+            game,
+            [
+                "--username",
+                "Player",
+                "--version",
+                "1.20.1",
+                "--gameDir",
+                ".",
+                "--width",
+                "1280",
+                "--height",
+                "720"
+            ]
+        );
+        assert!(jvm.iter().chain(&game).all(|arg| !arg.contains("${")));
+    }
+
+    #[test]
     fn launch_vars_debug_redacts_auth_access_token() {
         let raw_token = "secret-auth-access-token";
         let mut vars = default_launch_vars();
@@ -1520,7 +1686,7 @@ mod tests {
     }
 
     fn temp_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        crate::test_temp_root().join(format!(
             "axial-launch-{name}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

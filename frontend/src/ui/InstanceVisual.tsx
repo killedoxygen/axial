@@ -43,7 +43,7 @@ function loaderKeyForInstance(inst: VisualInstance, version: Version | undefined
   }
   const versionLoader = loaderKeyFromVersion(version);
   if (versionLoader !== 'vanilla') return versionLoader;
-  const installLoader = instanceInstallStatus(inst, version).item.loader;
+  const installLoader = instanceInstallStatus(inst, version).item?.loader;
   return loaderKeyFromComponentId(installLoader?.componentId);
 }
 

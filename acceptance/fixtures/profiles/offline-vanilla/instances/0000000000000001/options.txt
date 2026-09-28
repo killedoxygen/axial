@@ -1,0 +1,4 @@
+version:3465
+lang:en_us
+renderDistance:8
+maxFps:120

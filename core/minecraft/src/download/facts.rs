@@ -84,6 +84,7 @@ fn selected_download_target_prefix(kind: SelectedDownloadArtifactKind) -> &'stat
     match kind {
         SelectedDownloadArtifactKind::VersionJson => "minecraft_version_json",
         SelectedDownloadArtifactKind::ClientJar => "minecraft_client",
+        SelectedDownloadArtifactKind::ClientMappings => "minecraft_client_mappings",
         SelectedDownloadArtifactKind::Library => "minecraft_library",
         SelectedDownloadArtifactKind::AssetIndex => "minecraft_asset_index",
         SelectedDownloadArtifactKind::AssetObject => "minecraft_asset_object",

@@ -141,7 +141,10 @@ export function resolutionPlanResponse(value: unknown): ResolutionPlan {
         sha1: dtoOptionalString(entry.sha1, 'Content plan SHA-1'),
         sha512: dtoOptionalString(entry.sha512, 'Content plan SHA-512'),
         size: dtoOptionalNumber(entry.size, 'Content plan size'),
-        dependencies: dtoArray(entry.dependencies, 'Content plan dependencies').map(dependencyResponse),
+        dependencies:
+          entry.dependencies === undefined
+            ? []
+            : dtoArray(entry.dependencies, 'Content plan dependencies').map(dependencyResponse),
         reason: dtoEnum(entry.reason, 'Content plan reason', ['selected', 'dependency'] as const),
         already_installed: dtoBoolean(entry.already_installed, 'Content already installed'),
         update: dtoBoolean(entry.update, 'Content update'),
@@ -175,7 +178,7 @@ export function contentCompatResponse(value: unknown): ContentCompatResponse {
     candidates: dtoArray(record.candidates, 'Content compatibility candidates').map((candidate) => {
       const entry = dtoRecord(candidate, 'Content compatibility candidate');
       return {
-        loader: dtoEnum(entry.loader, 'Compatibility loader', LOADER_KEYS),
+        loader: entry.loader === '' ? 'vanilla' : dtoEnum(entry.loader, 'Compatibility loader', LOADER_KEYS),
         loader_label: dtoString(entry.loader_label, 'Compatibility loader label'),
         game_version: dtoString(entry.game_version, 'Compatibility game version'),
         selection_id: dtoString(entry.selection_id, 'Compatibility selection'),

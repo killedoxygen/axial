@@ -1,12 +1,13 @@
 import { signal } from '@preact/signals';
-import { defaults, local, saveLocalState, PRESET_HUES } from './state';
-import { api } from './api';
+import { defaults, local, localStateVersion, saveLocalState, PRESET_HUES, canEditPreferences } from './state';
+import { saveConfigPatch } from './hooks/use-autosave';
 import { config } from './store';
 import { Sound } from './sound';
 import { buildTheme, type Theme } from './tokens';
 import { toast } from './toast';
-import { windowSetResizeBackground } from './native';
-import { configResponse } from './dto-core';
+import { hasNativeDesktopRuntime, windowSetResizeBackground } from './native';
+import { flushNativePreferences, nativePreferencesHydrated } from './preferences/persistence';
+import type { Config } from './types-settings';
 
 const initialThemeHue = local.theme === 'custom' ? local.customHue : (PRESET_HUES[local.theme] ?? local.customHue);
 
@@ -104,15 +105,59 @@ interface ApplyOptions {
   transient?: boolean;
 }
 
+type ThemePreference = Pick<typeof local, 'theme' | 'customHue' | 'customVibrancy' | 'lightness'>;
+
+function currentPreference(): ThemePreference {
+  return { theme: local.theme, customHue: local.customHue, customVibrancy: local.customVibrancy, lightness: local.lightness };
+}
+
+let acceptedPreference = currentPreference();
+let themeSaveVersion = 0;
+
+function restorePreference(preference: ThemePreference): void {
+  Object.assign(local, preference);
+  const hue = preference.theme === 'custom' ? preference.customHue : (PRESET_HUES[preference.theme] ?? preference.customHue);
+  const dark = preference.lightness < 50;
+  applyCssVars(hue, dark, preference.customVibrancy);
+  themeSignal.value = buildTheme({ dark, hue, vibrancy: preference.customVibrancy });
+  syncNativeResizeBackground(dark);
+}
+
+function persistTheme(payload: Record<string, unknown>, failureMessage: string): void {
+  if (hasNativeDesktopRuntime()) {
+    saveLocalState();
+    Sound.ui('theme');
+    return;
+  }
+  const version = ++themeSaveVersion;
+  const preference = currentPreference();
+  void (async () => {
+    try {
+      await saveConfigPatch(payload);
+      acceptedPreference = preference;
+      if (version === themeSaveVersion) {
+        saveLocalState();
+        Sound.ui('theme');
+      }
+    } catch {
+      if (version !== themeSaveVersion) return;
+      const saved = config.value;
+      if (saved?.theme) acceptedPreference = {
+        theme: saved.theme, customHue: saved.custom_hue ?? defaults.customHue,
+        customVibrancy: saved.custom_vibrancy ?? defaults.customVibrancy, lightness: saved.lightness ?? defaults.lightness,
+      };
+      restorePreference(acceptedPreference);
+      saveLocalState();
+      toast(failureMessage, 'error');
+    }
+  })();
+}
+
 export function applyTheme(theme: string, hue: number | null, options: ApplyOptions = {}): void {
+  if ((!options.silent || options.transient) && !canEditPreferences()) return;
+  if (hasNativeDesktopRuntime() && !nativePreferencesHydrated()) return;
   const { silent = false } = options;
   const transient = options.transient === true;
-
-  const previousTheme = local.theme;
-  const previousHue = local.customHue;
-  const previousVibrancy = local.customVibrancy;
-  const previousLightness = local.lightness;
-  const previousResolvedHue = previousTheme === 'custom' ? previousHue : (PRESET_HUES[previousTheme] ?? previousHue);
 
   const lt = options.lightness ?? local.lightness;
   const vibrancy = options.vibrancy ?? local.customVibrancy;
@@ -144,38 +189,38 @@ export function applyTheme(theme: string, hue: number | null, options: ApplyOpti
       payload.custom_hue = resolvedHue;
       payload.custom_vibrancy = vibrancy;
     }
-    api('PUT', '/config', payload)
-      .then(configResponse)
-      .then((r) => {
-        config.value = r;
-        saveLocalState();
-        Sound.ui('theme');
-      })
-      .catch(() => {
-        local.theme = previousTheme;
-        local.customHue = previousHue;
-        local.customVibrancy = previousVibrancy;
-        local.lightness = previousLightness;
-        const previousDark = previousLightness < 50;
-        applyCssVars(previousResolvedHue, previousDark, previousVibrancy);
-        themeSignal.value = buildTheme({
-          dark: previousDark,
-          hue: previousResolvedHue,
-          vibrancy: previousVibrancy,
-        });
-        saveLocalState();
-        toast('Failed to save theme', 'error');
-      });
+    persistTheme(payload, 'Failed to save theme');
+  } else {
+    acceptedPreference = currentPreference();
   }
 }
 
-export function resetThemeToDefault(): void {
-  const previousTheme = local.theme;
-  const previousHue = local.customHue;
-  const previousVibrancy = local.customVibrancy;
-  const previousLightness = local.lightness;
-  const previousResolvedHue = previousTheme === 'custom' ? previousHue : (PRESET_HUES[previousTheme] ?? previousHue);
+export function applyConfigTheme(cfg: Config): void {
+  if (hasNativeDesktopRuntime()) return;
+  if (local.theme !== 'obsidian' || !cfg.theme || cfg.theme === 'obsidian') return;
+  applyTheme(cfg.theme, cfg.custom_hue ?? local.customHue, {
+    silent: true,
+    vibrancy: cfg.custom_vibrancy ?? local.customVibrancy,
+    lightness: cfg.lightness ?? local.lightness,
+  });
+}
 
+export async function applyImportedConfigTheme(cfg: Config, preferenceVersion: number): Promise<void> {
+  if (!hasNativeDesktopRuntime()) { applyConfigTheme(cfg); return; }
+  if (!canEditPreferences()) throw new Error('Interface preferences are paused. Refresh the imported settings again.');
+  if (localStateVersion.value !== preferenceVersion) return;
+  if (local.theme === 'obsidian' && cfg.theme && cfg.theme !== 'obsidian') {
+    applyTheme(cfg.theme, cfg.custom_hue ?? local.customHue, {
+      silent: true, vibrancy: cfg.custom_vibrancy ?? local.customVibrancy,
+      lightness: cfg.lightness ?? local.lightness,
+    });
+    saveLocalState();
+  }
+  await flushNativePreferences();
+}
+
+export function resetThemeToDefault(): void {
+  if (!canEditPreferences()) return;
   const nextTheme = defaults.theme;
   const nextHue = defaults.customHue;
   const nextVibrancy = defaults.customVibrancy;
@@ -191,34 +236,12 @@ export function resetThemeToDefault(): void {
   local.customVibrancy = nextVibrancy;
   local.lightness = nextLightness;
 
-  api('PUT', '/config', {
+  persistTheme({
     theme: nextTheme,
     lightness: nextLightness,
     custom_hue: nextHue,
     custom_vibrancy: nextVibrancy,
-  })
-    .then(configResponse)
-    .then((r) => {
-      config.value = r;
-      saveLocalState();
-      Sound.ui('theme');
-    })
-    .catch(() => {
-      local.theme = previousTheme;
-      local.customHue = previousHue;
-      local.customVibrancy = previousVibrancy;
-      local.lightness = previousLightness;
-      const previousDark = previousLightness < 50;
-      applyCssVars(previousResolvedHue, previousDark, previousVibrancy);
-      themeSignal.value = buildTheme({
-        dark: previousDark,
-        hue: previousResolvedHue,
-        vibrancy: previousVibrancy,
-      });
-      syncNativeResizeBackground(previousDark);
-      saveLocalState();
-      toast('Failed to reset theme', 'error');
-    });
+  }, 'Failed to reset theme');
 }
 
 export function positionFieldMarker(

@@ -1,15 +1,16 @@
 import type { JSX } from 'preact';
-import './downloads.css';
-import { IconButton, Meter } from '../../ui/Atoms';
+import { Button, IconButton, Meter } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { DownloadFailureNotice } from '../../ui/DownloadFailureNotice';
 import { useNowTicker } from '../../hooks/use-now';
 import {
   activeDownload,
+  activeInstallRetryPending,
   clearDownloadFailure,
   downloadFailure,
   downloadQueue,
   removeQueuedInstall,
+  retryActiveInstall,
   retryFailedInstall,
 } from '../../machines/downloads';
 
@@ -78,6 +79,17 @@ export function DownloadsView(): JSX.Element {
                 <span class="cp-dl-live-elapsed">{formatElapsedTime(active.startedAt, now)}</span>
               )}
             </div>
+            {active.installId && active.retryAction?.action === 'retry' && (
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={!active.retryAction.enabled || activeInstallRetryPending.value}
+                title={active.retryAction.disabled_reason || undefined}
+                onClick={() => void retryActiveInstall(active.installId)}
+              >
+                {active.retryAction.label}
+              </Button>
+            )}
           </div>
           <Meter value={pct} height={6} ariaLabel={`Install progress for ${title}`} />
           {step && (
@@ -130,7 +142,7 @@ export function DownloadsView(): JSX.Element {
                 <span class="cp-dl-queue-pos cp-dl-num">{item.position}</span>
                 <div class="cp-dl-queue-main">
                   <span class="cp-dl-queue-label">{item.label}</span>
-                  {item.install_item.loader && <span class="cp-dl-queue-version">{item.install_item.version_id}</span>}
+                  {item.install_item.loader && <span class="cp-dl-queue-version">{item.install_item.loader.minecraft_version}</span>}
                 </div>
                 <IconButton
                   icon="trash"
