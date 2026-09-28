@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readdir, readFile, rm, symlink, writeFile } from 'node:
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 import {
   discoverFrontendTests,
   frontendDependencyRoot,
@@ -319,29 +320,52 @@ test('runtime failures are returned and top-level hangs are killed and cleaned',
 });
 
 test('CLI environment targeting is exact and does not evaluate shell input', async () => {
-  const markerRoot = await mkdtemp(join(tmpdir(), 'axial-runner-injection-'));
-  const marker = join(markerRoot, 'must-not-exist');
+  const fixture = await createFixture();
+  const marker = join(fixture.root, 'must-not-exist');
+  const cli = join(fixture.root, 'run.mjs');
+  const selectedReceipt = join(fixture.receipts, 'selected');
   try {
-    const targeted = await runBoundedChild(process.execPath, [join(dependencyRoot, 'test/run.mjs')], {
-      cwd: dependencyRoot,
-      env: { ...process.env, AXIAL_FRONTEND_TEST: 'test/look-guardian.test.mjs' },
+    await write(join(fixture.testRoot, 'selected.test.mjs'), successfulMjsTest(selectedReceipt));
+    await write(join(fixture.testRoot, 'decoy.test.mjs'), successfulMjsTest(join(fixture.receipts, 'decoy')));
+    await write(cli, await readFile(join(dependencyRoot, 'test/run.mjs'), 'utf8'));
+    // Run the unchanged CLI and real runner against fixture sources so this
+    // selection contract does not repeat the full application's typecheck.
+    await write(
+      join(fixture.root, 'runner.mjs'),
+      `import { runFrontendTests as run } from ${JSON.stringify(pathToFileURL(join(dependencyRoot, 'test/runner.mjs')).href)};
+export function runFrontendTests(options) {
+  return run({
+    ...options,
+    dependencyRoot: ${JSON.stringify(dependencyRoot)},
+    frontendRoot: ${JSON.stringify(fixture.root)},
+    tsconfigPath: ${JSON.stringify(fixture.tsconfigPath)},
+  });
+}
+`,
+    );
+    const targeted = await runBoundedChild(process.execPath, [cli], {
+      cwd: fixture.root,
+      env: { ...process.env, AXIAL_FRONTEND_TEST: 'test/selected.test.mjs' },
       stdio: 'ignore',
       timeoutMs: 10_000,
     });
     assert.deepEqual({ code: targeted.code, timedOut: targeted.timedOut }, { code: 0, timedOut: false });
+    assert.deepEqual(await receiptNames(fixture), ['selected']);
+    await rm(selectedReceipt);
 
-    const hostile = await runBoundedChild(process.execPath, [join(dependencyRoot, 'test/run.mjs')], {
-      cwd: dependencyRoot,
+    const hostile = await runBoundedChild(process.execPath, [cli], {
+      cwd: fixture.root,
       env: {
         ...process.env,
-        AXIAL_FRONTEND_TEST: `test/look-guardian.test.mjs;touch ${marker}`,
+        AXIAL_FRONTEND_TEST: `test/selected.test.mjs;touch ${marker}`,
       },
       stdio: 'ignore',
       timeoutMs: 10_000,
     });
     assert.deepEqual({ code: hostile.code, timedOut: hostile.timedOut }, { code: 1, timedOut: false });
+    assert.deepEqual(await receiptNames(fixture), []);
     await assert.rejects(readFile(marker), /ENOENT/);
   } finally {
-    await rm(markerRoot, { force: true, recursive: true });
+    await rm(fixture.root, { force: true, recursive: true });
   }
 });
