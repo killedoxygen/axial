@@ -5662,14 +5662,14 @@ impl ManagedLibraryFile {
     }
 
     pub fn sha1_bounded(&self, max_size: u64) -> io::Result<[u8; 20]> {
-        self.revalidate()?;
+        self.operation.revalidate()?;
         let digest = self
             .directory
             .sha1_guarded_file_bytes_with_check(&self.name, &self.guard, max_size, || {
                 self.operation.revalidate().map_err(LoaderError::Io)
             })
             .map_err(loader_io)?;
-        self.revalidate()?;
+        self.operation.revalidate()?;
         Ok(digest)
     }
 }
@@ -6791,10 +6791,17 @@ mod library_lifecycle_tests {
     }
 
     #[test]
-    fn guarded_sha1_rejects_callback_failure_and_mid_read_source_changes() {
-        for failure in ["callback", "same-size rewrite", "replacement"] {
+    fn guarded_sha1_rejects_callback_failure_and_source_changes() {
+        for (failure, size, change_at) in [
+            ("callback", 128 * 1024, 3),
+            ("same-size rewrite", 128 * 1024, 3),
+            ("replacement", 128 * 1024, 3),
+            ("callback", 1, 4),
+            ("same-size rewrite", 1, 4),
+            ("replacement", 1, 4),
+        ] {
             let (temporary, root) = managed_library("guarded-sha1-changes");
-            let bytes = vec![0x5a; 128 * 1024];
+            let bytes = vec![0x5a; size];
             let path = temporary.path().join("artifact.bin");
             std::fs::write(&path, &bytes).unwrap();
             let operation = root.try_acquire().unwrap();
@@ -6809,7 +6816,7 @@ mod library_lifecycle_tests {
                 bytes.len() as u64,
                 || {
                     checks += 1;
-                    if checks == 3 {
+                    if checks == change_at {
                         match failure {
                             "callback" => {
                                 return Err(LoaderError::Verify("cancelled fixture".to_string()));
@@ -6830,10 +6837,12 @@ mod library_lifecycle_tests {
                     operation.revalidate().map_err(LoaderError::Io)
                 },
             );
-            assert!(checks >= 3, "{failure} must occur after the first read");
+            assert!(checks >= change_at, "{failure} callback was not reached");
             assert!(result.is_err(), "accepted {failure} during guarded hashing");
             if failure == "callback" {
                 assert_eq!(std::fs::read(path).unwrap(), bytes);
+            } else {
+                assert!(file.sha1_bounded(bytes.len() as u64).is_err());
             }
         }
     }
@@ -6848,8 +6857,9 @@ mod library_lifecycle_tests {
         ] {
             let file = batch.observe_file(&batch_path(name)).unwrap().unwrap();
             assert_eq!(file.read_bounded(32).unwrap(), bytes);
+            assert!(file.sha1_bounded(bytes.len() as u64 - 1).is_err());
             assert_eq!(
-                file.sha1_bounded(32).unwrap(),
+                file.sha1_bounded(bytes.len() as u64).unwrap(),
                 <[u8; 20]>::from(Sha1::digest(bytes))
             );
         }
@@ -6943,6 +6953,7 @@ mod library_lifecycle_tests {
         .unwrap();
 
         assert!(first.revalidate().is_err());
+        assert!(first.sha1_bounded(32).is_err());
         assert!(batch.observe_file(&batch_path("second")).is_err());
         for parent in ["assets", "previous-assets"] {
             assert_eq!(
@@ -6974,6 +6985,7 @@ mod library_lifecycle_tests {
 
         assert!(first.revalidate().is_err());
         assert!(first.read_bounded(32).is_err());
+        assert!(first.sha1_bounded(32).is_err());
         let replacement = batch.observe_file(&batch_path("first")).unwrap().unwrap();
         assert_ne!(replacement.revision_observation(), original_revision);
         assert_eq!(replacement.read_bounded(32).unwrap(), b"first payload");
