@@ -8,7 +8,7 @@
 use super::{
     catalog::{ContentError, ContentResult, ContentService},
     model::{CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId},
-    packs::{PackPlan, ResolvedPack, validate_download_url},
+    packs::{PackFileSelection, PackPlan, ResolvedPack, validate_download_url},
     provenance::{
         ContentManifest, LiveManagedContent, MANIFEST_FILE, MAX_MANIFEST_BYTES,
         ManagedContentFileName, ManifestEntry, PackInstallation, PackInstalledFile,
@@ -716,10 +716,29 @@ impl ContentMutations {
             .await?;
         let selection = preview.select(selection_ids)?;
         let plan = self
-            .plan_admitted(service, &instance, selection.selections())
+            .plan_selected_pack_admitted(service, &instance, selection)
             .await?;
-        selection.finish(plan.resolution())?;
         self.install_admitted(instance, plan, false)
+    }
+
+    async fn plan_selected_pack_admitted(
+        &self,
+        service: &ContentService,
+        instance: &RegisteredInstance,
+        selection: PackFileSelection,
+    ) -> Result<TargetedPlan, MutationError> {
+        instance
+            .validate_current()
+            .map_err(|_| MutationError::Changed)?;
+        let (manifest, live, _) = observe(instance.game_directory())?;
+        let state = ContentPlanState::from_instance(instance.record(), &manifest, &live)
+            .map_err(|_| MutationError::Changed)?;
+        TargetedPlan::resolve_selected_pack(service, state, selection, &manifest, &live)
+            .await
+            .map_err(|error| match error {
+                super::resolve::ResolutionError::Pack(error) => MutationError::Pack(error),
+                _ => MutationError::Unavailable,
+            })
     }
 
     pub fn has_unsettled_effects(&self) -> bool {
@@ -879,42 +898,52 @@ impl ContentMutations {
         let owner = self.clone();
         self.tasks
             .try_spawn(instance.clone(), move |cancel| async move {
-                let (before, live, raw) = observe(instance.game_directory())?;
-                let current = ContentPlanState::from_instance(instance.record(), &before, &live)
-                    .map_err(|_| MutationError::Changed)?;
-                let files = plan
-                    .authorized_files(&current, allow_incompatible)
-                    .map_err(|_| MutationError::Changed)?;
-                let mut after = before.clone();
-                after.try_upsert_batch(
-                    files
-                        .iter()
-                        .map(PlannedFile::entry)
-                        .collect::<ContentResult<Vec<_>>>()?,
-                )?;
-                for file in &files {
-                    if let Some(old) = before.find(&file.canonical_id) {
-                        after.try_set_enabled(&file.canonical_id, old.enabled())?;
-                    }
-                }
-                let sources = files
-                    .into_iter()
-                    .map(|file| {
-                        Ok((
-                            entry_path(
-                                after
-                                    .find(&file.canonical_id)
-                                    .ok_or(MutationError::Changed)?,
-                            )?,
-                            Source::Download { file: file.file },
-                        ))
-                    })
-                    .collect::<Result<HashMap<_, _>, MutationError>>()?;
-                owner
-                    .begin(instance, before, raw, after, sources, &cancel)
-                    .await
+                let receipt = owner.prepare_install(&instance, &plan, allow_incompatible)?;
+                owner.accept_batch(instance, receipt, &cancel).await
             })
             .map_err(|_| MutationError::Unavailable)
+    }
+
+    fn prepare_install(
+        &self,
+        instance: &RegisteredInstance,
+        plan: &TargetedPlan,
+        allow_incompatible: bool,
+    ) -> Result<Receipt, MutationError> {
+        let (before, live, raw) = observe(instance.game_directory())?;
+        let current = ContentPlanState::from_instance(instance.record(), &before, &live)
+            .map_err(|_| MutationError::Changed)?;
+        let files = plan
+            .authorized_files(&current, allow_incompatible)
+            .map_err(|_| MutationError::Changed)?;
+        let mut after = before.clone();
+        after.try_upsert_batch(
+            files
+                .iter()
+                .map(PlannedFile::entry)
+                .collect::<ContentResult<Vec<_>>>()?,
+        )?;
+        if plan.preserves_enabled_state() {
+            for file in &files {
+                if let Some(old) = before.find(&file.canonical_id) {
+                    after.try_set_enabled(&file.canonical_id, old.enabled())?;
+                }
+            }
+        }
+        let sources = files
+            .into_iter()
+            .map(|file| {
+                Ok((
+                    entry_path(
+                        after
+                            .find(&file.canonical_id)
+                            .ok_or(MutationError::Changed)?,
+                    )?,
+                    Source::Download { file: file.file },
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, MutationError>>()?;
+        self.prepare_batch(instance, before, raw, after, sources)
     }
 
     pub fn remove(
@@ -1124,6 +1153,18 @@ impl ContentMutations {
         sources: HashMap<String, Source>,
         cancel: &CancellationToken,
     ) -> Result<MutationReceipt, MutationError> {
+        let receipt = self.prepare_batch(&instance, before, raw, after, sources)?;
+        self.accept_batch(instance, receipt, cancel).await
+    }
+
+    fn prepare_batch(
+        &self,
+        instance: &RegisteredInstance,
+        before: ContentManifest,
+        raw: Option<Vec<u8>>,
+        after: ContentManifest,
+        sources: HashMap<String, Source>,
+    ) -> Result<Receipt, MutationError> {
         let old = manifest_paths(&before)?;
         let new = manifest_paths(&after)?;
         let mut paths: Vec<_> = old.keys().chain(new.keys()).cloned().collect();
@@ -1167,7 +1208,7 @@ impl ContentMutations {
             pack: None,
             local_mod: None,
         };
-        self.accept_batch(instance, receipt, cancel).await
+        Ok(receipt)
     }
 
     async fn accept_batch(
@@ -2441,15 +2482,6 @@ mod tests {
         hash: &str,
         title_response: bool,
     ) -> (ContentService, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let service = ContentService::with_base_url(
-            ProviderClient::new(ClientConfig::default()).unwrap(),
-            &origin,
-            crate::network::OriginPolicy::loopback_for_tests([&origin], 0).unwrap(),
-        )
-        .unwrap();
         let mut responses = vec![serde_json::json!({ hash: {
             "project_id": "known", "id": "known-v1", "name": "Identified fixture", "version_number": "1",
             "version_type": "release", "loaders": [], "game_versions": ["1.21.4"],
@@ -2459,6 +2491,21 @@ mod tests {
         if title_response {
             responses.push("malformed title metadata".into());
         }
+        metadata_provider(responses).await
+    }
+
+    async fn metadata_provider(
+        responses: Vec<String>,
+    ) -> (ContentService, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let service = ContentService::with_base_url(
+            ProviderClient::new(ClientConfig::default()).unwrap(),
+            &origin,
+            crate::network::OriginPolicy::loopback_for_tests([&origin], 0).unwrap(),
+        )
+        .unwrap();
         let task = tokio::spawn(async move {
             for body in responses {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -2491,6 +2538,19 @@ mod tests {
     }
 
     fn pack(indexed: &[(&str, &[u8])], overrides: &[(&str, &[u8])]) -> ResolvedPack {
+        let files = indexed.iter().map(|(path, bytes)| serde_json::json!({
+            "path": path, "fileSize": bytes.len(), "hashes": {"sha512": Proof::bytes(bytes).sha512},
+            "downloads": [format!("https://cdn.example.com/{}", path.rsplit('/').next().unwrap())],
+        })).collect::<Vec<_>>();
+        pack_with_index(
+            serde_json::json!({
+                "name":"Pack fixture", "dependencies":{"minecraft":"1.21.4"}, "files":files,
+            }),
+            overrides,
+        )
+    }
+
+    fn pack_with_index(index: serde_json::Value, overrides: &[(&str, &[u8])]) -> ResolvedPack {
         let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
         writer
             .start_file(
@@ -2498,17 +2558,8 @@ mod tests {
                 zip::write::SimpleFileOptions::default(),
             )
             .unwrap();
-        let files = indexed.iter().map(|(path, bytes)| serde_json::json!({
-            "path": path, "fileSize": bytes.len(), "hashes": {"sha512": Proof::bytes(bytes).sha512},
-            "downloads": [format!("https://cdn.example.com/{}", path.rsplit('/').next().unwrap())],
-        })).collect::<Vec<_>>();
         writer
-            .write_all(
-                &serde_json::to_vec(&serde_json::json!({
-                    "name": "Pack fixture", "dependencies": {"minecraft": "1.21.4"}, "files": files,
-                }))
-                .unwrap(),
-            )
+            .write_all(&serde_json::to_vec(&index).unwrap())
             .unwrap();
         for (path, bytes) in overrides {
             writer
@@ -3406,6 +3457,233 @@ mod tests {
             b"unowned pack bytes"
         );
         assert!(!owner.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn selected_pack_nonprimary_member_preserves_the_reviewed_payload() {
+        let (root, owner, id) = fixture().await;
+        let plan = selected_pack_plan(&owner, &id, false).await.unwrap();
+        assert!(plan.resolution().conflicts.is_empty());
+        assert_eq!(plan.resolution().items.len(), 1);
+        let selected = &plan.resolution().items[0];
+        assert_eq!(selected.file.filename, "chosen.zip");
+        assert_eq!(
+            selected.file.url,
+            "https://cdn.example.com/archive-member.zip"
+        );
+        assert_eq!(selected.file.size, Some(5));
+        assert_eq!(
+            selected.file.sha512.as_deref(),
+            Some(Proof::bytes(b"known").sha512.as_str())
+        );
+        let instance = owner.directories.admit(&id).unwrap();
+        let receipt = owner.prepare_install(&instance, &plan, false).unwrap();
+        assert_eq!(receipt.changes.len(), 1);
+        assert_eq!(receipt.changes[0].path, "resourcepacks/chosen.zip");
+        validate_receipt(&receipt).unwrap();
+        preflight(instance.game_directory(), &receipt, false).unwrap();
+        owner.persist_receipt(&receipt).unwrap();
+        owner
+            .apply(
+                instance,
+                receipt,
+                HashMap::from([("resourcepacks/chosen.zip".into(), b"known".to_vec())]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let directory = root.path().join("instances").join(id.as_str());
+        assert_eq!(
+            std::fs::read(directory.join("resourcepacks/chosen.zip")).unwrap(),
+            b"known"
+        );
+        assert!(!directory.join("resourcepacks/primary.zip").exists());
+        assert!(!directory.join("resourcepacks/known.zip").exists());
+        assert!(!directory.join("config/settings.txt").exists());
+        let installed = owner.installed(&id).unwrap();
+        assert_eq!(installed.entries().len(), 1);
+        let member = installed
+            .find(&CanonicalId("modrinth:known".into()))
+            .unwrap();
+        assert_eq!(member.version_id(), "known-v1");
+        assert_eq!(member.managed_filename().unwrap().as_str(), "chosen.zip");
+        assert_eq!(
+            member.sha512(),
+            Some(Proof::bytes(b"known").sha512.as_str())
+        );
+        assert!(!owner.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn selected_pack_same_version_replaces_the_disabled_artifact() {
+        let (root, owner, id) = fixture().await;
+        let directory = root.path().join("instances").join(id.as_str());
+        let member_id = CanonicalId("modrinth:known".into());
+        let mut before = ContentManifest::default();
+        before
+            .try_upsert(
+                ManifestEntry::managed(
+                    member_id.clone(),
+                    ProviderId::Modrinth,
+                    "known".into(),
+                    "known-v1".into(),
+                    ContentKind::ResourcePack,
+                    &FileRef {
+                        filename: "primary.zip".into(),
+                        url: "https://cdn.example.com/primary.zip".into(),
+                        size: Some(7),
+                        sha512: Some(Proof::bytes(b"primary").sha512),
+                        sha1: None,
+                        primary: true,
+                    },
+                    Vec::new(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        before.try_set_enabled(&member_id, false).unwrap();
+        std::fs::write(
+            directory.join(MANIFEST_FILE),
+            before.encode_managed().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("resourcepacks/primary.zip.disabled"),
+            b"primary",
+        )
+        .unwrap();
+        std::fs::write(directory.join("resourcepacks/user.zip"), b"user bytes").unwrap();
+        let plan = selected_pack_plan(&owner, &id, false).await.unwrap();
+        let selected = &plan.resolution().items[0];
+        assert!(selected.already_installed && selected.update);
+        let instance = owner.directories.admit(&id).unwrap();
+        let receipt = owner.prepare_install(&instance, &plan, false).unwrap();
+        assert_eq!(receipt.changes.len(), 2);
+        let after = ContentManifest::decode_managed(Some(&receipt.after_manifest)).unwrap();
+        assert!(after.find(&member_id).unwrap().enabled());
+        validate_receipt(&receipt).unwrap();
+        preflight(instance.game_directory(), &receipt, false).unwrap();
+        owner.persist_receipt(&receipt).unwrap();
+        owner
+            .apply(
+                instance,
+                receipt,
+                HashMap::from([("resourcepacks/chosen.zip".into(), b"known".to_vec())]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(directory.join("resourcepacks/chosen.zip")).unwrap(),
+            b"known"
+        );
+        assert_eq!(
+            std::fs::read(directory.join("resourcepacks/user.zip")).unwrap(),
+            b"user bytes"
+        );
+        assert!(
+            !directory
+                .join("resourcepacks/primary.zip.disabled")
+                .exists()
+        );
+        assert!(!directory.join("resourcepacks/chosen.zip.disabled").exists());
+        assert!(!directory.join("config/settings.txt").exists());
+        let installed = owner.installed(&id).unwrap();
+        let member = installed.find(&member_id).unwrap();
+        assert_eq!(member.version_id(), "known-v1");
+        assert!(member.enabled());
+        assert_eq!(
+            member.sha512(),
+            Some(Proof::bytes(b"known").sha512.as_str())
+        );
+        assert!(!owner.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn selected_pack_member_refuses_an_unselected_dependency() {
+        let (_root, owner, id) = fixture().await;
+        assert!(matches!(
+            selected_pack_plan(&owner, &id, true).await,
+            Err(MutationError::Pack(
+                super::super::packs::PackError::SelectionChanged
+            ))
+        ));
+        assert!(owner.installed(&id).unwrap().is_empty());
+        assert!(!owner.has_unsettled_effects());
+    }
+
+    async fn selected_pack_plan(
+        owner: &ContentMutations,
+        id: &InstanceId,
+        requires_dependency: bool,
+    ) -> Result<TargetedPlan, MutationError> {
+        let hash = Proof::bytes(b"known").sha512;
+        let published_file = |name: &str, bytes: &[u8], primary: bool| {
+            serde_json::json!({
+                "filename":name, "url":format!("https://cdn.example.com/{name}"),
+                "size":bytes.len(), "primary":primary,
+                "hashes":{"sha512":Proof::bytes(bytes).sha512},
+            })
+        };
+        let dependencies = if requires_dependency {
+            serde_json::json!([{"project_id":"dependency", "dependency_type":"required"}])
+        } else {
+            serde_json::json!([])
+        };
+        let version = serde_json::json!({
+            "project_id":"known", "id":"known-v1", "name":"Known version", "version_number":"1",
+            "version_type":"release", "loaders":["minecraft"], "game_versions":["1.21.4"],
+            "files":[published_file("primary.zip", b"primary", !requires_dependency),
+                published_file("known.zip", b"known", requires_dependency)],
+            "dependencies":dependencies,
+        });
+        let metadata = serde_json::json!([{
+            "id":"known", "title":"Known pack member", "project_type":"resourcepack",
+        }]);
+        let mut responses = vec![
+            serde_json::json!({hash.clone():version.clone()}).to_string(),
+            metadata.to_string(),
+            metadata.to_string(),
+            serde_json::json!([version]).to_string(),
+        ];
+        if requires_dependency {
+            responses.extend([
+                serde_json::json!([{
+                    "id":"dependency", "title":"Required dependency", "project_type":"resourcepack",
+                }]).to_string(),
+                serde_json::json!([{
+                    "project_id":"dependency", "id":"dependency-v1", "name":"Dependency", "version_number":"1",
+                    "version_type":"release", "loaders":["minecraft"], "game_versions":["1.21.4"],
+                    "files":[published_file("dependency.zip", b"dependency", true)], "dependencies":[],
+                }]).to_string(),
+            ]);
+        }
+        let (service, provider) = metadata_provider(responses).await;
+        let pack = pack_with_index(
+            serde_json::json!({"name":"Pack fixture", "dependencies":{"minecraft":"1.21.4"},
+                "files":[{"path":"resourcepacks/chosen.zip", "hashes":{"sha512":hash},
+                    "downloads":["https://cdn.example.com/archive-member.zip"]}]}),
+            &[("overrides/config/settings.txt", b"must not copy")],
+        );
+        let target = super::super::resolve::validated_target("vanilla", "1.21.4").unwrap();
+        let preview = super::super::packs::preview_files(&service, pack, &target, &[])
+            .await
+            .unwrap();
+        let shown = preview.snapshot();
+        assert_eq!(shown.files.len(), 1);
+        assert!(
+            shown.files[0].identified && shown.files[0].compatible && !shown.files[0].installed
+        );
+        let selection = preview
+            .select(&[shown.files[0].selection_id.clone()])
+            .unwrap();
+        let instance = owner.directories.admit(id).unwrap();
+        let plan = owner
+            .plan_selected_pack_admitted(&service, &instance, selection)
+            .await;
+        provider.await.unwrap();
+        plan
     }
 
     #[tokio::test]

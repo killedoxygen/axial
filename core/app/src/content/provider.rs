@@ -118,6 +118,8 @@ pub(super) mod dto {
         pub version_id: Option<String>,
         #[serde(default)]
         pub project_id: Option<String>,
+        #[serde(default)]
+        pub file_name: Option<String>,
         pub dependency_type: DependencyType,
     }
 
@@ -526,7 +528,7 @@ pub(super) fn map_version(version: dto::Version) -> ContentResult<ContentVersion
         dependencies: version
             .dependencies
             .into_iter()
-            .map(map_dependency)
+            .filter_map(|dependency| map_dependency(dependency).transpose())
             .collect::<ContentResult<Vec<_>>>()?,
     })
 }
@@ -575,7 +577,9 @@ pub(super) fn map_file(file: dto::VersionFile) -> ContentResult<FileRef> {
     })
 }
 
-pub(super) fn map_dependency(dependency: dto::Dependency) -> ContentResult<ContentDependency> {
+pub(super) fn map_dependency(
+    dependency: dto::Dependency,
+) -> ContentResult<Option<ContentDependency>> {
     let kind = match dependency.dependency_type {
         dto::DependencyType::Required => DependencyKind::Required,
         dto::DependencyType::Optional => DependencyKind::Optional,
@@ -589,15 +593,26 @@ pub(super) fn map_dependency(dependency: dto::Dependency) -> ContentResult<Conte
         validate_provider_identity("dependency version", version_id)?;
     }
     if dependency.project_id.is_none() && dependency.version_id.is_none() {
-        return Err(ContentError::ProviderMetadataInvalid(
-            "content dependency has no project or version identity".to_string(),
-        ));
+        let named = dependency.file_name.as_deref().is_some_and(|label| {
+            !label.trim().is_empty() && label.len() <= 1024 && !label.chars().any(char::is_control)
+        });
+        match kind {
+            // Embedded records carry no separate dependency or file authority.
+            DependencyKind::Embedded if named || dependency.file_name.is_none() => return Ok(None),
+            // Preserve the unresolved requirement so install admission can refuse it.
+            DependencyKind::Required if named => {}
+            _ => {
+                return Err(ContentError::ProviderMetadataInvalid(
+                    "content dependency has no project or version identity".to_string(),
+                ));
+            }
+        }
     }
-    Ok(ContentDependency {
+    Ok(Some(ContentDependency {
         project_id: dependency.project_id,
         version_id: dependency.version_id,
         kind,
-    })
+    }))
 }
 
 pub(super) fn map_identity(version: dto::Version) -> ContentResult<VersionIdentity> {
@@ -613,7 +628,7 @@ pub(super) fn map_identity(version: dto::Version) -> ContentResult<VersionIdenti
     let dependencies = version
         .dependencies
         .into_iter()
-        .map(map_dependency)
+        .filter_map(|dependency| map_dependency(dependency).transpose())
         .collect::<ContentResult<Vec<_>>>()?;
     Ok(VersionIdentity {
         provider: ProviderId::Modrinth,
@@ -841,7 +856,9 @@ mod tests {
             {"version_id":"pinned","dependency_type":"required"},
             {"project_id":"p2","dependency_type":"incompatible"},
             {"project_id":"p3","dependency_type":"optional"},
-            {"project_id":"p4","dependency_type":"embedded"}
+            {"project_id":"p4","dependency_type":"embedded"},
+            {"project_id":null,"version_id":null,"dependency_type":"embedded",
+                "file_name":"CatEyes-v7_Fabric-1.21.1.jar"}
         ]))
         .unwrap();
         let identity = map_identity(raw).unwrap();
@@ -870,6 +887,53 @@ mod tests {
         );
         let missing = serde_json::from_value(json!({"dependency_type":"required"})).unwrap();
         assert!(map_dependency(missing).is_err());
+    }
+
+    #[test]
+    fn embedded_file_labels_do_not_admit_invalid_or_unidentified_dependency_edges() {
+        for kind in ["optional", "incompatible"] {
+            let raw = json!({"project_id":null,"version_id":null,
+                "dependency_type":kind,"file_name":"CatEyes-v7_Fabric-1.21.1.jar"});
+            assert!(map_dependency(serde_json::from_value(raw).unwrap()).is_err());
+        }
+        for label in [
+            json!(""),
+            json!(" "),
+            json!("bad\nlabel"),
+            json!("x".repeat(1025)),
+        ] {
+            let raw = json!({"project_id":null,"version_id":null,
+                "dependency_type":"embedded","file_name":label});
+            assert!(map_dependency(serde_json::from_value(raw).unwrap()).is_err());
+        }
+        for label in [
+            json!(null),
+            json!(""),
+            json!("bad\nlabel"),
+            json!("x".repeat(1025)),
+        ] {
+            let raw = json!({"project_id":null,"version_id":null,
+                "dependency_type":"required","file_name":label});
+            assert!(map_dependency(serde_json::from_value(raw).unwrap()).is_err());
+        }
+        for (project, version) in [(Some("../bad"), None), (None, Some(""))] {
+            let raw = json!({"project_id":project,"version_id":version,
+                "dependency_type":"embedded","file_name":"CatEyes-v7_Fabric-1.21.1.jar"});
+            assert!(map_dependency(serde_json::from_value(raw).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn named_required_file_dependencies_remain_unidentified_obligations() {
+        let raw = json!({"project_id":null,"version_id":null,
+            "dependency_type":"required","file_name":"held-item-info-1.3.0.jar"});
+        let dependency = map_dependency(serde_json::from_value(raw).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(dependency).unwrap(),
+            json!({"kind":"required"})
+        );
     }
 
     #[test]

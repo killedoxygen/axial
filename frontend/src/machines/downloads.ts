@@ -402,7 +402,7 @@ async function enqueueBackendInstallItem(
   }
 }
 
-async function reconcileUncertainMutation(): Promise<void> {
+export async function reconcileUncertainMutation(): Promise<void> {
   // A lost response is resolved by an authoritative read, never mutation replay.
   await refreshInstallQueue({ connectActive: true }).catch(showInstallQueueError);
 }

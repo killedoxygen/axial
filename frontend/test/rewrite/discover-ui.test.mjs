@@ -94,6 +94,7 @@ async function clientHarness(respond) {
   const calls = [];
   const client = await loadSource('content.ts', {
     'api.ts': { api: async (/** @type {ApiCall} */ ...args) => { calls.push(plain(args)); return respond(...args); } },
+    'machines/downloads.ts': { reconcileUncertainMutation: async () => {} },
   });
   return { client, calls };
 }
@@ -179,7 +180,10 @@ async function actionHarness(planResponse = { ...conflictPlan, conflicts: [] }, 
       }
       throw new Error(`Unexpected request: ${path}`);
     } },
-    'machines/downloads.ts': { applyInstallQueueResponse: async (/** @type {Parameters<typeof import('../../src/machines/downloads').applyInstallQueueResponse>} */ ...args) => applied.push(args) },
+    'machines/downloads.ts': {
+      applyInstallQueueResponse: async (/** @type {Parameters<typeof import('../../src/machines/downloads').applyInstallQueueResponse>} */ ...args) => applied.push(args),
+      reconcileUncertainMutation: async () => {},
+    },
     'toast.ts': { toast: (/** @type {Parameters<typeof import('../../src/toast').toast>} */ ...args) => notices.push(args) },
     'utils.ts': { errMessage: (/** @type {unknown} */ error) => error instanceof Error ? error.message : String(error) },
     'ui-state.ts': { openCreateModpack: () => { throw new Error('Unexpected create navigation'); } },
@@ -353,10 +357,17 @@ test('search remount shares a pending request and a forced retry wins over an ol
   assert.equal(state.loading, false);
 });
 
-test('discover presentation, filters, target bar and pack picker retain the baseline source', async () => {
-  for (const file of ['DiscoverView.tsx', 'ContentDetailView.tsx', 'TargetBar.tsx', 'ModpackPicker.tsx', 'shared.tsx', 'markdown.tsx', 'discover.css']) {
+test('discover presentation, filters and target bar retain the baseline source', async () => {
+  for (const file of ['DiscoverView.tsx', 'ContentDetailView.tsx', 'TargetBar.tsx', 'shared.tsx', 'markdown.tsx', 'discover.css']) {
     const current = await readFile(resolve(sourceRoot, 'views/discover', file), 'utf8');
     const baseline = await readFile(resolve(sourceRoot, '../../legacy/frontend/src/views/discover', file), 'utf8');
     assert.equal(current, baseline, file);
   }
+  const picker = await readFile(resolve(sourceRoot, 'views/discover/ModpackPicker.tsx'), 'utf8');
+  const baselinePicker = await readFile(resolve(sourceRoot, '../../legacy/frontend/src/views/discover/ModpackPicker.tsx'), 'utf8');
+  const markup = '  return (\n    <Modal';
+  const currentMarkup = picker.indexOf(markup);
+  const baselineMarkup = baselinePicker.indexOf(markup);
+  assert.ok(currentMarkup >= 0 && baselineMarkup >= 0);
+  assert.equal(picker.slice(currentMarkup), baselinePicker.slice(baselineMarkup));
 });

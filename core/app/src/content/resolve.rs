@@ -9,6 +9,7 @@ use super::model::{
     CanonicalId, ContentDependency, ContentKind, ContentVersion, DependencyKind, FileRef,
     LoaderGameFilter, ProjectMetadata, ProviderId, ReleaseChannel, VersionIdentity,
 };
+use super::packs::{PackError, PackFileSelection};
 use super::provenance::{ContentManifest, LiveManagedContent, ManifestEntry};
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +131,8 @@ pub enum ResolutionError {
     LimitExceeded(ResolutionLimitExceeded),
     #[error(transparent)]
     Provider(#[from] ContentError),
+    #[error(transparent)]
+    Pack(#[from] PackError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +295,7 @@ pub struct TargetedPlan {
     state: ContentPlanState,
     resolution: ContentResolution,
     expires_at: std::time::Instant,
+    selected_pack: bool,
 }
 
 impl TargetedPlan {
@@ -310,7 +314,38 @@ impl TargetedPlan {
             state,
             resolution,
             expires_at,
+            selected_pack: false,
         })
+    }
+
+    pub(crate) async fn resolve_selected_pack(
+        service: &ContentService,
+        state: ContentPlanState,
+        selection: PackFileSelection,
+        manifest: &ContentManifest,
+        live: &LiveManagedContent,
+    ) -> Result<Self, ResolutionError> {
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let resolution = resolve_content_with_pack(
+            service,
+            state.target(),
+            selection.selections(),
+            manifest,
+            live,
+            Some(&selection),
+        )
+        .await?;
+        selection.finish(&resolution)?;
+        Ok(Self {
+            state,
+            resolution,
+            expires_at,
+            selected_pack: true,
+        })
+    }
+
+    pub(crate) fn preserves_enabled_state(&self) -> bool {
+        !self.selected_pack
     }
 
     pub fn resolution(&self) -> &ContentResolution {
@@ -589,6 +624,17 @@ pub async fn resolve_content(
     manifest: &ContentManifest,
     live_content: &LiveManagedContent,
 ) -> Result<ContentResolution, ResolutionError> {
+    resolve_content_with_pack(service, target, selections, manifest, live_content, None).await
+}
+
+async fn resolve_content_with_pack(
+    service: &ContentService,
+    target: &ResolutionTarget,
+    selections: &[ResolutionSelection],
+    manifest: &ContentManifest,
+    live_content: &LiveManagedContent,
+    pack: Option<&PackFileSelection>,
+) -> Result<ContentResolution, ResolutionError> {
     if selections.is_empty() {
         return Err(ResolutionError::NoSelection);
     }
@@ -659,6 +705,7 @@ pub async fn resolve_content(
             live_content,
             &exact_requirements,
             &mut work_budget,
+            pack,
         ))
         .await?;
         if pass.retry_with_exact.is_empty() {
@@ -773,6 +820,7 @@ async fn resolve_pass(
     live_content: &LiveManagedContent,
     exact_requirements: &HashMap<CanonicalId, String>,
     work_budget: &mut ResolutionBudget,
+    pack: Option<&PackFileSelection>,
 ) -> Result<ResolvePass, ResolutionError> {
     let selected_ids: Vec<CanonicalId> = selections
         .iter()
@@ -884,7 +932,15 @@ async fn resolve_pass(
             push_conflict(&mut conflicts, unavailable_conflict(&canonical_id))?;
             continue;
         };
-        let file = unambiguous_install_artifact(version)?.clone();
+        let pack_file = pack
+            .map(|pack| pack.artifact_for(&canonical_id, kind, version))
+            .transpose()?
+            .flatten();
+        let selected_pack = pack_file.is_some();
+        let file = match pack_file {
+            Some(file) => file,
+            None => unambiguous_install_artifact(version)?.clone(),
+        };
         let (artifact_bytes, _) = validate_planned_artifact(kind, &file)?;
         budget.admit_artifact(artifact_bytes)?;
         work_budget.admit_artifact(artifact_bytes)?;
@@ -970,8 +1026,17 @@ async fn resolve_pass(
         }
 
         let existing = manifest.find(&canonical_id);
-        let (already_installed, update) =
+        let (already_installed, mut update) =
             resolved_install_state(existing, live_content, &version.id);
+        if selected_pack && already_installed {
+            update |= existing.is_some_and(|entry| {
+                entry.kind() != kind
+                    || entry.managed_filename().map(|name| name.as_str())
+                        != Some(file.filename.as_str())
+                    || entry.sha512() != file.sha512.as_deref()
+                    || entry.size() != file.size
+            });
+        }
         let project_id = canonical_id.project_id().to_string();
 
         let item = ResolvedContentItem {
@@ -1636,6 +1701,55 @@ mod tests {
             title.map(str::to_string),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unidentified_required_file_dependencies_cannot_be_overridden() {
+        let fixture = ProviderFixture::new(
+            vec![provider_project("root", "Root")],
+            HashMap::from([(
+                "root".to_string(),
+                provider_versions(vec![provider_version(
+                    "root-v1",
+                    "root",
+                    vec![json!({"project_id":null,"version_id":null,
+                    "dependency_type":"required","file_name":"held-item-info-1.3.0.jar"})],
+                )]),
+            )]),
+        )
+        .await;
+        let state = ContentPlanState {
+            target: resolver_target(),
+            ..plan_state()
+        };
+        let plan = TargetedPlan::resolve(
+            &fixture.service,
+            state.clone(),
+            &[selection("modrinth:root", ContentKind::Mod)],
+            &ContentManifest::default(),
+            &LiveManagedContent::default(),
+        )
+        .await
+        .unwrap();
+        let resolution = plan.resolution();
+        assert_eq!(resolution.items.len(), 1);
+        assert_eq!(resolution.conflicts.len(), 1);
+        assert_eq!(
+            resolution.conflicts[0].reason,
+            ResolutionConflictReason::RequiredDependencyUnidentified
+        );
+        assert_eq!(
+            resolution.conflicts[0].kind(),
+            ResolutionConflictKind::Unavailable
+        );
+        for allow_incompatible in [false, true] {
+            assert!(matches!(
+                plan.authorized_files(&state, allow_incompatible),
+                Err(PlanValidationError::Unavailable)
+            ));
+        }
+        assert!(resolution.to_install().is_err());
+        assert_eq!(fixture.request_count("/v2/versions"), 0);
     }
 
     #[tokio::test]
@@ -2362,6 +2476,7 @@ mod tests {
                 conflicts: Vec::new(),
             },
             expires_at: now + std::time::Duration::from_secs(60),
+            selected_pack: false,
         };
         assert!(plan.validate_at(&state, now).is_ok());
         let mut replacements = vec![state.clone(); 5];
@@ -2398,6 +2513,7 @@ mod tests {
                 }],
             },
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            selected_pack: false,
         };
         assert!(matches!(
             plan.authorized_files(&state, false),

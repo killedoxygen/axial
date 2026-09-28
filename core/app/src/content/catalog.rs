@@ -534,6 +534,130 @@ mod tests {
         assert_eq!(request_url(&requests[3]).path(), "/v2/version/v1");
     }
 
+    fn sodium_plus_versions() -> Value {
+        json!([{
+            "project_id":"ch7UHY2J","id":"7rxdscKW","name":"2.3.2-alpha.6",
+            "version_number":"2.3.2-alpha.6","version_type":"alpha",
+            "loaders":["fabric"],"game_versions":["1.21.8"],
+            "files":[{
+                "filename":"Sodium Plus 2.3.2-alpha.6.mrpack",
+                "url":"https://cdn.modrinth.com/data/ch7UHY2J/versions/7rxdscKW/Sodium%20Plus%202.3.2-alpha.6.mrpack",
+                "size":224972,"primary":true,
+                "hashes":{"sha512":"276570edfc139ab80732c5f90d95a095c60d79508555035d3afc6cc66319d09c9756cd2377ed2e2b49e1f0e56c169c86292677b7e77f230c9b6532768b8cfec2"}
+            }],
+            "dependencies":[
+                {"project_id":"AANobbMI","version_id":"ND4ROcMQ",
+                    "file_name":null,"dependency_type":"embedded"},
+                {"project_id":null,"version_id":null,
+                    "file_name":"CatEyes-v7_Fabric-1.21.1.jar","dependency_type":"embedded"}
+            ]
+        }, {
+            "project_id":"ch7UHY2J","id":"DU3jnX8R","name":"v2.0.0_beta8+1.19.3",
+            "version_number":"2.0.0-beta8","version_type":"beta",
+            "loaders":["fabric"],"game_versions":["1.19.3"],
+            "files":[{
+                "filename":"Sodium Plus-2.0.0-beta8.mrpack",
+                "url":"https://cdn.modrinth.com/data/ch7UHY2J/versions/DU3jnX8R/Sodium%20Plus-2.0.0-beta8.mrpack",
+                "size":3355675,"primary":true,
+                "hashes":{"sha512":"c68163c60b65e05fff4d6bbeb2a81724bb1cfe5daf82090babfae3a6c482a477e40c5815805b74f47c340b3d7aa833c106b6370e2a024dd650bec30a42b9645e"}
+            }],
+            "dependencies":[{"project_id":null,"version_id":null,
+                "file_name":null,"dependency_type":"embedded"}]
+        }, {
+            "project_id":"ch7UHY2J","id":"DdnfdzjY","name":"Version 1.2.0",
+            "version_number":"1.2.0","version_type":"beta",
+            "loaders":["fabric"],"game_versions":["1.19"],
+            "files":[{
+                "filename":"Sodium_Plus-1.2.0_1.19.mrpack",
+                "url":"https://cdn.modrinth.com/data/ch7UHY2J/versions/1.2.0/Sodium_Plus-1.2.0_1.19.mrpack",
+                "size":2641977,"primary":true,
+                "hashes":{"sha512":"cb1664e44473d3547d34629d774f263f12348f2373ef51315f4e85d209b1122d8334027a2a225d8b6035a7054c973093ef1ad9fdf570a4ae71779c5728f6abb2"}
+            }],
+            "dependencies":[{"project_id":null,"version_id":null,
+                "file_name":"held-item-info-1.3.0.jar","dependency_type":"required"}]
+        }])
+    }
+
+    #[tokio::test]
+    async fn pack_detail_accepts_embedded_file_labels_without_dependency_authority() {
+        let versions = sodium_plus_versions();
+        let (service, server) = fixture(vec![
+            response(json!({"id":"ch7UHY2J","title":"Sodium Plus","project_type":"modpack"})),
+            response(versions.clone()),
+            response(versions),
+        ])
+        .await;
+        let detail = service
+            .detail(&CanonicalId("modrinth:ch7UHY2J".into()))
+            .await
+            .unwrap();
+        assert_eq!(detail.content.kind, ContentKind::Modpack);
+        assert_eq!(detail.versions.len(), 3);
+        let version = &detail.versions[0];
+        assert_eq!(version.id, "7rxdscKW");
+        assert_eq!(version.files.len(), 1);
+        assert_eq!(
+            version.primary_file().unwrap().filename,
+            "Sodium Plus 2.3.2-alpha.6.mrpack"
+        );
+        assert_eq!(
+            version.dependencies,
+            [ContentDependency {
+                project_id: Some("AANobbMI".into()),
+                version_id: Some("ND4ROcMQ".into()),
+                kind: DependencyKind::Embedded,
+            }]
+        );
+        assert_eq!(detail.versions[1].id, "DU3jnX8R");
+        assert!(detail.versions[1].dependencies.is_empty());
+        assert_eq!(detail.versions[2].id, "DdnfdzjY");
+        assert_eq!(
+            serde_json::to_value(&detail.versions[2].dependencies).unwrap(),
+            json!([{"kind":"required"}])
+        );
+        let identities = service
+            .version_identities(&["7rxdscKW".into(), "DU3jnX8R".into(), "DdnfdzjY".into()])
+            .await
+            .unwrap();
+        for version in &detail.versions {
+            assert_eq!(identities[&version.id].dependencies, version.dependencies);
+        }
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(request_url(&requests[0]).path(), "/v2/project/ch7UHY2J");
+        assert_eq!(
+            request_url(&requests[1]).path(),
+            "/v2/project/ch7UHY2J/version"
+        );
+        assert_eq!(request_url(&requests[2]).path(), "/v2/versions");
+    }
+
+    #[tokio::test]
+    async fn pack_version_refuses_unidentified_required_file_dependencies() {
+        use super::super::packs::{PackError, resolve_pack_version};
+
+        let project = json!({"id":"ch7UHY2J","title":"Sodium Plus","project_type":"modpack"});
+        let (service, server) = fixture(vec![
+            response(project.clone()),
+            response(sodium_plus_versions()),
+            response(project),
+            response(sodium_plus_versions()),
+        ])
+        .await;
+        let id = CanonicalId("modrinth:ch7UHY2J".into());
+        let (_, version) = resolve_pack_version(&service, &id, Some("7rxdscKW"))
+            .await
+            .unwrap();
+        assert_eq!(version.id, "7rxdscKW");
+        assert!(matches!(
+            resolve_pack_version(&service, &id, Some("DdnfdzjY")).await,
+            Err(PackError::Invalid(
+                "required dependency could not be identified"
+            ))
+        ));
+        assert_eq!(server.await.unwrap().len(), 4);
+    }
+
     #[tokio::test]
     async fn provider_hash_lookup_preserves_file_identity_and_version_dependencies() {
         let hash = "a".repeat(128);

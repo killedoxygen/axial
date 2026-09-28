@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { getModpackFiles, installModpack } from '../../content';
+import { contentRevision } from '../../content-activity';
 import { formatBytes, plural } from '../../format';
 import { applyInstallQueueResponse } from '../../machines/downloads';
 import { Button } from '../../ui/Atoms';
@@ -8,6 +9,8 @@ import { Icon } from '../../ui/Icons';
 import { Modal, ModalContent } from '../../ui/Modal';
 import { errMessage } from '../../utils';
 import type { ModpackFilesPlan } from '../../types-content';
+
+type PickerContext = { open: boolean; instanceId: string; canonicalId: string; versionId?: string };
 
 export function ModpackPicker({
   open,
@@ -22,31 +25,81 @@ export function ModpackPicker({
   versionId?: string;
   onClose: () => void;
 }): JSX.Element | null {
-  const [plan, setPlan] = useState<ModpackFilesPlan | null>(null);
+  const context = useRef<PickerContext>({ open, instanceId, canonicalId, versionId });
+  if (
+    context.current.open !== open ||
+    context.current.instanceId !== instanceId ||
+    context.current.canonicalId !== canonicalId ||
+    context.current.versionId !== versionId
+  ) {
+    context.current = { open, instanceId, canonicalId, versionId };
+  }
+  const currentContext = context.current;
+  const revision = contentRevision.value;
+  const refresh = useRef(0);
+  const generation = refresh.current;
+  const [loadedPlan, setPlan] = useState<{
+    context: PickerContext;
+    revision: number;
+    generation: number;
+    plan: ModpackFilesPlan;
+  } | null>(null);
+  const plan =
+    loadedPlan?.context === currentContext && loadedPlan.revision === revision && loadedPlan.generation === generation
+      ? loadedPlan.plan
+      : null;
+  const selectedContext = useRef<PickerContext | null>(null);
+  const pending = useRef<object | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [error, setError] = useState('');
+  const [submitError, setError] = useState('');
+  const [planError, setPlanError] = useState('');
+  const error = submitError || planError;
   const [busy, setBusy] = useState(false);
 
+  useEffect(
+    () => () => {
+      pending.current = null;
+    },
+    [],
+  );
   useEffect(() => {
-    if (!open) return;
+    if (!currentContext.open) return;
     let cancelled = false;
+    const initial = selectedContext.current !== currentContext;
     setPlan(null);
-    setError('');
-    void getModpackFiles(instanceId, canonicalId, versionId)
+    setPlanError('');
+    if (initial) {
+      setError('');
+      setSelected(new Set());
+      setBusy(false);
+      pending.current = null;
+    }
+    const current = (): boolean =>
+      !cancelled &&
+      context.current === currentContext &&
+      contentRevision.value === revision &&
+      refresh.current === generation;
+    void getModpackFiles(currentContext.instanceId, currentContext.canonicalId, currentContext.versionId)
       .then((next) => {
-        if (cancelled) return;
-        setPlan(next);
+        if (!current()) return;
+        setPlan({ context: currentContext, revision, generation, plan: next });
         setSelected(
-          new Set(next.files.filter((file) => file.compatible && !file.installed).map((file) => file.selection_id)),
+          (previous) =>
+            new Set(
+              next.files
+                .filter((file) => file.compatible && !file.installed && (initial || previous.has(file.selection_id)))
+                .map((file) => file.selection_id),
+            ),
         );
+        selectedContext.current = currentContext;
       })
       .catch((reason: unknown) => {
-        if (!cancelled) setError(errMessage(reason));
+        if (current()) setPlanError(errMessage(reason));
       });
     return () => {
       cancelled = true;
     };
-  }, [open, instanceId, canonicalId, versionId]);
+  }, [currentContext, revision, generation]);
 
   const files = useMemo(() => plan?.files.filter((file) => file.compatible && !file.installed) ?? [], [plan]);
   const selectedBytes = files.reduce(
@@ -56,7 +109,19 @@ export function ModpackPicker({
 
   if (!open) return null;
   const submit = async (): Promise<void> => {
-    if (!plan || selected.size === 0 || busy) return;
+    if (
+      !plan ||
+      selected.size === 0 ||
+      busy ||
+      pending.current ||
+      context.current !== currentContext ||
+      contentRevision.value !== revision ||
+      refresh.current !== generation
+    )
+      return;
+    const submission = {};
+    pending.current = submission;
+    const current = (): boolean => context.current === currentContext && pending.current === submission;
     setBusy(true);
     setError('');
     try {
@@ -65,11 +130,18 @@ export function ModpackPicker({
         includeOverrides: false,
       });
       await applyInstallQueueResponse(queue, { showNotice: true, connectActive: true });
-      onClose();
+      if (current()) onClose();
     } catch (reason) {
-      setError(errMessage(reason));
+      if (current()) {
+        refresh.current += 1;
+        setPlan(null);
+        setError(errMessage(reason));
+      }
     } finally {
-      setBusy(false);
+      if (current()) {
+        pending.current = null;
+        setBusy(false);
+      }
     }
   };
 

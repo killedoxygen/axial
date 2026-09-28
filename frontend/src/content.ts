@@ -11,6 +11,7 @@ import {
   resolutionPlanResponse,
 } from './dto-content';
 import { installQueueStateResponse } from './dto-install';
+import { reconcileUncertainMutation } from './machines/downloads';
 import type {
   ContentCompatResponse,
   ContentDetail,
@@ -39,6 +40,15 @@ export interface ContentSearchInput {
   limit?: number;
   /** Annotates each result with what this instance already has. */
   instanceId?: string;
+}
+
+async function queueResponse(request: Promise<unknown>): Promise<InstallQueueStateResponse> {
+  try {
+    return installQueueStateResponse(await request);
+  } catch (error) {
+    await reconcileUncertainMutation();
+    throw error;
+  }
 }
 
 export function searchContent(input: ContentSearchInput): Promise<ContentPage> {
@@ -80,11 +90,13 @@ export function installContent(
   selections: ContentSelection[],
   allowIncompatible = false,
 ): Promise<InstallQueueStateResponse> {
-  return api('POST', '/content/install', {
-    instance_id: instanceId,
-    selections,
-    allow_incompatible: allowIncompatible,
-  }).then(installQueueStateResponse);
+  return queueResponse(
+    api('POST', '/content/install', {
+      instance_id: instanceId,
+      selections,
+      allow_incompatible: allowIncompatible,
+    }),
+  );
 }
 
 /** Which instances a staged set could live in, ranked by how little each one drops. */
@@ -118,13 +130,15 @@ export function installModpack(
     includeOverrides?: boolean;
   } = {},
 ): Promise<InstallQueueStateResponse> {
-  return api('POST', '/content/modpack/install', {
-    instance_id: instanceId,
-    canonical_id: canonicalId,
-    version_id: versionId,
-    selected_file_ids: options.selectedFileIds ?? [],
-    include_overrides: options.includeOverrides ?? true,
-  }).then(installQueueStateResponse);
+  return queueResponse(
+    api('POST', '/content/modpack/install', {
+      instance_id: instanceId,
+      canonical_id: canonicalId,
+      version_id: versionId,
+      selected_file_ids: options.selectedFileIds ?? [],
+      include_overrides: options.includeOverrides ?? true,
+    }),
+  );
 }
 
 export function listInstanceContent(instanceId: string): Promise<InstanceContentResponse> {
@@ -136,7 +150,9 @@ export function checkContentUpdates(instanceId: string): Promise<ContentUpdatesR
 }
 
 export function uninstallContents(instanceId: string, canonicalIds: string[]): Promise<InstallQueueStateResponse> {
-  return api('POST', `/instances/${encodeURIComponent(instanceId)}/content/uninstall`, {
-    canonical_ids: canonicalIds,
-  }).then(installQueueStateResponse);
+  return queueResponse(
+    api('POST', `/instances/${encodeURIComponent(instanceId)}/content/uninstall`, {
+      canonical_ids: canonicalIds,
+    }),
+  );
 }

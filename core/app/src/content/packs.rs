@@ -5,7 +5,8 @@
 
 use super::catalog::ContentService;
 use super::model::{
-    CanonicalContent, CanonicalId, ContentKind, ContentVersion, FileRef, VersionIdentity,
+    CanonicalContent, CanonicalId, ContentKind, ContentVersion, DependencyKind, FileRef,
+    VersionIdentity,
 };
 use super::resolve::{ContentResolution, ResolutionSelection, ResolutionTarget, pick_version};
 use crate::files::portable::{
@@ -311,6 +312,15 @@ pub async fn resolve_pack_version(
     let version = pick_version(&detail.versions, version_id)
         .ok_or(PackError::SelectionChanged)?
         .clone();
+    if version.dependencies.iter().any(|dependency| {
+        dependency.kind == DependencyKind::Required
+            && dependency.project_id.is_none()
+            && dependency.version_id.is_none()
+    }) {
+        return Err(PackError::Invalid(
+            "required dependency could not be identified",
+        ));
+    }
     Ok((detail.content, version))
 }
 
@@ -472,6 +482,49 @@ impl PackFileSelection {
         &self.selections
     }
 
+    pub(crate) fn artifact_for(
+        &self,
+        canonical_id: &CanonicalId,
+        kind: ContentKind,
+        version: &ContentVersion,
+    ) -> PackResult<Option<FileRef>> {
+        let Some((selection, file)) = self
+            .selections
+            .iter()
+            .zip(&self.plan.files)
+            .find(|(selection, _)| selection.canonical_id == canonical_id.as_str())
+        else {
+            return Ok(None);
+        };
+        if selection.version_id.as_deref() != Some(version.id.as_str())
+            || selection.kind != kind
+            || file.kind() != Some(kind)
+        {
+            return Err(PackError::SelectionChanged);
+        }
+        let hash = file.sha512.as_ref().ok_or(PackError::SelectionChanged)?;
+        let published = version
+            .files
+            .iter()
+            .find(|published| published.sha512.as_ref() == Some(hash))
+            .ok_or(PackError::SelectionChanged)?;
+        if file
+            .size
+            .zip(published.size)
+            .is_some_and(|(declared, published)| declared != published)
+        {
+            return Err(PackError::SelectionChanged);
+        }
+        Ok(Some(FileRef {
+            filename: file.filename().into(),
+            url: file.url.clone(),
+            size: file.size.or(published.size),
+            sha512: file.sha512.clone(),
+            sha1: file.sha1.clone(),
+            primary: true,
+        }))
+    }
+
     pub fn finish(self, resolution: &ContentResolution) -> PackResult<PackPlan> {
         if !resolution.conflicts.is_empty() {
             return Err(PackError::SelectionChanged);
@@ -506,7 +559,7 @@ impl PackFileSelection {
                         && file.filename() == item.file.filename
                         && file.sha512.is_some()
                         && file.sha512 == item.file.sha512
-                        && file.size == item.file.size
+                        && file.size.is_none_or(|size| item.file.size == Some(size))
                 }) {
                     return Err(PackError::SelectionChanged);
                 }
@@ -1249,6 +1302,38 @@ mod tests {
             }],
         };
         assert!(selected().finish(&resolution).is_ok());
+        let mut version: ContentVersion = serde_json::from_value(serde_json::json!({
+            "id":"exact", "name":"Member", "version_number":"exact", "channel":"release",
+            "files":[resolution.items[0].file.clone()],
+        }))
+        .unwrap();
+        version.files[0].primary = false;
+        let mut primary = version.files[0].clone();
+        primary.filename = "primary.zip".into();
+        primary.sha512 = Some("a".repeat(128));
+        primary.primary = true;
+        version.files.insert(0, primary);
+        assert_eq!(
+            selected()
+                .artifact_for(
+                    &CanonicalId("modrinth:member".into()),
+                    ContentKind::ResourcePack,
+                    &version
+                )
+                .unwrap()
+                .unwrap()
+                .sha512,
+            resolution.items[0].file.sha512
+        );
+        version.files.pop();
+        assert!(matches!(
+            selected().artifact_for(
+                &CanonicalId("modrinth:member".into()),
+                ContentKind::ResourcePack,
+                &version
+            ),
+            Err(PackError::SelectionChanged)
+        ));
         resolution.items[0].file.sha512 = Some("a".repeat(128));
         assert!(matches!(
             selected().finish(&resolution),
