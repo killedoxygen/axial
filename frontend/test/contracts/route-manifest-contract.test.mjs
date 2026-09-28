@@ -78,8 +78,8 @@ function productionCompositionSource(source) {
   const wrapper = functionSource(source, 'start_profile');
   assert.match(
     wrapper.slice(wrapper.indexOf('{')),
-    /^\{\s*start_profile_inner\(\s*profile_root,\s*extra_origin,\s*native_login,\s*collector,\s*#\[cfg\(test\)\]\s*None,\s*\)\s*\.await\s*\}$/,
-    'production startup must delegate directly to the shared composition without test endpoint injection',
+    /^\{\s*start_profile_inner\(\s*profile_root,\s*extra_origin,\s*native_login,\s*collector,\s*(?:#\[cfg\(test\)\]\s*None,\s*){2}\)\s*\.await\s*\}$/,
+    'production startup must delegate directly to the shared composition without test input injection',
   );
   return functionSource(source, 'start_profile_inner');
 }
@@ -388,6 +388,8 @@ async fn start_profile() {
         collector,
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     ).await
 }
 #[cfg(test)]
@@ -401,10 +403,14 @@ async fn start_profile_inner() {
   assert.deepEqual(registeredRoutes(productionCompositionSource(source), 'fixture.rs'), [
     { method: 'GET', template: '/api/v1/production', registration_source: 'fixture.rs' },
   ]);
-  assert.throws(
-    () => productionCompositionSource(source.replace('        None,', '        Some(endpoints),')),
-    /without test endpoint injection/,
-  );
+  const slots = [...source.matchAll(/#\[cfg\(test\)\]\s*None,/g)];
+  assert.equal(slots.length, 2);
+  for (const slot of slots) {
+    for (const replacement of ['#[cfg(test)] Some(injected),', 'None,']) {
+      const changed = source.slice(0, slot.index) + replacement + source.slice(slot.index + slot[0].length);
+      assert.throws(() => productionCompositionSource(changed), /without test input injection/);
+    }
+  }
   assert.throws(
     () => productionCompositionSource(source.replace('    start_profile_inner(', '    test_startup(')),
     /delegate directly/,
