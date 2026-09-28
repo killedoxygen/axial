@@ -314,6 +314,9 @@ impl DesktopLifecycle {
             .unwrap_or_else(|error| error.into_inner())
             .admitted;
         if !admitted {
+            if intent != TerminalIntent::Close {
+                services.server.ensure_no_interrupted_launch()?;
+            }
             self.prepare_interface_preferences(intent).await?;
             // Preference HTTP writes and accepted skin intents must finish
             // while task admission is still open. A busy refusal remains a

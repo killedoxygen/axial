@@ -238,6 +238,14 @@ impl ServerHandle {
         self.shutdown_settled.load(Ordering::Acquire)
     }
 
+    /// Destructive shell actions must check before changing terminal admission.
+    pub fn ensure_no_interrupted_launch(&self) -> Result<(), String> {
+        self.library.ensure_no_interrupted_launch().map_err(|_| {
+            "A previous game process has not been proven settled. The local API remains available."
+                .to_string()
+        })
+    }
+
     /// Dropping this waiter retains the actual task handle for a later caller.
     pub async fn wait(&self) -> Result<(), String> {
         Self::join_owned(&self.serving, "The local API worker did not stop cleanly.").await
@@ -262,11 +270,8 @@ impl ServerHandle {
 
     /// Mutations settle before HTTP bodies are closed. A timeout never aborts
     /// application work or discards the task owner's retained obligations.
+    /// Historical interrupted launches stay fenced and preserved, not settled.
     pub async fn shutdown(&self) -> Result<(), String> {
-        self.library.ensure_no_interrupted_launch().map_err(|_| {
-            "A previous game process has not been proven settled. The local API remains available."
-                .to_string()
-        })?;
         self.installs.close_admission();
         self.library.close_admission();
         self.skins.shutdown().await.map_err(|_| {

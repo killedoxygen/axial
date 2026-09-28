@@ -25,6 +25,12 @@ const COMPONENT: &str = "java-runtime-gamma";
 const ASSET: &[u8] = b"real downloaded fixture asset";
 const NATIVE: &[u8] = b"fixture native bytes, not an executable native library";
 const PLAYER: &str = "FixturePlayer";
+const INTERRUPTED_CHILD_PROFILE: &str = "AXIAL_TEST_INTERRUPTED_GAME_PROFILE";
+const INTERRUPTED_CHILD_INSTANCE: &str = "AXIAL_TEST_INTERRUPTED_GAME_INSTANCE";
+const INTERRUPTED_CHILD_INTENT: &str = "AXIAL_TEST_INTERRUPTED_GAME_INTENT";
+const INTERRUPTED_CLEANUP_PORT: &str = "AXIAL_TEST_INTERRUPTED_GAME_CLEANUP_PORT";
+const INTERRUPTED_CLEANUP_TOKEN: &str = "AXIAL_TEST_INTERRUPTED_GAME_CLEANUP_TOKEN";
+const INTERRUPTED_CHILD_EXIT: i32 = 75;
 
 fn sha1(bytes: &[u8]) -> String {
     format!("{:x}", Sha1::digest(bytes))
@@ -82,6 +88,19 @@ fn fake_java() -> (Vec<u8>, Vec<u8>) {
     let prelude = format!(
         r#"import json, os, pathlib, sys
 os.environ["AXIAL_FAKE_JAVA"] = {config_literal}
+if ("net.minecraft.client.main.Main" in sys.argv[1:] or "--fixture-descendant" in sys.argv[1:]) and os.environ.get("{INTERRUPTED_CLEANUP_PORT}"):
+    import socket, threading
+    cleanup = socket.create_connection(("127.0.0.1", int(os.environ["{INTERRUPTED_CLEANUP_PORT}"])), timeout=5)
+    cleanup.settimeout(None)
+    cleanup.sendall((os.environ["{INTERRUPTED_CLEANUP_TOKEN}"] + " " + str(os.getpid()) + "\n").encode())
+    def await_fixture_cleanup():
+        try:
+            while cleanup.recv(1) == b"?":
+                cleanup.sendall(b"!")
+        except OSError:
+            pass
+        os._exit(0)
+    threading.Thread(target=await_fixture_cleanup, daemon=True).start()
 if "net.minecraft.client.main.Main" in sys.argv[1:]:
     args = sys.argv[1:]
     def value(flag):
@@ -575,6 +594,36 @@ async fn launch_and_stop(api: &Api, instance: &str) -> String {
 }
 
 async fn observe_and_stop_session(api: &Api, id: &str) -> BTreeSet<u64> {
+    let (mut events, processes) = observe_running_session(api, id).await;
+    api.post(&format!("/api/v1/launch/{id}/kill"), json!({}))
+        .await;
+    let terminal = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let (event, value) = events.next().await;
+            if event == "status" && value["phase"] == "exited" {
+                break value;
+            }
+        }
+    })
+    .await
+    .expect("stop must settle process tree and drain output");
+    assert_eq!(terminal["tree_settled"], true, "{terminal}");
+    assert_eq!(terminal["output_drained"], true, "{terminal}");
+    assert_eq!(terminal["process_alive"], false, "{terminal}");
+    assert_eq!(terminal["boot_observed"], true, "{terminal}");
+    assert_eq!(terminal["outcome"]["kind"], "stopped", "{terminal}");
+    assert_eq!(
+        terminal["outcome"]["reason"], "launcher_stopped",
+        "{terminal}"
+    );
+    assert_eq!(
+        api.get(&format!("/api/v1/launch/{id}/status")).await,
+        terminal
+    );
+    processes
+}
+
+async fn observe_running_session(api: &Api, id: &str) -> (Events, BTreeSet<u64>) {
     let mut events = api.events(&format!("/api/v1/launch/{id}/events")).await;
     let mut stdout = false;
     let mut stderr = false;
@@ -607,38 +656,330 @@ async fn observe_and_stop_session(api: &Api, id: &str) -> BTreeSet<u64> {
     })
     .await
     .expect("real owned Java and its descendant must emit status and both output streams");
-    api.post(&format!("/api/v1/launch/{id}/kill"), json!({}))
-        .await;
-    let terminal = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let (event, value) = events.next().await;
-            if event == "status" && value["phase"] == "exited" {
-                break value;
-            }
-        }
-    })
-    .await
-    .expect("stop must settle process tree and drain output");
-    assert_eq!(terminal["tree_settled"], true, "{terminal}");
-    assert_eq!(terminal["output_drained"], true, "{terminal}");
-    assert_eq!(terminal["process_alive"], false, "{terminal}");
-    assert_eq!(terminal["boot_observed"], true, "{terminal}");
-    assert_eq!(terminal["outcome"]["kind"], "stopped", "{terminal}");
-    assert_eq!(
-        terminal["outcome"]["reason"], "launcher_stopped",
-        "{terminal}"
-    );
-    assert_eq!(
-        api.get(&format!("/api/v1/launch/{id}/status")).await,
-        terminal
-    );
-    processes
+    (events, processes)
 }
 
 const SETTLED_CHILD_PROFILE: &str = "AXIAL_TEST_SETTLED_REPORT_PROFILE";
 const SETTLED_CHILD_INSTANCE: &str = "AXIAL_TEST_SETTLED_REPORT_INSTANCE";
 const SETTLED_CHILD_INTENT: &str = "AXIAL_TEST_SETTLED_REPORT_INTENT";
 const SETTLED_CHILD_EXIT: i32 = 74;
+
+async fn assert_fixture_child_exit(
+    mut child: tokio::process::Child,
+    output: &mut std::fs::File,
+    expected: i32,
+) {
+    use std::io::{Read, Seek, SeekFrom};
+    let result = tokio::time::timeout(Duration::from_secs(60), child.wait()).await;
+    if result.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    output
+        .seek(SeekFrom::Start(
+            output.metadata().unwrap().len().saturating_sub(65536),
+        ))
+        .unwrap();
+    let mut diagnostics = Vec::new();
+    output.read_to_end(&mut diagnostics).unwrap();
+    let diagnostics = String::from_utf8_lossy(&diagnostics);
+    let tail = diagnostics.lines().rev().take(30).collect::<Vec<_>>();
+    assert!(result.is_ok(), "fixture helper timed out: {tail:?}");
+    assert_eq!(result.unwrap().unwrap().code(), Some(expected), "{tail:?}");
+}
+
+fn unobserved_intent_payload(storage: &axial_app::storage::MetadataStore, intent: &str) -> Vec<u8> {
+    use axial_app::storage::StorageError;
+    storage.read(|db| -> Result<_, StorageError> {
+        let (payload, settlement, acknowledged): (Vec<u8>, Option<Vec<u8>>, i64) = db.query_row(
+            "SELECT payload,settlement,terminal_ack FROM launch_intents WHERE intent_key=?1 AND state='accepted'",
+            [intent], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert!(settlement.is_none(), "test-owned cleanup is not application settlement");
+        assert_eq!(acknowledged, 0);
+        assert_eq!(db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get::<_, i64>(0))?, 1);
+        assert_eq!(db.query_row("SELECT count(*) FROM launch_reports", [], |row| row.get::<_, i64>(0))?, 0);
+        Ok(payload)
+    }).unwrap()
+}
+
+async fn ping_fixture_channels(channels: &mut [tokio::net::TcpStream]) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for channel in channels {
+            channel.write_all(b"?").await.unwrap();
+            assert_eq!(channel.read_u8().await.unwrap(), b'!');
+        }
+    })
+    .await
+    .expect("both exact fixture processes must still be alive");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_interrupted_launch_preserves_quit_and_restores_fences() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let temporary =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let profile = temporary.path().join("profile");
+    let provider = Provider::start(false).await;
+    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+        .await
+        .unwrap();
+    let api = Api::new(&services);
+    api.post(
+        "/api/v1/accounts/offline",
+        json!({"username":PLAYER,"expected_selection_revision":0}),
+    )
+    .await;
+    api.request(
+        reqwest::Method::PUT,
+        "/api/v1/config",
+        Some(json!({
+            "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
+        })),
+    )
+    .await;
+    let install = api
+        .post(
+            "/api/v1/install/queue",
+            json!({"kind":"vanilla","version_id":VERSION}),
+        )
+        .await;
+    let terminal = install_terminal(&api, &install).await;
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    let created = api
+        .post(
+            "/api/v1/instances",
+            json!({
+                "name":"Interrupted fixture","selection_id":format!("vanilla|{VERSION}")
+            }),
+        )
+        .await;
+    let instance = created["id"].as_str().unwrap().to_owned();
+    assert!(created["install_queue"].is_null(), "{created}");
+    let native_root = services
+        .library
+        .admit()
+        .unwrap()
+        .read_projection()
+        .unwrap()
+        .join("cache/natives");
+    services.server.shutdown().await.unwrap();
+    assert!(services.server.is_shutdown_settled());
+    drop(services);
+    provider.shutdown().await;
+
+    // Each process watches its own authenticated test connection. Dropping any
+    // acquired connection (including during panic) exits only that fixture;
+    // dropping the listener resets queued connections. The app never sees it.
+    let cleanup = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let token = uuid::Uuid::new_v4().to_string();
+    let intent = uuid::Uuid::new_v4().to_string();
+    let mut output = tempfile::tempfile_in(temporary.path()).unwrap();
+    let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "offline_journey_tests::interrupted_launch_crash_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(INTERRUPTED_CHILD_PROFILE, &profile)
+        .env(INTERRUPTED_CHILD_INSTANCE, &instance)
+        .env(INTERRUPTED_CHILD_INTENT, &intent)
+        .env(
+            INTERRUPTED_CLEANUP_PORT,
+            cleanup.local_addr().unwrap().port().to_string(),
+        )
+        .env(INTERRUPTED_CLEANUP_TOKEN, &token)
+        .stdout(Stdio::from(output.try_clone().unwrap()))
+        .stderr(Stdio::from(output.try_clone().unwrap()))
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut channels = Vec::new();
+    let mut processes = BTreeSet::new();
+    let connected = tokio::time::timeout(Duration::from_secs(15), async {
+        for _ in 0..2 {
+            let (mut channel, peer) = cleanup.accept().await.unwrap();
+            assert!(peer.ip().is_loopback());
+            let mut header = Vec::new();
+            loop {
+                let byte = channel.read_u8().await.unwrap();
+                if byte == b'\n' {
+                    break;
+                }
+                header.push(byte);
+                assert!(header.len() <= 64, "bounded fixture handshake");
+            }
+            let header = String::from_utf8(header).unwrap();
+            let (received_token, pid) = header.split_once(' ').unwrap();
+            assert!(received_token == token, "fixture channel authentication");
+            assert!(processes.insert(pid.parse::<u64>().unwrap()));
+            channels.push(channel);
+        }
+    })
+    .await;
+    if connected.is_err() {
+        drop(channels);
+        drop(cleanup);
+        assert_fixture_child_exit(child, &mut output, INTERRUPTED_CHILD_EXIT).await;
+        panic!("the launched fixture and descendant must both own cleanup channels");
+    }
+    assert_fixture_child_exit(child, &mut output, INTERRUPTED_CHILD_EXIT).await;
+    ping_fixture_channels(&mut channels).await;
+    let (payload, original_instance) = {
+        let storage = Arc::new(
+            axial_app::storage::MetadataStore::open(profile.join("metadata.sqlite")).unwrap(),
+        );
+        let payload = unobserved_intent_payload(&storage, &intent);
+        let registry = axial_app::instances::directory::Registry::new(storage);
+        (
+            payload,
+            registry.get_live(&instance.parse().unwrap()).unwrap(),
+        )
+    };
+    let accepted: Value = serde_json::from_slice(&payload).unwrap();
+    let session = accepted["session_id"].as_str().unwrap();
+    assert_eq!(accepted["request"]["instance_id"], instance);
+    assert_eq!(accepted["request"]["intent_key"], intent);
+    let natives = std::fs::read_dir(&native_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(natives.len(), 1);
+    let native_files = [native_name(), ".axial-native-manifest.json"].map(|name| {
+        let path = natives[0].join(name);
+        let bytes = std::fs::read(&path).unwrap();
+        (path, bytes)
+    });
+    assert_eq!(native_files[0].1, NATIVE);
+
+    for _ in 0..2 {
+        let reopened = start_in_profile(profile.clone(), None).await.unwrap();
+        let api = Api::new(&reopened);
+        ping_fixture_channels(&mut channels).await;
+        let status = api.get(&format!("/api/v1/launch/intents/{intent}")).await;
+        assert_eq!(status["state"], "interrupted");
+        assert_eq!(status["code"], "interrupted");
+        assert_eq!(status["session_id"], session);
+        let replay = api
+            .client
+            .post(format!("{}/api/v1/launch", api.base))
+            .header(transport::CAPABILITY_HEADER, &api.capability)
+            .json(&json!({"instance_id":instance,"intent_key":intent}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), reqwest::StatusCode::CONFLICT);
+        assert_eq!(replay.json::<Value>().await.unwrap()["code"], "interrupted");
+        for (method, path, body) in [
+            (
+                reqwest::Method::PUT,
+                format!("/api/v1/instances/{instance}"),
+                json!({"name":"Must not change"}),
+            ),
+            (
+                reqwest::Method::DELETE,
+                format!("/api/v1/instances/{instance}?keep_files=true"),
+                Value::Null,
+            ),
+        ] {
+            let response = api
+                .client
+                .request(method, format!("{}{path}", api.base))
+                .header(transport::CAPABILITY_HEADER, &api.capability)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+            assert_eq!(
+                response.json::<Value>().await.unwrap(),
+                json!({
+                    "error":axial_app::instances::model::InstanceError::Busy.to_string()
+                })
+            );
+        }
+        assert_eq!(
+            api.get("/api/v1/launch/sessions").await,
+            json!({"sessions":[]})
+        );
+        assert_eq!(
+            api.get("/api/v1/launch/reports").await,
+            json!({"reports":[]})
+        );
+        assert_eq!(
+            unobserved_intent_payload(reopened.instances.registry().storage(), &intent),
+            payload
+        );
+        assert_eq!(
+            reopened
+                .instances
+                .registry()
+                .get_live(&instance.parse().unwrap())
+                .unwrap(),
+            original_instance
+        );
+        for (path, bytes) in &native_files {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(std::fs::read_dir(&native_root).unwrap().count(), 1);
+        reopened.server.shutdown().await.unwrap();
+        assert!(reopened.server.is_shutdown_settled());
+        ping_fixture_channels(&mut channels).await;
+        drop(reopened);
+    }
+
+    // Only the test closes its channels. This cannot mint an application proof.
+    for channel in &mut channels {
+        channel.write_all(b"x").await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for channel in &mut channels {
+            assert_eq!(channel.read(&mut [0]).await.unwrap(), 0);
+        }
+    })
+    .await
+    .expect("test-owned fixture cleanup must finish");
+    let storage = axial_app::storage::MetadataStore::open(profile.join("metadata.sqlite")).unwrap();
+    assert_eq!(unobserved_intent_payload(&storage, &intent), payload);
+    for (path, bytes) in &native_files {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "subprocess helper that exits with its actual game tree still running"]
+async fn interrupted_launch_crash_helper() {
+    let profile =
+        PathBuf::from(std::env::var_os(INTERRUPTED_CHILD_PROFILE).expect("isolated child profile"));
+    assert_eq!(std::fs::canonicalize(&profile).unwrap(), profile);
+    let instance = std::env::var(INTERRUPTED_CHILD_INSTANCE).unwrap();
+    let intent = std::env::var(INTERRUPTED_CHILD_INTENT).unwrap();
+    let services = start_in_profile(profile, None).await.unwrap();
+    let api = Api::new(&services);
+    wait_launchable(&api, &instance).await;
+    let accepted = api
+        .post(
+            "/api/v1/launch",
+            json!({"instance_id":instance,"intent_key":intent}),
+        )
+        .await;
+    let session = accepted["session_id"].as_str().unwrap();
+    let (_, processes) = observe_running_session(&api, session).await;
+    assert_eq!(processes.len(), 2);
+    let status = api.get(&format!("/api/v1/launch/{session}/status")).await;
+    assert_eq!(status["process_alive"], true);
+    assert_eq!(status["phase"], "running");
+    let payload = unobserved_intent_payload(services.instances.registry().storage(), &intent);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&payload).unwrap()["session_id"],
+        session
+    );
+    std::process::exit(INTERRUPTED_CHILD_EXIT);
+}
 
 fn settlement_evidence(
     storage: &axial_app::storage::MetadataStore,
@@ -689,10 +1030,7 @@ fn assert_observed_terminal(status: &Value, instance: &str, session: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_observed_settlement_survives_report_failure_and_process_restart() {
-    use std::{
-        io::{Read, Seek, SeekFrom},
-        process::Stdio,
-    };
+    use std::process::Stdio;
 
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
@@ -749,7 +1087,7 @@ async fn real_observed_settlement_survives_report_failure_and_process_restart() 
     // bypasses service shutdown, but only after the owned game tree is gone.
     let intent = uuid::Uuid::new_v4().to_string();
     let mut output = tempfile::tempfile_in(temporary.path()).unwrap();
-    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+    let child = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "offline_journey_tests::observed_settlement_crash_helper",
@@ -764,26 +1102,7 @@ async fn real_observed_settlement_survives_report_failure_and_process_restart() 
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(60), child.wait()).await;
-    if result.is_err() {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    }
-    output
-        .seek(SeekFrom::Start(
-            output.metadata().unwrap().len().saturating_sub(65536),
-        ))
-        .unwrap();
-    let mut diagnostics = Vec::new();
-    output.read_to_end(&mut diagnostics).unwrap();
-    let diagnostics = String::from_utf8_lossy(&diagnostics);
-    let tail = diagnostics.lines().rev().take(30).collect::<Vec<_>>();
-    assert!(result.is_ok(), "settlement helper timed out: {tail:?}");
-    assert_eq!(
-        result.unwrap().unwrap().code(),
-        Some(SETTLED_CHILD_EXIT),
-        "{tail:?}"
-    );
+    assert_fixture_child_exit(child, &mut output, SETTLED_CHILD_EXIT).await;
 
     let evidence = {
         let storage =

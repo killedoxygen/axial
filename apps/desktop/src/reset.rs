@@ -99,6 +99,9 @@ impl NativeReset {
             if state.requested {
                 return Ok(false);
             }
+            self.library
+                .ensure_no_interrupted_launch()
+                .map_err(|_| PREFLIGHT_FAILED)?;
             if state.pin.is_none() {
                 state.pin = Some(
                     self.library
@@ -377,7 +380,21 @@ mod tests {
     use super::*;
     use crate::{discord_presence::PresenceObserver, native_skin::NativeSkinFiles};
     use axial_app::library::AdmissionState;
+    use axial_app::{
+        launch::{coordinator::LaunchIntents, reports::LaunchReportStore},
+        storage::StorageError,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn lifecycle_for(services: &axial_api::DesktopServices) -> DesktopLifecycle {
+        DesktopLifecycle::new(
+            services.tasks.clone(),
+            services.server.clone(),
+            PresenceObserver::disabled_for_test(),
+            NativeSkinFiles::new(services.library.clone(), services.tasks.clone()),
+            services.skins.clone(),
+        )
+    }
 
     async fn fixture() -> (
         tempfile::TempDir,
@@ -390,17 +407,148 @@ mod tests {
         let services = axial_api::start_in_profile(temporary.path().join("rewrite"), None)
             .await
             .unwrap();
-        let skin_files = NativeSkinFiles::new(services.library.clone(), services.tasks.clone());
-        let lifecycle = DesktopLifecycle::new(
-            services.tasks.clone(),
-            services.server.clone(),
-            PresenceObserver::disabled_for_test(),
-            skin_files,
-            services.skins.clone(),
-        )
-        .without_interface_preferences_for_test();
+        let lifecycle = lifecycle_for(&services).without_interface_preferences_for_test();
         let reset = NativeReset::new(services.library.clone(), services.tasks.clone()).unwrap();
         (temporary, services, lifecycle, reset)
+    }
+
+    const UNBOUND_INTENT: &str = "d74a9bd4-d1eb-4122-b705-2f50ac9212e5";
+
+    fn fence_unbound_launch(services: &axial_api::DesktopServices) -> Vec<u8> {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "request": {
+                "instance_id": "a9d33868-e694-41f6-9b91-f5989e5f4152",
+                "intent_key": UNBOUND_INTENT,
+            },
+            "context": null,
+            "session_id": "e73780e5-964c-4382-b421-d07c8aa1c43f",
+        }))
+        .unwrap();
+        let storage = services.settings.metadata().clone();
+        storage
+            .transaction(|tx| -> Result<(), StorageError> {
+                tx.execute(
+                    "INSERT INTO launch_intents(intent_key,payload,state) VALUES(?1,?2,'accepted')",
+                    axial_app::storage::rusqlite::params![UNBOUND_INTENT, &payload],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        // An old accepted row cannot restore physical authority, but its failed
+        // restoration must still fence destructive lifecycle admission.
+        assert!(
+            LaunchIntents::restore(
+                storage.clone(),
+                LaunchReportStore::new(storage).unwrap(),
+                services.instances.directories(),
+            )
+            .is_err()
+        );
+        assert!(services.library.ensure_no_interrupted_launch().is_err());
+        payload
+    }
+
+    fn assert_unbound_launch_preserved(services: &axial_api::DesktopServices, payload: &[u8]) {
+        let row = services
+            .settings
+            .metadata()
+            .read(|db| -> Result<_, StorageError> {
+                Ok(db.query_row(
+                    "SELECT payload,state,terminal_ack,settlement,(SELECT count(*) FROM launch_reports)
+                     FROM launch_intents WHERE intent_key=?1",
+                    [UNBOUND_INTENT],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, bool>(2)?,
+                            row.get::<_, Option<Vec<u8>>>(3)?,
+                            row.get::<_, usize>(4)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap();
+        assert_eq!(row, (payload.to_vec(), "accepted".into(), false, None, 0));
+        assert!(services.library.ensure_no_interrupted_launch().is_err());
+    }
+
+    #[tokio::test]
+    async fn interrupted_launch_blocks_reset_before_pin_and_terminal_admission() {
+        let (_temporary, services, lifecycle, reset) = fixture().await;
+        let payload = fence_unbound_launch(&services);
+        let result = reset.prepare(&lifecycle).await;
+        let retained_pin = reset.state.lock().unwrap().pin.is_some();
+        let closing = services.tasks.status().closing;
+        let admission = services.library.snapshot().admission;
+        let settled = services.server.is_shutdown_settled();
+        let close = lifecycle.prepare_exit(TerminalIntent::Close).await;
+        services.library.try_preserve().unwrap();
+
+        assert_eq!(result, Err(PREFLIGHT_FAILED.into()));
+        assert!(!retained_pin);
+        assert!(!closing);
+        assert_eq!(admission, AdmissionState::Open);
+        assert!(!settled);
+        assert!(reset.take_after_exit().is_none());
+        close.unwrap();
+        assert_unbound_launch_preserved(&services, &payload);
+    }
+
+    #[tokio::test]
+    async fn interrupted_launch_blocks_destructive_intents_before_preferences_but_allows_close() {
+        let (_temporary, services, _, reset) = fixture().await;
+        let lifecycle = lifecycle_for(&services);
+        let payload = fence_unbound_launch(&services);
+        let mut events = lifecycle.interface_preferences_events();
+        let mut refusals = Vec::new();
+        for intent in [
+            TerminalIntent::Reset,
+            TerminalIntent::Restart,
+            TerminalIntent::Update,
+        ] {
+            let owner = lifecycle.clone();
+            let mut request = tokio::spawn(async move { owner.prepare_exit(intent).await });
+            let (result, preferences_requested) = tokio::select! {
+                result = &mut request => (result.unwrap(), false),
+                _ = events.changed() => {
+                    let event = events.borrow_and_update().clone().unwrap();
+                    lifecycle.interface_preferences_delivery_failed(&event);
+                    (request.await.unwrap(), true)
+                }
+            };
+            events.borrow_and_update();
+            refusals.push((intent, result, preferences_requested));
+        }
+        let closing = services.tasks.status().closing;
+        let admission = services.library.snapshot().admission;
+        let settled = services.server.is_shutdown_settled();
+        let url = tauri::Url::parse(&services.server.bootstrap().base_url).unwrap();
+        let address = ("127.0.0.1", url.port().unwrap());
+        let available = tokio::net::TcpStream::connect(address).await.is_ok();
+        let close = lifecycle
+            .clone()
+            .without_interface_preferences_for_test()
+            .prepare_exit(TerminalIntent::Close)
+            .await;
+        services.library.try_preserve().unwrap();
+
+        for (intent, result, preferences_requested) in refusals {
+            assert!(result.is_err(), "{intent:?}");
+            assert!(!preferences_requested, "{intent:?}");
+        }
+        assert!(!closing);
+        assert_eq!(admission, AdmissionState::Open);
+        assert!(!settled);
+        assert!(available);
+        close.unwrap();
+        assert!(services.server.is_shutdown_settled());
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        assert!(reset.take_after_exit().is_none());
+        assert!(services.library.begin_switch().is_err());
+        assert!(services.library.take_reset_session().is_err());
+        assert!(services.library.revoke_application_root().is_err());
+        assert_unbound_launch_preserved(&services, &payload);
     }
 
     #[tokio::test]
