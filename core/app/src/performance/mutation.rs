@@ -9,7 +9,7 @@ use crate::{
     content::catalog::ContentService,
     instances::{
         directory::{InstanceDirectories, RegisteredInstance},
-        model::InstanceId,
+        model::{InstanceError, InstanceId, InstanceLifecycle},
     },
     storage::{
         MetadataStore, Migration, StorageError,
@@ -65,6 +65,8 @@ pub fn has_pending(storage: &MetadataStore, id: &InstanceId) -> Result<bool, Sto
 pub enum PerformanceMutationError {
     #[error("performance storage is unavailable")]
     Storage(#[from] StorageError),
+    #[error("instance was not found")]
+    InstanceNotFound,
     #[error("instance is busy or unavailable")]
     InstanceUnavailable,
     #[error("performance work is still settling; the instance remains reserved")]
@@ -87,6 +89,7 @@ impl PerformanceMutationError {
     pub(crate) fn diagnostic_code(&self) -> &'static str {
         match self {
             Self::Storage(_) => "storage_unavailable",
+            Self::InstanceNotFound => "instance_not_found",
             Self::InstanceUnavailable => "instance_unavailable",
             Self::Unsettled => "unsettled",
             Self::Failed => "failed_preserved",
@@ -1263,6 +1266,14 @@ impl PerformanceService {
         id: &InstanceId,
     ) -> Result<Option<PerformanceOperationStatus>, PerformanceMutationError> {
         self.storage.read(|connection| {
+            let instance = crate::instances::directory::get_in(connection, id).map_err(|error| match error {
+                InstanceError::NotFound => PerformanceMutationError::InstanceNotFound,
+                InstanceError::Storage(error) => PerformanceMutationError::Storage(error),
+                _ => PerformanceMutationError::Storage(StorageError::Corrupt),
+            })?;
+            if instance.lifecycle != InstanceLifecycle::Live {
+                return Err(PerformanceMutationError::InstanceUnavailable);
+            }
             let record: Option<(String, String, Vec<u8>)> = connection.query_row("SELECT id,state,payload FROM performance_commands WHERE instance_id=?1 ORDER BY (state='historical'),rowid DESC LIMIT 1", [id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
             record.map(|(operation, state, bytes)| command_status(&operation, id.as_str(), &state, &bytes)).transpose()
         })
@@ -4039,7 +4050,165 @@ mod tests {
         assert!(PreparedOperationImport::prepare(many).is_err());
     }
 
+    #[tokio::test]
+    async fn latest_performance_operation_requires_live_registry_target() {
+        let (_root, service, admitted) = launch_fixture().await;
+        let live = service.instance_operation(&admitted.record().instance.id);
+        let unknown = service.instance_operation(&InstanceId::new());
+        let registry = service.instances.registry();
+        let mut pending = admitted.record().instance.clone();
+        pending.id = InstanceId::new();
+        pending.name = "Reserved Performance target".into();
+        let reserved = service
+            .storage
+            .transaction(|tx| registry.reserve(tx, pending, &admitted.record().library_id))
+            .unwrap();
+        let reserved_result = service.instance_operation(&reserved.instance.id);
+        let deleting = service
+            .storage
+            .transaction(|tx| {
+                registry.mark_deleting(
+                    tx,
+                    &admitted.record().instance.id,
+                    admitted.record().revision,
+                )
+            })
+            .unwrap();
+        let deleting_result = service.instance_operation(&deleting.instance.id);
+        assert!(matches!(live, Ok(None)));
+        assert!(
+            matches!(unknown, Err(PerformanceMutationError::InstanceNotFound)),
+            "an unknown UUID is not a live instance with empty history"
+        );
+        assert!(matches!(
+            reserved_result,
+            Err(PerformanceMutationError::InstanceUnavailable)
+        ));
+        assert!(matches!(
+            deleting_result,
+            Err(PerformanceMutationError::InstanceUnavailable)
+        ));
+        assert!(service.tasks.status().is_idle());
+    }
+
+    #[tokio::test]
+    async fn latest_performance_operation_deleted_target_keeps_global_history_on_reopen() {
+        use crate::instances::{
+            create::InstanceService,
+            delete::{DeleteIntent, DeletionStatus},
+            directory::Registry,
+        };
+        let (root, service, admitted) = launch_fixture_with_storage(true).await;
+        service
+            .storage
+            .migrate(&[crate::instances::delete::MIGRATION])
+            .unwrap();
+        let id = admitted.record().instance.id.clone();
+        let record = historical(&id, 1);
+        let batch = PreparedOperationImport::prepare(vec![record.clone()]).unwrap();
+        service
+            .storage
+            .transaction(|tx| batch.insert_in(tx))
+            .unwrap();
+        let status = service.operation(&record.id).unwrap().unwrap();
+        assert_eq!(
+            service.instance_operation(&id).unwrap(),
+            Some(status.clone())
+        );
+        drop(admitted);
+        let instances = InstanceService::new(service.instances.clone(), service.tasks.clone());
+        let deletion = instances
+            .delete(&id, DeleteIntent::KeepFiles, uuid::Uuid::new_v4())
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deletion.status, DeletionStatus::Removed);
+        let removed_result = service.instance_operation(&id);
+        assert_eq!(service.operation(&record.id).unwrap(), Some(status.clone()));
+        service
+            .tasks
+            .shutdown(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let library = service.instances.library().clone();
+        let content = service.content.clone();
+        let transfers = service.transfers.clone();
+        drop(instances);
+        drop(service);
+        let storage = Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
+        let directories = InstanceDirectories::new(
+            Registry::new(storage.clone()),
+            library,
+            crate::tasks::Exclusions::new(),
+        );
+        let reopened = PerformanceService::new(
+            storage.clone(),
+            directories,
+            TaskOwner::new(8).unwrap(),
+            content,
+            transfers,
+        )
+        .unwrap();
+        assert_eq!(reopened.operation(&record.id).unwrap(), Some(status));
+        let reopened_result = reopened.instance_operation(&id);
+        storage.read(|db| batch.verify_in(db)).unwrap();
+        assert_eq!(reopened.pending_count().unwrap(), 0);
+        assert!(reopened.tasks.status().is_idle());
+        assert!(
+            matches!(
+                removed_result,
+                Err(PerformanceMutationError::InstanceNotFound)
+            ),
+            "removed instances must not have an instance-scoped latest view"
+        );
+        assert!(
+            matches!(
+                reopened_result,
+                Err(PerformanceMutationError::InstanceNotFound)
+            ),
+            "registry absence remains authoritative after reopening"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_performance_operation_refuses_corrupt_registry_without_hiding_global_history() {
+        let (_root, service, admitted) = launch_fixture().await;
+        let id = &admitted.record().instance.id;
+        let history = historical(id, 1);
+        let batch = PreparedOperationImport::prepare(vec![history.clone()]).unwrap();
+        service
+            .storage
+            .transaction(|tx| batch.insert_in(tx))
+            .unwrap();
+        let global = service.operation(&history.id).unwrap();
+        service
+            .storage
+            .transaction(|tx| -> Result<_, StorageError> {
+                tx.execute(
+                    "UPDATE instances SET record_json='{' WHERE id=?1",
+                    [id.as_str()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            service.instance_operation(id),
+            Err(PerformanceMutationError::Storage(StorageError::Corrupt))
+        ));
+        assert_eq!(service.operation(&history.id).unwrap(), global);
+        service.storage.read(|db| batch.verify_in(db)).unwrap();
+        assert!(service.tasks.status().is_idle());
+    }
+
     async fn launch_fixture() -> (tempfile::TempDir, PerformanceService, RegisteredInstance) {
+        launch_fixture_with_storage(false).await
+    }
+
+    async fn launch_fixture_with_storage(
+        durable: bool,
+    ) -> (tempfile::TempDir, PerformanceService, RegisteredInstance) {
         use crate::{
             instances::{
                 create::{CreateTarget, InstanceService, tests::request},
@@ -4054,7 +4223,11 @@ mod tests {
             LibraryOpenOutcome::Ready(library) => library,
             other => panic!("fixture library did not open: {other:?}"),
         };
-        let storage = Arc::new(MetadataStore::in_memory().unwrap());
+        let storage = Arc::new(if durable {
+            MetadataStore::open(root.path().join("metadata.sqlite")).unwrap()
+        } else {
+            MetadataStore::in_memory().unwrap()
+        });
         storage
             .migrate(&[
                 crate::instances::directory::MIGRATION,

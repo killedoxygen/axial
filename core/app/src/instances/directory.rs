@@ -610,15 +610,23 @@ impl Registry {
     }
 }
 
-fn get_in(connection: &rusqlite::Connection, id: &InstanceId) -> InstanceResult<InstanceRecord> {
-    let raw: Option<String> = connection
+pub(crate) fn get_in(
+    connection: &rusqlite::Connection,
+    id: &InstanceId,
+) -> InstanceResult<InstanceRecord> {
+    let raw: Option<(String, String)> = connection
         .query_row(
-            "SELECT record_json FROM instances WHERE id = ?1",
+            "SELECT lifecycle, record_json FROM instances WHERE id = ?1",
             [id.as_str()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    decode(&raw.ok_or(InstanceError::NotFound)?)
+    let (lifecycle, raw) = raw.ok_or(InstanceError::NotFound)?;
+    let record = decode(&raw)?;
+    if record.instance.id != *id || record.lifecycle.as_str() != lifecycle {
+        return Err(InstanceError::InvalidInput);
+    }
+    Ok(record)
 }
 
 pub(super) fn decode(raw: &str) -> InstanceResult<InstanceRecord> {
@@ -817,6 +825,51 @@ mod tests {
             )),
             Err(InstanceError::NameConflict)
         ));
+    }
+
+    #[test]
+    fn lookup_rejects_indexed_identity_or_lifecycle_disagreement() {
+        for field in ["identity", "lifecycle"] {
+            let registry = memory();
+            let current = publish(&registry, "Survival");
+            registry
+                .storage()
+                .transaction(|tx| -> InstanceResult<()> {
+                    if field == "identity" {
+                        let mut other = current.clone();
+                        other.instance.id = InstanceId::new();
+                        other.directory_name = other.instance.id.as_str().to_owned();
+                        tx.execute(
+                            "UPDATE instances SET record_json=?1 WHERE id=?2",
+                            params![
+                                serde_json::to_string(&other).unwrap(),
+                                current.instance.id.as_str()
+                            ],
+                        )?;
+                    } else {
+                        tx.execute(
+                            "UPDATE instances SET lifecycle='deleting' WHERE id=?1",
+                            [current.instance.id.as_str()],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    registry.get_record(&current.instance.id),
+                    Err(InstanceError::InvalidInput)
+                ),
+                "{field}"
+            );
+            assert!(
+                matches!(
+                    registry.get_live(&current.instance.id),
+                    Err(InstanceError::InvalidInput)
+                ),
+                "{field}"
+            );
+        }
     }
 
     #[test]

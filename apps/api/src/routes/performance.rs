@@ -247,7 +247,9 @@ fn selected(
 }
 fn error(error: PerformanceMutationError) -> (StatusCode, Json<Value>) {
     let code = match error {
-        PerformanceMutationError::SnapshotNotFound => StatusCode::NOT_FOUND,
+        PerformanceMutationError::InstanceNotFound | PerformanceMutationError::SnapshotNotFound => {
+            StatusCode::NOT_FOUND
+        }
         PerformanceMutationError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::CONFLICT,
     };

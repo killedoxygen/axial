@@ -3171,6 +3171,234 @@ pub(super) mod tests {
         }
     }
 
+    fn succeeded_performance_journal(instance: &str) -> Value {
+        let operation = "op-00000000-0000-4000-8000-000000000001";
+        json!({
+            "schema":"axial.state.operation_journals.v10","next_sequence":2,
+            "entries":[{
+                "journal_id":format!("journal-{operation}"),"operation_id":operation,"sequence":1,
+                "command":"ApplyPerformancePlan","intent":{
+                    "kind":"performance","intent":{
+                        "instance_id":instance,"requested_action":"install","action":"install",
+                        "base_target_id":"old-composition","rollback":"Unavailable",
+                        "game_version":"1.20.1","loader":"fabric","mode":"managed"
+                    },"phase":{"phase":"terminal","terminal":{
+                        "outcome":"succeeded","prepared":{"result_target_id":"old-composition","proof":{
+                            "proof":"install_plan","graph_sha512":"a".repeat(128),"artifact_count":1_000_000,"aggregate_bytes":u64::MAX
+                        }},"changed_target":true,"rollback":"Available"
+                    }},"created_at":"2024-02-29T12:34:56.000Z","updated_at":"2024-02-29T12:35:56.000Z"
+                },"status":"Succeeded","owner":"Application","ownership":"CompositionManaged",
+                "targets":[
+                    {"system":"State","kind":"Instance","id":instance,"ownership":"CompositionManaged"},
+                    {"system":"Performance","kind":"PerformanceComposition","id":"old-composition","ownership":"CompositionManaged"}
+                ],"planned_steps":[],"completed_steps":[],"failure_point":null,"rollback":"Available",
+                "guardian_diagnosis_ids":[],"outcome":"Succeeded","reconciliation_attempt":null,"reconciliation_terminal":null,
+                "persisted_state_repair_attempt":null,"persisted_state_repair_terminal":null,"guardian_install_terminal":null
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn latest_performance_operation_requires_a_current_instance() {
+        const SECOND: &str = "0000000000000002";
+        let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let baseline = root.path().join("baseline");
+        fs::create_dir(&baseline).unwrap();
+        copy_fixture(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../acceptance/fixtures/profiles/offline-vanilla"),
+            &baseline,
+        );
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(baseline.join("instances.json")).unwrap()).unwrap();
+        let mut second = registry["instances"][0].clone();
+        second["id"] = json!(SECOND);
+        second["name"] = json!("Historical B");
+        registry["instances"].as_array_mut().unwrap().push(second);
+        fs::write(
+            baseline.join("instances.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let second_directory = baseline.join("instances").join(SECOND);
+        fs::create_dir(&second_directory).unwrap();
+        copy_fixture(&baseline.join("instances").join(FIRST), &second_directory);
+        fs::create_dir(baseline.join("state")).unwrap();
+        let journal = serde_json::to_vec(&succeeded_performance_journal(SECOND)).unwrap();
+        fs::write(baseline.join("state/operation-journals.json"), &journal).unwrap();
+        let profile = root.path().join("replacement");
+        let services = crate::start_in_profile(profile.clone(), None)
+            .await
+            .unwrap();
+        let source = ReadOnlySource::from_native_selection(
+            services.library.admit_application_root().unwrap(),
+            &baseline,
+        )
+        .unwrap();
+        let preview = services
+            .imports
+            .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
+            .unwrap();
+        assert!(
+            preview
+                .instances
+                .iter()
+                .all(|instance| instance.ordinary_import_available)
+        );
+        let bootstrap = services.server.bootstrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let request = |method, path: &str| {
+            client
+                .request(method, format!("{}{path}", bootstrap.base_url))
+                .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
+        };
+        let mut imported_ids = Vec::new();
+        for legacy_id in [FIRST, SECOND] {
+            let response = request(Method::POST, "/api/v1/import/instances")
+                .json(&json!({"fingerprint":preview.fingerprint,"legacy_id":legacy_id}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let imported: Value = response.json().await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{imported}");
+            imported_ids.push(imported["instance"]["id"].as_str().unwrap().to_owned());
+        }
+        let latest = |id: &str| format!("/api/v1/performance/instances/{id}/operation");
+        let empty: Value = request(Method::GET, &latest(&imported_ids[0]))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(empty, json!({"operation":null}));
+        let historical: Value = request(Method::GET, &latest(&imported_ids[1]))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let operation = &historical["operation"];
+        assert_eq!(operation["instance_id"], imported_ids[1]);
+        assert_eq!(operation["history"]["intent"]["instance_id"], SECOND);
+        assert_eq!(operation["state"], "complete");
+        let operation_path = format!(
+            "/api/v1/performance/operations/{}",
+            operation["id"].as_str().unwrap()
+        );
+        let global: Value = request(Method::GET, &operation_path)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(&global, operation);
+        let unknown = "00000000-0000-4000-8000-000000000099";
+        assert_eq!(
+            request(Method::GET, &latest(unknown))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        for invalid in [
+            FIRST.to_owned(),
+            format!("archived-{}-{SECOND}", "a".repeat(64)),
+        ] {
+            assert_eq!(
+                request(Method::GET, &latest(&invalid))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let deleted: Value = request(
+            Method::DELETE,
+            &format!(
+                "/api/v1/instances/{}?keep_files=true&operation_id={}",
+                imported_ids[1],
+                uuid::Uuid::new_v4()
+            ),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(deleted["deletion"]["status"], "removed");
+        assert_eq!(
+            request(Method::GET, &latest(&imported_ids[1]))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let retained: Value = request(Method::GET, &operation_path)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(retained, global);
+        services.imports.forget().unwrap();
+        assert_eq!(services.instances.registry().list().unwrap().len(), 1);
+        assert!(services.tasks.status().is_idle());
+        assert!(services.sessions.snapshots().is_empty());
+        drop(source);
+        services.server.shutdown().await.unwrap();
+        services.server.wait().await.unwrap();
+        drop(services);
+        let reopened = crate::start_in_profile(profile, None).await.unwrap();
+        let bootstrap = reopened.server.bootstrap();
+        for (path, expected_status, expected_body) in [
+            (latest(&imported_ids[0]), StatusCode::OK, Some(empty)),
+            (latest(&imported_ids[1]), StatusCode::NOT_FOUND, None),
+            (latest(unknown), StatusCode::NOT_FOUND, None),
+            (operation_path, StatusCode::OK, Some(global)),
+        ] {
+            let response = client
+                .get(format!("{}{path}", bootstrap.base_url))
+                .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status);
+            if let Some(expected) = expected_body {
+                assert_eq!(response.json::<Value>().await.unwrap(), expected);
+            }
+        }
+        assert!(reopened.tasks.status().is_idle());
+        assert_eq!(
+            fs::read(baseline.join("state/operation-journals.json")).unwrap(),
+            journal
+        );
+        reopened.server.shutdown().await.unwrap();
+        reopened.server.wait().await.unwrap();
+    }
+
     async fn composed_deleted_instance_report_import(
         import_before_metadata: Option<bool>,
         completed_benchmark_run: Option<bool>,
@@ -3215,36 +3443,16 @@ pub(super) mod tests {
             ]}]
         });
         let operation_fixture = with_performance_operation.then(|| {
-            let intent = json!({
-                "instance_id":"0000000000000002","requested_action":"install","action":"install",
-                "base_target_id":"old-composition","rollback":"Unavailable",
-                "game_version":"1.20.1","loader":"fabric","mode":"managed"
-            });
-            let terminal = json!({
-                "outcome":"succeeded","prepared":{"result_target_id":"old-composition","proof":{
-                    "proof":"install_plan","graph_sha512":"a".repeat(128),"artifact_count":1_000_000,"aggregate_bytes":u64::MAX
-                }},"changed_target":true,"rollback":"Available"
-            });
-            let operation = "op-00000000-0000-4000-8000-000000000001";
-            let journal = json!({
-                "schema":"axial.state.operation_journals.v10","next_sequence":2,
-                "entries":[{
-                    "journal_id":format!("journal-{operation}"),"operation_id":operation,"sequence":1,
-                    "command":"ApplyPerformancePlan","intent":{
-                        "kind":"performance","intent":intent,"phase":{"phase":"terminal","terminal":terminal},
-                        "created_at":"2024-02-29T12:34:56.000Z","updated_at":"2024-02-29T12:35:56.000Z"
-                    },"status":"Succeeded","owner":"Application","ownership":"CompositionManaged",
-                    "targets":[
-                        {"system":"State","kind":"Instance","id":"0000000000000002","ownership":"CompositionManaged"},
-                        {"system":"Performance","kind":"PerformanceComposition","id":"old-composition","ownership":"CompositionManaged"}
-                    ],"planned_steps":[],"completed_steps":[],"failure_point":null,"rollback":"Available",
-                    "guardian_diagnosis_ids":[],"outcome":"Succeeded","reconciliation_attempt":null,"reconciliation_terminal":null,
-                    "persisted_state_repair_attempt":null,"persisted_state_repair_terminal":null,"guardian_install_terminal":null
-                }]
-            });
+            let journal = succeeded_performance_journal("0000000000000002");
             fs::create_dir(baseline.join("state")).unwrap();
-            fs::write(baseline.join("state/operation-journals.json"), serde_json::to_vec(&journal).unwrap()).unwrap();
-            json!({"operation_id":operation,"sequence":1,"intent":intent,"terminal":terminal})
+            fs::write(
+                baseline.join("state/operation-journals.json"),
+                serde_json::to_vec(&journal).unwrap(),
+            )
+            .unwrap();
+            let entry = &journal["entries"][0];
+            json!({"operation_id":entry["operation_id"],"sequence":entry["sequence"],
+                "intent":entry["intent"]["intent"],"terminal":entry["intent"]["phase"]["terminal"]})
         });
         let mut prior = report.clone();
         prior["session_id"] = json!("session-deleted-before");
