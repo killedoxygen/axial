@@ -1834,6 +1834,8 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn composed_metadata_import_preserves_global_install_history_without_instances() {
+        use sha2::{Digest, Sha256};
+
         let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let baseline = root.path().join("baseline");
         fs::create_dir(&baseline).unwrap();
@@ -1933,10 +1935,69 @@ pub(super) mod tests {
                 ])
             )
         ]);
+        let observed_at = "2026-08-13T10:00:00.000Z";
+        let suppression_until = "2026-08-13T10:05:00.000Z";
+        let mut binding = Sha256::new();
+        binding.update(b"axial.guardian.install_failure_memory_binding.v3\0");
+        for value in [
+            "Download:download_unavailable:Execution.Artifact.install_initialization_cancelled:Managed:install_provider",
+            "execution",
+            "artifact",
+            "launcher_managed",
+            "install_initialization_cancelled",
+            observed_at,
+            suppression_until,
+        ] {
+            binding.update((value.len() as u64).to_be_bytes());
+            binding.update(value.as_bytes());
+        }
+        let binding = hex::encode(binding.finalize());
+        // Original legacy/core/minecraft/src/loaders/api.rs encodings for Fabric 0.15.11 on 1.20.1.
+        let loader = "loader-v2-YXhpYWwtaW5zdGFsbGVkLWxvYWRlcgABAAYxLjIwLjEABzAuMTUuMTE";
+        let build =
+            "loader-build-v1-YXhpYWwtbG9hZGVyLWJ1aWxkAAEAAAAAAAAABjEuMjAuMQAAAAAAAAAHMC4xNS4xMQ";
+        let cancellations: Vec<_> = [false, true].into_iter().enumerate().map(|(index, is_loader)| {
+            let number = index + 3;
+            let id = format!("op-00000000-0000-4000-8000-{number:012x}");
+            let mut cancelled = failed.clone();
+            cancelled["journal_id"] = json!(format!("journal-{id}"));
+            cancelled["operation_id"] = json!(id);
+            cancelled["sequence"] = json!(9007199254740995_u64 + index as u64);
+            let prefix = if is_loader { "loader-install" } else { "install" };
+            cancelled["targets"][0] = target("Session", &format!("{prefix}-{number:032x}"));
+            if is_loader {
+                cancelled["targets"][1] = target("Version", "target");
+                cancelled["planned_steps"] = json!([step("install_version", "Planning", "Planned", json!([
+                    "install_kind:loader", format!("install_version_id:{loader}"),
+                    "loader_component:net.fabricmc.fabric-loader", format!("loader_build_id:{build}")
+                ]))]);
+            }
+            cancelled["failure_point"] = json!("install_initialization_cancelled");
+            let mut terminal = step("install_progress_initializing", "Failed", "Failed", json!([
+                "install_phase:initializing", "install_done:true", "install_error:true"
+            ]));
+            terminal["guardian_fact_ids"] = json!(["download_interrupted"]);
+            cancelled["completed_steps"] = json!([terminal]);
+            cancelled["guardian_diagnosis_ids"] = json!(["download_unavailable"]);
+            cancelled["guardian_install_terminal"] = json!({
+                "diagnosis_id":"download_unavailable", "action":"Retry", "memory":{
+                    "binding":binding, "target":{
+                        "system":"Execution", "kind":"Artifact", "id":"install_initialization_cancelled", "ownership":"LauncherManaged"
+                    }, "observed_at":observed_at, "suppression_until":suppression_until
+                }
+            });
+            cancelled
+        }).collect();
         fs::create_dir(baseline.join("state")).unwrap();
-        fs::write(baseline.join("state/operation-journals.json"), serde_json::to_vec(&json!({
-            "schema":"axial.state.operation_journals.v10","next_sequence":9007199254740995_u64,"entries":[succeeded,failed]
-        })).unwrap()).unwrap();
+        fs::write(
+            baseline.join("state/operation-journals.json"),
+            serde_json::to_vec(&json!({
+                "schema":"axial.state.operation_journals.v10","next_sequence":9007199254740997_u64,
+                "entries":[succeeded,failed,cancellations[0],cancellations[1]]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let source_files = [
             "config.json",
             "accounts.json",
@@ -2041,7 +2102,7 @@ pub(super) mod tests {
             "FixturePlayer"
         );
         assert_eq!(recorded["cutover_available"], false);
-        assert_eq!(recorded["receipt"]["global_install_history_count"], 2);
+        assert_eq!(recorded["receipt"]["global_install_history_count"], 4);
         for suffix in [
             "?after=",
             "?after=private-predecessor-secret",
@@ -2075,7 +2136,7 @@ pub(super) mod tests {
             .await
             .unwrap();
         let records = page["records"].as_array().unwrap();
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 4);
         assert!(page["next_after"].is_null());
         for (operation, outcome, sequence) in [
             (operation_id, "Succeeded", "9007199254740993"),
@@ -2106,6 +2167,69 @@ pub(super) mod tests {
             }
             assert!(row.get("request").is_none());
             assert!(row.get("actions").is_none());
+        }
+        for original in &cancellations {
+            let row = records
+                .iter()
+                .find(|row| row["operation_id"] == original["operation_id"])
+                .unwrap();
+            assert_eq!(row["historical"], true);
+            assert!(row["instance_id"].is_null());
+            assert_eq!(
+                row["sequence"],
+                original["sequence"].as_u64().unwrap().to_string()
+            );
+            for field in [
+                "journal_id",
+                "command",
+                "outcome",
+                "targets",
+                "rollback",
+                "failure_point",
+            ] {
+                assert_eq!(row[field], original[field], "{field}");
+            }
+            assert_eq!(row["outcome"], "Failed");
+            assert_eq!(row["failure_point"], "install_initialization_cancelled");
+            for field in ["planned_steps", "completed_steps"] {
+                let mut expected = original[field].clone();
+                for step in expected.as_array_mut().unwrap() {
+                    step.as_object_mut().unwrap().remove("guardian_fact_ids");
+                }
+                assert_eq!(row[field], expected);
+            }
+            for absent in [
+                "status",
+                "request",
+                "actions",
+                "can_cancel",
+                "can_retry",
+                "guardian_diagnosis_ids",
+                "guardian_install_terminal",
+            ] {
+                assert!(row.get(absent).is_none(), "{absent}");
+            }
+            let id = row["id"].as_str().unwrap();
+            assert_eq!(
+                request(Method::POST, &format!("/api/v1/install/{id}/cancel"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                request(
+                    Method::POST,
+                    &format!("/api/v1/install/queue/retry?expected_install_id={id}")
+                )
+                .json(&json!({"kind":"vanilla","version_id":"must-not-enqueue"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+                StatusCode::BAD_REQUEST
+            );
         }
         let last_id = records.last().unwrap()["id"].as_str().unwrap();
         let empty: Value = request(

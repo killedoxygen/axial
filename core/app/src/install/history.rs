@@ -1058,26 +1058,35 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
             {
                 return Err(HistoryError::Invalid);
             }
-            let [step] = source.completed_steps.as_slice() else {
-                return Err(HistoryError::Invalid);
-            };
-            if step.step_id != "content_progress_initializing"
-                || step.phase != "Failed"
-                || step.result != "Failed"
-                || step.changed_target.is_some()
-                || step.generated_facts
-                    != [
-                        "install_phase:initializing",
-                        "install_done:true",
-                        "install_error:true",
-                    ]
-                || step.rollback != "NotApplicable"
-                || !step.guardian_fact_ids.is_empty()
-                || step.metrics.is_some()
+            validate_initialization_failure(source, "content_progress_initializing", &[])?;
+            return Ok(Some(id.clone()));
+        }
+        (
+            Identity::Vanilla(_) | Identity::Loader { .. },
+            "Failed",
+            Some("Failed"),
+            Some("install_initialization_cancelled"),
+        ) => {
+            validate_initialization_failure(
+                source,
+                "install_progress_initializing",
+                &["download_interrupted"],
+            )?;
+            validate_guardian_terminal(source)?;
+            let terminal = source
+                .guardian_install_terminal
+                .as_ref()
+                .ok_or(HistoryError::Invalid)?;
+            let memory = terminal.memory.as_ref().ok_or(HistoryError::Invalid)?;
+            if source.guardian_diagnosis_ids != ["download_unavailable"]
+                || terminal.diagnosis_id != "download_unavailable"
+                || terminal.action != "Retry"
+                || memory.target.id != "install_initialization_cancelled"
+                || memory.target.ownership != "LauncherManaged"
             {
                 return Err(HistoryError::Invalid);
             }
-            return Ok(Some(id.clone()));
+            return Ok(None);
         }
         (_, "Succeeded", Some("Succeeded"), None)
             if source.guardian_diagnosis_ids.is_empty()
@@ -1157,6 +1166,33 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
         Identity::Content(id) if checkpoints == 0 => Ok(Some(id)),
         _ => Err(HistoryError::Invalid),
     }
+}
+
+fn validate_initialization_failure(
+    source: &SourceOperation,
+    step_id: &str,
+    guardian_fact_ids: &[&str],
+) -> Result<(), HistoryError> {
+    let [step] = source.completed_steps.as_slice() else {
+        return Err(HistoryError::Invalid);
+    };
+    if step.step_id != step_id
+        || step.phase != "Failed"
+        || step.result != "Failed"
+        || step.changed_target.is_some()
+        || step.generated_facts
+            != [
+                "install_phase:initializing",
+                "install_done:true",
+                "install_error:true",
+            ]
+        || step.rollback != "NotApplicable"
+        || step.guardian_fact_ids != guardian_fact_ids
+        || step.metrics.is_some()
+    {
+        return Err(HistoryError::Invalid);
+    }
+    Ok(())
 }
 
 fn validate_progress(
@@ -2959,6 +2995,232 @@ mod tests {
             [], |row| row.get(0),
         ).map_err(StorageError::from)).unwrap();
         assert_eq!(live_tables, 0);
+    }
+
+    fn cancelled_install_initializations() -> Vec<SourceOperation> {
+        let observed_at = "2026-08-13T10:00:00.000Z";
+        let suppression_until = "2026-08-13T10:05:00.000Z";
+        // Original install/operation.rs writer and guardian/copy.rs v3 binding.
+        let mut binding = Sha256::new();
+        binding.update(b"axial.guardian.install_failure_memory_binding.v3\0");
+        for value in [
+            "Download:download_unavailable:Execution.Artifact.install_initialization_cancelled:Managed:install_provider",
+            "execution",
+            "artifact",
+            "launcher_managed",
+            "install_initialization_cancelled",
+            observed_at,
+            suppression_until,
+        ] {
+            binding.update((value.len() as u64).to_be_bytes());
+            binding.update(value.as_bytes());
+        }
+        let binding = hex::encode(binding.finalize());
+        source_records()
+            .into_iter()
+            .take(2)
+            .map(|mut source| {
+                source.status = "Failed".into();
+                source.outcome = Some("Failed".into());
+                source.failure_point = Some("install_initialization_cancelled".into());
+                source.completed_steps = serde_json::from_value(json!([{
+                    "step_id":"install_progress_initializing", "phase":"Failed", "result":"Failed",
+                    "changed_target":null,
+                    "generated_facts":["install_phase:initializing", "install_done:true", "install_error:true"],
+                    "rollback":"NotApplicable", "guardian_fact_ids":["download_interrupted"], "metrics":null
+                }])).unwrap();
+                source.guardian_diagnosis_ids = vec!["download_unavailable".into()];
+                source.guardian_install_terminal = Some(serde_json::from_value(json!({
+                    "diagnosis_id":"download_unavailable", "action":"Retry", "memory":{
+                        "binding":binding, "target":{
+                            "system":"Execution", "kind":"Artifact",
+                            "id":"install_initialization_cancelled", "ownership":"LauncherManaged"
+                        }, "observed_at":observed_at, "suppression_until":suppression_until
+                    }
+                })).unwrap());
+                serde_json::from_slice(&serde_json::to_vec(&source).unwrap()).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn install_initialization_cancelled_history_preserves_pre_worker_failure() {
+        let sources = cancelled_install_initializations();
+        assert_eq!(
+            sources[0].planned_steps[0].generated_facts[0],
+            "install_kind:vanilla"
+        );
+        assert_eq!(
+            sources[1].planned_steps[0].generated_facts[0],
+            "install_kind:loader"
+        );
+        let prepared: Vec<_> = sources
+            .iter()
+            .cloned()
+            .map(|source| PreparedOperation::prepare(SOURCE, source))
+            .collect();
+        assert!(
+            prepared.iter().all(Result::is_ok),
+            "Vanilla/loader admission: {prepared:?}"
+        );
+        let batch = PreparedImport::bind_global(prepared.into_iter().map(Result::unwrap).collect())
+            .unwrap();
+        let proof = batch.completion_proof(SOURCE).unwrap();
+        assert_eq!(proof.count(), 2);
+        let store = MetadataStore::in_memory().unwrap();
+        store.migrate(&[MIGRATION]).unwrap();
+        store.transaction(|tx| batch.insert_in(tx)).unwrap();
+        store.transaction(|tx| batch.insert_in(tx)).unwrap();
+        store.read(|db| proof.verify_in(db, SOURCE)).unwrap();
+        let page = store
+            .read(|db| read_completed_in(db, SOURCE, Some(&proof), None, None))
+            .unwrap();
+        assert_eq!(page.records.len(), 2);
+        assert!(page.next_after.is_none());
+        for source in sources {
+            let id = history_id(SOURCE, &source.operation_id);
+            let (_, instance, bytes) = store
+                .read(|db| stored_row(db, &id, MAX_RECORD_BYTES))
+                .unwrap()
+                .unwrap();
+            assert!(instance.is_none());
+            let saved: StoredRecord = serde_json::from_slice(&bytes.unwrap()).unwrap();
+            assert_eq!(saved.source, source);
+            let record = page.records.iter().find(|record| record.id == id).unwrap();
+            let wire = serde_json::to_value(record).unwrap();
+            assert_eq!(wire["historical"], true);
+            assert!(wire["instance_id"].is_null());
+            assert_eq!(wire["command"], "InstallVersion");
+            assert_eq!(wire["outcome"], "Failed");
+            assert_eq!(wire["failure_point"], "install_initialization_cancelled");
+            assert_eq!(wire["sequence"], source.sequence.to_string());
+            assert_eq!(
+                wire["targets"],
+                serde_json::to_value(&source.targets).unwrap()
+            );
+            assert_eq!(
+                wire["completed_steps"],
+                json!([{
+                    "step_id":"install_progress_initializing", "phase":"Failed", "result":"Failed",
+                    "changed_target":null,
+                    "generated_facts":["install_phase:initializing", "install_done:true", "install_error:true"],
+                    "rollback":"NotApplicable", "metrics":null
+                }])
+            );
+            assert!(wire.get("guardian_install_terminal").is_none());
+            assert!(wire.get("guardian_diagnosis_ids").is_none());
+            assert!(wire.get("allowed_actions").is_none());
+        }
+        assert_eq!(count(&store), 2);
+    }
+
+    #[test]
+    fn install_initialization_cancelled_history_rejects_worker_effects_and_contradictions() {
+        let successes = source_records();
+        for source in cancelled_install_initializations() {
+            PreparedOperation::prepare(SOURCE, source.clone()).unwrap();
+            for (pointer, value) in [
+                ("/status", json!("Running")),
+                ("/outcome", Value::Null),
+                ("/failure_point", json!("install_worker_interrupted")),
+                ("/failure_point", json!("install_progress_error")),
+                (
+                    "/completed_steps/0/step_id",
+                    json!("install_progress_error"),
+                ),
+                ("/completed_steps/0/result", json!("Completed")),
+                (
+                    "/completed_steps/0/changed_target",
+                    json!(source.targets[1]),
+                ),
+                (
+                    "/completed_steps/0/generated_facts",
+                    json!([
+                        "install_phase:initializing",
+                        "install_error:true",
+                        "install_done:true"
+                    ]),
+                ),
+                ("/completed_steps/0/rollback", json!("Applied")),
+                ("/completed_steps/0/guardian_fact_ids", json!([])),
+                (
+                    "/completed_steps/0/guardian_fact_ids",
+                    json!(["install_processor_failed"]),
+                ),
+                ("/guardian_diagnosis_ids", json!([])),
+                (
+                    "/guardian_diagnosis_ids",
+                    json!(["download_unavailable", "install_processor_failed"]),
+                ),
+                ("/guardian_install_terminal", Value::Null),
+                (
+                    "/guardian_install_terminal/diagnosis_id",
+                    json!("install_processor_failed"),
+                ),
+                (
+                    "/guardian_install_terminal",
+                    json!({"diagnosis_id":"download_unavailable", "action":"Block", "memory":null}),
+                ),
+                ("/guardian_install_terminal/memory", Value::Null),
+                (
+                    "/guardian_install_terminal/memory/target/id",
+                    json!("another_artifact"),
+                ),
+                (
+                    "/guardian_install_terminal/memory/target/ownership",
+                    json!("ExternalProviderDerived"),
+                ),
+                (
+                    "/guardian_install_terminal/memory/binding",
+                    json!("invalid"),
+                ),
+                (
+                    "/guardian_install_terminal/memory/observed_at",
+                    json!("2026-08-13T10:00:00Z"),
+                ),
+                (
+                    "/guardian_install_terminal/memory/suppression_until",
+                    json!("2026-08-13T10:06:00.000Z"),
+                ),
+            ] {
+                let mut invalid = serde_json::to_value(&source).unwrap();
+                *invalid.pointer_mut(pointer).unwrap() = value;
+                let invalid = serde_json::from_value(invalid).unwrap();
+                assert!(
+                    matches!(
+                        PreparedOperation::prepare(SOURCE, invalid),
+                        Err(HistoryError::Invalid)
+                    ),
+                    "{pointer}"
+                );
+            }
+            for extra in &successes[0].completed_steps[..2] {
+                let mut invalid = source.clone();
+                invalid.completed_steps.insert(0, extra.clone());
+                assert!(matches!(
+                    PreparedOperation::prepare(SOURCE, invalid),
+                    Err(HistoryError::Invalid)
+                ));
+            }
+            let mut with_metrics = source.clone();
+            with_metrics.completed_steps[0].metrics =
+                successes[2].completed_steps.last().unwrap().metrics.clone();
+            assert!(matches!(
+                PreparedOperation::prepare(SOURCE, with_metrics),
+                Err(HistoryError::Invalid)
+            ));
+            let mut content = successes[2].clone();
+            content.status = source.status;
+            content.outcome = source.outcome;
+            content.failure_point = source.failure_point;
+            content.completed_steps = source.completed_steps;
+            content.guardian_diagnosis_ids = source.guardian_diagnosis_ids;
+            content.guardian_install_terminal = source.guardian_install_terminal;
+            assert!(matches!(
+                PreparedOperation::prepare(SOURCE, content),
+                Err(HistoryError::Invalid)
+            ));
+        }
     }
 
     #[test]
