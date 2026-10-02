@@ -1834,6 +1834,15 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn composed_metadata_import_preserves_global_install_history_without_instances() {
+        composed_global_install_history_import(false).await;
+    }
+
+    #[tokio::test]
+    async fn composed_metadata_import_preserves_worker_interruption_without_instance_authority() {
+        composed_global_install_history_import(true).await;
+    }
+
+    async fn composed_global_install_history_import(worker_interrupted: bool) {
         use sha2::{Digest, Sha256};
 
         let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
@@ -1841,17 +1850,21 @@ pub(super) mod tests {
         fs::create_dir(&baseline).unwrap();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../acceptance/fixtures/profiles/offline-vanilla");
-        for leaf in ["config.json", "accounts.json"] {
-            fs::copy(fixture.join(leaf), baseline.join(leaf)).unwrap();
+        if worker_interrupted {
+            copy_fixture(&fixture, &baseline);
+        } else {
+            for leaf in ["config.json", "accounts.json"] {
+                fs::copy(fixture.join(leaf), baseline.join(leaf)).unwrap();
+            }
+            fs::write(
+                baseline.join("instances.json"),
+                serde_json::to_vec(&json!({
+                    "schema_version":3,"last_instance_id":"","pending_deletions":[],"instances":[]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         }
-        fs::write(
-            baseline.join("instances.json"),
-            serde_json::to_vec(&json!({
-                "schema_version":3,"last_instance_id":"","pending_deletions":[],"instances":[]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
         let evidence = concat!(
             "managed-install-v1.d04GQwjfbBL-0D8y3lfjdZK09vfV7jEm-Ej_MLnnOLY.",
             "AQEBAQEBAQEBAQEBAQEBAQ.AgICAgICAgICAgICAgICAg.",
@@ -1988,32 +2001,95 @@ pub(super) mod tests {
             });
             cancelled
         }).collect();
+        let observations = if worker_interrupted {
+            let mut binding = Sha256::new();
+            binding.update(b"axial.guardian.install_failure_memory_binding.v3\0");
+            for value in [
+                "Download:download_unavailable:Execution.Artifact.install_worker_interrupted:Managed:install_provider",
+                "execution",
+                "artifact",
+                "launcher_managed",
+                "install_worker_interrupted",
+                observed_at,
+                suppression_until,
+            ] {
+                binding.update((value.len() as u64).to_be_bytes());
+                binding.update(value.as_bytes());
+            }
+            let binding = hex::encode(binding.finalize());
+            [false, true].into_iter().enumerate().map(|(index, is_loader)| {
+                let number = index + 3;
+                let id = format!("op-00000000-0000-4000-8000-{number:012x}");
+                let mut interrupted = succeeded.clone();
+                interrupted["journal_id"] = json!(format!("journal-{id}"));
+                interrupted["operation_id"] = json!(id);
+                interrupted["sequence"] = json!(9007199254740995_u64 + index as u64);
+                let prefix = if is_loader { "loader-install" } else { "install" };
+                interrupted["targets"][0] = target("Session", &format!("{prefix}-{number:032x}"));
+                if is_loader {
+                    interrupted["targets"][1] = target("Version", "target");
+                    interrupted["planned_steps"] = json!([step("install_version", "Planning", "Planned", json!([
+                        "install_kind:loader", format!("install_version_id:{loader}"),
+                        "loader_component:net.fabricmc.fabric-loader", format!("loader_build_id:{build}")
+                    ]))]);
+                }
+                interrupted["status"] = json!("Failed");
+                interrupted["outcome"] = json!("Failed");
+                interrupted["failure_point"] = json!("install_worker_interrupted");
+                let mut terminal = step("install_progress_error", "Failed", "Failed", json!([
+                    "install_phase:error", "install_done:true", "install_error:true"
+                ]));
+                terminal["guardian_fact_ids"] = json!(["download_interrupted"]);
+                interrupted["completed_steps"] = json!([terminal]);
+                interrupted["guardian_diagnosis_ids"] = json!(["download_unavailable"]);
+                interrupted["guardian_install_terminal"] = json!({
+                    "diagnosis_id":"download_unavailable", "action":"Retry", "memory":{
+                        "binding":binding, "target":{
+                            "system":"Execution", "kind":"Artifact", "id":"install_worker_interrupted", "ownership":"LauncherManaged"
+                        }, "observed_at":observed_at, "suppression_until":suppression_until
+                    }
+                });
+                interrupted
+            }).collect::<Vec<_>>()
+        } else {
+            cancellations
+        };
         fs::create_dir(baseline.join("state")).unwrap();
         fs::write(
             baseline.join("state/operation-journals.json"),
             serde_json::to_vec(&json!({
                 "schema":"axial.state.operation_journals.v10","next_sequence":9007199254740997_u64,
-                "entries":[succeeded,failed,cancellations[0],cancellations[1]]
+                "entries":[succeeded,failed,observations[0],observations[1]]
             }))
             .unwrap(),
         )
         .unwrap();
-        let source_files = [
+        let mut source_files = vec![
             "config.json",
             "accounts.json",
             "instances.json",
             "state/operation-journals.json",
         ];
+        if worker_interrupted {
+            source_files.extend([
+                "instances/0000000000000001/options.txt",
+                "instances/0000000000000001/mods/user-file.keep",
+                "instances/0000000000000001/saves/Fixture World/user-note.txt",
+            ]);
+        }
         let source_snapshot = || {
-            source_files.map(|path| {
-                (
-                    fs::read(baseline.join(path)).unwrap(),
-                    fs::metadata(baseline.join(path))
-                        .unwrap()
-                        .modified()
-                        .unwrap(),
-                )
-            })
+            source_files
+                .iter()
+                .map(|path| {
+                    (
+                        fs::read(baseline.join(path)).unwrap(),
+                        fs::metadata(baseline.join(path))
+                            .unwrap()
+                            .modified()
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
         };
         let unchanged = source_snapshot();
         let profile = root.path().join("replacement");
@@ -2029,7 +2105,7 @@ pub(super) mod tests {
             .imports
             .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
             .unwrap();
-        assert!(preview.instances.is_empty());
+        assert_eq!(preview.instances.len(), usize::from(worker_interrupted));
         assert!(preview.metadata_import_available);
         let input = json!({"metadata_import_id":preview.metadata_import_id,"fingerprint":preview.fingerprint,
             "expected_settings_revision":services.settings.current().unwrap().revision,
@@ -2047,6 +2123,40 @@ pub(super) mod tests {
                 .request(method, format!("{}{path}", bootstrap.base_url))
                 .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
         };
+        let assert_instance_refused = || async {
+            if !worker_interrupted {
+                return;
+            }
+            let preview: Value = request(Method::GET, "/api/v1/import/preview")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(preview["instances"][0]["legacy_id"], FIRST);
+            assert_eq!(preview["instances"][0]["ordinary_import_available"], false);
+            assert!(
+                preview["blockers"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("unsettled_operation"))
+            );
+            assert_eq!(
+                request(Method::POST, "/api/v1/import/instances")
+                    .json(&json!({"fingerprint":preview["fingerprint"],"legacy_id":FIRST}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+            assert!(services.instances.registry().list().unwrap().is_empty());
+            assert!(services.instances.pending().unwrap().is_empty());
+        };
+        assert_instance_refused().await;
         assert_eq!(
             client
                 .get(format!("{}{history_path}", bootstrap.base_url))
@@ -2103,6 +2213,14 @@ pub(super) mod tests {
         );
         assert_eq!(recorded["cutover_available"], false);
         assert_eq!(recorded["receipt"]["global_install_history_count"], 4);
+        if worker_interrupted {
+            services
+                .imports
+                .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
+                .unwrap();
+            assert_instance_refused().await;
+            services.imports.forget().unwrap();
+        }
         for suffix in [
             "?after=",
             "?after=private-predecessor-secret",
@@ -2168,7 +2286,7 @@ pub(super) mod tests {
             assert!(row.get("request").is_none());
             assert!(row.get("actions").is_none());
         }
-        for original in &cancellations {
+        for original in &observations {
             let row = records
                 .iter()
                 .find(|row| row["operation_id"] == original["operation_id"])
@@ -2190,7 +2308,14 @@ pub(super) mod tests {
                 assert_eq!(row[field], original[field], "{field}");
             }
             assert_eq!(row["outcome"], "Failed");
-            assert_eq!(row["failure_point"], "install_initialization_cancelled");
+            assert_eq!(
+                row["failure_point"],
+                if worker_interrupted {
+                    "install_worker_interrupted"
+                } else {
+                    "install_initialization_cancelled"
+                }
+            );
             for field in ["planned_steps", "completed_steps"] {
                 let mut expected = original[field].clone();
                 for step in expected.as_array_mut().unwrap() {

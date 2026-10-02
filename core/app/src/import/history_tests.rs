@@ -781,6 +781,64 @@ fn detached_driver_co_publication_is_identical_in_both_import_orders() {
 }
 
 #[test]
+fn worker_interrupted_global_observation_does_not_waive_ordinary_import() {
+    let fixture = Fixture::new();
+    let records = crate::install::history::tests::worker_interrupted_sources();
+    let path = fixture.baseline.join("state/operation-journals.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "schema":"axial.state.operation_journals.v10", "next_sequence":14, "entries":records
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let before = crate::import::tests::snapshot(&fixture.baseline);
+    let inventory = fixture.capture();
+    assert!(!inventory.preview().instances[0].ordinary_import_available);
+    assert!(matches!(
+        prepare_history(&inventory),
+        Err(ImportError::InvalidData)
+    ));
+    assert!(matches!(
+        prepare_rules_history(&inventory),
+        Err(ImportError::InvalidData)
+    ));
+
+    let global = prepare_global_install_history(&inventory)
+        .expect("optional metadata retains terminal observation, not effect settlement");
+    let source = inventory.source_identity().unwrap();
+    let proof = global.completion_proof(&source).unwrap();
+    assert_eq!(proof.count(), 2);
+    let store = MetadataStore::in_memory().unwrap();
+    store
+        .migrate(&[crate::install::history::MIGRATION])
+        .unwrap();
+    store.transaction(|tx| global.insert_in(tx)).unwrap();
+    store.transaction(|tx| global.insert_in(tx)).unwrap();
+    let page = store
+        .read(|db| {
+            crate::install::history::read_completed_in(db, &source, Some(&proof), None, None)
+        })
+        .unwrap();
+    assert_eq!(page.records.len(), 2);
+    assert!(page.records.iter().all(|record| record.historical
+        && record.instance_id.is_none()
+        && record.failure_point.as_deref() == Some("install_worker_interrupted")));
+    assert!(!inventory.preview().instances[0].ordinary_import_available);
+    assert!(matches!(
+        prepare_history(&inventory),
+        Err(ImportError::InvalidData)
+    ));
+    assert!(matches!(
+        prepare_rules_history(&inventory),
+        Err(ImportError::InvalidData)
+    ));
+    assert_eq!(crate::import::tests::snapshot(&fixture.baseline), before);
+}
+
+#[test]
 fn archived_content_co_publication_preserves_exact_history_in_both_orders() {
     for metadata_first in [false, true] {
         let fixture = Fixture::new();

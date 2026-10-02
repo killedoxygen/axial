@@ -285,12 +285,38 @@ struct ValidatedOperation {
     id: String,
     source_id: String,
     source: SourceOperation,
-    legacy_instance_id: Option<String>,
+    admission: SourceAdmission,
     stored_bytes: usize,
+}
+
+#[derive(Debug)]
+enum SourceAdmission {
+    Global,
+    Instance(String),
+    GlobalObservation,
 }
 
 impl PreparedOperation {
     pub(crate) fn prepare(source_id: &str, source: SourceOperation) -> Result<Self, HistoryError> {
+        let operation = Self::readable(source_id, source)?;
+        if matches!(operation.0.admission, SourceAdmission::GlobalObservation) {
+            return Err(HistoryError::Invalid);
+        }
+        Ok(operation)
+    }
+
+    pub(crate) fn prepare_global_observation(
+        source_id: &str,
+        source: SourceOperation,
+    ) -> Result<Self, HistoryError> {
+        let operation = Self::readable(source_id, source)?;
+        if operation.legacy_instance_id().is_some() {
+            return Err(HistoryError::Invalid);
+        }
+        Ok(operation)
+    }
+
+    fn readable(source_id: &str, source: SourceOperation) -> Result<Self, HistoryError> {
         if !lower_hex(source_id, 64)
             || serde_json::to_vec(&source)
                 .map_err(|_| HistoryError::Invalid)?
@@ -299,15 +325,14 @@ impl PreparedOperation {
         {
             return Err(HistoryError::Invalid);
         }
-        let legacy_instance_id = validate_source(&source)?;
+        let admission = validate_source(&source)?;
         let id = history_id(source_id, &source.operation_id);
         let stored_bytes = serde_json::to_vec(&StoredRef {
             schema: 1,
             id: &id,
             source_id,
-            instance_id: legacy_instance_id
-                .as_ref()
-                .map(|_| "00000000-0000-0000-0000-000000000001"),
+            instance_id: matches!(admission, SourceAdmission::Instance(_))
+                .then_some("00000000-0000-0000-0000-000000000001"),
             source: &source,
         })
         .map_err(|_| HistoryError::Invalid)?
@@ -319,13 +344,16 @@ impl PreparedOperation {
             id,
             source_id: source_id.to_owned(),
             source,
-            legacy_instance_id,
+            admission,
             stored_bytes,
         })))
     }
 
     pub(crate) fn legacy_instance_id(&self) -> Option<&str> {
-        self.0.legacy_instance_id.as_deref()
+        match &self.0.admission {
+            SourceAdmission::Instance(id) => Some(id),
+            SourceAdmission::Global | SourceAdmission::GlobalObservation => None,
+        }
     }
 }
 
@@ -434,6 +462,9 @@ impl PreparedImport {
         }
         let mut bound = Vec::with_capacity(records.len());
         for operation in records {
+            if matches!(operation.0.admission, SourceAdmission::GlobalObservation) {
+                return Err(HistoryError::Invalid);
+            }
             let instance_id = match operation.legacy_instance_id() {
                 None => None,
                 Some(id) if id == legacy_id => Some(instance.as_str().to_owned()),
@@ -663,7 +694,7 @@ fn decode_stored(
     {
         return Err(HistoryError::Conflict);
     }
-    let operation = PreparedOperation::prepare(&saved.source_id, saved.source)
+    let operation = PreparedOperation::readable(&saved.source_id, saved.source)
         .map_err(|_| HistoryError::Conflict)?;
     if operation.0.id != id || !valid_binding(&operation, saved.instance_id.as_deref()) {
         return Err(HistoryError::Conflict);
@@ -930,7 +961,7 @@ enum Identity {
     Content(String),
 }
 
-fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryError> {
+fn validate_source(source: &SourceOperation) -> Result<SourceAdmission, HistoryError> {
     let id = source
         .operation_id
         .strip_prefix("op-")
@@ -1059,19 +1090,29 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
                 return Err(HistoryError::Invalid);
             }
             validate_initialization_failure(source, "content_progress_initializing", &[])?;
-            return Ok(Some(id.clone()));
+            return Ok(SourceAdmission::Instance(id.clone()));
         }
         (
             Identity::Vanilla(_) | Identity::Loader { .. },
             "Failed",
             Some("Failed"),
-            Some("install_initialization_cancelled"),
+            Some(failure @ ("install_initialization_cancelled" | "install_worker_interrupted")),
         ) => {
-            validate_initialization_failure(
-                source,
-                "install_progress_initializing",
-                &["download_interrupted"],
-            )?;
+            if failure == "install_initialization_cancelled" {
+                validate_initialization_failure(
+                    source,
+                    "install_progress_initializing",
+                    &["download_interrupted"],
+                )?;
+            } else {
+                let [step] = source.completed_steps.as_slice() else {
+                    return Err(HistoryError::Invalid);
+                };
+                validate_failed_progress(step)?;
+                if step.guardian_fact_ids != ["download_interrupted"] {
+                    return Err(HistoryError::Invalid);
+                }
+            }
             validate_guardian_terminal(source)?;
             let terminal = source
                 .guardian_install_terminal
@@ -1081,12 +1122,18 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
             if source.guardian_diagnosis_ids != ["download_unavailable"]
                 || terminal.diagnosis_id != "download_unavailable"
                 || terminal.action != "Retry"
-                || memory.target.id != "install_initialization_cancelled"
+                || memory.target.id != failure
                 || memory.target.ownership != "LauncherManaged"
             {
                 return Err(HistoryError::Invalid);
             }
-            return Ok(None);
+            return Ok(if failure == "install_initialization_cancelled" {
+                SourceAdmission::Global
+            } else {
+                // A terminal status remains readable without proving that the
+                // interrupted worker settled its file or process effects.
+                SourceAdmission::GlobalObservation
+            });
         }
         (_, "Succeeded", Some("Succeeded"), None)
             if source.guardian_diagnosis_ids.is_empty()
@@ -1161,9 +1208,11 @@ fn validate_source(source: &SourceOperation) -> Result<Option<String>, HistoryEr
     }
     match identity {
         _ if failed && !rolled_back => Err(HistoryError::Invalid),
-        Identity::Vanilla(_) if checkpoints == 1 => Ok(None),
-        Identity::Loader { .. } if checkpoints == 2 || (failed && checkpoints == 1) => Ok(None),
-        Identity::Content(id) if checkpoints == 0 => Ok(Some(id)),
+        Identity::Vanilla(_) if checkpoints == 1 => Ok(SourceAdmission::Global),
+        Identity::Loader { .. } if checkpoints == 2 || (failed && checkpoints == 1) => {
+            Ok(SourceAdmission::Global)
+        }
+        Identity::Content(id) if checkpoints == 0 => Ok(SourceAdmission::Instance(id)),
         _ => Err(HistoryError::Invalid),
     }
 }
@@ -1768,7 +1817,7 @@ fn legacy_sensitive(value: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::MetadataStore;
     use serde_json::{Value, json};
@@ -1784,6 +1833,49 @@ mod tests {
     fn cancelled_initialization() -> SourceOperation {
         let journal = crate::import::tests::cancelled_content_initialization_journal();
         serde_json::from_value(journal["entries"][0].clone()).unwrap()
+    }
+
+    pub(crate) fn worker_interrupted_sources() -> Vec<SourceOperation> {
+        let observed_at = "2026-08-13T10:00:00.000Z";
+        let suppression_until = "2026-08-13T10:05:00.000Z";
+        let mut binding = Sha256::new();
+        binding.update(b"axial.guardian.install_failure_memory_binding.v3\0");
+        for value in [
+            "Download:download_unavailable:Execution.Artifact.install_worker_interrupted:Managed:install_provider",
+            "execution",
+            "artifact",
+            "launcher_managed",
+            "install_worker_interrupted",
+            observed_at,
+            suppression_until,
+        ] {
+            binding.update((value.len() as u64).to_be_bytes());
+            binding.update(value.as_bytes());
+        }
+        let binding = hex::encode(binding.finalize());
+        source_records().into_iter().take(2).map(|mut source| {
+            // record_install_operation_interrupted with interrupted_install_progress,
+            // not a publication/rollback or initialization-cleanup record.
+            source.status = "Failed".into();
+            source.outcome = Some("Failed".into());
+            source.failure_point = Some("install_worker_interrupted".into());
+            source.completed_steps = serde_json::from_value(json!([{
+                "step_id":"install_progress_error", "phase":"Failed", "result":"Failed",
+                "changed_target":null,
+                "generated_facts":["install_phase:error", "install_done:true", "install_error:true"],
+                "rollback":"NotApplicable", "guardian_fact_ids":["download_interrupted"], "metrics":null
+            }])).unwrap();
+            source.guardian_diagnosis_ids = vec!["download_unavailable".into()];
+            source.guardian_install_terminal = Some(serde_json::from_value(json!({
+                "diagnosis_id":"download_unavailable", "action":"Retry", "memory":{
+                    "binding":binding, "target":{
+                        "system":"Execution", "kind":"Artifact", "id":"install_worker_interrupted",
+                        "ownership":"LauncherManaged"
+                    }, "observed_at":observed_at, "suppression_until":suppression_until
+                }
+            })).unwrap());
+            source
+        }).collect()
     }
 
     fn rolled_back_records() -> Vec<SourceOperation> {
@@ -3041,6 +3133,152 @@ mod tests {
                 serde_json::from_slice(&serde_json::to_vec(&source).unwrap()).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn worker_interrupted_history_is_readable_without_ordinary_import_authority() {
+        for source in worker_interrupted_sources() {
+            assert!(matches!(
+                PreparedOperation::prepare(SOURCE, source.clone()),
+                Err(HistoryError::Invalid)
+            ));
+            let id = history_id(SOURCE, &source.operation_id);
+            let bytes = serde_json::to_vec(&StoredRef {
+                schema: 1,
+                id: &id,
+                source_id: SOURCE,
+                instance_id: None,
+                source: &source,
+            })
+            .unwrap();
+            let saved = decode_stored(&id, SOURCE, None, Some(bytes))
+                .expect("terminal observation is readable without settled-effect proof");
+            assert_eq!(saved.operation.0.source, source);
+            assert!(saved.instance_id.is_none());
+            let wire = serde_json::to_value(saved.project()).unwrap();
+            assert_eq!(wire["historical"], true);
+            assert_eq!(wire["outcome"], "Failed");
+            assert_eq!(wire["failure_point"], "install_worker_interrupted");
+            assert_eq!(wire["rollback"], "NotApplicable");
+            assert_eq!(
+                wire["targets"],
+                serde_json::to_value(&source.targets).unwrap()
+            );
+            assert!(wire.get("allowed_actions").is_none());
+            assert!(wire.get("guardian_install_terminal").is_none());
+            assert!(wire.get("guardian_diagnosis_ids").is_none());
+            assert!(matches!(
+                PreparedOperation::prepare(SOURCE, saved.operation.0.source.clone()),
+                Err(HistoryError::Invalid)
+            ));
+            assert!(matches!(
+                PreparedImport::bind(
+                    vec![saved.operation.clone()],
+                    "0123456789abcdef",
+                    &InstanceId::new()
+                ),
+                Err(HistoryError::Invalid)
+            ));
+            assert!(PreparedImport::bind_global(vec![saved.operation]).is_ok());
+            assert!(PreparedOperation::prepare_global_observation(SOURCE, source).is_ok());
+        }
+        assert!(matches!(
+            PreparedOperation::prepare_global_observation(SOURCE, source_records().remove(2)),
+            Err(HistoryError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn worker_interrupted_history_reader_rejects_unsupported_and_incoherent_evidence() {
+        let successes = source_records();
+        for source in worker_interrupted_sources() {
+            let id = history_id(SOURCE, &source.operation_id);
+            let record = serde_json::to_value(StoredRef {
+                schema: 1,
+                id: &id,
+                source_id: SOURCE,
+                instance_id: None,
+                source: &source,
+            })
+            .unwrap();
+            let mut extra_checkpoint = source.completed_steps.clone();
+            extra_checkpoint.insert(0, successes[0].completed_steps[1].clone());
+            let mut extra_progress = source.completed_steps.clone();
+            extra_progress.insert(0, successes[0].completed_steps[0].clone());
+            for (pointer, value) in [
+                ("/source/status", json!("Running")),
+                ("/source/outcome", Value::Null),
+                ("/source/failure_point", json!("install_progress_error")),
+                ("/source/failure_point", json!("unknown_worker_error")),
+                ("/source/targets/1/id", json!("different_version")),
+                ("/source/completed_steps", json!(extra_checkpoint)),
+                ("/source/completed_steps", json!(extra_progress)),
+                ("/source/completed_steps/0/result", json!("Completed")),
+                (
+                    "/source/completed_steps/0/changed_target",
+                    json!(source.targets[1]),
+                ),
+                (
+                    "/source/completed_steps/0/generated_facts",
+                    json!(["install_phase:error", "install_done:true"]),
+                ),
+                ("/source/completed_steps/0/rollback", json!("Applied")),
+                ("/source/completed_steps/0/guardian_fact_ids", json!([])),
+                (
+                    "/source/completed_steps/0/metrics",
+                    json!(successes[2].completed_steps.last().unwrap().metrics),
+                ),
+                ("/source/guardian_diagnosis_ids", json!([])),
+                ("/source/guardian_install_terminal", Value::Null),
+                (
+                    "/source/guardian_install_terminal/diagnosis_id",
+                    json!("install_processor_failed"),
+                ),
+                ("/source/guardian_install_terminal/action", json!("Block")),
+                (
+                    "/source/guardian_install_terminal/memory/target/id",
+                    json!("install_initialization_cancelled"),
+                ),
+                (
+                    "/source/guardian_install_terminal/memory/binding",
+                    json!("invalid"),
+                ),
+                (
+                    "/source/guardian_install_terminal/memory/observed_at",
+                    json!("2026-08-13T10:00:00Z"),
+                ),
+                (
+                    "/source/guardian_install_terminal/memory/suppression_until",
+                    json!("2026-08-13T10:06:00.000Z"),
+                ),
+            ] {
+                let mut invalid = record.clone();
+                *invalid.pointer_mut(pointer).unwrap() = value;
+                assert!(
+                    matches!(
+                        decode_stored(
+                            &id,
+                            SOURCE,
+                            None,
+                            Some(serde_json::to_vec(&invalid).unwrap())
+                        ),
+                        Err(HistoryError::Conflict)
+                    ),
+                    "{pointer}"
+                );
+            }
+            let mut unknown = record;
+            unknown["source"]["unknown_effect"] = json!(true);
+            assert!(matches!(
+                decode_stored(
+                    &id,
+                    SOURCE,
+                    None,
+                    Some(serde_json::to_vec(&unknown).unwrap())
+                ),
+                Err(HistoryError::Conflict)
+            ));
+        }
     }
 
     #[test]

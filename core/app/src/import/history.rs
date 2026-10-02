@@ -874,7 +874,13 @@ pub(super) fn prepare_global_install_history(
         // unsupported or malformed global record must not become an empty proof.
         for entry in decode_journal(&inventory.record_bytes(JOURNAL)?)? {
             if entry.command == "InstallVersion" {
-                records.push(entry.convert_install(&source)?);
+                records.push(
+                    PreparedInstallOperation::prepare_global_observation(
+                        &source,
+                        entry.into_install_source()?,
+                    )
+                    .map_err(|_| ImportError::InvalidData)?,
+                );
             }
         }
     }
@@ -987,44 +993,45 @@ pub(super) fn prepare_rules_history(
 
 impl LegacyOperation {
     fn convert_install(self, source: &str) -> ImportResult<PreparedInstallOperation> {
+        PreparedInstallOperation::prepare(source, self.into_install_source()?)
+            .map_err(|_| ImportError::InvalidData)
+    }
+
+    fn into_install_source(self) -> ImportResult<SourceOperation> {
         if !matches!(self.intent, LegacyIntent::Generic {}) {
             return Err(ImportError::InvalidData);
         }
-        PreparedInstallOperation::prepare(
-            source,
-            SourceOperation {
-                journal_id: self.journal_id,
-                operation_id: self.operation_id,
-                sequence: self.sequence,
-                parent_operation_id: self.parent_operation_id,
-                command: self.command,
-                intent: SourceIntent::Generic {},
-                status: self.status,
-                owner: self.owner,
-                ownership: self.ownership,
-                targets: self.targets,
-                planned_steps: self
-                    .planned_steps
-                    .into_iter()
-                    .map(LegacyGuardianStep::into_install)
-                    .collect(),
-                completed_steps: self
-                    .completed_steps
-                    .into_iter()
-                    .map(LegacyGuardianStep::into_install)
-                    .collect(),
-                failure_point: self.failure_point,
-                rollback: rollback_label(self.rollback).to_owned(),
-                guardian_diagnosis_ids: self.guardian_diagnosis_ids,
-                outcome: self.outcome,
-                reconciliation_attempt: self.reconciliation_attempt,
-                reconciliation_terminal: self.reconciliation_terminal,
-                persisted_state_repair_attempt: self.persisted_state_repair_attempt,
-                persisted_state_repair_terminal: self.persisted_state_repair_terminal,
-                guardian_install_terminal: self.guardian_install_terminal,
-            },
-        )
-        .map_err(|_| ImportError::InvalidData)
+        Ok(SourceOperation {
+            journal_id: self.journal_id,
+            operation_id: self.operation_id,
+            sequence: self.sequence,
+            parent_operation_id: self.parent_operation_id,
+            command: self.command,
+            intent: SourceIntent::Generic {},
+            status: self.status,
+            owner: self.owner,
+            ownership: self.ownership,
+            targets: self.targets,
+            planned_steps: self
+                .planned_steps
+                .into_iter()
+                .map(LegacyGuardianStep::into_install)
+                .collect(),
+            completed_steps: self
+                .completed_steps
+                .into_iter()
+                .map(LegacyGuardianStep::into_install)
+                .collect(),
+            failure_point: self.failure_point,
+            rollback: rollback_label(self.rollback).to_owned(),
+            guardian_diagnosis_ids: self.guardian_diagnosis_ids,
+            outcome: self.outcome,
+            reconciliation_attempt: self.reconciliation_attempt,
+            reconciliation_terminal: self.reconciliation_terminal,
+            persisted_state_repair_attempt: self.persisted_state_repair_attempt,
+            persisted_state_repair_terminal: self.persisted_state_repair_terminal,
+            guardian_install_terminal: self.guardian_install_terminal,
+        })
     }
 
     fn convert_rules(self) -> ImportResult<HistoricalRulesRefresh> {
