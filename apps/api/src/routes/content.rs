@@ -565,6 +565,19 @@ mod tests {
                         paths.lock().unwrap().push(uri.path().to_owned());
                         match uri.path() {
                             "/v2/project/owned/version" => Json(json!([])).into_response(),
+                            "/v2/project/updateable/version" => Json(json!([{
+                                "project_id":"updateable", "id":"v2", "name":"Release",
+                                "version_number":"2.0", "version_type":"release",
+                                "game_versions":["1.21.4"], "loaders":["minecraft"],
+                                "files":[{"filename":"updateable-v2.zip", "size":3,
+                                    "url":"https://cdn.modrinth.com/updateable-v2.zip", "primary":true,
+                                    "hashes":{"sha512":"a".repeat(128)}}]
+                            }]))
+                            .into_response(),
+                            "/v2/project/removed/version" => StatusCode::NOT_FOUND.into_response(),
+                            "/v2/project/unavailable/version" => {
+                                StatusCode::SERVICE_UNAVAILABLE.into_response()
+                            }
                             "/v2/project/pack" => Json(json!({
                                 "id":"pack", "title":"Fixture pack", "project_type":"modpack"
                             }))
@@ -782,6 +795,99 @@ mod tests {
         assert!(!fixture.game.join("mods/missing.jar").exists());
         drop(launch);
         fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn content_updates_isolate_provider_failures_without_mutating_files_or_queue() {
+        for unavailable in ["removed", "unavailable"] {
+            let fixture = Fixture::new().await;
+            let projects = [unavailable, "updateable"];
+            let mut manifest = ContentManifest::default();
+            for project in projects {
+                manifest
+                    .try_upsert(
+                        ManifestEntry::managed(
+                            CanonicalId::for_project(ProviderId::Modrinth, project),
+                            ProviderId::Modrinth,
+                            project.into(),
+                            "v1".into(),
+                            ContentKind::ResourcePack,
+                            &FileRef {
+                                filename: format!("{project}.zip"),
+                                url: format!("https://cdn.modrinth.com/{project}.zip"),
+                                size: Some(3),
+                                sha512: Some(concat!(
+                                    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2",
+                                    "192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+                                ).into()),
+                                sha1: None,
+                                primary: true,
+                            },
+                            Vec::new(),
+                            Some(format!("Installed {project}")),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                std::fs::write(
+                    fixture.game.join(format!("resourcepacks/{project}.zip")),
+                    b"abc",
+                )
+                .unwrap();
+            }
+            let raw = manifest.encode_managed().unwrap();
+            std::fs::write(fixture.game.join(MANIFEST_FILE), &raw).unwrap();
+            std::fs::write(fixture.game.join("resourcepacks/user.zip"), b"untouched").unwrap();
+            let before_queue = serde_json::to_value(fixture.queue.snapshot()).unwrap();
+            let endpoint = format!("/api/v1/instances/{}/content", fixture.id);
+            let (status, before_listing) = fixture.get(&endpoint).await;
+            assert_eq!(status, StatusCode::OK, "{before_listing}");
+            assert_eq!(before_listing["entries"].as_array().unwrap().len(), 2);
+
+            let (status, updates) = fixture.get(&format!("{endpoint}/updates")).await;
+            assert_eq!(status, StatusCode::OK, "{unavailable}: {updates}");
+            assert_eq!(
+                updates,
+                json!({"updates":[{
+                    "canonical_id":"modrinth:updateable", "kind":"resource_pack",
+                    "current_version_id":"v1", "latest_version_id":"v2",
+                    "latest_version_number":"2.0", "title":"Installed updateable"
+                }]})
+            );
+            let paths = fixture.paths.lock().unwrap().clone();
+            assert!(paths.contains(&format!("/v2/project/{unavailable}/version")));
+            assert!(paths.contains(&"/v2/project/updateable/version".to_string()));
+            assert!(paths.iter().all(|path| path.ends_with("/version")));
+            let (status, after_listing) = fixture.get(&endpoint).await;
+            assert_eq!(status, StatusCode::OK, "{after_listing}");
+            assert_eq!(after_listing, before_listing);
+            assert_eq!(
+                std::fs::read(fixture.game.join(MANIFEST_FILE)).unwrap(),
+                raw
+            );
+            for project in projects {
+                assert_eq!(
+                    std::fs::read(fixture.game.join(format!("resourcepacks/{project}.zip")))
+                        .unwrap(),
+                    b"abc"
+                );
+            }
+            assert_eq!(
+                std::fs::read(fixture.game.join("resourcepacks/user.zip")).unwrap(),
+                b"untouched"
+            );
+            assert!(
+                !fixture
+                    .game
+                    .join("resourcepacks/updateable-v2.zip")
+                    .exists()
+            );
+            assert_eq!(
+                serde_json::to_value(fixture.queue.snapshot()).unwrap(),
+                before_queue
+            );
+            fixture.close().await;
+        }
     }
 
     #[tokio::test]

@@ -1234,6 +1234,7 @@ pub struct AvailableUpdate {
     pub title: Option<String>,
 }
 
+/// Provider failure omits that project's update, not other projects' candidates.
 pub async fn available_updates(
     service: &ContentService,
     target: &ResolutionTarget,
@@ -1251,9 +1252,17 @@ pub async fn available_updates(
         if entry.kind() == ContentKind::Modpack {
             continue;
         }
-        let versions = service
+        let versions = match service
             .versions(entry.canonical_id(), &target.filter_for(entry.kind()))
-            .await?;
+            .await
+        {
+            Ok(versions) => versions,
+            Err(error @ ContentError::Provider(crate::network::DownloadError::Cancelled)) => {
+                return Err(error);
+            }
+            Err(ContentError::Provider(_) | ContentError::ProviderMetadataInvalid(_)) => continue,
+            Err(error) => return Err(error),
+        };
         if let Some(version) = newer_version(&versions, entry.version_id()).filter(|version| {
             !version_conflicts_with_installed(version, entry.canonical_id(), &installed)
         }) {
@@ -1888,30 +1897,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn available_updates_preserve_provider_failure() {
-        let fixture = ProviderFixture::new(
-            Vec::new(),
-            HashMap::from([("root".into(), ProviderResponse::Status(503))]),
-        )
-        .await;
+    async fn available_updates_isolate_provider_failures() {
+        for response in [
+            ProviderResponse::Status(404),
+            ProviderResponse::Status(503),
+            ProviderResponse::Json(json!({"invalid": "version list"})),
+        ] {
+            let fixture = ProviderFixture::new(
+                Vec::new(),
+                HashMap::from([
+                    ("unavailable".into(), response),
+                    (
+                        "root".into(),
+                        provider_versions(vec![provider_version("v2", "root", Vec::new())]),
+                    ),
+                ]),
+            )
+            .await;
+            let mut manifest = ContentManifest::default();
+            manifest
+                .try_upsert(update_entry("unavailable", ContentKind::Mod, None))
+                .unwrap();
+            let updates = available_updates(
+                &fixture.service,
+                &resolver_target(),
+                &manifest,
+                &LiveManagedContent::from_entries(manifest.entries()),
+            )
+            .await
+            .expect("an unavailable project contributes no update");
+            assert!(updates.is_empty());
+
+            manifest
+                .try_upsert(update_entry(
+                    "root",
+                    ContentKind::Mod,
+                    Some("Installed title"),
+                ))
+                .unwrap();
+            let updates = available_updates(
+                &fixture.service,
+                &resolver_target(),
+                &manifest,
+                &LiveManagedContent::from_entries(manifest.entries()),
+            )
+            .await
+            .expect("an unavailable project must not hide another project's update");
+            assert_eq!(
+                serde_json::to_value(updates).unwrap(),
+                json!([{
+                    "canonical_id": "modrinth:root", "kind": "mod",
+                    "current_version_id": "v1", "latest_version_id": "v2",
+                    "latest_version_number": "v2", "title": "Installed title"
+                }])
+            );
+            assert_eq!(fixture.request_count("/v2/project/root/version"), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn available_updates_preserve_invalid_targets_and_cancellation() {
+        let fixture = ProviderFixture::new(Vec::new(), HashMap::new()).await;
         let mut manifest = ContentManifest::default();
         manifest
             .try_upsert(update_entry("root", ContentKind::Mod, None))
             .unwrap();
-
-        let error = available_updates(
-            &fixture.service,
-            &resolver_target(),
-            &manifest,
-            &LiveManagedContent::from_entries(manifest.entries()),
-        )
-        .await
-        .expect_err("provider failure must not become an empty update list");
-
+        let live = LiveManagedContent::from_entries(manifest.entries());
+        let mut target = resolver_target();
+        target.game_version = "invalid\nversion".into();
         assert!(matches!(
-            error,
-            ContentError::Provider(crate::network::DownloadError::HttpStatus { status: 503 })
+            available_updates(&fixture.service, &target, &manifest, &live).await,
+            Err(ContentError::Invalid(_))
         ));
+        let cancellation = crate::tasks::CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            available_updates(
+                &fixture.service.with_cancellation(cancellation),
+                &resolver_target(),
+                &manifest,
+                &live,
+            )
+            .await,
+            Err(ContentError::Provider(
+                crate::network::DownloadError::Cancelled
+            ))
+        ));
+        assert!(fixture.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
