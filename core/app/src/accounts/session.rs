@@ -629,7 +629,7 @@ mod tests {
                     tx,
                     &[],
                     &[input.clone()],
-                    &input.account_id()?,
+                    Some(&input.account_id()?),
                     0,
                 )
             })
@@ -904,7 +904,10 @@ mod tests {
             .select_account(capture.account_id().into(), AccountPreconditions::default())
             .await
             .unwrap();
-        assert_eq!(selected.active_account_id.as_ref(), Some(capture.identity()));
+        assert_eq!(
+            selected.active_account_id.as_ref(),
+            Some(capture.identity())
+        );
         service.tasks.close_admission();
         assert!(matches!(
             service.refresh_selected().await,

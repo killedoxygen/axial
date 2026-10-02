@@ -175,7 +175,6 @@ function metadataReceipt(value: unknown, expectedId: string): MetadataImportRece
       ? undefined
       : count(record.archived_content_operation_count, 'Imported archived content operation count');
   if (
-    total === 0 ||
     total > 256 ||
     settingsRevision === 0 ||
     (historyCount !== undefined && historyCount > 128) ||
@@ -183,7 +182,7 @@ function metadataReceipt(value: unknown, expectedId: string): MetadataImportRece
     (benchmarkCount !== undefined && benchmarkCount > 1024) ||
     (operationCount !== undefined && operationCount > 128) ||
     (contentCount !== undefined && contentCount > 128) ||
-    (record.account_id_mapping === null && microsoftCount > 0)
+    (record.account_id_mapping === null && (total === 0 || microsoftCount > 0))
   ) {
     throw new Error('The metadata import receipt was invalid.');
   }

@@ -494,6 +494,7 @@ pub(super) mod tests {
                     axial_app::import::METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
                     axial_app::import::METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
                     axial_app::import::METADATA_IMPORT_ARCHIVED_CONTENT_MIGRATION,
+                    axial_app::import::METADATA_IMPORT_UNSELECTED_ACCOUNTS_MIGRATION,
                     axial_app::performance::benchmarks::MIGRATION,
                     axial_app::performance::benchmarks::MIGRATION_V2,
                     axial_app::performance::benchmarks::MIGRATION_V3,
@@ -1594,6 +1595,163 @@ pub(super) mod tests {
             .await;
         assert_eq!(status, StatusCode::OK, "{recorded}");
         assert!(recorded["receipt"].is_null());
+    }
+
+    #[tokio::test]
+    async fn unselected_account_profile_import_preserves_metadata_and_survivor_after_reopen() {
+        for microsoft in [false, true] {
+            let fixture = Fixture::new();
+            if microsoft {
+                fixture.select_source_microsoft(false);
+            }
+            let path = fixture.baseline.join("accounts.json");
+            let mut accounts: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            accounts["active_account_id"] = Value::Null;
+            if !microsoft {
+                accounts["accounts"] = json!([]);
+            }
+            fs::write(&path, serde_json::to_vec(&accounts).unwrap()).unwrap();
+            let path = fixture.baseline.join("config.json");
+            let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            config["username"] = json!("PreviousPlayer");
+            config["launch_auth_mode"] = json!("offline");
+            fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let canaries: Vec<_> = [
+                "accounts.json",
+                "config.json",
+                "instances/0000000000000001/options.txt",
+            ]
+            .into_iter()
+            .map(|path| (path, fs::read(fixture.baseline.join(path)).unwrap()))
+            .collect();
+            fixture
+                .services
+                .previews
+                .admit(Inventory::capture(&fixture.source, &BTreeMap::new()).unwrap())
+                .unwrap();
+            let (status, preview) = fixture
+                .request(Method::GET, "/api/v1/import/preview", Value::Null)
+                .await;
+            assert_eq!(status, StatusCode::OK, "{preview}");
+            assert_eq!(preview["metadata_import_available"], true, "{preview}");
+            assert_eq!(preview["instances"][0]["ordinary_import_available"], true);
+            let request = fixture.metadata_request();
+            let status_path = format!(
+                "/api/v1/import/metadata/{}",
+                request["metadata_import_id"].as_str().unwrap()
+            );
+            let (status, imported) = fixture
+                .request(Method::POST, "/api/v1/import/metadata", request.clone())
+                .await;
+            assert_eq!(status, StatusCode::OK, "{imported}");
+            let receipt = imported["receipt"].clone();
+            assert_eq!(receipt["imported_offline_account_count"], 0);
+            assert_eq!(
+                receipt["imported_microsoft_account_count"],
+                usize::from(microsoft)
+            );
+            assert_eq!(
+                receipt["account_id_mapping"],
+                if microsoft {
+                    json!({(LEGACY_MICROSOFT_ID):MICROSOFT_ID})
+                } else {
+                    json!({})
+                }
+            );
+            let snapshot = fixture.services.accounts.snapshot().unwrap();
+            assert!(snapshot.active_account_id.is_none());
+            assert_eq!(snapshot.accounts.len(), usize::from(microsoft));
+            assert!(
+                snapshot
+                    .accounts
+                    .iter()
+                    .all(|account| account.login_id.is_none()
+                        && account.minecraft_profile.is_none()
+                        && account.credential_revision == 0)
+            );
+            let settings = fixture.services.settings.current().unwrap();
+            assert_eq!(settings.username, "PreviousPlayer");
+            assert_eq!(
+                settings.launch_auth_mode,
+                axial_app::settings::ConfigLaunchAuthMode::Offline
+            );
+            let (status, projected) = fixture
+                .request(Method::GET, "/api/v1/config", Value::Null)
+                .await;
+            assert_eq!(status, StatusCode::OK, "{projected}");
+            assert_eq!(projected["username"], "PreviousPlayer");
+            assert_eq!(projected["launch_auth_mode"], "offline");
+            let (status, instance) = fixture
+                .post(json!({"fingerprint":preview["fingerprint"],"legacy_id":FIRST}))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{instance}");
+            assert_eq!(
+                fixture.services.instances.registry().list().unwrap().len(),
+                1
+            );
+            fixture
+                .services
+                .accounts
+                .create_offline_account("LaterPlayer")
+                .unwrap();
+            let later = fixture.services.accounts.snapshot().unwrap();
+            let (status, replay) = fixture
+                .request(Method::POST, "/api/v1/import/metadata", request)
+                .await;
+            assert_eq!(status, StatusCode::OK, "{replay}");
+            assert_eq!(replay["receipt"], receipt);
+            assert_eq!(replay["already_imported"], true);
+            assert_eq!(fixture.services.accounts.snapshot().unwrap(), later);
+            fixture.services.previews.forget().unwrap();
+            let (status, recorded) = fixture
+                .request(Method::GET, &status_path, Value::Null)
+                .await;
+            assert_eq!(status, StatusCode::OK, "{recorded}");
+            assert_eq!(recorded["receipt"], receipt);
+
+            let storage = Arc::new(
+                MetadataStore::open(fixture._root.path().join("replacement/metadata.sqlite"))
+                    .unwrap(),
+            );
+            let settings = Arc::new(
+                SettingsStore::new_with_telemetry_identity(storage.clone(), true).unwrap(),
+            );
+            let accounts = Arc::new(AccountDirectory::new(storage.clone()).unwrap());
+            let library = fixture.services.instances.directories().library().clone();
+            let skins = Arc::new(SavedSkinLibrary::new(
+                SavedSkinStore::new(storage.clone()),
+                library.admit_application_root().unwrap(),
+            ));
+            let tasks = TaskOwner::new(4).unwrap();
+            let rules = PerformanceRules::with_remote(storage.clone(), None, None).unwrap();
+            let instances = Arc::new(InstanceService::new(
+                InstanceDirectories::new(Registry::new(storage), library, Exclusions::new()),
+                tasks.clone(),
+            ));
+            assert_eq!(
+                instances.registry().list().unwrap()[0].instance.id.as_str(),
+                instance["instance"]["id"].as_str().unwrap()
+            );
+            let reopened = router(
+                Arc::new(ImportPreviews::new()),
+                instances,
+                settings,
+                accounts.clone(),
+                skins,
+                rules,
+                fixture.services.telemetry.clone(),
+                tasks,
+            )
+            .unwrap();
+            let (status, reopened_receipt) = read_route(reopened, &status_path).await;
+            assert_eq!(status, StatusCode::OK, "{reopened_receipt}");
+            assert_eq!(reopened_receipt, recorded);
+            assert_eq!(accounts.snapshot().unwrap(), later);
+            for (path, bytes) in canaries {
+                assert_eq!(fs::read(fixture.baseline.join(path)).unwrap(), bytes);
+            }
+            assert!(!fixture.baseline.join(".axial-root.lease").exists());
+        }
     }
 
     #[tokio::test]

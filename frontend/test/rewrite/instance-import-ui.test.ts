@@ -1059,6 +1059,8 @@ test('applying imported music synchronizes playback, volume and track without pe
     {
       './api': { apiResourceUrl: (path: string) => path },
       './hooks/use-autosave': {
+        canAutoSave: () => true,
+        registerAutoSaveDraft: () => () => {},
         saveConfigPatch: async () => {
           writes += 1;
         },
@@ -1379,6 +1381,28 @@ test('a legacy offline completion receipt retains its explicitly unavailable ide
   assert.equal(h.workflow.state.value.metadataReceipt?.imported_microsoft_account_count, 0);
 });
 
+test('zero-account metadata receipts complete through POST and lost-response status reads', async () => {
+  for (const lostResponse of [false, true]) {
+    const h = harness();
+    const empty = { ...receipt, imported_offline_account_count: 0, account_id_mapping: {} };
+    h.setPreview(preview({ offline_account_count: 0, microsoft_reauthentication_count: 0 }));
+    await h.workflow.chooseProfile();
+    await h.workflow.prepareMetadataImport();
+    h.setMetadataPost(async () => {
+      if (lostResponse) throw new Error('Response lost');
+      return { receipt: empty, already_imported: false, cutover_available: false };
+    });
+    h.setMetadataRead(async () => ({ receipt: empty, cutover_available: false }));
+    h.setSettings({ ...settings, revision: 8, account_selection_revision: 5, username: 'PreviousPlayer' });
+    await h.workflow.importMetadata();
+    assert.equal(h.workflow.state.value.phase, 'metadata-imported');
+    assert.equal(h.workflow.state.value.error, null);
+    assert.equal(JSON.stringify(h.workflow.state.value.metadataReceipt), JSON.stringify(empty));
+    assert.equal(h.calls.filter(([method]) => method === 'POST').length, 1);
+    assert.equal(h.store.config.value.username, 'PreviousPlayer');
+  }
+});
+
 test('metadata confirmation cancellation and late preflight completion cannot submit', async () => {
   const h = harness();
   await h.workflow.chooseProfile();
@@ -1549,6 +1573,7 @@ test('invalid or mismatched metadata receipts cannot claim completion or refresh
     { ...receipt, metadata_import_id: 'd'.repeat(64) },
     { ...receipt, imported_offline_account_count: -1 },
     { ...receipt, imported_offline_account_count: 0 },
+    { ...receipt, imported_offline_account_count: 0, account_id_mapping: null },
     { ...receipt, imported_microsoft_account_count: -1 },
     { ...receipt, imported_microsoft_account_count: 0.5 },
     { ...receipt, imported_offline_account_count: 256, imported_microsoft_account_count: 1 },

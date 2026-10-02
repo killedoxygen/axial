@@ -332,14 +332,15 @@ impl AccountDirectory {
 
     /// Microsoft rows are identities awaiting reauthentication, never secure
     /// sessions. All rows and the selected mode share the caller's transaction.
+    /// No source selection explicitly clears the destination selection.
     pub(crate) fn import_identities_in_transaction(
         transaction: &Transaction<'_>,
         offline: &[OfflineIdentityImport],
         microsoft: &[MicrosoftIdentityImport],
-        active_id: &str,
+        active_id: Option<&str>,
         expected_selection_revision: u64,
     ) -> Result<AccountSnapshot, AccountError> {
-        let active_id = AccountId::parse(active_id)?;
+        let active_id = active_id.map(AccountId::parse).transpose()?;
         mutate_transaction(transaction, |snapshot, revision| {
             if snapshot.selection_revision != expected_selection_revision {
                 return Err(AccountError::StaleCapture);
@@ -361,10 +362,13 @@ impl AccountDirectory {
                 }
                 import_microsoft(snapshot, revision, input)?;
             }
-            if !seen.contains(active_id.as_str()) {
+            if active_id
+                .as_ref()
+                .is_some_and(|id| !seen.contains(id.as_str()))
+            {
                 return Err(AccountError::NoSelection);
             }
-            select_identity(snapshot, Some(active_id));
+            select_identity(snapshot, active_id);
             Ok(())
         })
     }
@@ -651,8 +655,12 @@ fn write_snapshot(
         let json = serde_json::to_string(account).map_err(|_| AccountError::InvalidStoredData)?;
         transaction.execute("INSERT INTO account_directory(account_id, record_json) VALUES(?1, ?2) ON CONFLICT(account_id) DO UPDATE SET record_json = excluded.record_json", params![account.account_id.as_str(), json])?;
     }
-    transaction.execute("UPDATE account_selection SET revision = ?1, active_account_id = ?2, launch_auth_mode = ?3 WHERE singleton = 1",
-        params![next.revision, next.active_account_id.as_ref().map(AccountId::as_str), match next.launch_auth_mode { LaunchAuthMode::Offline => "offline", LaunchAuthMode::Online => "online" }])?;
+    if transaction.execute("UPDATE account_selection SET revision = ?1, active_account_id = ?2, launch_auth_mode = ?3 WHERE singleton = 1",
+        params![next.revision, next.active_account_id.as_ref().map(AccountId::as_str), match next.launch_auth_mode { LaunchAuthMode::Offline => "offline", LaunchAuthMode::Online => "online" }])? != 1
+        || read_snapshot(transaction)? != *next
+    {
+        return Err(AccountError::InvalidStoredData);
+    }
     Ok(())
 }
 
@@ -931,7 +939,7 @@ mod tests {
                         tx,
                         &[],
                         &[input.clone()],
-                        &input.account_id()?,
+                        Some(&input.account_id()?),
                         0,
                     )
                 })
@@ -949,7 +957,7 @@ mod tests {
                         tx,
                         &[],
                         &[input.clone()],
-                        &input.account_id()?,
+                        Some(&input.account_id()?),
                         imported.selection_revision,
                     )
                 })
@@ -981,7 +989,7 @@ mod tests {
                     tx,
                     &[],
                     &[input.clone()],
-                    &input.account_id()?,
+                    Some(&input.account_id()?),
                     0,
                 )
             })
@@ -996,7 +1004,7 @@ mod tests {
                     tx,
                     &[offline.clone()],
                     &[changed],
-                    &offline.account_id,
+                    Some(&offline.account_id),
                     original.selection_revision
                 ))
                 .is_err()
@@ -1008,7 +1016,7 @@ mod tests {
                     tx,
                     &[offline.clone()],
                     &[input.clone(), input.clone()],
-                    &offline.account_id,
+                    Some(&offline.account_id),
                     original.selection_revision
                 ))
                 .is_err()
@@ -1020,7 +1028,7 @@ mod tests {
                     tx,
                     &[offline.clone()],
                     &[],
-                    &input.account_id()?,
+                    Some(&input.account_id()?),
                     original.selection_revision
                 ))
                 .is_err()
@@ -1032,7 +1040,7 @@ mod tests {
                     tx,
                     &[offline.clone()],
                     &[input.clone()],
-                    &offline.account_id,
+                    Some(&offline.account_id),
                     0
                 ))
                 .is_err()
@@ -1045,7 +1053,7 @@ mod tests {
                     tx,
                     &[offline.clone()],
                     &[input.clone()],
-                    &offline.account_id,
+                    Some(&offline.account_id),
                     original.selection_revision,
                 )
             })
@@ -1075,7 +1083,7 @@ mod tests {
                 tx,
                 &[],
                 &[input.clone()],
-                &input.account_id()?,
+                Some(&input.account_id()?),
                 authenticated.selection_revision
             )),
             Err(AccountError::AlreadyExists)
@@ -1094,7 +1102,7 @@ mod tests {
                     tx,
                     &[],
                     &[input.clone()],
-                    &input.account_id()?,
+                    Some(&input.account_id()?),
                     0,
                 )
             })

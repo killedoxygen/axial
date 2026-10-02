@@ -98,6 +98,37 @@ pub const METADATA_IMPORT_ARCHIVED_CONTENT_MIGRATION: Migration = Migration {
         CHECK(archived_content_history_proof IS NULL OR length(CAST(archived_content_history_proof AS BLOB)) <= 16384);",
 };
 
+pub const METADATA_IMPORT_UNSELECTED_ACCOUNTS_MIGRATION: Migration = Migration {
+    id: "profile_metadata_imports.v8",
+    sql: "CREATE TABLE profile_metadata_imports_v8 (
+        source_id TEXT PRIMARY KEY NOT NULL,
+        fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+        import_id TEXT NOT NULL UNIQUE CHECK(length(import_id) = 64),
+        account_count INTEGER NOT NULL CHECK(account_count BETWEEN 0 AND 256),
+        settings_revision INTEGER NOT NULL CHECK(settings_revision > 0),
+        selection_revision INTEGER NOT NULL CHECK(selection_revision >= 0),
+        microsoft_account_count INTEGER NOT NULL DEFAULT 0 CHECK(microsoft_account_count BETWEEN 0 AND account_count),
+        account_id_mapping TEXT CHECK(account_id_mapping IS NULL OR length(CAST(account_id_mapping AS BLOB)) <= 131072),
+        global_install_history_proof TEXT CHECK(global_install_history_proof IS NULL OR length(CAST(global_install_history_proof AS BLOB)) <= 16384),
+        archived_launch_report_proof TEXT CHECK(archived_launch_report_proof IS NULL OR length(CAST(archived_launch_report_proof AS BLOB)) <= 131072),
+        archived_benchmark_proof TEXT CHECK(archived_benchmark_proof IS NULL OR length(CAST(archived_benchmark_proof AS BLOB)) <= 131072),
+        archived_performance_operation_proof TEXT CHECK(archived_performance_operation_proof IS NULL OR length(CAST(archived_performance_operation_proof AS BLOB)) <= 16384),
+        archived_content_history_proof TEXT CHECK(archived_content_history_proof IS NULL OR length(CAST(archived_content_history_proof AS BLOB)) <= 16384)
+    );
+    INSERT INTO profile_metadata_imports_v8 (
+        source_id, fingerprint, import_id, account_count, settings_revision, selection_revision,
+        microsoft_account_count, account_id_mapping, global_install_history_proof,
+        archived_launch_report_proof, archived_benchmark_proof,
+        archived_performance_operation_proof, archived_content_history_proof
+    ) SELECT source_id, fingerprint, import_id, account_count, settings_revision, selection_revision,
+        microsoft_account_count, account_id_mapping, global_install_history_proof,
+        archived_launch_report_proof, archived_benchmark_proof,
+        archived_performance_operation_proof, archived_content_history_proof
+      FROM profile_metadata_imports;
+    DROP TABLE profile_metadata_imports;
+    ALTER TABLE profile_metadata_imports_v8 RENAME TO profile_metadata_imports;",
+};
+
 const MAX_MAPPING_BYTES: usize = 131072;
 
 #[derive(Debug, thiserror::Error)]
@@ -398,7 +429,7 @@ impl PreparedMetadataImport {
                     transaction,
                     &self.accounts.offline,
                     &self.accounts.microsoft,
-                    &self.accounts.active_id,
+                    self.accounts.selection.as_ref().map(|(id, _, _)| id.as_str()),
                     request.expected_account_selection_revision,
                 ).map_err(account_error)?;
                 config.account_selection_revision = snapshot.selection_revision;
@@ -658,7 +689,7 @@ fn read_receipt(
     else {
         return Ok(None);
     };
-    if !(1..=256).contains(&count)
+    if count > 256
         || microsoft_count > count
         || settings_revision == 0
         || settings_revision > 9_007_199_254_740_991
@@ -668,7 +699,7 @@ fn read_receipt(
         return Err(SettingsError::Corrupt);
     }
     let mapping = match (length, encoded) {
-        (None, None) if microsoft_count == 0 => None,
+        (None, None) if microsoft_count == 0 && count > 0 => None,
         (Some(_), Some(encoded)) => Some(decode_mapping(&encoded, count, microsoft_count)?),
         _ => return Err(SettingsError::Corrupt),
     };
@@ -931,9 +962,7 @@ pub(super) struct PreparedAccounts {
     pub(super) offline: Vec<OfflineIdentityImport>,
     pub(super) microsoft: Vec<MicrosoftIdentityImport>,
     mapping: BTreeMap<String, String>,
-    active_id: String,
-    active_name: String,
-    active_mode: ConfigLaunchAuthMode,
+    selection: Option<(String, String, ConfigLaunchAuthMode)>,
 }
 
 pub(super) fn prepare_accounts(
@@ -944,9 +973,13 @@ pub(super) fn prepare_accounts(
         serde_json::from_slice(&inventory.record_bytes("profile/accounts.json")?)
             .map_err(|_| ImportError::InvalidData)?,
     )?;
-    if prepared.active_mode != settings.config.launch_auth_mode
-        || prepared.active_name != settings.config.username
-    {
+    let consistent = match &prepared.selection {
+        Some((_, name, mode)) => {
+            *mode == settings.config.launch_auth_mode && *name == settings.config.username
+        }
+        None => settings.config.launch_auth_mode == ConfigLaunchAuthMode::Offline,
+    };
+    if !consistent {
         return Err(ImportError::InvalidData);
     }
     Ok(prepared)
@@ -960,12 +993,11 @@ pub(super) fn convert_accounts(value: serde_json::Value) -> ImportResult<Prepare
         serde_json::from_value(value).map_err(|_| ImportError::InvalidData)?;
     if source.schema != "axial.accounts"
         || source.schema_version != 1
-        || source.accounts.is_empty()
         || source.accounts.len() > 256
     {
         return Err(ImportError::InvalidData);
     }
-    let active = source.active_account_id.ok_or(ImportError::InvalidData)?;
+    let active = source.active_account_id;
     let mut offline = Vec::new();
     let mut microsoft = Vec::new();
     let mut mapping = BTreeMap::new();
@@ -993,18 +1025,18 @@ pub(super) fn convert_accounts(value: serde_json::Value) -> ImportResult<Prepare
         {
             return Err(ImportError::InvalidData);
         }
-        if legacy_id == active {
+        if active.as_ref() == Some(&legacy_id) {
             selected = Some((destination_id, name, mode));
         }
     }
-    let (active_id, active_name, active_mode) = selected.ok_or(ImportError::InvalidData)?;
+    if active.is_some() && selected.is_none() {
+        return Err(ImportError::InvalidData);
+    }
     Ok(PreparedAccounts {
         offline,
         microsoft,
         mapping,
-        active_id,
-        active_name,
-        active_mode,
+        selection: selected,
     })
 }
 

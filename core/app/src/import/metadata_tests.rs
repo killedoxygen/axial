@@ -63,6 +63,7 @@ fn stores(path: &Path) -> (SettingsStore, AccountDirectory) {
             METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
             METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
             METADATA_IMPORT_ARCHIVED_CONTENT_MIGRATION,
+            METADATA_IMPORT_UNSELECTED_ACCOUNTS_MIGRATION,
             install_history::MIGRATION,
             crate::launch::reports::REPORT_MIGRATION,
             crate::performance::benchmarks::MIGRATION,
@@ -2444,6 +2445,356 @@ fn microsoft_source(source: &Fixture, name: &str, mixed: bool) {
     });
 }
 
+fn unselected_source(source: &Fixture, microsoft: bool) {
+    if microsoft {
+        microsoft_source(source, "PreviousPlayer", false);
+    }
+    let path = source.baseline.join("accounts.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["active_account_id"] = Value::Null;
+    if !microsoft {
+        value["accounts"] = json!([]);
+    }
+    fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    config(source, |value| {
+        value["launch_auth_mode"] = json!("offline");
+        value["username"] = json!("PreviousPlayer");
+    });
+}
+
+#[test]
+fn unselected_account_import_preserves_absence_settings_and_completed_replay() {
+    for microsoft in [false, true] {
+        let source = Fixture::new();
+        unselected_source(&source, microsoft);
+        let before = snapshot(&source.baseline);
+        let (prepared, mut request) = prepare(&source);
+        assert!(source.capture().preview().instances[0].ordinary_import_available);
+        let destination = Destination::new();
+        destination
+            .accounts
+            .create_offline_account("DestinationUser")
+            .unwrap();
+        request.expected_account_selection_revision =
+            destination.accounts.selection_revision().unwrap();
+        let committed = destination.commit(&prepared, &request).unwrap();
+        let receipt = committed.response.receipt.clone();
+        assert_eq!(receipt.imported_offline_account_count, 0);
+        assert_eq!(
+            receipt.imported_microsoft_account_count,
+            usize::from(microsoft)
+        );
+        assert_eq!(
+            receipt.account_id_mapping.as_ref().unwrap().len(),
+            usize::from(microsoft)
+        );
+        assert_eq!(committed.settings.config.username, "PreviousPlayer");
+        assert_eq!(
+            committed.settings.config.launch_auth_mode,
+            ConfigLaunchAuthMode::Offline
+        );
+        let accounts = destination.accounts.snapshot().unwrap();
+        assert!(accounts.active_account().is_none());
+        assert_eq!(accounts.accounts.len(), 1 + usize::from(microsoft));
+        assert!(
+            accounts
+                .accounts
+                .iter()
+                .all(|account| account.login_id.is_none()
+                    && account.minecraft_profile.is_none()
+                    && account.credential_revision == 0)
+        );
+        destination
+            .accounts
+            .create_offline_account("LaterPlayer")
+            .unwrap();
+        let later = destination.accounts.snapshot().unwrap();
+        assert!(
+            destination
+                .commit(&prepared, &request)
+                .unwrap()
+                .response
+                .already_imported
+        );
+        assert_eq!(destination.accounts.snapshot().unwrap(), later);
+        assert_eq!(
+            metadata_status(&destination.settings, &request.metadata_import_id)
+                .unwrap()
+                .receipt,
+            Some(receipt.clone())
+        );
+        let (settings, accounts) = stores(&destination._root.path().join("metadata.sqlite"));
+        assert_eq!(accounts.snapshot().unwrap(), later);
+        assert_eq!(
+            metadata_status(&settings, &request.metadata_import_id)
+                .unwrap()
+                .receipt,
+            Some(receipt)
+        );
+        assert_eq!(snapshot(&source.baseline), before);
+    }
+}
+
+#[test]
+fn unselected_account_import_requires_exact_selection_publication() {
+    for action in [
+        "BEFORE UPDATE ON account_selection BEGIN SELECT RAISE(IGNORE); END;",
+        "AFTER UPDATE ON account_selection BEGIN UPDATE account_selection SET active_account_id=OLD.active_account_id WHERE singleton=1; END;",
+    ] {
+        let source = Fixture::new();
+        unselected_source(&source, false);
+        let source_before = snapshot(&source.baseline);
+        let (prepared, mut request) = prepare(&source);
+        let destination = Destination::new();
+        destination
+            .accounts
+            .create_offline_account("DestinationUser")
+            .unwrap();
+        let accounts_before = destination.accounts.snapshot().unwrap();
+        let settings_before = destination.settings.current().unwrap();
+        request.expected_account_selection_revision = accounts_before.selection_revision;
+        let changes = destination.settings.subscribe().unwrap();
+        destination
+            .settings
+            .metadata()
+            .transaction(|tx| -> Result<(), StorageError> {
+                tx.execute_batch(&format!("CREATE TRIGGER alter_selection {action}"))?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(destination.commit(&prepared, &request).is_err(), "{action}");
+        assert_eq!(destination.accounts.snapshot().unwrap(), accounts_before);
+        assert_eq!(destination.settings.current().unwrap(), settings_before);
+        assert!(!changes.has_changed().unwrap());
+        assert!(
+            metadata_status(&destination.settings, &request.metadata_import_id)
+                .unwrap()
+                .receipt
+                .is_none()
+        );
+        destination
+            .settings
+            .metadata()
+            .transaction(|tx| -> Result<(), StorageError> {
+                tx.execute_batch("DROP TRIGGER alter_selection")?;
+                Ok(())
+            })
+            .unwrap();
+        let receipt = destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt;
+        assert_eq!(receipt.account_id_mapping, Some(BTreeMap::new()));
+        assert!(
+            destination
+                .accounts
+                .snapshot()
+                .unwrap()
+                .active_account_id
+                .is_none()
+        );
+        assert_eq!(snapshot(&source.baseline), source_before);
+    }
+}
+
+#[test]
+fn unselected_account_import_preserves_cas_and_source_selection_validation() {
+    for microsoft in [false, true] {
+        let source = Fixture::new();
+        unselected_source(&source, microsoft);
+        let source_before = snapshot(&source.baseline);
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        destination
+            .accounts
+            .create_offline_account("DestinationUser")
+            .unwrap();
+        let accounts_before = destination.accounts.snapshot().unwrap();
+        let settings_before = destination.settings.current().unwrap();
+        let changes = destination.settings.subscribe().unwrap();
+        for stale_settings in [false, true] {
+            let mut stale = request.clone();
+            if stale_settings {
+                stale.expected_account_selection_revision = accounts_before.selection_revision;
+                stale.expected_settings_revision = settings_before.revision + 1;
+            }
+            assert!(matches!(
+                destination.commit(&prepared, &stale),
+                Err(MetadataImportError::Settings(SettingsError::Conflict))
+            ));
+            assert_eq!(destination.accounts.snapshot().unwrap(), accounts_before);
+            assert_eq!(destination.settings.current().unwrap(), settings_before);
+            assert!(!changes.has_changed().unwrap());
+            assert!(
+                metadata_status(&destination.settings, &request.metadata_import_id)
+                    .unwrap()
+                    .receipt
+                    .is_none()
+            );
+        }
+        assert_eq!(snapshot(&source.baseline), source_before);
+        for invalid in ["online", "missing_selected"] {
+            if invalid == "online" {
+                config(&source, |value| value["launch_auth_mode"] = json!("online"));
+            } else {
+                config(&source, |value| {
+                    value["launch_auth_mode"] = json!("offline")
+                });
+                let path = source.baseline.join("accounts.json");
+                let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                value["active_account_id"] = json!(FIRST);
+                fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            let previews = ImportPreviews::new();
+            let preview = previews.admit(source.capture()).unwrap();
+            assert!(!preview.metadata_import_available, "{invalid}");
+            assert!(!preview.instances[0].ordinary_import_available, "{invalid}");
+            assert!(previews.prepare_metadata(&preview.fingerprint).is_err());
+        }
+    }
+}
+
+#[test]
+fn unselected_account_receipt_requires_explicit_empty_mapping_without_repair() {
+    let source = Fixture::new();
+    unselected_source(&source, false);
+    let (prepared, request) = prepare(&source);
+    let destination = Destination::new();
+    let receipt = destination
+        .commit(&prepared, &request)
+        .unwrap()
+        .response
+        .receipt;
+    let accounts = destination.accounts.snapshot().unwrap();
+    let settings = destination.settings.current().unwrap();
+    for encoded in [
+        None,
+        Some("{}".to_owned()),
+        Some(json!([[FIRST, FIRST]]).to_string()),
+    ] {
+        destination
+            .settings
+            .metadata()
+            .transaction(|tx| -> Result<(), StorageError> {
+                tx.execute(
+                    "UPDATE profile_metadata_imports SET account_id_mapping=?1 WHERE import_id=?2",
+                    params![encoded, request.metadata_import_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(metadata_status(&destination.settings, &request.metadata_import_id).is_err());
+        assert!(destination.commit(&prepared, &request).is_err());
+        let persisted = destination
+            .settings
+            .metadata()
+            .read(|db| -> Result<Option<String>, StorageError> {
+                Ok(db.query_row(
+                    "SELECT account_id_mapping FROM profile_metadata_imports WHERE import_id=?1",
+                    [&request.metadata_import_id],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(persisted, encoded);
+        assert_eq!(destination.accounts.snapshot().unwrap(), accounts);
+        assert_eq!(destination.settings.current().unwrap(), settings);
+    }
+    destination
+        .settings
+        .metadata()
+        .transaction(|tx| -> Result<(), StorageError> {
+            tx.execute(
+                "UPDATE profile_metadata_imports SET account_id_mapping='[]' WHERE import_id=?1",
+                [&request.metadata_import_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        metadata_status(&destination.settings, &request.metadata_import_id)
+            .unwrap()
+            .receipt,
+        Some(receipt)
+    );
+}
+
+#[test]
+fn unselected_account_v8_migration_preserves_every_v7_receipt_field_and_reopen() {
+    use crate::storage::rusqlite::types::Value as SqlValue;
+
+    let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let path = root.path().join("metadata.sqlite");
+    let store = MetadataStore::open(&path).unwrap();
+    store
+        .migrate(&[
+            METADATA_IMPORT_MIGRATION,
+            METADATA_IMPORT_IDENTITIES_MIGRATION,
+            METADATA_IMPORT_HISTORY_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_CONTENT_MIGRATION,
+        ])
+        .unwrap();
+    store.transaction(|tx| -> Result<(), StorageError> {
+        tx.execute("INSERT INTO profile_metadata_imports VALUES (?1,?2,?3,2,11,13,1,?4,?5,?6,?7,?8,?9)", params![
+            "a".repeat(64), "b".repeat(64), "c".repeat(64),
+            json!([[FIRST,FIRST],[MICROSOFT_SOURCE,MICROSOFT_DESTINATION]]).to_string(),
+            "{\"global\": \"é\"}", "{\"reports\": []}", "{\"benchmarks\": []}",
+            "{\"performance\": []}", "{\"content\": []}"
+        ])?;
+        tx.execute("INSERT INTO profile_metadata_imports(source_id,fingerprint,import_id,account_count,settings_revision,selection_revision) VALUES (?1,?2,?3,1,7,0)", params!["d".repeat(64), "e".repeat(64), "f".repeat(64)])?;
+        Ok(())
+    }).unwrap();
+    let read_rows = |store: &MetadataStore| {
+        store
+            .read(|db| -> Result<Vec<Vec<SqlValue>>, StorageError> {
+                let mut query =
+                    db.prepare("SELECT * FROM profile_metadata_imports ORDER BY source_id")?;
+                assert_eq!(query.column_count(), 13);
+                let rows =
+                    query.query_map([], |row| (0..13).map(|index| row.get(index)).collect())?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap()
+    };
+    let before = read_rows(&store);
+    store
+        .migrate(&[METADATA_IMPORT_UNSELECTED_ACCOUNTS_MIGRATION])
+        .unwrap();
+    assert_eq!(read_rows(&store), before);
+    drop(store);
+    let reopened = MetadataStore::open(&path).unwrap();
+    reopened
+        .migrate(&[METADATA_IMPORT_UNSELECTED_ACCOUNTS_MIGRATION])
+        .unwrap();
+    assert_eq!(read_rows(&reopened), before);
+    for invalid in [
+        "account_count=-1",
+        "account_count=257",
+        "microsoft_account_count=3",
+        "archived_content_history_proof=printf('%.*c',16385,'x')",
+    ] {
+        assert!(
+            reopened
+                .transaction(|tx| -> Result<(), StorageError> {
+                    tx.execute(
+                        &format!(
+                            "UPDATE profile_metadata_imports SET {invalid} WHERE source_id=?1"
+                        ),
+                        ["a".repeat(64)],
+                    )?;
+                    Ok(())
+                })
+                .is_err(),
+            "{invalid}"
+        );
+        assert_eq!(read_rows(&reopened), before);
+    }
+}
+
 fn authenticate(accounts: &AccountDirectory) {
     accounts
         .commit_microsoft(
@@ -2670,6 +3021,7 @@ fn v1_receipts_keep_historical_meaning_and_new_mapping_corruption_is_rejected() 
             METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
             METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
             METADATA_IMPORT_ARCHIVED_CONTENT_MIGRATION,
+            METADATA_IMPORT_UNSELECTED_ACCOUNTS_MIGRATION,
         ])
         .unwrap();
     let receipt = metadata_status(&old_settings, &old_id)

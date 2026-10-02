@@ -541,6 +541,7 @@ async fn start_profile_inner(
             axial_app::import::METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
             axial_app::import::METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
             axial_app::import::METADATA_IMPORT_ARCHIVED_CONTENT_MIGRATION,
+            axial_app::import::METADATA_IMPORT_UNSELECTED_ACCOUNTS_MIGRATION,
             axial_app::instances::directory::MIGRATION, axial_app::instances::delete::MIGRATION,
             axial_app::instances::create::MIGRATION, axial_app::instances::create::DUPLICATE_WITNESS_MIGRATION,
             axial_app::instances::import::MIGRATION,

@@ -1381,7 +1381,7 @@ mod tests {
                     transaction,
                     &[],
                     &[imported.clone()],
-                    &imported.account_id()?,
+                    Some(&imported.account_id()?),
                     0,
                 )
             })
@@ -1455,7 +1455,9 @@ mod tests {
             SavedSkinStore::new(metadata),
             root.clone(),
         ));
-        let bytes = crate::media::normalize_skin_png(&png(11)).unwrap().png_bytes;
+        let bytes = crate::media::normalize_skin_png(&png(11))
+            .unwrap()
+            .png_bytes;
         let historical = SavedSkinRecord {
             texture_key: texture_key(&bytes),
             name: "Imported history".into(),
