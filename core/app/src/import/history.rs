@@ -154,6 +154,7 @@ pub(super) fn prepare_history_with_rules(
     }
     let source = inventory.source_identity()?;
     source_instance_ids(inventory)?;
+    validate_benchmark_namespaces(inventory)?;
     let empty_archived = Arc::new(
         PreparedReportImport::prepare_archived(&source, Vec::new())
             .map_err(|_| ImportError::InvalidData)?,
@@ -344,13 +345,15 @@ pub(super) fn prepare_history_with_rules(
         }
     }
     let mut driver_ids = BTreeSet::new();
+    let mut detached_drivers = Vec::new();
     for driver in drivers {
         if !driver_ids.insert(driver.id.clone()) {
             return Err(ImportError::InvalidData);
         }
-        let suite = suites
-            .get(&driver.suite_id)
-            .ok_or(ImportError::InvalidData)?;
+        let Some(suite) = suites.get(&driver.suite_id) else {
+            detached_drivers.push(driver.convert_detached(&source)?);
+            continue;
+        };
         let converted = driver.convert(&source, suite, &reports)?;
         if let Some(selected) = prepared.instances.get_mut(&suite.instance_id) {
             selected.drivers.push(converted);
@@ -362,10 +365,16 @@ pub(super) fn prepare_history_with_rules(
         PreparedReportImport::prepare_archived(&source, archived_reports)
             .map_err(|_| ImportError::InvalidData)?,
     );
-    let archived_benchmarks = Arc::new(
+    let mut archived_benchmarks =
         PreparedBenchmarkImport::prepare_archived(&source, archived_suites, archived_drivers)
-            .map_err(|_| ImportError::InvalidData)?,
-    );
+            .map_err(|_| ImportError::InvalidData)?;
+    archived_benchmarks
+        .append(
+            &PreparedBenchmarkImport::prepare_detached(&source, detached_drivers)
+                .map_err(|_| ImportError::InvalidData)?,
+        )
+        .map_err(|_| ImportError::InvalidData)?;
+    let archived_benchmarks = Arc::new(archived_benchmarks);
     for history in prepared.instances.values_mut() {
         history.archived_reports = Arc::clone(&archived_reports);
         history.archived_benchmarks = Arc::clone(&archived_benchmarks);
@@ -538,6 +547,7 @@ fn prepare_archived_benchmarks(
     mut count: usize,
     mut bytes: usize,
 ) -> ImportResult<PreparedBenchmarkImport> {
+    validate_benchmark_namespaces(inventory)?;
     let mut suites = BTreeMap::new();
     let mut drivers = Vec::new();
     for file in inventory.file_manifests().filter(|file| {
@@ -583,21 +593,81 @@ fn prepare_archived_benchmarks(
         ));
     }
     let mut archived_drivers = Vec::new();
+    let mut detached_drivers = Vec::new();
     let mut driver_ids = BTreeSet::new();
     for driver in drivers {
         if !driver_ids.insert(driver.id.clone()) {
             return Err(ImportError::InvalidData);
         }
-        // A pruned parent cannot identify the driver's original instance.
-        let suite = suites
-            .get(&driver.suite_id)
-            .ok_or(ImportError::InvalidData)?;
+        let Some(suite) = suites.get(&driver.suite_id) else {
+            detached_drivers.push(driver.convert_detached(source)?);
+            continue;
+        };
         if !instances.contains(&suite.instance_id) {
             archived_drivers.push(driver.convert(source, suite, reports)?);
         }
     }
-    PreparedBenchmarkImport::prepare_archived(source, archived_suites, archived_drivers)
-        .map_err(|_| ImportError::InvalidData)
+    let mut batch =
+        PreparedBenchmarkImport::prepare_archived(source, archived_suites, archived_drivers)
+            .map_err(|_| ImportError::InvalidData)?;
+    batch
+        .append(
+            &PreparedBenchmarkImport::prepare_detached(source, detached_drivers)
+                .map_err(|_| ImportError::InvalidData)?,
+        )
+        .map_err(|_| ImportError::InvalidData)?;
+    Ok(batch)
+}
+
+fn validate_benchmark_namespaces(inventory: &Inventory) -> ImportResult<()> {
+    let aliased = |path: &str| {
+        [SUITE_PREFIX, DRIVER_PREFIX].into_iter().any(|prefix| {
+            let mut different = false;
+            for (actual, expected) in path.split('/').zip(prefix.trim_end_matches('/').split('/')) {
+                if !axial_fs::leaf_names_equivalent(actual.as_ref(), expected.as_ref()) {
+                    return false;
+                }
+                different |= actual != expected;
+            }
+            different
+        })
+    };
+    // Both source stores are flat. Unobserved or aliased entries cannot prove
+    // pruning or an empty batch, even when no exact-spelling record was captured.
+    for path in inventory.directory_names() {
+        if aliased(path)
+            || [SUITE_PREFIX, DRIVER_PREFIX]
+                .into_iter()
+                .any(|prefix| path.starts_with(prefix))
+        {
+            return Err(ImportError::InvalidData);
+        }
+    }
+    for file in inventory.file_manifests() {
+        if aliased(&file.relative)
+            || [SUITE_PREFIX, DRIVER_PREFIX].into_iter().any(|prefix| {
+                let namespace = prefix.trim_end_matches('/');
+                file.relative == namespace || namespace.starts_with(&format!("{}/", file.relative))
+            })
+        {
+            return Err(ImportError::InvalidData);
+        }
+    }
+    for obligation in inventory.obligations() {
+        let path = obligation.source_record.as_str();
+        if aliased(path)
+            || obligation.blocker == ImportBlocker::UnsafeFile
+                && [SUITE_PREFIX, DRIVER_PREFIX].into_iter().any(|prefix| {
+                    let namespace = prefix.trim_end_matches('/');
+                    path == namespace
+                        || path.starts_with(prefix)
+                        || namespace.starts_with(&format!("{path}/"))
+                })
+        {
+            return Err(ImportError::InvalidData);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1174,20 +1244,15 @@ struct LegacyDriver {
 }
 
 impl LegacyDriver {
-    fn convert(
-        self,
-        source: &str,
-        suite: &LegacySuite,
-        reports: &BTreeMap<String, SourceReport>,
-    ) -> ImportResult<BenchmarkSuiteDriverStatus> {
+    fn validate(&self) -> ImportResult<()> {
         let created = benchmark_timestamp(&self.created_at)?;
         let updated = benchmark_timestamp(&self.updated_at)?;
         if !self
             .id
             .strip_prefix("benchmark-suite-driver-")
             .is_some_and(super::model::legacy_id)
-            || self.suite_id != suite.suite_id
-            || self.mode != suite.mode
+            || !suite_id(&self.suite_id)
+            || !benchmark_mode(&self.mode)
             || !matches!(
                 self.state.as_str(),
                 "complete" | "failed" | "stopped" | "interrupted"
@@ -1198,6 +1263,16 @@ impl LegacyDriver {
             || self.active_session_id.is_some()
             || self.state == "complete" && self.pending_run_index.is_some()
             || self.last_session_id.is_some() && self.last_run_index.is_none()
+            || self
+                .last_session_id
+                .as_deref()
+                .is_some_and(|id| !session_id(id))
+            || self
+                .pending_run_index
+                .is_some_and(|index| index >= self.run_count)
+            || self
+                .last_run_index
+                .is_some_and(|index| index >= self.run_count)
             || created > updated
             || self.error.as_deref().is_some_and(|error| {
                 error.chars().count() > 160
@@ -1213,14 +1288,24 @@ impl LegacyDriver {
         {
             return Err(ImportError::InvalidData);
         }
+        Ok(())
+    }
+
+    fn convert(
+        self,
+        source: &str,
+        suite: &LegacySuite,
+        reports: &BTreeMap<String, SourceReport>,
+    ) -> ImportResult<BenchmarkSuiteDriverStatus> {
+        self.validate()?;
+        if self.suite_id != suite.suite_id || self.mode != suite.mode {
+            return Err(ImportError::InvalidData);
+        }
         // A stopped driver may have planned the next, not-yet-created index.
         // Only a historical last run requires a surviving suite descriptor.
         if self
-            .pending_run_index
-            .is_some_and(|index| index >= self.run_count)
-            || self.last_run_index.is_some_and(|index| {
-                index >= self.run_count || !suite.runs.iter().any(|run| run.run_index == index)
-            })
+            .last_run_index
+            .is_some_and(|index| !suite.runs.iter().any(|run| run.run_index == index))
         {
             return Err(ImportError::InvalidData);
         }
@@ -1233,14 +1318,26 @@ impl LegacyDriver {
             let proof = reports.get(session).ok_or(ImportError::InvalidData)?;
             // A terminal driver may predate an explicit rerun. Preserve its
             // counts and old session when the retained descriptor proves it.
-            if !session_id(session)
-                || !proof.matches(suite, run)
-                || benchmark_timestamp(&proof.launched_at)? > updated
+            if !proof.matches(suite, run)
+                || benchmark_timestamp(&proof.launched_at)? > benchmark_timestamp(&self.updated_at)?
             {
                 return Err(ImportError::InvalidData);
             }
         }
-        Ok(BenchmarkSuiteDriverStatus {
+        Ok(self.into_record(source))
+    }
+
+    fn convert_detached(self, source: &str) -> ImportResult<BenchmarkSuiteDriverStatus> {
+        self.validate()?;
+        // A queued handoff retains its suite claim; pruning cannot explain it.
+        if self.error.as_deref() == Some("driver automatic resume queued after restart") {
+            return Err(ImportError::InvalidData);
+        }
+        Ok(self.into_record(source))
+    }
+
+    fn into_record(self, source: &str) -> BenchmarkSuiteDriverStatus {
+        BenchmarkSuiteDriverStatus {
             id: imported_benchmark_id(source, "driver", &self.id),
             suite_id: imported_benchmark_id(source, "suite", &self.suite_id),
             mode: self.mode,
@@ -1256,7 +1353,7 @@ impl LegacyDriver {
             created_at: self.created_at,
             updated_at: self.updated_at,
             historical: true,
-        })
+        }
     }
 }
 

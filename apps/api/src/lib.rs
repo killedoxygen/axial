@@ -549,6 +549,7 @@ async fn start_profile_inner(
             axial_app::performance::mutation::MIGRATION, axial_app::performance::mutation::MIGRATION_V2,
             axial_app::performance::benchmarks::MIGRATION,
             axial_app::performance::benchmarks::MIGRATION_V2,
+            axial_app::performance::benchmarks::MIGRATION_V3,
             axial_app::skins::store::MIGRATION, axial_app::skins::store::IMPORT_MIGRATION,
             axial_app::launch::coordinator::INTENT_MIGRATION,
             axial_app::launch::coordinator::INTENT_TERMINAL_MIGRATION,

@@ -415,6 +415,7 @@ fn archived_benchmarks_co_publish_without_destination_instance_or_execution_auth
             .migrate(&[
                 crate::performance::benchmarks::MIGRATION,
                 crate::performance::benchmarks::MIGRATION_V2,
+                crate::performance::benchmarks::MIGRATION_V3,
             ])
             .unwrap();
         metadata
@@ -501,6 +502,281 @@ fn archived_benchmarks_do_not_waive_unrelated_live_work_or_missing_report_batch(
                 2
             );
         }
+    }
+}
+
+#[test]
+fn detached_driver_import_requires_authoritative_absence_not_bad_parent_or_queued_handoff() {
+    for case in [
+        "absent",
+        "queued",
+        "nonterminal",
+        "active_session",
+        "invalid_suite_id",
+        "bad_last_index",
+        "bad_last_session",
+        "schema",
+        "malformed",
+        "directory",
+        "namespace_file",
+        "live_parent",
+        "journal",
+    ] {
+        let fixture = Fixture::new();
+        let mut status = driver();
+        match case {
+            "queued" => {
+                status["state"] = json!("interrupted");
+                status["error"] = json!("driver automatic resume queued after restart");
+            }
+            "nonterminal" => status["state"] = json!("scheduled"),
+            "active_session" => status["active_session_id"] = json!("session-a"),
+            "invalid_suite_id" => status["suite_id"] = json!("not-a-suite"),
+            "bad_last_index" => status["last_run_index"] = json!(64),
+            "bad_last_session" => status["last_session_id"] = json!("../private/session"),
+            _ => {}
+        }
+        write_benchmark(&fixture, "suite-drivers", DRIVER, &status);
+        match case {
+            "schema" => {
+                let mut parent = suite();
+                parent["instance_id"] = json!(SECOND);
+                parent["schema_version"] = json!(77);
+                write_benchmark(&fixture, "suites", SUITE, &parent);
+            }
+            "live_parent" => write_benchmark(&fixture, "suites", SUITE, &suite()),
+            "journal" => {
+                let mut journal = crate::import::tests::successful_install_journal();
+                journal["entries"][0]["status"] = json!("Running");
+                let path = fixture.baseline.join("state/operation-journals.json");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+            }
+            "malformed" => {
+                let path = fixture.baseline.join("benchmarks/suites");
+                fs::create_dir_all(&path).unwrap();
+                fs::write(path.join(format!("{SUITE}.json")), b"{").unwrap();
+            }
+            "directory" => fs::create_dir_all(
+                fixture
+                    .baseline
+                    .join("benchmarks/suites")
+                    .join(format!("{SUITE}.json")),
+            )
+            .unwrap(),
+            "namespace_file" => fs::write(
+                fixture.baseline.join("benchmarks/suites"),
+                b"not a suite directory",
+            )
+            .unwrap(),
+            _ => {}
+        }
+        let before = crate::import::tests::snapshot(&fixture.baseline);
+        let inventory = fixture.capture();
+        let archived = prepare_archived_history(&inventory).unwrap();
+        if matches!(case, "absent" | "live_parent" | "journal") {
+            assert_eq!(
+                archived
+                    .benchmarks
+                    .unwrap()
+                    .completion_proof(&inventory.source_identity().unwrap())
+                    .unwrap()
+                    .count(),
+                usize::from(case != "live_parent")
+            );
+            assert_eq!(
+                prepare_history(&inventory).is_ok(),
+                case == "absent",
+                "{case}"
+            );
+            assert_eq!(
+                inventory.preview().instances[0].ordinary_import_available,
+                case == "absent",
+                "{case}"
+            );
+        } else {
+            assert!(archived.benchmarks.is_none(), "{case}");
+            assert!(prepare_history(&inventory).is_err(), "{case}");
+        }
+        assert_eq!(crate::import::tests::snapshot(&fixture.baseline), before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn detached_driver_does_not_treat_unsafe_suite_namespace_as_pruned() {
+    for case in ["symlink_parent", "symlink_namespace", "hardlink_parent"] {
+        let fixture = Fixture::new();
+        write_benchmark(&fixture, "suite-drivers", DRIVER, &driver());
+        let external = fixture
+            .baseline
+            .parent()
+            .unwrap()
+            .join("private-suite.json");
+        let bytes = serde_json::to_vec(&suite()).unwrap();
+        fs::write(&external, &bytes).unwrap();
+        let namespace = fixture.baseline.join("benchmarks/suites");
+        if case == "symlink_namespace" {
+            std::os::unix::fs::symlink(&external, &namespace).unwrap();
+        } else {
+            fs::create_dir_all(&namespace).unwrap();
+            let parent = namespace.join(format!("{SUITE}.json"));
+            if case == "symlink_parent" {
+                std::os::unix::fs::symlink(&external, parent).unwrap();
+            } else {
+                fs::hard_link(&external, parent).unwrap();
+            }
+        }
+        let before = crate::import::tests::snapshot(&fixture.baseline);
+        if case == "hardlink_parent" {
+            assert!(matches!(fixture.try_capture(), Err(ImportError::Io(_))));
+            assert_eq!(fs::read(&external).unwrap(), bytes);
+            assert_eq!(crate::import::tests::snapshot(&fixture.baseline), before);
+            continue;
+        }
+        let inventory = fixture.capture();
+        assert!(
+            prepare_archived_history(&inventory)
+                .unwrap()
+                .benchmarks
+                .is_none(),
+            "{case}"
+        );
+        assert!(
+            !inventory.preview().instances[0].ordinary_import_available,
+            "{case}"
+        );
+        assert!(prepare_history(&inventory).is_err(), "{case}");
+        assert_eq!(fs::read(&external).unwrap(), bytes);
+        assert_eq!(crate::import::tests::snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn detached_driver_does_not_treat_case_aliased_suite_namespace_as_pruned() {
+    for alias in [
+        "benchmarks/Suites",
+        "Benchmarks/suites",
+        "Benchmarks/Suites",
+    ] {
+        let fixture = Fixture::new();
+        let parent = fixture.baseline.join(alias);
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(
+            parent.join(format!("{SUITE}.json")),
+            serde_json::to_vec(&suite()).unwrap(),
+        )
+        .unwrap();
+        write_benchmark(&fixture, "suite-drivers", DRIVER, &driver());
+        let before = crate::import::tests::snapshot(&fixture.baseline);
+        let inventory = fixture.capture();
+        assert!(
+            inventory
+                .directory_names()
+                .any(|path| path == format!("profile/{alias}"))
+        );
+        assert!(
+            prepare_archived_history(&inventory)
+                .unwrap()
+                .benchmarks
+                .is_none(),
+            "{alias}"
+        );
+        assert!(prepare_history(&inventory).is_err(), "{alias}");
+        assert!(
+            !inventory.preview().instances[0].ordinary_import_available,
+            "{alias}"
+        );
+        assert_eq!(crate::import::tests::snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn detached_driver_does_not_acknowledge_case_aliased_driver_folder_as_empty() {
+    let fixture = Fixture::new();
+    write_benchmark(&fixture, "Suite-drivers", DRIVER, &driver());
+    let before = crate::import::tests::snapshot(&fixture.baseline);
+    let inventory = fixture.capture();
+    assert!(
+        inventory
+            .directory_names()
+            .any(|path| path == "profile/benchmarks/Suite-drivers")
+    );
+    assert!(
+        !inventory
+            .file_manifests()
+            .any(|file| file.relative.starts_with(DRIVER_PREFIX))
+    );
+    assert!(
+        prepare_archived_history(&inventory)
+            .unwrap()
+            .benchmarks
+            .is_none()
+    );
+    assert!(prepare_history(&inventory).is_err());
+    assert!(!inventory.preview().instances[0].ordinary_import_available);
+    assert_eq!(crate::import::tests::snapshot(&fixture.baseline), before);
+}
+
+#[test]
+fn detached_driver_co_publication_is_identical_in_both_import_orders() {
+    for metadata_first in [false, true] {
+        let fixture = Fixture::new();
+        write_benchmark(&fixture, "suite-drivers", DRIVER, &driver());
+        let before = crate::import::tests::snapshot(&fixture.baseline);
+        let inventory = fixture.capture();
+        let source = inventory.source_identity().unwrap();
+        let metadata_batch = prepare_archived_history(&inventory)
+            .unwrap()
+            .benchmarks
+            .unwrap();
+        let bound = prepare_history(&inventory)
+            .unwrap()
+            .for_instance(INSTANCE)
+            .unwrap()
+            .bind_instance(&InstanceId::new())
+            .unwrap();
+        let metadata = MetadataStore::in_memory().unwrap();
+        metadata
+            .migrate(&[
+                crate::performance::benchmarks::MIGRATION,
+                crate::performance::benchmarks::MIGRATION_V2,
+                crate::performance::benchmarks::MIGRATION_V3,
+            ])
+            .unwrap();
+        let batches = if metadata_first {
+            [&*metadata_batch, &bound.benchmarks]
+        } else {
+            [&bound.benchmarks, &*metadata_batch]
+        };
+        for batch in batches {
+            metadata.transaction(|tx| batch.insert_in(tx)).unwrap();
+            metadata.read(|db| batch.verify_in(db)).unwrap();
+        }
+        let saved: BenchmarkSuiteDriverStatus = metadata
+            .read(|db| -> Result<_, crate::storage::StorageError> {
+                let bytes: Vec<u8> =
+                    db.query_row("SELECT payload FROM benchmark_drivers", [], |row| {
+                        row.get(0)
+                    })?;
+                Ok(serde_json::from_slice(&bytes).unwrap())
+            })
+            .unwrap();
+        assert_eq!(saved.id, imported_benchmark_id(&source, "driver", DRIVER));
+        assert_eq!(
+            saved.suite_id,
+            imported_benchmark_id(&source, "suite", SUITE)
+        );
+        assert_eq!(
+            saved.last_session_id.as_deref(),
+            Some(imported_id(&source, "session-a").as_str())
+        );
+        assert!(saved.historical);
+        let no_authority = metadata.read(|db| -> Result<_, crate::storage::StorageError> {
+            Ok(db.query_row("SELECT (SELECT count(*) FROM benchmark_suites),(SELECT count(*) FROM benchmark_drivers WHERE request IS NOT NULL OR source_driver_id IS NOT NULL)", [], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)))?)
+        }).unwrap();
+        assert_eq!(no_authority, (0, 0));
+        assert_eq!(crate::import::tests::snapshot(&fixture.baseline), before);
     }
 }
 
@@ -672,7 +948,7 @@ fn source_scope_is_stable_without_aliasing_another_profile() {
 
 #[test]
 fn terminal_benchmark_history_preserves_exact_read_only_records_and_source() {
-    use crate::performance::benchmarks::{BenchmarkError, MIGRATION, MIGRATION_V2};
+    use crate::performance::benchmarks::{BenchmarkError, MIGRATION, MIGRATION_V2, MIGRATION_V3};
     for (state, error) in [
         ("stopped", "Stopped by the user"),
         (
@@ -705,7 +981,9 @@ fn terminal_benchmark_history_preserves_exact_read_only_records_and_source() {
         for _ in 0..2 {
             let metadata =
                 Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
-            metadata.migrate(&[MIGRATION, MIGRATION_V2]).unwrap();
+            metadata
+                .migrate(&[MIGRATION, MIGRATION_V2, MIGRATION_V3])
+                .unwrap();
             let reports = LaunchReportStore::new(metadata.clone()).unwrap();
             metadata
                 .transaction(|tx| -> Result<(), BenchmarkError> {
@@ -832,7 +1110,7 @@ fn terminal_benchmark_history_rejects_unsupported_or_incoherent_source_without_w
         "limit_descriptor",
         "limit_unknown_driver",
         "driver_counts",
-        "orphan_driver",
+        "detached_queued",
         "missing_last",
         "unsafe_error",
     ] {
@@ -872,7 +1150,11 @@ fn terminal_benchmark_history_rejects_unsupported_or_incoherent_source_without_w
             }
             "limit_unknown_driver" | "handoff_unknown_driver" => status["future"] = json!(true),
             "driver_counts" => status["launched_run_count"] = json!(2),
-            "orphan_driver" => status["suite_id"] = json!("suite-dev-0000000000000002"),
+            "detached_queued" => {
+                status["suite_id"] = json!("suite-dev-0000000000000002");
+                status["state"] = json!("interrupted");
+                status["error"] = json!("driver automatic resume queued after restart");
+            }
             "missing_last" => status["last_session_id"] = json!("missing"),
             "unsafe_error" => status["error"] = json!("/private/profile/secret"),
             _ => unreachable!(),

@@ -49,7 +49,11 @@ impl Fixture {
     }
 
     pub(crate) fn capture(&self) -> Inventory {
-        Inventory::capture(&self.source, &BTreeMap::new()).unwrap()
+        self.try_capture().unwrap()
+    }
+
+    pub(crate) fn try_capture(&self) -> ImportResult<Inventory> {
+        Inventory::capture(&self.source, &BTreeMap::new())
     }
     fn write(&self, relative: &str, value: &Value) {
         let path = self.baseline.join(relative);

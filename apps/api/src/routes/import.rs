@@ -494,6 +494,7 @@ pub(super) mod tests {
                     axial_app::import::METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
                     axial_app::performance::benchmarks::MIGRATION,
                     axial_app::performance::benchmarks::MIGRATION_V2,
+                    axial_app::performance::benchmarks::MIGRATION_V3,
                     axial_app::performance::rules::MIGRATION,
                     axial_app::performance::rules::IMPORT_MIGRATION,
                 ])
@@ -3083,6 +3084,7 @@ pub(super) mod tests {
                 Some(import_before_metadata),
                 None,
                 "development",
+                false,
             )
             .await;
         }
@@ -3090,7 +3092,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn composed_metadata_import_retains_deleted_instance_reports_without_instances() {
-        composed_deleted_instance_report_import(None, None, "development").await;
+        composed_deleted_instance_report_import(None, None, "development", false).await;
     }
 
     #[tokio::test]
@@ -3100,6 +3102,7 @@ pub(super) mod tests {
                 Some(import_before_metadata),
                 Some(true),
                 "development",
+                false,
             )
             .await;
         }
@@ -3107,19 +3110,37 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn composed_metadata_import_retains_deleted_instance_benchmarks_without_instances() {
-        composed_deleted_instance_report_import(None, Some(true), "development").await;
+        composed_deleted_instance_report_import(None, Some(true), "development", false).await;
     }
 
     #[tokio::test]
     async fn composed_metadata_import_retains_deleted_instance_all_pending_benchmarks() {
-        composed_deleted_instance_report_import(None, Some(false), "development").await;
+        composed_deleted_instance_report_import(None, Some(false), "development", false).await;
     }
 
     #[tokio::test]
     async fn composed_deleted_instance_qualification_retains_incomplete_history() {
         for completed in [false, true] {
-            composed_deleted_instance_report_import(None, Some(completed), "release_validation")
-                .await;
+            composed_deleted_instance_report_import(
+                None,
+                Some(completed),
+                "release_validation",
+                false,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn composed_metadata_import_retains_terminal_driver_with_pruned_parent() {
+        for import_before_metadata in [None, Some(true), Some(false)] {
+            composed_deleted_instance_report_import(
+                import_before_metadata,
+                Some(true),
+                "development",
+                true,
+            )
+            .await;
         }
     }
 
@@ -3127,6 +3148,7 @@ pub(super) mod tests {
         import_before_metadata: Option<bool>,
         completed_benchmark_run: Option<bool>,
         benchmark_mode: &str,
+        parent_pruned: bool,
     ) {
         let has_survivor = import_before_metadata.is_some();
         let with_benchmarks = completed_benchmark_run.is_some();
@@ -3220,6 +3242,9 @@ pub(super) mod tests {
                 ("benchmarks/suites/suite-dev-0000000000000002.json", &suite),
                 ("benchmarks/suite-drivers/benchmark-suite-driver-0000000000000002.json", &driver),
             ] {
+                if parent_pruned && path.starts_with("benchmarks/suites/") {
+                    continue;
+                }
                 let path = baseline.join(path);
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
@@ -3243,10 +3268,11 @@ pub(super) mod tests {
             "benchmarks/launch/session-deleted-before.json",
         ];
         if with_benchmarks {
-            source_files.extend([
-                "benchmarks/suites/suite-dev-0000000000000002.json",
-                "benchmarks/suite-drivers/benchmark-suite-driver-0000000000000002.json",
-            ]);
+            if !parent_pruned {
+                source_files.push("benchmarks/suites/suite-dev-0000000000000002.json");
+            }
+            source_files
+                .push("benchmarks/suite-drivers/benchmark-suite-driver-0000000000000002.json");
         }
         if has_survivor {
             source_files.extend([
@@ -3336,6 +3362,76 @@ pub(super) mod tests {
             assert!(suite_id.starts_with("legacy-suite-"));
             let driver_path = format!("{drivers_path}/{driver_id}");
             let suite_path = format!("/api/v1/launch/benchmark/suites/{suite_id}");
+            if parent_pruned {
+                let reports: Value = request(Method::GET, "/api/v1/launch/reports")
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let proof = reports["reports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["recorded_at"] == report["recorded_at"])
+                    .unwrap();
+                let mut expected = original_driver.clone();
+                expected["id"] = json!(driver_id);
+                expected["suite_id"] = json!(suite_id);
+                expected["last_session_id"] = proof["session_id"].clone();
+                expected["historical"] = json!(true);
+                assert_eq!(driver["driver"], expected);
+                for path in [
+                    suite_path,
+                    format!("/api/v1/launch/benchmark/qualification/family-c-1-12-2/{suite_id}"),
+                ] {
+                    assert_eq!(
+                        request(Method::GET, &path).send().await.unwrap().status(),
+                        StatusCode::NOT_FOUND
+                    );
+                }
+                for (action, expected_status) in [
+                    ("resume", StatusCode::NOT_FOUND),
+                    ("stop", StatusCode::BAD_REQUEST),
+                ] {
+                    assert_eq!(
+                        request(Method::POST, &format!("{driver_path}/{action}"))
+                            .send()
+                            .await
+                            .unwrap()
+                            .status(),
+                        expected_status
+                    );
+                }
+                for path in [
+                    "/api/v1/launch/benchmark/suite/tick",
+                    "/api/v1/launch/benchmark/suite/driver",
+                ] {
+                    assert_eq!(
+                        request(Method::POST, path)
+                            .json(&json!({"suite_id":suite_id,"suite_mode":benchmark_mode}))
+                            .send()
+                            .await
+                            .unwrap()
+                            .status(),
+                        StatusCode::BAD_REQUEST
+                    );
+                }
+                let detail: Value = request(Method::GET, &driver_path)
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(&detail, driver);
+                return vec![(drivers_path.into(), listing), (driver_path, detail)];
+            }
             let suite: Value = request(Method::GET, &suite_path)
                 .send()
                 .await
@@ -3489,6 +3585,14 @@ pub(super) mod tests {
         } else {
             None
         };
+        let stored_driver_rows = |services: &crate::DesktopServices| {
+            services.settings.metadata().read::<_, StorageError>(|db| {
+                Ok(db.prepare("SELECT driver_id,payload,request,detached_source FROM benchmark_drivers ORDER BY driver_id")?
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Option<Vec<u8>>>(2)?, row.get::<_, Option<String>>(3)?)))?
+                    .collect::<Result<Vec<_>, _>>()?)
+            }).unwrap()
+        };
+        let mut saved_driver_rows = None;
         let mut receipt = None;
         for replay in [false, true] {
             if replay {
@@ -3510,7 +3614,10 @@ pub(super) mod tests {
             assert_eq!(imported["receipt"]["imported_offline_account_count"], 2);
             assert_eq!(imported["receipt"]["archived_launch_report_count"], 2);
             if with_benchmarks {
-                assert_eq!(imported["receipt"]["archived_benchmark_count"], 2);
+                assert_eq!(
+                    imported["receipt"]["archived_benchmark_count"],
+                    if parent_pruned { 1 } else { 2 }
+                );
             }
             assert_eq!(services.accounts.snapshot().unwrap().accounts.len(), 2);
             assert_eq!(
@@ -3610,6 +3717,16 @@ pub(super) mod tests {
             } else {
                 saved_benchmarks = Some(benchmarks);
             }
+            let driver_rows = stored_driver_rows(&services);
+            for (_, _, request, detached_source) in &driver_rows {
+                assert!(request.is_none());
+                assert_eq!(detached_source.is_some(), parent_pruned);
+            }
+            if let Some(saved) = &saved_driver_rows {
+                assert_eq!(&driver_rows, saved);
+            } else {
+                saved_driver_rows = Some(driver_rows);
+            }
             if let Some(saved) = &saved {
                 assert_eq!(&history, saved);
             } else {
@@ -3653,7 +3770,7 @@ pub(super) mod tests {
                      (SELECT COUNT(*) FROM benchmark_drivers),(SELECT COUNT(*) FROM installed_versions),
                      (SELECT COUNT(*) FROM benchmark_drivers WHERE request IS NOT NULL)",
                     [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?;
-                assert_eq!(counts, (0, u64::from(with_benchmarks), u64::from(with_benchmarks), 0, 0));
+                assert_eq!(counts, (0, u64::from(with_benchmarks && !parent_pruned), u64::from(with_benchmarks), 0, 0));
                 Ok(())
             }).unwrap();
         };
@@ -3698,6 +3815,7 @@ pub(super) mod tests {
             assert_eq!(actual, expected);
         }
         assert_inert(&reopened);
+        assert_eq!(stored_driver_rows(&reopened), saved_driver_rows.unwrap());
         assert_eq!(source_snapshot(), unchanged);
         reopened.server.shutdown().await.unwrap();
         reopened.server.wait().await.unwrap();

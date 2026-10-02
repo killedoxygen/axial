@@ -65,6 +65,7 @@ fn stores(path: &Path) -> (SettingsStore, AccountDirectory) {
             crate::launch::reports::REPORT_MIGRATION,
             crate::performance::benchmarks::MIGRATION,
             crate::performance::benchmarks::MIGRATION_V2,
+            crate::performance::benchmarks::MIGRATION_V3,
         ])
         .unwrap();
     let settings = SettingsStore::new_with_telemetry_identity(Arc::clone(&store), true).unwrap();
@@ -212,6 +213,97 @@ fn archived_benchmarks_metadata_preserves_report_backed_plan_and_inactive_driver
     assert_eq!(snapshot(&source.baseline), before);
 }
 
+#[test]
+fn detached_driver_metadata_preserves_pruned_parent_reference_and_reopen() {
+    let source = Fixture::new();
+    archived_benchmark(&source);
+    fs::remove_file(
+        source
+            .baseline
+            .join("benchmarks/suites/suite-dev-0000000000000002.json"),
+    )
+    .unwrap();
+    fs::remove_file(
+        source
+            .baseline
+            .join("benchmarks/launch/session-archived.json"),
+    )
+    .unwrap();
+    let before = snapshot(&source.baseline);
+    let (prepared, request) = prepare(&source);
+    let destination = Destination::new();
+    let receipt = destination
+        .commit(&prepared, &request)
+        .unwrap()
+        .response
+        .receipt;
+    assert_eq!(receipt.archived_launch_report_count, Some(0));
+    assert_eq!(receipt.archived_benchmark_count, Some(1));
+    let rows = benchmark_rows(&destination);
+    assert_eq!(rows.len(), 1);
+    let driver: Value = serde_json::from_slice(&rows[0].1).unwrap();
+    assert_eq!(driver["historical"], true);
+    assert!(
+        driver["suite_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("legacy-suite-")
+    );
+    assert!(
+        driver["last_session_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("legacy-")
+    );
+    assert_eq!(driver["last_run_index"], 0);
+    assert_eq!(driver["pending_run_index"], 1);
+    assert!(rows[0].2.is_none() && rows[0].3.is_none());
+    let counts = destination.settings.metadata().read(|db| -> Result<_, StorageError> {
+        Ok(db.query_row("SELECT (SELECT count(*) FROM benchmark_suites),(SELECT count(*) FROM launch_reports)", [], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)))?)
+    }).unwrap();
+    assert_eq!(counts, (0, 0));
+    assert_eq!(
+        destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt,
+        receipt
+    );
+    let (reopened, _) = stores(&destination._root.path().join("metadata.sqlite"));
+    assert_eq!(
+        metadata_status(&reopened, &request.metadata_import_id)
+            .unwrap()
+            .receipt,
+        Some(receipt)
+    );
+    assert_eq!(benchmark_rows(&destination), rows);
+    assert_eq!(snapshot(&source.baseline), before);
+    destination
+        .settings
+        .metadata()
+        .transaction(|tx| -> Result<(), StorageError> {
+            tx.execute("UPDATE benchmark_drivers SET detached_source=NULL", [])?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(metadata_status(&reopened, &request.metadata_import_id).is_err());
+    assert!(destination.commit(&prepared, &request).is_err());
+    let missing_provenance: Option<String> = destination
+        .settings
+        .metadata()
+        .read(|db| -> Result<_, StorageError> {
+            Ok(
+                db.query_row("SELECT detached_source FROM benchmark_drivers", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        })
+        .unwrap();
+    assert!(missing_provenance.is_none());
+    assert_eq!(benchmark_rows(&destination), rows);
+}
+
 fn benchmark_rows(
     destination: &Destination,
 ) -> Vec<(String, Vec<u8>, Option<Vec<u8>>, Option<String>)> {
@@ -224,55 +316,65 @@ fn benchmark_rows(
 
 #[test]
 fn archived_benchmarks_old_receipt_completion_preserves_later_edits() {
-    let source = Fixture::new();
-    archived_benchmark(&source);
-    let (prepared, request) = prepare(&source);
-    let destination = Destination::new();
-    let mut old = prepared.clone();
-    old.archived_benchmarks = None;
-    let mut expected = destination.commit(&old, &request).unwrap().response.receipt;
-    assert!(
-        !serde_json::to_value(&expected)
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .contains_key("archived_benchmark_count")
-    );
-    let reports = archived_rows(&destination);
-    destination.accounts.select(SECOND).unwrap();
-    let accounts = destination.accounts.snapshot().unwrap();
-    let config = destination
-        .settings
-        .update(ConfigPatch {
-            expected_revision: 1,
-            theme: Some(ConfigTheme::Birch),
-            ..ConfigPatch::default()
-        })
-        .unwrap();
-    let changes = destination.settings.subscribe().unwrap();
-    expected.archived_benchmark_count = Some(2);
-    let completed = destination.commit(&prepared, &request).unwrap();
-    assert!(completed.response.already_imported);
-    assert_eq!(completed.response.receipt, expected);
-    assert_eq!(completed.settings.config, config);
-    assert_eq!(destination.accounts.snapshot().unwrap(), accounts);
-    assert_eq!(archived_rows(&destination), reports);
-    assert!(!changes.has_changed().unwrap());
-    let rows = benchmark_rows(&destination);
-    assert_eq!(rows.len(), 2);
-    assert!(
-        rows.iter()
-            .all(|(_, _, request, parent)| request.is_none() && parent.is_none())
-    );
-    let (reopened, _) = stores(&destination._root.path().join("metadata.sqlite"));
-    assert_eq!(
-        metadata_status(&reopened, &request.metadata_import_id)
-            .unwrap()
-            .receipt,
-        Some(expected)
-    );
-    destination.commit(&prepared, &request).unwrap();
-    assert_eq!(benchmark_rows(&destination), rows);
+    for detached in [false, true] {
+        let source = Fixture::new();
+        archived_benchmark(&source);
+        if detached {
+            fs::remove_file(
+                source
+                    .baseline
+                    .join("benchmarks/suites/suite-dev-0000000000000002.json"),
+            )
+            .unwrap();
+        }
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        let mut old = prepared.clone();
+        old.archived_benchmarks = None;
+        let mut expected = destination.commit(&old, &request).unwrap().response.receipt;
+        assert!(
+            !serde_json::to_value(&expected)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("archived_benchmark_count")
+        );
+        let reports = archived_rows(&destination);
+        destination.accounts.select(SECOND).unwrap();
+        let accounts = destination.accounts.snapshot().unwrap();
+        let config = destination
+            .settings
+            .update(ConfigPatch {
+                expected_revision: 1,
+                theme: Some(ConfigTheme::Birch),
+                ..ConfigPatch::default()
+            })
+            .unwrap();
+        let changes = destination.settings.subscribe().unwrap();
+        expected.archived_benchmark_count = Some(if detached { 1 } else { 2 });
+        let completed = destination.commit(&prepared, &request).unwrap();
+        assert!(completed.response.already_imported);
+        assert_eq!(completed.response.receipt, expected);
+        assert_eq!(completed.settings.config, config);
+        assert_eq!(destination.accounts.snapshot().unwrap(), accounts);
+        assert_eq!(archived_rows(&destination), reports);
+        assert!(!changes.has_changed().unwrap());
+        let rows = benchmark_rows(&destination);
+        assert_eq!(rows.len(), if detached { 1 } else { 2 });
+        assert!(
+            rows.iter()
+                .all(|(_, _, request, parent)| request.is_none() && parent.is_none())
+        );
+        let (reopened, _) = stores(&destination._root.path().join("metadata.sqlite"));
+        assert_eq!(
+            metadata_status(&reopened, &request.metadata_import_id)
+                .unwrap()
+                .receipt,
+            Some(expected)
+        );
+        destination.commit(&prepared, &request).unwrap();
+        assert_eq!(benchmark_rows(&destination), rows);
+    }
 }
 
 #[test]
@@ -283,7 +385,7 @@ fn archived_benchmarks_optional_refusal_preserves_reports_and_metadata() {
         "active_session",
         "running_run",
         "partial_pair",
-        "orphan_driver",
+        "detached_queued",
         "missing_report",
         "wrong_report",
         "unsupported_registry",
@@ -314,12 +416,21 @@ fn archived_benchmarks_optional_refusal_preserves_reports_and_metadata() {
             fs::write(path, serde_json::to_vec(&value_before).unwrap()).unwrap();
         }
         match variant {
-            "orphan_driver" => fs::remove_file(
-                source
+            "detached_queued" => {
+                fs::remove_file(
+                    source
+                        .baseline
+                        .join("benchmarks/suites/suite-dev-0000000000000002.json"),
+                )
+                .unwrap();
+                let path = source
                     .baseline
-                    .join("benchmarks/suites/suite-dev-0000000000000002.json"),
-            )
-            .unwrap(),
+                    .join("benchmarks/suite-drivers/benchmark-suite-driver-0000000000000002.json");
+                let mut driver: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                driver["state"] = json!("interrupted");
+                driver["error"] = json!("driver automatic resume queued after restart");
+                fs::write(path, serde_json::to_vec(&driver).unwrap()).unwrap();
+            }
             "missing_report" => fs::remove_file(
                 source
                     .baseline
@@ -370,6 +481,97 @@ fn archived_benchmarks_optional_refusal_preserves_reports_and_metadata() {
         assert!(benchmark_rows(&destination).is_empty());
         assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
         assert_eq!(snapshot(&source.baseline), before);
+    }
+}
+
+#[test]
+fn detached_driver_unobservable_namespaces_do_not_claim_empty_metadata_completion() {
+    #[cfg(not(unix))]
+    let shapes = ["file", "nested"];
+    #[cfg(unix)]
+    let shapes = [
+        "file",
+        "nested",
+        "symlink_namespace",
+        "symlink_record",
+        "hardlink_record",
+    ];
+    for namespace in ["suites", "suite-drivers"] {
+        for shape in shapes {
+            let source = Fixture::new();
+            archived_report(&source, |_| {});
+            let path = source.baseline.join("benchmarks").join(namespace);
+            match shape {
+                "file" => fs::write(&path, b"unobserved history").unwrap(),
+                "nested" => fs::create_dir_all(path.join("retained.json")).unwrap(),
+                #[cfg(unix)]
+                _ => {
+                    let external = source
+                        .baseline
+                        .parent()
+                        .unwrap()
+                        .join("private-history.json");
+                    fs::write(&external, b"unobserved history").unwrap();
+                    if shape == "symlink_namespace" {
+                        std::os::unix::fs::symlink(&external, &path).unwrap();
+                    } else {
+                        fs::create_dir_all(&path).unwrap();
+                        if shape == "symlink_record" {
+                            std::os::unix::fs::symlink(&external, path.join("retained.json"))
+                                .unwrap();
+                        } else {
+                            fs::hard_link(&external, path.join("retained.json")).unwrap();
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                _ => unreachable!(),
+            }
+            let before = snapshot(&source.baseline);
+            if shape == "hardlink_record" {
+                assert!(matches!(
+                    source.try_capture(),
+                    Err(crate::import::ImportError::Io(_))
+                ));
+                assert_eq!(
+                    fs::read(
+                        source
+                            .baseline
+                            .parent()
+                            .unwrap()
+                            .join("private-history.json")
+                    )
+                    .unwrap(),
+                    b"unobserved history"
+                );
+                assert_eq!(snapshot(&source.baseline), before);
+                continue;
+            }
+            let inventory = source.capture();
+            assert!(!inventory.file_manifests().any(|file| {
+                file.relative.starts_with("profile/benchmarks/suites/")
+                    || file
+                        .relative
+                        .starts_with("profile/benchmarks/suite-drivers/")
+            }));
+            assert!(crate::import::history::prepare_history(&inventory).is_err());
+            let (prepared, request) = prepare(&source);
+            let destination = Destination::new();
+            let receipt = destination
+                .commit(&prepared, &request)
+                .unwrap()
+                .response
+                .receipt;
+            assert_eq!(
+                receipt.archived_benchmark_count, None,
+                "{namespace}/{shape}"
+            );
+            assert_eq!(receipt.archived_launch_report_count, Some(1));
+            assert_eq!(archived_rows(&destination).len(), 1);
+            assert!(benchmark_rows(&destination).is_empty());
+            assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
+            assert_eq!(snapshot(&source.baseline), before);
+        }
     }
 }
 

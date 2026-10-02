@@ -1392,6 +1392,7 @@ pub(crate) mod tests {
                 crate::install::history::MIGRATION,
                 crate::performance::benchmarks::MIGRATION,
                 crate::performance::benchmarks::MIGRATION_V2,
+                crate::performance::benchmarks::MIGRATION_V3,
             ])
             .unwrap();
         crate::settings::SettingsStore::new(storage.clone()).unwrap();
