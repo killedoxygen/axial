@@ -493,6 +493,7 @@ pub(super) mod tests {
                     axial_app::import::METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
                     axial_app::import::METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
                     axial_app::import::METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
+                    axial_app::import::METADATA_IMPORT_ARCHIVED_CONTENT_MIGRATION,
                     axial_app::performance::benchmarks::MIGRATION,
                     axial_app::performance::benchmarks::MIGRATION_V2,
                     axial_app::performance::benchmarks::MIGRATION_V3,
@@ -2329,7 +2330,8 @@ pub(super) mod tests {
             .metadata()
             .transaction::<_, StorageError>(|db| {
                 db.execute(
-                    "UPDATE profile_metadata_imports SET global_install_history_proof = NULL",
+                    "UPDATE profile_metadata_imports SET global_install_history_proof = NULL,
+                     archived_content_history_proof = NULL",
                     [],
                 )?;
                 Ok(())
@@ -2343,6 +2345,11 @@ pub(super) mod tests {
         assert!(
             recorded["receipt"]
                 .get("global_install_history_count")
+                .is_none()
+        );
+        assert!(
+            recorded["receipt"]
+                .get("archived_content_operation_count")
                 .is_none()
         );
         let (status, history) = fixture
@@ -3093,6 +3100,7 @@ pub(super) mod tests {
                 "development",
                 false,
                 false,
+                false,
             )
             .await;
         }
@@ -3100,7 +3108,8 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn composed_metadata_import_retains_deleted_instance_reports_without_instances() {
-        composed_deleted_instance_report_import(None, None, "development", false, false).await;
+        composed_deleted_instance_report_import(None, None, "development", false, false, false)
+            .await;
     }
 
     #[tokio::test]
@@ -3112,6 +3121,7 @@ pub(super) mod tests {
                 "development",
                 false,
                 false,
+                false,
             )
             .await;
         }
@@ -3119,14 +3129,28 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn composed_metadata_import_retains_deleted_instance_benchmarks_without_instances() {
-        composed_deleted_instance_report_import(None, Some(true), "development", false, false)
-            .await;
+        composed_deleted_instance_report_import(
+            None,
+            Some(true),
+            "development",
+            false,
+            false,
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn composed_metadata_import_retains_deleted_instance_all_pending_benchmarks() {
-        composed_deleted_instance_report_import(None, Some(false), "development", false, false)
-            .await;
+        composed_deleted_instance_report_import(
+            None,
+            Some(false),
+            "development",
+            false,
+            false,
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3136,6 +3160,7 @@ pub(super) mod tests {
                 None,
                 Some(completed),
                 "release_validation",
+                false,
                 false,
                 false,
             )
@@ -3152,6 +3177,7 @@ pub(super) mod tests {
                 "development",
                 true,
                 false,
+                false,
             )
             .await;
         }
@@ -3166,9 +3192,91 @@ pub(super) mod tests {
                 "development",
                 false,
                 true,
+                false,
             )
             .await;
         }
+    }
+
+    #[tokio::test]
+    async fn composed_metadata_import_retains_deleted_instance_content_operations() {
+        for import_before_metadata in [None, Some(true), Some(false)] {
+            composed_deleted_instance_report_import(
+                import_before_metadata,
+                None,
+                "development",
+                false,
+                false,
+                true,
+            )
+            .await;
+        }
+    }
+
+    fn terminal_content_journal(instance: &str) -> Value {
+        let target = |kind: &str, id: &str| json!({"system":"Application","kind":kind,"id":id,"ownership":"LauncherManaged"});
+        let step = |id: &str, phase: &str, result: &str, facts: Value| {
+            json!({"step_id":id,"phase":phase,"result":result,"changed_target":null,
+                "generated_facts":facts,"rollback":"NotApplicable","guardian_fact_ids":[],"metrics":null})
+        };
+        let mut terminal = step(
+            "content_progress_done",
+            "Downloading",
+            "Completed",
+            json!(["install_phase:done", "install_done:true"]),
+        );
+        let counters = [
+            "checksum_mismatch",
+            "metadata_invalid",
+            "metadata_missing",
+            "interrupted",
+            "network_failure",
+            "permission_failure",
+            "promote_failed",
+            "provider_failure",
+            "size_mismatch",
+            "temp_discarded",
+            "temp_write_failed",
+            "written_to_temp",
+            "promoted",
+        ]
+        .into_iter()
+        .map(|key| (key.to_owned(), json!(u64::MAX)))
+        .collect::<serde_json::Map<_, _>>();
+        terminal["metrics"] = json!({"kind":"content_download","values":counters});
+        let id = "op-00000000-0000-4000-8000-000000000001";
+        let succeeded = json!({
+            "journal_id":format!("journal-{id}"),"operation_id":id,"sequence":9007199254740993_u64,
+            "parent_operation_id":null,"command":"ModifyInstanceContent","intent":{"kind":"generic"},
+            "status":"Succeeded","owner":"Application","ownership":"LauncherManaged",
+            "targets":[target("Session","content-00000000000000000000000000000001"),target("Instance",instance)],
+            "planned_steps":[step("modify_instance_content","Planning","Planned",json!([]))],
+            "completed_steps":[terminal],"failure_point":null,"rollback":"NotApplicable",
+            "guardian_diagnosis_ids":[],"outcome":"Succeeded","reconciliation_attempt":null,
+            "reconciliation_terminal":null,"persisted_state_repair_attempt":null,
+            "persisted_state_repair_terminal":null,"guardian_install_terminal":null
+        });
+        let id = "op-00000000-0000-4000-8000-000000000002";
+        let mut cancelled = succeeded.clone();
+        cancelled["journal_id"] = json!(format!("journal-{id}"));
+        cancelled["operation_id"] = json!(id);
+        cancelled["sequence"] = json!(9007199254740994_u64);
+        cancelled["targets"][0] = target("Session", "content-00000000000000000000000000000002");
+        cancelled["status"] = json!("Failed");
+        cancelled["outcome"] = json!("Failed");
+        cancelled["failure_point"] = json!("content_initialization_cancelled");
+        cancelled["completed_steps"] = json!([step(
+            "content_progress_initializing",
+            "Failed",
+            "Failed",
+            json!([
+                "install_phase:initializing",
+                "install_done:true",
+                "install_error:true"
+            ])
+        )]);
+        json!({"schema":"axial.state.operation_journals.v10","next_sequence":9007199254740995_u64,
+            "entries":[succeeded,cancelled]})
     }
 
     fn succeeded_performance_journal(instance: &str) -> Value {
@@ -3405,6 +3513,7 @@ pub(super) mod tests {
         benchmark_mode: &str,
         parent_pruned: bool,
         with_performance_operation: bool,
+        with_content_operations: bool,
     ) {
         let has_survivor = import_before_metadata.is_some();
         let with_benchmarks = completed_benchmark_run.is_some();
@@ -3453,6 +3562,16 @@ pub(super) mod tests {
             let entry = &journal["entries"][0];
             json!({"operation_id":entry["operation_id"],"sequence":entry["sequence"],
                 "intent":entry["intent"]["intent"],"terminal":entry["intent"]["phase"]["terminal"]})
+        });
+        let content_fixture = with_content_operations.then(|| {
+            let journal = terminal_content_journal("0000000000000002");
+            fs::create_dir(baseline.join("state")).unwrap();
+            fs::write(
+                baseline.join("state/operation-journals.json"),
+                serde_json::to_vec(&journal).unwrap(),
+            )
+            .unwrap();
+            journal
         });
         let mut prior = report.clone();
         prior["session_id"] = json!("session-deleted-before");
@@ -3535,7 +3654,7 @@ pub(super) mod tests {
             "benchmarks/launch/session-deleted.json",
             "benchmarks/launch/session-deleted-before.json",
         ];
-        if with_performance_operation {
+        if with_performance_operation || with_content_operations {
             source_files.push("state/operation-journals.json");
         }
         if with_benchmarks {
@@ -3875,6 +3994,109 @@ pub(super) mod tests {
             Some((path, operation, bytes.clone()))
         };
         let status_path = format!("/api/v1/import/metadata/{}", preview.metadata_import_id);
+        let content_history_path = format!("{status_path}/install-history");
+        let read_content_history = || async {
+            let Some(original) = &content_fixture else {
+                return None;
+            };
+            let page: Value = request(Method::GET, &content_history_path)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(page["next_after"].is_null());
+            let records = page["records"].as_array().unwrap();
+            assert_eq!(records.len(), 2);
+            for original in original["entries"].as_array().unwrap() {
+                let record = records
+                    .iter()
+                    .find(|record| record["operation_id"] == original["operation_id"])
+                    .unwrap();
+                assert_eq!(record["historical"], true);
+                let source_id = record["source_id"].as_str().unwrap();
+                assert_eq!(source_id.len(), 64);
+                let instance = format!("archived-{source_id}-0000000000000002");
+                assert_eq!(record["instance_id"], instance);
+                assert!(uuid::Uuid::parse_str(&instance).is_err());
+                assert_eq!(
+                    record["sequence"],
+                    original["sequence"].as_u64().unwrap().to_string()
+                );
+                for field in ["journal_id", "command", "targets", "outcome", "rollback"] {
+                    assert_eq!(record[field], original[field], "{field}");
+                }
+                if original["failure_point"].is_null() {
+                    assert!(record.get("failure_point").is_none());
+                } else {
+                    assert_eq!(record["failure_point"], "content_initialization_cancelled");
+                    assert_eq!(record["outcome"], "Failed");
+                }
+                for field in ["planned_steps", "completed_steps"] {
+                    let mut expected = original[field].clone();
+                    for step in expected.as_array_mut().unwrap() {
+                        step.as_object_mut().unwrap().remove("guardian_fact_ids");
+                        if !step["metrics"].is_null() {
+                            let counters = step["metrics"]["values"].as_object_mut().unwrap();
+                            assert_eq!(counters.len(), 13);
+                            for counter in counters.values_mut() {
+                                assert_eq!(counter.as_u64().unwrap(), u64::MAX);
+                                *counter = json!(u64::MAX.to_string());
+                            }
+                        }
+                    }
+                    assert_eq!(record[field], expected);
+                }
+                for absent in [
+                    "status",
+                    "request",
+                    "actions",
+                    "can_cancel",
+                    "can_retry",
+                    "guardian_diagnosis_ids",
+                    "guardian_install_terminal",
+                ] {
+                    assert!(record.get(absent).is_none(), "{absent}");
+                }
+                let id = record["id"].as_str().unwrap();
+                assert!(id.starts_with("legacy-install-"));
+                assert_eq!(
+                    request(Method::POST, &format!("/api/v1/install/{id}/cancel"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::NOT_FOUND
+                );
+                assert_eq!(
+                    request(
+                        Method::POST,
+                        &format!("/api/v1/install/queue/retry?expected_install_id={id}")
+                    )
+                    .json(&json!({"kind":"vanilla","version_id":"must-not-enqueue"}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                    StatusCode::BAD_REQUEST
+                );
+                assert_eq!(
+                    request(
+                        Method::GET,
+                        &format!("/api/v1/install/history?instance_id={instance}")
+                    )
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                    StatusCode::BAD_REQUEST
+                );
+            }
+            Some(page)
+        };
         let import_survivor = || async {
             let response = request(Method::POST, "/api/v1/import/instances")
                 .json(&json!({"fingerprint":preview.fingerprint,"legacy_id":FIRST}))
@@ -3929,6 +4151,7 @@ pub(super) mod tests {
         } else {
             None
         };
+        let mut saved_content_history = None;
         let mut receipt = None;
         for replay in [false, true] {
             if replay {
@@ -3937,15 +4160,50 @@ pub(super) mod tests {
                     .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
                     .unwrap();
             }
-            let response = request(Method::POST, "/api/v1/import/metadata")
-                .json(&input)
-                .send()
+            let imported: Value = if with_content_operations && !has_survivor && !replay {
+                let consent = services.telemetry.consent_change_owned().await;
+                let mut tasks = services.tasks.subscribe();
+                let dispatch = request(Method::POST, "/api/v1/import/metadata").json(&input);
+                let waiter = tokio::spawn(async move { dispatch.send().await });
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while services.tasks.status().running.is_empty() {
+                        tasks.changed().await.unwrap();
+                    }
+                })
                 .await
                 .unwrap();
-            let status = response.status();
-            let imported: Value = response.json().await.unwrap();
-            assert_eq!(status, StatusCode::OK, "{imported}");
-            assert_eq!(imported["already_imported"], replay);
+                services.imports.forget().unwrap();
+                waiter.abort();
+                assert!(waiter.await.unwrap_err().is_cancelled());
+                drop(consent);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !services.tasks.status().is_idle() {
+                        tasks.changed().await.unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+                request(Method::GET, &status_path)
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap()
+            } else {
+                let response = request(Method::POST, "/api/v1/import/metadata")
+                    .json(&input)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let imported: Value = response.json().await.unwrap();
+                assert_eq!(status, StatusCode::OK, "{imported}");
+                assert_eq!(imported["already_imported"], replay);
+                imported
+            };
             assert_eq!(imported["cutover_available"], false);
             assert_eq!(imported["receipt"]["imported_offline_account_count"], 2);
             assert_eq!(imported["receipt"]["archived_launch_report_count"], 2);
@@ -3966,6 +4224,10 @@ pub(super) mod tests {
                 services.settings.current().unwrap().username,
                 "FixturePlayer"
             );
+            if with_content_operations {
+                assert_eq!(imported["receipt"]["global_install_history_count"], 0);
+                assert_eq!(imported["receipt"]["archived_content_operation_count"], 2);
+            }
             if let Some(receipt) = &receipt {
                 assert_eq!(&imported["receipt"], receipt);
             } else {
@@ -3985,6 +4247,12 @@ pub(super) mod tests {
                 recorded,
                 json!({"receipt":imported["receipt"],"cutover_available":false})
             );
+            let content_history = read_content_history().await;
+            if saved_content_history.is_some() {
+                assert_eq!(content_history, saved_content_history);
+            } else {
+                saved_content_history = content_history;
+            }
             let history: Value = request(Method::GET, "/api/v1/launch/reports")
                 .send()
                 .await
@@ -4099,6 +4367,7 @@ pub(super) mod tests {
                 assert_eq!(after, history);
                 assert_eq!(read_benchmarks().await, *saved_benchmarks.as_ref().unwrap());
                 assert_eq!(read_operation().await, saved_operation);
+                assert_eq!(read_content_history().await, saved_content_history);
             }
         }
         let assert_inert = |services: &crate::DesktopServices| {
@@ -4144,6 +4413,9 @@ pub(super) mod tests {
             ),
         ];
         reads.extend(saved_benchmarks.unwrap());
+        if let Some(history) = saved_content_history {
+            reads.push((content_history_path, history));
+        }
         if let Some((path, operation, bytes)) = &saved_operation {
             reads.push((path.clone(), operation.clone()));
             let stored: Vec<u8> = reopened

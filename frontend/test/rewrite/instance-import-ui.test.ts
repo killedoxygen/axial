@@ -1483,6 +1483,7 @@ for (const [label, field, limit] of [
   ['archived launch report', 'archived_launch_report_count', 1024],
   ['archived benchmark', 'archived_benchmark_count', 1024],
   ['archived performance operation', 'archived_performance_operation_count', 128],
+  ['archived content operation', 'archived_content_operation_count', 128],
 ] as const) {
   test(`${label} counts survive metadata receipts and status reads with optional compatibility`, async () => {
     for (const count of [undefined, null, 0, 2, limit]) {

@@ -3398,7 +3398,7 @@ fn content_initialization_cancelled_import_refuses_worker_effects_and_raw_malfor
         "cancelled",
         "missing-failure",
         "worker-failure",
-        "wrong-instance",
+        "invalid-instance",
         "extra-step",
         "metrics",
         "changed-target",
@@ -3419,7 +3419,7 @@ fn content_initialization_cancelled_import_refuses_worker_effects_and_raw_malfor
             }
             "missing-failure" => entry["failure_point"] = Value::Null,
             "worker-failure" => entry["failure_point"] = json!("operation_worker_stopped"),
-            "wrong-instance" => entry["targets"][1]["id"] = json!(SECOND),
+            "invalid-instance" => entry["targets"][1]["id"] = json!("invalid"),
             "extra-step" => entry["completed_steps"].as_array_mut().unwrap().insert(
                 0,
                 successful_install_journal()["entries"][2]["completed_steps"][0].clone(),
@@ -3784,7 +3784,7 @@ fn successful_install_history_import_refuses_unproven_and_raw_malformed_evidence
         "checkpoint-version",
         "activation",
         "terminal-first",
-        "wrong-instance",
+        "invalid-instance",
         "content-phase",
         "metrics-kind",
         "missing-counter",
@@ -3830,7 +3830,7 @@ fn successful_install_history_import_refuses_unproven_and_raw_malformed_evidence
                 .as_array_mut()
                 .unwrap()
                 .swap(0, 2),
-            "wrong-instance" => journal["entries"][2]["targets"][1]["id"] = json!(SECOND),
+            "invalid-instance" => journal["entries"][2]["targets"][1]["id"] = json!("invalid"),
             "content-phase" => {
                 journal["entries"][2]["completed_steps"][1]["phase"] = json!("Completed")
             }
@@ -4029,7 +4029,7 @@ pub(crate) fn terminal_performance_journal() -> Value {
     json!({"schema":"axial.state.operation_journals.v10", "next_sequence":7, "entries":entries})
 }
 
-fn terminal_rules_journal() -> Value {
+pub(crate) fn terminal_rules_journal() -> Value {
     let cache = json!({"system":"Performance","kind":"Config","id":"performance_rules_cache","ownership":"LauncherManaged"});
     let entries: Vec<_> = (0..4).map(|index| {
         let operation = format!("op-{}", uuid::Uuid::new_v4());

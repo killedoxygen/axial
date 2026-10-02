@@ -14,7 +14,10 @@ use axial_minecraft::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use ts_rs::TS;
 
 const MAX_RECORD_BYTES: usize = 256 * 1024;
@@ -298,19 +301,17 @@ impl PreparedOperation {
         }
         let legacy_instance_id = validate_source(&source)?;
         let id = history_id(source_id, &source.operation_id);
-        let mut stored_bytes = serde_json::to_vec(&StoredRef {
+        let stored_bytes = serde_json::to_vec(&StoredRef {
             schema: 1,
             id: &id,
             source_id,
-            instance_id: None,
+            instance_id: legacy_instance_id
+                .as_ref()
+                .map(|_| "00000000-0000-0000-0000-000000000001"),
             source: &source,
         })
         .map_err(|_| HistoryError::Invalid)?
         .len();
-        // A canonical UUID string occupies 38 JSON bytes instead of null's 4.
-        if legacy_instance_id.is_some() {
-            stored_bytes += 34;
-        }
         if stored_bytes > MAX_RECORD_BYTES {
             return Err(HistoryError::Invalid);
         }
@@ -328,7 +329,8 @@ impl PreparedOperation {
     }
 }
 
-pub(crate) struct PreparedImport(Vec<BoundOperation>);
+#[derive(Clone)]
+pub(crate) struct PreparedImport(Vec<Arc<BoundOperation>>);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -340,7 +342,7 @@ pub(crate) struct CompletionProof {
 
 struct BoundOperation {
     operation: PreparedOperation,
-    instance_id: Option<InstanceId>,
+    instance_id: Option<String>,
     bytes: Vec<u8>,
 }
 
@@ -349,7 +351,7 @@ struct StoredRef<'a> {
     schema: u8,
     id: &'a str,
     source_id: &'a str,
-    instance_id: Option<&'a InstanceId>,
+    instance_id: Option<&'a str>,
     source: &'a SourceOperation,
 }
 
@@ -359,38 +361,66 @@ struct StoredRecord {
     schema: u8,
     id: String,
     source_id: String,
-    instance_id: Option<InstanceId>,
+    instance_id: Option<String>,
     source: SourceOperation,
 }
 
 struct ReadRecord {
     operation: PreparedOperation,
-    instance_id: Option<InstanceId>,
+    instance_id: Option<String>,
 }
 
 impl PreparedImport {
     pub(crate) fn validate(records: &[PreparedOperation]) -> Result<(), HistoryError> {
-        if records.len() > MAX_BATCH_RECORDS {
+        Self::validate_with_archived(records, &Self(Vec::new()))
+    }
+
+    pub(crate) fn validate_with_archived(
+        records: &[PreparedOperation],
+        archived: &Self,
+    ) -> Result<(), HistoryError> {
+        validate_batch(
+            records
+                .iter()
+                .map(|record| (record, record.0.stored_bytes))
+                .chain(
+                    archived
+                        .0
+                        .iter()
+                        .map(|record| (&record.operation, record.bytes.len())),
+                ),
+        )
+    }
+
+    pub(crate) fn append(&mut self, other: &Self) -> Result<(), HistoryError> {
+        validate_batch(
+            self.0
+                .iter()
+                .chain(&other.0)
+                .map(|record| (&record.operation, record.bytes.len())),
+        )?;
+        self.0.extend(other.0.iter().cloned());
+        Ok(())
+    }
+
+    pub(crate) fn bind_archived(
+        source_id: &str,
+        records: Vec<PreparedOperation>,
+    ) -> Result<Self, HistoryError> {
+        if !lower_hex(source_id, 64) || records.len() > MAX_BATCH_RECORDS {
             return Err(HistoryError::Invalid);
         }
-        let mut ids = BTreeSet::new();
-        let mut sequences = BTreeSet::new();
-        let source_id = records.first().map(|record| &record.0.source_id);
-        let mut total = 0usize;
-        for record in records {
-            let value = &record.0;
-            total = total
-                .checked_add(value.stored_bytes)
-                .ok_or(HistoryError::Invalid)?;
-            if !ids.insert(&value.id)
-                || !sequences.insert(value.source.sequence)
-                || Some(&value.source_id) != source_id
-                || total > MAX_BATCH_BYTES
-            {
+        let mut bound = Vec::with_capacity(records.len());
+        for operation in records {
+            if operation.0.source_id != source_id {
                 return Err(HistoryError::Invalid);
             }
+            let instance = archived_instance(&operation).ok_or(HistoryError::Invalid)?;
+            bound.push(Arc::new(BoundOperation::new(operation, Some(instance))?));
         }
-        Ok(())
+        let bound = Self(bound);
+        Self::validate_with_archived(&[], &bound)?;
+        Ok(bound)
     }
 
     pub(crate) fn bind(
@@ -406,10 +436,10 @@ impl PreparedImport {
         for operation in records {
             let instance_id = match operation.legacy_instance_id() {
                 None => None,
-                Some(id) if id == legacy_id => Some(instance.clone()),
+                Some(id) if id == legacy_id => Some(instance.as_str().to_owned()),
                 Some(_) => return Err(HistoryError::Invalid),
             };
-            bound.push(BoundOperation::new(operation, instance_id)?);
+            bound.push(Arc::new(BoundOperation::new(operation, instance_id)?));
         }
         Ok(Self(bound))
     }
@@ -422,7 +452,7 @@ impl PreparedImport {
                 if operation.legacy_instance_id().is_some() {
                     return Err(HistoryError::Invalid);
                 }
-                BoundOperation::new(operation, None)
+                BoundOperation::new(operation, None).map(Arc::new)
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Self)
@@ -432,11 +462,25 @@ impl PreparedImport {
         &self,
         source_id: &str,
     ) -> Result<CompletionProof, HistoryError> {
+        self.proof(source_id, CompletionScope::Global)
+    }
+
+    pub(crate) fn archived_completion_proof(
+        &self,
+        source_id: &str,
+    ) -> Result<CompletionProof, HistoryError> {
+        self.proof(source_id, CompletionScope::Archived)
+    }
+
+    fn proof(
+        &self,
+        source_id: &str,
+        scope: CompletionScope,
+    ) -> Result<CompletionProof, HistoryError> {
         if !lower_hex(source_id, 64)
             || self.0.iter().any(|record| {
                 record.operation.0.source_id != source_id
-                    || record.instance_id.is_some()
-                    || record.operation.legacy_instance_id().is_some()
+                    || !scope.matches(&record.operation, record.instance_id.as_deref())
             })
         {
             return Err(HistoryError::Invalid);
@@ -447,7 +491,7 @@ impl PreparedImport {
             .iter()
             .map(|record| record.operation.0.id.clone())
             .collect();
-        let mut digest = completion_hash(source_id, &ids);
+        let mut digest = completion_hash(source_id, &ids, scope);
         for record in records {
             digest.update((record.bytes.len() as u64).to_be_bytes());
             digest.update(&record.bytes);
@@ -460,21 +504,26 @@ impl PreparedImport {
     }
 
     pub(crate) fn insert_in(&self, tx: &Transaction<'_>) -> Result<(), HistoryError> {
+        let mut remaining = MAX_BATCH_BYTES;
         for record in &self.0 {
             let value = &record.operation.0;
-            match stored(tx, &value.id)? {
-                Some(saved) if record.matches(&saved) => continue,
-                Some(_) => return Err(HistoryError::Conflict),
+            match stored_row(tx, &value.id, MAX_RECORD_BYTES.min(remaining))? {
+                Some((source, instance, bytes)) => {
+                    let bytes = bytes.ok_or(HistoryError::Conflict)?;
+                    remaining -= bytes.len();
+                    if !record.matches(&source, instance.as_deref(), &bytes) {
+                        return Err(HistoryError::Conflict);
+                    }
+                    continue;
+                }
                 None => {}
             }
+            remaining = remaining
+                .checked_sub(record.bytes.len())
+                .ok_or(HistoryError::Invalid)?;
             if tx.execute(
                 "INSERT INTO install_history(id,source_id,instance_id,payload) VALUES(?1,?2,?3,?4)",
-                params![
-                    value.id,
-                    value.source_id,
-                    record.instance_id.as_ref().map(InstanceId::as_str),
-                    record.bytes
-                ],
+                params![value.id, value.source_id, record.instance_id, record.bytes],
             )? != 1
             {
                 return Err(HistoryError::Conflict);
@@ -484,12 +533,15 @@ impl PreparedImport {
         self.verify_in(tx)
     }
 
-    pub(crate) fn verify_in(&self, tx: &Transaction<'_>) -> Result<(), HistoryError> {
+    pub(crate) fn verify_in(&self, db: &Connection) -> Result<(), HistoryError> {
+        let mut remaining = MAX_BATCH_BYTES;
         for record in &self.0 {
-            if stored(tx, &record.operation.0.id)?
-                .as_ref()
-                .is_none_or(|saved| !record.matches(saved))
-            {
+            let (source, instance, bytes) =
+                stored_row(db, &record.operation.0.id, MAX_RECORD_BYTES.min(remaining))?
+                    .ok_or(HistoryError::Conflict)?;
+            let bytes = bytes.ok_or(HistoryError::Conflict)?;
+            remaining -= bytes.len();
+            if !record.matches(&source, instance.as_deref(), &bytes) {
                 return Err(HistoryError::Conflict);
             }
         }
@@ -497,21 +549,63 @@ impl PreparedImport {
     }
 }
 
+fn validate_batch<'a>(
+    records: impl IntoIterator<Item = (&'a PreparedOperation, usize)>,
+) -> Result<(), HistoryError> {
+    let mut ids = BTreeSet::new();
+    let mut sequences = BTreeSet::new();
+    let mut source_id = None;
+    let mut total = 0usize;
+    for (record, bytes) in records {
+        let value = &record.0;
+        total = total.checked_add(bytes).ok_or(HistoryError::Invalid)?;
+        if !ids.insert(&value.id)
+            || !sequences.insert(value.source.sequence)
+            || *source_id.get_or_insert(value.source_id.as_str()) != value.source_id.as_str()
+            || ids.len() > MAX_BATCH_RECORDS
+            || total > MAX_BATCH_BYTES
+        {
+            return Err(HistoryError::Invalid);
+        }
+    }
+    Ok(())
+}
+
+fn archived_instance(operation: &PreparedOperation) -> Option<String> {
+    operation
+        .legacy_instance_id()
+        .map(|legacy| format!("archived-{}-{legacy}", operation.0.source_id))
+}
+
+fn valid_binding(operation: &PreparedOperation, instance: Option<&str>) -> bool {
+    match (operation.legacy_instance_id(), instance) {
+        (None, None) => true,
+        (Some(_), Some(instance)) => {
+            instance.parse::<InstanceId>().is_ok()
+                || archived_instance(operation).as_deref() == Some(instance)
+        }
+        _ => false,
+    }
+}
+
 impl BoundOperation {
     fn new(
         operation: PreparedOperation,
-        instance_id: Option<InstanceId>,
+        instance_id: Option<String>,
     ) -> Result<Self, HistoryError> {
+        if !valid_binding(&operation, instance_id.as_deref()) {
+            return Err(HistoryError::Invalid);
+        }
         let value = &operation.0;
         let bytes = serde_json::to_vec(&StoredRef {
             schema: 1,
             id: &value.id,
             source_id: &value.source_id,
-            instance_id: instance_id.as_ref(),
+            instance_id: instance_id.as_deref(),
             source: &value.source,
         })
         .map_err(|_| HistoryError::Invalid)?;
-        if bytes.len() != value.stored_bytes || bytes.len() > MAX_RECORD_BYTES {
+        if bytes.len() > MAX_RECORD_BYTES {
             return Err(HistoryError::Invalid);
         }
         Ok(Self {
@@ -521,18 +615,11 @@ impl BoundOperation {
         })
     }
 
-    fn matches(&self, saved: &ReadRecord) -> bool {
-        self.operation.0.id == saved.operation.0.id
-            && self.operation.0.source_id == saved.operation.0.source_id
-            && self.operation.0.source == saved.operation.0.source
-            && self.instance_id == saved.instance_id
+    fn matches(&self, source_id: &str, instance_id: Option<&str>, bytes: &[u8]) -> bool {
+        self.operation.0.source_id == source_id
+            && self.instance_id.as_deref() == instance_id
+            && self.bytes == bytes
     }
-}
-
-fn stored(db: &Connection, id: &str) -> Result<Option<ReadRecord>, HistoryError> {
-    stored_row(db, id, MAX_RECORD_BYTES)?
-        .map(|(source, instance, bytes)| decode_stored(id, &source, instance.as_deref(), bytes))
-        .transpose()
 }
 
 fn stored_row(
@@ -540,14 +627,25 @@ fn stored_row(
     id: &str,
     max_bytes: usize,
 ) -> Result<Option<(String, Option<String>, Option<Vec<u8>>)>, HistoryError> {
-    Ok(db
+    let row: Option<(Option<String>, Option<String>, bool, Option<Vec<u8>>)> = db
         .query_row(
-            "SELECT source_id,instance_id,CASE WHEN length(payload)<=?2 THEN payload END
-         FROM install_history WHERE id=?1",
+            "SELECT
+                CASE WHEN length(CAST(source_id AS BLOB))=64 THEN source_id END,
+                CASE WHEN length(CAST(instance_id AS BLOB))<=90 THEN instance_id END,
+                instance_id IS NULL OR length(CAST(instance_id AS BLOB))<=90,
+                CASE WHEN length(CAST(payload AS BLOB))<=?2 THEN payload END
+             FROM install_history WHERE id=?1",
             params![id, max_bytes],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .optional()?)
+        .optional()?;
+    row.map(|(source, instance, binding_bounded, bytes)| {
+        if !binding_bounded {
+            return Err(HistoryError::Conflict);
+        }
+        Ok((source.ok_or(HistoryError::Conflict)?, instance, bytes))
+    })
+    .transpose()
 }
 
 fn decode_stored(
@@ -561,15 +659,13 @@ fn decode_stored(
     if saved.schema != 1
         || saved.id != id
         || saved.source_id != source_id
-        || saved.instance_id.as_ref().map(InstanceId::as_str) != instance_id
+        || saved.instance_id.as_deref() != instance_id
     {
         return Err(HistoryError::Conflict);
     }
     let operation = PreparedOperation::prepare(&saved.source_id, saved.source)
         .map_err(|_| HistoryError::Conflict)?;
-    if operation.0.id != id
-        || operation.legacy_instance_id().is_some() != saved.instance_id.is_some()
-    {
+    if operation.0.id != id || !valid_binding(&operation, saved.instance_id.as_deref()) {
         return Err(HistoryError::Conflict);
     }
     Ok(ReadRecord {
@@ -584,18 +680,11 @@ impl CompletionProof {
     }
 
     pub(crate) fn verify_in(&self, db: &Connection, source_id: &str) -> Result<(), HistoryError> {
-        self.read_in(db, source_id, None).map(|_| ())
+        read_completed_in(db, source_id, Some(self), None, None).map(|_| ())
     }
 
-    fn read_in(
-        &self,
-        db: &Connection,
-        source_id: &str,
-        after: Option<&str>,
-    ) -> Result<HistoryPage, HistoryError> {
-        validate_cursor(after)?;
-        if !lower_hex(source_id, 64)
-            || self.source_id != source_id
+    fn validate(&self, source_id: &str) -> Result<(), HistoryError> {
+        if self.source_id != source_id
             || !lower_hex(&self.digest, 64)
             || self.ids.len() > MAX_BATCH_RECORDS
             || self.ids.iter().any(|id| !valid_history_id(id))
@@ -603,50 +692,33 @@ impl CompletionProof {
         {
             return Err(HistoryError::Conflict);
         }
-        let mut digest = completion_hash(source_id, &self.ids);
-        let mut total = 0usize;
-        let mut sequences = BTreeSet::new();
-        let mut records = Vec::new();
-        let mut has_more = false;
-        for id in &self.ids {
-            // Cap the next payload before it crosses the SQLite boundary, not
-            // after allocating an entire snapshot of individually bounded rows.
-            let (source, instance, bytes) =
-                stored_row(db, id, MAX_RECORD_BYTES.min(MAX_BATCH_BYTES - total))?
-                    .ok_or(HistoryError::Conflict)?;
-            let bytes = bytes.ok_or(HistoryError::Conflict)?;
-            total += bytes.len();
-            digest.update((bytes.len() as u64).to_be_bytes());
-            digest.update(&bytes);
-            let saved = decode_stored(id, &source, instance.as_deref(), Some(bytes))?;
-            if source != source_id
-                || saved.instance_id.is_some()
-                || saved.operation.legacy_instance_id().is_some()
-                || !sequences.insert(saved.operation.0.source.sequence)
-            {
-                return Err(HistoryError::Conflict);
-            }
-            if id.as_str() > after.unwrap_or("") {
-                if records.len() < PAGE_SIZE {
-                    records.push(saved.project());
-                } else {
-                    has_more = true;
-                }
-            }
-        }
-        if hex::encode(digest.finalize()) != self.digest {
-            return Err(HistoryError::Conflict);
-        }
-        Ok(HistoryPage {
-            next_after: has_more.then(|| records.last().expect("full history page").id.clone()),
-            records,
-        })
+        Ok(())
     }
 }
 
-fn completion_hash(source_id: &str, ids: &[String]) -> Sha256 {
+#[derive(Clone, Copy)]
+enum CompletionScope {
+    Global,
+    Archived,
+}
+
+impl CompletionScope {
+    fn matches(self, operation: &PreparedOperation, instance: Option<&str>) -> bool {
+        match self {
+            Self::Global => operation.legacy_instance_id().is_none() && instance.is_none(),
+            Self::Archived => {
+                instance.is_some() && archived_instance(operation).as_deref() == instance
+            }
+        }
+    }
+}
+
+fn completion_hash(source_id: &str, ids: &[String], scope: CompletionScope) -> Sha256 {
     let mut hash = Sha256::new();
-    hash.update(b"axial.legacy.install.completion.v1\0");
+    hash.update(match scope {
+        CompletionScope::Global => b"axial.legacy.install.completion.v1\0".as_slice(),
+        CompletionScope::Archived => b"axial.legacy.content.archived.completion.v1\0".as_slice(),
+    });
     hash.update((source_id.len() as u64).to_be_bytes());
     hash.update(source_id.as_bytes());
     hash.update((ids.len() as u64).to_be_bytes());
@@ -660,13 +732,76 @@ fn completion_hash(source_id: &str, ids: &[String]) -> Sha256 {
 /// The metadata owner resolves this exact snapshot from a completed receipt in
 /// the same metadata read. Each page verifies at most 128 rows / 8 MiB;
 /// unrelated records imported later neither join nor invalidate the snapshot.
-pub(crate) fn read_global_in(
+pub(crate) fn read_completed_in(
     db: &Connection,
     source_id: &str,
-    proof: &CompletionProof,
+    global: Option<&CompletionProof>,
+    archived: Option<&CompletionProof>,
     after: Option<&str>,
 ) -> Result<HistoryPage, HistoryError> {
-    proof.read_in(db, source_id, after)
+    validate_cursor(after)?;
+    if !lower_hex(source_id, 64)
+        || (global.is_none() && archived.is_none())
+        || global
+            .map_or(0, CompletionProof::count)
+            .saturating_add(archived.map_or(0, CompletionProof::count))
+            > MAX_BATCH_RECORDS
+    {
+        return Err(HistoryError::Conflict);
+    }
+    let mut remaining = MAX_BATCH_BYTES;
+    let mut ids = BTreeSet::new();
+    let mut sequences = BTreeSet::new();
+    let mut records = BTreeMap::new();
+    for (proof, scope) in [
+        (global, CompletionScope::Global),
+        (archived, CompletionScope::Archived),
+    ] {
+        let Some(proof) = proof else { continue };
+        proof.validate(source_id)?;
+        let mut digest = completion_hash(source_id, &proof.ids, scope);
+        for id in &proof.ids {
+            if !ids.insert(id) {
+                return Err(HistoryError::Conflict);
+            }
+            let (source, instance, bytes) = stored_row(db, id, MAX_RECORD_BYTES.min(remaining))?
+                .ok_or(HistoryError::Conflict)?;
+            let bytes = bytes.ok_or(HistoryError::Conflict)?;
+            remaining -= bytes.len();
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(&bytes);
+            let saved = decode_stored(id, &source, instance.as_deref(), Some(bytes))?;
+            if source != source_id
+                || !scope.matches(&saved.operation, saved.instance_id.as_deref())
+                || !sequences.insert(saved.operation.0.source.sequence)
+            {
+                return Err(HistoryError::Conflict);
+            }
+            if id.as_str() > after.unwrap_or("") {
+                records.insert(id.clone(), saved.project());
+                if records.len() > PAGE_SIZE + 1 {
+                    records.pop_last();
+                }
+            }
+        }
+        if hex::encode(digest.finalize()) != proof.digest {
+            return Err(HistoryError::Conflict);
+        }
+    }
+    let has_more = records.len() > PAGE_SIZE;
+    if has_more {
+        records.pop_last();
+    }
+    Ok(HistoryPage {
+        next_after: has_more.then(|| {
+            records
+                .last_key_value()
+                .expect("full history page")
+                .0
+                .clone()
+        }),
+        records: records.into_values().collect(),
+    })
 }
 
 /// The instance owner supplies its completed import mapping in this same read
@@ -690,8 +825,10 @@ pub(crate) fn read_in(
            SELECT id FROM (SELECT id FROM install_history
              WHERE source_id=?1 AND instance_id=?2 AND id>?3 ORDER BY id LIMIT 33)
          )
-         SELECT h.id,h.source_id,h.instance_id,
-           CASE WHEN length(h.payload)<=262144 THEN h.payload END
+         SELECT CASE WHEN length(CAST(h.id AS BLOB))=79 THEN h.id END,
+           CASE WHEN length(CAST(h.source_id AS BLOB))=64 THEN h.source_id END,
+           CASE WHEN length(CAST(h.instance_id AS BLOB))<=36 THEN h.instance_id END,
+           CASE WHEN length(CAST(h.payload AS BLOB))<=262144 THEN h.payload END
          FROM (SELECT id FROM candidates ORDER BY id LIMIT 33) page
          JOIN install_history h ON h.id=page.id ORDER BY page.id",
     )?;
@@ -715,7 +852,10 @@ pub(crate) fn read_in(
                 .operation
                 .legacy_instance_id()
                 .is_some_and(|id| id != legacy_id)
-            || saved.instance_id.as_ref().is_some_and(|id| id != instance)
+            || saved
+                .instance_id
+                .as_deref()
+                .is_some_and(|id| id != instance.as_str())
         {
             return Err(HistoryError::Conflict);
         }
@@ -735,7 +875,7 @@ impl ReadRecord {
             id: value.id.clone(),
             historical: true,
             source_id: value.source_id.clone(),
-            instance_id: self.instance_id.as_ref().map(|id| id.as_str().to_owned()),
+            instance_id: self.instance_id.clone(),
             journal_id: source.journal_id.clone(),
             operation_id: source.operation_id.clone(),
             sequence: source.sequence.to_string(),
@@ -1636,6 +1776,20 @@ mod tests {
             .collect()
     }
 
+    fn archived_content_records(count: u64) -> Vec<PreparedOperation> {
+        let original = source_records().remove(2);
+        (1..=count)
+            .map(|number| {
+                let mut source = original.clone();
+                source.operation_id = format!("op-20000000-0000-4000-8000-{number:012x}");
+                source.journal_id = format!("journal-{}", source.operation_id);
+                source.sequence = 1000 + number;
+                source.targets[0].id = format!("content-{number:032x}");
+                PreparedOperation::prepare(SOURCE, source).unwrap()
+            })
+            .collect()
+    }
+
     fn fixture() -> (MetadataStore, InstanceId, String, Vec<PreparedOperation>) {
         let store = MetadataStore::in_memory().unwrap();
         store.migrate(&[MIGRATION]).unwrap();
@@ -1660,6 +1814,664 @@ mod tests {
                     .map_err(StorageError::from)
             })
             .unwrap()
+    }
+
+    fn padded_snapshot(
+        store: &MetadataStore,
+        batch: &PreparedImport,
+        scope: CompletionScope,
+    ) -> CompletionProof {
+        store
+            .transaction(|tx| -> Result<(), StorageError> {
+                for record in &batch.0 {
+                    let mut bytes = record.bytes.clone();
+                    bytes.resize(MAX_RECORD_BYTES, b' ');
+                    tx.execute(
+                        "UPDATE install_history SET payload=?1 WHERE id=?2",
+                        params![bytes, record.operation.0.id],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut proof = batch.proof(SOURCE, scope).unwrap();
+        let mut digest = completion_hash(SOURCE, &proof.ids, scope);
+        for id in &proof.ids {
+            let (_, _, bytes) = store
+                .read(|db| stored_row(db, id, MAX_RECORD_BYTES))
+                .unwrap()
+                .unwrap();
+            let bytes = bytes.unwrap();
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(&bytes);
+        }
+        proof.digest = hex::encode(digest.finalize());
+        proof
+    }
+
+    #[test]
+    fn archived_content_history_readback_preserves_supported_terminal_records() {
+        let mut succeeded = source_records().remove(2);
+        succeeded.sequence = u64::MAX - 1;
+        let SourceMetrics::ContentDownload(metrics) = succeeded
+            .completed_steps
+            .last_mut()
+            .unwrap()
+            .metrics
+            .as_mut()
+            .unwrap();
+        metrics.written_to_temp = u64::MAX;
+        metrics.promoted = u64::MAX;
+        for source in [succeeded, cancelled_initialization()] {
+            let operation = PreparedOperation::prepare(SOURCE, source.clone()).unwrap();
+            let instance = format!(
+                "archived-{SOURCE}-{}",
+                operation.legacy_instance_id().unwrap()
+            );
+            assert_eq!(instance.len(), 90);
+            assert!(instance.parse::<InstanceId>().is_err());
+            let bytes = serde_json::to_vec(&json!({
+                "schema": 1,
+                "id": operation.0.id,
+                "source_id": SOURCE,
+                "instance_id": instance,
+                "source": source,
+            }))
+            .unwrap();
+            let record = decode_stored(&operation.0.id, SOURCE, Some(&instance), Some(bytes))
+                .expect("supported archived content history must decode")
+                .project();
+            assert_eq!(record.instance_id.as_deref(), Some(instance.as_str()));
+            assert_eq!(record.operation_id, source.operation_id);
+            assert_eq!(record.journal_id, source.journal_id);
+            assert_eq!(record.sequence, source.sequence.to_string());
+            assert_eq!(record.command, "ModifyInstanceContent");
+            assert_eq!(record.outcome, source.outcome.unwrap());
+            assert_eq!(record.failure_point, source.failure_point);
+            assert_eq!(
+                serde_json::to_value(&record.targets).unwrap(),
+                serde_json::to_value(&source.targets).unwrap()
+            );
+            let wire = serde_json::to_value(&record).unwrap();
+            for field in ["accepted_at", "created_at", "allowed_actions", "status"] {
+                assert!(wire.get(field).is_none(), "{field}");
+            }
+            let terminal = wire["completed_steps"].as_array().unwrap().last().unwrap();
+            if record.outcome == "Succeeded" {
+                assert!(wire.get("failure_point").is_none());
+                assert_eq!(terminal["phase"], "Downloading");
+                assert_eq!(
+                    terminal["generated_facts"],
+                    json!(["install_phase:done", "install_done:true"])
+                );
+                let counters = terminal["metrics"]["values"].as_object().unwrap();
+                assert_eq!(counters.len(), 13);
+                assert!(counters.values().all(Value::is_string));
+                assert_eq!(counters["written_to_temp"], u64::MAX.to_string());
+                assert_eq!(counters["promoted"], u64::MAX.to_string());
+            } else {
+                assert_eq!(wire["failure_point"], "content_initialization_cancelled");
+                assert_eq!(record.completed_steps.len(), 1);
+                assert_eq!(terminal["step_id"], "content_progress_initializing");
+                assert_eq!(terminal["phase"], "Failed");
+                assert!(terminal["metrics"].is_null());
+                assert!(terminal["changed_target"].is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn archived_content_history_binding_shares_exact_bytes_in_either_publication_order() {
+        for metadata_first in [false, true] {
+            let (store, instance, legacy, records) = fixture();
+            let archived =
+                PreparedImport::bind_archived(SOURCE, archived_content_records(2)).unwrap();
+            let proof = archived.archived_completion_proof(SOURCE).unwrap();
+            let mut combined = PreparedImport::bind(records, &legacy, &instance).unwrap();
+            combined.append(&archived).unwrap();
+            assert!(Arc::ptr_eq(&combined.0[3], &archived.0[0]));
+            assert!(Arc::ptr_eq(&combined.0[4], &archived.0[1]));
+            for batch in if metadata_first {
+                [&archived, &combined]
+            } else {
+                [&combined, &archived]
+            } {
+                store.transaction(|tx| batch.insert_in(tx)).unwrap();
+            }
+            store.read(|db| combined.verify_in(db)).unwrap();
+            store
+                .read(|db| read_completed_in(db, SOURCE, None, Some(&proof), None))
+                .unwrap();
+            assert_eq!(count(&store), 5);
+            let live = read(&store, &legacy, &instance, None).unwrap();
+            assert_eq!(live.records.len(), 3);
+            assert!(live.records.iter().all(|record| {
+                record
+                    .instance_id
+                    .as_deref()
+                    .is_none_or(|id| id == instance.as_str())
+            }));
+            let page = store
+                .read(|db| read_completed_in(db, SOURCE, None, Some(&proof), None))
+                .unwrap();
+            assert_eq!(page.records.len(), 2);
+            assert!(page.records.iter().all(|record| {
+                record.instance_id.as_deref()
+                    == Some(format!("archived-{SOURCE}-{legacy}").as_str())
+            }));
+            for record in &archived.0 {
+                let stored = store
+                    .read(|db| stored_row(db, &record.operation.0.id, MAX_RECORD_BYTES))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored.2.as_deref(), Some(record.bytes.as_slice()));
+                assert_eq!(record.bytes.len(), record.operation.0.stored_bytes + 54);
+            }
+        }
+    }
+
+    #[test]
+    fn archived_content_history_rejects_scope_source_identity_and_duplicate_conflicts() {
+        let (store, instance, legacy, records) = fixture();
+        let archived_records = archived_content_records(2);
+        assert!(PreparedImport::bind_archived("invalid", vec![]).is_err());
+        assert!(PreparedImport::bind_archived(OTHER_SOURCE, archived_records.clone()).is_err());
+        assert!(PreparedImport::bind_archived(SOURCE, global_records(1)).is_err());
+        assert!(
+            PreparedImport::bind_archived(SOURCE, vec![archived_records[0].clone(); 2]).is_err()
+        );
+        assert!(PreparedImport::bind_archived(SOURCE, archived_content_records(129)).is_err());
+        let archived = PreparedImport::bind_archived(SOURCE, archived_records.clone()).unwrap();
+        assert!(archived.completion_proof(SOURCE).is_err());
+        assert!(archived.archived_completion_proof(OTHER_SOURCE).is_err());
+        let live = PreparedImport::bind(records, &legacy, &instance).unwrap();
+        assert!(live.archived_completion_proof(SOURCE).is_err());
+        let mut duplicate = PreparedImport::bind_archived(SOURCE, archived_records).unwrap();
+        assert!(duplicate.append(&archived).is_err());
+        assert_eq!(duplicate.0.len(), 2);
+
+        let global = PreparedImport::bind_global(vec![]).unwrap();
+        let old = global.completion_proof(SOURCE).unwrap();
+        let empty = PreparedImport::bind_archived(SOURCE, vec![]).unwrap();
+        let archive_proof = empty.archived_completion_proof(SOURCE).unwrap();
+        assert_eq!(archive_proof.count(), 0);
+        assert_ne!(old.digest, archive_proof.digest);
+        assert!(
+            store
+                .read(|db| read_completed_in(db, SOURCE, None, Some(&old), None))
+                .is_err()
+        );
+        assert!(
+            store
+                .read(|db| archive_proof.verify_in(db, SOURCE))
+                .is_err()
+        );
+        assert!(
+            store
+                .read(|db| read_completed_in(db, SOURCE, None, None, None))
+                .is_err()
+        );
+        let page = store
+            .read(|db| read_completed_in(db, SOURCE, Some(&old), Some(&archive_proof), None))
+            .unwrap();
+        assert!(page.records.is_empty());
+        assert!(page.next_after.is_none());
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            format!(
+                "{{\"source_id\":\"{SOURCE}\",\"ids\":[],\"digest\":\"7cf39a7e06414d5ce13f50e49836d6051d05720096e709581d7302f681c3c81b\"}}"
+            )
+        );
+
+        let full = archived_content_records(64);
+        let mut combined = PreparedImport::bind_global(global_records(64)).unwrap();
+        let first = PreparedImport::bind_archived(SOURCE, full).unwrap();
+        PreparedImport::validate_with_archived(&global_records(64), &first).unwrap();
+        combined.append(&first).unwrap();
+        let extra = PreparedImport::bind_archived(
+            SOURCE,
+            vec![archived_content_records(65).pop().unwrap()],
+        )
+        .unwrap();
+        assert!(combined.append(&extra).is_err());
+        assert_eq!(combined.0.len(), 128);
+        assert!(PreparedImport::validate_with_archived(&global_records(65), &first).is_err());
+        let conflicting = PreparedImport::bind_global(vec![
+            PreparedOperation::prepare(SOURCE, {
+                let mut source = source_records().remove(0);
+                source.sequence = 1001;
+                source
+            })
+            .unwrap(),
+        ])
+        .unwrap();
+        assert!(duplicate.append(&conflicting).is_err());
+        assert_eq!(duplicate.0.len(), 2);
+    }
+
+    #[test]
+    fn archived_content_history_combined_receipt_is_immutable_paginated_and_source_free() {
+        let root =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let path = root.path().join("history.sqlite");
+        let store = MetadataStore::open(&path).unwrap();
+        store.migrate(&[MIGRATION]).unwrap();
+        let global = PreparedImport::bind_global(global_records(20)).unwrap();
+        let archived = PreparedImport::bind_archived(SOURCE, archived_content_records(20)).unwrap();
+        let global_proof = global.completion_proof(SOURCE).unwrap();
+        let archive_proof = archived.archived_completion_proof(SOURCE).unwrap();
+        let encoded = serde_json::to_vec(&(global_proof.clone(), archive_proof.clone())).unwrap();
+        store
+            .transaction(|tx| {
+                global.insert_in(tx)?;
+                archived.insert_in(tx)
+            })
+            .unwrap();
+        let first = store
+            .read(|db| {
+                read_completed_in(db, SOURCE, Some(&global_proof), Some(&archive_proof), None)
+            })
+            .unwrap();
+        assert_eq!(first.records.len(), 32);
+        assert!(first.next_after.is_some());
+        let later = PreparedImport::bind_archived(
+            SOURCE,
+            vec![archived_content_records(21).pop().unwrap()],
+        )
+        .unwrap();
+        store.transaction(|tx| later.insert_in(tx)).unwrap();
+        drop(store);
+        let store = MetadataStore::open(&path).unwrap();
+        store.migrate(&[MIGRATION]).unwrap();
+        let (global_proof, archive_proof): (CompletionProof, CompletionProof) =
+            serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            first,
+            store
+                .read(|db| read_completed_in(
+                    db,
+                    SOURCE,
+                    Some(&global_proof),
+                    Some(&archive_proof),
+                    None
+                ))
+                .unwrap()
+        );
+        let last = store
+            .read(|db| {
+                read_completed_in(
+                    db,
+                    SOURCE,
+                    Some(&global_proof),
+                    Some(&archive_proof),
+                    first.next_after.as_deref(),
+                )
+            })
+            .unwrap();
+        assert_eq!(last.records.len(), 8);
+        assert!(last.next_after.is_none());
+        let actual: Vec<_> = first
+            .records
+            .iter()
+            .chain(&last.records)
+            .map(|record| record.id.clone())
+            .collect();
+        let mut expected = global_proof.ids.clone();
+        expected.extend(archive_proof.ids.iter().cloned());
+        expected.sort();
+        assert_eq!(actual, expected);
+        assert_eq!(count(&store), 41);
+        let tail = actual.last().unwrap();
+        store
+            .transaction(|tx| -> Result<(), StorageError> {
+                tx.execute("DELETE FROM install_history WHERE id=?1", [tail])?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .read(|db| read_completed_in(
+                    db,
+                    SOURCE,
+                    Some(&global_proof),
+                    Some(&archive_proof),
+                    None
+                ))
+                .is_err()
+        );
+        assert_eq!(count(&store), 40);
+    }
+
+    #[test]
+    fn archived_content_history_replay_requires_original_encoded_tuple() {
+        #[derive(Serialize)]
+        struct PreviousStored<'a> {
+            schema: u8,
+            id: &'a str,
+            source_id: &'a str,
+            instance_id: Option<&'a InstanceId>,
+            source: &'a SourceOperation,
+        }
+        let (store, instance, legacy, records) = fixture();
+        let batch = PreparedImport::bind(records, &legacy, &instance).unwrap();
+        store.transaction(|tx| -> Result<(), StorageError> {
+            for record in &batch.0 {
+                let bytes = serde_json::to_vec(&PreviousStored {
+                    schema: 1, id: &record.operation.0.id, source_id: SOURCE,
+                    instance_id: record.instance_id.as_ref().map(|_| &instance),
+                    source: &record.operation.0.source,
+                }).unwrap();
+                assert_eq!(bytes, record.bytes);
+                tx.execute("INSERT INTO install_history(id,source_id,instance_id,payload) VALUES(?1,?2,?3,?4)", params![
+                    record.operation.0.id, SOURCE, record.instance_id, bytes,
+                ])?;
+            }
+            Ok(())
+        }).unwrap();
+        store.transaction(|tx| batch.insert_in(tx)).unwrap();
+        store.read(|db| batch.verify_in(db)).unwrap();
+        let archived = PreparedImport::bind_archived(SOURCE, archived_content_records(1)).unwrap();
+        store.transaction(|tx| archived.insert_in(tx)).unwrap();
+        for record in [&batch.0[0], &archived.0[0]] {
+            let mut changed = record.bytes.clone();
+            changed.push(b' ');
+            store
+                .transaction(|tx| -> Result<(), StorageError> {
+                    tx.execute(
+                        "UPDATE install_history SET payload=?1 WHERE id=?2",
+                        params![changed, record.operation.0.id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        for prepared in [&batch, &archived] {
+            assert!(matches!(
+                store.transaction(|tx| prepared.insert_in(tx)),
+                Err(HistoryError::Conflict)
+            ));
+            assert!(matches!(
+                store.read(|db| prepared.verify_in(db)),
+                Err(HistoryError::Conflict)
+            ));
+        }
+        assert_eq!(count(&store), 4);
+    }
+
+    #[test]
+    fn archived_content_history_combined_receipt_charges_actual_stored_bytes() {
+        let (store, _, _, _) = fixture();
+        let global = PreparedImport::bind_global(global_records(16)).unwrap();
+        let archived = PreparedImport::bind_archived(SOURCE, archived_content_records(16)).unwrap();
+        store
+            .transaction(|tx| {
+                global.insert_in(tx)?;
+                archived.insert_in(tx)
+            })
+            .unwrap();
+        let global_proof = padded_snapshot(&store, &global, CompletionScope::Global);
+        let archive_proof = padded_snapshot(&store, &archived, CompletionScope::Archived);
+        let page = store
+            .read(|db| {
+                read_completed_in(db, SOURCE, Some(&global_proof), Some(&archive_proof), None)
+            })
+            .unwrap();
+        assert_eq!(page.records.len(), 32);
+        assert!(page.next_after.is_none());
+        let extra = PreparedImport::bind_archived(
+            SOURCE,
+            vec![archived_content_records(17).pop().unwrap()],
+        )
+        .unwrap();
+        store.transaction(|tx| extra.insert_in(tx)).unwrap();
+        let mut expanded = archived.clone();
+        expanded.append(&extra).unwrap();
+        let expanded_proof = padded_snapshot(&store, &expanded, CompletionScope::Archived);
+        store.read(|db| global_proof.verify_in(db, SOURCE)).unwrap();
+        store
+            .read(|db| read_completed_in(db, SOURCE, None, Some(&expanded_proof), None))
+            .unwrap();
+        assert!(
+            store
+                .read(|db| read_completed_in(
+                    db,
+                    SOURCE,
+                    Some(&global_proof),
+                    Some(&expanded_proof),
+                    None
+                ))
+                .is_err()
+        );
+        assert!(
+            store
+                .read(|db| stored_row(db, &extra.0[0].operation.0.id, 0))
+                .unwrap()
+                .unwrap()
+                .2
+                .is_none()
+        );
+        assert_eq!(count(&store), 33);
+        assert_eq!(
+            page,
+            store
+                .read(|db| read_completed_in(
+                    db,
+                    SOURCE,
+                    Some(&global_proof),
+                    Some(&archive_proof),
+                    None
+                ))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn archived_content_history_combined_receipt_bounds_count_and_sequence_across_scopes() {
+        let (store, _, _, _) = fixture();
+        let global = PreparedImport::bind_global(global_records(64)).unwrap();
+        let archived = PreparedImport::bind_archived(SOURCE, archived_content_records(64)).unwrap();
+        store
+            .transaction(|tx| {
+                global.insert_in(tx)?;
+                archived.insert_in(tx)
+            })
+            .unwrap();
+        let global_proof = global.completion_proof(SOURCE).unwrap();
+        let archive_proof = archived.archived_completion_proof(SOURCE).unwrap();
+        store
+            .read(|db| {
+                read_completed_in(db, SOURCE, Some(&global_proof), Some(&archive_proof), None)
+            })
+            .unwrap();
+        let extra = PreparedImport::bind_archived(
+            SOURCE,
+            vec![archived_content_records(65).pop().unwrap()],
+        )
+        .unwrap();
+        store.transaction(|tx| extra.insert_in(tx)).unwrap();
+        let mut expanded = archived.clone();
+        expanded.append(&extra).unwrap();
+        let expanded_proof = expanded.archived_completion_proof(SOURCE).unwrap();
+        store
+            .read(|db| read_completed_in(db, SOURCE, None, Some(&expanded_proof), None))
+            .unwrap();
+        assert!(
+            store
+                .read(|db| read_completed_in(
+                    db,
+                    SOURCE,
+                    Some(&global_proof),
+                    Some(&expanded_proof),
+                    None
+                ))
+                .is_err()
+        );
+        assert_eq!(count(&store), 129);
+
+        let (store, _, _, _) = fixture();
+        let global = PreparedImport::bind_global(global_records(1)).unwrap();
+        let mut content = source_records().remove(2);
+        content.sequence = 1;
+        let archived = PreparedImport::bind_archived(SOURCE, prepare(vec![content])).unwrap();
+        store
+            .transaction(|tx| {
+                global.insert_in(tx)?;
+                archived.insert_in(tx)
+            })
+            .unwrap();
+        let global_proof = global.completion_proof(SOURCE).unwrap();
+        let archive_proof = archived.archived_completion_proof(SOURCE).unwrap();
+        store.read(|db| global_proof.verify_in(db, SOURCE)).unwrap();
+        store
+            .read(|db| read_completed_in(db, SOURCE, None, Some(&archive_proof), None))
+            .unwrap();
+        assert!(
+            store
+                .read(|db| read_completed_in(
+                    db,
+                    SOURCE,
+                    Some(&global_proof),
+                    Some(&archive_proof),
+                    None
+                ))
+                .is_err()
+        );
+        let mut duplicate = archive_proof;
+        duplicate.ids = global_proof.ids.clone();
+        assert!(
+            store
+                .read(|db| read_completed_in(
+                    db,
+                    SOURCE,
+                    Some(&global_proof),
+                    Some(&duplicate),
+                    None
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn archived_content_history_readback_rejects_wrong_binding_and_unbounded_index_bytes() {
+        for corruption in [
+            "archive_source",
+            "legacy",
+            "indexed_binding",
+            "source_bytes",
+            "binding_bytes",
+        ] {
+            let (store, _, _, _) = fixture();
+            let batch = PreparedImport::bind_archived(SOURCE, archived_content_records(1)).unwrap();
+            let proof = batch.archived_completion_proof(SOURCE).unwrap();
+            store.transaction(|tx| batch.insert_in(tx)).unwrap();
+            let record = &batch.0[0];
+            store
+                .transaction(|tx| -> Result<(), StorageError> {
+                    let mut payload: Value = serde_json::from_slice(&record.bytes).unwrap();
+                    match corruption {
+                        "source_bytes" => {
+                            tx.execute(
+                                "UPDATE install_history SET source_id=?1 WHERE id=?2",
+                                params!["é".repeat(64), record.operation.0.id],
+                            )?;
+                        }
+                        "binding_bytes" => {
+                            tx.execute(
+                                "UPDATE install_history SET instance_id=?1 WHERE id=?2",
+                                params!["é".repeat(46), record.operation.0.id],
+                            )?;
+                        }
+                        "indexed_binding" => {
+                            tx.execute(
+                                "UPDATE install_history SET instance_id=?1 WHERE id=?2",
+                                params![InstanceId::new().as_str(), record.operation.0.id],
+                            )?;
+                        }
+                        _ => {
+                            let instance = if corruption == "archive_source" {
+                                format!(
+                                    "archived-{OTHER_SOURCE}-{}",
+                                    record.operation.legacy_instance_id().unwrap()
+                                )
+                            } else {
+                                format!("archived-{SOURCE}-ffffffffffffffff")
+                            };
+                            payload["instance_id"] = json!(instance);
+                            tx.execute(
+                                "UPDATE install_history SET instance_id=?1,payload=?2 WHERE id=?3",
+                                params![
+                                    instance,
+                                    serde_json::to_vec(&payload).unwrap(),
+                                    record.operation.0.id
+                                ],
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    store.read(|db| read_completed_in(db, SOURCE, None, Some(&proof), None)),
+                    Err(HistoryError::Conflict)
+                ),
+                "{corruption}"
+            );
+            assert!(
+                matches!(
+                    store.read(|db| batch.verify_in(db)),
+                    Err(HistoryError::Conflict)
+                ),
+                "{corruption}"
+            );
+            assert!(
+                matches!(
+                    store.transaction(|tx| batch.insert_in(tx)),
+                    Err(HistoryError::Conflict)
+                ),
+                "{corruption}"
+            );
+            if matches!(corruption, "source_bytes" | "binding_bytes") {
+                assert!(
+                    matches!(
+                        store.read(|db| stored_row(db, &record.operation.0.id, MAX_RECORD_BYTES)),
+                        Err(HistoryError::Conflict)
+                    ),
+                    "{corruption}"
+                );
+            }
+            assert_eq!(count(&store), 1);
+        }
+    }
+
+    #[test]
+    fn archived_content_history_publication_rolls_back_ignored_or_byte_rewritten_rows() {
+        for rewrite in [false, true] {
+            let (store, _, _, _) = fixture();
+            let batch = PreparedImport::bind_archived(SOURCE, archived_content_records(2)).unwrap();
+            let first = &batch.0[0].operation.0.id;
+            let second = &batch.0[1].operation.0.id;
+            let trigger = if rewrite {
+                format!(
+                    "CREATE TRIGGER break_history AFTER INSERT ON install_history WHEN NEW.id='{second}' BEGIN UPDATE install_history SET payload=CAST(payload||' ' AS BLOB) WHERE id='{first}'; END;"
+                )
+            } else {
+                format!(
+                    "CREATE TRIGGER break_history BEFORE INSERT ON install_history WHEN NEW.id='{second}' BEGIN SELECT RAISE(IGNORE); END;"
+                )
+            };
+            store
+                .transaction(|tx| -> Result<(), StorageError> {
+                    tx.execute_batch(&trigger)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(matches!(
+                store.transaction(|tx| batch.insert_in(tx)),
+                Err(HistoryError::Conflict)
+            ));
+            assert_eq!(count(&store), 0);
+        }
     }
 
     #[test]
@@ -2729,7 +3541,7 @@ mod tests {
         store.transaction(|tx| batch.insert_in(tx)).unwrap();
         store.transaction(|tx| batch.insert_in(tx)).unwrap();
         let first = store
-            .read(|db| read_global_in(db, SOURCE, &proof, None))
+            .read(|db| read_completed_in(db, SOURCE, Some(&proof), None, None))
             .unwrap();
         assert_eq!(first.records.len(), PAGE_SIZE);
         assert!(
@@ -2763,11 +3575,13 @@ mod tests {
         assert_eq!(
             first,
             store
-                .read(|db| read_global_in(db, SOURCE, &proof, None))
+                .read(|db| read_completed_in(db, SOURCE, Some(&proof), None, None))
                 .unwrap()
         );
         let last = store
-            .read(|db| read_global_in(db, SOURCE, &proof, first.next_after.as_deref()))
+            .read(|db| {
+                read_completed_in(db, SOURCE, Some(&proof), None, first.next_after.as_deref())
+            })
             .unwrap();
         assert_eq!(last.records.len(), 3);
         assert!(last.next_after.is_none());
@@ -2780,12 +3594,12 @@ mod tests {
         assert_eq!(ids, proof.ids);
         assert!(
             store
-                .read(|db| read_global_in(db, SOURCE, &proof, Some("../invalid")))
+                .read(|db| read_completed_in(db, SOURCE, Some(&proof), None, Some("../invalid")))
                 .is_err()
         );
         assert!(
             store
-                .read(|db| read_global_in(db, OTHER_SOURCE, &proof, None))
+                .read(|db| read_completed_in(db, OTHER_SOURCE, Some(&proof), None, None))
                 .is_err()
         );
     }
@@ -2825,7 +3639,7 @@ mod tests {
             empty.completion_proof(OTHER_SOURCE).unwrap().digest
         );
         let page = store
-            .read(|db| read_global_in(db, SOURCE, &empty_proof, None))
+            .read(|db| read_completed_in(db, SOURCE, Some(&empty_proof), None, None))
             .unwrap();
         assert!(page.records.is_empty());
         assert!(page.next_after.is_none());
@@ -2920,7 +3734,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    store.read(|db| read_global_in(db, SOURCE, &proof, None)),
+                    store.read(|db| read_completed_in(db, SOURCE, Some(&proof), None, None)),
                     Err(HistoryError::Conflict)
                 ),
                 "{corruption}"

@@ -170,6 +170,10 @@ function metadataReceipt(value: unknown, expectedId: string): MetadataImportRece
     record.archived_performance_operation_count == null
       ? undefined
       : count(record.archived_performance_operation_count, 'Imported archived performance operation count');
+  const contentCount =
+    record.archived_content_operation_count == null
+      ? undefined
+      : count(record.archived_content_operation_count, 'Imported archived content operation count');
   if (
     total === 0 ||
     total > 256 ||
@@ -178,6 +182,7 @@ function metadataReceipt(value: unknown, expectedId: string): MetadataImportRece
     (reportCount !== undefined && reportCount > 1024) ||
     (benchmarkCount !== undefined && benchmarkCount > 1024) ||
     (operationCount !== undefined && operationCount > 128) ||
+    (contentCount !== undefined && contentCount > 128) ||
     (record.account_id_mapping === null && microsoftCount > 0)
   ) {
     throw new Error('The metadata import receipt was invalid.');
@@ -208,6 +213,7 @@ function metadataReceipt(value: unknown, expectedId: string): MetadataImportRece
     ...(reportCount === undefined ? {} : { archived_launch_report_count: reportCount }),
     ...(benchmarkCount === undefined ? {} : { archived_benchmark_count: benchmarkCount }),
     ...(operationCount === undefined ? {} : { archived_performance_operation_count: operationCount }),
+    ...(contentCount === undefined ? {} : { archived_content_operation_count: contentCount }),
   };
 }
 

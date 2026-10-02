@@ -60,6 +60,7 @@ pub(crate) struct PreparedHistory {
     archived_reports: Arc<PreparedReportImport>,
     archived_benchmarks: Arc<PreparedBenchmarkImport>,
     archived_operations: Arc<PreparedOperationImport>,
+    archived_content: Arc<PreparedInstallImport>,
     content: Vec<PreparedInstallOperation>,
     rules: Option<CompletedRulesImport>,
 }
@@ -128,20 +129,24 @@ impl PreparedHistory {
         operations
             .append(&self.archived_operations)
             .map_err(|_| ImportError::InvalidData)?;
+        let mut installs = PreparedInstallImport::bind(
+            self.global_installs
+                .iter()
+                .chain(&self.content)
+                .cloned()
+                .collect(),
+            &self.legacy_id,
+            instance,
+        )
+        .map_err(|_| ImportError::InvalidData)?;
+        installs
+            .append(&self.archived_content)
+            .map_err(|_| ImportError::InvalidData)?;
         Ok(BoundHistory {
             reports,
             benchmarks,
             operations,
-            installs: PreparedInstallImport::bind(
-                self.global_installs
-                    .iter()
-                    .chain(&self.content)
-                    .cloned()
-                    .collect(),
-                &self.legacy_id,
-                instance,
-            )
-            .map_err(|_| ImportError::InvalidData)?,
+            installs,
             rules: self.rules.clone(),
         })
     }
@@ -174,6 +179,10 @@ pub(super) fn prepare_history_with_rules(
         PreparedOperationImport::prepare_archived(&source, Vec::new())
             .map_err(|_| ImportError::InvalidData)?,
     );
+    let empty_content = Arc::new(
+        PreparedInstallImport::bind_archived(&source, Vec::new())
+            .map_err(|_| ImportError::InvalidData)?,
+    );
     let mut prepared = PreparedSourceHistory {
         instances: inventory
             .instances()
@@ -191,6 +200,7 @@ pub(super) fn prepare_history_with_rules(
                         archived_reports: Arc::clone(&empty_archived),
                         archived_benchmarks: Arc::clone(&empty_benchmarks),
                         archived_operations: Arc::clone(&empty_operations),
+                        archived_content: Arc::clone(&empty_content),
                         content: Vec::new(),
                         rules: rules.cloned(),
                     },
@@ -206,6 +216,7 @@ pub(super) fn prepare_history_with_rules(
     let mut bytes = 0usize;
     let mut global_installs = Vec::new();
     let mut archived_operations = Vec::new();
+    let mut archived_content = Vec::new();
     if inventory
         .file_manifests()
         .any(|file| file.relative == JOURNAL)
@@ -229,12 +240,13 @@ pub(super) fn prepare_history_with_rules(
                         "InstallVersion" | "ModifyInstanceContent" => {
                             let operation = entry.convert_install(&source)?;
                             if let Some(instance) = operation.legacy_instance_id() {
-                                prepared
-                                    .instances
-                                    .get_mut(instance)
-                                    .ok_or(ImportError::InvalidData)?
-                                    .content
-                                    .push(operation);
+                                if let Some(history) = prepared.instances.get_mut(instance) {
+                                    history.content.push(operation);
+                                } else if !source_instances.contains(instance) {
+                                    archived_content.push(operation);
+                                } else {
+                                    return Err(ImportError::InvalidData);
+                                }
                             } else {
                                 global_installs.push(operation);
                             }
@@ -260,7 +272,11 @@ pub(super) fn prepare_history_with_rules(
                 .insert(format!("{JOURNAL}#/entries/{index}"));
         }
     }
-    PreparedInstallImport::validate(
+    let archived_content = Arc::new(
+        PreparedInstallImport::bind_archived(&source, archived_content)
+            .map_err(|_| ImportError::InvalidData)?,
+    );
+    PreparedInstallImport::validate_with_archived(
         &global_installs
             .iter()
             .chain(
@@ -271,6 +287,7 @@ pub(super) fn prepare_history_with_rules(
             )
             .cloned()
             .collect::<Vec<_>>(),
+        &archived_content,
     )
     .map_err(|_| ImportError::InvalidData)?;
     let global_installs: Arc<[PreparedInstallOperation]> = global_installs.into();
@@ -281,6 +298,7 @@ pub(super) fn prepare_history_with_rules(
     for history in prepared.instances.values_mut() {
         history.global_installs = global_installs.clone();
         history.archived_operations = Arc::clone(&archived_operations);
+        history.archived_content = Arc::clone(&archived_content);
     }
     let mut reports = BTreeMap::new();
     let mut archived_reports = Vec::new();
@@ -895,6 +913,32 @@ pub(super) fn prepare_archived_operations(
         .map_err(|_| ImportError::InvalidData)
 }
 
+pub(super) fn prepare_archived_content_history(
+    inventory: &Inventory,
+) -> ImportResult<PreparedInstallImport> {
+    let instances = source_instance_ids(inventory)?;
+    let source = inventory.source_identity()?;
+    validate_journal_namespace(inventory)?;
+    let mut records = Vec::new();
+    if inventory
+        .file_manifests()
+        .any(|file| file.relative == JOURNAL)
+    {
+        for entry in decode_journal(&inventory.record_bytes(JOURNAL)?)? {
+            if entry.command == "ModifyInstanceContent" {
+                let operation = entry.convert_install(&source)?;
+                let instance = operation
+                    .legacy_instance_id()
+                    .ok_or(ImportError::InvalidData)?;
+                if !instances.contains(instance) {
+                    records.push(operation);
+                }
+            }
+        }
+    }
+    PreparedInstallImport::bind_archived(&source, records).map_err(|_| ImportError::InvalidData)
+}
+
 pub(super) fn prepare_rules_history(
     inventory: &Inventory,
 ) -> ImportResult<Vec<HistoricalRulesRefresh>> {
@@ -907,12 +951,9 @@ pub(super) fn prepare_rules_history(
     }
     let mut records = Vec::new();
     let mut installs = Vec::new();
+    let mut archived_content = Vec::new();
     let source = inventory.source_identity()?;
-    let instances: BTreeSet<_> = inventory
-        .instances()
-        .iter()
-        .map(|instance| instance.legacy_id.as_str())
-        .collect();
+    let instances = source_instance_ids(inventory)?;
     for entry in decode_journal(&inventory.record_bytes(JOURNAL)?)? {
         match &entry.intent {
             LegacyIntent::Generic {} => match entry.command.as_str() {
@@ -923,9 +964,10 @@ pub(super) fn prepare_rules_history(
                         .legacy_instance_id()
                         .is_some_and(|id| !instances.contains(id))
                     {
-                        return Err(ImportError::InvalidData);
+                        archived_content.push(operation);
+                    } else {
+                        installs.push(operation);
                     }
-                    installs.push(operation);
                 }
                 _ => return Err(ImportError::InvalidData),
             },
@@ -935,7 +977,10 @@ pub(super) fn prepare_rules_history(
             }
         }
     }
-    PreparedInstallImport::validate(&installs).map_err(|_| ImportError::InvalidData)?;
+    let archived_content = PreparedInstallImport::bind_archived(&source, archived_content)
+        .map_err(|_| ImportError::InvalidData)?;
+    PreparedInstallImport::validate_with_archived(&installs, &archived_content)
+        .map_err(|_| ImportError::InvalidData)?;
     records.sort_by_key(|record| record.sequence);
     Ok(records)
 }

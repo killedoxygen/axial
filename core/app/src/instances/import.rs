@@ -1218,6 +1218,7 @@ mod tests {
             "benchmark_suites",
             "benchmark_drivers",
             "performance_commands",
+            "install_history",
         ]
         .into_iter()
         .flat_map(|table| ["initial", "ready", "published"].map(|phase| (table, phase)))
@@ -1229,6 +1230,17 @@ mod tests {
                 entry["targets"][0]["id"] = serde_json::json!("0000000000000002");
                 entry["intent"]["intent"]["instance_id"] = serde_json::json!("0000000000000002");
             }
+            let mut content = crate::import::tests::cancelled_content_initialization_journal();
+            for target in content["entries"][0]["targets"].as_array_mut().unwrap() {
+                if target["kind"] == "Instance" {
+                    target["id"] = serde_json::json!("0000000000000002");
+                }
+            }
+            journal["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(content["entries"][0].clone());
+            journal["next_sequence"] = content["next_sequence"].clone();
             let journal_path = source.baseline.join("state/operation-journals.json");
             std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
             std::fs::write(journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
@@ -1274,6 +1286,20 @@ mod tests {
                     .unwrap()
             };
             assert_eq!(operation_count(), 0);
+            let install_count = || {
+                service
+                    .registry()
+                    .storage()
+                    .read(|db| -> Result<usize, crate::storage::StorageError> {
+                        Ok(
+                            db.query_row("SELECT count(*) FROM install_history", [], |row| {
+                                row.get(0)
+                            })?,
+                        )
+                    })
+                    .unwrap()
+            };
+            assert_eq!(install_count(), 0);
             service
                 .registry()
                 .storage()
@@ -1292,6 +1318,7 @@ mod tests {
             assert_eq!(recovered.id, id);
             assert_eq!(reports(root.path()).len(), 1);
             assert_eq!(operation_count(), 6);
+            assert_eq!(install_count(), 1);
             assert_benchmark_history(
                 &benchmark_history(root.path()),
                 &id,

@@ -62,6 +62,7 @@ fn stores(path: &Path) -> (SettingsStore, AccountDirectory) {
             METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
             METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
             METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_CONTENT_MIGRATION,
             install_history::MIGRATION,
             crate::launch::reports::REPORT_MIGRATION,
             crate::performance::benchmarks::MIGRATION,
@@ -106,6 +107,493 @@ fn global_journal(source: &Fixture, change: impl FnOnce(&mut Value)) {
     let path = source.baseline.join("state/operation-journals.json");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+}
+
+fn archived_content_journal(source: &Fixture, change: impl FnOnce(&mut Value)) {
+    let mut journal = crate::import::tests::successful_install_journal();
+    let cancelled = crate::import::tests::cancelled_content_initialization_journal();
+    journal["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(cancelled["entries"][0].clone());
+    journal["next_sequence"] = cancelled["next_sequence"].clone();
+    for entry in journal["entries"].as_array_mut().unwrap() {
+        for target in entry["targets"].as_array_mut().unwrap() {
+            if target["kind"] == "Instance" {
+                target["id"] = json!("0000000000000002");
+            }
+        }
+    }
+    change(&mut journal);
+    let path = source.baseline.join("state/operation-journals.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+}
+
+#[test]
+fn archived_content_metadata_preserves_missing_target_evidence_and_reopen() {
+    let source = Fixture::new();
+    archived_content_journal(&source, |_| {});
+    let before = snapshot(&source.baseline);
+    let (prepared, request) = prepare(&source);
+    let destination = Destination::new();
+    let receipt = destination
+        .commit(&prepared, &request)
+        .unwrap()
+        .response
+        .receipt;
+    assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
+    assert_eq!(destination.settings.current().unwrap().revision, 1);
+    assert_eq!(receipt.global_install_history_count, Some(2));
+    assert_eq!(
+        serde_json::to_value(&receipt).unwrap()["archived_content_operation_count"],
+        2
+    );
+    let page =
+        metadata_install_history(&destination.settings, &request.metadata_import_id, None).unwrap();
+    assert_eq!(page.records.len(), 4);
+    assert!(page.next_after.is_none());
+    let archived = format!("archived-{}-0000000000000002", prepared.source_id);
+    for record in &page.records {
+        assert!(record.historical);
+        if record.command == "ModifyInstanceContent" {
+            assert_eq!(record.instance_id.as_deref(), Some(archived.as_str()));
+            assert_eq!(
+                record
+                    .targets
+                    .iter()
+                    .find(|target| target.kind == "Instance")
+                    .unwrap()
+                    .id,
+                "0000000000000002"
+            );
+        } else {
+            assert!(record.instance_id.is_none());
+        }
+    }
+    assert_eq!(
+        page.records
+            .iter()
+            .filter(|record| record.command == "ModifyInstanceContent")
+            .count(),
+        2
+    );
+    assert!(page.records.iter().any(|record| {
+        record.outcome == "Failed"
+            && record.failure_point.as_deref() == Some("content_initialization_cancelled")
+    }));
+    assert_eq!(
+        destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt,
+        receipt
+    );
+    let (reopened, _) = stores(&destination._root.path().join("metadata.sqlite"));
+    assert_eq!(
+        metadata_status(&reopened, &request.metadata_import_id)
+            .unwrap()
+            .receipt,
+        Some(receipt)
+    );
+    assert_eq!(
+        metadata_install_history(&reopened, &request.metadata_import_id, None).unwrap(),
+        page
+    );
+    assert_eq!(snapshot(&source.baseline), before);
+}
+
+#[test]
+fn archived_content_old_receipt_completion_preserves_later_edits() {
+    let source = Fixture::new();
+    archived_content_journal(&source, |_| {});
+    let (prepared, request) = prepare(&source);
+    let destination = Destination::new();
+    let mut old = prepared.clone();
+    old.archived_content = None;
+    let mut receipt = destination.commit(&old, &request).unwrap().response.receipt;
+    assert_eq!(receipt.archived_content_operation_count, None);
+    assert_eq!(receipt.global_install_history_count, Some(2));
+    let original_rows = content_rows(&destination);
+    assert_eq!(original_rows.len(), 2);
+    destination.accounts.select(SECOND).unwrap();
+    let accounts = destination.accounts.snapshot().unwrap();
+    let config = destination
+        .settings
+        .update(ConfigPatch {
+            expected_revision: 1,
+            theme: Some(ConfigTheme::Birch),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    let changes = destination.settings.subscribe().unwrap();
+    receipt.archived_content_operation_count = Some(2);
+    let completed = destination.commit(&prepared, &request).unwrap();
+    assert!(completed.response.already_imported);
+    assert_eq!(completed.response.receipt, receipt);
+    assert_eq!(completed.settings.config, config);
+    assert_eq!(destination.accounts.snapshot().unwrap(), accounts);
+    assert!(!changes.has_changed().unwrap());
+    let rows = content_rows(&destination);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.1.is_none())
+            .cloned()
+            .collect::<Vec<_>>(),
+        original_rows
+    );
+    destination.commit(&prepared, &request).unwrap();
+    let (reopened, _) = stores(&destination._root.path().join("metadata.sqlite"));
+    assert_eq!(
+        metadata_status(&reopened, &request.metadata_import_id)
+            .unwrap()
+            .receipt,
+        Some(receipt)
+    );
+    assert_eq!(content_rows(&destination), rows);
+}
+
+#[test]
+fn archived_content_optional_refusal_does_not_claim_unsupported_history_empty() {
+    for case in [
+        "empty",
+        "live",
+        "failed",
+        "running",
+        "spoof",
+        "registry",
+        "directory",
+        "file_alias",
+    ] {
+        let source = Fixture::new();
+        archived_report(&source, |_| {});
+        if case != "empty" {
+            archived_content_journal(&source, |journal| match case {
+                "live" => {
+                    for entry in journal["entries"].as_array_mut().unwrap() {
+                        for target in entry["targets"].as_array_mut().unwrap() {
+                            if target["kind"] == "Instance" {
+                                target["id"] = json!("0000000000000001");
+                            }
+                        }
+                    }
+                }
+                "failed" => {
+                    journal["entries"][2]["status"] = json!("Failed");
+                    journal["entries"][2]["outcome"] = json!("Failed");
+                    journal["entries"][2]["failure_point"] = json!("install_progress_error");
+                }
+                "running" => {
+                    journal["entries"][2]["status"] = json!("Running");
+                    journal["entries"][2]["outcome"] = Value::Null;
+                }
+                "spoof" => journal["entries"][2]["intent"] = json!({"kind":"performance"}),
+                _ => {}
+            });
+        }
+        let path = source.baseline.join("state/operation-journals.json");
+        match case {
+            "registry" => {
+                let path = source.baseline.join("instances.json");
+                let mut registry: Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                registry["schema_version"] = json!(4);
+                fs::write(path, serde_json::to_vec(&registry).unwrap()).unwrap();
+            }
+            "directory" => {
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+            }
+            "file_alias" => {
+                let bytes = fs::read(&path).unwrap();
+                fs::remove_file(&path).unwrap();
+                fs::write(source.baseline.join("state/Operation-journals.json"), bytes).unwrap();
+            }
+            _ => {}
+        }
+        let before = snapshot(&source.baseline);
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        let receipt = destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt;
+        assert_eq!(
+            receipt.archived_content_operation_count,
+            matches!(case, "empty" | "live").then_some(0),
+            "{case}"
+        );
+        assert_eq!(
+            receipt.global_install_history_count,
+            match case {
+                "empty" => Some(0),
+                "spoof" | "directory" | "file_alias" => None,
+                _ => Some(2),
+            },
+            "{case}"
+        );
+        assert_eq!(
+            receipt.archived_launch_report_count,
+            (case != "registry").then_some(1),
+            "{case}"
+        );
+        assert!(content_rows(&destination).iter().all(|row| row.1.is_none()));
+        assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
+        assert_eq!(snapshot(&source.baseline), before);
+    }
+}
+
+fn content_rows(destination: &Destination) -> Vec<(String, Option<String>, Vec<u8>)> {
+    destination
+        .settings
+        .metadata()
+        .read(|db| -> Result<_, StorageError> {
+            Ok(db
+                .prepare("SELECT id,instance_id,payload FROM install_history ORDER BY id")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<_, _>>()?)
+        })
+        .unwrap()
+}
+
+#[test]
+fn archived_content_metadata_reader_uses_only_completed_receipt_scopes() {
+    let source = Fixture::new();
+    archived_content_journal(&source, |_| {});
+    let (prepared, request) = prepare(&source);
+    for (global, archived) in [(false, false), (true, false), (false, true)] {
+        let destination = Destination::new();
+        let mut selected = prepared.clone();
+        if !global {
+            selected.global_history = None;
+        }
+        if !archived {
+            selected.archived_content = None;
+        }
+        let receipt = destination
+            .commit(&selected, &request)
+            .unwrap()
+            .response
+            .receipt;
+        assert_eq!(receipt.global_install_history_count, global.then_some(2));
+        assert_eq!(
+            receipt.archived_content_operation_count,
+            archived.then_some(2)
+        );
+        let page =
+            metadata_install_history(&destination.settings, &request.metadata_import_id, None);
+        if !global && !archived {
+            assert!(page.is_err());
+        } else {
+            let page = page.unwrap();
+            assert_eq!(page.records.len(), 2);
+            assert!(
+                page.records
+                    .iter()
+                    .all(|record| record.instance_id.is_some() == archived)
+            );
+        }
+    }
+}
+
+#[test]
+fn archived_content_combined_budget_preserves_global_completion_and_metadata() {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let source = Fixture::new();
+    let template = crate::import::tests::successful_install_journal();
+    let entries: Vec<_> = (0..128)
+        .map(|index| {
+            let mut entry = template["entries"][if index % 2 == 0 { 0 } else { 2 }].clone();
+            let operation = format!("op-00000000-0000-4000-8000-{index:012x}");
+            entry["operation_id"] = json!(operation);
+            entry["journal_id"] = json!(format!("journal-{operation}"));
+            entry["sequence"] = json!(index + 1);
+            if index % 2 != 0 {
+                entry["targets"][1]["id"] = json!("0000000000000002");
+            }
+            entry
+        })
+        .collect();
+    let mut journal = json!({"schema":"axial.state.operation_journals.v10", "next_sequence":129, "entries":entries});
+    let mut raw_bytes = serde_json::to_vec(&journal).unwrap().len();
+    for entry in journal["entries"].as_array_mut().unwrap() {
+        let namespace = if entry["command"] == "InstallVersion" {
+            "install"
+        } else {
+            "content"
+        };
+        let steps = entry["completed_steps"].as_array_mut().unwrap();
+        while steps.len() < 256 {
+            let phase = format!("phase:{:042}", steps.len());
+            let step = json!({"step_id":format!("{namespace}_progress_{phase}"), "phase":"Running",
+                "result":"Completed", "changed_target":null, "generated_facts":[format!("install_phase:{phase}")],
+                "rollback":"NotApplicable", "guardian_fact_ids":[], "metrics":null});
+            let added = serde_json::to_vec(&step).unwrap().len() + 1;
+            if raw_bytes + added > LIMIT - 1024 {
+                break;
+            }
+            raw_bytes += added;
+            steps.insert(steps.len() - 1, step);
+        }
+    }
+    let raw = serde_json::to_vec(&journal).unwrap();
+    assert_eq!(raw.len(), raw_bytes);
+    assert!(raw.len() < LIMIT && raw.len() > LIMIT - 2048);
+    let path = source.baseline.join("state/operation-journals.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, raw).unwrap();
+    let inventory = source.capture();
+    let global = crate::import::history::prepare_global_install_history(&inventory).unwrap();
+    let archive = crate::import::history::prepare_archived_content_history(&inventory).unwrap();
+    assert_eq!(
+        global
+            .completion_proof(&inventory.source_identity().unwrap())
+            .unwrap()
+            .count(),
+        64
+    );
+    assert_eq!(
+        archive
+            .archived_completion_proof(&inventory.source_identity().unwrap())
+            .unwrap()
+            .count(),
+        64
+    );
+    let mut combined = global;
+    assert!(combined.append(&archive).is_err());
+    assert!(crate::import::history::prepare_history(&inventory).is_err());
+    assert!(crate::import::history::prepare_rules_history(&inventory).is_err());
+    drop(inventory);
+    let (prepared, request) = prepare(&source);
+    assert!(prepared.archived_content.is_none());
+    let destination = Destination::new();
+    let receipt = destination
+        .commit(&prepared, &request)
+        .unwrap()
+        .response
+        .receipt;
+    assert_eq!(receipt.global_install_history_count, Some(64));
+    assert_eq!(receipt.archived_content_operation_count, None);
+    assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
+    assert_eq!(destination.settings.current().unwrap().revision, 1);
+    assert_eq!(content_rows(&destination).len(), 64);
+}
+
+#[test]
+fn archived_content_publication_and_late_settings_write_are_atomic() {
+    for old in [false, true] {
+        for effect in [
+            "ignore_record",
+            "ignore_receipt",
+            "rewrite_record",
+            "late_settings",
+        ] {
+            if old && effect == "late_settings" {
+                continue;
+            }
+            let source = Fixture::new();
+            archived_content_journal(&source, |_| {});
+            let (prepared, request) = prepare(&source);
+            let destination = Destination::new();
+            if old {
+                let mut previous = prepared.clone();
+                previous.archived_content = None;
+                destination.commit(&previous, &request).unwrap();
+            }
+            let config = destination.settings.current().unwrap();
+            let accounts = destination.accounts.snapshot().unwrap();
+            let receipt = metadata_status(&destination.settings, &request.metadata_import_id)
+                .unwrap()
+                .receipt;
+            let rows = content_rows(&destination);
+            let action = if old {
+                "UPDATE OF archived_content_history_proof"
+            } else {
+                "INSERT"
+            };
+            let trigger = match effect {
+                "ignore_record" => "BEFORE INSERT ON install_history WHEN NEW.instance_id IS NOT NULL BEGIN SELECT RAISE(IGNORE); END;".to_owned(),
+                "ignore_receipt" => format!("BEFORE {action} ON profile_metadata_imports BEGIN SELECT RAISE(IGNORE); END;"),
+                "rewrite_record" => format!("AFTER {action} ON profile_metadata_imports BEGIN UPDATE install_history SET payload=CAST('{{}}' AS BLOB) WHERE instance_id IS NOT NULL; END;"),
+                _ => "AFTER UPDATE ON settings_config BEGIN UPDATE install_history SET instance_id=NULL WHERE instance_id IS NOT NULL; END;".to_owned(),
+            };
+            destination
+                .settings
+                .metadata()
+                .transaction(|tx| -> Result<(), StorageError> {
+                    tx.execute_batch(&format!("CREATE TRIGGER corrupt_content {trigger}"))?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                destination.commit(&prepared, &request).is_err(),
+                "{old}/{effect}"
+            );
+            assert_eq!(destination.settings.current().unwrap(), config);
+            assert_eq!(destination.accounts.snapshot().unwrap(), accounts);
+            assert_eq!(
+                metadata_status(&destination.settings, &request.metadata_import_id)
+                    .unwrap()
+                    .receipt,
+                receipt
+            );
+            assert_eq!(content_rows(&destination), rows);
+        }
+    }
+}
+
+#[test]
+fn archived_content_completed_receipt_rejects_corruption_without_repair() {
+    for corruption in [
+        "missing",
+        "payload",
+        "binding",
+        "proof",
+        "oversized",
+        "multibyte",
+    ] {
+        let source = Fixture::new();
+        archived_content_journal(&source, |_| {});
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        destination.commit(&prepared, &request).unwrap();
+        destination.settings.metadata().transaction(|tx| -> Result<(), StorageError> {
+            match corruption {
+                "missing" => { tx.execute("DELETE FROM install_history WHERE instance_id IS NOT NULL", [])?; }
+                "payload" => { tx.execute("UPDATE install_history SET payload=CAST('{}' AS BLOB) WHERE instance_id IS NOT NULL", [])?; }
+                "binding" => { tx.execute("UPDATE install_history SET instance_id=NULL WHERE instance_id IS NOT NULL", [])?; }
+                _ => {
+                    let proof = match corruption { "oversized" => " ".repeat(16*1024+1), "multibyte" => "é".repeat(9*1024), _ => "{}".to_owned() };
+                    if matches!(corruption, "oversized" | "multibyte") {
+                        assert!(tx.execute("UPDATE profile_metadata_imports SET archived_content_history_proof=?1", [&proof]).is_err());
+                        tx.execute_batch("PRAGMA ignore_check_constraints=ON")?;
+                    }
+                    tx.execute("UPDATE profile_metadata_imports SET archived_content_history_proof=?1", [&proof])?;
+                    tx.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
+                }
+            }
+            Ok(())
+        }).unwrap();
+        let rows = content_rows(&destination);
+        assert!(
+            metadata_status(&destination.settings, &request.metadata_import_id).is_err(),
+            "{corruption}"
+        );
+        assert!(
+            metadata_install_history(&destination.settings, &request.metadata_import_id, None)
+                .is_err(),
+            "{corruption}"
+        );
+        assert!(
+            destination.commit(&prepared, &request).is_err(),
+            "{corruption}"
+        );
+        assert_eq!(content_rows(&destination), rows);
+        assert_eq!(destination.settings.current().unwrap().revision, 1);
+    }
 }
 
 fn archived_performance_journal(source: &Fixture, change: impl FnOnce(&mut Value)) {
@@ -1397,12 +1885,6 @@ fn global_history_optional_conversion_preserves_metadata_without_claiming_comple
         let wire = serde_json::to_value(&receipt).unwrap();
         if corruption == "none" {
             assert_eq!(wire["global_install_history_count"], 0);
-            assert!(
-                metadata_install_history(&destination.settings, &request.metadata_import_id, None)
-                    .unwrap()
-                    .records
-                    .is_empty()
-            );
         } else {
             assert!(
                 !wire
@@ -1410,10 +1892,21 @@ fn global_history_optional_conversion_preserves_metadata_without_claiming_comple
                     .unwrap()
                     .contains_key("global_install_history_count")
             );
-            assert!(
-                metadata_install_history(&destination.settings, &request.metadata_import_id, None)
-                    .is_err()
-            );
+        }
+        let archive_is_observable = matches!(corruption, "none" | "unsupported" | "partial");
+        assert_eq!(
+            receipt.archived_content_operation_count,
+            archive_is_observable.then_some(0),
+            "{corruption}"
+        );
+        let history =
+            metadata_install_history(&destination.settings, &request.metadata_import_id, None);
+        if archive_is_observable {
+            let history = history.unwrap();
+            assert!(history.records.is_empty());
+            assert!(history.next_after.is_none());
+        } else {
+            assert!(history.is_err(), "{corruption}");
         }
         assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
         assert_eq!(snapshot(&source.baseline), before);
@@ -1431,12 +1924,14 @@ fn global_history_old_receipt_completion_preserves_later_edits_and_reopen() {
     // without global history. Exercise that real transaction with no batch.
     let mut metadata_only = prepared.clone();
     metadata_only.global_history = None;
+    metadata_only.archived_content = None;
     let original = destination
         .commit(&metadata_only, &request)
         .unwrap()
         .response
         .receipt;
     assert_eq!(original.global_install_history_count, None);
+    assert_eq!(original.archived_content_operation_count, None);
     assert!(
         metadata_install_history(&destination.settings, &request.metadata_import_id, None).is_err()
     );
@@ -1454,6 +1949,7 @@ fn global_history_old_receipt_completion_preserves_later_edits_and_reopen() {
     let completed = destination.commit(&prepared, &request).unwrap();
     let mut expected = original;
     expected.global_install_history_count = Some(2);
+    expected.archived_content_operation_count = Some(0);
     assert!(completed.response.already_imported);
     assert_eq!(completed.response.receipt, expected);
     assert_eq!(completed.settings.config, config);
@@ -2173,6 +2669,7 @@ fn v1_receipts_keep_historical_meaning_and_new_mapping_corruption_is_rejected() 
             METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
             METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
             METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_CONTENT_MIGRATION,
         ])
         .unwrap();
     let receipt = metadata_status(&old_settings, &old_id)

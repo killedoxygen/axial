@@ -92,6 +92,12 @@ pub const METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION: Migration = Migration {
         CHECK(archived_performance_operation_proof IS NULL OR length(CAST(archived_performance_operation_proof AS BLOB)) <= 16384);",
 };
 
+pub const METADATA_IMPORT_ARCHIVED_CONTENT_MIGRATION: Migration = Migration {
+    id: "profile_metadata_imports.v7",
+    sql: "ALTER TABLE profile_metadata_imports ADD COLUMN archived_content_history_proof TEXT
+        CHECK(archived_content_history_proof IS NULL OR length(CAST(archived_content_history_proof AS BLOB)) <= 16384);",
+};
+
 const MAX_MAPPING_BYTES: usize = 131072;
 
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +119,7 @@ pub struct PreparedMetadataImport {
     accounts: PreparedAccounts,
     settings: PreparedSettingsImport,
     global_history: Option<(Arc<PreparedInstallImport>, CompletionProof)>,
+    archived_content: Option<(Arc<PreparedInstallImport>, CompletionProof)>,
     archived_reports: Option<(Arc<PreparedReportImport>, ArchivedReportCompletionProof)>,
     archived_benchmarks: Option<(
         Arc<PreparedBenchmarkImport>,
@@ -161,6 +168,24 @@ impl Inventory {
             Err(ImportError::InvalidData | ImportError::LimitExceeded) => None,
             Err(error) => return Err(error),
         };
+        let archived_content = match super::history::prepare_archived_content_history(self) {
+            Ok(batch) => {
+                let combined_valid = global_history.as_ref().is_none_or(|(global, _)| {
+                    let mut combined = global.as_ref().clone();
+                    combined.append(&batch).is_ok()
+                });
+                if combined_valid {
+                    let proof = batch
+                        .archived_completion_proof(&source_id)
+                        .map_err(|_| ImportError::InvalidData)?;
+                    Some((Arc::new(batch), proof))
+                } else {
+                    None
+                }
+            }
+            Err(ImportError::InvalidData | ImportError::LimitExceeded) => None,
+            Err(error) => return Err(error),
+        };
         let (archived_reports, archived_benchmarks) =
             match super::history::prepare_archived_history(self) {
                 Ok(history) => {
@@ -200,6 +225,7 @@ impl Inventory {
             accounts,
             settings,
             global_history,
+            archived_content,
             archived_reports,
             archived_benchmarks,
             archived_operations,
@@ -276,6 +302,27 @@ impl PreparedMetadataImport {
                                 if cancel.is_cancelled() {
                                     return Err(SettingsError::Unavailable);
                                 }
+                            }
+                        }
+                    }
+                    if let Some((batch, proof)) = &self.archived_content {
+                        match &stored.archived_content {
+                            Some(existing) if existing != proof => return Err(SettingsError::Conflict),
+                            Some(_) => {}
+                            None => {
+                                if cancel.is_cancelled() { return Err(SettingsError::Unavailable); }
+                                batch.insert_in(transaction).map_err(history_error)?;
+                                if transaction.execute(
+                                    "UPDATE profile_metadata_imports SET archived_content_history_proof=?1
+                                     WHERE source_id=?2 AND fingerprint=?3 AND import_id=?4
+                                     AND archived_content_history_proof IS NULL",
+                                    params![encode_proof(proof)?, self.source_id, fingerprint, id],
+                                )? != 1 {
+                                    return Err(SettingsError::Conflict);
+                                }
+                                stored.archived_content = Some(proof.clone());
+                                stored.receipt.archived_content_operation_count = Some(proof.count());
+                                if cancel.is_cancelled() { return Err(SettingsError::Unavailable); }
                             }
                         }
                     }
@@ -358,6 +405,9 @@ impl PreparedMetadataImport {
                 if let Some((batch, _)) = &self.global_history {
                     batch.insert_in(transaction).map_err(history_error)?;
                 }
+                if let Some((batch, _)) = &self.archived_content {
+                    batch.insert_in(transaction).map_err(history_error)?;
+                }
                 if let Some((batch, _)) = &self.archived_reports {
                     batch.insert_in(transaction).map_err(report_error)?;
                 }
@@ -373,6 +423,7 @@ impl PreparedMetadataImport {
                     imported_microsoft_account_count: self.accounts.microsoft.len(),
                     account_id_mapping: Some(self.accounts.mapping.clone()),
                     global_install_history_count: self.global_history.as_ref().map(|(_, proof)| proof.count()),
+                    archived_content_operation_count: self.archived_content.as_ref().map(|(_, proof)| proof.count()),
                     archived_launch_report_count: self.archived_reports.as_ref().map(|(_, proof)| proof.count()),
                     archived_benchmark_count: self.archived_benchmarks.as_ref().map(|(_, proof)| proof.count()),
                     archived_performance_operation_count: self.archived_operations.as_ref().map(|(_, proof)| proof.count()),
@@ -381,7 +432,7 @@ impl PreparedMetadataImport {
                     account_selection_revision: snapshot.selection_revision,
                 };
                 if transaction.execute(
-                    "INSERT INTO profile_metadata_imports(source_id, fingerprint, import_id, account_count, settings_revision, selection_revision, microsoft_account_count, account_id_mapping, global_install_history_proof, archived_launch_report_proof, archived_benchmark_proof, archived_performance_operation_proof) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    "INSERT INTO profile_metadata_imports(source_id, fingerprint, import_id, account_count, settings_revision, selection_revision, microsoft_account_count, account_id_mapping, global_install_history_proof, archived_launch_report_proof, archived_benchmark_proof, archived_performance_operation_proof, archived_content_history_proof) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![self.source_id, self.inventory.fingerprint(), self.import_id,
                         self.accounts.mapping.len(), completed.settings_revision,
                         completed.account_selection_revision, completed.imported_microsoft_account_count,
@@ -389,7 +440,8 @@ impl PreparedMetadataImport {
                         self.global_history.as_ref().map(|(_, proof)| encode_proof(proof)).transpose()?,
                         self.archived_reports.as_ref().map(|(_, proof)| encode_archived_proof(proof)).transpose()?,
                         self.archived_benchmarks.as_ref().map(|(_, proof)| encode_benchmark_proof(proof)).transpose()?,
-                        self.archived_operations.as_ref().map(|(_, proof)| encode_operation_proof(proof)).transpose()?],
+                        self.archived_operations.as_ref().map(|(_, proof)| encode_operation_proof(proof)).transpose()?,
+                        self.archived_content.as_ref().map(|(_, proof)| encode_proof(proof)).transpose()?],
                 )? != 1 {
                     return Err(SettingsError::Conflict);
                 }
@@ -401,6 +453,7 @@ impl PreparedMetadataImport {
                     source_id: self.source_id.clone(),
                     fingerprint: self.inventory.fingerprint().to_owned(),
                     global_history: self.global_history.as_ref().map(|(_, proof)| proof.clone()),
+                    archived_content: self.archived_content.as_ref().map(|(_, proof)| proof.clone()),
                     archived_reports: self.archived_reports.as_ref().map(|(_, proof)| proof.clone()),
                     archived_benchmarks: self.archived_benchmarks.as_ref().map(|(_, proof)| proof.clone()),
                     archived_operations: self.archived_operations.as_ref().map(|(_, proof)| proof.clone()),
@@ -464,12 +517,17 @@ pub fn metadata_install_history(
     let page = settings.metadata().read(|connection| {
         let transaction = connection.unchecked_transaction()?;
         let stored = read_receipt(&transaction, id)?.ok_or(SettingsError::Unavailable)?;
-        let proof = stored
-            .global_history
-            .as_ref()
-            .ok_or(SettingsError::Unavailable)?;
-        let page = install_history::read_global_in(&transaction, &stored.source_id, proof, after)
-            .map_err(history_error)?;
+        if stored.global_history.is_none() && stored.archived_content.is_none() {
+            return Err(SettingsError::Unavailable);
+        }
+        let page = install_history::read_completed_in(
+            &transaction,
+            &stored.source_id,
+            stored.global_history.as_ref(),
+            stored.archived_content.as_ref(),
+            after,
+        )
+        .map_err(history_error)?;
         transaction.commit()?;
         Ok::<_, SettingsError>(page)
     })?;
@@ -482,6 +540,7 @@ struct StoredReceipt {
     source_id: String,
     fingerprint: String,
     global_history: Option<CompletionProof>,
+    archived_content: Option<CompletionProof>,
     archived_reports: Option<ArchivedReportCompletionProof>,
     archived_benchmarks: Option<ArchivedBenchmarkCompletionProof>,
     archived_operations: Option<ArchivedOperationCompletionProof>,
@@ -489,10 +548,15 @@ struct StoredReceipt {
 
 impl StoredReceipt {
     fn verify_history(&self, connection: &Connection) -> Result<(), SettingsError> {
-        if let Some(proof) = &self.global_history {
-            proof
-                .verify_in(connection, &self.source_id)
-                .map_err(history_error)?;
+        if self.global_history.is_some() || self.archived_content.is_some() {
+            install_history::read_completed_in(
+                connection,
+                &self.source_id,
+                self.global_history.as_ref(),
+                self.archived_content.as_ref(),
+                None,
+            )
+            .map_err(history_error)?;
         }
         if let Some(proof) = &self.archived_reports {
             proof
@@ -542,7 +606,9 @@ fn read_receipt(
             length(CAST(archived_benchmark_proof AS BLOB)),
             CASE WHEN length(CAST(archived_benchmark_proof AS BLOB)) <= ?5 THEN archived_benchmark_proof END,
             length(CAST(archived_performance_operation_proof AS BLOB)),
-            CASE WHEN length(CAST(archived_performance_operation_proof AS BLOB)) <= ?6 THEN archived_performance_operation_proof END
+            CASE WHEN length(CAST(archived_performance_operation_proof AS BLOB)) <= ?6 THEN archived_performance_operation_proof END,
+            length(CAST(archived_content_history_proof AS BLOB)),
+            CASE WHEN length(CAST(archived_content_history_proof AS BLOB)) <= ?3 THEN archived_content_history_proof END
          FROM profile_metadata_imports WHERE import_id = ?1",
             params![import_id, MAX_MAPPING_BYTES, MAX_COMPLETION_PROOF_BYTES, MAX_ARCHIVED_PROOF_BYTES, MAX_ARCHIVED_BENCHMARK_PROOF_BYTES, MAX_ARCHIVED_OPERATION_PROOF_BYTES],
             |row| {
@@ -563,6 +629,8 @@ fn read_receipt(
                     row.get::<_, Option<String>>(13)?,
                     row.get::<_, Option<usize>>(14)?,
                     row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<usize>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
                 ))
             },
         )
@@ -584,6 +652,8 @@ fn read_receipt(
         encoded_benchmarks,
         operation_length,
         encoded_operations,
+        content_length,
+        encoded_content,
     )) = row
     else {
         return Ok(None);
@@ -606,7 +676,8 @@ fn read_receipt(
     if (proof_length.is_some()
         || archived_length.is_some()
         || benchmark_length.is_some()
-        || operation_length.is_some())
+        || operation_length.is_some()
+        || content_length.is_some())
         && (!valid_identity(&source_id)
             || !valid_identity(&fingerprint)
             || self::import_id(&source_id, &fingerprint) != import_id)
@@ -614,6 +685,13 @@ fn read_receipt(
         return Err(SettingsError::Corrupt);
     }
     let global_history: Option<CompletionProof> = match (proof_length, encoded_proof) {
+        (None, None) => None,
+        (Some(length), Some(encoded)) if length <= MAX_COMPLETION_PROOF_BYTES => {
+            Some(serde_json::from_str(&encoded).map_err(|_| SettingsError::Corrupt)?)
+        }
+        _ => return Err(SettingsError::Corrupt),
+    };
+    let archived_content: Option<CompletionProof> = match (content_length, encoded_content) {
         (None, None) => None,
         (Some(length), Some(encoded)) if length <= MAX_COMPLETION_PROOF_BYTES => {
             Some(serde_json::from_str(&encoded).map_err(|_| SettingsError::Corrupt)?)
@@ -651,6 +729,7 @@ fn read_receipt(
             imported_microsoft_account_count: microsoft_count,
             account_id_mapping: mapping,
             global_install_history_count: global_history.as_ref().map(CompletionProof::count),
+            archived_content_operation_count: archived_content.as_ref().map(CompletionProof::count),
             archived_launch_report_count: archived_reports
                 .as_ref()
                 .map(ArchivedReportCompletionProof::count),
@@ -666,6 +745,7 @@ fn read_receipt(
         source_id,
         fingerprint,
         global_history,
+        archived_content,
         archived_reports,
         archived_benchmarks,
         archived_operations,

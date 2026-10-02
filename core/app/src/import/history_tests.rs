@@ -781,6 +781,153 @@ fn detached_driver_co_publication_is_identical_in_both_import_orders() {
 }
 
 #[test]
+fn archived_content_co_publication_preserves_exact_history_in_both_orders() {
+    for metadata_first in [false, true] {
+        let fixture = Fixture::new();
+        let mut journal = crate::import::tests::successful_install_journal();
+        journal["entries"].as_array_mut().unwrap().push(
+            crate::import::tests::cancelled_content_initialization_journal()["entries"][0].clone(),
+        );
+        journal["next_sequence"] = json!(15);
+        for entry in journal["entries"].as_array_mut().unwrap() {
+            for target in entry["targets"].as_array_mut().unwrap() {
+                if target["kind"] == "Instance" {
+                    target["id"] = json!(SECOND);
+                }
+            }
+        }
+        let path = fixture.baseline.join("state/operation-journals.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let before = crate::import::tests::snapshot(&fixture.baseline);
+        let inventory = fixture.capture();
+        let source = inventory.source_identity().unwrap();
+        let archive = prepare_archived_content_history(&inventory).unwrap();
+        let global = prepare_global_install_history(&inventory).unwrap();
+        let bound = prepare_history(&inventory)
+            .unwrap()
+            .for_instance(INSTANCE)
+            .unwrap()
+            .bind_instance(&InstanceId::new())
+            .unwrap();
+        assert!(inventory.preview().instances[0].ordinary_import_available);
+        let store = MetadataStore::in_memory().unwrap();
+        store
+            .migrate(&[crate::install::history::MIGRATION])
+            .unwrap();
+        let mut metadata = global.clone();
+        metadata.append(&archive).unwrap();
+        let batches = if metadata_first {
+            [&metadata, &bound.installs]
+        } else {
+            [&bound.installs, &metadata]
+        };
+        let mut original = None;
+        for batch in batches {
+            store.transaction(|tx| batch.insert_in(tx)).unwrap();
+            store.read(|db| batch.verify_in(db)).unwrap();
+            let saved = store
+                .read(
+                    |db| -> Result<
+                        Vec<(String, Option<String>, Vec<u8>)>,
+                        crate::storage::StorageError,
+                    > {
+                        Ok(db
+                            .prepare(
+                                "SELECT id,instance_id,payload FROM install_history ORDER BY id",
+                            )?
+                            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                            .collect::<Result<_, _>>()?)
+                    },
+                )
+                .unwrap();
+            if let Some(previous) = &original {
+                assert_eq!(&saved, previous);
+            } else {
+                original = Some(saved);
+            }
+        }
+        let proof = archive.archived_completion_proof(&source).unwrap();
+        assert_eq!(proof.count(), 2);
+        store
+            .read(|db| {
+                crate::install::history::read_completed_in(db, &source, None, Some(&proof), None)
+            })
+            .unwrap();
+        for (_, instance, bytes) in original.unwrap() {
+            let saved: Value = serde_json::from_slice(&bytes).unwrap();
+            let original = journal["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["operation_id"] == saved["source"]["operation_id"])
+                .unwrap();
+            assert_eq!(&saved["source"], original);
+            assert_eq!(
+                instance,
+                (original["command"] == "ModifyInstanceContent")
+                    .then(|| format!("archived-{source}-{SECOND}"))
+            );
+        }
+        assert_eq!(crate::import::tests::snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn archived_content_rules_projection_preserves_rules_and_refuses_unsettled_content() {
+    for case in [
+        "success",
+        "initialization_cancelled",
+        "generic_failed",
+        "running",
+    ] {
+        let fixture = Fixture::new();
+        let mut journal = crate::import::tests::terminal_rules_journal();
+        let mut entry = if case == "initialization_cancelled" {
+            crate::import::tests::cancelled_content_initialization_journal()["entries"][0].clone()
+        } else {
+            crate::import::tests::successful_install_journal()["entries"][2].clone()
+        };
+        entry["targets"][1]["id"] = json!(SECOND);
+        match case {
+            "generic_failed" => {
+                entry["status"] = json!("Failed");
+                entry["outcome"] = json!("Failed");
+                entry["failure_point"] = json!("install_progress_error");
+            }
+            "running" => {
+                entry["status"] = json!("Running");
+                entry["outcome"] = Value::Null;
+            }
+            _ => {}
+        }
+        journal["entries"].as_array_mut().unwrap().push(entry);
+        journal["next_sequence"] = json!(15);
+        let path = fixture.baseline.join("state/operation-journals.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let inventory = fixture.capture();
+        let rules = prepare_rules_history(&inventory);
+        let content = prepare_archived_content_history(&inventory);
+        if matches!(case, "success" | "initialization_cancelled") {
+            assert_eq!(rules.unwrap().len(), 4, "{case}");
+            assert_eq!(
+                content
+                    .unwrap()
+                    .archived_completion_proof(&inventory.source_identity().unwrap())
+                    .unwrap()
+                    .count(),
+                1
+            );
+        } else {
+            assert!(rules.is_err(), "{case}");
+            assert!(content.is_err(), "{case}");
+            assert!(prepare_history(&inventory).is_err(), "{case}");
+        }
+    }
+}
+
+#[test]
 fn archived_performance_co_publication_preserves_exact_operations_in_both_orders() {
     for metadata_first in [false, true] {
         let fixture = Fixture::new();
@@ -849,7 +996,7 @@ fn archived_performance_co_publication_preserves_exact_operations_in_both_orders
 
 #[test]
 fn archived_performance_does_not_waive_other_journal_families_or_unresolved_effects() {
-    for case in ["missing_content", "running_install", "unknown_command"] {
+    for case in ["failed_content", "running_install", "unknown_command"] {
         let fixture = Fixture::new();
         let mut journal = crate::import::tests::terminal_performance_journal();
         for entry in journal["entries"].as_array_mut().unwrap() {
@@ -857,9 +1004,14 @@ fn archived_performance_does_not_waive_other_journal_families_or_unresolved_effe
             entry["targets"][0]["id"] = json!(SECOND);
         }
         let other = crate::import::tests::successful_install_journal();
-        let mut entry = other["entries"][if case == "missing_content" { 2 } else { 0 }].clone();
+        let mut entry = other["entries"][if case == "failed_content" { 2 } else { 0 }].clone();
         match case {
-            "missing_content" => entry["targets"][1]["id"] = json!(SECOND),
+            "failed_content" => {
+                entry["targets"][1]["id"] = json!(SECOND);
+                entry["status"] = json!("Failed");
+                entry["outcome"] = json!("Failed");
+                entry["failure_point"] = json!("install_progress_error");
+            }
             "running_install" => entry["status"] = json!("Running"),
             _ => entry["command"] = json!("UnknownCommand"),
         }

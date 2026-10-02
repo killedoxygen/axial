@@ -199,8 +199,9 @@ impl MetadataStore {
         })
     }
 
-    /// Runs a query-only callback. Domain errors remain typed. This callback may
-    /// not manage transactions or change connection configuration itself.
+    /// Runs a query-only callback. Domain errors remain typed. A read-only
+    /// snapshot transaction must finish inside the callback; transactions may
+    /// not escape and connection configuration must not change.
     pub fn read<T, E>(&self, read: impl FnOnce(&Connection) -> Result<T, E>) -> Result<T, E>
     where
         E: From<StorageError>,
