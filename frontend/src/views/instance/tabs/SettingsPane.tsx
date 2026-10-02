@@ -7,7 +7,7 @@ import { OverrideChip, SettingRow, SettingsSection } from '../../../ui/SettingsS
 import { MemoryField, recommendedHeapRange } from '../../../ui/MemoryField';
 import { WindowField } from '../../../ui/WindowField';
 import { JavaPathField, JvmArgsInput } from '../../../ui/RuntimeFields';
-import { useAutoSave } from '../../../hooks/use-autosave';
+import { canAutoSave, useAutoSave } from '../../../hooks/use-autosave';
 import { jvmPresetSelectLabel, normalizeJvmPreset, useJvmPresets } from '../../../hooks/use-jvm-presets';
 import { api } from '../../../api';
 import { config, systemInfo } from '../../../store';
@@ -43,12 +43,14 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
     ? Math.max(1, Math.floor(systemInfo.value.total_memory_mb / 1024))
     : 32;
   const [recMin, recMax] = recommendedHeapRange(totalGb);
+  const flushArgs = useRef<() => void>(() => {});
 
   const { commit, saving } = useAutoSave<EnrichedInstance & { error?: string }>({
     send: (patch) => api('PUT', `/instances/${encodeURIComponent(inst.id)}`, patch).then(enrichedInstanceResponse),
     apply: (res) => updateInstanceInList(res),
     errorLabel: 'instance settings',
     target: `/instances/${inst.id}`,
+    flushPending: () => flushArgs.current(),
   });
 
   const [healthRefreshKey, setHealthRefreshKey] = useState(0);
@@ -83,7 +85,6 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
   const [jvmArgs, setJvmArgs] = useState(savedArgs);
   const argsTimer = useRef<number | null>(null);
   const pendingArgs = useRef<string | null>(null);
-  const flushArgs = useRef<() => void>(() => {});
 
   useEffect(() => {
     setMaxGb(savedMaxGb);
@@ -132,6 +133,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
   }, [inst.id, inst.performance_mode, globalMode, healthRefreshKey]);
 
   const commitArgs = (next: string): void => {
+    if (!canAutoSave()) return;
     pendingArgs.current = null;
     if (next === savedArgs) return;
     commit(
@@ -141,6 +143,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
   };
 
   const onArgsChange = (next: string): void => {
+    if (!canAutoSave()) return;
     setJvmArgs(next);
     pendingArgs.current = next;
     if (argsTimer.current !== null) window.clearTimeout(argsTimer.current);
@@ -151,18 +154,12 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
   };
 
   flushArgs.current = () => {
+    if (argsTimer.current !== null) {
+      window.clearTimeout(argsTimer.current);
+      argsTimer.current = null;
+    }
     if (pendingArgs.current !== null) commitArgs(pendingArgs.current);
   };
-
-  useEffect(() => {
-    return () => {
-      if (argsTimer.current !== null) {
-        window.clearTimeout(argsTimer.current);
-        argsTimer.current = null;
-      }
-      flushArgs.current();
-    };
-  }, [inst.id]);
 
   const modeOptions: Array<ChoicePillOption<InstancePerformanceMode>> = [
     {

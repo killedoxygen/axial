@@ -15,52 +15,96 @@ import type { NativePreferencesRequest } from '../../src/native';
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const ts: typeof import('typescript') = createRequire(resolve(frontend, 'package.json'))('typescript');
 const tick = (): Promise<void> => new Promise((done) => setImmediate(done));
-function signal<T>(value: T) { return { value }; }
+function signal<T>(value: T) {
+  return { value };
+}
 
 function source<T>(path: string, imports: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
   const filename = resolve(frontend, 'src', path);
   const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename, compilerOptions: {
-      target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS,
-      jsx: ts.JsxEmit.ReactJSX, jsxImportSource: 'preact',
+    fileName: filename,
+    compilerOptions: {
+      target: ts.ScriptTarget.ES2020,
+      module: ts.ModuleKind.CommonJS,
+      jsx: ts.JsxEmit.ReactJSX,
+      jsxImportSource: 'preact',
     },
   });
   const exports = {};
-  vm.runInNewContext(compiled.outputText, {
-    exports, Error, URLSearchParams,
-    require(id: string): unknown {
-      if (id === '@preact/signals') return { signal };
-      if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-      throw new Error(`Unreviewed preference dependency: ${id}`);
-    }, ...globals,
-  }, { filename });
+  vm.runInNewContext(
+    compiled.outputText,
+    {
+      exports,
+      Error,
+      URLSearchParams,
+      require(id: string): unknown {
+        if (id === '@preact/signals') return { signal };
+        if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
+        throw new Error(`Unreviewed preference dependency: ${id}`);
+      },
+      ...globals,
+    },
+    { filename },
+  );
   return exports as T;
 }
 
 function deferred<T>() {
   let resolveValue!: (value: T) => void;
   let reject!: (value: unknown) => void;
-  const promise = new Promise<T>((yes, no) => { resolveValue = yes; reject = no; });
+  const promise = new Promise<T>((yes, no) => {
+    resolveValue = yes;
+    reject = no;
+  });
   return { promise, resolve: resolveValue, reject };
 }
 
 function config(patch: Partial<Config> = {}): Config {
   return {
-    revision: 0, account_selection_revision: 0, username: 'Player', launch_auth_mode: 'offline',
-    max_memory_mb: 4096, min_memory_mb: 1024, java_path_override: '', window_width: 854, window_height: 480,
-    jvm_preset: '', performance_mode: 'vanilla', theme: '', custom_hue: null, custom_vibrancy: null, lightness: null,
-    onboarding_done: true, telemetry_enabled: false, discord_rpc_enabled: false, discord_rpc_onboarding_seen: false,
-    music_enabled: false, music_volume: 0.5, music_track: 0, ...patch,
+    revision: 0,
+    account_selection_revision: 0,
+    username: 'Player',
+    launch_auth_mode: 'offline',
+    max_memory_mb: 4096,
+    min_memory_mb: 1024,
+    java_path_override: '',
+    window_width: 854,
+    window_height: 480,
+    jvm_preset: '',
+    performance_mode: 'vanilla',
+    theme: '',
+    custom_hue: null,
+    custom_vibrancy: null,
+    lightness: null,
+    onboarding_done: true,
+    telemetry_enabled: false,
+    discord_rpc_enabled: false,
+    discord_rpc_onboarding_seen: false,
+    music_enabled: false,
+    music_volume: 0.5,
+    music_track: 0,
+    ...patch,
   };
 }
 
 function envelope(patch: Partial<InterfacePreferences['preferences']> = {}): InterfacePreferences {
-  return { version: 1, preferences: { ...preferences.defaultLocalPreferences(), ...patch }, route: { name: 'settings' } };
+  return {
+    version: 1,
+    preferences: { ...preferences.defaultLocalPreferences(), ...patch },
+    route: { name: 'settings' },
+  };
 }
 
-function harness(options: { native?: boolean; value?: InterfacePreferences | null; pending?: NativePreferencesRequest } = {}) {
+function harness(
+  options: { native?: boolean; value?: InterfacePreferences | null; pending?: NativePreferencesRequest } = {},
+) {
   const nativeEnabled = options.native !== false;
-  const backend = { snapshot: { revision: 4, value: options.value === undefined ? envelope() : options.value } as InterfacePreferencesSnapshot };
+  const backend = {
+    snapshot: {
+      revision: 4,
+      value: options.value === undefined ? envelope() : options.value,
+    } as InterfacePreferencesSnapshot,
+  };
   const writes: InterfacePreferencesUpdate[] = [];
   const reads: string[] = [];
   const events: string[] = [];
@@ -78,17 +122,28 @@ function harness(options: { native?: boolean; value?: InterfacePreferences | nul
   let read: () => Promise<unknown> = async () => structuredClone(backend.snapshot);
   function commit(update: InterfacePreferencesUpdate): unknown {
     assert.equal(update.expected_revision, backend.snapshot.revision);
-    const current = backend.snapshot.value ?? { version: 1, preferences: preferences.defaultLocalPreferences(), route: null };
+    const current = backend.snapshot.value ?? {
+      version: 1,
+      preferences: preferences.defaultLocalPreferences(),
+      route: null,
+    };
     const change = update.change;
-    const value = change.kind === 'replace' ? change.value
-      : change.kind === 'local' ? { ...current, preferences: change.preferences } : { ...current, route: change.route };
+    const value =
+      change.kind === 'replace'
+        ? change.value
+        : change.kind === 'local'
+          ? { ...current, preferences: change.preferences }
+          : { ...current, route: change.route };
     backend.snapshot = { revision: update.expected_revision + 1, value: structuredClone(value) };
     return { revision: backend.snapshot.revision };
   }
   let write: (update: InterfacePreferencesUpdate) => Promise<unknown> = async (update) => commit(update);
   const api = {
     api: async (method: string, path: string, body?: unknown): Promise<unknown> => {
-      if (method === 'GET') { reads.push(path); return read(); }
+      if (method === 'GET') {
+        reads.push(path);
+        return read();
+      }
       assert.equal(path, '/config/interface-preferences');
       assert.equal(method, 'PUT');
       const update = body as InterfacePreferencesUpdate;
@@ -98,74 +153,191 @@ function harness(options: { native?: boolean; value?: InterfacePreferences | nul
     isApiError: (error: unknown) => error instanceof Error && 'status' in error,
     apiResourceUrl: (path: string) => path,
   };
-  const nativeWindow = { __TAURI__: {
-    core: { invoke: async (command: string, args?: Record<string, unknown>) => {
-      events.push(command);
-      if (command === 'pending_interface_preferences') return readPending();
-      if (command === 'complete_interface_preferences') { completions.push(structuredClone(args) as { requestId: string; saved: boolean }); return; }
-      if (command === 'window_set_resize_background') return;
-      if (command === 'app_version') return '1.0.0';
-      throw new Error(`Unexpected native command ${command}`);
-    } },
-    event: { listen: async (name: string, callback: typeof listener) => {
-      events.push(`listen:${name}`); listener = callback; return () => {};
-    } },
-  } };
-  const native = source<typeof import('../../src/native')>('native.ts', { './dto-contract': contract },
-    { window: nativeEnabled ? nativeWindow : {} });
-  const owner = source<typeof import('../../src/preferences/persistence')>('preferences/persistence.ts', {
-    '../api': api, '../dto-contract': contract, '../native': native,
-    '../toast': { toast: (message: string) => notices.push(message) }, './local': preferences,
-  }, { location: { reload() { reloads++; } } });
-  const localStorage = {
-    getItem(key: string) { storageReads++; return storage.get(key) ?? null; },
-    setItem(key: string, value: string) { storage.set(key, value); }, removeItem(key: string) { storage.delete(key); },
+  const nativeWindow = {
+    __TAURI__: {
+      core: {
+        invoke: async (command: string, args?: Record<string, unknown>) => {
+          events.push(command);
+          if (command === 'pending_interface_preferences') return readPending();
+          if (command === 'complete_interface_preferences') {
+            completions.push(structuredClone(args) as { requestId: string; saved: boolean });
+            return;
+          }
+          if (command === 'window_set_resize_background') return;
+          if (command === 'app_version') return '1.0.0';
+          throw new Error(`Unexpected native command ${command}`);
+        },
+      },
+      event: {
+        listen: async (name: string, callback: typeof listener) => {
+          events.push(`listen:${name}`);
+          listener = callback;
+          return () => {};
+        },
+      },
+    },
   };
-  const state = source<typeof import('../../src/state')>('state.ts', {
-    './preferences/local': preferences, './preferences/persistence': owner, './native': native,
-  }, { localStorage });
-  const ui = source<typeof import('../../src/ui-state')>('ui-state.ts', {
-    './preferences/local': preferences, './preferences/persistence': owner, './native': native,
-  }, { localStorage });
+  const native = source<typeof import('../../src/native')>(
+    'native.ts',
+    { './dto-contract': contract },
+    { window: nativeEnabled ? nativeWindow : {} },
+  );
+  const owner = source<typeof import('../../src/preferences/persistence')>(
+    'preferences/persistence.ts',
+    {
+      '../api': api,
+      '../dto-contract': contract,
+      '../native': native,
+      '../hooks/use-autosave': { prepareAutoSaves: () => ({ done: Promise.resolve(true), release() {} }) },
+      '../toast': { toast: (message: string) => notices.push(message) },
+      './local': preferences,
+    },
+    {
+      location: {
+        reload() {
+          reloads++;
+        },
+      },
+    },
+  );
+  const localStorage = {
+    getItem(key: string) {
+      storageReads++;
+      return storage.get(key) ?? null;
+    },
+    setItem(key: string, value: string) {
+      storage.set(key, value);
+    },
+    removeItem(key: string) {
+      storage.delete(key);
+    },
+  };
+  const state = source<typeof import('../../src/state')>(
+    'state.ts',
+    {
+      './preferences/local': preferences,
+      './preferences/persistence': owner,
+      './native': native,
+    },
+    { localStorage },
+  );
+  const ui = source<typeof import('../../src/ui-state')>(
+    'ui-state.ts',
+    {
+      './preferences/local': preferences,
+      './preferences/persistence': owner,
+      './native': native,
+    },
+    { localStorage },
+  );
   const soundCalls: string[] = [];
   const Sound = {
-    ui: (value: string) => soundCalls.push(value), enabled: true,
-    warmup: async () => { soundCalls.push(`warmup:${Sound.enabled}`); },
+    ui: (value: string) => soundCalls.push(value),
+    enabled: true,
+    warmup: async () => {
+      soundCalls.push(`warmup:${Sound.enabled}`);
+    },
   };
   const configWrites: unknown[] = [];
   const configState = signal(config());
   const css = new Map<string, string>();
-  const theme = source<typeof import('../../src/theme')>('theme.ts', {
-    './state': state, './hooks/use-autosave': { saveConfigPatch: async (value: unknown) => { configWrites.push(value); } },
-    './store': { config: configState }, './sound': { Sound },
-    './tokens': { buildTheme: (value: unknown) => value }, './toast': { toast: (message: string) => notices.push(message) },
-    './native': native, './preferences/persistence': owner,
-  }, { document: { documentElement: { style: { setProperty: (key: string, value: string) => css.set(key, value) }, setAttribute() {} } } });
+  const theme = source<typeof import('../../src/theme')>(
+    'theme.ts',
+    {
+      './state': state,
+      './hooks/use-autosave': {
+        saveConfigPatch: async (value: unknown) => {
+          configWrites.push(value);
+        },
+      },
+      './store': { config: configState },
+      './sound': { Sound },
+      './tokens': { buildTheme: (value: unknown) => value },
+      './toast': { toast: (message: string) => notices.push(message) },
+      './native': native,
+      './preferences/persistence': owner,
+    },
+    {
+      document: {
+        documentElement: {
+          style: { setProperty: (key: string, value: string) => css.set(key, value) },
+          setAttribute() {},
+        },
+      },
+    },
+  );
   const shortcuts = source<typeof import('../../src/shortcuts')>('shortcuts.ts', {
-    './ui-state': ui, './store': {}, './actions': {}, './launch': {}, './sound': { Sound }, './state': state,
+    './ui-state': ui,
+    './store': {},
+    './actions': {},
+    './launch': {},
+    './sound': { Sound },
+    './state': state,
   });
   const skin = source<typeof import('../../src/player-skin')>('player-skin.ts', {
-    './api': api, './default-skins': { DEFAULT_SKINS: [{ id: 'steve', src: 'steve.png' }, { id: 'alex', src: 'alex.png' }] },
-    './machines/accounts-state': { accountsSnapshot: signal({ state: 'loading', accounts: [], status: null }), activeAccount: () => null },
-    './state': state, './store': { config: signal(config()) },
+    './api': api,
+    './default-skins': {
+      DEFAULT_SKINS: [
+        { id: 'steve', src: 'steve.png' },
+        { id: 'alex', src: 'alex.png' },
+      ],
+    },
+    './machines/accounts-state': {
+      accountsSnapshot: signal({ state: 'loading', accounts: [], status: null }),
+      activeAccount: () => null,
+    },
+    './state': state,
+    './store': { config: signal(config()) },
   });
   return {
-    owner, native, state, ui, theme, shortcuts, skin, backend, writes, reads, events, completions, notices, Sound, configState,
-    storage, css, soundCalls, configWrites, commit, storageReads: () => storageReads, reloads: () => reloads,
-    read(next: typeof read): void { read = next; }, write(next: typeof write): void { write = next; },
-    readPending(next: typeof readPending): void { readPending = next; },
+    owner,
+    native,
+    state,
+    ui,
+    theme,
+    shortcuts,
+    skin,
+    backend,
+    writes,
+    reads,
+    events,
+    completions,
+    notices,
+    Sound,
+    configState,
+    storage,
+    css,
+    soundCalls,
+    configWrites,
+    commit,
+    storageReads: () => storageReads,
+    reloads: () => reloads,
+    read(next: typeof read): void {
+      read = next;
+    },
+    write(next: typeof write): void {
+      write = next;
+    },
+    readPending(next: typeof readPending): void {
+      readPending = next;
+    },
     async hydrate(cfg = config()): Promise<void> {
       const loaded = await owner.initializeNativePreferences(cfg);
-      Object.assign(state.local, loaded.preferences); ui.route.value = loaded.route ?? { name: 'home' };
+      Object.assign(state.local, loaded.preferences);
+      ui.route.value = loaded.route ?? { name: 'home' };
     },
     emit(phase: NativePreferencesRequest['phase'], id = 'preferences-1'): void {
-      assert.ok(listener); pending = { request_id: id, phase }; listener({ payload: pending });
+      assert.ok(listener);
+      pending = { request_id: id, phase };
+      listener({ payload: pending });
     },
   };
 }
 
 test('native hydration ignores shared WebView storage and preserves explicit obsidian and fractional values', async () => {
-  const h = harness({ value: envelope({ theme: 'obsidian', customHue: 142.75, customVibrancy: 77.25, lightness: 0.5 }) });
+  const h = harness({
+    value: envelope({ theme: 'obsidian', customHue: 142.75, customVibrancy: 77.25, lightness: 0.5 }),
+  });
   h.ui.restoreRoute();
   h.shortcuts.setShortcutOverride('new-instance', { key: 'x', meta: true });
   h.skin.setSelectedSkin('default:alex');
@@ -209,7 +381,7 @@ test('one in-flight write coalesces later local and route edits against the late
   const h = harness();
   await h.hydrate();
   const held = deferred<unknown>();
-  h.write((update) => h.writes.length === 1 ? held.promise : Promise.resolve(h.commit(update)));
+  h.write((update) => (h.writes.length === 1 ? held.promise : Promise.resolve(h.commit(update))));
   h.shortcuts.setShortcutOverride('new-instance', { key: 'x', meta: true });
   await tick();
   for (let index = 0; index < 30; index++) {
@@ -220,7 +392,10 @@ test('one in-flight write coalesces later local and route edits against the late
   held.resolve(h.commit(h.writes[0]));
   await h.owner.flushNativePreferences();
   assert.equal(h.writes.length, 2);
-  assert.deepEqual(h.writes.map((write) => write.expected_revision), [4, 5]);
+  assert.deepEqual(
+    h.writes.map((write) => write.expected_revision),
+    [4, 5],
+  );
   assert.equal(h.backend.snapshot.value?.route?.name, 'instance');
   assert.equal((h.backend.snapshot.value?.route as { id: string }).id, 'instance-29');
   assert.equal(h.backend.snapshot.value?.preferences.selectedSkin, 'default:alex');
@@ -235,12 +410,19 @@ test('lost responses reconcile sorted maps exactly and an older read never repla
       const local = snapshot.value.preferences;
       // Model the backend's BTreeMap response independently of submitted order.
       local.shortcuts = Object.fromEntries(Object.entries(local.shortcuts).sort(([a], [b]) => a.localeCompare(b)));
-      local.overlayPositions = Object.fromEntries(Object.entries(local.overlayPositions).sort(([a], [b]) => a.localeCompare(b)));
-      local.selectedSkinsByAccount = Object.fromEntries(Object.entries(local.selectedSkinsByAccount).sort(([a], [b]) => a.localeCompare(b)));
+      local.overlayPositions = Object.fromEntries(
+        Object.entries(local.overlayPositions).sort(([a], [b]) => a.localeCompare(b)),
+      );
+      local.selectedSkinsByAccount = Object.fromEntries(
+        Object.entries(local.selectedSkinsByAccount).sort(([a], [b]) => a.localeCompare(b)),
+      );
     }
     return snapshot;
   });
-  h.write(async (update) => { h.commit(update); throw new Error('Response lost'); });
+  h.write(async (update) => {
+    h.commit(update);
+    throw new Error('Response lost');
+  });
   h.state.local.shortcuts = { z: { key: 'z', meta: true }, a: { key: 'a', ctrl: true } };
   h.state.local.overlayPositions = { z: { x: 3.75, y: 4.5, scaleX: 0.3 }, a: { x: 1, y: 2 } };
   h.state.local.selectedSkinsByAccount = { z: 'default:alex', a: 'default:steve' };
@@ -248,7 +430,9 @@ test('lost responses reconcile sorted maps exactly and an older read never repla
   await h.owner.flushNativePreferences();
   assert.equal(h.writes.length, 1);
   assert.equal(h.notices.length, 0);
-  h.write(async () => { throw new Error('Response not yet committed'); });
+  h.write(async () => {
+    throw new Error('Response not yet committed');
+  });
   h.skin.setSelectedSkin('default:alex');
   await assert.rejects(h.owner.flushNativePreferences());
   await assert.rejects(h.owner.flushNativePreferences());
@@ -271,7 +455,8 @@ test('flush seals real writers and navigation until matching release, and supers
   h.skin.setSelectedSkin('default:alex');
   h.theme.applyTheme('end', null);
   h.theme.applyTheme('custom', 18, { silent: true, transient: true });
-  h.ui.navigate({ name: 'downloads' }); h.ui.goBack();
+  h.ui.navigate({ name: 'downloads' });
+  h.ui.goBack();
   assert.equal(JSON.stringify(h.state.local), before);
   assert.equal(h.ui.route.value.name, 'accounts');
   assert.equal(h.css.size, 0);
@@ -292,7 +477,7 @@ test('discard seals queued drafts without saving them and release recovers them 
   const h = harness();
   await h.hydrate();
   const held = deferred<unknown>();
-  h.write((update) => h.writes.length === 1 ? held.promise : Promise.resolve(h.commit(update)));
+  h.write((update) => (h.writes.length === 1 ? held.promise : Promise.resolve(h.commit(update))));
   h.shortcuts.setShortcutOverride('new-instance', { key: 'q', meta: true });
   await tick();
   h.skin.setSelectedSkin('default:alex');
@@ -312,7 +497,9 @@ test('discard seals queued drafts without saving them and release recovers them 
 test('a refused save remains a draft and native release does not replay it', async () => {
   const h = harness();
   await h.hydrate();
-  h.write(async () => { throw Object.assign(new Error('Conflict'), { status: 409 }); });
+  h.write(async () => {
+    throw Object.assign(new Error('Conflict'), { status: 409 });
+  });
   h.skin.setSelectedSkin('default:alex');
   await assert.rejects(h.owner.flushNativePreferences());
   h.emit('flush');
@@ -349,8 +536,13 @@ test('native import drains before its final witness and never replays stale draf
 test('unknown native import stays sealed and repeated Reload only reconciles until commit is proven', async () => {
   const h = harness();
   await h.hydrate();
-  h.write(async () => { throw new Error('Response lost'); });
-  await assert.rejects(h.owner.replaceNativePreferences(envelope({ theme: 'end' }), () => true), /needs confirmation/);
+  h.write(async () => {
+    throw new Error('Response lost');
+  });
+  await assert.rejects(
+    h.owner.replaceNativePreferences(envelope({ theme: 'end' }), () => true),
+    /needs confirmation/,
+  );
   assert.equal(await h.owner.reloadApplication(), false);
   assert.equal(await h.owner.reloadApplication(), false);
   assert.equal(h.reloads(), 0);
@@ -374,42 +566,106 @@ test('explicit imported theme uses the native owner and yields to newer edits or
   assert.equal(h.backend.snapshot.value?.preferences.selectedSkin, 'default:alex');
   assert.equal(h.configWrites.length, 0);
   h.emit('discard');
-  await assert.rejects(h.theme.applyImportedConfigTheme(config({ theme: 'nether' }), h.state.localStateVersion.value), /paused/);
+  await assert.rejects(
+    h.theme.applyImportedConfigTheme(config({ theme: 'nether' }), h.state.localStateVersion.value),
+    /paused/,
+  );
 });
 
 test('bootstrap retains its visible retry state until native hydration succeeds before theme, sound and deferred writers', async () => {
   const h = harness({ value: envelope({ theme: 'obsidian', customHue: 125.25, sounds: false }) });
   h.Sound.enabled = false;
-  h.read(async () => { throw new Error('Profile preferences unavailable'); });
+  h.read(async () => {
+    throw new Error('Profile preferences unavailable');
+  });
   const store = {
-    config: h.configState, appVersion: signal(''), bootstrapError: signal<string | null>(null),
-    bootstrapState: signal('loading'), devMode: signal(false), instances: signal([]),
-    lastInstanceId: signal(null), launchSessions: signal({}), systemInfo: signal(null), versions: signal([]),
+    config: h.configState,
+    appVersion: signal(''),
+    bootstrapError: signal<string | null>(null),
+    bootstrapState: signal('loading'),
+    devMode: signal(false),
+    instances: signal([]),
+    lastInstanceId: signal(null),
+    launchSessions: signal({}),
+    systemInfo: signal(null),
+    versions: signal([]),
   };
   const deferredCalls: string[] = [];
   const response: Record<string, unknown> = {
-    '/config': config({ theme: 'nether' }), '/status': { dev_mode: false, setup_required: false },
-    '/system': {}, '/music/status': { count: 0 }, '/versions': { versions: [] },
-    '/instances': { instances: [], last_instance_id: null }, '/launch/sessions': {},
+    '/config': config({ theme: 'nether' }),
+    '/status': { dev_mode: false, setup_required: false },
+    '/system': {},
+    '/music/status': { count: 0 },
+    '/versions': { versions: [] },
+    '/instances': { instances: [], last_instance_id: null },
+    '/launch/sessions': {},
   };
-  const bootstrap = source<typeof import('../../src/bootstrap')>('bootstrap.ts', {
-    './api': { initializeApiBase: async () => {}, api: async (_method: string, path: string) => {
-      assert.ok(path in response); return response[path];
-    } },
-    './App': { preloadDeferredViews() { deferredCalls.push('views'); } }, './dto-contract': contract,
-    './dto-core': Object.fromEntries(['configResponse', 'instancesResponse', 'launcherStatusResponse',
-      'musicStatusResponse', 'systemInfoResponse', 'versionsResponse'].map((name) => [name, (value: unknown) => value])),
-    './machines/downloads': { refreshInstallQueue: async () => {} }, './launch': {},
-    './launch-response-adapters': { launchSessionsResponse: (value: unknown) => value },
-    './music': { Music: { setTrackCount() {}, applyConfig() {}, enabled: false } },
-    './native': h.native, './preferences/persistence': h.owner, './state': h.state, './store': store,
-    './sound': { Sound: h.Sound, bindButtonSounds() { deferredCalls.push('buttons'); } },
-    './player-skin': { refreshAccountSkin() { deferredCalls.push('skin'); h.skin.refreshAccountSkin(); } },
-    './startup-warnings': { startupWarningMessages: () => [] }, './theme': h.theme,
-    './toast': { toast() {} }, './ui-state': h.ui,
-    './updater': { scheduleAutoUpdateCheck() { deferredCalls.push('updater'); } },
-    './utils': { errMessage: (error: Error) => error.message },
-  }, { window: { requestIdleCallback(run: () => void) { run(); }, addEventListener() {} } });
+  const bootstrap = source<typeof import('../../src/bootstrap')>(
+    'bootstrap.ts',
+    {
+      './api': {
+        initializeApiBase: async () => {},
+        api: async (_method: string, path: string) => {
+          assert.ok(path in response);
+          return response[path];
+        },
+      },
+      './App': {
+        preloadDeferredViews() {
+          deferredCalls.push('views');
+        },
+      },
+      './dto-contract': contract,
+      './dto-core': Object.fromEntries(
+        [
+          'configResponse',
+          'instancesResponse',
+          'launcherStatusResponse',
+          'musicStatusResponse',
+          'systemInfoResponse',
+          'versionsResponse',
+        ].map((name) => [name, (value: unknown) => value]),
+      ),
+      './machines/downloads': { refreshInstallQueue: async () => {} },
+      './launch': {},
+      './launch-response-adapters': { launchSessionsResponse: (value: unknown) => value },
+      './music': { Music: { setTrackCount() {}, applyConfig() {}, enabled: false } },
+      './native': h.native,
+      './preferences/persistence': h.owner,
+      './state': h.state,
+      './store': store,
+      './sound': {
+        Sound: h.Sound,
+        bindButtonSounds() {
+          deferredCalls.push('buttons');
+        },
+      },
+      './player-skin': {
+        refreshAccountSkin() {
+          deferredCalls.push('skin');
+          h.skin.refreshAccountSkin();
+        },
+      },
+      './startup-warnings': { startupWarningMessages: () => [] },
+      './theme': h.theme,
+      './toast': { toast() {} },
+      './ui-state': h.ui,
+      './updater': {
+        scheduleAutoUpdateCheck() {
+          deferredCalls.push('updater');
+        },
+      },
+      './utils': { errMessage: (error: Error) => error.message },
+    },
+    {
+      window: {
+        requestIdleCallback(run: () => void) {
+          run();
+        },
+        addEventListener() {},
+      },
+    },
+  );
   await bootstrap.startApplicationBootstrap();
   assert.equal(store.bootstrapState.value, 'error');
   assert.equal(store.bootstrapError.value, 'Profile preferences unavailable');
@@ -471,9 +727,11 @@ test('an already rendered audio control cannot mutate local sound or audio state
   const audio = source<typeof import('../../src/views/settings/AudioSection')>('views/settings/AudioSection.tsx', {
     'preact/jsx-runtime': { jsx, jsxs: jsx },
     'preact/hooks': { useState: (value: unknown) => [value, () => {}], useEffect() {} },
-    '../../ui/Atoms': { Toggle: 'Toggle' }, '../../ui/Slider': {},
+    '../../ui/Atoms': { Toggle: 'Toggle' },
+    '../../ui/Slider': {},
     '../../ui/SettingsSheet': { SettingRow: 'SettingRow', SettingsSection: 'SettingsSection' },
-    '../../state': h.state, '../../sound': { Sound: h.Sound },
+    '../../state': h.state,
+    '../../sound': { Sound: h.Sound },
     '../../music': { musicStateVersion: signal(0), Music: { enabled: false, volume: 50 } },
   });
   const node = audio.AudioSection() as unknown as Node;

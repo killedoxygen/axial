@@ -1,6 +1,6 @@
 import { signal } from '@preact/signals';
 import { apiResourceUrl } from './api';
-import { saveConfigPatch } from './hooks/use-autosave';
+import { canAutoSave, registerAutoSaveDraft, saveConfigPatch } from './hooks/use-autosave';
 import { config } from './store';
 import { toast } from './toast';
 
@@ -14,6 +14,7 @@ let fadeFrom = 0;
 let fadeTarget = 0;
 let fadeCallback: (() => void) | null = null;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let persistPending = false;
 let suppressed = false;
 let pendingPlay: Promise<void> | null = null;
 let pendingPlayVersion = 0;
@@ -112,11 +113,13 @@ export const Music = {
       saveVersion += 1;
       if (persistTimer) clearTimeout(persistTimer);
       persistTimer = null;
+      persistPending = false;
       this.enabled = cfg.music_enabled ?? false;
       this.volume = 5;
     }
     if (cfg.music_enabled != null) this.enabled = cfg.music_enabled;
-    if (cfg.music_volume != null && Number.isFinite(cfg.music_volume)) this.volume = Math.max(0, Math.min(100, cfg.music_volume));
+    if (cfg.music_volume != null && Number.isFinite(cfg.music_volume))
+      this.volume = Math.max(0, Math.min(100, cfg.music_volume));
     if (cfg.music_track != null) this.track = clampTrack(cfg.music_track);
     acceptedMusic = { enabled: this.enabled, volume: this.volume, track: this.track };
     if (syncPlayback) {
@@ -145,22 +148,33 @@ export const Music = {
   persist(): void {
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = null;
+    if (!canAutoSave()) {
+      persistPending = true;
+      return;
+    }
+    persistPending = false;
     const version = ++saveVersion;
     const preference = { enabled: this.enabled, volume: this.volume, track: this.track };
     void (async () => {
       try {
-        await saveConfigPatch({
-          music_enabled: preference.enabled, music_volume: preference.volume, music_track: preference.track,
-        }, () => version === saveVersion);
+        await saveConfigPatch(
+          {
+            music_enabled: preference.enabled,
+            music_volume: preference.volume,
+            music_track: preference.track,
+          },
+          () => version === saveVersion,
+        );
         if (version === saveVersion) acceptedMusic = preference;
       } catch {
         if (version !== saveVersion) return;
         const saved = config.value;
-        if (saved) acceptedMusic = {
-          enabled: saved.music_enabled ?? false,
-          volume: saved.music_volume ?? 5,
-          track: clampTrack(saved.music_track),
-        };
+        if (saved)
+          acceptedMusic = {
+            enabled: saved.music_enabled ?? false,
+            volume: saved.music_volume ?? 5,
+            track: clampTrack(saved.music_track),
+          };
         const trackChanged = this.track !== acceptedMusic.track;
         Object.assign(this, acceptedMusic);
         if (trackChanged && audio) {
@@ -179,6 +193,7 @@ export const Music = {
   debouncedPersist(): void {
     // Pending slider edits must not be rolled back by an older failed request.
     saveVersion += 1;
+    persistPending = true;
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
       this.persist();
@@ -187,6 +202,7 @@ export const Music = {
   },
 
   toggle(): void {
+    if (!canAutoSave()) return;
     this.enabled = !this.enabled;
     this.persist();
     if (this.enabled && !suppressed) void this.play();
@@ -195,6 +211,10 @@ export const Music = {
   },
 
   setVolume(v: number): void {
+    if (!canAutoSave()) {
+      this.syncUI();
+      return;
+    }
     if (!Number.isFinite(v)) return;
     this.volume = Math.max(0, Math.min(100, v));
     if (audio && !suppressed) {
@@ -248,11 +268,15 @@ export const Music = {
         this.syncUI();
       } catch (error) {
         // Autoplay denial is expected until the first user interaction.
-        if (version === playbackVersion && !(error instanceof DOMException && error.name === 'NotAllowedError')) playbackFailed();
+        if (version === playbackVersion && !(error instanceof DOMException && error.name === 'NotAllowedError'))
+          playbackFailed();
       }
     })();
-    try { await pendingPlay; }
-    finally { pendingPlay = null; }
+    try {
+      await pendingPlay;
+    } finally {
+      pendingPlay = null;
+    }
   },
 
   stop(): void {
@@ -265,6 +289,7 @@ export const Music = {
   },
 
   nextTrack(): void {
+    if (!canAutoSave()) return;
     playbackVersion += 1;
     this.track = (this.track + 1) % trackCount;
     this.ready = false;
@@ -304,3 +329,7 @@ export const Music = {
     notifyMusicState();
   },
 };
+
+registerAutoSaveDraft(() => {
+  if (persistPending) Music.persist();
+});
