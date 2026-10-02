@@ -434,6 +434,51 @@ test('required hydration follows newer registry revisions and restarted epochs b
   }
 });
 
+test('new registry cursors drain the active read pair before reading only the latest cursor', async () => {
+  for (const failure of [undefined, '/versions', '/instances']) {
+    const h = downloadsHarness();
+    const oldVersions = deferred<unknown>();
+    const oldInstances = deferred<unknown>();
+    let active = 0;
+    let maximumActive = 0;
+    const track = async (reply: Promise<unknown>): Promise<unknown> => {
+      maximumActive = Math.max(maximumActive, ++active);
+      try { return await reply; } finally { active -= 1; }
+    };
+    h.read((path) => track(path === '/versions' ? oldVersions.promise : oldInstances.promise));
+    const old = h.machine.applyInstallQueueResponse(queue('first', 1, 0));
+    await flush();
+    h.read((path) => track(Promise.resolve(path === '/versions'
+      ? { versions: ['latest'] } : { instances: ['latest'], last_instance_id: 'latest' })));
+    const middle = h.machine.applyInstallQueueResponse(queue('first', 2, 1));
+    const latest = h.machine.applyInstallQueueResponse(queue('first', 3, 2));
+    await flush();
+    assert.equal(h.calls.length, 2, 'new cursors must join both active requests');
+    assert.deepEqual(h.store.instances.value, []);
+
+    if (failure === '/instances') oldInstances.reject(new Error('Obsolete instance read failed'));
+    else if (failure === '/versions') oldVersions.reject(new Error('Obsolete version read failed'));
+    else oldVersions.resolve({ versions: ['obsolete'] });
+    await flush();
+    assert.equal(h.calls.length, 2, 'one settled request must not release the other active request');
+    assert.deepEqual(h.store.instances.value, []);
+    if (failure === '/instances') oldVersions.resolve({ versions: ['obsolete'] });
+    else oldInstances.resolve({ instances: ['obsolete'], last_instance_id: 'obsolete' });
+    await Promise.all([old, middle, latest]);
+    assert.equal(maximumActive, 2);
+    assert.equal(active, 0);
+    assert.equal(h.calls.length, 4, 'the intermediate cursor must not start another read pair');
+    assert.deepEqual(h.store.versions.value, ['latest']);
+    assert.deepEqual(h.store.instances.value, ['latest']);
+    assert.equal(h.store.lastInstanceId.value, 'latest');
+    assert.equal(h.errors.length, 0);
+    assert.equal(h.clock.timeouts.size, 0);
+    await h.machine.applyInstallQueueResponse(queue('first', 4, 3));
+    assert.equal(h.calls.length, 6, 'completed reads must release the next invalidation');
+    assert.equal(active, 0);
+  }
+});
+
 test('a superseded initial queue response still awaits the current stream registry projection', async () => {
   const h = downloadsHarness();
   const oldQueue = deferred<unknown>();
@@ -482,9 +527,11 @@ test('a required attempt cannot reuse a projection read that began before the at
   await flush();
   h.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
     ? { versions: ['fresh'] } : { instances: ['fresh'], last_instance_id: 'fresh' });
-  await h.machine.refreshInstallQueue({ requireInstalledState: true });
+  const freshRead = h.machine.refreshInstallQueue({ requireInstalledState: true });
+  await flush();
+  assert.equal(h.calls.filter((path) => path === '/instances').length, 1);
   oldVersions.resolve({ versions: ['old'] });
-  await oldRead;
+  await Promise.all([oldRead, freshRead]);
   assert.deepEqual(h.store.versions.value, ['fresh']);
   assert.deepEqual(h.store.instances.value, ['fresh']);
   assert.equal(h.store.lastInstanceId.value, 'fresh');
@@ -496,12 +543,12 @@ test('a failed newer projection cannot be hidden by completion of an obsolete re
   const oldVersions = deferred<unknown>();
   h.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
     ? oldVersions.promise : { instances: ['old'], last_instance_id: 'old' });
-  const initial = assert.rejects(h.machine.refreshInstallQueue({ requireInstalledState: true }), /could not be refreshed/);
+  const initial = assert.rejects(h.machine.refreshInstallQueue({ requireInstalledState: true }), /New projection unavailable/);
   await flush();
   h.read(async () => { throw new Error('New projection unavailable'); });
-  await h.machine.applyInstallQueueResponse(queue('first', 2, 1));
+  const current = h.machine.applyInstallQueueResponse(queue('first', 2, 1));
   oldVersions.resolve({ versions: ['old'] });
-  await initial;
+  await Promise.all([initial, current]);
   assert.deepEqual(h.store.instances.value, []);
   assert.equal(h.calls.filter((path) => path === '/instances').length, 2);
   assert.equal(h.clock.timeouts.size, 1);
@@ -520,6 +567,30 @@ test('disconnecting a required projection discards its late read and does not re
   await stopped;
   assert.deepEqual(h.store.instances.value, []);
   assert.equal(h.calls.filter((path) => path === '/instances').length, 1);
+});
+
+test('a fresh required read after disconnect still drains the prior backend requests', async () => {
+  const h = downloadsHarness();
+  const oldVersions = deferred<unknown>();
+  const oldInstances = deferred<unknown>();
+  h.read(async (path) => path === '/versions' ? oldVersions.promise : oldInstances.promise);
+  const oldRead = h.machine.applyInstallQueueResponse(queue('first', 1, 0));
+  await flush();
+  h.machine.disconnectInstallQueue();
+  h.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
+    ? { versions: ['fresh'] } : { instances: ['fresh'], last_instance_id: 'fresh' });
+  const freshRead = h.machine.refreshInstallQueue({ requireInstalledState: true });
+  await flush();
+  assert.equal(h.calls.filter((path) => path === '/instances').length, 1);
+  oldVersions.reject(new Error('Disconnected read failed'));
+  await flush();
+  assert.equal(h.calls.filter((path) => path === '/instances').length, 1);
+  oldInstances.resolve({ instances: ['old'], last_instance_id: 'old' });
+  await Promise.all([oldRead, freshRead]);
+  assert.deepEqual(h.store.instances.value, ['fresh']);
+  assert.equal(h.calls.filter((path) => path === '/instances').length, 2);
+  assert.equal(h.errors.length, 0);
+  assert.equal(h.clock.timeouts.size, 0);
 });
 
 test('coalesced successful installs invalidate views without an observed active phase', async () => {
@@ -771,9 +842,9 @@ test('delayed registry reads from an old process cannot overwrite the restarted 
   await flush();
   harness.read(async (path) => path === '/versions' ? { versions: ['new'] }
     : { instances: ['new'], last_instance_id: 'new' });
-  await harness.machine.applyInstallQueueResponse(queue('new', 1, 0));
+  const current = harness.machine.applyInstallQueueResponse(queue('new', 1, 0));
   oldVersions.resolve({ versions: ['old'] });
-  await oldRefresh;
+  await Promise.all([oldRefresh, current]);
   assert.deepEqual(harness.store.versions.value, ['new']);
   assert.deepEqual(harness.store.instances.value, ['new']);
   assert.equal(harness.store.lastInstanceId.value, 'new');

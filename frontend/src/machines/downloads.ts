@@ -80,7 +80,7 @@ let registryRefreshGeneration = 0;
 const retiredQueueEpochs = new Set<string>();
 type RegistryCursor = { epoch: string; revision: number };
 let reconciledRegistry: RegistryCursor | null = null;
-let registryRead: { cursor: RegistryCursor; promise: Promise<void>; dispose: () => void } | null = null;
+let registryRead: { cursor: RegistryCursor; generation: number; promise: Promise<void>; dispose: () => void } | null = null;
 let registryRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let registryReadFailures = 0;
 
@@ -152,7 +152,6 @@ export function disconnectInstallQueue(): void {
   closeQueueStream = null;
   registryRefreshGeneration += 1;
   registryRead?.dispose();
-  registryRead = null;
   if (registryRetryTimer !== undefined) clearTimeout(registryRetryTimer);
   registryRetryTimer = undefined;
 }
@@ -165,7 +164,6 @@ export async function refreshInstallQueue(
     // instance changes need not advance the install queue's registry revision.
     registryRefreshGeneration += 1;
     registryRead?.dispose();
-    registryRead = null;
     reconciledRegistry = null;
     if (registryRetryTimer !== undefined) clearTimeout(registryRetryTimer);
     registryRetryTimer = undefined;
@@ -251,7 +249,7 @@ async function refreshInstalledState(required = false): Promise<void> {
       if (required) throw new Error('Install state could not be refreshed. Retry startup.');
       return;
     }
-    const read = registryRead && sameRegistry(registryRead.cursor, cursor)
+    const read = registryRead && registryRead.generation === registryRefreshGeneration && sameRegistry(registryRead.cursor, cursor)
       ? registryRead.promise : readInstalledState(cursor);
     try {
       await read;
@@ -272,11 +270,15 @@ async function refreshInstalledState(required = false): Promise<void> {
 }
 
 function readInstalledState(cursor: RegistryCursor): Promise<void> {
+  const previous = registryRead?.promise;
   registryRead?.dispose();
   const generation = ++registryRefreshGeneration;
   let stopWatching = (): void => {};
   const promise = Promise.resolve().then(async () => {
     try {
+      // Superseding a response does not stop its backend proof. Drain both
+      // requests before the newest cursor starts another projection.
+      await previous?.catch(() => {});
       // Account edits and session settlement do not advance the install cursor.
       // Rebase once against their existing owners before falling back to paced retry.
       for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -298,17 +300,19 @@ function readInstalledState(cursor: RegistryCursor): Promise<void> {
         let superseded = false;
         stopWatching = effect(() => { if (!inputsCurrent()) superseded = true; });
         try {
-          const [versionsRes, instancesRes] = await Promise.all([
+          const [versionsRead, instancesRead] = await Promise.allSettled([
             api('GET', '/versions').then(versionsResponse),
             api('GET', '/instances').then(instancesResponse),
           ]);
           if (generation !== registryRefreshGeneration) return;
           if (superseded || !inputsCurrent()) continue;
+          if (versionsRead.status === 'rejected') throw versionsRead.reason;
+          if (instancesRead.status === 'rejected') throw instancesRead.reason;
           stopWatching();
           batch(() => {
-            versions.value = versionsRes.versions;
-            instances.value = instancesRes.instances;
-            lastInstanceId.value = instancesRes.last_instance_id;
+            versions.value = versionsRead.value.versions;
+            instances.value = instancesRead.value.instances;
+            lastInstanceId.value = instancesRead.value.last_instance_id;
           });
           reconciledRegistry = cursor;
           registryReadFailures = 0;
@@ -327,10 +331,10 @@ function readInstalledState(cursor: RegistryCursor): Promise<void> {
       }
       scheduleRegistryRetry(500);
     } finally {
-      if (generation === registryRefreshGeneration) registryRead = null;
+      if (registryRead?.promise === promise) registryRead = null;
     }
   });
-  registryRead = { cursor, promise, dispose: () => stopWatching() };
+  registryRead = { cursor, generation, promise, dispose: () => stopWatching() };
   return promise;
 }
 
