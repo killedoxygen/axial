@@ -1212,6 +1212,57 @@ impl PerformanceService {
     pub fn rules(&self) -> &PerformanceRules {
         &self.rules
     }
+
+    #[cfg(feature = "test-support")]
+    pub fn with_rules_for_test(mut self, rules: PerformanceRules) -> Self {
+        assert!(rules.uses_metadata(&self.storage));
+        self.rules = rules;
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn install_plan_for_test(
+        &self,
+        id: &InstanceId,
+        plan: axial_performance::ManagedCompositionInstallPlan,
+        transfers: ManagedArtifactTransferResolver,
+    ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
+        let instance = self
+            .instances
+            .admit(id)
+            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
+        validate_target(
+            &instance,
+            &self.resolution_request(
+                plan.game_version().into(),
+                plan.loader().into(),
+                PerformanceMode::Managed,
+            ),
+        )?;
+        let service = self.clone();
+        self.tasks
+            .try_spawn(instance.clone(), move |_| async move {
+                let bound = service.bind(instance).await?;
+                let admitted = bound.instance.clone();
+                bound
+                    .authority
+                    .ensure_installed(
+                        &bound.identity,
+                        &bound.effects,
+                        &plan,
+                        transfers,
+                        move || async move { admitted.validate_current() },
+                    )
+                    .await
+                    .map_err(|_| PerformanceMutationError::Failed)?;
+                service.recover_bound(&bound).await
+            })
+            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?
+            .join()
+            .await
+            .map_err(|_| PerformanceMutationError::Unsettled)?
+    }
+
     pub fn instances(&self) -> &InstanceDirectories {
         &self.instances
     }
@@ -1444,14 +1495,29 @@ impl PerformanceService {
         &self,
         id: &InstanceId,
     ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
-        self.inspect_with_request(id, None).await
+        self.inspect_owned(id, None)
+            .await
+            .map(|(inspection, _)| inspection)
     }
 
-    pub async fn inspect_with_request(
+    pub async fn resolve_and_inspect(
+        &self,
+        id: &InstanceId,
+        request: ResolutionRequest,
+    ) -> Result<axial_performance::ManagedResolvedInspection, PerformanceMutationError> {
+        let (inspection, plan) = self.inspect_owned(id, Some(request)).await?;
+        Ok(axial_performance::ManagedResolvedInspection {
+            inspection,
+            plan: plan.ok_or(PerformanceMutationError::PlanUnavailable)?,
+        })
+    }
+
+    async fn inspect_owned(
         &self,
         id: &InstanceId,
         request: Option<ResolutionRequest>,
-    ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
+    ) -> Result<(ManagedCompositionInspection, Option<CompositionPlan>), PerformanceMutationError>
+    {
         let instance = self
             .instances
             .admit(id)
@@ -1494,17 +1560,21 @@ impl PerformanceService {
                     Ok(admission)
                 };
                 let inspection = match request {
-                    Some(request) => bound
-                        .authority
-                        .resolve_and_inspect(&bound.identity, &bound.effects, request, admit)
-                        .await
-                        .map(|resolved| resolved.inspection),
-                    None => {
+                    Some(request) => {
+                        // Keep validated rules pinned while the leaf replaces
+                        // caller evidence with this admitted instance's files.
+                        let _rules = service.rules.plan(request.clone()).await?;
                         bound
                             .authority
-                            .inspect(&bound.identity, &bound.effects, None, admit)
+                            .resolve_and_inspect(&bound.identity, &bound.effects, request, admit)
                             .await
+                            .map(|resolved| (resolved.inspection, Some(resolved.plan)))
                     }
+                    None => bound
+                        .authority
+                        .inspect(&bound.identity, &bound.effects, None, admit)
+                        .await
+                        .map(|inspection| (inspection, None)),
                 };
                 match inspection {
                     Ok(inspection) => {

@@ -4,8 +4,8 @@ use axial_app::{
     instances::model::InstanceId,
     performance::{
         PerformanceMutationError, PerformanceService,
-        health::health_response,
-        model::PerformancePlanRequest,
+        health::{disabled_health_response, health_response, resolved_health_response},
+        model::{PerformanceMode, PerformancePlanRequest},
         plan::{configured_mode, plan_response, resolve_mode, version_target},
     },
     settings::SettingsStore,
@@ -69,6 +69,14 @@ async fn plan(
 ) -> ApiResult {
     let Query(input) = query.map_err(|_| invalid())?;
     let request = resolution(&api, &input)?;
+    if let Some(id) = input.instance_id.as_deref() {
+        let resolved = api
+            .service
+            .resolve_and_inspect(&id.parse::<InstanceId>().map_err(|_| invalid())?, request)
+            .await
+            .map_err(error)?;
+        return Ok(Json(json!(plan_response(&resolved.plan))));
+    }
     let planned = api.service.rules().plan(request).await.map_err(|error| {
         (
             StatusCode::CONFLICT,
@@ -95,9 +103,12 @@ async fn health(
             ..Default::default()
         },
     )?;
-    Ok(Json(json!(health_response(
+    if request.mode != PerformanceMode::Managed {
+        return Ok(Json(json!(disabled_health_response())));
+    }
+    Ok(Json(json!(resolved_health_response(
         api.service
-            .inspect_with_request(&id, Some(request))
+            .resolve_and_inspect(&id, request)
             .await
             .map_err(error)?
     ))))
@@ -271,6 +282,468 @@ fn unavailable() -> (StatusCode, Json<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axial_app::{
+        import::{Inventory, ReadOnlySource},
+        instances::model::InstancePatch,
+        performance::rules::PerformanceRules,
+        storage::StorageError,
+    };
+    use axial_performance::{
+        CompositionPlan, CompositionTier, ManagedArtifactPin, ManagedArtifactRole,
+        ManagedArtifactTransferResolver, ManagedCompositionInstallPlan, PerformanceMode,
+        RulesCacheSnapshot, RulesSignatureMetadata,
+        types::{ManagedMod, ModCondition, VersionFamily},
+    };
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha512};
+    use std::{
+        collections::BTreeMap,
+        io::Write,
+        path::{Path as FilePath, PathBuf},
+        time::Duration,
+    };
+    use tower::ServiceExt;
+
+    struct ProjectionFixture {
+        root: tempfile::TempDir,
+        services: crate::DesktopServices,
+        instance: InstanceId,
+        mods: PathBuf,
+    }
+
+    impl ProjectionFixture {
+        async fn new() -> Self {
+            let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let services = crate::start_in_profile(root.path().join("replacement"), None)
+                .await
+                .unwrap();
+            let source_path = root.path().join("predecessor");
+            std::fs::create_dir_all(source_path.join("instances/0000000000000001/mods")).unwrap();
+            for (name, bytes) in [
+                (
+                    "config.json",
+                    include_bytes!(
+                        "../../../../acceptance/fixtures/profiles/offline-vanilla/config.json"
+                    )
+                    .as_slice(),
+                ),
+                (
+                    "accounts.json",
+                    include_bytes!(
+                        "../../../../acceptance/fixtures/profiles/offline-vanilla/accounts.json"
+                    )
+                    .as_slice(),
+                ),
+            ] {
+                std::fs::write(source_path.join(name), bytes).unwrap();
+            }
+            let mut source: Value = serde_json::from_str(include_str!(
+                "../../../../acceptance/fixtures/profiles/offline-vanilla/instances.json"
+            ))
+            .unwrap();
+            source["instances"][0]["version_id"] = json!(
+                axial_minecraft::loaders::installed_version_id_for(
+                    axial_minecraft::loaders::LoaderComponentId::Fabric,
+                    "1.20.1",
+                    "0.16.9",
+                )
+                .unwrap()
+            );
+            source["instances"][0]["loader_key"] = json!("fabric");
+            source["instances"][0]["performance_mode"] = json!("managed");
+            std::fs::write(
+                source_path.join("instances.json"),
+                serde_json::to_vec(&source).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                source_path.join("instances/0000000000000001/mods/iris-mc1.20.1-1.7.0.jar"),
+                jar("iris"),
+            )
+            .unwrap();
+            let source = ReadOnlySource::from_native_selection(
+                services.library.admit_application_root().unwrap(),
+                &source_path,
+            )
+            .unwrap();
+            let preview = services
+                .imports
+                .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
+                .unwrap();
+            assert!(preview.instances[0].ordinary_import_available);
+            let prepared = services
+                .imports
+                .prepare_instance(&preview.fingerprint, "0000000000000001")
+                .unwrap();
+            let imported = services
+                .instances
+                .import_instance(prepared)
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap();
+            services.imports.forget().unwrap();
+            drop(source);
+            let mods = services
+                .library
+                .admit()
+                .unwrap()
+                .read_projection()
+                .unwrap()
+                .join("instances")
+                .join(imported.id.as_str())
+                .join("mods");
+            Self {
+                root,
+                services,
+                instance: imported.id,
+                mods,
+            }
+        }
+
+        fn router(&self) -> Router {
+            router(
+                Arc::new(self.services.performance.clone()),
+                self.services.settings.clone(),
+            )
+        }
+
+        fn signed_rules_router(&self) -> Router {
+            let key = SigningKey::from_bytes(&[23; 32]);
+            let mut manifest = axial_performance::builtin_manifest().unwrap();
+            manifest.generated_at = "2026-10-02T00:00:00Z".into();
+            for composition in &mut manifest.compositions {
+                for artifact in &mut composition.mods {
+                    if artifact.slug == "nvidium" {
+                        artifact.condition = ModCondition::Always;
+                        artifact.hardware_req = None;
+                    }
+                }
+            }
+            let signature =
+                key.sign(&axial_performance::canonical_manifest_payload(&manifest).unwrap());
+            let snapshot = RulesCacheSnapshot {
+                rule_source: axial_performance::RuleSource::Remote,
+                rule_channel: axial_performance::RuleChannel::Remote,
+                schema_version: manifest.schema_version,
+                generated_at: manifest.generated_at.clone(),
+                updated_at: manifest.generated_at.clone(),
+                validation: axial_performance::RulesValidation::Valid,
+                manifest,
+                signature: RulesSignatureMetadata {
+                    signature: hex::encode(signature.to_bytes()),
+                    key_id: Some("projection-fixture".into()),
+                },
+            };
+            self.services
+                .settings
+                .metadata()
+                .transaction(|db| -> Result<_, StorageError> {
+                    db.execute(
+                        "INSERT INTO performance_rules(singleton,snapshot) VALUES(1,?1)",
+                        [snapshot.encode().unwrap()],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            let rules = PerformanceRules::with_remote(
+                self.services.settings.metadata().clone(),
+                Some("https://example.invalid/rules".into()),
+                Some(hex::encode(key.verifying_key().to_bytes())),
+            )
+            .unwrap();
+            let service = self.services.performance.clone().with_rules_for_test(rules);
+            router(Arc::new(service), self.services.settings.clone())
+        }
+
+        async fn seed_managed(&self) {
+            use axial_minecraft::download::{
+                RetryPolicy, TransferClient, TransferClientConfig, TransferOrigin,
+            };
+            let bytes = jar("fixture_managed");
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let body = bytes.clone();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new().route(
+                        "/managed.jar",
+                        get(move || {
+                            let body = body.clone();
+                            async move { body }
+                        }),
+                    ),
+                )
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+            });
+            let url = format!("http://{address}/managed.jar");
+            let transfers = ManagedArtifactTransferResolver::new(
+                move |url| async move {
+                    if url.host_str() != Some("127.0.0.1") || url.port() != Some(address.port()) {
+                        return Err(std::io::Error::other("unexpected fixture origin"));
+                    }
+                    let origin = TransferOrigin::from_loopback_http_for_test_support(&url)
+                        .map_err(std::io::Error::other)?;
+                    let config = TransferClientConfig::bounded(
+                        Duration::from_secs(2),
+                        Duration::from_secs(5),
+                        Duration::from_secs(10),
+                        vec![origin],
+                    )
+                    .map_err(std::io::Error::other)?;
+                    TransferClient::build(config).map_err(std::io::Error::other)
+                },
+                RetryPolicy::none(),
+            );
+            let plan = ManagedCompositionInstallPlan::seal(
+                CompositionPlan {
+                    composition_id: "fixture-managed".into(),
+                    family: VersionFamily::E,
+                    loader: "fabric".into(),
+                    mode: PerformanceMode::Managed,
+                    tier: CompositionTier::Core,
+                    jvm_preset: String::new(),
+                    warnings: Vec::new(),
+                    fallback_reason: String::new(),
+                    mods: vec![ManagedMod {
+                        artifact_id: "fixture".into(),
+                        project_id: "AANobbMI".into(),
+                        slug: "fixture".into(),
+                        name: "Fixture".into(),
+                        condition: ModCondition::Always,
+                        version_range: String::new(),
+                        exact_game_versions: Vec::new(),
+                        hardware_req: None,
+                        mutual_exclusions: Vec::new(),
+                    }],
+                },
+                "1.20.1",
+                "fabric",
+                vec![
+                    ManagedArtifactPin::new(
+                        "AANobbMI",
+                        "abcdefgh",
+                        "fixture-managed.jar",
+                        url,
+                        bytes.len() as u64,
+                        format!("{:x}", Sha512::digest(&bytes)),
+                        ManagedArtifactRole::Root,
+                    )
+                    .unwrap(),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+            let inspection = self
+                .services
+                .performance
+                .install_plan_for_test(&self.instance, plan, transfers)
+                .await
+                .unwrap();
+            assert_eq!(inspection.health, axial_performance::BundleHealth::Healthy);
+            assert_eq!(inspection.state.unwrap().installed_mods.len(), 1);
+            assert!(!inspection.rollback_snapshots.is_empty());
+            stop.send(()).unwrap();
+            server.await.unwrap();
+        }
+
+        async fn close(self) {
+            self.services.server.shutdown().await.unwrap();
+            drop(self.services);
+            drop(self.root);
+        }
+    }
+
+    fn jar(id: &str) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(
+                serde_json::to_string(&json!({"schemaVersion":1,"id":id,"version":"1.0.0"}))
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    async fn get_json(router: Router, path: &str) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn files(root: &FilePath) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut pending = vec![root.to_owned()];
+        let mut files = BTreeMap::new();
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files.insert(
+                        entry.path().strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    #[tokio::test]
+    async fn performance_projection_instance_plan_uses_admitted_installed_mods() {
+        let fixture = ProjectionFixture::new().await;
+        let router = fixture.signed_rules_router();
+        let before = files(&fixture.mods);
+        let query = "/api/v1/performance/plan?game_version=1.20.1&loader=fabric&mode=managed";
+        let request_only = get_json(router.clone(), query).await;
+        let instance = get_json(
+            router.clone(),
+            &format!("{query}&instance_id={}", fixture.instance),
+        )
+        .await;
+        let after = files(&fixture.mods);
+        drop(router);
+        fixture.close().await;
+        assert_eq!(request_only.0, StatusCode::OK, "{}", request_only.1);
+        assert!(
+            request_only.1["effective"]["managed_artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|artifact| artifact["slug"] == "nvidium")
+        );
+        assert_eq!(instance.0, StatusCode::OK, "{}", instance.1);
+        assert!(
+            instance.1["effective"]["managed_artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|artifact| artifact["slug"] != "nvidium"),
+            "{}",
+            instance.1
+        );
+        assert!(
+            instance.1["effective"]["explanation"]["details"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning == "nvidium skipped: incompatible with managed mod iris")
+        );
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn performance_projection_managed_health_retains_plan_warnings() {
+        let fixture = ProjectionFixture::new().await;
+        let router = fixture.signed_rules_router();
+        let before = files(&fixture.mods);
+        let response = get_json(
+            router.clone(),
+            &format!(
+                "/api/v1/performance/health?instance_id={}",
+                fixture.instance
+            ),
+        )
+        .await;
+        let after = files(&fixture.mods);
+        drop(router);
+        fixture.close().await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        assert!(
+            response.1["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning == "nvidium skipped: incompatible with managed mod iris"),
+            "{}",
+            response.1
+        );
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn performance_projection_nonmanaged_health_is_disabled_without_file_changes() {
+        let fixture = ProjectionFixture::new().await;
+        fixture.seed_managed().await;
+        let before = files(&fixture.mods);
+        let mut responses = Vec::new();
+        for mode in ["custom", "vanilla"] {
+            fixture
+                .services
+                .instances
+                .update(
+                    &fixture.instance,
+                    serde_json::from_value::<InstancePatch>(json!({"performance_mode":mode}))
+                        .unwrap(),
+                )
+                .unwrap();
+            let admission = fixture
+                .services
+                .performance
+                .instances()
+                .admit(&fixture.instance)
+                .unwrap();
+            responses.push(
+                get_json(
+                    fixture.router(),
+                    &format!(
+                        "/api/v1/performance/health?instance_id={}",
+                        fixture.instance
+                    ),
+                )
+                .await,
+            );
+            admission.validate_current().unwrap();
+            drop(admission);
+        }
+        let after = files(&fixture.mods);
+        let pending = fixture
+            .services
+            .settings
+            .metadata()
+            .read(|db| -> Result<i64, StorageError> {
+                Ok(
+                    db.query_row("SELECT count(*) FROM performance_operations", [], |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
+            .unwrap();
+        fixture.close().await;
+        for (status, response) in responses {
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(response["health"], "disabled", "{response}");
+            assert_eq!(response["warnings"], json!([]));
+            assert_eq!(response["view_model"]["tone"], "mute");
+            assert_eq!(response["view_model"]["actions"], json!([]));
+            assert_eq!(response["view_model"]["title"], "No managed bundle");
+            assert_eq!(response["rollback_available"], false);
+        }
+        assert_eq!(before, after);
+        assert_eq!(pending, 0);
+    }
 
     #[test]
     fn operation_projection_preserves_history_and_unchanged_live_wire() {

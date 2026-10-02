@@ -1,7 +1,7 @@
 //! Public health is derived from exact admitted leaf inspection.
 
 use super::model::*;
-use axial_performance::ManagedCompositionInspection;
+use axial_performance::{ManagedCompositionInspection, ManagedResolvedInspection};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
@@ -12,6 +12,38 @@ pub struct PerformanceHealthResponse {
     pub managed_artifacts: Vec<PerformanceManagedArtifactSummary>,
     pub rollback_available: bool,
     pub view_model: PerformancePlanSummaryViewModel,
+}
+
+/// Selected non-managed mode does not inspect or settle retained managed files.
+pub fn disabled_health_response() -> PerformanceHealthResponse {
+    PerformanceHealthResponse {
+        state: None,
+        health: BundleHealth::Disabled,
+        warnings: Vec::new(),
+        managed_artifacts: Vec::new(),
+        rollback_available: false,
+        view_model: PerformancePlanSummaryViewModel {
+            state_id: "performance_summary_disabled".into(),
+            title: "No managed bundle".into(),
+            detail: "Memory allocation and Java detection are shown below.".into(),
+            tone: ViewModelTone::Mute,
+            health: Some("disabled".into()),
+            composition_id: None,
+            managed_artifact_count: 0,
+            actions: Vec::new(),
+        },
+    }
+}
+
+pub fn resolved_health_response(
+    mut resolved: ManagedResolvedInspection,
+) -> PerformanceHealthResponse {
+    resolved
+        .plan
+        .warnings
+        .append(&mut resolved.inspection.warnings);
+    resolved.inspection.warnings = resolved.plan.warnings;
+    health_response(resolved.inspection)
 }
 
 pub fn health_response(inspection: ManagedCompositionInspection) -> PerformanceHealthResponse {
