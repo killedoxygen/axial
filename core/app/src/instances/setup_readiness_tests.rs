@@ -436,7 +436,10 @@ async fn scanner_ready_artifact_drift_offers_install_without_masking_transient_b
     drop(publication);
     let runtime_block = service.enrich(instance.clone(), &versions).await;
     assert_eq!(runtime_block.launch_action.primary_action, "blocked");
-    assert!(runtime_block.status_detail.contains("Java runtime"));
+    assert_eq!(
+        runtime_block.status_detail,
+        "The selected Java executable is missing."
+    );
     std::fs::write(
         root.path().join("versions/1.21.4/1.21.4.jar"),
         b"externally changed",
@@ -516,13 +519,16 @@ async fn absent_or_unready_catalog_does_not_turn_launch_blocks_into_install_perm
     drop(publication);
 
     let runtime = service.launch.preflight(instance.id.clone()).await;
-    assert_eq!(runtime.error.unwrap().code, LaunchError::RuntimeUnavailable);
+    assert_eq!(
+        serde_json::to_value(runtime.error.unwrap()).unwrap()["code"],
+        "runtime_unavailable"
+    );
     for catalog in unready_catalogs(&versions) {
         let blocked = service.enrich(instance.clone(), &catalog).await;
         assert_eq!(blocked.launch_action.primary_action, "blocked");
         assert_eq!(
             blocked.status_detail,
-            LaunchError::RuntimeUnavailable.to_string()
+            "The selected Java executable is missing."
         );
         assert!(blocked.needs_install.is_empty());
     }
@@ -1011,7 +1017,7 @@ async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
     assert_eq!(rows[2].launch_action.primary_action, "blocked");
     assert_eq!(
         rows[2].status_detail,
-        LaunchError::RuntimeUnavailable.to_string()
+        "The selected Java executable is missing."
     );
     assert_eq!(
         service

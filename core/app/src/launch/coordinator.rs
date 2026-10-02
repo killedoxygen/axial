@@ -71,7 +71,7 @@ use crate::{
     },
     library::{ApplicationRootPin, GenerationPin},
     performance::{PerformanceMutationError, PerformanceService},
-    runtime::discovery::RuntimeDiscovery,
+    runtime::{discovery::RuntimeDiscovery, model::JavaDiscoveryError},
     settings::{EffectiveLaunchSettings, SettingsStore},
     tasks::{CancellationToken, ExclusionLease, TaskOwner},
 };
@@ -305,7 +305,7 @@ impl LaunchCoordinator {
                 let admitted = match self.admit(&request.instance_id) {
                     Ok(admitted) => admitted,
                     Err(error) => {
-                        self.intents.settle(&key, Err(error));
+                        self.intents.settle(&key, Err(error.clone()));
                         return Err(error);
                     }
                 };
@@ -535,7 +535,7 @@ impl LaunchCoordinator {
                             .runtimes
                             .select(&required, &settings.java_path, &cancel)
                             .await
-                            .map_err(|_| LaunchError::RuntimeUnavailable)?;
+                            .map_err(LaunchError::RuntimeFailure)?;
                         let contribution =
                             axial_performance::effective_performance_plan(performance.plan());
                         let options = launch_options(&settings, target, &contribution)?;
@@ -677,7 +677,7 @@ impl LaunchCoordinator {
             .runtimes
             .select(&required, &effective.java_path, cancellation)
             .await
-            .map_err(|_| LaunchError::RuntimeUnavailable)?;
+            .map_err(LaunchError::RuntimeFailure)?;
         if cancellation.is_cancelled() {
             return Err(LaunchError::Cancelled);
         }
@@ -997,7 +997,7 @@ fn validate_intent_key(key: &str) -> Result<(), LaunchError> {
 }
 
 /// Only bounded domain text can cross the transport boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchError {
     #[error("The launch request is invalid.")]
@@ -1060,6 +1060,17 @@ pub enum LaunchError {
     Closed,
     #[error("The launch could not be prepared. Its status is retained for inspection.")]
     PreparationFailed,
+    #[error("{0}")]
+    #[serde(untagged, skip_deserializing)]
+    RuntimeFailure(#[serde(serialize_with = "serialize_runtime_failure")] JavaDiscoveryError),
+}
+
+fn serialize_runtime_failure<S: serde::Serializer>(
+    _: &JavaDiscoveryError,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    // Keep code-only persisted refusals compatible; fresh responses retain the cause.
+    LaunchError::RuntimeUnavailable.serialize(serializer)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1644,7 +1655,7 @@ impl LaunchIntents {
                 "pending" => {
                     // No process was authorized. Ordinary launch recovery only
                     // reads status; do not leave it waiting for a lost worker.
-                    self.reject(key, LaunchError::PreparationFailed)?;
+                    self.reject(key, &LaunchError::PreparationFailed)?;
                     LaunchIntentStatus::Rejected {
                         error: LaunchError::PreparationFailed.into(),
                     }
@@ -1782,7 +1793,7 @@ impl LaunchIntents {
             return;
         }
         let result = match result {
-            Err(error) => self.reject(key, error).and(Err(error)),
+            Err(error) => self.reject(key, &error).and(Err(error)),
             success => success,
         };
         entry.status.send_replace(match result {
@@ -1793,7 +1804,7 @@ impl LaunchIntents {
         });
     }
 
-    fn reject(&self, key: &str, error: LaunchError) -> Result<(), LaunchError> {
+    fn reject(&self, key: &str, error: &LaunchError) -> Result<(), LaunchError> {
         if let Some(storage) = &self.storage {
             let error =
                 serde_json::to_string(&error).map_err(|_| LaunchError::IntentUnavailable)?;
@@ -2102,6 +2113,208 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn assert_runtime_failure_keeps_safe_cause(missing: bool, launch: bool) {
+        let (root, coordinator, id) = preflight_fixture().await;
+        let storage = Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
+        let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
+        let coordinator = coordinator
+            .with_storage(storage.clone(), reports.clone())
+            .unwrap();
+        let before = coordinator.instances.registry().get_live(&id).unwrap();
+        let game = coordinator
+            .instances
+            .admit_read(&id)
+            .unwrap()
+            .game_directory()
+            .read_projection()
+            .unwrap();
+        let canary = game.join("runtime-refusal-canary.txt");
+        std::fs::write(&canary, b"preserve instance files").unwrap();
+        let game_names = || {
+            let mut names = std::fs::read_dir(&game)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let names_before = game_names();
+        let pin = coordinator.instances.library().admit().unwrap();
+        let installed = coordinator
+            .installs
+            .ready_version(&pin, "1.20.1")
+            .await
+            .unwrap();
+        let version = installed.version();
+        let required = axial_minecraft::effective_java_version_for(
+            "1.20.1",
+            &version.kind,
+            &version.java_version,
+        )
+        .major_version;
+        let actual = required + 1;
+        let java = root.path().join("probe-java");
+        let expected = if missing {
+            std::fs::remove_file(&java).unwrap();
+            "The selected Java executable is missing.".to_owned()
+        } else {
+            std::fs::write(
+                &java,
+                format!(
+                    "#!/bin/sh\nprobe_dir=${{0%/*}}\nif [ \"$#\" -ne 2 ] || [ \"$1\" != '-XshowSettings:properties' ] || [ \"$2\" != '-version' ]; then\n  printf 'unexpected game invocation' > \"$probe_dir/game-started\"\n  exit 1\nfi\nprintf '%s\\n' \"$$\" > \"$probe_dir/probe-started\"\nprintf 'private-probe-output --accessToken private-probe-token\\njava.version = {actual}.0.3\\nos.arch = {}\\njava.vendor = PrivateProbeVendor\\n' >&2\n",
+                    std::env::consts::ARCH,
+                ),
+            )
+            .unwrap();
+            format!("Java {required} is required; the selected executable provides Java {actual}.")
+        };
+        let mut request = request();
+        request.instance_id = id.clone();
+        request.username = Some(
+            coordinator
+                .accounts
+                .capture_selected()
+                .unwrap()
+                .display_name()
+                .to_owned(),
+        );
+        let key = request.intent_key.clone().unwrap();
+        let response = if launch {
+            coordinator
+                .launch(request.clone())
+                .await
+                .map(|_| None)
+                .unwrap_or_else(|error| Some(LaunchErrorResponse::from(error)))
+        } else {
+            let result = coordinator.preflight(id.clone()).await;
+            assert!(!result.launchable);
+            result.error
+        };
+        coordinator
+            .tasks
+            .shutdown(std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(coordinator.tasks.status().is_idle());
+        assert!(coordinator.sessions.snapshots().is_empty());
+        assert!(reports.list_recent(10).unwrap().is_empty());
+        assert!(!root.path().join("game-started").exists());
+        if missing {
+            assert!(!root.path().join("probe-started").exists());
+        } else {
+            let pid: i32 = std::fs::read_to_string(root.path().join("probe-started"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+        assert_eq!(
+            coordinator.instances.registry().get_live(&id).unwrap(),
+            before
+        );
+        assert_eq!(game_names(), names_before);
+        assert_eq!(std::fs::read(canary).unwrap(), b"preserve instance files");
+        installed.revalidate().unwrap();
+        let pending: i64 = storage
+            .read(|db| -> Result<_, StorageError> {
+                Ok(db.query_row(
+                    "SELECT (SELECT count(*) FROM performance_operations) + (SELECT count(*) FROM performance_commands) + (SELECT count(*) FROM content_batches) + (SELECT count(*) FROM launch_intents WHERE state != 'rejected')",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(pending, 0);
+        let response = response.expect("the runtime refusal must reach the consumer");
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(wire["code"], "runtime_unavailable");
+        if launch {
+            let Some(LaunchIntentStatus::Rejected { error }) = coordinator.intent(&key).unwrap()
+            else {
+                panic!("the launch refusal must settle its intent");
+            };
+            assert_eq!(serde_json::to_value(error).unwrap(), wire);
+            let replay = coordinator.launch(request).await.unwrap_err();
+            assert_eq!(
+                serde_json::to_value(LaunchErrorResponse::from(replay)).unwrap(),
+                wire
+            );
+        } else {
+            assert!(coordinator.intent(&key).unwrap().is_none());
+        }
+        let serialized = wire.to_string();
+        for private in [
+            root.path().to_str().unwrap(),
+            "probe-java",
+            "private-probe-output",
+            "private-probe-token",
+            "PrivateProbeVendor",
+            "--accessToken",
+            "-XshowSettings:properties",
+        ] {
+            assert!(
+                !serialized.contains(private),
+                "private runtime detail escaped"
+            );
+        }
+        assert_eq!(
+            wire,
+            serde_json::json!({"code":"runtime_unavailable", "error":expected})
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preflight_missing_java_keeps_safe_cause() {
+        assert_runtime_failure_keeps_safe_cause(true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preflight_wrong_java_major_keeps_safe_cause() {
+        assert_runtime_failure_keeps_safe_cause(false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_missing_java_keeps_safe_cause() {
+        assert_runtime_failure_keeps_safe_cause(true, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_wrong_java_major_keeps_safe_cause() {
+        assert_runtime_failure_keeps_safe_cause(false, true).await;
+    }
+
+    #[test]
+    fn runtime_failure_keeps_existing_code_and_legacy_deserialization() {
+        let cause = JavaDiscoveryError::IncompatibleVersion {
+            required: 17,
+            actual: 21,
+        };
+        let response = LaunchErrorResponse::from(LaunchError::RuntimeFailure(cause.clone()));
+        assert_eq!(response.error, cause.to_string());
+        let code = serde_json::to_value(response.code).unwrap();
+        assert_eq!(code, serde_json::json!("runtime_unavailable"));
+        assert_eq!(
+            serde_json::from_value::<LaunchError>(code).unwrap(),
+            LaunchError::RuntimeUnavailable
+        );
+        assert!(
+            serde_json::from_value::<LaunchError>(serde_json::json!({
+                "runtime_failure": {"required":17, "actual":21}
+            }))
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn preflight_projection_reuses_verified_install_but_ordinary_reads_stay_fresh() {
         let (root, coordinator, id) = preflight_fixture().await;
@@ -2392,7 +2605,11 @@ mod tests {
             ("foreground", false, Some(LaunchError::InstanceBusy)),
             ("foreground", true, Some(LaunchError::InstanceBusy)),
             ("display", false, None),
-            ("none", true, Some(LaunchError::RuntimeUnavailable)),
+            (
+                "none",
+                true,
+                Some(LaunchError::RuntimeFailure(JavaDiscoveryError::Failed)),
+            ),
         ] {
             let (root, coordinator, id) = preflight_fixture().await;
             let mut projection = coordinator.preflight_projection();
