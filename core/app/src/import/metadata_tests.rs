@@ -61,11 +61,14 @@ fn stores(path: &Path) -> (SettingsStore, AccountDirectory) {
             METADATA_IMPORT_HISTORY_MIGRATION,
             METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
             METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
             install_history::MIGRATION,
             crate::launch::reports::REPORT_MIGRATION,
             crate::performance::benchmarks::MIGRATION,
             crate::performance::benchmarks::MIGRATION_V2,
             crate::performance::benchmarks::MIGRATION_V3,
+            crate::performance::mutation::MIGRATION,
+            crate::performance::mutation::MIGRATION_V2,
         ])
         .unwrap();
     let settings = SettingsStore::new_with_telemetry_identity(Arc::clone(&store), true).unwrap();
@@ -103,6 +106,413 @@ fn global_journal(source: &Fixture, change: impl FnOnce(&mut Value)) {
     let path = source.baseline.join("state/operation-journals.json");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+}
+
+fn archived_performance_journal(source: &Fixture, change: impl FnOnce(&mut Value)) {
+    let mut journal = crate::import::tests::terminal_performance_journal();
+    for entry in journal["entries"].as_array_mut().unwrap() {
+        entry["intent"]["intent"]["instance_id"] = json!("0000000000000002");
+        entry["targets"][0]["id"] = json!("0000000000000002");
+    }
+    change(&mut journal);
+    let path = source.baseline.join("state/operation-journals.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+}
+
+#[test]
+fn archived_performance_metadata_preserves_missing_target_evidence_and_reopen() {
+    let source = Fixture::new();
+    archived_performance_journal(&source, |_| {});
+    let before = snapshot(&source.baseline);
+    let (prepared, request) = prepare(&source);
+    let destination = Destination::new();
+    let receipt = destination
+        .commit(&prepared, &request)
+        .unwrap()
+        .response
+        .receipt;
+    assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
+    assert_eq!(destination.settings.current().unwrap().revision, 1);
+    assert_eq!(
+        serde_json::to_value(&receipt).unwrap()["archived_performance_operation_count"],
+        6
+    );
+    let records = performance_rows(&destination);
+    assert_eq!(records.len(), 6);
+    let journal: Value = serde_json::from_slice(
+        &fs::read(source.baseline.join("state/operation-journals.json")).unwrap(),
+    )
+    .unwrap();
+    for (_, instance, state, bytes) in &records {
+        assert_eq!(
+            instance,
+            &format!("archived-{}-0000000000000002", prepared.source_id)
+        );
+        assert_eq!(state, "historical");
+        let value: Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(value["instance_id"], *instance);
+        assert_eq!(
+            value["evidence"]["intent"]["instance_id"],
+            "0000000000000002"
+        );
+        let original = journal["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["operation_id"] == value["evidence"]["operation_id"])
+            .unwrap();
+        assert_eq!(value["evidence"]["intent"], original["intent"]["intent"]);
+        assert_eq!(
+            value["evidence"]["terminal"],
+            original["intent"]["phase"]["terminal"]
+        );
+        assert_eq!(value["created_at"], original["intent"]["created_at"]);
+        assert_eq!(value["updated_at"], original["intent"]["updated_at"]);
+    }
+    assert_eq!(
+        destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt,
+        receipt
+    );
+    let (reopened, _) = stores(&destination._root.path().join("metadata.sqlite"));
+    assert_eq!(
+        metadata_status(&reopened, &request.metadata_import_id)
+            .unwrap()
+            .receipt,
+        Some(receipt)
+    );
+    assert_eq!(performance_rows(&destination), records);
+    let pending = destination
+        .settings
+        .metadata()
+        .read(|db| -> Result<u32, StorageError> {
+            Ok(
+                db.query_row("SELECT count(*) FROM performance_operations", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        })
+        .unwrap();
+    assert_eq!(pending, 0);
+    assert_eq!(snapshot(&source.baseline), before);
+}
+
+fn performance_rows(destination: &Destination) -> Vec<(String, String, String, Vec<u8>)> {
+    destination
+        .settings
+        .metadata()
+        .read(|db| -> Result<_, StorageError> {
+            Ok(db
+                .prepare(
+                    "SELECT id,instance_id,state,payload FROM performance_commands ORDER BY id",
+                )?
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<Result<_, _>>()?)
+        })
+        .unwrap()
+}
+
+#[test]
+fn archived_performance_old_receipt_completion_preserves_later_edits() {
+    let source = Fixture::new();
+    archived_performance_journal(&source, |_| {});
+    let (prepared, request) = prepare(&source);
+    let destination = Destination::new();
+    let mut old = prepared.clone();
+    old.archived_operations = None;
+    let mut receipt = destination.commit(&old, &request).unwrap().response.receipt;
+    assert!(
+        !serde_json::to_value(&receipt)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("archived_performance_operation_count")
+    );
+    assert!(performance_rows(&destination).is_empty());
+    destination.accounts.select(SECOND).unwrap();
+    let accounts = destination.accounts.snapshot().unwrap();
+    let config = destination
+        .settings
+        .update(ConfigPatch {
+            expected_revision: 1,
+            theme: Some(ConfigTheme::Birch),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    let changes = destination.settings.subscribe().unwrap();
+    receipt.archived_performance_operation_count = Some(6);
+    let completed = destination.commit(&prepared, &request).unwrap();
+    assert!(completed.response.already_imported);
+    assert_eq!(completed.response.receipt, receipt);
+    assert_eq!(completed.settings.config, config);
+    assert_eq!(destination.accounts.snapshot().unwrap(), accounts);
+    assert!(!changes.has_changed().unwrap());
+    let rows = performance_rows(&destination);
+    assert_eq!(rows.len(), 6);
+    destination.commit(&prepared, &request).unwrap();
+    let (reopened, _) = stores(&destination._root.path().join("metadata.sqlite"));
+    assert_eq!(
+        metadata_status(&reopened, &request.metadata_import_id)
+            .unwrap()
+            .receipt,
+        Some(receipt)
+    );
+    assert_eq!(performance_rows(&destination), rows);
+}
+
+#[test]
+fn archived_performance_optional_refusal_never_claims_missing_or_unsupported_history_empty() {
+    for case in [
+        "empty",
+        "live",
+        "schema",
+        "duplicate",
+        "active",
+        "spoof",
+        "bad_proof",
+        "registry",
+        "malformed",
+        "directory",
+        "ancestor_file",
+        "state_alias",
+        "file_alias",
+    ] {
+        let source = Fixture::new();
+        archived_report(&source, |_| {});
+        if case != "empty" {
+            archived_performance_journal(&source, |journal| match case {
+                "live" => {
+                    for entry in journal["entries"].as_array_mut().unwrap() {
+                        entry["intent"]["intent"]["instance_id"] = json!("0000000000000001");
+                        entry["targets"][0]["id"] = json!("0000000000000001");
+                    }
+                }
+                "schema" => journal["schema"] = json!("axial.state.operation_journals.v9"),
+                "duplicate" => journal["entries"][1] = journal["entries"][0].clone(),
+                "active" => journal["entries"][0]["intent"]["phase"]["phase"] = json!("prepared"),
+                "spoof" => journal["entries"][0]["intent"] = json!({"kind":"generic"}),
+                "bad_proof" => {
+                    journal["entries"][5]["intent"]["phase"]["terminal"]["prepared"]["proof"]["graph_sha512"] =
+                        json!("invalid")
+                }
+                _ => {}
+            });
+        }
+        let path = source.baseline.join("state/operation-journals.json");
+        match case {
+            "registry" => {
+                let path = source.baseline.join("instances.json");
+                let mut registry: Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                registry["schema_version"] = json!(4);
+                fs::write(path, serde_json::to_vec(&registry).unwrap()).unwrap();
+            }
+            "malformed" => fs::write(path, b"{").unwrap(),
+            "directory" => {
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+            }
+            "ancestor_file" | "state_alias" | "file_alias" => {
+                let bytes = fs::read(&path).unwrap();
+                fs::remove_file(&path).unwrap();
+                if case == "file_alias" {
+                    fs::write(source.baseline.join("state/Operation-journals.json"), bytes)
+                        .unwrap();
+                } else {
+                    fs::remove_dir(source.baseline.join("state")).unwrap();
+                    if case == "ancestor_file" {
+                        fs::write(source.baseline.join("state"), bytes).unwrap();
+                    } else {
+                        fs::create_dir(source.baseline.join("State")).unwrap();
+                        fs::write(source.baseline.join("State/operation-journals.json"), bytes)
+                            .unwrap();
+                    }
+                }
+            }
+            _ => {}
+        }
+        let before = snapshot(&source.baseline);
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        let receipt = destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt;
+        assert_eq!(
+            receipt.archived_performance_operation_count,
+            matches!(case, "empty" | "live").then_some(0),
+            "{case}"
+        );
+        assert_eq!(
+            receipt.archived_launch_report_count,
+            (case != "registry").then_some(1),
+            "{case}"
+        );
+        if matches!(
+            case,
+            "directory" | "ancestor_file" | "state_alias" | "file_alias"
+        ) {
+            assert_eq!(receipt.global_install_history_count, None);
+            assert!(crate::import::history::prepare_rules_history(&source.capture()).is_err());
+        }
+        assert!(performance_rows(&destination).is_empty());
+        assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
+        assert_eq!(snapshot(&source.baseline), before);
+    }
+}
+
+#[test]
+fn archived_performance_publication_and_late_settings_write_are_atomic() {
+    for old in [false, true] {
+        for effect in [
+            "ignore_record",
+            "ignore_receipt",
+            "rewrite_record",
+            "late_settings",
+        ] {
+            if old && effect == "late_settings" {
+                continue;
+            }
+            let source = Fixture::new();
+            archived_performance_journal(&source, |_| {});
+            let (prepared, request) = prepare(&source);
+            let destination = Destination::new();
+            if old {
+                let mut previous = prepared.clone();
+                previous.archived_operations = None;
+                destination.commit(&previous, &request).unwrap();
+            }
+            let config = destination.settings.current().unwrap();
+            let accounts = destination.accounts.snapshot().unwrap();
+            let receipt = metadata_status(&destination.settings, &request.metadata_import_id)
+                .unwrap()
+                .receipt;
+            let changes = destination.settings.subscribe().unwrap();
+            let action = if old {
+                "UPDATE OF archived_performance_operation_proof"
+            } else {
+                "INSERT"
+            };
+            let trigger = match effect {
+                "ignore_record" => "BEFORE INSERT ON performance_commands BEGIN SELECT RAISE(IGNORE); END;".to_owned(),
+                "ignore_receipt" => format!("BEFORE {action} ON profile_metadata_imports BEGIN SELECT RAISE(IGNORE); END;"),
+                "rewrite_record" => format!("AFTER {action} ON profile_metadata_imports BEGIN UPDATE performance_commands SET payload=CAST('{{}}' AS BLOB); END;"),
+                _ => "AFTER UPDATE ON settings_config BEGIN UPDATE performance_commands SET state='queued'; END;".to_owned(),
+            };
+            destination
+                .settings
+                .metadata()
+                .transaction(|tx| -> Result<(), StorageError> {
+                    tx.execute_batch(&format!("CREATE TRIGGER corrupt_operations {trigger}"))?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                destination.commit(&prepared, &request).is_err(),
+                "{old}/{effect}"
+            );
+            assert_eq!(destination.settings.current().unwrap(), config);
+            assert_eq!(destination.accounts.snapshot().unwrap(), accounts);
+            assert_eq!(
+                metadata_status(&destination.settings, &request.metadata_import_id)
+                    .unwrap()
+                    .receipt,
+                receipt
+            );
+            assert!(performance_rows(&destination).is_empty());
+            assert!(!changes.has_changed().unwrap());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn archived_performance_unsafe_journal_absence_preserves_independent_metadata() {
+    for ancestor in [false, true] {
+        let source = Fixture::new();
+        archived_report(&source, |_| {});
+        let external = source.baseline.parent().unwrap().join("private-journal");
+        fs::write(&external, b"not admitted").unwrap();
+        let link = if ancestor {
+            source.baseline.join("state")
+        } else {
+            fs::create_dir(source.baseline.join("state")).unwrap();
+            source.baseline.join("state/operation-journals.json")
+        };
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+        let before = snapshot(&source.baseline);
+        let inventory = source.capture();
+        assert!(crate::import::history::prepare_history(&inventory).is_err());
+        assert!(crate::import::history::prepare_rules_history(&inventory).is_err());
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        let receipt = destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt;
+        assert_eq!(receipt.archived_performance_operation_count, None);
+        assert_eq!(receipt.global_install_history_count, None);
+        assert_eq!(receipt.archived_launch_report_count, Some(1));
+        assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
+        assert_eq!(fs::read(external).unwrap(), b"not admitted");
+        assert_eq!(snapshot(&source.baseline), before);
+    }
+}
+
+#[test]
+fn archived_performance_completed_receipt_rejects_corruption_and_oversized_proofs_without_repair() {
+    for corruption in [
+        "missing",
+        "payload",
+        "binding",
+        "state",
+        "proof",
+        "oversized",
+        "multibyte",
+    ] {
+        let source = Fixture::new();
+        archived_performance_journal(&source, |_| {});
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        destination.commit(&prepared, &request).unwrap();
+        destination.settings.metadata().transaction(|tx| -> Result<(), StorageError> {
+            match corruption {
+                "missing" => { tx.execute("DELETE FROM performance_commands", [])?; }
+                "payload" => { tx.execute("UPDATE performance_commands SET payload=CAST('{}' AS BLOB)", [])?; }
+                "binding" => { tx.execute("UPDATE performance_commands SET instance_id='00000000-0000-4000-8000-000000000001'", [])?; }
+                "state" => { tx.execute("UPDATE performance_commands SET state='queued'", [])?; }
+                _ => {
+                    let proof = match corruption { "oversized" => " ".repeat(16*1024+1), "multibyte" => "é".repeat(9*1024), _ => "{}".to_owned() };
+                    if matches!(corruption, "oversized" | "multibyte") {
+                        assert!(tx.execute("UPDATE profile_metadata_imports SET archived_performance_operation_proof=?1", [&proof]).is_err());
+                        tx.execute_batch("PRAGMA ignore_check_constraints=ON")?;
+                    }
+                    tx.execute("UPDATE profile_metadata_imports SET archived_performance_operation_proof=?1", [&proof])?;
+                    tx.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
+                }
+            }
+            Ok(())
+        }).unwrap();
+        let rows = performance_rows(&destination);
+        assert!(
+            metadata_status(&destination.settings, &request.metadata_import_id).is_err(),
+            "{corruption}"
+        );
+        assert!(
+            destination.commit(&prepared, &request).is_err(),
+            "{corruption}"
+        );
+        assert_eq!(performance_rows(&destination), rows);
+        assert_eq!(destination.settings.current().unwrap().revision, 1);
+    }
 }
 
 fn archived_report(source: &Fixture, change: impl FnOnce(&mut Value)) {
@@ -1762,6 +2172,7 @@ fn v1_receipts_keep_historical_meaning_and_new_mapping_corruption_is_rejected() 
             METADATA_IMPORT_HISTORY_MIGRATION,
             METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
             METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
         ])
         .unwrap();
     let receipt = metadata_status(&old_settings, &old_id)

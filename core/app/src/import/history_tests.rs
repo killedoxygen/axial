@@ -781,6 +781,111 @@ fn detached_driver_co_publication_is_identical_in_both_import_orders() {
 }
 
 #[test]
+fn archived_performance_co_publication_preserves_exact_operations_in_both_orders() {
+    for metadata_first in [false, true] {
+        let fixture = Fixture::new();
+        let mut journal = crate::import::tests::terminal_performance_journal();
+        for entry in journal["entries"].as_array_mut().unwrap() {
+            entry["intent"]["intent"]["instance_id"] = json!(SECOND);
+            entry["targets"][0]["id"] = json!(SECOND);
+        }
+        let path = fixture.baseline.join("state/operation-journals.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let before = crate::import::tests::snapshot(&fixture.baseline);
+        let inventory = fixture.capture();
+        let source = inventory.source_identity().unwrap();
+        let archive = prepare_archived_operations(&inventory).unwrap();
+        let bound = prepare_history(&inventory)
+            .unwrap()
+            .for_instance(INSTANCE)
+            .unwrap()
+            .bind_instance(&InstanceId::new())
+            .unwrap();
+        assert!(inventory.preview().instances[0].ordinary_import_available);
+        let metadata = MetadataStore::in_memory().unwrap();
+        metadata
+            .migrate(&[
+                crate::performance::mutation::MIGRATION,
+                crate::performance::mutation::MIGRATION_V2,
+            ])
+            .unwrap();
+        let batches = if metadata_first {
+            [&archive, &bound.operations]
+        } else {
+            [&bound.operations, &archive]
+        };
+        for batch in batches {
+            metadata.transaction(|tx| batch.insert_in(tx)).unwrap();
+            metadata.read(|db| batch.verify_in(db)).unwrap();
+        }
+        let proof = archive.completion_proof(&source).unwrap();
+        assert_eq!(proof.count(), 6);
+        metadata.read(|db| proof.verify_in(db, &source)).unwrap();
+        let saved = metadata.read(|db| -> Result<Vec<(String, String, Vec<u8>)>, crate::storage::StorageError> {
+            Ok(db.prepare("SELECT instance_id,state,payload FROM performance_commands ORDER BY id")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?.collect::<Result<_, _>>()?)
+        }).unwrap();
+        assert_eq!(saved.len(), 6);
+        for (instance, state, bytes) in saved {
+            assert_eq!(instance, format!("archived-{source}-{SECOND}"));
+            assert_eq!(state, "historical");
+            let record: Value = serde_json::from_slice(&bytes).unwrap();
+            let original = journal["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["operation_id"] == record["evidence"]["operation_id"])
+                .unwrap();
+            assert_eq!(record["evidence"]["intent"], original["intent"]["intent"]);
+            assert_eq!(
+                record["evidence"]["terminal"],
+                original["intent"]["phase"]["terminal"]
+            );
+        }
+        assert_eq!(crate::import::tests::snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn archived_performance_does_not_waive_other_journal_families_or_unresolved_effects() {
+    for case in ["missing_content", "running_install", "unknown_command"] {
+        let fixture = Fixture::new();
+        let mut journal = crate::import::tests::terminal_performance_journal();
+        for entry in journal["entries"].as_array_mut().unwrap() {
+            entry["intent"]["intent"]["instance_id"] = json!(SECOND);
+            entry["targets"][0]["id"] = json!(SECOND);
+        }
+        let other = crate::import::tests::successful_install_journal();
+        let mut entry = other["entries"][if case == "missing_content" { 2 } else { 0 }].clone();
+        match case {
+            "missing_content" => entry["targets"][1]["id"] = json!(SECOND),
+            "running_install" => entry["status"] = json!("Running"),
+            _ => entry["command"] = json!("UnknownCommand"),
+        }
+        journal["entries"].as_array_mut().unwrap().push(entry);
+        journal["next_sequence"] = other["next_sequence"].clone();
+        let path = fixture.baseline.join("state/operation-journals.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let inventory = fixture.capture();
+        let archive = prepare_archived_operations(&inventory).unwrap();
+        assert_eq!(
+            archive
+                .completion_proof(&inventory.source_identity().unwrap())
+                .unwrap()
+                .count(),
+            6
+        );
+        assert!(prepare_history(&inventory).is_err(), "{case}");
+        assert!(
+            !inventory.preview().instances[0].ordinary_import_available,
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn terminal_conversion_preserves_neutral_fields_comparison_and_source_bytes() {
     let fixture = Fixture::new();
     let mut value = report();

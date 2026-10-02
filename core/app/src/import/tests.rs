@@ -3931,7 +3931,7 @@ fn successful_install_history_import_keeps_source_fences() {
     assert_eq!(snapshot(&fixture.baseline), before);
 }
 
-fn terminal_performance_journal() -> Value {
+pub(crate) fn terminal_performance_journal() -> Value {
     let cases = [
         (
             "install",
@@ -4514,7 +4514,7 @@ fn terminal_performance_import_rejects_incoherent_unknown_and_nonterminal_record
         "time",
         "proof",
         "unknown",
-        "source-instance",
+        "instance-identity",
         "error",
     ] {
         let fixture = Fixture::new();
@@ -4537,9 +4537,9 @@ fn terminal_performance_import_rejects_incoherent_unknown_and_nonterminal_record
                 journal["entries"][0]["intent"]["phase"]["terminal"]["changed_target"] = json!(true)
             }
             "unknown" => journal["entries"][0]["retained_effect"] = json!({"must":"survive"}),
-            "source-instance" => {
-                journal["entries"][0]["intent"]["intent"]["instance_id"] = json!(SECOND);
-                journal["entries"][0]["targets"][0]["id"] = json!(SECOND);
+            "instance-identity" => {
+                journal["entries"][0]["intent"]["intent"]["instance_id"] = json!("invalid");
+                journal["entries"][0]["targets"][0]["id"] = json!("invalid");
             }
             "error" => {
                 journal["entries"][3]["intent"]["phase"]["terminal"]["error"] =

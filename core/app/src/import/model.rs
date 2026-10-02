@@ -139,6 +139,8 @@ pub struct MetadataImportReceipt {
     pub archived_launch_report_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_benchmark_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_performance_operation_count: Option<usize>,
     pub settings_revision: u64,
     pub account_selection_revision: u64,
 }

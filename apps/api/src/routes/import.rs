@@ -492,9 +492,12 @@ pub(super) mod tests {
                     axial_app::import::METADATA_IMPORT_HISTORY_MIGRATION,
                     axial_app::import::METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
                     axial_app::import::METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
+                    axial_app::import::METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
                     axial_app::performance::benchmarks::MIGRATION,
                     axial_app::performance::benchmarks::MIGRATION_V2,
                     axial_app::performance::benchmarks::MIGRATION_V3,
+                    axial_app::performance::mutation::MIGRATION,
+                    axial_app::performance::mutation::MIGRATION_V2,
                     axial_app::performance::rules::MIGRATION,
                     axial_app::performance::rules::IMPORT_MIGRATION,
                 ])
@@ -2227,6 +2230,10 @@ pub(super) mod tests {
         assert_eq!(response["receipt"]["archived_launch_report_count"], 0);
         assert_eq!(response["receipt"]["archived_benchmark_count"], 0);
         assert_eq!(
+            response["receipt"]["archived_performance_operation_count"],
+            0
+        );
+        assert_eq!(
             response["receipt"]["metadata_import_id"],
             request["metadata_import_id"]
         );
@@ -3085,6 +3092,7 @@ pub(super) mod tests {
                 None,
                 "development",
                 false,
+                false,
             )
             .await;
         }
@@ -3092,7 +3100,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn composed_metadata_import_retains_deleted_instance_reports_without_instances() {
-        composed_deleted_instance_report_import(None, None, "development", false).await;
+        composed_deleted_instance_report_import(None, None, "development", false, false).await;
     }
 
     #[tokio::test]
@@ -3103,6 +3111,7 @@ pub(super) mod tests {
                 Some(true),
                 "development",
                 false,
+                false,
             )
             .await;
         }
@@ -3110,12 +3119,14 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn composed_metadata_import_retains_deleted_instance_benchmarks_without_instances() {
-        composed_deleted_instance_report_import(None, Some(true), "development", false).await;
+        composed_deleted_instance_report_import(None, Some(true), "development", false, false)
+            .await;
     }
 
     #[tokio::test]
     async fn composed_metadata_import_retains_deleted_instance_all_pending_benchmarks() {
-        composed_deleted_instance_report_import(None, Some(false), "development", false).await;
+        composed_deleted_instance_report_import(None, Some(false), "development", false, false)
+            .await;
     }
 
     #[tokio::test]
@@ -3125,6 +3136,7 @@ pub(super) mod tests {
                 None,
                 Some(completed),
                 "release_validation",
+                false,
                 false,
             )
             .await;
@@ -3139,6 +3151,21 @@ pub(super) mod tests {
                 Some(true),
                 "development",
                 true,
+                false,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn composed_metadata_import_retains_deleted_instance_performance_operation() {
+        for import_before_metadata in [None, Some(true), Some(false)] {
+            composed_deleted_instance_report_import(
+                import_before_metadata,
+                None,
+                "development",
+                false,
+                true,
             )
             .await;
         }
@@ -3149,6 +3176,7 @@ pub(super) mod tests {
         completed_benchmark_run: Option<bool>,
         benchmark_mode: &str,
         parent_pruned: bool,
+        with_performance_operation: bool,
     ) {
         let has_survivor = import_before_metadata.is_some();
         let with_benchmarks = completed_benchmark_run.is_some();
@@ -3184,7 +3212,39 @@ pub(super) mod tests {
             "stages":[{"stage":"starting","label":"Starting process","started_at_ms":10,"ended_at_ms":510,"duration_ms":500,
                 "result":"complete","warnings":[],"fallback_reason":null,"evidence":[
                     {"id":"command_prepared","system":"execution","summary":"Command prepared","details":["arg_count:3"]}
-                ]}]
+            ]}]
+        });
+        let operation_fixture = with_performance_operation.then(|| {
+            let intent = json!({
+                "instance_id":"0000000000000002","requested_action":"install","action":"install",
+                "base_target_id":"old-composition","rollback":"Unavailable",
+                "game_version":"1.20.1","loader":"fabric","mode":"managed"
+            });
+            let terminal = json!({
+                "outcome":"succeeded","prepared":{"result_target_id":"old-composition","proof":{
+                    "proof":"install_plan","graph_sha512":"a".repeat(128),"artifact_count":1_000_000,"aggregate_bytes":u64::MAX
+                }},"changed_target":true,"rollback":"Available"
+            });
+            let operation = "op-00000000-0000-4000-8000-000000000001";
+            let journal = json!({
+                "schema":"axial.state.operation_journals.v10","next_sequence":2,
+                "entries":[{
+                    "journal_id":format!("journal-{operation}"),"operation_id":operation,"sequence":1,
+                    "command":"ApplyPerformancePlan","intent":{
+                        "kind":"performance","intent":intent,"phase":{"phase":"terminal","terminal":terminal},
+                        "created_at":"2024-02-29T12:34:56.000Z","updated_at":"2024-02-29T12:35:56.000Z"
+                    },"status":"Succeeded","owner":"Application","ownership":"CompositionManaged",
+                    "targets":[
+                        {"system":"State","kind":"Instance","id":"0000000000000002","ownership":"CompositionManaged"},
+                        {"system":"Performance","kind":"PerformanceComposition","id":"old-composition","ownership":"CompositionManaged"}
+                    ],"planned_steps":[],"completed_steps":[],"failure_point":null,"rollback":"Available",
+                    "guardian_diagnosis_ids":[],"outcome":"Succeeded","reconciliation_attempt":null,"reconciliation_terminal":null,
+                    "persisted_state_repair_attempt":null,"persisted_state_repair_terminal":null,"guardian_install_terminal":null
+                }]
+            });
+            fs::create_dir(baseline.join("state")).unwrap();
+            fs::write(baseline.join("state/operation-journals.json"), serde_json::to_vec(&journal).unwrap()).unwrap();
+            json!({"operation_id":operation,"sequence":1,"intent":intent,"terminal":terminal})
         });
         let mut prior = report.clone();
         prior["session_id"] = json!("session-deleted-before");
@@ -3267,6 +3327,9 @@ pub(super) mod tests {
             "benchmarks/launch/session-deleted.json",
             "benchmarks/launch/session-deleted-before.json",
         ];
+        if with_performance_operation {
+            source_files.push("state/operation-journals.json");
+        }
         if with_benchmarks {
             if !parent_pruned {
                 source_files.push("benchmarks/suites/suite-dev-0000000000000002.json");
@@ -3543,6 +3606,66 @@ pub(super) mod tests {
                 (suite_path, suite),
             ]
         };
+        let read_operation = || async {
+            let Some(expected) = &operation_fixture else {
+                return None;
+            };
+            let rows = services.settings.metadata().read::<_, StorageError>(|db| {
+                Ok(db.prepare("SELECT id,instance_id,state,payload FROM performance_commands ORDER BY id")?
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?)))?
+                    .collect::<Result<Vec<_>, _>>()?)
+            }).unwrap();
+            assert_eq!(rows.len(), 1);
+            let (id, instance, state, bytes) = &rows[0];
+            assert!(id.starts_with("legacy-performance-"));
+            assert!(instance.starts_with("archived-") && instance.ends_with("-0000000000000002"));
+            assert_eq!(state, "historical");
+            assert!(uuid::Uuid::parse_str(instance).is_err());
+            let path = format!("/api/v1/performance/operations/{id}");
+            let operation: Value = request(Method::GET, &path)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(operation["instance_id"], *instance);
+            assert_eq!(operation["history"], *expected);
+            assert_eq!(operation["state"], "complete");
+            assert_eq!(operation["action"], "install");
+            assert_eq!(operation["created_at"], "2024-02-29T12:34:56.000Z");
+            assert_eq!(operation["updated_at"], "2024-02-29T12:35:56.000Z");
+            assert_eq!(
+                operation["view_model"]["title"],
+                "Historical Performance operation"
+            );
+            assert!(operation["error"].is_null());
+            assert_eq!(
+                request(
+                    Method::GET,
+                    &format!("/api/v1/performance/instances/{instance}/operation")
+                )
+                .send()
+                .await
+                .unwrap()
+                .status(),
+                StatusCode::BAD_REQUEST
+            );
+            for action in ["apply", "remove", "rollback"] {
+                assert_eq!(
+                    request(Method::POST, "/api/v1/performance/install")
+                        .json(&json!({"instance_id":instance,"action":action,"queued":true}))
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::BAD_REQUEST
+                );
+            }
+            Some((path, operation, bytes.clone()))
+        };
         let status_path = format!("/api/v1/import/metadata/{}", preview.metadata_import_id);
         let import_survivor = || async {
             let response = request(Method::POST, "/api/v1/import/instances")
@@ -3593,6 +3716,11 @@ pub(super) mod tests {
             }).unwrap()
         };
         let mut saved_driver_rows = None;
+        let mut saved_operation = if survivor_id.is_some() {
+            read_operation().await
+        } else {
+            None
+        };
         let mut receipt = None;
         for replay in [false, true] {
             if replay {
@@ -3613,6 +3741,12 @@ pub(super) mod tests {
             assert_eq!(imported["cutover_available"], false);
             assert_eq!(imported["receipt"]["imported_offline_account_count"], 2);
             assert_eq!(imported["receipt"]["archived_launch_report_count"], 2);
+            if with_performance_operation {
+                assert_eq!(
+                    imported["receipt"]["archived_performance_operation_count"],
+                    1
+                );
+            }
             if with_benchmarks {
                 assert_eq!(
                     imported["receipt"]["archived_benchmark_count"],
@@ -3712,6 +3846,12 @@ pub(super) mod tests {
             comparison["baseline_session_id"] = previous["session_id"].clone();
             assert_eq!(current["comparison"], comparison);
             let benchmarks = read_benchmarks().await;
+            let operation = read_operation().await;
+            if saved_operation.is_some() {
+                assert_eq!(operation, saved_operation);
+            } else {
+                saved_operation = operation;
+            }
             if let Some(saved) = &saved_benchmarks {
                 assert_eq!(&benchmarks, saved);
             } else {
@@ -3750,6 +3890,7 @@ pub(super) mod tests {
                     .unwrap();
                 assert_eq!(after, history);
                 assert_eq!(read_benchmarks().await, *saved_benchmarks.as_ref().unwrap());
+                assert_eq!(read_operation().await, saved_operation);
             }
         }
         let assert_inert = |services: &crate::DesktopServices| {
@@ -3771,6 +3912,10 @@ pub(super) mod tests {
                      (SELECT COUNT(*) FROM benchmark_drivers WHERE request IS NOT NULL)",
                     [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?;
                 assert_eq!(counts, (0, u64::from(with_benchmarks && !parent_pruned), u64::from(with_benchmarks), 0, 0));
+                let commands: (u64, u64, u64) = db.query_row(
+                    "SELECT (SELECT COUNT(*) FROM performance_operations),(SELECT COUNT(*) FROM performance_commands WHERE state!='historical'),
+                     (SELECT COUNT(*) FROM performance_commands WHERE state='historical')", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+                assert_eq!(commands, (0, 0, u64::from(with_performance_operation)));
                 Ok(())
             }).unwrap();
         };
@@ -3791,6 +3936,21 @@ pub(super) mod tests {
             ),
         ];
         reads.extend(saved_benchmarks.unwrap());
+        if let Some((path, operation, bytes)) = &saved_operation {
+            reads.push((path.clone(), operation.clone()));
+            let stored: Vec<u8> = reopened
+                .settings
+                .metadata()
+                .read::<_, StorageError>(|db| {
+                    Ok(db.query_row(
+                        "SELECT payload FROM performance_commands WHERE id=?1",
+                        [operation["id"].as_str().unwrap()],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(&stored, bytes);
+        }
         for record in saved["reports"].as_array().unwrap() {
             reads.push((
                 format!(

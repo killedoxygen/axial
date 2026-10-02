@@ -1479,12 +1479,13 @@ test('metadata history completion remains optional, bounded and separate from in
   }
 });
 
-for (const [label, field] of [
-  ['archived launch report', 'archived_launch_report_count'],
-  ['archived benchmark', 'archived_benchmark_count'],
+for (const [label, field, limit] of [
+  ['archived launch report', 'archived_launch_report_count', 1024],
+  ['archived benchmark', 'archived_benchmark_count', 1024],
+  ['archived performance operation', 'archived_performance_operation_count', 128],
 ] as const) {
   test(`${label} counts survive metadata receipts and status reads with optional compatibility`, async () => {
-    for (const count of [undefined, null, 0, 2, 1024]) {
+    for (const count of [undefined, null, 0, 2, limit]) {
       for (const lost of [false, true]) {
         const h = harness();
         h.setPreview(preview({ instances: [], blockers: ['cutover_not_implemented', 'unsettled_operation'] }));
@@ -1523,7 +1524,7 @@ for (const [label, field] of [
   });
 
   test(`invalid ${label} counts cannot confirm metadata imports or refresh destination state`, async () => {
-    for (const count of [-1, 0.5, 1025, Number.MAX_SAFE_INTEGER + 1, '2', true, {}, []]) {
+    for (const count of [-1, 0.5, limit + 1, Number.MAX_SAFE_INTEGER + 1, '2', true, {}, []]) {
       const h = harness();
       await h.workflow.chooseProfile();
       await h.workflow.prepareMetadataImport();

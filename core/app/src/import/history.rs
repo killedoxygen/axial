@@ -25,6 +25,7 @@ use crate::{
         mutation::{
             HistoricalOperation, HistoricalOperationEvidence, HistoricalOperationIntent,
             HistoricalOperationTerminal, HistoricalRollback, PreparedOperationImport,
+            historical_operation_id,
         },
         rules::{
             CompletedRulesImport, HistoricalRulesRefresh, HistoricalRulesRefreshFailure,
@@ -58,6 +59,7 @@ pub(crate) struct PreparedHistory {
     global_installs: Arc<[PreparedInstallOperation]>,
     archived_reports: Arc<PreparedReportImport>,
     archived_benchmarks: Arc<PreparedBenchmarkImport>,
+    archived_operations: Arc<PreparedOperationImport>,
     content: Vec<PreparedInstallOperation>,
     rules: Option<CompletedRulesImport>,
 }
@@ -109,7 +111,7 @@ impl PreparedHistory {
         }
         let mut operations = self.operations.clone();
         for operation in &mut operations {
-            operation.instance_id = instance.clone();
+            operation.instance_id = instance.as_str().to_owned();
         }
         let mut reports =
             PreparedReportImport::prepare(reports).map_err(|_| ImportError::InvalidData)?;
@@ -121,11 +123,15 @@ impl PreparedHistory {
         benchmarks
             .append(&self.archived_benchmarks)
             .map_err(|_| ImportError::InvalidData)?;
+        let mut operations =
+            PreparedOperationImport::prepare(operations).map_err(|_| ImportError::InvalidData)?;
+        operations
+            .append(&self.archived_operations)
+            .map_err(|_| ImportError::InvalidData)?;
         Ok(BoundHistory {
             reports,
             benchmarks,
-            operations: PreparedOperationImport::prepare(operations)
-                .map_err(|_| ImportError::InvalidData)?,
+            operations,
             installs: PreparedInstallImport::bind(
                 self.global_installs
                     .iter()
@@ -153,14 +159,19 @@ pub(super) fn prepare_history_with_rules(
         inventory.validate_rules_completion(rules)?;
     }
     let source = inventory.source_identity()?;
-    source_instance_ids(inventory)?;
+    let source_instances = source_instance_ids(inventory)?;
     validate_benchmark_namespaces(inventory)?;
+    validate_journal_namespace(inventory)?;
     let empty_archived = Arc::new(
         PreparedReportImport::prepare_archived(&source, Vec::new())
             .map_err(|_| ImportError::InvalidData)?,
     );
     let empty_benchmarks = Arc::new(
         PreparedBenchmarkImport::prepare_archived(&source, Vec::new(), Vec::new())
+            .map_err(|_| ImportError::InvalidData)?,
+    );
+    let empty_operations = Arc::new(
+        PreparedOperationImport::prepare_archived(&source, Vec::new())
             .map_err(|_| ImportError::InvalidData)?,
     );
     let mut prepared = PreparedSourceHistory {
@@ -179,6 +190,7 @@ pub(super) fn prepare_history_with_rules(
                         global_installs: Arc::from([]),
                         archived_reports: Arc::clone(&empty_archived),
                         archived_benchmarks: Arc::clone(&empty_benchmarks),
+                        archived_operations: Arc::clone(&empty_operations),
                         content: Vec::new(),
                         rules: rules.cloned(),
                     },
@@ -193,6 +205,7 @@ pub(super) fn prepare_history_with_rules(
     };
     let mut bytes = 0usize;
     let mut global_installs = Vec::new();
+    let mut archived_operations = Vec::new();
     if inventory
         .file_manifests()
         .any(|file| file.relative == JOURNAL)
@@ -235,12 +248,13 @@ pub(super) fn prepare_history_with_rules(
                 }
             };
             let operation = entry.convert(&source)?;
-            prepared
-                .instances
-                .get_mut(&instance)
-                .ok_or(ImportError::InvalidData)?
-                .operations
-                .push(operation);
+            if let Some(history) = prepared.instances.get_mut(&instance) {
+                history.operations.push(operation);
+            } else if !source_instances.contains(&instance) {
+                archived_operations.push(operation);
+            } else {
+                return Err(ImportError::InvalidData);
+            }
             prepared
                 .supported_records
                 .insert(format!("{JOURNAL}#/entries/{index}"));
@@ -260,8 +274,13 @@ pub(super) fn prepare_history_with_rules(
     )
     .map_err(|_| ImportError::InvalidData)?;
     let global_installs: Arc<[PreparedInstallOperation]> = global_installs.into();
+    let archived_operations = Arc::new(
+        PreparedOperationImport::prepare_archived(&source, archived_operations)
+            .map_err(|_| ImportError::InvalidData)?,
+    );
     for history in prepared.instances.values_mut() {
         history.global_installs = global_installs.clone();
+        history.archived_operations = Arc::clone(&archived_operations);
     }
     let mut reports = BTreeMap::new();
     let mut archived_reports = Vec::new();
@@ -621,16 +640,9 @@ fn prepare_archived_benchmarks(
 
 fn validate_benchmark_namespaces(inventory: &Inventory) -> ImportResult<()> {
     let aliased = |path: &str| {
-        [SUITE_PREFIX, DRIVER_PREFIX].into_iter().any(|prefix| {
-            let mut different = false;
-            for (actual, expected) in path.split('/').zip(prefix.trim_end_matches('/').split('/')) {
-                if !axial_fs::leaf_names_equivalent(actual.as_ref(), expected.as_ref()) {
-                    return false;
-                }
-                different |= actual != expected;
-            }
-            different
-        })
+        [SUITE_PREFIX, DRIVER_PREFIX]
+            .into_iter()
+            .any(|prefix| source_path_aliased(path, prefix.trim_end_matches('/')))
     };
     // Both source stores are flat. Unobserved or aliased entries cannot prove
     // pruning or an empty batch, even when no exact-spelling record was captured.
@@ -663,6 +675,45 @@ fn validate_benchmark_namespaces(inventory: &Inventory) -> ImportResult<()> {
                         || path.starts_with(prefix)
                         || namespace.starts_with(&format!("{path}/"))
                 })
+        {
+            return Err(ImportError::InvalidData);
+        }
+    }
+    Ok(())
+}
+
+fn source_path_aliased(path: &str, expected: &str) -> bool {
+    let mut different = false;
+    for (actual, expected) in path.split('/').zip(expected.split('/')) {
+        if !axial_fs::leaf_names_equivalent(actual.as_ref(), expected.as_ref()) {
+            return false;
+        }
+        different |= actual != expected;
+    }
+    different
+}
+
+fn validate_journal_namespace(inventory: &Inventory) -> ImportResult<()> {
+    let descendants = format!("{JOURNAL}/");
+    for path in inventory.directory_names() {
+        if source_path_aliased(path, JOURNAL) || path == JOURNAL || path.starts_with(&descendants) {
+            return Err(ImportError::InvalidData);
+        }
+    }
+    for file in inventory.file_manifests() {
+        if source_path_aliased(&file.relative, JOURNAL)
+            || JOURNAL.starts_with(&format!("{}/", file.relative))
+        {
+            return Err(ImportError::InvalidData);
+        }
+    }
+    for obligation in inventory.obligations() {
+        let path = obligation.source_record.as_str();
+        if source_path_aliased(path, JOURNAL)
+            || obligation.blocker == ImportBlocker::UnsafeFile
+                && (path == JOURNAL
+                    || path.starts_with(&descendants)
+                    || JOURNAL.starts_with(&format!("{path}/")))
         {
             return Err(ImportError::InvalidData);
         }
@@ -794,6 +845,7 @@ fn decode_journal(raw: &[u8]) -> ImportResult<Vec<LegacyOperation>> {
 pub(super) fn prepare_global_install_history(
     inventory: &Inventory,
 ) -> ImportResult<PreparedInstallImport> {
+    validate_journal_namespace(inventory)?;
     let mut records = Vec::new();
     if inventory
         .file_manifests()
@@ -811,9 +863,42 @@ pub(super) fn prepare_global_install_history(
     PreparedInstallImport::bind_global(records).map_err(|_| ImportError::InvalidData)
 }
 
+pub(super) fn prepare_archived_operations(
+    inventory: &Inventory,
+) -> ImportResult<PreparedOperationImport> {
+    let instances = source_instance_ids(inventory)?;
+    let source = inventory.source_identity()?;
+    validate_journal_namespace(inventory)?;
+    let mut records = Vec::new();
+    if inventory
+        .file_manifests()
+        .any(|file| file.relative == JOURNAL)
+    {
+        for entry in decode_journal(&inventory.record_bytes(JOURNAL)?)? {
+            match &entry.intent {
+                LegacyIntent::Performance(lifecycle) => {
+                    if entry.command != "ApplyPerformancePlan" {
+                        return Err(ImportError::InvalidData);
+                    }
+                    if !instances.contains(&lifecycle.intent.instance_id) {
+                        records.push(entry.convert(&source)?);
+                    }
+                }
+                LegacyIntent::Generic {} if entry.command == "ApplyPerformancePlan" => {
+                    return Err(ImportError::InvalidData);
+                }
+                LegacyIntent::Generic {} => {}
+            }
+        }
+    }
+    PreparedOperationImport::prepare_archived(&source, records)
+        .map_err(|_| ImportError::InvalidData)
+}
+
 pub(super) fn prepare_rules_history(
     inventory: &Inventory,
 ) -> ImportResult<Vec<HistoricalRulesRefresh>> {
+    validate_journal_namespace(inventory)?;
     if !inventory
         .file_manifests()
         .any(|file| file.relative == JOURNAL)
@@ -1055,16 +1140,9 @@ impl LegacyOperation {
         {
             return Err(ImportError::InvalidData);
         }
-        let mut hash = Sha256::new();
-        hash.update(b"axial.legacy.performance.v1\0");
-        hash.update((source.len() as u64).to_be_bytes());
-        hash.update(source.as_bytes());
-        hash.update(self.operation_id.as_bytes());
         Ok(HistoricalOperation {
-            id: format!("legacy-performance-{:x}", hash.finalize()),
-            instance_id: UNBOUND_INSTANCE
-                .parse()
-                .map_err(|_| ImportError::InvalidData)?,
+            id: historical_operation_id(source, &self.operation_id),
+            instance_id: UNBOUND_INSTANCE.to_owned(),
             created_at: lifecycle.created_at,
             updated_at: lifecycle.updated_at,
             evidence: HistoricalOperationEvidence {

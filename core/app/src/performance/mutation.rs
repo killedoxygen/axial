@@ -23,6 +23,7 @@ use axial_performance::{
     ManagedInstanceIdentity, ManagedRollbackOutcome, PerformanceMode, ResolutionRequest,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
@@ -43,6 +44,10 @@ const MAX_PENDING_OPERATIONS: usize = 128;
 const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PENDING_ROW_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ACTIVE_COMMANDS: usize = 128;
+const MAX_HISTORY_RECORDS: usize = 128;
+const MAX_HISTORY_ROW_BYTES: usize = 16 * 1024;
+const MAX_HISTORY_BYTES: usize = MAX_HISTORY_RECORDS * MAX_HISTORY_ROW_BYTES;
+pub(crate) const MAX_ARCHIVED_OPERATION_PROOF_BYTES: usize = 16 * 1024;
 
 pub fn has_pending(storage: &MetadataStore, id: &InstanceId) -> Result<bool, StorageError> {
     storage.read(|connection| {
@@ -201,7 +206,7 @@ pub enum HistoricalRollback {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistoricalOperationIntent {
-    /// Original source identity. The enclosing status has the destination UUID.
+    /// Original source identity. The enclosing status has a mapped or archived identity.
     pub instance_id: String,
     pub requested_action: HistoricalOperationAction,
     pub action: HistoricalOperationAction,
@@ -302,7 +307,7 @@ impl HistoricalOperationTerminal {
 #[serde(deny_unknown_fields)]
 pub(crate) struct HistoricalOperation {
     pub id: String,
-    pub instance_id: InstanceId,
+    pub instance_id: String,
     pub created_at: String,
     pub updated_at: String,
     pub evidence: HistoricalOperationEvidence,
@@ -324,13 +329,46 @@ impl From<rusqlite::Error> for OperationImportError {
 }
 
 #[derive(Clone)]
-pub(crate) struct PreparedOperationImport(Vec<(HistoricalOperation, Vec<u8>)>);
+pub(crate) struct PreparedOperationImport(Vec<Arc<(HistoricalOperation, Vec<u8>)>>);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArchivedOperationCompletionProof {
+    source_id: String,
+    operation_ids: Vec<String>,
+    digest: String,
+}
 
 impl PreparedOperationImport {
-    pub(crate) fn prepare(
+    pub(crate) fn prepare(records: Vec<HistoricalOperation>) -> Result<Self, OperationImportError> {
+        if records.len() > MAX_HISTORY_RECORDS
+            || records
+                .iter()
+                .any(|record| record.instance_id.parse::<InstanceId>().is_err())
+        {
+            return Err(OperationImportError::Invalid);
+        }
+        Self::prepare_records(records)
+    }
+
+    pub(crate) fn prepare_archived(
+        source: &str,
         mut records: Vec<HistoricalOperation>,
     ) -> Result<Self, OperationImportError> {
-        if records.len() > 128 {
+        if !lower_hex(source, 64) || records.len() > MAX_HISTORY_RECORDS {
+            return Err(OperationImportError::Invalid);
+        }
+        for record in &mut records {
+            record.instance_id =
+                format!("archived-{source}-{}", record.evidence.intent.instance_id);
+        }
+        Self::prepare_records(records)
+    }
+
+    fn prepare_records(
+        mut records: Vec<HistoricalOperation>,
+    ) -> Result<Self, OperationImportError> {
+        if records.len() > MAX_HISTORY_RECORDS {
             return Err(OperationImportError::Invalid);
         }
         records.sort_by_key(|record| record.evidence.sequence);
@@ -342,32 +380,92 @@ impl PreparedOperationImport {
                 return Err(OperationImportError::Invalid);
             }
             let bytes = serde_json::to_vec(&record).map_err(|_| OperationImportError::Invalid)?;
-            if bytes.len() > 16 * 1024 {
+            if bytes.len() > MAX_HISTORY_ROW_BYTES {
                 return Err(OperationImportError::Invalid);
             }
-            prepared.push((record, bytes));
+            prepared.push(Arc::new((record, bytes)));
         }
         Ok(Self(prepared))
     }
 
+    pub(crate) fn append(&mut self, other: &Self) -> Result<(), OperationImportError> {
+        if self.0.len().saturating_add(other.0.len()) > MAX_HISTORY_RECORDS {
+            return Err(OperationImportError::Invalid);
+        }
+        let mut ids = BTreeSet::new();
+        let mut bytes = 0usize;
+        for record in self.0.iter().chain(&other.0) {
+            if !ids.insert(&record.0.id) {
+                return Err(OperationImportError::Invalid);
+            }
+            bytes = bytes.saturating_add(record.1.len());
+        }
+        if bytes > MAX_HISTORY_BYTES {
+            return Err(OperationImportError::Invalid);
+        }
+        self.0.extend(other.0.iter().cloned());
+        self.0.sort_by_key(|record| record.0.evidence.sequence);
+        Ok(())
+    }
+
+    pub(crate) fn completion_proof(
+        &self,
+        source: &str,
+    ) -> Result<ArchivedOperationCompletionProof, OperationImportError> {
+        if !lower_hex(source, 64)
+            || self
+                .0
+                .iter()
+                .any(|record| archived_operation_source(&record.0) != Some(source))
+        {
+            return Err(OperationImportError::Invalid);
+        }
+        let mut records = self.0.iter().collect::<Vec<_>>();
+        records.sort_unstable_by_key(|record| &record.0.id);
+        let operation_ids = records
+            .iter()
+            .map(|record| record.0.id.clone())
+            .collect::<Vec<_>>();
+        let mut digest = operation_completion_hash(source, &operation_ids);
+        for record in records {
+            digest.update((record.1.len() as u64).to_be_bytes());
+            digest.update(&record.1);
+        }
+        let proof = ArchivedOperationCompletionProof {
+            source_id: source.to_owned(),
+            operation_ids,
+            digest: hex::encode(digest.finalize()),
+        };
+        proof.validate(source)?;
+        Ok(proof)
+    }
+
     pub(crate) fn insert_in(&self, tx: &Transaction<'_>) -> Result<(), OperationImportError> {
-        for (record, bytes) in &self.0 {
-            match stored_history(tx, &record.id)? {
-                Some(saved) if saved == *record => {}
+        let mut remaining = MAX_HISTORY_BYTES;
+        for prepared in &self.0 {
+            let (record, bytes) = prepared.as_ref();
+            match stored_history(tx, &record.id, &mut remaining)? {
+                Some((saved, encoded)) if saved == *record && encoded == *bytes => {}
                 Some(_) => return Err(OperationImportError::Conflict),
                 None => {
+                    remaining = remaining
+                        .checked_sub(bytes.len())
+                        .ok_or(OperationImportError::Invalid)?;
                     if tx.execute("INSERT INTO performance_commands(id,instance_id,state,payload) VALUES(?1,?2,'historical',?3)", params![record.id, record.instance_id.as_str(), bytes])? != 1 {
                         return Err(OperationImportError::Conflict);
                     }
                 }
             }
         }
-        Ok(())
+        self.verify_in(tx)
     }
 
-    pub(crate) fn verify_in(&self, tx: &Transaction<'_>) -> Result<(), OperationImportError> {
-        for (record, _) in &self.0 {
-            if stored_history(tx, &record.id)?.as_ref() != Some(record) {
+    pub(crate) fn verify_in(&self, db: &Connection) -> Result<(), OperationImportError> {
+        let mut remaining = MAX_HISTORY_BYTES;
+        for prepared in &self.0 {
+            if stored_history(db, &prepared.0.id, &mut remaining)?.as_ref()
+                != Some(prepared.as_ref())
+            {
                 return Err(OperationImportError::Conflict);
             }
         }
@@ -375,18 +473,118 @@ impl PreparedOperationImport {
     }
 }
 
+impl ArchivedOperationCompletionProof {
+    pub(crate) fn count(&self) -> usize {
+        self.operation_ids.len()
+    }
+
+    fn validate(&self, source: &str) -> Result<(), OperationImportError> {
+        if !lower_hex(source, 64)
+            || self.source_id != source
+            || !lower_hex(&self.digest, 64)
+            || self.count() > MAX_HISTORY_RECORDS
+            || self.operation_ids.iter().any(|id| {
+                !id.strip_prefix("legacy-performance-")
+                    .is_some_and(|id| lower_hex(id, 64))
+            })
+            || self.operation_ids.windows(2).any(|ids| ids[0] >= ids[1])
+            || serde_json::to_vec(self)
+                .map_err(|_| OperationImportError::Invalid)?
+                .len()
+                > MAX_ARCHIVED_OPERATION_PROOF_BYTES
+        {
+            return Err(OperationImportError::Invalid);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_in(
+        &self,
+        db: &Connection,
+        source: &str,
+    ) -> Result<(), OperationImportError> {
+        self.validate(source)?;
+        let mut remaining = MAX_HISTORY_BYTES;
+        let mut digest = operation_completion_hash(source, &self.operation_ids);
+        for id in &self.operation_ids {
+            let (record, bytes) =
+                stored_history(db, id, &mut remaining)?.ok_or(OperationImportError::Conflict)?;
+            if archived_operation_source(&record) != Some(source) {
+                return Err(OperationImportError::Conflict);
+            }
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+        if hex::encode(digest.finalize()) != self.digest {
+            return Err(OperationImportError::Conflict);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn historical_operation_id(source: &str, operation: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"axial.legacy.performance.v1\0");
+    hash.update((source.len() as u64).to_be_bytes());
+    hash.update(source.as_bytes());
+    hash.update(operation.as_bytes());
+    format!("legacy-performance-{:x}", hash.finalize())
+}
+
+fn operation_completion_hash(source: &str, ids: &[String]) -> Sha256 {
+    let mut hash = Sha256::new();
+    hash.update(b"axial.legacy.performance.completion.v1\0");
+    hash.update(source.as_bytes());
+    hash.update((ids.len() as u64).to_be_bytes());
+    for id in ids {
+        hash.update((id.len() as u64).to_be_bytes());
+        hash.update(id.as_bytes());
+    }
+    hash
+}
+
+fn archived_operation_source(record: &HistoricalOperation) -> Option<&str> {
+    let (source, instance) = record
+        .instance_id
+        .strip_prefix("archived-")?
+        .split_once('-')?;
+    (lower_hex(source, 64)
+        && lower_hex(instance, 16)
+        && instance == record.evidence.intent.instance_id)
+        .then_some(source)
+}
+
+fn bounded_command_row(
+    db: &Connection,
+    id: &str,
+    remaining: &mut usize,
+) -> Result<Option<(String, String, Vec<u8>)>, StorageError> {
+    let row: Option<(Option<String>, Option<String>, Option<Vec<u8>>)> = db.query_row(
+        "SELECT CASE WHEN length(CAST(instance_id AS BLOB))<=90 THEN instance_id END,CASE WHEN length(CAST(state AS BLOB))<=32 THEN state END,CASE WHEN length(CAST(payload AS BLOB))<=?2 THEN payload END FROM performance_commands WHERE id=?1",
+        params![id, MAX_HISTORY_ROW_BYTES.min(*remaining)],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()?;
+    row.map(|(instance, state, bytes)| {
+        let bytes = bytes.ok_or(StorageError::Corrupt)?;
+        *remaining = remaining
+            .checked_sub(bytes.len())
+            .ok_or(StorageError::Corrupt)?;
+        Ok((
+            instance.ok_or(StorageError::Corrupt)?,
+            state.ok_or(StorageError::Corrupt)?,
+            bytes,
+        ))
+    })
+    .transpose()
+}
+
 fn stored_history(
     db: &Connection,
     id: &str,
-) -> Result<Option<HistoricalOperation>, OperationImportError> {
-    let row: Option<(String, String, Vec<u8>)> = db
-        .query_row(
-            "SELECT instance_id,state,payload FROM performance_commands WHERE id=?1",
-            [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    row.map(|(instance, state, bytes)| decode_history(id, &instance, &state, &bytes))
+    remaining: &mut usize,
+) -> Result<Option<(HistoricalOperation, Vec<u8>)>, OperationImportError> {
+    bounded_command_row(db, id, remaining)?
+        .map(|(instance, state, bytes)| Ok((decode_history(id, &instance, &state, &bytes)?, bytes)))
         .transpose()
 }
 
@@ -396,7 +594,7 @@ fn decode_history(
     state: &str,
     bytes: &[u8],
 ) -> Result<HistoricalOperation, OperationImportError> {
-    if state != "historical" || bytes.len() > 16 * 1024 {
+    if state != "historical" || bytes.len() > MAX_HISTORY_ROW_BYTES {
         return Err(OperationImportError::Conflict);
     }
     let record: HistoricalOperation =
@@ -423,14 +621,19 @@ fn validate_history(record: &HistoricalOperation) -> Result<(), OperationImportE
     };
     let evidence = &record.evidence;
     let intent = &evidence.intent;
+    let valid_instance = record.instance_id.parse::<InstanceId>().is_ok()
+        || archived_operation_source(record).is_some_and(|source| {
+            record.id == historical_operation_id(source, &evidence.operation_id)
+        });
     let source_id = evidence
         .operation_id
         .strip_prefix("op-")
         .and_then(|id| uuid::Uuid::parse_str(id).ok());
-    if !record
-        .id
-        .strip_prefix("legacy-performance-")
-        .is_some_and(|id| lower_hex(id, 64))
+    if !valid_instance
+        || !record
+            .id
+            .strip_prefix("legacy-performance-")
+            .is_some_and(|id| lower_hex(id, 64))
         || source_id.is_none_or(|id| {
             id.get_version() != Some(uuid::Version::Random)
                 || id.get_variant() != uuid::Variant::RFC4122
@@ -1048,13 +1251,8 @@ impl PerformanceService {
         id: &str,
     ) -> Result<Option<PerformanceOperationStatus>, PerformanceMutationError> {
         self.storage.read(|connection| {
-            let record: Option<(String, String, Vec<u8>)> = connection
-                .query_row(
-                    "SELECT instance_id,state,payload FROM performance_commands WHERE id=?1",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
+            let mut remaining = MAX_HISTORY_ROW_BYTES;
+            let record = bounded_command_row(connection, id, &mut remaining)?;
             record
                 .map(|(instance, state, bytes)| command_status(id, &instance, &state, &bytes))
                 .transpose()
@@ -3264,7 +3462,7 @@ mod tests {
     fn historical(instance: &InstanceId, sequence: u64) -> HistoricalOperation {
         HistoricalOperation {
             id: format!("legacy-performance-{sequence:064x}"),
-            instance_id: instance.clone(),
+            instance_id: instance.to_string(),
             created_at: "2024-02-29T12:34:56.000Z".into(),
             updated_at: "2024-02-29T12:35:56.000Z".into(),
             evidence: HistoricalOperationEvidence {
@@ -3291,6 +3489,328 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[tokio::test]
+    async fn archived_performance_operation_status_survives_missing_source_instance() {
+        let (_root, service, instance) = launch_fixture().await;
+        let mut record = historical(&instance.record().instance.id, 1);
+        record.id = historical_operation_id(&"a".repeat(64), &record.evidence.operation_id);
+        let archived = format!(
+            "archived-{}-{}",
+            "a".repeat(64),
+            record.evidence.intent.instance_id
+        );
+        let mut wire = serde_json::to_value(&record).unwrap();
+        wire["instance_id"] = serde_json::json!(archived);
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        service.storage.transaction(|tx| -> Result<_, StorageError> {
+            tx.execute("INSERT INTO performance_commands(id,instance_id,state,payload) VALUES(?1,?2,'historical',?3)", params![record.id, archived, bytes])?;
+            Ok(())
+        }).unwrap();
+        let status = service
+            .operation(&record.id)
+            .expect("retained terminal Performance history must not require a current instance")
+            .unwrap();
+        assert_eq!(status.instance_id, archived);
+        assert_eq!(status.state, "complete");
+        assert_eq!(status.action, "install");
+        assert_eq!(status.history, Some(record.evidence));
+        assert!(archived.parse::<InstanceId>().is_err());
+        assert!(service.save_operation(&status).is_err());
+        service.recover_pending().await.unwrap();
+        assert_eq!(service.pending_count().unwrap(), 0);
+        assert!(!service.has_unsettled_effects());
+        assert!(service.tasks.status().is_idle());
+        let reopened = PerformanceService::new(
+            service.storage.clone(),
+            service.instances.clone(),
+            TaskOwner::new(8).unwrap(),
+            service.content.clone(),
+            service.transfers.clone(),
+        )
+        .unwrap();
+        assert_eq!(reopened.operation(&record.id).unwrap(), Some(status));
+        service
+            .storage
+            .read(|db| -> Result<_, StorageError> {
+                let saved: (String, String, Vec<u8>) = db.query_row(
+                    "SELECT instance_id,state,payload FROM performance_commands WHERE id=?1",
+                    [&record.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                assert_eq!(saved, (archived, "historical".into(), bytes));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    const ARCHIVED_OPERATION_SOURCE: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn archival_operation(sequence: u64) -> HistoricalOperation {
+        let mut record = historical(&InstanceId::new(), sequence);
+        record.id =
+            historical_operation_id(ARCHIVED_OPERATION_SOURCE, &record.evidence.operation_id);
+        record
+    }
+
+    #[test]
+    fn archived_performance_proof_reopens_exact_snapshot_and_preserves_mapped_codec() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let path = root.path().join("metadata.sqlite");
+        let store = MetadataStore::open(&path).unwrap();
+        store.migrate(&[MIGRATION, MIGRATION_V2]).unwrap();
+        let batch = PreparedOperationImport::prepare_archived(
+            ARCHIVED_OPERATION_SOURCE,
+            vec![archival_operation(2), archival_operation(1)],
+        )
+        .unwrap();
+        let proof = batch.completion_proof(ARCHIVED_OPERATION_SOURCE).unwrap();
+        assert_eq!(proof.count(), 2);
+        let mapped_id = InstanceId::new();
+        let mapped = historical(&mapped_id, 3);
+        let mapped_bytes = serde_json::to_vec(&mapped).unwrap();
+        assert_eq!(
+            serde_json::to_value(&mapped).unwrap()["instance_id"],
+            serde_json::to_value(&mapped_id).unwrap()
+        );
+        let mut combined = PreparedOperationImport::prepare(vec![mapped.clone()]).unwrap();
+        combined.append(&batch).unwrap();
+        assert!(
+            combined
+                .completion_proof(ARCHIVED_OPERATION_SOURCE)
+                .is_err()
+        );
+        store.transaction(|tx| combined.insert_in(tx)).unwrap();
+        store.transaction(|tx| combined.insert_in(tx)).unwrap();
+        let later = PreparedOperationImport::prepare_archived(
+            ARCHIVED_OPERATION_SOURCE,
+            vec![archival_operation(4)],
+        )
+        .unwrap();
+        store.transaction(|tx| later.insert_in(tx)).unwrap();
+        drop(store);
+        let store = MetadataStore::open(&path).unwrap();
+        let proof: ArchivedOperationCompletionProof =
+            serde_json::from_slice(&serde_json::to_vec(&proof).unwrap()).unwrap();
+        store
+            .read(|db| {
+                proof.verify_in(db, ARCHIVED_OPERATION_SOURCE)?;
+                combined.verify_in(db)?;
+                let mut remaining = MAX_HISTORY_BYTES;
+                let (saved, bytes) = stored_history(db, &mapped.id, &mut remaining)?.unwrap();
+                assert_eq!((saved, bytes), (mapped, mapped_bytes));
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM performance_commands", [], |row| row
+                        .get::<_, usize>(
+                        0
+                    ))?,
+                    4
+                );
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM performance_operations", [], |row| row
+                        .get::<_, usize>(0))?,
+                    0
+                );
+                Ok::<_, OperationImportError>(())
+            })
+            .unwrap();
+        let empty = PreparedOperationImport::prepare_archived(ARCHIVED_OPERATION_SOURCE, vec![])
+            .unwrap()
+            .completion_proof(ARCHIVED_OPERATION_SOURCE)
+            .unwrap();
+        assert_eq!(empty.count(), 0);
+        store
+            .read(|db| empty.verify_in(db, ARCHIVED_OPERATION_SOURCE))
+            .unwrap();
+        assert!(
+            store
+                .read(|db| proof.verify_in(db, &"b".repeat(64)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn archived_performance_replay_refuses_missing_changed_or_misindexed_evidence() {
+        for change in [
+            "missing", "instance", "state", "payload", "source", "intent", "spacing",
+        ] {
+            let store = MetadataStore::in_memory().unwrap();
+            store.migrate(&[MIGRATION, MIGRATION_V2]).unwrap();
+            let batch = PreparedOperationImport::prepare_archived(
+                ARCHIVED_OPERATION_SOURCE,
+                vec![archival_operation(1)],
+            )
+            .unwrap();
+            let proof = batch.completion_proof(ARCHIVED_OPERATION_SOURCE).unwrap();
+            store.transaction(|tx| batch.insert_in(tx)).unwrap();
+            store.transaction(|tx| -> Result<_, StorageError> {
+                match change {
+                    "missing" => { tx.execute("DELETE FROM performance_commands", [])?; }
+                    "instance" => { tx.execute("UPDATE performance_commands SET instance_id=?1", [InstanceId::new().as_str()])?; }
+                    "state" => { tx.execute("UPDATE performance_commands SET state='complete'", [])?; }
+                    "payload" => { tx.execute("UPDATE performance_commands SET payload=CAST(json_set(payload,'$.updated_at','2024-02-29T12:36:56.000Z') AS BLOB)", [])?; }
+                    "source" => { tx.execute("UPDATE performance_commands SET instance_id=?1,payload=CAST(json_set(payload,'$.instance_id',?1) AS BLOB)", [format!("archived-{}-0000000000000001", "b".repeat(64))])?; }
+                    "intent" => { tx.execute("UPDATE performance_commands SET payload=CAST(json_set(payload,'$.evidence.intent.instance_id','0000000000000002') AS BLOB)", [])?; }
+                    "spacing" => { let mut bytes = batch.0[0].1.clone(); bytes.push(b' '); tx.execute("UPDATE performance_commands SET payload=?1", [bytes])?; }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            }).unwrap();
+            assert!(
+                store
+                    .read(|db| proof.verify_in(db, ARCHIVED_OPERATION_SOURCE))
+                    .is_err(),
+                "{change}"
+            );
+            assert!(store.read(|db| batch.verify_in(db)).is_err(), "{change}");
+            if change != "missing" {
+                assert!(
+                    store.transaction(|tx| batch.insert_in(tx)).is_err(),
+                    "{change}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn archived_performance_insert_and_final_verify_roll_back_ignored_and_late_changes() {
+        for effect in [
+            "SELECT RAISE(IGNORE)",
+            "SELECT RAISE(ABORT,'refused')",
+            "UPDATE performance_commands SET state='complete'",
+            "UPDATE performance_commands SET instance_id='different'",
+        ] {
+            let store = MetadataStore::in_memory().unwrap();
+            store.migrate(&[MIGRATION, MIGRATION_V2]).unwrap();
+            let batch = PreparedOperationImport::prepare_archived(
+                ARCHIVED_OPERATION_SOURCE,
+                vec![archival_operation(1), archival_operation(2)],
+            )
+            .unwrap();
+            store.transaction(|tx| -> Result<_, StorageError> {
+                tx.execute_batch(&format!("CREATE TRIGGER refuse_history BEFORE INSERT ON performance_commands WHEN NEW.id='{}' BEGIN {effect}; END;", batch.0[1].0.id))?;
+                Ok(())
+            }).unwrap();
+            assert!(
+                store.transaction(|tx| batch.insert_in(tx)).is_err(),
+                "{effect}"
+            );
+            store
+                .read(|db| -> Result<_, StorageError> {
+                    assert_eq!(
+                        db.query_row("SELECT count(*) FROM performance_commands", [], |row| row
+                            .get::<_, usize>(
+                            0
+                        ))?,
+                        0
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let store = MetadataStore::in_memory().unwrap();
+        store.migrate(&[MIGRATION, MIGRATION_V2]).unwrap();
+        let batch = PreparedOperationImport::prepare_archived(
+            ARCHIVED_OPERATION_SOURCE,
+            vec![archival_operation(1)],
+        )
+        .unwrap();
+        let proof = batch.completion_proof(ARCHIVED_OPERATION_SOURCE).unwrap();
+        store.transaction(|tx| batch.insert_in(tx)).unwrap();
+        assert!(store.transaction(|tx| {
+            tx.execute("UPDATE performance_commands SET payload=CAST(json_set(payload,'$.updated_at','2024-02-29T12:36:56.000Z') AS BLOB)", [])?;
+            proof.verify_in(tx, ARCHIVED_OPERATION_SOURCE)
+        }).is_err());
+        store.read(|db| batch.verify_in(db)).unwrap();
+    }
+
+    #[test]
+    fn archived_performance_admission_and_persisted_byte_limits_are_exact() {
+        let batch = PreparedOperationImport::prepare_archived(
+            ARCHIVED_OPERATION_SOURCE,
+            vec![archival_operation(1)],
+        )
+        .unwrap();
+        assert!(PreparedOperationImport::prepare(vec![batch.0[0].0.clone()]).is_err());
+        assert!(PreparedOperationImport::prepare_archived("invalid", vec![]).is_err());
+        assert!(
+            PreparedOperationImport::prepare_archived(&"b".repeat(64), vec![archival_operation(1)])
+                .is_err()
+        );
+        assert!(
+            PreparedOperationImport::prepare_archived(
+                ARCHIVED_OPERATION_SOURCE,
+                vec![historical(&InstanceId::new(), 1)]
+            )
+            .is_err()
+        );
+        let before = batch.completion_proof(ARCHIVED_OPERATION_SOURCE).unwrap();
+        let mut duplicate = batch.clone();
+        assert!(duplicate.append(&batch).is_err());
+        assert_eq!(
+            duplicate
+                .completion_proof(ARCHIVED_OPERATION_SOURCE)
+                .unwrap(),
+            before
+        );
+        let full = PreparedOperationImport::prepare_archived(
+            ARCHIVED_OPERATION_SOURCE,
+            (1..=128).map(archival_operation).collect(),
+        )
+        .unwrap();
+        let proof = full.completion_proof(ARCHIVED_OPERATION_SOURCE).unwrap();
+        assert_eq!(proof.count(), 128);
+        assert!(serde_json::to_vec(&proof).unwrap().len() < MAX_ARCHIVED_OPERATION_PROOF_BYTES);
+        assert!(
+            PreparedOperationImport::prepare_archived(
+                ARCHIVED_OPERATION_SOURCE,
+                (1..=129).map(archival_operation).collect()
+            )
+            .is_err()
+        );
+        for indices in [
+            vec![proof.operation_ids[0].clone(); 2],
+            proof.operation_ids.iter().rev().cloned().collect(),
+        ] {
+            let mut invalid = proof.clone();
+            invalid.operation_ids = indices;
+            assert!(invalid.validate(ARCHIVED_OPERATION_SOURCE).is_err());
+        }
+        let store = MetadataStore::in_memory().unwrap();
+        store.migrate(&[MIGRATION, MIGRATION_V2]).unwrap();
+        store.transaction(|tx| full.insert_in(tx)).unwrap();
+        store
+            .transaction(|tx| -> Result<_, StorageError> {
+                for record in &full.0 {
+                    let mut bytes = record.1.clone();
+                    bytes.resize(MAX_HISTORY_ROW_BYTES, b' ');
+                    tx.execute(
+                        "UPDATE performance_commands SET payload=?1 WHERE id=?2",
+                        params![bytes, record.0.id],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        store
+            .read(|db| {
+                let mut remaining = MAX_HISTORY_BYTES;
+                for record in &full.0 {
+                    stored_history(db, &record.0.id, &mut remaining)?.unwrap();
+                }
+                assert_eq!(remaining, 0);
+                assert!(matches!(
+                    stored_history(db, &full.0[0].0.id, &mut remaining),
+                    Err(OperationImportError::Storage(StorageError::Corrupt))
+                ));
+                assert_eq!(remaining, 0);
+                assert!(proof.verify_in(db, ARCHIVED_OPERATION_SOURCE).is_err());
+                assert!(full.verify_in(db).is_err());
+                Ok::<_, OperationImportError>(())
+            })
+            .unwrap();
     }
 
     #[tokio::test]

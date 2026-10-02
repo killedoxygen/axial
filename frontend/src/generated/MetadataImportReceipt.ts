@@ -13,4 +13,4 @@ account_id_mapping: { [key in string]: string } | null,
  * Absent means history completion was not proved, including old receipts.
  * Zero is a verified empty source-global install-history snapshot.
  */
-global_install_history_count?: number | null, archived_launch_report_count?: number | null, archived_benchmark_count?: number | null, settings_revision: number, account_selection_revision: number, };
+global_install_history_count?: number | null, archived_launch_report_count?: number | null, archived_benchmark_count?: number | null, archived_performance_operation_count?: number | null, settings_revision: number, account_selection_revision: number, };

@@ -1213,12 +1213,25 @@ mod tests {
 
     #[tokio::test]
     async fn final_creation_write_cannot_acknowledge_corrupted_history() {
-        for (table, phase) in ["launch_reports", "benchmark_suites", "benchmark_drivers"]
-            .into_iter()
-            .flat_map(|table| ["initial", "ready", "published"].map(|phase| (table, phase)))
+        for (table, phase) in [
+            "launch_reports",
+            "benchmark_suites",
+            "benchmark_drivers",
+            "performance_commands",
+        ]
+        .into_iter()
+        .flat_map(|table| ["initial", "ready", "published"].map(|phase| (table, phase)))
         {
             let source = Fixture::new();
             add_history(&source, "0000000000000001", "session-a");
+            let mut journal = crate::import::tests::terminal_performance_journal();
+            for entry in journal["entries"].as_array_mut().unwrap() {
+                entry["targets"][0]["id"] = serde_json::json!("0000000000000002");
+                entry["intent"]["intent"]["instance_id"] = serde_json::json!("0000000000000002");
+            }
+            let journal_path = source.baseline.join("state/operation-journals.json");
+            std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+            std::fs::write(journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
             let (root, service) = super::super::create::tests::fixture();
             let imported = prepared(&source);
             let id = if phase == "initial" {
@@ -1247,6 +1260,20 @@ mod tests {
             assert!(reports(root.path()).is_empty());
             assert!(benchmark_history(root.path()).suites.is_empty());
             assert!(benchmark_history(root.path()).drivers.is_empty());
+            let operation_count = || {
+                service
+                    .registry()
+                    .storage()
+                    .read(|db| -> Result<usize, crate::storage::StorageError> {
+                        Ok(db.query_row(
+                            "SELECT count(*) FROM performance_commands",
+                            [],
+                            |row| row.get::<_, usize>(0),
+                        )?)
+                    })
+                    .unwrap()
+            };
+            assert_eq!(operation_count(), 0);
             service
                 .registry()
                 .storage()
@@ -1264,6 +1291,7 @@ mod tests {
                 .unwrap();
             assert_eq!(recovered.id, id);
             assert_eq!(reports(root.path()).len(), 1);
+            assert_eq!(operation_count(), 6);
             assert_benchmark_history(
                 &benchmark_history(root.path()),
                 &id,

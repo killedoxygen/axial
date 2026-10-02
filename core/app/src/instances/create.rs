@@ -813,6 +813,10 @@ impl InstanceService {
                         .benchmarks
                         .verify_in(tx)
                         .map_err(super::import::benchmark_error)?;
+                    history
+                        .operations
+                        .verify_in(tx)
+                        .map_err(super::import::operation_error)?;
                 }
                 Ok(committed)
             })?;
@@ -1114,6 +1118,7 @@ impl InstanceService {
                     if let Some(history) = &history {
                         history.reports.verify_in(tx).map_err(super::import::report_error)?;
                         history.benchmarks.verify_in(tx).map_err(super::import::benchmark_error)?;
+                        history.operations.verify_in(tx).map_err(super::import::operation_error)?;
                     }
                     Ok(committed)
                 })?;
