@@ -60,8 +60,11 @@ fn stores(path: &Path) -> (SettingsStore, AccountDirectory) {
             METADATA_IMPORT_IDENTITIES_MIGRATION,
             METADATA_IMPORT_HISTORY_MIGRATION,
             METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
             install_history::MIGRATION,
             crate::launch::reports::REPORT_MIGRATION,
+            crate::performance::benchmarks::MIGRATION,
+            crate::performance::benchmarks::MIGRATION_V2,
         ])
         .unwrap();
     let settings = SettingsStore::new_with_telemetry_identity(Arc::clone(&store), true).unwrap();
@@ -133,6 +136,362 @@ fn archived_rows(destination: &Destination) -> Vec<(String, String, Vec<u8>)> {
         .unwrap()
 }
 
+fn archived_benchmark(source: &Fixture) {
+    archived_report(source, |report| {
+        report["scenario"]["benchmark_profile"] = json!("vanilla_baseline");
+        report["scenario"]["benchmark_run_type"] = json!("coldish");
+        report["scenario"]["benchmark_mode"] = json!("development");
+        report["scenario"]["benchmark_id"] = json!("benchmark-0000000000000001");
+    });
+    for (path, value) in [
+        (
+            "suites/suite-dev-0000000000000002.json",
+            json!({
+                "schema":"axial.launch.benchmark.suite","schema_version":2,
+                "suite_id":"suite-dev-0000000000000002","instance_id":"0000000000000002","mode":"development",
+                "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:02Z",
+                "runs":[{"run_index":0,"profile":"vanilla_baseline","run_type":"coldish","target_id":"",
+                    "benchmark_id":"benchmark-0000000000000001","session_id":"session-archived",
+                    "launched_at":"2026-01-01T00:00:00Z","state":"exited"},
+                    {"run_index":1,"profile":"vanilla_baseline","run_type":"warm","target_id":"",
+                    "benchmark_id":"benchmark-0000000000000002","session_id":null,"launched_at":null,"state":"pending"}]
+            }),
+        ),
+        (
+            "suite-drivers/benchmark-suite-driver-0000000000000002.json",
+            json!({
+                "id":"benchmark-suite-driver-0000000000000002","suite_id":"suite-dev-0000000000000002",
+                "mode":"development","state":"stopped","interval_ms":30000,"run_count":2,"launched_run_count":1,
+                "pending_run_index":1,"active_session_id":null,"last_run_index":0,"last_session_id":"session-archived",
+                "error":"Stopped by the user","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:02Z"
+            }),
+        ),
+    ] {
+        let path = source.baseline.join("benchmarks").join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn archived_benchmarks_metadata_preserves_report_backed_plan_and_inactive_driver() {
+    let source = Fixture::new();
+    archived_benchmark(&source);
+    let before = snapshot(&source.baseline);
+    let (prepared, request) = prepare(&source);
+    let destination = Destination::new();
+    let receipt = destination
+        .commit(&prepared, &request)
+        .unwrap()
+        .response
+        .receipt;
+    assert_eq!(receipt.archived_launch_report_count, Some(1));
+    assert_eq!(
+        serde_json::to_value(&receipt).unwrap()["archived_benchmark_count"],
+        2
+    );
+    let counts = destination.settings.metadata().read(|db| -> Result<_, StorageError> {
+        Ok(db.query_row("SELECT (SELECT count(*) FROM benchmark_suites), (SELECT count(*) FROM benchmark_drivers), (SELECT count(*) FROM benchmark_drivers WHERE request IS NOT NULL OR source_driver_id IS NOT NULL)", [], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?)))?)
+    }).unwrap();
+    assert_eq!(counts, (1, 1, 0));
+    assert_eq!(
+        destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt,
+        receipt
+    );
+    let (reopened, _) = stores(&destination._root.path().join("metadata.sqlite"));
+    assert_eq!(
+        metadata_status(&reopened, &request.metadata_import_id)
+            .unwrap()
+            .receipt,
+        Some(receipt)
+    );
+    assert_eq!(snapshot(&source.baseline), before);
+}
+
+fn benchmark_rows(
+    destination: &Destination,
+) -> Vec<(String, Vec<u8>, Option<Vec<u8>>, Option<String>)> {
+    destination.settings.metadata().read(|db| -> Result<_, StorageError> {
+        Ok(db.prepare("SELECT suite_id,payload,NULL,source_suite_id FROM benchmark_suites UNION ALL SELECT driver_id,payload,request,source_driver_id FROM benchmark_drivers ORDER BY 1")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            .collect::<Result<_, _>>()?)
+    }).unwrap()
+}
+
+#[test]
+fn archived_benchmarks_old_receipt_completion_preserves_later_edits() {
+    let source = Fixture::new();
+    archived_benchmark(&source);
+    let (prepared, request) = prepare(&source);
+    let destination = Destination::new();
+    let mut old = prepared.clone();
+    old.archived_benchmarks = None;
+    let mut expected = destination.commit(&old, &request).unwrap().response.receipt;
+    assert!(
+        !serde_json::to_value(&expected)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("archived_benchmark_count")
+    );
+    let reports = archived_rows(&destination);
+    destination.accounts.select(SECOND).unwrap();
+    let accounts = destination.accounts.snapshot().unwrap();
+    let config = destination
+        .settings
+        .update(ConfigPatch {
+            expected_revision: 1,
+            theme: Some(ConfigTheme::Birch),
+            ..ConfigPatch::default()
+        })
+        .unwrap();
+    let changes = destination.settings.subscribe().unwrap();
+    expected.archived_benchmark_count = Some(2);
+    let completed = destination.commit(&prepared, &request).unwrap();
+    assert!(completed.response.already_imported);
+    assert_eq!(completed.response.receipt, expected);
+    assert_eq!(completed.settings.config, config);
+    assert_eq!(destination.accounts.snapshot().unwrap(), accounts);
+    assert_eq!(archived_rows(&destination), reports);
+    assert!(!changes.has_changed().unwrap());
+    let rows = benchmark_rows(&destination);
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|(_, _, request, parent)| request.is_none() && parent.is_none())
+    );
+    let (reopened, _) = stores(&destination._root.path().join("metadata.sqlite"));
+    assert_eq!(
+        metadata_status(&reopened, &request.metadata_import_id)
+            .unwrap()
+            .receipt,
+        Some(expected)
+    );
+    destination.commit(&prepared, &request).unwrap();
+    assert_eq!(benchmark_rows(&destination), rows);
+}
+
+#[test]
+fn archived_benchmarks_optional_refusal_preserves_reports_and_metadata() {
+    for variant in [
+        "empty",
+        "active_driver",
+        "active_session",
+        "running_run",
+        "partial_pair",
+        "orphan_driver",
+        "missing_report",
+        "wrong_report",
+        "unsupported_registry",
+    ] {
+        let source = Fixture::new();
+        if variant != "empty" {
+            archived_benchmark(&source);
+        }
+        let (relative, field, value) = match variant {
+            "active_driver" => (
+                "benchmarks/suite-drivers/benchmark-suite-driver-0000000000000002.json",
+                "state",
+                json!("active"),
+            ),
+            "active_session" => (
+                "benchmarks/suite-drivers/benchmark-suite-driver-0000000000000002.json",
+                "active_session_id",
+                json!("session-archived"),
+            ),
+            "unsupported_registry" => ("instances.json", "schema_version", json!(4)),
+            _ => ("", "", Value::Null),
+        };
+        if !relative.is_empty() {
+            let path = source.baseline.join(relative);
+            let mut value_before: Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            value_before[field] = value;
+            fs::write(path, serde_json::to_vec(&value_before).unwrap()).unwrap();
+        }
+        match variant {
+            "orphan_driver" => fs::remove_file(
+                source
+                    .baseline
+                    .join("benchmarks/suites/suite-dev-0000000000000002.json"),
+            )
+            .unwrap(),
+            "missing_report" => fs::remove_file(
+                source
+                    .baseline
+                    .join("benchmarks/launch/session-archived.json"),
+            )
+            .unwrap(),
+            "wrong_report" => archived_report(&source, |_| {}),
+            "running_run" | "partial_pair" => {
+                let path = source
+                    .baseline
+                    .join("benchmarks/suites/suite-dev-0000000000000002.json");
+                let mut suite: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                if variant == "running_run" {
+                    suite["runs"][0]["state"] = json!("running");
+                } else {
+                    suite["runs"][1]["session_id"] = json!("session-archived");
+                }
+                fs::write(path, serde_json::to_vec(&suite).unwrap()).unwrap();
+            }
+            _ => {}
+        }
+        let before = snapshot(&source.baseline);
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        let receipt = destination
+            .commit(&prepared, &request)
+            .unwrap()
+            .response
+            .receipt;
+        assert_eq!(
+            receipt.archived_benchmark_count,
+            (variant == "empty").then_some(0),
+            "{variant}"
+        );
+        let report_count = match variant {
+            "empty" | "missing_report" => Some(0),
+            "unsupported_registry" => None,
+            _ => Some(1),
+        };
+        assert_eq!(
+            receipt.archived_launch_report_count, report_count,
+            "{variant}"
+        );
+        assert_eq!(
+            archived_rows(&destination).len(),
+            report_count.unwrap_or_default()
+        );
+        assert!(benchmark_rows(&destination).is_empty());
+        assert_eq!(destination.accounts.snapshot().unwrap().accounts.len(), 2);
+        assert_eq!(snapshot(&source.baseline), before);
+    }
+}
+
+#[test]
+fn archived_benchmarks_publication_and_late_writes_are_atomic() {
+    for old in [false, true] {
+        for effect in [
+            "ignore_suite",
+            "ignore_driver",
+            "ignore_receipt",
+            "rewrite_suite",
+            "rewrite_driver",
+            "late_settings",
+        ] {
+            if old && effect == "late_settings" {
+                continue;
+            }
+            let source = Fixture::new();
+            archived_benchmark(&source);
+            let (prepared, request) = prepare(&source);
+            let destination = Destination::new();
+            if old {
+                let mut previous = prepared.clone();
+                previous.archived_benchmarks = None;
+                destination.commit(&previous, &request).unwrap();
+            }
+            let before_config = destination.settings.current().unwrap();
+            let before_accounts = destination.accounts.snapshot().unwrap();
+            let before_receipt =
+                metadata_status(&destination.settings, &request.metadata_import_id)
+                    .unwrap()
+                    .receipt;
+            let before_reports = archived_rows(&destination);
+            let changes = destination.settings.subscribe().unwrap();
+            let action = if old {
+                "UPDATE OF archived_benchmark_proof"
+            } else {
+                "INSERT"
+            };
+            let trigger = match effect {
+                "ignore_suite" => "BEFORE INSERT ON benchmark_suites BEGIN SELECT RAISE(IGNORE); END;".to_owned(),
+                "ignore_driver" => "BEFORE INSERT ON benchmark_drivers BEGIN SELECT RAISE(IGNORE); END;".to_owned(),
+                "ignore_receipt" => format!("BEFORE {action} ON profile_metadata_imports BEGIN SELECT RAISE(IGNORE); END;"),
+                "rewrite_suite" => format!("AFTER {action} ON profile_metadata_imports BEGIN UPDATE benchmark_suites SET payload=CAST('{{}}' AS BLOB); END;"),
+                "rewrite_driver" => format!("AFTER {action} ON profile_metadata_imports BEGIN UPDATE benchmark_drivers SET payload=CAST('{{}}' AS BLOB); END;"),
+                _ => "AFTER UPDATE ON settings_config BEGIN UPDATE benchmark_drivers SET request=CAST('{}' AS BLOB); END;".to_owned(),
+            };
+            destination
+                .settings
+                .metadata()
+                .transaction(|tx| -> Result<(), StorageError> {
+                    tx.execute_batch(&format!("CREATE TRIGGER corrupt_benchmarks {trigger}"))?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                destination.commit(&prepared, &request).is_err(),
+                "{old}/{effect}"
+            );
+            assert_eq!(destination.settings.current().unwrap(), before_config);
+            assert_eq!(destination.accounts.snapshot().unwrap(), before_accounts);
+            assert_eq!(
+                metadata_status(&destination.settings, &request.metadata_import_id)
+                    .unwrap()
+                    .receipt,
+                before_receipt
+            );
+            assert_eq!(archived_rows(&destination), before_reports);
+            assert!(benchmark_rows(&destination).is_empty());
+            assert!(!changes.has_changed().unwrap());
+        }
+    }
+}
+
+#[test]
+fn archived_benchmarks_completed_proof_is_verify_only() {
+    for corruption in [
+        "missing_suite",
+        "missing_driver",
+        "payload",
+        "request",
+        "link",
+        "proof",
+        "missing_report",
+    ] {
+        let source = Fixture::new();
+        archived_benchmark(&source);
+        let (prepared, request) = prepare(&source);
+        let destination = Destination::new();
+        destination.commit(&prepared, &request).unwrap();
+        destination
+            .settings
+            .metadata()
+            .transaction(|tx| -> Result<(), StorageError> {
+                tx.execute_batch(match corruption {
+                    "missing_suite" => "DELETE FROM benchmark_suites;",
+                    "missing_driver" => "DELETE FROM benchmark_drivers;",
+                    "payload" => "UPDATE benchmark_drivers SET payload=CAST('{}' AS BLOB);",
+                    "request" => "UPDATE benchmark_drivers SET request=CAST('{}' AS BLOB);",
+                    "link" => "UPDATE benchmark_suites SET source_suite_id='another-suite';",
+                    "proof" => "UPDATE profile_metadata_imports SET archived_benchmark_proof='{}';",
+                    _ => "DELETE FROM launch_reports;",
+                })?;
+                Ok(())
+            })
+            .unwrap();
+        let before = benchmark_rows(&destination);
+        let reports = archived_rows(&destination);
+        assert!(
+            metadata_status(&destination.settings, &request.metadata_import_id).is_err(),
+            "{corruption}"
+        );
+        assert!(
+            destination.commit(&prepared, &request).is_err(),
+            "{corruption}"
+        );
+        assert_eq!(benchmark_rows(&destination), before);
+        assert_eq!(archived_rows(&destination), reports);
+        assert_eq!(destination.settings.current().unwrap().revision, 1);
+    }
+}
+
 #[test]
 fn archived_reports_old_receipt_completion_preserves_edits_and_reopen() {
     let source = Fixture::new();
@@ -142,6 +501,7 @@ fn archived_reports_old_receipt_completion_preserves_edits_and_reopen() {
     let destination = Destination::new();
     let mut metadata_only = prepared.clone();
     metadata_only.archived_reports = None;
+    metadata_only.archived_benchmarks = None;
     let original = destination
         .commit(&metadata_only, &request)
         .unwrap()
@@ -169,6 +529,7 @@ fn archived_reports_old_receipt_completion_preserves_edits_and_reopen() {
     let completed = destination.commit(&prepared, &request).unwrap();
     let mut expected = original;
     expected.archived_launch_report_count = Some(1);
+    expected.archived_benchmark_count = Some(0);
     assert!(completed.response.already_imported);
     assert_eq!(completed.response.receipt, expected);
     assert_eq!(completed.settings.config, config);
@@ -267,6 +628,7 @@ fn archived_reports_publication_and_late_settings_write_are_atomic() {
             if old {
                 let mut metadata_only = prepared.clone();
                 metadata_only.archived_reports = None;
+                metadata_only.archived_benchmarks = None;
                 destination.commit(&metadata_only, &request).unwrap();
             }
             let before_config = destination.settings.current().unwrap();
@@ -1197,6 +1559,7 @@ fn v1_receipts_keep_historical_meaning_and_new_mapping_corruption_is_rejected() 
             METADATA_IMPORT_IDENTITIES_MIGRATION,
             METADATA_IMPORT_HISTORY_MIGRATION,
             METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
+            METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
         ])
         .unwrap();
     let receipt = metadata_status(&old_settings, &old_id)
@@ -1209,6 +1572,7 @@ fn v1_receipts_keep_historical_meaning_and_new_mapping_corruption_is_rejected() 
     assert_eq!(receipt.settings_revision, 3);
     assert_eq!(receipt.global_install_history_count, None);
     assert_eq!(receipt.archived_launch_report_count, None);
+    assert_eq!(receipt.archived_benchmark_count, None);
 
     let destination = Destination::new();
     let source = Fixture::new();

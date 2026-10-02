@@ -491,6 +491,9 @@ pub(super) mod tests {
                     axial_app::import::METADATA_IMPORT_IDENTITIES_MIGRATION,
                     axial_app::import::METADATA_IMPORT_HISTORY_MIGRATION,
                     axial_app::import::METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
+                    axial_app::import::METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
+                    axial_app::performance::benchmarks::MIGRATION,
+                    axial_app::performance::benchmarks::MIGRATION_V2,
                     axial_app::performance::rules::MIGRATION,
                     axial_app::performance::rules::IMPORT_MIGRATION,
                 ])
@@ -2221,6 +2224,7 @@ pub(super) mod tests {
         assert_eq!(response["receipt"]["imported_offline_account_count"], 2);
         assert_eq!(response["receipt"]["global_install_history_count"], 0);
         assert_eq!(response["receipt"]["archived_launch_report_count"], 0);
+        assert_eq!(response["receipt"]["archived_benchmark_count"], 0);
         assert_eq!(
             response["receipt"]["metadata_import_id"],
             request["metadata_import_id"]
@@ -3075,17 +3079,58 @@ pub(super) mod tests {
     #[tokio::test]
     async fn composed_metadata_import_retains_deleted_instance_reports_with_a_survivor() {
         for import_before_metadata in [true, false] {
-            composed_deleted_instance_report_import(Some(import_before_metadata)).await;
+            composed_deleted_instance_report_import(
+                Some(import_before_metadata),
+                None,
+                "development",
+            )
+            .await;
         }
     }
 
     #[tokio::test]
     async fn composed_metadata_import_retains_deleted_instance_reports_without_instances() {
-        composed_deleted_instance_report_import(None).await;
+        composed_deleted_instance_report_import(None, None, "development").await;
     }
 
-    async fn composed_deleted_instance_report_import(import_before_metadata: Option<bool>) {
+    #[tokio::test]
+    async fn composed_metadata_import_retains_deleted_instance_benchmarks_with_a_survivor() {
+        for import_before_metadata in [false, true] {
+            composed_deleted_instance_report_import(
+                Some(import_before_metadata),
+                Some(true),
+                "development",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn composed_metadata_import_retains_deleted_instance_benchmarks_without_instances() {
+        composed_deleted_instance_report_import(None, Some(true), "development").await;
+    }
+
+    #[tokio::test]
+    async fn composed_metadata_import_retains_deleted_instance_all_pending_benchmarks() {
+        composed_deleted_instance_report_import(None, Some(false), "development").await;
+    }
+
+    #[tokio::test]
+    async fn composed_deleted_instance_qualification_retains_incomplete_history() {
+        for completed in [false, true] {
+            composed_deleted_instance_report_import(None, Some(completed), "release_validation")
+                .await;
+        }
+    }
+
+    async fn composed_deleted_instance_report_import(
+        import_before_metadata: Option<bool>,
+        completed_benchmark_run: Option<bool>,
+        benchmark_mode: &str,
+    ) {
         let has_survivor = import_before_metadata.is_some();
+        let with_benchmarks = completed_benchmark_run.is_some();
+        let benchmark_run_index = usize::from(benchmark_mode == "release_validation");
         let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let baseline = root.path().join("baseline");
         fs::create_dir(&baseline).unwrap();
@@ -3130,6 +3175,57 @@ pub(super) mod tests {
             "matched_sample_count":1,"metric_name":"boot_duration_ms","current_value_ms":1000,
             "baseline_value_ms":2000,"delta_ms":-1000,"delta_percent":-50.0
         });
+        let benchmark_fixture = completed_benchmark_run.map(|completed| {
+            use axial_app::performance::benchmarks::{benchmark_suite_plan, benchmark_suite_run_id};
+            let plan = benchmark_suite_plan(benchmark_mode).unwrap();
+            let runs: Vec<_> = plan.into_iter().enumerate().map(|(index, run)| {
+                json!({"run_index":index,"profile":run.profile,"run_type":run.run_type,
+                    "target_id":run.target_id.unwrap_or(""),
+                    "benchmark_id":benchmark_suite_run_id(benchmark_mode, index, run),
+                    "session_id":(completed && index == benchmark_run_index).then_some("session-deleted"),
+                    "launched_at":(completed && index == benchmark_run_index).then_some("2026-01-01T00:00:00Z"),
+                    "state":if completed && index == benchmark_run_index {"exited"} else {"pending"}})
+            }).collect();
+            report["scenario"]["benchmark_profile"] = runs[benchmark_run_index]["profile"].clone();
+            report["scenario"]["benchmark_run_type"] = runs[benchmark_run_index]["run_type"].clone();
+            report["scenario"]["benchmark_mode"] = json!(benchmark_mode);
+            report["scenario"]["benchmark_id"] = runs[benchmark_run_index]["benchmark_id"].clone();
+            if benchmark_mode == "release_validation" {
+                report["version_id"] = json!("1.12.2");
+                report["scenario"]["version_id"] = json!("1.12.2");
+                report["scenario"]["performance_mode"] = json!("managed");
+                report["scenario"]["scenario_id"] = json!("managed_launch");
+                prior["version_id"] = json!("1.12.2");
+                report["comparison"]["baseline"]["version_id"] = json!("1.12.2");
+            }
+            prior["scenario"] = report["scenario"].clone();
+            prior["scenario"]["performance_mode"] = json!("vanilla");
+            prior["scenario"]["scenario_id"] = json!("vanilla_launch");
+            for field in ["benchmark_profile", "benchmark_run_type", "benchmark_mode"] {
+                report["comparison"]["baseline"][field] = report["scenario"][field].clone();
+            }
+            let suite = json!({
+                "schema":"axial.launch.benchmark.suite","schema_version":2,
+                "suite_id":"suite-dev-0000000000000002","instance_id":"0000000000000002","mode":benchmark_mode,
+                "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:02Z","runs":runs
+            });
+            let driver = json!({
+                "id":"benchmark-suite-driver-0000000000000002","suite_id":suite["suite_id"],
+                "mode":benchmark_mode,"state":"stopped","interval_ms":30000,"run_count":suite["runs"].as_array().unwrap().len(),"launched_run_count":usize::from(completed),
+                "pending_run_index":if benchmark_run_index == 0 {usize::from(completed)} else {0},"active_session_id":null,
+                "last_run_index":completed.then_some(benchmark_run_index),"last_session_id":completed.then_some("session-deleted"),
+                "error":"Stopped by the user","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:02Z"
+            });
+            for (path, value) in [
+                ("benchmarks/suites/suite-dev-0000000000000002.json", &suite),
+                ("benchmarks/suite-drivers/benchmark-suite-driver-0000000000000002.json", &driver),
+            ] {
+                let path = baseline.join(path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+            }
+            (suite, driver)
+        });
         let report_directory = baseline.join("benchmarks/launch");
         fs::create_dir_all(&report_directory).unwrap();
         for record in [&report, &prior] {
@@ -3146,6 +3242,12 @@ pub(super) mod tests {
             "benchmarks/launch/session-deleted.json",
             "benchmarks/launch/session-deleted-before.json",
         ];
+        if with_benchmarks {
+            source_files.extend([
+                "benchmarks/suites/suite-dev-0000000000000002.json",
+                "benchmarks/suite-drivers/benchmark-suite-driver-0000000000000002.json",
+            ]);
+        }
         if has_survivor {
             source_files.extend([
                 "instances/0000000000000001/options.txt",
@@ -3205,6 +3307,146 @@ pub(super) mod tests {
                 .request(method, format!("{}{path}", bootstrap.base_url))
                 .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
         };
+        let read_benchmarks = || async {
+            let Some((original_suite, original_driver)) = &benchmark_fixture else {
+                return Vec::new();
+            };
+            let drivers_path = "/api/v1/launch/benchmark/suite/drivers";
+            let listing: Value = request(Method::GET, drivers_path)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let drivers = listing["drivers"].as_array().unwrap();
+            assert_eq!(
+                drivers.len(),
+                1,
+                "deleted instance's historical driver was not retained"
+            );
+            let driver = &drivers[0];
+            assert_eq!(driver["view_model"]["can_resume"], false);
+            assert!(driver.get("resumed_driver_id").is_none());
+            let driver_id = driver["driver"]["id"].as_str().unwrap();
+            let suite_id = driver["driver"]["suite_id"].as_str().unwrap();
+            assert!(driver_id.starts_with("legacy-driver-"));
+            assert!(suite_id.starts_with("legacy-suite-"));
+            let driver_path = format!("{drivers_path}/{driver_id}");
+            let suite_path = format!("/api/v1/launch/benchmark/suites/{suite_id}");
+            let suite: Value = request(Method::GET, &suite_path)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let instance = suite["instance_id"].as_str().unwrap();
+            assert!(uuid::Uuid::parse_str(instance).is_err());
+            let session = &suite["runs"][benchmark_run_index]["session_id"];
+            if completed_benchmark_run == Some(true) {
+                let proof: Value = request(
+                    Method::GET,
+                    &format!("/api/v1/launch/reports/{}", session.as_str().unwrap()),
+                )
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+                assert_eq!(proof["instance_id"], instance);
+                assert_eq!(proof["recorded_at"], report["recorded_at"]);
+            } else {
+                assert!(session.is_null());
+            }
+            let mut expected_suite = original_suite.clone();
+            expected_suite["suite_id"] = json!(suite_id);
+            expected_suite["instance_id"] = json!(instance);
+            expected_suite["historical"] = json!(true);
+            expected_suite["runs"][benchmark_run_index]["session_id"] = session.clone();
+            assert_eq!(suite, expected_suite);
+            if benchmark_mode == "release_validation" {
+                let qualification: Value = request(
+                    Method::GET,
+                    &format!("/api/v1/launch/benchmark/qualification/family-c-1-12-2/{suite_id}"),
+                )
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+                assert_eq!(qualification["status"], "incomplete");
+                assert_eq!(qualification["suite"]["suite_id"], suite_id);
+                let managed = &qualification["targets"][1];
+                let has_proof = completed_benchmark_run == Some(true);
+                assert_eq!(managed["proof"]["present"], has_proof);
+                let missing = managed["missing"].as_array().unwrap();
+                assert_eq!(
+                    missing.contains(&json!("managed_install_state_invalid")),
+                    has_proof
+                );
+                assert!(!missing.contains(&json!("managed_install_state_missing")));
+                for field in [
+                    "present",
+                    "expected_artifacts_present",
+                    "ownership",
+                    "source",
+                    "integrity",
+                ] {
+                    assert_eq!(managed["managed_install"][field], false, "{field}");
+                }
+            }
+            let mut expected_driver = original_driver.clone();
+            expected_driver["id"] = json!(driver_id);
+            expected_driver["suite_id"] = json!(suite_id);
+            expected_driver["last_session_id"] = session.clone();
+            expected_driver["historical"] = json!(true);
+            assert_eq!(driver["driver"], expected_driver);
+            for action in ["stop", "resume"] {
+                assert_eq!(
+                    request(Method::POST, &format!("{driver_path}/{action}"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::BAD_REQUEST
+                );
+            }
+            for path in [
+                "/api/v1/launch/benchmark",
+                "/api/v1/launch/benchmark/suite/tick",
+                "/api/v1/launch/benchmark/suite/driver",
+            ] {
+                assert_eq!(request(Method::POST, path)
+                    .json(&json!({"instance_id":instance,"suite_id":suite_id,"suite_mode":benchmark_mode}))
+                    .send().await.unwrap().status(), StatusCode::BAD_REQUEST);
+            }
+            let detail: Value = request(Method::GET, &driver_path)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(&detail, driver);
+            vec![
+                (drivers_path.into(), listing),
+                (driver_path, detail),
+                (suite_path, suite),
+            ]
+        };
         let status_path = format!("/api/v1/import/metadata/{}", preview.metadata_import_id);
         let import_survivor = || async {
             let response = request(Method::POST, "/api/v1/import/instances")
@@ -3242,6 +3484,11 @@ pub(super) mod tests {
         } else {
             None
         };
+        let mut saved_benchmarks = if survivor_id.is_some() {
+            Some(read_benchmarks().await)
+        } else {
+            None
+        };
         let mut receipt = None;
         for replay in [false, true] {
             if replay {
@@ -3262,6 +3509,9 @@ pub(super) mod tests {
             assert_eq!(imported["cutover_available"], false);
             assert_eq!(imported["receipt"]["imported_offline_account_count"], 2);
             assert_eq!(imported["receipt"]["archived_launch_report_count"], 2);
+            if with_benchmarks {
+                assert_eq!(imported["receipt"]["archived_benchmark_count"], 2);
+            }
             assert_eq!(services.accounts.snapshot().unwrap().accounts.len(), 2);
             assert_eq!(
                 services.settings.current().unwrap().username,
@@ -3354,6 +3604,12 @@ pub(super) mod tests {
             let mut comparison = report["comparison"].clone();
             comparison["baseline_session_id"] = previous["session_id"].clone();
             assert_eq!(current["comparison"], comparison);
+            let benchmarks = read_benchmarks().await;
+            if let Some(saved) = &saved_benchmarks {
+                assert_eq!(&benchmarks, saved);
+            } else {
+                saved_benchmarks = Some(benchmarks);
+            }
             if let Some(saved) = &saved {
                 assert_eq!(&history, saved);
             } else {
@@ -3376,6 +3632,7 @@ pub(super) mod tests {
                     .await
                     .unwrap();
                 assert_eq!(after, history);
+                assert_eq!(read_benchmarks().await, *saved_benchmarks.as_ref().unwrap());
             }
         }
         let assert_inert = |services: &crate::DesktopServices| {
@@ -3389,12 +3646,14 @@ pub(super) mod tests {
             assert!(services.sessions.snapshots().is_empty());
             assert!(services.installs.snapshot().active.is_none());
             assert!(services.installs.snapshot().items.is_empty());
+            assert!(services.tasks.status().is_idle());
             services.settings.metadata().read::<_, StorageError>(|db| {
-                let counts: (u64, u64, u64, u64) = db.query_row(
+                let counts: (u64, u64, u64, u64, u64) = db.query_row(
                     "SELECT (SELECT COUNT(*) FROM launch_intents),(SELECT COUNT(*) FROM benchmark_suites),
-                     (SELECT COUNT(*) FROM benchmark_drivers),(SELECT COUNT(*) FROM installed_versions)",
-                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
-                assert_eq!(counts, (0, 0, 0, 0));
+                     (SELECT COUNT(*) FROM benchmark_drivers),(SELECT COUNT(*) FROM installed_versions),
+                     (SELECT COUNT(*) FROM benchmark_drivers WHERE request IS NOT NULL)",
+                    [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?;
+                assert_eq!(counts, (0, u64::from(with_benchmarks), u64::from(with_benchmarks), 0, 0));
                 Ok(())
             }).unwrap();
         };
@@ -3414,6 +3673,7 @@ pub(super) mod tests {
                 json!({"receipt":receipt.unwrap(),"cutover_available":false}),
             ),
         ];
+        reads.extend(saved_benchmarks.unwrap());
         for record in saved["reports"].as_array().unwrap() {
             reads.push((
                 format!(

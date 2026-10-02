@@ -29,6 +29,10 @@ use crate::{
         PreparedReportImport, ReportError,
     },
     library::ApplicationRootPin,
+    performance::benchmarks::{
+        ArchivedBenchmarkCompletionProof, BenchmarkError, MAX_ARCHIVED_BENCHMARK_PROOF_BYTES,
+        PreparedBenchmarkImport,
+    },
     settings::{
         ConfigLaunchAuthMode, PreparedSettingsImport, SettingsCommit, SettingsError, SettingsStore,
         prepare_legacy_import,
@@ -72,6 +76,12 @@ pub const METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION: Migration = Migration {
         CHECK(archived_launch_report_proof IS NULL OR length(CAST(archived_launch_report_proof AS BLOB)) <= 131072);",
 };
 
+pub const METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION: Migration = Migration {
+    id: "profile_metadata_imports.v5",
+    sql: "ALTER TABLE profile_metadata_imports ADD COLUMN archived_benchmark_proof TEXT
+        CHECK(archived_benchmark_proof IS NULL OR length(CAST(archived_benchmark_proof AS BLOB)) <= 131072);",
+};
+
 const MAX_MAPPING_BYTES: usize = 131072;
 
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +104,10 @@ pub struct PreparedMetadataImport {
     settings: PreparedSettingsImport,
     global_history: Option<(Arc<PreparedInstallImport>, CompletionProof)>,
     archived_reports: Option<(Arc<PreparedReportImport>, ArchivedReportCompletionProof)>,
+    archived_benchmarks: Option<(
+        Arc<PreparedBenchmarkImport>,
+        ArchivedBenchmarkCompletionProof,
+    )>,
 }
 
 /// Telemetry consent is published by the accepted command's owned consent
@@ -133,16 +147,27 @@ impl Inventory {
             Err(ImportError::InvalidData | ImportError::LimitExceeded) => None,
             Err(error) => return Err(error),
         };
-        let archived_reports = match super::history::prepare_archived_reports(self) {
-            Ok(batch) => {
-                let proof = batch
-                    .completion_proof(&source_id)
-                    .map_err(|_| ImportError::InvalidData)?;
-                Some((batch, proof))
-            }
-            Err(ImportError::InvalidData | ImportError::LimitExceeded) => None,
-            Err(error) => return Err(error),
-        };
+        let (archived_reports, archived_benchmarks) =
+            match super::history::prepare_archived_history(self) {
+                Ok(history) => {
+                    let proof = history
+                        .reports
+                        .completion_proof(&source_id)
+                        .map_err(|_| ImportError::InvalidData)?;
+                    let benchmarks = history
+                        .benchmarks
+                        .map(|batch| {
+                            let proof = batch
+                                .completion_proof(&source_id)
+                                .map_err(|_| ImportError::InvalidData)?;
+                            Ok::<_, ImportError>((batch, proof))
+                        })
+                        .transpose()?;
+                    (Some((history.reports, proof)), benchmarks)
+                }
+                Err(ImportError::InvalidData | ImportError::LimitExceeded) => (None, None),
+                Err(error) => return Err(error),
+            };
         self.revalidate()?;
         Ok(PreparedMetadataImport {
             inventory: Arc::clone(self),
@@ -152,6 +177,7 @@ impl Inventory {
             settings,
             global_history,
             archived_reports,
+            archived_benchmarks,
         })
     }
 
@@ -249,6 +275,27 @@ impl PreparedMetadataImport {
                             }
                         }
                     }
+                    if let Some((batch, proof)) = &self.archived_benchmarks {
+                        match &stored.archived_benchmarks {
+                            Some(existing) if existing != proof => return Err(SettingsError::Conflict),
+                            Some(_) => {}
+                            None => {
+                                if cancel.is_cancelled() { return Err(SettingsError::Unavailable); }
+                                batch.insert_in(transaction).map_err(benchmark_error)?;
+                                if transaction.execute(
+                                    "UPDATE profile_metadata_imports SET archived_benchmark_proof=?1
+                                     WHERE source_id=?2 AND fingerprint=?3 AND import_id=?4
+                                     AND archived_benchmark_proof IS NULL",
+                                    params![encode_benchmark_proof(proof)?, self.source_id, fingerprint, id],
+                                )? != 1 {
+                                    return Err(SettingsError::Conflict);
+                                }
+                                stored.archived_benchmarks = Some(proof.clone());
+                                stored.receipt.archived_benchmark_count = Some(proof.count());
+                                if cancel.is_cancelled() { return Err(SettingsError::Unavailable); }
+                            }
+                        }
+                    }
                     return Ok((false, stored));
                 }
                 if cancel.is_cancelled() {
@@ -268,6 +315,9 @@ impl PreparedMetadataImport {
                 if let Some((batch, _)) = &self.archived_reports {
                     batch.insert_in(transaction).map_err(report_error)?;
                 }
+                if let Some((batch, _)) = &self.archived_benchmarks {
+                    batch.insert_in(transaction).map_err(benchmark_error)?;
+                }
                 let completed = MetadataImportReceipt {
                     metadata_import_id: self.import_id.clone(),
                     imported_offline_account_count: self.accounts.offline.len(),
@@ -275,18 +325,20 @@ impl PreparedMetadataImport {
                     account_id_mapping: Some(self.accounts.mapping.clone()),
                     global_install_history_count: self.global_history.as_ref().map(|(_, proof)| proof.count()),
                     archived_launch_report_count: self.archived_reports.as_ref().map(|(_, proof)| proof.count()),
+                    archived_benchmark_count: self.archived_benchmarks.as_ref().map(|(_, proof)| proof.count()),
                     settings_revision: request.expected_settings_revision.checked_add(1)
                         .ok_or(SettingsError::Unavailable)?,
                     account_selection_revision: snapshot.selection_revision,
                 };
                 if transaction.execute(
-                    "INSERT INTO profile_metadata_imports(source_id, fingerprint, import_id, account_count, settings_revision, selection_revision, microsoft_account_count, account_id_mapping, global_install_history_proof, archived_launch_report_proof) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO profile_metadata_imports(source_id, fingerprint, import_id, account_count, settings_revision, selection_revision, microsoft_account_count, account_id_mapping, global_install_history_proof, archived_launch_report_proof, archived_benchmark_proof) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![self.source_id, self.inventory.fingerprint(), self.import_id,
                         self.accounts.mapping.len(), completed.settings_revision,
                         completed.account_selection_revision, completed.imported_microsoft_account_count,
                         encode_mapping(&self.accounts.mapping)?,
                         self.global_history.as_ref().map(|(_, proof)| encode_proof(proof)).transpose()?,
-                        self.archived_reports.as_ref().map(|(_, proof)| encode_archived_proof(proof)).transpose()?],
+                        self.archived_reports.as_ref().map(|(_, proof)| encode_archived_proof(proof)).transpose()?,
+                        self.archived_benchmarks.as_ref().map(|(_, proof)| encode_benchmark_proof(proof)).transpose()?],
                 )? != 1 {
                     return Err(SettingsError::Conflict);
                 }
@@ -299,6 +351,7 @@ impl PreparedMetadataImport {
                     fingerprint: self.inventory.fingerprint().to_owned(),
                     global_history: self.global_history.as_ref().map(|(_, proof)| proof.clone()),
                     archived_reports: self.archived_reports.as_ref().map(|(_, proof)| proof.clone()),
+                    archived_benchmarks: self.archived_benchmarks.as_ref().map(|(_, proof)| proof.clone()),
                 }))
             },
             |transaction, receipt| verify_receipt(transaction, receipt),
@@ -378,6 +431,7 @@ struct StoredReceipt {
     fingerprint: String,
     global_history: Option<CompletionProof>,
     archived_reports: Option<ArchivedReportCompletionProof>,
+    archived_benchmarks: Option<ArchivedBenchmarkCompletionProof>,
 }
 
 impl StoredReceipt {
@@ -391,6 +445,14 @@ impl StoredReceipt {
             proof
                 .verify_in(connection, &self.source_id)
                 .map_err(report_error)?;
+        }
+        if let Some(proof) = &self.archived_benchmarks {
+            if self.archived_reports.is_none() {
+                return Err(SettingsError::Corrupt);
+            }
+            proof
+                .verify_in(connection, &self.source_id)
+                .map_err(benchmark_error)?;
         }
         Ok(())
     }
@@ -418,9 +480,11 @@ fn read_receipt(
             fingerprint, length(CAST(global_install_history_proof AS BLOB)),
             CASE WHEN length(CAST(global_install_history_proof AS BLOB)) <= ?3 THEN global_install_history_proof END,
             length(CAST(archived_launch_report_proof AS BLOB)),
-            CASE WHEN length(CAST(archived_launch_report_proof AS BLOB)) <= ?4 THEN archived_launch_report_proof END
+            CASE WHEN length(CAST(archived_launch_report_proof AS BLOB)) <= ?4 THEN archived_launch_report_proof END,
+            length(CAST(archived_benchmark_proof AS BLOB)),
+            CASE WHEN length(CAST(archived_benchmark_proof AS BLOB)) <= ?5 THEN archived_benchmark_proof END
          FROM profile_metadata_imports WHERE import_id = ?1",
-            params![import_id, MAX_MAPPING_BYTES, MAX_COMPLETION_PROOF_BYTES, MAX_ARCHIVED_PROOF_BYTES],
+            params![import_id, MAX_MAPPING_BYTES, MAX_COMPLETION_PROOF_BYTES, MAX_ARCHIVED_PROOF_BYTES, MAX_ARCHIVED_BENCHMARK_PROOF_BYTES],
             |row| {
                 Ok((
                     row.get::<_, usize>(0)?,
@@ -435,6 +499,8 @@ fn read_receipt(
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, Option<usize>>(10)?,
                     row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<usize>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             },
         )
@@ -452,6 +518,8 @@ fn read_receipt(
         encoded_proof,
         archived_length,
         encoded_archived,
+        benchmark_length,
+        encoded_benchmarks,
     )) = row
     else {
         return Ok(None);
@@ -471,7 +539,7 @@ fn read_receipt(
         _ => return Err(SettingsError::Corrupt),
     };
     let source_id = source_id.ok_or(SettingsError::Corrupt)?;
-    if (proof_length.is_some() || archived_length.is_some())
+    if (proof_length.is_some() || archived_length.is_some() || benchmark_length.is_some())
         && (!valid_identity(&source_id)
             || !valid_identity(&fingerprint)
             || self::import_id(&source_id, &fingerprint) != import_id)
@@ -493,6 +561,14 @@ fn read_receipt(
             }
             _ => return Err(SettingsError::Corrupt),
         };
+    let archived_benchmarks: Option<ArchivedBenchmarkCompletionProof> =
+        match (benchmark_length, encoded_benchmarks) {
+            (None, None) => None,
+            (Some(length), Some(encoded)) if length <= MAX_ARCHIVED_BENCHMARK_PROOF_BYTES => {
+                Some(serde_json::from_str(&encoded).map_err(|_| SettingsError::Corrupt)?)
+            }
+            _ => return Err(SettingsError::Corrupt),
+        };
     Ok(Some(StoredReceipt {
         receipt: MetadataImportReceipt {
             metadata_import_id: import_id.to_owned(),
@@ -503,6 +579,9 @@ fn read_receipt(
             archived_launch_report_count: archived_reports
                 .as_ref()
                 .map(ArchivedReportCompletionProof::count),
+            archived_benchmark_count: archived_benchmarks
+                .as_ref()
+                .map(ArchivedBenchmarkCompletionProof::count),
             settings_revision,
             account_selection_revision,
         },
@@ -510,6 +589,7 @@ fn read_receipt(
         fingerprint,
         global_history,
         archived_reports,
+        archived_benchmarks,
     }))
 }
 
@@ -549,6 +629,24 @@ fn report_error(error: ReportError) -> SettingsError {
         ReportError::Invalid | ReportError::TooLarge => SettingsError::Corrupt,
         ReportError::ConflictingSession => SettingsError::Conflict,
         ReportError::Storage(error) => SettingsError::Storage(error),
+    }
+}
+
+fn encode_benchmark_proof(
+    proof: &ArchivedBenchmarkCompletionProof,
+) -> Result<String, SettingsError> {
+    let encoded = serde_json::to_string(proof).map_err(|_| SettingsError::Unavailable)?;
+    if encoded.len() > MAX_ARCHIVED_BENCHMARK_PROOF_BYTES {
+        return Err(SettingsError::Unavailable);
+    }
+    Ok(encoded)
+}
+
+fn benchmark_error(error: BenchmarkError) -> SettingsError {
+    match error {
+        BenchmarkError::Storage(error) => SettingsError::Storage(error),
+        BenchmarkError::ConflictingHistory => SettingsError::Conflict,
+        _ => SettingsError::Corrupt,
     }
 }
 

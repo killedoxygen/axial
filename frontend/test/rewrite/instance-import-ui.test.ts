@@ -1479,63 +1479,68 @@ test('metadata history completion remains optional, bounded and separate from in
   }
 });
 
-test('archived launch report counts survive metadata receipts and status reads with optional compatibility', async () => {
-  for (const reportCount of [undefined, null, 0, 1024]) {
-    for (const lost of [false, true]) {
+for (const [label, field] of [
+  ['archived launch report', 'archived_launch_report_count'],
+  ['archived benchmark', 'archived_benchmark_count'],
+] as const) {
+  test(`${label} counts survive metadata receipts and status reads with optional compatibility`, async () => {
+    for (const count of [undefined, null, 0, 2, 1024]) {
+      for (const lost of [false, true]) {
+        const h = harness();
+        h.setPreview(preview({ instances: [], blockers: ['cutover_not_implemented', 'unsettled_operation'] }));
+        await h.workflow.chooseProfile();
+        await h.workflow.prepareMetadataImport();
+        const result = {
+          ...receipt,
+          global_install_history_count: 128,
+          ...(count === undefined ? {} : { [field]: count }),
+        };
+        h.setSettings({ ...settings, revision: 8, account_selection_revision: 5 });
+        h.setMetadataPost(async () => {
+          if (lost) throw new Error('Response lost');
+          return JSON.parse(JSON.stringify({ receipt: result, already_imported: false, cutover_available: false }));
+        });
+        h.setMetadataRead(async () => JSON.parse(JSON.stringify({ receipt: result, cutover_available: false })));
+        await h.workflow.importMetadata();
+        const expected = {
+          ...receipt,
+          global_install_history_count: 128,
+          ...(count == null ? {} : { [field]: count }),
+        };
+        assert.equal(h.workflow.state.value.phase, 'metadata-imported');
+        assert.equal(h.workflow.state.value.error, null);
+        assert.equal(JSON.stringify(h.workflow.state.value.metadataReceipt), JSON.stringify(expected));
+        assert.equal(
+          Object.prototype.hasOwnProperty.call(h.workflow.state.value.metadataReceipt, field),
+          count != null,
+        );
+        assert.equal(h.workflow.state.value.preview?.cutover_available, false);
+        assert.equal(h.navigation.length, 0);
+        assert.equal(h.calls.filter(([method]) => method === 'POST').length, 1);
+        assert.equal(h.calls.filter(([, path]) => path === `/import/metadata/${metadataId}`).length, lost ? 1 : 0);
+      }
+    }
+  });
+
+  test(`invalid ${label} counts cannot confirm metadata imports or refresh destination state`, async () => {
+    for (const count of [-1, 0.5, 1025, Number.MAX_SAFE_INTEGER + 1, '2', true, {}, []]) {
       const h = harness();
-      h.setPreview(preview({ instances: [], blockers: ['cutover_not_implemented', 'unsettled_operation'] }));
       await h.workflow.chooseProfile();
       await h.workflow.prepareMetadataImport();
-      const result = {
-        ...receipt,
-        global_install_history_count: 128,
-        ...(reportCount === undefined ? {} : { archived_launch_report_count: reportCount }),
-      };
-      h.setSettings({ ...settings, revision: 8, account_selection_revision: 5 });
-      h.setMetadataPost(async () => {
-        if (lost) throw new Error('Response lost');
-        return JSON.parse(JSON.stringify({ receipt: result, already_imported: false, cutover_available: false }));
-      });
+      const result = { ...receipt, [field]: count };
+      h.setMetadataPost(async () =>
+        JSON.parse(JSON.stringify({ receipt: result, already_imported: false, cutover_available: false })),
+      );
       h.setMetadataRead(async () => JSON.parse(JSON.stringify({ receipt: result, cutover_available: false })));
       await h.workflow.importMetadata();
-      const expected = {
-        ...receipt,
-        global_install_history_count: 128,
-        ...(reportCount == null ? {} : { archived_launch_report_count: reportCount }),
-      };
-      assert.equal(h.workflow.state.value.phase, 'metadata-imported');
-      assert.equal(h.workflow.state.value.error, null);
-      assert.equal(JSON.stringify(h.workflow.state.value.metadataReceipt), JSON.stringify(expected));
-      assert.equal(
-        Object.prototype.hasOwnProperty.call(h.workflow.state.value.metadataReceipt, 'archived_launch_report_count'),
-        reportCount != null,
-      );
-      assert.equal(h.workflow.state.value.preview?.cutover_available, false);
-      assert.equal(h.navigation.length, 0);
+      assert.equal(h.workflow.state.value.phase, 'metadata-uncertain', JSON.stringify(count));
+      assert.equal(h.workflow.state.value.metadataReceipt, null);
+      assert.equal(h.accountRefreshes.length, 0);
+      assert.equal(h.flagRefreshes.length, 0);
       assert.equal(h.calls.filter(([method]) => method === 'POST').length, 1);
-      assert.equal(h.calls.filter(([, path]) => path === `/import/metadata/${metadataId}`).length, lost ? 1 : 0);
     }
-  }
-});
-
-test('invalid archived launch report counts cannot confirm metadata imports or refresh destination state', async () => {
-  for (const reportCount of [-1, 0.5, 1025, Number.MAX_SAFE_INTEGER + 1, '2', true, {}, []]) {
-    const h = harness();
-    await h.workflow.chooseProfile();
-    await h.workflow.prepareMetadataImport();
-    const result = { ...receipt, archived_launch_report_count: reportCount };
-    h.setMetadataPost(async () =>
-      JSON.parse(JSON.stringify({ receipt: result, already_imported: false, cutover_available: false })),
-    );
-    h.setMetadataRead(async () => JSON.parse(JSON.stringify({ receipt: result, cutover_available: false })));
-    await h.workflow.importMetadata();
-    assert.equal(h.workflow.state.value.phase, 'metadata-uncertain', JSON.stringify(reportCount));
-    assert.equal(h.workflow.state.value.metadataReceipt, null);
-    assert.equal(h.accountRefreshes.length, 0);
-    assert.equal(h.flagRefreshes.length, 0);
-    assert.equal(h.calls.filter(([method]) => method === 'POST').length, 1);
-  }
-});
+  });
+}
 
 test('invalid or mismatched metadata receipts cannot claim completion or refresh destination state', async () => {
   for (const invalid of [

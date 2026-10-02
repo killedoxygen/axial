@@ -199,7 +199,7 @@ fn archived_reports_share_publication_with_survivors_and_keep_pruned_comparisons
     let before = crate::import::tests::snapshot(&fixture.baseline);
     let inventory = fixture.capture();
     let source = inventory.source_identity().unwrap();
-    let batch = prepare_archived_reports(&inventory).unwrap();
+    let batch = prepare_archived_history(&inventory).unwrap().reports;
     assert_eq!(batch.completion_proof(&source).unwrap().count(), 1);
     let history = prepare_history(&inventory).unwrap();
     assert_eq!(history.supported_records().len(), 2);
@@ -287,11 +287,12 @@ fn archived_reports_require_original_registry_identity_evidence() {
         archived["instance_id"] = json!(SECOND);
         write(&fixture, "session-a.json", &archived);
         let inventory = fixture.capture();
-        let result = prepare_archived_reports(&inventory);
+        let result = prepare_archived_history(&inventory);
         if variant == "dangling_selection" {
             assert_eq!(
                 result
                     .unwrap()
+                    .reports
                     .completion_proof(&inventory.source_identity().unwrap())
                     .unwrap()
                     .count(),
@@ -341,17 +342,163 @@ fn archived_reports_do_not_waive_live_reports_suites_or_unsettled_journals() {
             !inventory.preview().instances[0].ordinary_import_available,
             "{obligation}"
         );
-        let batch = prepare_archived_reports(&inventory);
+        let batch = prepare_archived_history(&inventory);
         if obligation == "bad_archive" {
             assert!(batch.is_err());
         } else {
             assert_eq!(
                 batch
                     .unwrap()
+                    .reports
                     .completion_proof(&inventory.source_identity().unwrap())
                     .unwrap()
                     .count(),
                 1
+            );
+        }
+    }
+}
+
+#[test]
+fn archived_benchmarks_co_publish_without_destination_instance_or_execution_authority() {
+    for state in ["terminal", "all_pending", "mixed"] {
+        let fixture = Fixture::new();
+        let mut archived_report = benchmark_report();
+        archived_report["instance_id"] = json!(SECOND);
+        let mut archived_suite = suite();
+        archived_suite["instance_id"] = json!(SECOND);
+        let mut archived_driver = driver();
+        if state == "all_pending" {
+            archived_suite["runs"][0]["state"] = json!("pending");
+            archived_suite["runs"][0]["session_id"] = Value::Null;
+            archived_suite["runs"][0]["launched_at"] = Value::Null;
+            archived_driver["launched_run_count"] = json!(0);
+            archived_driver["last_run_index"] = Value::Null;
+            archived_driver["last_session_id"] = Value::Null;
+            archived_driver["pending_run_index"] = json!(0);
+        } else if state == "mixed" {
+            let mut pending = archived_suite["runs"][0].clone();
+            pending["run_index"] = json!(1);
+            pending["benchmark_id"] = json!("benchmark-0000000000000002");
+            pending["state"] = json!("pending");
+            pending["session_id"] = Value::Null;
+            pending["launched_at"] = Value::Null;
+            archived_suite["runs"].as_array_mut().unwrap().push(pending);
+            archived_driver["run_count"] = json!(2);
+            archived_driver["pending_run_index"] = json!(1);
+        }
+        write_benchmark_history(
+            &fixture,
+            &archived_report,
+            &archived_suite,
+            &archived_driver,
+        );
+        let before = crate::import::tests::snapshot(&fixture.baseline);
+        let inventory = fixture.capture();
+        let source = inventory.source_identity().unwrap();
+        let archive = prepare_archived_history(&inventory).unwrap();
+        let benchmark_batch = archive.benchmarks.unwrap();
+        assert_eq!(
+            benchmark_batch.completion_proof(&source).unwrap().count(),
+            2
+        );
+        let history = prepare_history(&inventory).unwrap();
+        assert_eq!(history.supported_records().len(), 3);
+        let bound = history
+            .for_instance(INSTANCE)
+            .unwrap()
+            .bind_instance(&InstanceId::new())
+            .unwrap();
+        let metadata = Arc::new(MetadataStore::in_memory().unwrap());
+        let reports = LaunchReportStore::new(metadata.clone()).unwrap();
+        metadata
+            .migrate(&[
+                crate::performance::benchmarks::MIGRATION,
+                crate::performance::benchmarks::MIGRATION_V2,
+            ])
+            .unwrap();
+        metadata
+            .transaction(|tx| {
+                bound.reports.insert_in(tx).unwrap();
+                bound.benchmarks.insert_in(tx)?;
+                bound.benchmarks.verify_in(tx)
+            })
+            .unwrap();
+        let saved: BenchmarkSuiteManifest = metadata
+            .read(|db| -> Result<_, crate::storage::StorageError> {
+                let payload: Vec<u8> =
+                    db.query_row("SELECT payload FROM benchmark_suites", [], |row| row.get(0))?;
+                Ok(serde_json::from_slice(&payload).unwrap())
+            })
+            .unwrap();
+        assert_eq!(saved.instance_id, format!("archived-{source}-{SECOND}"));
+        assert!(saved.historical);
+        assert!(saved.runs.iter().all(|run| run.launch_intent.is_none()));
+        assert_eq!(
+            reports.list_recent(10).unwrap()[0].instance_id,
+            saved.instance_id
+        );
+        metadata
+            .transaction(|tx| {
+                archive.reports.insert_in(tx).unwrap();
+                benchmark_batch.insert_in(tx)?;
+                benchmark_batch.verify_in(tx)
+            })
+            .unwrap();
+        let authorities: u32 = metadata.read(|db| -> Result<_, crate::storage::StorageError> {
+            Ok(db.query_row("SELECT count(*) FROM benchmark_drivers WHERE request IS NOT NULL OR source_driver_id IS NOT NULL", [], |row| row.get(0))?)
+        }).unwrap();
+        assert_eq!(authorities, 0);
+        assert_eq!(crate::import::tests::snapshot(&fixture.baseline), before);
+    }
+}
+
+#[test]
+fn archived_benchmarks_do_not_waive_unrelated_live_work_or_missing_report_batch() {
+    for unrelated in ["journal", "live_suite", "bad_archived_report"] {
+        let fixture = Fixture::new();
+        let mut archived_report = benchmark_report();
+        archived_report["instance_id"] = json!(SECOND);
+        let mut archived_suite = suite();
+        archived_suite["instance_id"] = json!(SECOND);
+        write_benchmark_history(&fixture, &archived_report, &archived_suite, &driver());
+        match unrelated {
+            "journal" => {
+                let mut journal = crate::import::tests::successful_install_journal();
+                journal["entries"][0]["status"] = json!("Running");
+                let path = fixture.baseline.join("state/operation-journals.json");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+            }
+            "live_suite" => {
+                let mut live = suite();
+                live["suite_id"] = json!("suite-dev-0000000000000003");
+                live["runs"][0]["state"] = json!("running");
+                write_benchmark(&fixture, "suites", "suite-dev-0000000000000003", &live);
+            }
+            _ => {
+                let mut invalid = archived_report.clone();
+                invalid["session_id"] = json!("session-bad");
+                invalid["outcome"] = json!("running");
+                write(&fixture, "session-bad.json", &invalid);
+            }
+        }
+        let inventory = fixture.capture();
+        assert!(prepare_history(&inventory).is_err(), "{unrelated}");
+        assert!(!inventory.preview().instances[0].ordinary_import_available);
+        let archive = prepare_archived_history(&inventory);
+        if unrelated == "bad_archived_report" {
+            assert!(archive.is_err());
+        } else {
+            assert_eq!(
+                archive
+                    .unwrap()
+                    .benchmarks
+                    .unwrap()
+                    .completion_proof(&inventory.source_identity().unwrap())
+                    .unwrap()
+                    .count(),
+                2
             );
         }
     }

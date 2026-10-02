@@ -14,6 +14,7 @@ use crate::{
     tasks::{CancellationToken, TaskOwner},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
@@ -25,6 +26,12 @@ const MATRIX_SCHEMA: &str = "axial.launch.benchmark.matrix";
 const MATRIX_SCHEMA_VERSION: u32 = 1;
 const MAX_MATRIX_JSON_BYTES: usize = 12 * 1024;
 const MAX_RESTART_DRIVERS: usize = 8;
+const MAX_IMPORT_RECORDS: usize = 1024;
+const MAX_IMPORT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SUITE_BYTES: usize = 256 * 1024;
+const MAX_DRIVER_BYTES: usize = 16 * 1024;
+const MAX_STORED_DRIVERS: usize = 4096;
+pub(crate) const MAX_ARCHIVED_BENCHMARK_PROOF_BYTES: usize = 128 * 1024;
 const RESTART_INTERRUPTED_ERROR: &str = "Driver interrupted by application restart";
 const RESTART_LIMIT_ERROR: &str = "driver ignored after restart resume limit";
 
@@ -852,8 +859,17 @@ fn require_mutable(historical: bool) -> Result<(), BenchmarkError> {
 /// transaction; insertion grants neither launch intent nor driver authority.
 #[derive(Clone)]
 pub(crate) struct PreparedBenchmarkImport {
-    suites: Vec<(BenchmarkSuiteManifest, Vec<u8>)>,
-    drivers: Vec<(BenchmarkSuiteDriverStatus, Vec<u8>)>,
+    suites: Vec<Arc<(BenchmarkSuiteManifest, Vec<u8>)>>,
+    drivers: Vec<Arc<(BenchmarkSuiteDriverStatus, Vec<u8>)>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArchivedBenchmarkCompletionProof {
+    source_id: String,
+    suite_ids: Vec<String>,
+    driver_ids: Vec<String>,
+    digest: String,
 }
 
 impl PreparedBenchmarkImport {
@@ -861,7 +877,37 @@ impl PreparedBenchmarkImport {
         suites: Vec<BenchmarkSuiteManifest>,
         drivers: Vec<BenchmarkSuiteDriverStatus>,
     ) -> Result<Self, BenchmarkError> {
-        if suites.len().saturating_add(drivers.len()) > 1024 {
+        Self::prepare_bound(suites, drivers, None)
+    }
+
+    pub(crate) fn prepare_archived(
+        source: &str,
+        suites: Vec<(String, BenchmarkSuiteManifest)>,
+        drivers: Vec<BenchmarkSuiteDriverStatus>,
+    ) -> Result<Self, BenchmarkError> {
+        if !lower_hex(source, 64) || suites.len().saturating_add(drivers.len()) > MAX_IMPORT_RECORDS
+        {
+            return Err(BenchmarkError::Invalid);
+        }
+        let suites = suites
+            .into_iter()
+            .map(|(legacy_id, mut suite)| {
+                if !lower_hex(&legacy_id, 16) {
+                    return Err(BenchmarkError::Invalid);
+                }
+                suite.instance_id = format!("archived-{source}-{legacy_id}");
+                Ok(suite)
+            })
+            .collect::<Result<_, BenchmarkError>>()?;
+        Self::prepare_bound(suites, drivers, Some(source))
+    }
+
+    fn prepare_bound(
+        suites: Vec<BenchmarkSuiteManifest>,
+        drivers: Vec<BenchmarkSuiteDriverStatus>,
+        source: Option<&str>,
+    ) -> Result<Self, BenchmarkError> {
+        if suites.len().saturating_add(drivers.len()) > MAX_IMPORT_RECORDS {
             return Err(BenchmarkError::Invalid);
         }
         let mut suite_modes = BTreeMap::new();
@@ -869,6 +915,10 @@ impl PreparedBenchmarkImport {
         for suite in &suites {
             if !suite.historical
                 || validate_suite(suite).is_err()
+                || match source {
+                    Some(source) => archived_instance_source(&suite.instance_id) != Some(source),
+                    None => suite.instance_id.parse::<InstanceId>().is_err(),
+                }
                 || suite_modes
                     .insert(suite.suite_id.as_str(), suite.mode.as_str())
                     .is_some()
@@ -897,10 +947,10 @@ impl PreparedBenchmarkImport {
             .map(|suite| {
                 let encoded = serde_json::to_vec(&suite).map_err(|_| BenchmarkError::Invalid)?;
                 bytes = bytes.saturating_add(encoded.len());
-                if encoded.len() > 256 * 1024 || bytes > 64 * 1024 * 1024 {
+                if encoded.len() > MAX_SUITE_BYTES || bytes > MAX_IMPORT_BYTES {
                     return Err(BenchmarkError::Invalid);
                 }
-                Ok((suite, encoded))
+                Ok(Arc::new((suite, encoded)))
             })
             .collect::<Result<_, BenchmarkError>>()?;
         let drivers = drivers
@@ -908,53 +958,307 @@ impl PreparedBenchmarkImport {
             .map(|driver| {
                 let encoded = serde_json::to_vec(&driver).map_err(|_| BenchmarkError::Invalid)?;
                 bytes = bytes.saturating_add(encoded.len());
-                if encoded.len() > 16 * 1024 || bytes > 64 * 1024 * 1024 {
+                if encoded.len() > MAX_DRIVER_BYTES || bytes > MAX_IMPORT_BYTES {
                     return Err(BenchmarkError::Invalid);
                 }
-                Ok((driver, encoded))
+                Ok(Arc::new((driver, encoded)))
             })
             .collect::<Result<_, BenchmarkError>>()?;
         Ok(Self { suites, drivers })
     }
 
+    pub(crate) fn append(&mut self, other: &Self) -> Result<(), BenchmarkError> {
+        if self.suites.len() + self.drivers.len() + other.suites.len() + other.drivers.len()
+            > MAX_IMPORT_RECORDS
+        {
+            return Err(BenchmarkError::Invalid);
+        }
+        let mut ids = BTreeSet::new();
+        let mut sessions = BTreeSet::new();
+        let mut bytes = 0usize;
+        for record in self.suites.iter().chain(&other.suites) {
+            if !ids.insert(&record.0.suite_id)
+                || record
+                    .0
+                    .runs
+                    .iter()
+                    .filter_map(|run| run.session_id.as_ref())
+                    .any(|id| !sessions.insert(id))
+            {
+                return Err(BenchmarkError::Invalid);
+            }
+            bytes = bytes.saturating_add(record.1.len());
+        }
+        ids.clear();
+        for record in self.drivers.iter().chain(&other.drivers) {
+            if !ids.insert(&record.0.id) {
+                return Err(BenchmarkError::Invalid);
+            }
+            bytes = bytes.saturating_add(record.1.len());
+        }
+        if bytes > MAX_IMPORT_BYTES {
+            return Err(BenchmarkError::Invalid);
+        }
+        self.suites.extend(other.suites.iter().cloned());
+        self.drivers.extend(other.drivers.iter().cloned());
+        Ok(())
+    }
+
+    pub(crate) fn completion_proof(
+        &self,
+        source: &str,
+    ) -> Result<ArchivedBenchmarkCompletionProof, BenchmarkError> {
+        if !lower_hex(source, 64)
+            || self
+                .suites
+                .iter()
+                .any(|record| archived_instance_source(&record.0.instance_id) != Some(source))
+        {
+            return Err(BenchmarkError::Invalid);
+        }
+        let mut suites: Vec<_> = self.suites.iter().collect();
+        let mut drivers: Vec<_> = self.drivers.iter().collect();
+        suites.sort_unstable_by_key(|record| &record.0.suite_id);
+        drivers.sort_unstable_by_key(|record| &record.0.id);
+        let suite_ids: Vec<_> = suites
+            .iter()
+            .map(|record| record.0.suite_id.clone())
+            .collect();
+        let driver_ids: Vec<_> = drivers.iter().map(|record| record.0.id.clone()).collect();
+        let mut digest = archived_completion_hash(source, &suite_ids, &driver_ids);
+        for bytes in suites
+            .iter()
+            .map(|record| &record.1)
+            .chain(drivers.iter().map(|record| &record.1))
+        {
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+        let proof = ArchivedBenchmarkCompletionProof {
+            source_id: source.to_owned(),
+            suite_ids,
+            driver_ids,
+            digest: hex::encode(digest.finalize()),
+        };
+        proof.validate(source)?;
+        Ok(proof)
+    }
+
     pub(crate) fn insert_in(&self, tx: &Transaction<'_>) -> Result<(), BenchmarkError> {
-        for (suite, bytes) in &self.suites {
-            match stored_suite(tx, &suite.suite_id)? {
-                Some(saved) if saved == *suite => {}
+        let mut remaining = MAX_IMPORT_BYTES;
+        for record in &self.suites {
+            let (suite, bytes) = record.as_ref();
+            match imported_suite_row(tx, &suite.suite_id, &mut remaining)? {
+                Some((saved, _)) if saved == *suite => {}
                 Some(_) => return Err(BenchmarkError::ConflictingHistory),
                 None => {
-                    tx.execute(
+                    remaining = remaining
+                        .checked_sub(bytes.len())
+                        .ok_or(BenchmarkError::Invalid)?;
+                    if tx.execute(
                         "INSERT INTO benchmark_suites(suite_id,payload) VALUES(?1,?2)",
                         params![suite.suite_id, bytes],
-                    )?;
+                    )? != 1
+                    {
+                        return Err(BenchmarkError::ConflictingHistory);
+                    }
                 }
             }
         }
-        for (driver, bytes) in &self.drivers {
-            match stored_driver(tx, &driver.id)? {
-                Some(saved) if saved == *driver => {}
+        for record in &self.drivers {
+            let (driver, bytes) = record.as_ref();
+            match imported_driver_row(tx, &driver.id, &mut remaining)? {
+                Some((saved, _)) if saved == *driver => {}
                 Some(_) => return Err(BenchmarkError::ConflictingHistory),
                 None => {
-                    tx.execute("INSERT INTO benchmark_drivers(driver_id,payload,request) VALUES(?1,?2,NULL)", params![driver.id, bytes])?;
+                    remaining = remaining
+                        .checked_sub(bytes.len())
+                        .ok_or(BenchmarkError::Invalid)?;
+                    if tx.execute("INSERT INTO benchmark_drivers(driver_id,payload,request) VALUES(?1,?2,NULL)", params![driver.id, bytes])? != 1 {
+                        return Err(BenchmarkError::ConflictingHistory);
+                    }
                 }
             }
+        }
+        self.verify_in(tx)
+    }
+
+    pub(crate) fn verify_in(&self, db: &Connection) -> Result<(), BenchmarkError> {
+        verify_driver_capacity(db)?;
+        let mut remaining = MAX_IMPORT_BYTES;
+        for record in &self.suites {
+            if imported_suite_row(db, &record.0.suite_id, &mut remaining)?
+                .as_ref()
+                .map(|(suite, _)| suite)
+                != Some(&record.0)
+            {
+                return Err(BenchmarkError::ConflictingHistory);
+            }
+        }
+        for record in &self.drivers {
+            if imported_driver_row(db, &record.0.id, &mut remaining)?
+                .as_ref()
+                .map(|(driver, _)| driver)
+                != Some(&record.0)
+            {
+                return Err(BenchmarkError::ConflictingHistory);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn imported_suite_row(
+    db: &Connection,
+    id: &str,
+    remaining: &mut usize,
+) -> Result<Option<(BenchmarkSuiteManifest, Vec<u8>)>, BenchmarkError> {
+    let row: Option<(Option<Vec<u8>>, bool)> = db.query_row(
+        "SELECT CASE WHEN length(payload)<=?2 THEN payload END,source_suite_id IS NULL FROM benchmark_suites WHERE suite_id=?1",
+        params![id, MAX_SUITE_BYTES.min(*remaining)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    row.map(|(bytes, unlinked)| {
+        let bytes = bytes.ok_or(BenchmarkError::Invalid)?;
+        *remaining -= bytes.len();
+        let suite: BenchmarkSuiteManifest =
+            serde_json::from_slice(&bytes).map_err(|_| BenchmarkError::Unavailable)?;
+        if !unlinked || !suite.historical || suite.suite_id != id {
+            return Err(BenchmarkError::Unavailable);
+        }
+        validate_suite(&suite)?;
+        Ok((suite, bytes))
+    })
+    .transpose()
+}
+
+fn imported_driver_row(
+    db: &Connection,
+    id: &str,
+    remaining: &mut usize,
+) -> Result<Option<(BenchmarkSuiteDriverStatus, Vec<u8>)>, BenchmarkError> {
+    let row: Option<(Option<Vec<u8>>, bool)> = db.query_row(
+        "SELECT CASE WHEN length(payload)<=?2 THEN payload END,request IS NULL AND source_driver_id IS NULL FROM benchmark_drivers WHERE driver_id=?1",
+        params![id, MAX_DRIVER_BYTES.min(*remaining)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    row.map(|(bytes, unlinked)| {
+        let bytes = bytes.ok_or(BenchmarkError::Invalid)?;
+        *remaining -= bytes.len();
+        let driver = decode_driver(id, &bytes, None)?;
+        if !unlinked || !driver.historical {
+            return Err(BenchmarkError::Unavailable);
+        }
+        Ok((driver, bytes))
+    })
+    .transpose()
+}
+
+impl ArchivedBenchmarkCompletionProof {
+    pub(crate) fn count(&self) -> usize {
+        self.suite_ids.len() + self.driver_ids.len()
+    }
+
+    fn validate(&self, source: &str) -> Result<(), BenchmarkError> {
+        if !lower_hex(source, 64)
+            || self.source_id != source
+            || !lower_hex(&self.digest, 64)
+            || self.count() > MAX_IMPORT_RECORDS
+            || self
+                .suite_ids
+                .iter()
+                .any(|id| !imported_id(id, "legacy-suite-"))
+            || self
+                .driver_ids
+                .iter()
+                .any(|id| !imported_id(id, "legacy-driver-"))
+            || self.suite_ids.windows(2).any(|ids| ids[0] >= ids[1])
+            || self.driver_ids.windows(2).any(|ids| ids[0] >= ids[1])
+            || serde_json::to_vec(self)
+                .map_err(|_| BenchmarkError::Invalid)?
+                .len()
+                > MAX_ARCHIVED_BENCHMARK_PROOF_BYTES
+        {
+            return Err(BenchmarkError::Invalid);
         }
         Ok(())
     }
 
-    pub(crate) fn verify_in(&self, tx: &Transaction<'_>) -> Result<(), BenchmarkError> {
-        for (suite, _) in &self.suites {
-            if stored_suite(tx, &suite.suite_id)?.as_ref() != Some(suite) {
-                return Err(BenchmarkError::ConflictingHistory);
+    pub(crate) fn verify_in(&self, db: &Connection, source: &str) -> Result<(), BenchmarkError> {
+        self.validate(source)?;
+        verify_driver_capacity(db)?;
+        let mut digest = archived_completion_hash(source, &self.suite_ids, &self.driver_ids);
+        let mut remaining = MAX_IMPORT_BYTES;
+        let mut suites = BTreeMap::new();
+        let mut sessions = BTreeSet::new();
+        for id in &self.suite_ids {
+            let (suite, bytes) = imported_suite_row(db, id, &mut remaining)?
+                .ok_or(BenchmarkError::ConflictingHistory)?;
+            if archived_instance_source(&suite.instance_id) != Some(source)
+                || suite
+                    .runs
+                    .iter()
+                    .filter_map(|run| run.session_id.as_ref())
+                    .any(|id| !sessions.insert(id.clone()))
+            {
+                return Err(BenchmarkError::Invalid);
             }
+            suites.insert(suite.suite_id, suite.mode);
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
         }
-        for (driver, _) in &self.drivers {
-            if stored_driver(tx, &driver.id)?.as_ref() != Some(driver) {
-                return Err(BenchmarkError::ConflictingHistory);
+        for id in &self.driver_ids {
+            let (driver, bytes) = imported_driver_row(db, id, &mut remaining)?
+                .ok_or(BenchmarkError::ConflictingHistory)?;
+            if suites.get(&driver.suite_id) != Some(&driver.mode) {
+                return Err(BenchmarkError::Invalid);
             }
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+        if hex::encode(digest.finalize()) != self.digest {
+            return Err(BenchmarkError::ConflictingHistory);
         }
         Ok(())
     }
+}
+
+fn archived_completion_hash(source: &str, suites: &[String], drivers: &[String]) -> Sha256 {
+    let mut hash = Sha256::new();
+    hash.update(b"axial.legacy.benchmarks.completion.v1\0");
+    hash.update(source.as_bytes());
+    for ids in [suites, drivers] {
+        hash.update((ids.len() as u64).to_be_bytes());
+        for id in ids {
+            hash.update((id.len() as u64).to_be_bytes());
+            hash.update(id.as_bytes());
+        }
+    }
+    hash
+}
+
+fn lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn archived_instance_source(value: &str) -> Option<&str> {
+    let (source, legacy) = value.strip_prefix("archived-")?.split_once('-')?;
+    (lower_hex(source, 64) && lower_hex(legacy, 16)).then_some(source)
+}
+
+fn verify_driver_capacity(db: &Connection) -> Result<(), BenchmarkError> {
+    let count: usize = db.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM benchmark_drivers LIMIT ?1)",
+        [MAX_STORED_DRIVERS + 1],
+        |row| row.get(0),
+    )?;
+    if count > MAX_STORED_DRIVERS {
+        return Err(BenchmarkError::ConflictingHistory);
+    }
+    Ok(())
 }
 
 fn stored_suite(
@@ -1014,7 +1318,10 @@ fn validate_source_suite(
     connection: &Connection,
     source: &BenchmarkSuiteManifest,
 ) -> Result<(), BenchmarkError> {
-    if !source.historical || !current_plan_matches(source) {
+    if !source.historical
+        || archived_instance_source(&source.instance_id).is_some()
+        || !current_plan_matches(source)
+    {
         return Err(BenchmarkError::Invalid);
     }
     validate_historical_suite(source)?;
@@ -1097,12 +1404,26 @@ fn validate_driver_link(
     source_id: Option<&str>,
     suites: &mut BTreeMap<String, (BenchmarkSuiteManifest, Option<String>)>,
 ) -> Result<(), BenchmarkError> {
+    if driver.historical {
+        if request.is_some() || source_id.is_some() {
+            return Err(BenchmarkError::Unavailable);
+        }
+        if !suites.contains_key(&driver.suite_id) {
+            let record =
+                read_suite(connection, &driver.suite_id)?.ok_or(BenchmarkError::Unavailable)?;
+            validate_suite_in(connection, &record.0, record.1.as_deref())?;
+            suites.insert(driver.suite_id.clone(), record);
+        }
+        let (suite, parent) = &suites[&driver.suite_id];
+        return if suite.historical && parent.is_none() && suite.mode == driver.mode {
+            Ok(())
+        } else {
+            Err(BenchmarkError::Unavailable)
+        };
+    }
     let Some(source_id) = source_id else {
         return Ok(());
     };
-    if driver.historical {
-        return Err(BenchmarkError::Unavailable);
-    }
     let (bytes, source_request, parent): (Vec<u8>, Option<Vec<u8>>, Option<String>) = connection
         .query_row(
             "SELECT payload,request,source_driver_id FROM benchmark_drivers WHERE driver_id=?1",
@@ -1209,12 +1530,12 @@ fn continuation_in(
 fn stored_drivers_in(
     connection: &Connection,
 ) -> Result<Vec<BenchmarkSuiteDriverStatus>, BenchmarkError> {
-    let mut query = connection.prepare("SELECT driver_id,payload,request,source_driver_id FROM benchmark_drivers ORDER BY rowid DESC LIMIT 4097")?;
-    let mut rows = query.query([])?;
+    let mut query = connection.prepare("SELECT driver_id,payload,request,source_driver_id FROM benchmark_drivers ORDER BY rowid DESC LIMIT ?1")?;
+    let mut rows = query.query([MAX_STORED_DRIVERS + 1])?;
     let mut drivers = Vec::new();
     let mut suites = BTreeMap::new();
     while let Some(row) = rows.next()? {
-        if drivers.len() == 4096 {
+        if drivers.len() == MAX_STORED_DRIVERS {
             return Err(BenchmarkError::Unavailable);
         }
         let id: String = row.get(0)?;
@@ -1411,6 +1732,16 @@ impl BenchmarkService {
                     proofs.push(proof);
                 }
             }
+        }
+        if suite.historical && archived_instance_source(&suite.instance_id).is_some() {
+            let managed =
+                super::qualification::unavailable_managed_install_evidence(&suite, &proofs);
+            return Ok(super::qualification::qualification_payload(
+                &suite,
+                &proofs,
+                Some(&managed),
+                true,
+            ));
         }
         let instance_id = suite
             .instance_id
@@ -1861,10 +2192,14 @@ impl BenchmarkService {
         let request = serde_json::to_vec(&captured).map_err(|_| BenchmarkError::Unavailable)?;
         let payload = serde_json::to_vec(&driver).map_err(|_| BenchmarkError::Unavailable)?;
         self.storage.transaction(|tx| {
-            tx.execute(
+            if tx.execute(
                 "INSERT INTO benchmark_drivers(driver_id,payload,request) VALUES(?1,?2,?3)",
                 params![driver.id, payload, request],
-            )?;
+            )? != 1
+            {
+                return Err(BenchmarkError::Unavailable);
+            }
+            verify_driver_capacity(tx)?;
             Ok::<_, BenchmarkError>(())
         })?;
         drop(lease);
@@ -2087,6 +2422,7 @@ impl BenchmarkService {
             if tx.execute("INSERT INTO benchmark_drivers(driver_id,payload,request,source_driver_id) VALUES(?1,?2,?3,?4)", params![driver.id, payload, captured, source_driver.id])? != 1 {
                 return Err(BenchmarkError::Unavailable);
             }
+            verify_driver_capacity(tx)?;
             if stored_driver(tx, &driver.id)?.as_ref() != Some(&driver) { return Err(BenchmarkError::Unavailable); }
             Ok((driver.clone(), true))
         })?;
@@ -2336,7 +2672,8 @@ fn validate_historical_suite(suite: &BenchmarkSuiteManifest) -> Result<(), Bench
     if suite.schema != "axial.launch.benchmark.suite"
         || suite.schema_version != 2
         || !imported_id(&suite.suite_id, "legacy-suite-")
-        || suite.instance_id.parse::<InstanceId>().is_err()
+        || (suite.instance_id.parse::<InstanceId>().is_err()
+            && archived_instance_source(&suite.instance_id).is_none())
         || !matches!(
             suite.mode.as_str(),
             "development" | "qualification" | "release_validation"

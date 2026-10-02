@@ -162,12 +162,17 @@ function metadataReceipt(value: unknown, expectedId: string): MetadataImportRece
     record.archived_launch_report_count == null
       ? undefined
       : count(record.archived_launch_report_count, 'Imported archived launch report count');
+  const benchmarkCount =
+    record.archived_benchmark_count == null
+      ? undefined
+      : count(record.archived_benchmark_count, 'Imported archived benchmark count');
   if (
     total === 0 ||
     total > 256 ||
     settingsRevision === 0 ||
     (historyCount !== undefined && historyCount > 128) ||
     (reportCount !== undefined && reportCount > 1024) ||
+    (benchmarkCount !== undefined && benchmarkCount > 1024) ||
     (record.account_id_mapping === null && microsoftCount > 0)
   ) {
     throw new Error('The metadata import receipt was invalid.');
@@ -196,6 +201,7 @@ function metadataReceipt(value: unknown, expectedId: string): MetadataImportRece
     account_selection_revision: count(record.account_selection_revision, 'Imported account selection revision'),
     ...(historyCount === undefined ? {} : { global_install_history_count: historyCount }),
     ...(reportCount === undefined ? {} : { archived_launch_report_count: reportCount }),
+    ...(benchmarkCount === undefined ? {} : { archived_benchmark_count: benchmarkCount }),
   };
 }
 
