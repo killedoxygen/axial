@@ -1,6 +1,6 @@
 import { signal } from '@preact/signals';
 import { local, saveLocalState, canEditPreferences } from './state';
-import { api } from './api';
+import { api, isApiError } from './api';
 import { toast } from './toast';
 import { hasNativeDesktopRuntime, openExternalURL, requestNativeAppRestart } from './native';
 import { appVersion, bootstrapState, launchState, updateCheckState, updateInfo } from './store';
@@ -8,7 +8,7 @@ import { activeDownload, downloadQueue } from './machines/downloads';
 import { Sound } from './sound';
 import { idleUpdateFlow, type UpdateFlowPhase, type UpdateFlowState, type UpdateInfo } from './types-update';
 import { errMessage } from './utils';
-import { dtoEnum, dtoNumber, dtoRecord, dtoString } from './dto-contract';
+import { dtoBoolean, dtoEnum, dtoNumber, dtoRecord, dtoString, isDtoRecord } from './dto-contract';
 
 const AUTO_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const AUTO_CHECK_DELAY_MS = 1600;
@@ -23,6 +23,14 @@ let pendingCheck: Promise<UpdateInfo | null> | null = null;
 let pendingCheckSeq = 0;
 let pendingCheckToken: symbol | null = null;
 let flowPollTimer: number | null = null;
+let flowPollPending = false;
+let updateRequestSequence = 0;
+let pendingUpdateRequest: {
+  kind: 'download' | 'apply';
+  version: string;
+  revision: number;
+  response: 'pending' | 'unknown' | 'returned';
+} | null = null;
 
 export const updateFlow = signal<UpdateFlowState>(idleUpdateFlow);
 export const updateRestartRequested = signal(false);
@@ -142,7 +150,10 @@ export async function restartDesktopApp(): Promise<void> {
 
 export function updateFlowFromResponse(res: unknown): UpdateFlowState {
   const record = dtoRecord(res, 'Update flow');
+  const revision = dtoNumber(record.revision, 'Update revision');
+  if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('Update revision response was invalid.');
   return {
+    revision,
     phase: dtoEnum(record.phase, 'Update flow phase', [
       'idle',
       'downloading',
@@ -156,6 +167,8 @@ export function updateFlowFromResponse(res: unknown): UpdateFlowState {
     total_bytes: record.total_bytes == null ? null : dtoNumber(record.total_bytes, 'Update total bytes'),
     percent: record.percent == null ? null : dtoNumber(record.percent, 'Update percent'),
     message: dtoString(record.message, 'Update message'),
+    can_download: dtoBoolean(record.can_download, 'Update download availability'),
+    can_restart: dtoBoolean(record.can_restart, 'Update restart availability'),
   };
 }
 
@@ -221,12 +234,61 @@ function scheduleUpdateFlowPoll(): void {
 }
 
 async function pollUpdateFlow(): Promise<void> {
+  if (flowPollPending || pendingUpdateRequest?.response === 'pending') return;
+  flowPollPending = true;
+  const sequence = updateRequestSequence;
   try {
-    const res = await api('GET', '/update/flow');
-    setUpdateFlow(updateFlowFromResponse(res));
+    const next = updateFlowFromResponse(await api('GET', '/update/flow'));
+    if (sequence !== updateRequestSequence || next.revision < updateFlow.value.revision) return;
+    const request = pendingUpdateRequest;
+    if (request?.response === 'unknown') {
+      if (next.version !== request.version || next.revision <= request.revision) return;
+      if (request.kind === 'download' && next.phase === 'idle') return;
+      if (request.kind === 'apply' && next.phase !== 'applying' && !next.can_restart) return;
+    }
+    pendingUpdateRequest = null;
+    if (next.phase === 'idle') autoApplyOnReady = false;
+    setUpdateFlow(next);
     await restartInstalledUpdate();
-  } catch {}
-  if (updateFlowPollActive(updateFlow.value.phase)) scheduleUpdateFlowPoll();
+  } catch {
+    // An unavailable read cannot settle an accepted or possibly accepted command.
+  } finally {
+    flowPollPending = false;
+    if (
+      (pendingUpdateRequest && pendingUpdateRequest.response !== 'pending') ||
+      updateFlowPollActive(updateFlow.value.phase)
+    )
+      scheduleUpdateFlowPoll();
+  }
+}
+
+function beginUpdateRequest(kind: 'download' | 'apply', version: string): boolean {
+  if (pendingUpdateRequest || updateFlow.value.can_restart) return false;
+  pendingUpdateRequest = { kind, version, revision: updateFlow.value.revision, response: 'pending' };
+  updateRequestSequence++;
+  return true;
+}
+
+function recoverUpdateRequest(error: unknown): void {
+  if (!pendingUpdateRequest) return;
+  const returned =
+    isApiError(error) &&
+    isDtoRecord(error.payload) &&
+    [
+      'update_unsupported',
+      'update_busy',
+      'update_stale_release',
+      'update_not_ready',
+      'update_failed',
+      'invalid_update_request',
+    ].includes(String(error.payload.code));
+  pendingUpdateRequest.response = returned ? 'returned' : 'unknown';
+  if (returned) autoApplyOnReady = false;
+  toast(
+    returned ? `Update request failed: ${errMessage(error)}` : 'Update response unavailable. Checking update status.',
+    'error',
+  );
+  void pollUpdateFlow();
 }
 
 export async function startUpdateDownload(): Promise<void> {
@@ -237,12 +299,15 @@ export async function startUpdateDownload(): Promise<void> {
     return;
   }
   if (updateFlowPollActive(updateFlow.value.phase)) return;
+  if (!beginUpdateRequest('download', info.latest_version)) return;
   try {
     const res = await api('POST', '/update/download', { version: info.latest_version });
-    setUpdateFlow(updateFlowFromResponse(res));
+    const next = updateFlowFromResponse(res);
+    pendingUpdateRequest = null;
+    setUpdateFlow(next);
     if (updateFlowPollActive(updateFlow.value.phase)) scheduleUpdateFlowPoll();
   } catch (err: unknown) {
-    toast(`Update download failed: ${errMessage(err)}`, 'error');
+    recoverUpdateRequest(err);
   }
 }
 
@@ -267,12 +332,14 @@ export async function applyUpdateAndRestart(): Promise<void> {
     toast('Finish downloads and close running games before updating.', 'error');
     return;
   }
+  if (!beginUpdateRequest('apply', updateFlow.value.version)) return;
   try {
     const res = await api('POST', '/update/apply');
-    setUpdateFlow(updateFlowFromResponse(res));
+    const next = updateFlowFromResponse(res);
+    pendingUpdateRequest = null;
+    setUpdateFlow(next);
   } catch (err: unknown) {
-    toast(`Failed to apply update: ${errMessage(err)}`, 'error');
-    void pollUpdateFlow();
+    recoverUpdateRequest(err);
     return;
   }
   if (updateFlowPollActive(updateFlow.value.phase)) {
@@ -304,7 +371,12 @@ export async function checkForUpdates(options: { force?: boolean; silent?: boole
       const res = updateInfoResponse(await api('GET', force ? '/update?force=1' : '/update'));
       if (checkSeq === pendingCheckSeq) {
         updateInfo.value = res;
-        if (canEditPreferences() && res.available && local.dismissedUpdateVersion && local.dismissedUpdateVersion !== res.latest_version) {
+        if (
+          canEditPreferences() &&
+          res.available &&
+          local.dismissedUpdateVersion &&
+          local.dismissedUpdateVersion !== res.latest_version
+        ) {
           local.dismissedUpdateVersion = '';
         }
         updateCheckState.value = 'ready';

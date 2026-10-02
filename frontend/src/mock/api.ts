@@ -1042,36 +1042,55 @@ function mockUpdateInfo(): UpdateInfo & { checked_at: string } {
 function mockUpdateFlow(): UpdateFlowState {
   if (mockUpdateApplied) {
     return {
+      revision: MOCK_UPDATE_DOWNLOAD_MS + 2,
       phase: 'restart-pending',
       version: MOCK_UPDATE_VERSION,
       received_bytes: MOCK_UPDATE_TOTAL_BYTES,
       total_bytes: MOCK_UPDATE_TOTAL_BYTES,
       percent: 100,
       message: '',
+      can_download: false,
+      can_restart: true,
     };
   }
   if (mockUpdateDownloadStartedAt === null) {
-    return { phase: 'idle', version: '', received_bytes: 0, total_bytes: null, percent: null, message: '' };
+    return {
+      revision: 0,
+      phase: 'idle',
+      version: '',
+      received_bytes: 0,
+      total_bytes: null,
+      percent: null,
+      message: '',
+      can_download: true,
+      can_restart: false,
+    };
   }
   const elapsed = Date.now() - mockUpdateDownloadStartedAt;
   const fraction = Math.min(1, elapsed / MOCK_UPDATE_DOWNLOAD_MS);
   if (fraction >= 1) {
     return {
+      revision: MOCK_UPDATE_DOWNLOAD_MS + 1,
       phase: 'ready',
       version: MOCK_UPDATE_VERSION,
       received_bytes: MOCK_UPDATE_TOTAL_BYTES,
       total_bytes: MOCK_UPDATE_TOTAL_BYTES,
       percent: 100,
       message: '',
+      can_download: false,
+      can_restart: false,
     };
   }
   return {
+    revision: Math.max(0, Math.floor(elapsed)) + 1,
     phase: 'downloading',
     version: MOCK_UPDATE_VERSION,
     received_bytes: Math.round(MOCK_UPDATE_TOTAL_BYTES * fraction),
     total_bytes: MOCK_UPDATE_TOTAL_BYTES,
     percent: Math.round(fraction * 100),
     message: '',
+    can_download: false,
+    can_restart: false,
   };
 }
 

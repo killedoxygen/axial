@@ -75,6 +75,7 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
   const inApp = canInstallUpdateInApp();
   const restartBlocked = restartBlockedByActivity();
   const restartRequested = updateRestartRequested.value;
+  const restartRequired = phase === 'failed' && flow.can_restart;
 
   const title =
     phase === 'downloading'
@@ -149,7 +150,7 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
         </div>
       )}
 
-      {(phase === 'idle' || phase === 'failed') && (
+      {(phase === 'idle' || (phase === 'failed' && !restartRequired)) && (
         <>
           <div class="cp-update-card-actions">
             {inApp ? (
@@ -158,6 +159,7 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
                 size="sm"
                 icon="refresh"
                 style={{ width: '100%' }}
+                disabled={phase === 'failed' && !flow.can_download}
                 onClick={() => void downloadAndInstallUpdate()}
               >
                 {phase === 'failed' ? 'Try again' : 'Update & restart'}
@@ -208,13 +210,13 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
         </div>
       )}
 
-      {phase === 'restart-pending' && (
+      {(phase === 'restart-pending' || restartRequired) && (
         <div class="cp-update-card-actions">
           <Button
             variant="primary"
             size="sm"
             icon="refresh"
-            disabled={restartRequested}
+            disabled={restartRequested || restartBlocked}
             style={{ width: '100%' }}
             onClick={() => void restartDesktopApp()}
           >

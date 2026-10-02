@@ -60,26 +60,31 @@ export function AboutSettingsSection(): JSX.Element {
   const [, setDismissedAt] = useState(0);
   const checking = checkState === 'checking';
   const flowBusy = flowState.phase === 'downloading' || flowState.phase === 'applying';
-  const flowStaged = flowState.phase === 'ready' || flowState.phase === 'restart-pending';
+  const restartRequired = flowState.phase === 'failed' && flowState.can_restart;
+  const flowStaged = flowState.phase === 'ready' || flowState.phase === 'restart-pending' || restartRequired;
   const latestVersion = flowState.version || info?.latest_version || appVersion.value;
   const releaseChannel = displayReleaseChannel(appVersion.value);
   const status = flowBusy
     ? flowState.phase === 'applying'
       ? `Installing ${displayReleaseVersion(latestVersion)}...`
       : `Downloading ${displayReleaseVersion(latestVersion)}...`
-    : flowStaged
-      ? flowState.phase === 'restart-pending'
-        ? updateRestartRequested.value
-          ? `Update installed. Axial is restarting into ${displayReleaseVersion(latestVersion)}.`
-          : `Update installed. Restart Axial when you are ready.`
-        : `${displayReleaseVersion(latestVersion)} is downloaded and ready to install.`
-      : checking
-        ? 'Checking for updates...'
-        : info
-          ? info.available
-            ? `${displayReleaseChannel(latestVersion)} update available: ${displayReleaseVersion(info.current_version)} → ${displayReleaseVersion(latestVersion)}`
-            : `Current release: ${displayReleaseVersion(info.current_version)}`
-          : 'Updates have not been checked yet.';
+    : restartRequired
+      ? updateRestartRequested.value
+        ? 'Restarting Axial...'
+        : 'Restart Axial before continuing.'
+      : flowStaged
+        ? flowState.phase === 'restart-pending'
+          ? updateRestartRequested.value
+            ? `Update installed. Axial is restarting into ${displayReleaseVersion(latestVersion)}.`
+            : `Update installed. Restart Axial when you are ready.`
+          : `${displayReleaseVersion(latestVersion)} is downloaded and ready to install.`
+        : checking
+          ? 'Checking for updates...'
+          : info
+            ? info.available
+              ? `${displayReleaseChannel(latestVersion)} update available: ${displayReleaseVersion(info.current_version)} → ${displayReleaseVersion(latestVersion)}`
+              : `Current release: ${displayReleaseVersion(info.current_version)}`
+            : 'Updates have not been checked yet.';
   const visibleUpdate = hasVisibleUpdate() && !flowBusy && !flowStaged;
   const checkedAt = info ? formatUpdateCheckTime(info.checked_at) : 'Not checked yet';
   const restartBlocked = restartBlockedByActivity();
@@ -144,7 +149,7 @@ export function AboutSettingsSection(): JSX.Element {
               <Button
                 variant="primary"
                 icon="refresh"
-                disabled={restartRequested}
+                disabled={restartRequested || restartBlocked}
                 onClick={() => void restartDesktopApp()}
               >
                 {restartRequested ? 'Restarting…' : 'Restart now'}
@@ -163,7 +168,12 @@ export function AboutSettingsSection(): JSX.Element {
         {visibleUpdate && (
           <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             {canInstallUpdateInApp() ? (
-              <Button variant="primary" icon="download" onClick={() => void startUpdateDownload()}>
+              <Button
+                variant="primary"
+                icon="download"
+                disabled={flowState.phase === 'failed' && !flowState.can_download}
+                onClick={() => void startUpdateDownload()}
+              >
                 {flowState.phase === 'failed' ? 'Try again' : 'Download update'}
               </Button>
             ) : (

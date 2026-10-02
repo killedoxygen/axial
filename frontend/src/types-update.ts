@@ -1,3 +1,5 @@
+import type { UpdateFlow } from './generated/UpdateFlow';
+
 export type UpdateKind = 'none' | 'release-page' | 'release-asset';
 export type UpdateInstallMode = 'in-app' | 'external';
 
@@ -16,22 +18,29 @@ export interface UpdateInfo {
   checked_at: string;
 }
 
-export type UpdateFlowPhase = 'idle' | 'downloading' | 'ready' | 'applying' | 'restart-pending' | 'failed';
+export type UpdateFlowPhase = UpdateFlow['phase'];
 
-export interface UpdateFlowState {
-  phase: UpdateFlowPhase;
-  version: string;
-  received_bytes: number;
-  total_bytes: number | null;
-  percent: number | null;
-  message: string;
-}
+export type UpdateFlowState = Pick<
+  UpdateFlow,
+  | 'revision'
+  | 'phase'
+  | 'version'
+  | 'received_bytes'
+  | 'total_bytes'
+  | 'percent'
+  | 'message'
+  | 'can_download'
+  | 'can_restart'
+>;
 
 export const idleUpdateFlow: UpdateFlowState = {
+  revision: 0,
   phase: 'idle',
   version: '',
   received_bytes: 0,
   total_bytes: null,
   percent: null,
   message: '',
+  can_download: false,
+  can_restart: false,
 };

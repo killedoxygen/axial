@@ -5,10 +5,12 @@ import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
 import type { UpdateFlowState, UpdateInfo } from '../../src/types-update';
+import type { UpdateFlow } from '../../src/generated/UpdateFlow';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
 const ts: typeof import('typescript') = requireDependency('typescript');
+const jsx: typeof import('preact/jsx-runtime') = requireDependency('preact/jsx-runtime');
 const signal = <T>(value: T): { value: T } => ({ value });
 const settle = (): Promise<void> => new Promise((done) => setImmediate(done));
 
@@ -16,7 +18,12 @@ function source<T>(path: string, imports: Record<string, unknown> = {}, globals:
   const filename = resolve(frontend, 'src', path);
   const { outputText } = ts.transpileModule(readFileSync(filename, 'utf8'), {
     fileName: filename,
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+      jsx: ts.JsxEmit.ReactJSX,
+      jsxImportSource: 'preact',
+    },
   });
   const exports = {};
   vm.runInNewContext(
@@ -26,6 +33,7 @@ function source<T>(path: string, imports: Record<string, unknown> = {}, globals:
       Error,
       require(id: string): unknown {
         if (id === '@preact/signals') return { signal };
+        if (id === 'preact/jsx-runtime') return jsx;
         if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
         throw new Error(`Unreviewed updater test dependency: ${id}`);
       },
@@ -39,8 +47,21 @@ function source<T>(path: string, imports: Record<string, unknown> = {}, globals:
 const dto = source<typeof import('../../src/dto-contract')>('dto-contract.ts');
 const updateTypes = source<typeof import('../../src/types-update')>('types-update.ts');
 
-function flow(phase: UpdateFlowState['phase'], message = ''): UpdateFlowState {
-  return { phase, version: '1.1.0', received_bytes: 100, total_bytes: 100, percent: 100, message };
+function flow(phase: UpdateFlowState['phase'], message = '', terminal = false): UpdateFlow {
+  return {
+    revision: 10,
+    phase,
+    version: '1.1.0',
+    received_bytes: 100,
+    total_bytes: 100,
+    percent: 100,
+    message,
+    supported: true,
+    can_check: !terminal && (phase === 'idle' || phase === 'failed'),
+    can_download: !terminal && (phase === 'idle' || phase === 'failed'),
+    can_apply: phase === 'ready',
+    can_restart: terminal || phase === 'restart-pending',
+  };
 }
 
 function info(): UpdateInfo {
@@ -102,8 +123,9 @@ function harness() {
           assert.ok(responses.has(path), `Unexpected update request ${path}`);
           const response = responses.get(path);
           if (response instanceof Error) throw response;
-          return response;
+          return typeof response === 'function' ? response() : response;
         },
+        isApiError: (error: unknown) => error instanceof Error && error.name === 'ApiError',
       },
       './toast': { toast: (message: string) => notices.push(message) },
       './native': {
@@ -171,6 +193,190 @@ test('force checks retain their query and downloads submit the exact checked ver
   assert.equal(h.updater.updateFlow.value.phase, 'downloading');
   assert.equal(h.timers.size, 1);
 });
+
+for (const operation of ['download', 'apply'] as const) {
+  test(`lost ${operation} response keeps reading through failures without replaying the command`, async () => {
+    const h = harness();
+    h.store.updateInfo.value = info();
+    const initial = operation === 'apply' ? 'ready' : 'idle';
+    h.updater.updateFlow.value = flow(initial);
+    h.responses.set(`/update/${operation}`, new Error('Response lost after acceptance'));
+    h.responses.set('/update/flow', new Error('Status temporarily unavailable'));
+    const command = operation === 'apply' ? h.updater.applyUpdateAndRestart : h.updater.startUpdateDownload;
+    await command();
+    await settle();
+    assert.equal(h.calls.filter((call) => call.path === '/update/flow').length, 1);
+    assert.equal(h.timers.size, 1, 'unknown outcome must survive the first failed status read');
+    await command();
+    assert.equal(h.calls.filter((call) => call.method === 'POST').length, 1);
+    h.responses.set('/update/flow', flow(initial));
+    await h.poll();
+    assert.equal(h.timers.size, 1, 'a pre-acceptance phase does not settle a lost response');
+    await command();
+    assert.equal(h.calls.filter((call) => call.method === 'POST').length, 1);
+    h.responses.set('/update/flow', { ...flow(operation === 'apply' ? 'applying' : 'downloading'), revision: 11 });
+    await h.poll();
+    assert.equal(h.restarts(), 0);
+    h.responses.set('/update/flow', { ...flow(operation === 'apply' ? 'restart-pending' : 'ready'), revision: 12 });
+    await h.poll();
+    assert.equal(h.updater.updateFlow.value.phase, operation === 'apply' ? 'restart-pending' : 'ready');
+    assert.equal(h.restarts(), operation === 'apply' ? 1 : 0);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.calls.filter((call) => call.method === 'POST').length, 1);
+  });
+}
+
+test('a returned apply refusal reconciles read failures before allowing an explicit retry', async () => {
+  const h = harness();
+  h.updater.updateFlow.value = flow('ready');
+  h.responses.set(
+    '/update/apply',
+    Object.assign(new Error('Application work is active.'), {
+      name: 'ApiError',
+      status: 502,
+      payload: { code: 'update_failed' },
+    }),
+  );
+  h.responses.set('/update/flow', new Error('Status temporarily unavailable'));
+  await h.updater.applyUpdateAndRestart();
+  await settle();
+  assert.equal(h.timers.size, 1);
+  h.responses.set('/update/flow', flow('ready'));
+  await h.poll();
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.restarts(), 0);
+  assert.equal(h.calls.filter((call) => call.method === 'POST').length, 1);
+  h.responses.set('/update/apply', { ...flow('restart-pending'), revision: 12 });
+  await h.updater.applyUpdateAndRestart();
+  assert.equal(h.calls.filter((call) => call.method === 'POST').length, 2);
+  assert.equal(h.restarts(), 1);
+});
+
+test('download-and-install retains its intent through a lost download response', async () => {
+  const h = harness();
+  h.store.updateInfo.value = info();
+  h.updater.updateFlow.value = flow('idle');
+  h.responses.set('/update/download', new Error('Response lost after acceptance'));
+  h.responses.set('/update/flow', { ...flow('ready'), revision: 11 });
+  h.responses.set('/update/apply', { ...flow('applying'), revision: 12 });
+  await h.updater.downloadAndInstallUpdate();
+  await settle();
+  assert.equal(h.updater.updateFlow.value.phase, 'applying');
+  assert.equal(h.calls.filter((call) => call.path === '/update/download').length, 1);
+  assert.equal(h.calls.filter((call) => call.path === '/update/apply').length, 1);
+  assert.equal(h.restarts(), 0);
+  h.responses.set('/update/flow', { ...flow('restart-pending'), revision: 13 });
+  await h.poll();
+  assert.equal(h.restarts(), 1);
+});
+
+test('recovery refuses stale and unrelated flow evidence and serializes pending commands', async () => {
+  const h = harness();
+  h.updater.updateFlow.value = flow('ready');
+  let loseResponse: ((error: Error) => void) | undefined;
+  h.responses.set(
+    '/update/apply',
+    () =>
+      new Promise((_resolve, reject) => {
+        loseResponse = reject;
+      }),
+  );
+  const request = h.updater.applyUpdateAndRestart();
+  await h.updater.applyUpdateAndRestart();
+  assert.equal(h.calls.length, 1);
+  assert.ok(loseResponse);
+  h.responses.set('/update/flow', { ...flow('restart-pending'), revision: 9 });
+  loseResponse(new Error('Response lost'));
+  await request;
+  await settle();
+  assert.equal(h.updater.updateFlow.value.phase, 'ready');
+  assert.equal(h.restarts(), 0);
+  h.responses.set('/update/flow', { ...flow('restart-pending'), version: '1.2.0', revision: 12 });
+  await h.poll();
+  assert.equal(h.restarts(), 0);
+  assert.equal(h.updater.updateFlow.value.phase, 'ready');
+  h.responses.set('/update/flow', { ...flow('failed', 'Installation failed.', true), revision: 12 });
+  await h.poll();
+  assert.equal(h.updater.updateFlow.value.phase, 'failed');
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.restarts(), 0);
+  assert.equal(h.calls.filter((call) => call.method === 'POST').length, 1);
+});
+
+test('flow decoding preserves owner action flags and rejects invalid recovery evidence', () => {
+  const h = harness();
+  const terminal = h.updater.updateFlowFromResponse(flow('failed', 'Installation failed.', true));
+  assert.equal(terminal.can_restart, true);
+  assert.equal(terminal.can_download, false);
+  for (const invalid of [
+    { can_restart: 'true' },
+    { can_download: undefined },
+    { revision: -1 },
+    { revision: 1.5 },
+    { revision: Number.MAX_SAFE_INTEGER + 1 },
+  ])
+    assert.throws(() => h.updater.updateFlowFromResponse({ ...flow('failed'), ...invalid }));
+});
+
+interface Node {
+  type: unknown;
+  props: Record<string, unknown>;
+}
+
+function nodes(value: unknown): Node[] {
+  if (Array.isArray(value)) return value.flatMap(nodes);
+  if (!value || typeof value !== 'object' || !('props' in value)) return [];
+  const node = value as Node;
+  if (typeof node.type === 'function') return nodes(node.type(node.props));
+  return [node, ...Object.values(node.props).flatMap(nodes)];
+}
+
+function renderControls(h: ReturnType<typeof harness>, surface: 'widget' | 'about'): Node[] {
+  const prefix = surface === 'widget' ? '../' : '../../';
+  const imports = {
+    'preact/hooks': {
+      useState: () => [true, () => {}],
+      useRef: () => ({ current: null }),
+      useEffect() {},
+    },
+    [`${prefix}updater`]: h.updater,
+    [`${prefix}store`]: h.store,
+    [`${prefix}ui/Atoms`]: { Button: 'Button' },
+    [`${prefix}ui/Icons`]: { Icon: 'Icon' },
+    [`${prefix}ui/SettingsSheet`]: { SettingRow: 'SettingRow', SettingsSection: 'SettingsSection' },
+    [`${prefix}format`]: { formatBytes: String },
+    [`${prefix}native`]: { hasNativeDesktopRuntime: () => true },
+    [`${prefix}toast`]: { toast() {} },
+    [`${prefix}utils`]: { errMessage: String },
+  };
+  return nodes(
+    surface === 'widget'
+      ? source<typeof import('../../src/shell/UpdateWidget')>('shell/UpdateWidget.tsx', imports).UpdateWidget()
+      : source<typeof import('../../src/views/settings/AboutSettingsSection')>(
+          'views/settings/AboutSettingsSection.tsx',
+          imports,
+        ).AboutSettingsSection(),
+  );
+}
+
+for (const surface of ['widget', 'about'] as const) {
+  test(`${surface} installation failure offers restart while a failed download can retry`, async () => {
+    for (const terminal of [true, false]) {
+      const h = harness();
+      h.store.updateInfo.value = info();
+      h.updater.updateFlow.value = h.updater.updateFlowFromResponse(flow('failed', 'Update failed.', terminal));
+      const primary = renderControls(h, surface).find(
+        (node) => node.type === 'Button' && node.props.variant === 'primary',
+      );
+      assert.ok(primary);
+      assert.equal(primary.props.children, terminal ? 'Restart now' : 'Try again');
+      (primary.props.onClick as () => void)();
+      await settle();
+      assert.equal(h.restarts(), terminal ? 1 : 0);
+      assert.equal(h.calls.filter((call) => call.path === '/update/download').length, terminal ? 0 : 1);
+    }
+  });
+}
 
 test('accepted apply polls through installation and interrupted reads before restarting', async () => {
   const h = harness();
