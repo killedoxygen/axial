@@ -312,7 +312,6 @@ struct ManagedLibraryAuthority {
 struct ManagedLibraryAdmissionVerifier {
     state: RwLock<Arc<ManagedLibraryAdmissionState>>,
     root_identity: axial_fs::DirectoryFilesystemIdentity,
-    test_root: Weak<ManagedRoot>,
 }
 
 struct ManagedLibraryAdmissionState {
@@ -323,10 +322,6 @@ struct ManagedLibraryAdmissionState {
 enum ManagedLibraryAdmission {
     App(AdmittedAbsoluteDirectory),
     Retained(Directory),
-    #[cfg(any(test, feature = "test-support"))]
-    Test {
-        path: Arc<PathBuf>,
-    },
 }
 
 struct ManagedAuthorityLifecycle {
@@ -4750,7 +4745,6 @@ impl ManagedLibraryRoot {
                 epoch: 0,
             })),
             root_identity: root.inner.identity.filesystem_identity(),
-            test_root: Arc::downgrade(&root.inner.root),
         });
         let managed = Self {
             authority: Arc::new(ManagedLibraryAuthority {
@@ -4768,6 +4762,13 @@ impl ManagedLibraryRoot {
         let configured_path = absolute_root_key(path).map_err(loader_io)?;
         let session = acquire_root_session(&configured_path).map_err(loader_io)?;
         let directory = session.root()?;
+        let admission = session.admit_absolute_directory(&configured_path)?;
+        if admission.identity()? != directory.identity()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed test admission does not match the leased root",
+            ));
+        }
         let effects = directory.create_effect_owner()?;
         let root = ManagedDir::from_directory_with_session(
             directory,
@@ -4776,12 +4777,7 @@ impl ManagedLibraryRoot {
         )
         .map_err(loader_io)?;
         root.settle().map_err(loader_io)?;
-        Self::finish_construction(
-            root,
-            ManagedLibraryAdmission::Test {
-                path: Arc::new(configured_path),
-            },
-        )
+        Self::finish_construction(root, ManagedLibraryAdmission::Retained(admission))
     }
 
     pub fn try_acquire(&self) -> io::Result<ManagedLibraryOperation> {
@@ -4985,9 +4981,7 @@ impl ManagedLibraryAdmissionVerifier {
     fn verify(&self) -> io::Result<()> {
         for _ in 0..3 {
             let admission = self.snapshot()?;
-            admission
-                .current
-                .revalidate(self.root_identity, &self.test_root)?;
+            admission.current.revalidate(self.root_identity)?;
             if self.is_current(&admission)? {
                 return Ok(());
             }
@@ -5001,9 +4995,7 @@ impl ManagedLibraryAdmissionVerifier {
     fn binding(&self) -> io::Result<axial_fs::DirectoryFilesystemIdentity> {
         for _ in 0..3 {
             let admission = self.snapshot()?;
-            let binding = admission
-                .current
-                .filesystem_identity(self.root_identity, &self.test_root)?;
+            let binding = admission.current.filesystem_identity()?;
             if self.is_current(&admission)? {
                 return Ok(binding);
             }
@@ -5687,10 +5679,7 @@ impl ManagedLibraryRetirement {
             Ok(()) => {
                 let binding = if admission
                     .current
-                    .revalidate(
-                        self.authority.admission.root_identity,
-                        &self.authority.admission.test_root,
-                    )
+                    .revalidate(self.authority.admission.root_identity)
                     .is_ok()
                 {
                     ManagedLibraryRetirementBinding::BindingIntact
@@ -5709,10 +5698,7 @@ impl ManagedLibraryRetirement {
                     .map_err(loader_io)?;
                 if admission
                     .current
-                    .revalidate(
-                        self.authority.admission.root_identity,
-                        &self.authority.admission.test_root,
-                    )
+                    .revalidate(self.authority.admission.root_identity)
                     .is_ok()
                 {
                     return Err(loader_io(error));
@@ -5790,29 +5776,16 @@ impl PreparedManagedLibraryAdmissionRebind {
 }
 
 impl ManagedLibraryAdmission {
-    fn filesystem_identity(
-        &self,
-        _root_identity: axial_fs::DirectoryFilesystemIdentity,
-        _test_root: &Weak<ManagedRoot>,
-    ) -> io::Result<axial_fs::DirectoryFilesystemIdentity> {
+    fn filesystem_identity(&self) -> io::Result<axial_fs::DirectoryFilesystemIdentity> {
         match self {
             Self::App(admission) => admission.filesystem_identity(),
             Self::Retained(directory) => directory
                 .identity()
                 .map(|identity| identity.filesystem_identity()),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Test { .. } => {
-                self.revalidate(_root_identity, _test_root)?;
-                Ok(_root_identity)
-            }
         }
     }
 
-    fn revalidate(
-        &self,
-        root_identity: axial_fs::DirectoryFilesystemIdentity,
-        _test_root: &Weak<ManagedRoot>,
-    ) -> io::Result<()> {
+    fn revalidate(&self, root_identity: axial_fs::DirectoryFilesystemIdentity) -> io::Result<()> {
         match self {
             Self::Retained(directory) => {
                 if directory.identity()?.filesystem_identity() != root_identity {
@@ -5832,12 +5805,6 @@ impl ManagedLibraryAdmission {
                 }
                 Ok(())
             }
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Test { path } => _test_root
-                .upgrade()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "managed root expired"))?
-                .validate_requested_binding(path)
-                .map_err(loader_io),
         }
     }
 }
@@ -7393,6 +7360,95 @@ mod library_lifecycle_tests {
             root.binding().expect("root binding"),
             ManagedLibraryBinding(root.authority.root.inner.identity.filesystem_identity())
         );
+    }
+
+    #[test]
+    fn test_admission_refuses_root_replacement_without_touching_either_tree() {
+        let temporary = tempfile::Builder::new()
+            .prefix("axial-test-admission-replacement-")
+            .tempdir_in(crate::test_temp_root())
+            .unwrap();
+        let path = temporary.path().join("library");
+        let displaced = temporary.path().join("displaced-library");
+        let replacement = temporary.path().join("replacement-library");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("artifact.bin"), b"original").unwrap();
+        let root = ManagedLibraryRoot::open_for_test(&path).unwrap();
+        let operation = root.try_acquire().unwrap();
+        let witness = root.witness();
+        let file = operation
+            .observe_file(&PortableRelativePath::new_exact("artifact.bin").unwrap())
+            .unwrap()
+            .unwrap();
+        let digest = file.sha1_bounded(8).unwrap();
+
+        std::fs::rename(&path, &displaced).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("artifact.bin"), b"replacement").unwrap();
+        assert!(root.revalidate().is_err());
+        assert!(root.try_acquire().is_err());
+        assert!(witness.try_acquire().is_err());
+        assert!(operation.revalidate().is_err());
+        assert!(file.sha1_bounded(8).is_err());
+        assert_eq!(
+            std::fs::read(path.join("artifact.bin")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(displaced.join("artifact.bin")).unwrap(),
+            b"original"
+        );
+
+        std::fs::rename(&path, &replacement).unwrap();
+        std::fs::rename(&displaced, &path).unwrap();
+        root.revalidate().unwrap();
+        assert_eq!(file.sha1_bounded(8).unwrap(), digest);
+        assert_eq!(
+            std::fs::read(replacement.join("artifact.bin")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn test_admission_refuses_case_only_root_and_ancestor_renames_after_parent_churn() {
+        for rename_root in [true, false] {
+            let temporary = tempfile::Builder::new()
+                .prefix("axial-test-admission-spelling-")
+                .tempdir_in(crate::test_temp_root())
+                .unwrap();
+            let parent = temporary.path().join("parent");
+            let path = parent.join("library");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("artifact.bin"), b"original").unwrap();
+            let root = ManagedLibraryRoot::open_for_test(&path).unwrap();
+            let operation = root.try_acquire().unwrap();
+            let file = operation
+                .observe_file(&PortableRelativePath::new_exact("artifact.bin").unwrap())
+                .unwrap()
+                .unwrap();
+            let digest = file.sha1_bounded(8).unwrap();
+            let original = if rename_root { &path } else { &parent };
+            let alias = original.with_file_name(if rename_root { "Library" } else { "Parent" });
+            let sibling = original.parent().unwrap().join("harmless-sibling");
+            std::fs::create_dir(&sibling).unwrap();
+            root.revalidate().unwrap();
+            assert_eq!(file.sha1_bounded(8).unwrap(), digest);
+
+            std::fs::rename(original, &alias).unwrap();
+            assert!(root.revalidate().is_err());
+            assert!(root.try_acquire().is_err());
+            assert!(operation.revalidate().is_err());
+            assert!(file.sha1_bounded(8).is_err());
+
+            std::fs::rename(&alias, original).unwrap();
+            root.revalidate().unwrap();
+            assert_eq!(file.sha1_bounded(8).unwrap(), digest);
+            assert_eq!(
+                std::fs::read(path.join("artifact.bin")).unwrap(),
+                b"original"
+            );
+            assert!(sibling.is_dir());
+        }
     }
 
     #[test]
