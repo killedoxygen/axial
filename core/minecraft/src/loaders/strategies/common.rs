@@ -257,7 +257,12 @@ async fn reconstruct_profile_after_sources(
     };
     let profile_bytes = profile_source.into_bytes_for(url, &plan.record.version_id)?;
     let fragment = parse_profile_json(&profile_bytes, &plan.record.component_name)?;
-    validate_profile_source_structure(&fragment, &plan.record, &proof)?;
+    validate_profile_source_structure(
+        &fragment,
+        &plan.record,
+        &proof,
+        reconstructed_effective_version(base.receipt()),
+    )?;
     let declarations = seal_profile_exact_library_declarations(
         fragment,
         proof,
@@ -648,7 +653,12 @@ where
         .await?
         .into_bytes_for(profile_url, &plan.record.version_id)?;
     let fragment = parse_profile_json(&profile_bytes, &plan.record.component_name)?;
-    validate_profile_source_structure(&fragment, &plan.record, &source_proof)?;
+    validate_profile_source_structure(
+        &fragment,
+        &plan.record,
+        &source_proof,
+        base_derivation.effective_version(),
+    )?;
     send(progress(
         "profile",
         1,
@@ -1265,6 +1275,7 @@ fn validate_profile_source_structure(
     fragment: &LoaderProfileFragment,
     record: &LoaderBuildRecord,
     proof: &ProfileInstallProof,
+    authenticated_base: &crate::launch::VersionJson,
 ) -> Result<(), LoaderError> {
     validate_provider_version_id(&fragment.id, "upstream loader profile version id")?;
     let (canonical_profile_id, inherits_from, client_main_class) = proof.identity();
@@ -1290,6 +1301,9 @@ fn validate_profile_source_structure(
         ));
     }
 
+    if record.component_id == LoaderComponentId::Quilt {
+        providers::validate_quilt_profile_mappings(fragment, record, proof, authenticated_base)?;
+    }
     Ok(())
 }
 
@@ -1633,13 +1647,16 @@ mod tests {
 
     #[tokio::test]
     async fn profile_reconstruction_matches_install_and_leaves_all_managed_state_untouched() {
-        for component in [LoaderComponentId::Fabric, LoaderComponentId::Quilt] {
+        for (component, base_id, omit_mappings) in [
+            (LoaderComponentId::Fabric, "1.21.5", false),
+            (LoaderComponentId::Quilt, "1.21.5", false),
+            (LoaderComponentId::Quilt, "26.3", true),
+        ] {
             let root = temp_dir(match component {
                 LoaderComponentId::Fabric => "fabric-reconstruction-parity",
                 LoaderComponentId::Quilt => "quilt-reconstruction-parity",
                 _ => unreachable!(),
             });
-            let base_id = "1.21.5";
             let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
             let vanilla_exact =
                 zip_entries(&[("org/example/VanillaExact.class", b"inherited-vanilla-exact")]);
@@ -1648,13 +1665,19 @@ mod tests {
             let client_server = TestByteServer::start(base_client.clone());
             let vanilla_exact_server = TestByteServer::start(vanilla_exact.clone());
             let exact_server = TestByteServer::start(profile_exact.clone());
-            let version_bytes = vanilla_version_bytes_with_exact_library(
+            let mut version_bytes = vanilla_version_bytes_with_exact_library(
                 base_id,
                 &client_server.url,
                 &base_client,
                 &vanilla_exact_server.url,
                 &vanilla_exact,
             );
+            if omit_mappings {
+                let mut version: serde_json::Value =
+                    serde_json::from_slice(&version_bytes).expect("base version");
+                version["releaseTime"] = serde_json::json!("2025-12-16T00:00:00Z");
+                version_bytes = serde_json::to_vec(&version).expect("dated base version");
+            }
             let version_server = TestByteServer::start(version_bytes.clone());
             let manifest = test_install_manifest(base_id, &version_server.url, &version_bytes);
             let incomplete_server = TestByteServer::start(zip_entries(&[(
@@ -1667,6 +1690,7 @@ mod tests {
                 TestByteServer::start(zip_entries(&[("org/example/Extra.class", b"extra")]));
 
             let mut record = profile_record();
+            record.minecraft_version = base_id.to_string();
             if component == LoaderComponentId::Quilt {
                 record.component_id = component;
                 record.component_name = component.display_name().to_string();
@@ -1674,14 +1698,34 @@ mod tests {
                 record.strategy = LoaderInstallStrategy::QuiltProfile;
                 canonicalize_record_identity(&mut record);
             }
-            let (profile_bytes, proof_bytes, expected_fresh) = profile_reconstruction_sources(
-                &record,
-                &incomplete_server.url,
-                &exact_server.url,
-                &profile_exact,
-                &native_server.url,
-                &extra_server.url,
-            );
+            let (mut profile_bytes, mut proof_bytes, mut expected_fresh) =
+                profile_reconstruction_sources(
+                    &record,
+                    &incomplete_server.url,
+                    &exact_server.url,
+                    &profile_exact,
+                    &native_server.url,
+                    &extra_server.url,
+                );
+            if omit_mappings {
+                let mut profile: serde_json::Value =
+                    serde_json::from_slice(&profile_bytes).expect("profile");
+                profile["libraries"]
+                    .as_array_mut()
+                    .expect("libraries")
+                    .retain(|library| {
+                        library["name"] != format!("org.quiltmc:hashed:{base_id}")
+                            && library["name"] != format!("net.fabricmc:intermediary:{base_id}")
+                    });
+                profile_bytes = serde_json::to_vec(&profile).expect("unobfuscated profile");
+                let mut proof: serde_json::Value =
+                    serde_json::from_slice(&proof_bytes).expect("proof");
+                let proof = proof.as_object_mut().expect("proof object");
+                proof.remove("hashed");
+                proof.remove("intermediary");
+                proof_bytes = serde_json::to_vec(&proof).expect("unobfuscated proof");
+                expected_fresh.0 = 0;
+            }
             let profile_server = TestByteServer::start(profile_bytes);
             let proof_server = TestByteServer::start(proof_bytes);
             record.install_source = LoaderInstallSource::ProfileJson {
@@ -1720,6 +1764,10 @@ mod tests {
             )
             .await
             .expect("install profile loader");
+            if omit_mappings {
+                assert!(!root.join("libraries/org/quiltmc/hashed").exists());
+                assert!(!root.join("libraries/net/fabricmc/intermediary").exists());
+            }
             assert_eq!(
                 vanilla_exact_server.request_count(),
                 inherited_requests_after_base,
@@ -1805,6 +1853,151 @@ mod tests {
                 incomplete_server,
                 native_server,
                 extra_server,
+                profile_server,
+                proof_server,
+            ] {
+                server.stop();
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn quilt_mapping_omission_is_fenced_in_install_and_reconstruction() {
+        for (release_time, declare_mapping, expected_error) in [
+            (
+                "2025-12-15T23:59:59Z",
+                false,
+                "Quilt profile requires both mappings for an obfuscated Minecraft base",
+            ),
+            (
+                "not-a-time",
+                false,
+                "Quilt mapping omission requires an authenticated base release time",
+            ),
+            (
+                "2025-12-16T00:00:00Z",
+                true,
+                "Quilt profile mappings do not match its live provider proof",
+            ),
+        ] {
+            let root = temp_dir("quilt-mapping-omission-refusal");
+            let mut record = profile_record();
+            record.component_id = LoaderComponentId::Quilt;
+            record.component_name = "Quilt".to_string();
+            record.minecraft_version = "26.3".to_string();
+            record.loader_version = "0.31.0-beta.4".to_string();
+            record.strategy = LoaderInstallStrategy::QuiltProfile;
+            canonicalize_record_identity(&mut record);
+
+            let client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
+            let client_server = TestByteServer::start(client.clone());
+            let mut version: serde_json::Value = serde_json::from_slice(&vanilla_version_bytes(
+                &record.minecraft_version,
+                &client_server.url,
+                &client,
+            ))
+            .expect("base version");
+            version["releaseTime"] = serde_json::json!(release_time);
+            let version_bytes = serde_json::to_vec(&version).expect("dated base version");
+            let version_server = TestByteServer::start(version_bytes.clone());
+            let manifest = test_install_manifest(
+                &record.minecraft_version,
+                &version_server.url,
+                &version_bytes,
+            );
+            let library = zip_entries(&[("org/example/Library.class", b"library")]);
+            let library_server = TestByteServer::start(library.clone());
+            let (profile_bytes, proof_bytes, _) = profile_reconstruction_sources(
+                &record,
+                &library_server.url,
+                &library_server.url,
+                &library,
+                &library_server.url,
+                &library_server.url,
+            );
+            let mut profile: serde_json::Value =
+                serde_json::from_slice(&profile_bytes).expect("profile");
+            profile["releaseTime"] = serde_json::json!("2099-01-01T00:00:00Z");
+            profile["libraries"]
+                .as_array_mut()
+                .expect("libraries")
+                .retain(|library| {
+                    library["name"] == "org.quiltmc:quilt-loader:0.31.0-beta.4"
+                        || (declare_mapping && library["name"] == "org.quiltmc:hashed:26.3")
+                });
+            let mut proof: serde_json::Value = serde_json::from_slice(&proof_bytes).expect("proof");
+            let proof = proof.as_object_mut().expect("proof object");
+            proof.remove("hashed");
+            proof.remove("intermediary");
+            let profile_server =
+                TestByteServer::start(serde_json::to_vec(&profile).expect("profile bytes"));
+            let proof_server =
+                TestByteServer::start(serde_json::to_vec(&proof).expect("proof bytes"));
+            record.install_source = LoaderInstallSource::ProfileJson {
+                url: profile_server.url.clone(),
+            };
+            let plan = LoaderInstallPlan { record };
+            let library_root = test_library_operation(&root);
+            let install_downloader = test_downloader(library_root.operation(), manifest.clone());
+            let base_receipt = install_downloader
+                .install_version(&plan.record.minecraft_version, |_| {})
+                .await
+                .expect("install authenticated base");
+            drop(install_downloader);
+            checkpoint_and_ack_version_bundle(
+                library_root.operation(),
+                &plan.record.minecraft_version,
+            )
+            .await;
+            seed_reconstruction_sentinels(&root);
+            let before = snapshot_tree(&root);
+            let install_proof =
+                crate::loaders::providers::fetch_profile_install_proof_from_url_for_test(
+                    &plan.record,
+                    &proof_server.url,
+                )
+                .await
+                .expect("decode official omitted mapping shape");
+
+            let install_error = install_profile_source_after_authenticated_base(
+                &library_root,
+                &plan,
+                test_loader_base_derivation(base_receipt),
+                install_proof,
+                &mut |_| {},
+            )
+            .await
+            .expect_err("mapping admission must refuse install");
+            let reconstruction_downloader = test_downloader(library_root.operation(), manifest);
+            let reconstruction_error = match reconstruct_profile_with_test_sources(
+                &plan,
+                &reconstruction_downloader,
+                &proof_server.url,
+            )
+            .await
+            {
+                Ok(_) => panic!("mapping admission must refuse reconstruction"),
+                Err(error) => error,
+            };
+
+            for error in [install_error, reconstruction_error] {
+                assert!(
+                    matches!(error, LoaderError::InvalidProfile(ref message) if message == expected_error),
+                    "must reach mapping admission rather than an earlier dependency refusal: {error:?}"
+                );
+            }
+            assert_eq!(library_server.request_count(), 0);
+            assert_eq!(profile_server.request_count(), 2);
+            assert_eq!(proof_server.request_count(), 2);
+            assert_eq!(version_server.request_count(), 2);
+            assert_eq!(client_server.request_count(), 1);
+            assert_eq!(snapshot_tree(&root), before);
+            assert!(!versions_dir(&root).join(&plan.record.version_id).exists());
+            for server in [
+                client_server,
+                version_server,
+                library_server,
                 profile_server,
                 proof_server,
             ] {
@@ -2979,8 +3172,10 @@ printf '%s' 'processor-terminal' > "$last"
         let record = profile_record();
         let proof = fabric_profile_proof(&record);
         let fragment = fabric_profile_fragment(&record);
+        let base = serde_json::from_value(serde_json::json!({"id": record.minecraft_version}))
+            .expect("base version");
 
-        validate_profile_source_structure(&fragment, &record, &proof)
+        validate_profile_source_structure(&fragment, &record, &proof, &base)
             .expect("exact live profile proof");
         let loader = fragment
             .libraries
@@ -2995,6 +3190,8 @@ printf '%s' 'processor-terminal' > "$last"
     fn profile_source_rejects_identity_drift_and_base_owned_overrides() {
         let record = profile_record();
         let proof = fabric_profile_proof(&record);
+        let base = serde_json::from_value(serde_json::json!({"id": record.minecraft_version}))
+            .expect("base version");
 
         let mut variants = Vec::new();
         let mut fragment = fabric_profile_fragment(&record);
@@ -3027,7 +3224,7 @@ printf '%s' 'processor-terminal' > "$last"
 
         for fragment in variants {
             assert!(
-                validate_profile_source_structure(&fragment, &record, &proof).is_err(),
+                validate_profile_source_structure(&fragment, &record, &proof, &base).is_err(),
                 "identity drift or base-owned override must fail"
             );
         }
@@ -3457,7 +3654,8 @@ printf '%s' 'processor-terminal' > "$last"
         let mut record = profile_record();
         record.component_id = LoaderComponentId::Quilt;
         record.component_name = "Quilt".to_string();
-        record.loader_version = "0.29.2".to_string();
+        record.minecraft_version = "26.3".to_string();
+        record.loader_version = "0.31.0-beta.4".to_string();
         canonicalize_record_identity(&mut record);
         record.strategy = LoaderInstallStrategy::QuiltProfile;
         let coordinate = format!("org.quiltmc:quilt-loader:{}", record.loader_version);
@@ -3504,6 +3702,14 @@ printf '%s' 'processor-terminal' > "$last"
             )],
         );
         write_base_version(&root, &record.minecraft_version);
+        let base_path = versions_dir(&root)
+            .join(&record.minecraft_version)
+            .join(format!("{}.json", record.minecraft_version));
+        let mut base: serde_json::Value =
+            serde_json::from_slice(&fs::read(&base_path).expect("base bytes")).expect("base");
+        base["releaseTime"] = serde_json::json!("2025-12-16T00:00:00Z");
+        fs::write(&base_path, serde_json::to_vec(&base).expect("dated base"))
+            .expect("write dated base");
         let base = test_authenticated_receipt(&root, &record.minecraft_version);
         let library_root = test_library_operation(&root);
 
