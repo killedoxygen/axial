@@ -264,6 +264,11 @@ impl AuthService {
     pub async fn refresh(&self, capture: CapturedAccount) -> Result<CapturedAccount, AuthError> {
         let service = self.clone();
         self.retain(async move {
+            match service.launch_credentials(&capture).await {
+                Ok(_) => return Ok(capture),
+                Err(AuthError::SignInRequired) => {}
+                Err(error) => return Err(error),
+            }
             let (fence, refresh_token) = service.begin_refresh(&capture).await?;
             // Failure leaves the pending marker intact: the old refresh token
             // may already have been rotated by the provider.
@@ -785,6 +790,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_selected_refresh_without_refresh_token_preserves_capture_and_credentials() {
+        let service = service();
+        let mut result = provider_result(FIRST, "PlayerOne", "ready");
+        result.microsoft_refresh_token = None;
+        let original = service
+            .commit_login(
+                service.directory.selection_revision().unwrap(),
+                service.login_generation.load(Ordering::SeqCst),
+                result,
+            )
+            .await
+            .unwrap();
+        let snapshot = service.directory.snapshot().unwrap();
+        let credentials = service.launch_credentials(&original).await.unwrap();
+        assert!(credentials.microsoft_refresh_token().is_none());
+        let credential_status = service
+            .credentials
+            .status(original.account_id())
+            .await
+            .unwrap();
+        assert_eq!(credential_status.state, CredentialState::Ready);
+
+        let refreshed = service.refresh_selected().await.unwrap();
+
+        assert_eq!(refreshed.account_id(), original.account_id());
+        assert_eq!(refreshed.login_id(), original.login_id());
+        assert_eq!(refreshed.profile(), original.profile());
+        assert_eq!(
+            (
+                refreshed.selection_revision(),
+                refreshed.account_revision(),
+                refreshed.profile_revision(),
+                refreshed.credential_revision(),
+            ),
+            (
+                original.selection_revision(),
+                original.account_revision(),
+                original.profile_revision(),
+                original.credential_revision(),
+            )
+        );
+        assert_eq!(service.directory.snapshot().unwrap(), snapshot);
+        assert_eq!(
+            service.launch_credentials(&refreshed).await.unwrap(),
+            credentials
+        );
+        assert_eq!(
+            service
+                .credentials
+                .status(refreshed.account_id())
+                .await
+                .unwrap(),
+            credential_status
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_refresh_requires_refresh_credentials_for_expired_or_near_expiry_tokens() {
+        for remaining_seconds in [0, 15] {
+            let service = service();
+            let mut result = provider_result(FIRST, "PlayerOne", "expiring");
+            result.microsoft_refresh_token = None;
+            result.minecraft_expires_at = now_seconds() + remaining_seconds;
+            let capture = service
+                .commit_login(
+                    service.directory.selection_revision().unwrap(),
+                    service.login_generation.load(Ordering::SeqCst),
+                    result,
+                )
+                .await
+                .unwrap();
+            let snapshot = service.directory.snapshot().unwrap();
+            let credentials = service.credentials(&capture).await.unwrap();
+            assert!(matches!(
+                service.launch_credentials(&capture).await,
+                Err(AuthError::SignInRequired)
+            ));
+
+            assert!(matches!(
+                service.refresh_selected().await,
+                Err(AuthError::SignInRequired)
+            ));
+
+            assert_eq!(service.directory.snapshot().unwrap(), snapshot);
+            assert_eq!(service.credentials(&capture).await.unwrap(), credentials);
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_refresh_preserves_selection_kind_and_shutdown_refusals() {
+        let service = service();
+        let mut result = provider_result(FIRST, "PlayerOne", "ready");
+        result.microsoft_refresh_token = None;
+        let capture = service
+            .commit_login(
+                service.directory.selection_revision().unwrap(),
+                service.login_generation.load(Ordering::SeqCst),
+                result,
+            )
+            .await
+            .unwrap();
+        service.directory.create_offline_account("Steve").unwrap();
+        assert!(matches!(
+            service.refresh(capture.clone()).await,
+            Err(AuthError::Account(AccountError::StaleCapture))
+        ));
+        assert!(matches!(
+            service.refresh_selected().await,
+            Err(AuthError::Account(AccountError::NotMicrosoft))
+        ));
+        let selected = service
+            .select_account(capture.account_id().into(), AccountPreconditions::default())
+            .await
+            .unwrap();
+        assert_eq!(selected.active_account_id.as_ref(), Some(capture.identity()));
+        service.tasks.close_admission();
+        assert!(matches!(
+            service.refresh_selected().await,
+            Err(AuthError::Unavailable)
+        ));
+    }
+
+    #[tokio::test]
     async fn account_switch_and_cancel_reject_late_login_without_keyring_publication() {
         let service = service();
         let revision = service.directory.selection_revision().unwrap();
@@ -856,6 +984,10 @@ mod tests {
         let _interrupted = service.begin_refresh(&capture).await.unwrap();
         assert!(matches!(
             service.credentials(&capture).await,
+            Err(AuthError::Credentials(CredentialError::Unresolved))
+        ));
+        assert!(matches!(
+            service.refresh_selected().await,
             Err(AuthError::Credentials(CredentialError::Unresolved))
         ));
         assert!(
