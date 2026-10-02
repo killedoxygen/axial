@@ -70,7 +70,9 @@ def isolated_profiles():
     are checked on exit even after a failing scenario. No keyring is configured.
     """
     source_before = tree_fingerprint(PROFILE_FIXTURE)
-    with tempfile.TemporaryDirectory(prefix="axial-scenario-") as directory:
+    with tempfile.TemporaryDirectory(
+        prefix="axial-scenario-", dir=Path(tempfile.gettempdir()).resolve()
+    ) as directory:
         root = Path(directory)
         baseline = root / "baseline"
         replacement = root / "replacement"
