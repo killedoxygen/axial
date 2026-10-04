@@ -157,10 +157,22 @@ async fn report_failure(context: tauri::Context<tauri::Wry>, failure: Arc<Failur
             return preserve(failure).await;
         }
     };
+    #[cfg(target_os = "macos")]
+    let termination = match crate::termination::install(app.handle()) {
+        Ok(guard) => guard,
+        Err(_) => {
+            tracing::error!(
+                "Could not guard native termination; preserving without the error window"
+            );
+            return preserve(failure).await;
+        }
+    };
     if let Some(decision) = reset_decision {
         #[cfg(debug_assertions)]
         let restart_environment = app.env();
         app.run_return(|_, _| {});
+        #[cfg(target_os = "macos")]
+        drop(termination);
         let confirmed = decision.finish();
         #[cfg(debug_assertions)]
         if confirmed && callback_completion.await.is_ok() {
@@ -197,6 +209,8 @@ async fn report_failure(context: tauri::Context<tauri::Wry>, failure: Arc<Failur
             }
         }
     });
+    #[cfg(target_os = "macos")]
+    drop(termination);
     match worker.await {
         Ok(message) => message,
         Err(_) => {

@@ -33,6 +33,8 @@ libc = "0.2.184"
 lzma-rs = "0.3.0"
 md5 = "0.8.0"
 mime_guess = "2.0.5"
+objc2 = "=0.6.4"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder"] }
 p256 = { version = "0.13.2", features = ["ecdsa"] }
 png = "0.17.16"
 rand = "0.8.5"

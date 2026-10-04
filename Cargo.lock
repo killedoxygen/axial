@@ -356,6 +356,8 @@ dependencies = [
  "axial-api",
  "axial-app",
  "axial-fs",
+ "objc2",
+ "objc2-app-kit",
  "png 0.17.16",
  "serde",
  "serde_json",

@@ -6,6 +6,8 @@ mod native_skin;
 #[cfg(debug_assertions)]
 mod reset;
 mod startup;
+#[cfg(target_os = "macos")]
+mod termination;
 mod update;
 mod window;
 
@@ -15,8 +17,6 @@ use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
 const CLOSE_BLOCKED_EVENT: &str = "axial:desktop:close-blocked";
 const API_STOPPED_EVENT: &str = "axial:desktop:api-stopped";
-#[cfg(target_os = "macos")]
-const QUIT_MENU_ID: &str = "axial-quit";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Builder::new_multi_thread()
@@ -166,15 +166,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(debug_assertions)]
             reset::app_reset,
         ]);
-    #[cfg(target_os = "macos")]
-    let builder = {
-        let menu_lifecycle = lifecycle.clone();
-        builder.menu(close_menu).on_menu_event(move |app, event| {
-            if event.id().as_ref() == QUIT_MENU_ID {
-                request_close(app.clone(), menu_lifecycle.clone());
-            }
-        })
-    };
     #[cfg(debug_assertions)]
     let builder = builder.manage(reset.clone());
     let app = builder
@@ -271,6 +262,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(error.into());
         }
     };
+    #[cfg(target_os = "macos")]
+    let termination = match termination::install(app.handle()) {
+        Ok(guard) => guard,
+        Err(error) => {
+            lifecycle.shutdown_after_event_loop().await;
+            return Err(error.into());
+        }
+    };
     let restart_environment = app.env();
     let exit_lifecycle = lifecycle.clone();
     let exit_code = app.run_return(move |app, event| {
@@ -281,6 +280,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    #[cfg(target_os = "macos")]
+    drop(termination);
     lifecycle.shutdown_after_event_loop().await;
     #[cfg(debug_assertions)]
     reset.quiesce_after_exit().await;
@@ -332,31 +333,4 @@ fn request_close(app: tauri::AppHandle, lifecycle: DesktopLifecycle) {
             );
         }
     });
-}
-
-#[cfg(target_os = "macos")]
-fn close_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
-    use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
-
-    let invalid = || std::io::Error::other("The native Quit menu could not be configured.");
-    let menu = Menu::default(app)?;
-    let menus = menu.items()?;
-    let application = menus
-        .first()
-        .and_then(MenuItemKind::as_submenu)
-        .ok_or_else(invalid)?;
-    let items = application.items()?;
-    let quit = items
-        .last()
-        .and_then(MenuItemKind::as_predefined_menuitem)
-        .ok_or_else(invalid)?;
-    let text = quit.text()?;
-    if text != PredefinedMenuItem::quit(app, None)?.text()? {
-        return Err(invalid().into());
-    }
-    // AppKit's predefined Quit bypasses the cancellable lifecycle event.
-    let replacement = MenuItem::with_id(app, QUIT_MENU_ID, text, true, Some("CmdOrCtrl+Q"))?;
-    application.remove(quit)?;
-    application.insert(&replacement, items.len() - 1)?;
-    Ok(menu)
 }
