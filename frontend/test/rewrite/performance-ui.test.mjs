@@ -43,13 +43,19 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
   const notices = [];
   /** @type {string[]} */
   const clipboard = [];
+  /** @type {string[]} */
+  const subscriptions = [];
   /** @type {Map<string, { exports: Record<string, unknown> }>} */
   const modules = new Map();
   let cursor = 0;
   const store = {
     config: { value: config },
     devMode: { value: false },
-    instances: { value: [] },
+    instances: { value: /** @type {import('../../src/types-instance').EnrichedInstance[]} */ ([]) },
+    launchSessions: { value: /** @type {Record<string, import('../../src/types-launch').LaunchSession>} */ ({}) },
+    launchState: { value: /** @type {import('../../src/store').LaunchState} */ ({ status: 'idle' }) },
+    logLines: { value: 0 },
+    collapsedLogSeverity: { value: null },
     selectedInstanceId: { value: null },
     lastInstanceId: { value: null },
     versionById: () => null,
@@ -109,6 +115,15 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
       isApiError: (error) => error instanceof Error && error.name === 'ApiError' && 'status' in error,
     },
     store,
+    'backend/events': {
+      /** @param {string} path */
+      subscribeApiEvents: (path) => {
+        subscriptions.push(path);
+        return () => {};
+      },
+    },
+    music: { Music: { suppress() {}, unsuppress() {} } },
+    sound: { Sound: { init() {} } },
     toast: {
       /** @param {Parameters<typeof import('../../src/toast').toast>} args */
       toast: (...args) => notices.push(args),
@@ -131,6 +146,7 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
     Number,
     Set,
     Object,
+    window: { setInterval: () => 1, clearInterval() {} },
     navigator: {
       clipboard: {
         /** @param {string} text */
@@ -172,6 +188,7 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
     calls,
     notices,
     clipboard,
+    subscriptions,
     /** @template {keyof ViewModules} T @param {T} path @returns {ViewModules[T]} */
     load: (path) => /** @type {ViewModules[T]} */ (/** @type {unknown} */ (load(resolve(frontend, 'src', path)))),
     /** @template {object} P @param {(props: P) => unknown} component @param {P} [props] */
@@ -370,8 +387,8 @@ test('Performance Lab remains a developer disclosure with all existing blocks', 
   );
 });
 
-/** @param {{ id?: string, state?: string, pending?: number | null, canResume?: boolean }} [options] */
-function driverResponse({ id = 'driver', state = 'stopped', pending = null, canResume } = {}) {
+/** @param {{ id?: string, state?: string, pending?: number | null, canResume?: boolean, sessionId?: string | null }} [options] */
+function driverResponse({ id = 'driver', state = 'stopped', pending = null, canResume, sessionId = null } = {}) {
   return {
     status: 'ok',
     driver: {
@@ -379,7 +396,7 @@ function driverResponse({ id = 'driver', state = 'stopped', pending = null, canR
       state,
       suite_id: 'suite',
       mode: 'release_validation',
-      active_session_id: null,
+      active_session_id: sessionId,
       last_session_id: 'recorded-session',
     },
     suite: {
@@ -413,6 +430,146 @@ const driverProps = {
     },
   },
 };
+
+/** @param {string} id @returns {import('../../src/types-instance').EnrichedInstance} */
+function driverInstance(id) {
+  return {
+    id,
+    name: id,
+    version_id: '1.21',
+    created_at: '2026-10-04T08:00:00Z',
+    version_display: {
+      loader_key: 'vanilla',
+      loader_label: 'Vanilla',
+      minecraft_label: '1.21',
+      loader_version_label: '',
+      loader_detail_label: '',
+      summary_label: '1.21',
+      supports_mods: false,
+    },
+    launchable: true,
+    launch_action: { state_id: 'ready', label: 'Launch', tone: 'ok', launchable: true, primary_action: 'launch' },
+    saves_count: 0,
+    mods_count: 0,
+    resource_count: 0,
+    shader_count: 0,
+    counts_available: false,
+  };
+}
+
+/** @param {string} id */
+function driverSession(id) {
+  return {
+    session_id: `session-${id}`,
+    instance_id: `instance-${id}`,
+    revision: 1,
+    launched_at: '2026-10-04T08:00:00Z',
+    notice: null,
+    outcome: null,
+    view_model: {
+      state_id: 'running',
+      label: 'Playing',
+      progress_pct: 100,
+      terminal: false,
+      playing: true,
+      process_live: true,
+      can_stop: true,
+    },
+  };
+}
+
+test('Refresh adopts every distinct active driver session through the real launch owner', async () => {
+  const rows = ['1', '2', '1'].map((id, index) =>
+    driverResponse({ id: `driver-${index}`, state: 'waiting', sessionId: `session-${id}` }),
+  );
+  let lists = 0;
+  const h = viewHarness({
+    api: async (method, path) => {
+      assert.equal(method, 'GET');
+      if (path === '/launch/benchmark/suite/drivers') return { status: 'ok', drivers: ++lists === 1 ? [] : rows };
+      if (path === '/launch/session-1/status') return driverSession('1');
+      if (path === '/launch/session-2/status') return driverSession('2');
+      assert.fail(`Unexpected read ${path}`);
+    },
+  });
+  h.store.instances.value = [driverInstance('instance-1'), driverInstance('instance-2')];
+  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
+  const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
+  render();
+  await h.settle();
+  assert.equal(Object.keys(h.store.launchSessions.value).length, 0);
+  control(render(), 'Button', 'Refresh').onClick();
+  await h.settle();
+  assert.deepEqual(Object.keys(h.store.launchSessions.value).sort(), ['instance-1', 'instance-2']);
+  assert.equal(h.store.launchSessions.value['instance-1'].viewModel.can_stop, true);
+  assert.equal(h.store.launchSessions.value['instance-2'].sessionId, 'session-2');
+  assert.deepEqual(h.subscriptions, ['/launch/session-1/events', '/launch/session-2/events']);
+  const reads = h.calls.filter(([, path]) => path.endsWith('/status')).length;
+  control(render(), 'Button', 'Refresh').onClick();
+  await h.settle();
+  assert.equal(h.calls.filter(([, path]) => path.endsWith('/status')).length, reads);
+  assert.equal(h.subscriptions.length, 2);
+  assert.deepEqual(h.notices, []);
+});
+
+test('an acknowledged Resume stays successful when its separate session read fails safely', async () => {
+  const h = viewHarness({
+    api: async (method, path) => {
+      if (method === 'POST') return driverResponse({ state: 'running', sessionId: 'session-1', canResume: false });
+      if (path === '/launch/benchmark/suite/drivers') return { status: 'ok', drivers: [driverResponse()] };
+      assert.equal(path, '/launch/session-1/status');
+      throw new Error('private provider detail');
+    },
+  });
+  h.store.instances.value = [driverInstance('instance-1')];
+  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
+  const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
+  render();
+  await h.settle();
+  control(render(), 'Button', 'Resume').onClick();
+  await h.settle();
+  assert.match(visibleText(render()), /Backend running/);
+  assert.ok(h.notices.some(([message]) => message === 'Driver resumed'));
+  assert.ok(h.notices.some(([message, tone]) => tone === 'error' && /session/.test(message)));
+  assert.doesNotMatch(h.notices.flat().join(' '), /Resume failed|private provider detail/);
+  assert.equal(h.calls.filter(([method]) => method === 'POST').length, 1);
+  assert.equal(Object.keys(h.store.launchSessions.value).length, 0);
+});
+
+for (const invalidation of ['Refresh', 'Stop', 'unmount']) {
+  test(`a pending session read cannot adopt after its driver observation changes: ${invalidation}`, async () => {
+    const pending = deferredResponse();
+    let lists = 0;
+    const h = viewHarness({
+      api: async (method, path) => {
+        if (method === 'POST') return driverResponse();
+        if (path === '/launch/benchmark/suite/drivers')
+          return {
+            status: 'ok',
+            drivers: ++lists === 1 ? [driverResponse({ state: 'waiting', sessionId: 'session-1' })] : [],
+          };
+        assert.equal(path, '/launch/session-1/status');
+        return pending.promise;
+      },
+    });
+    h.store.instances.value = [driverInstance('instance-1')];
+    const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
+    const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
+    render();
+    await h.settle();
+    assert.ok(
+      h.calls.some(([, path]) => path === '/launch/session-1/status'),
+      'the session read must be pending',
+    );
+    if (invalidation === 'unmount') h.dispose();
+    else control(render(), 'Button', invalidation).onClick();
+    await h.settle();
+    pending.resolve(driverSession('1'));
+    await h.settle();
+    assert.equal(Object.keys(h.store.launchSessions.value).length, 0);
+    assert.deepEqual(h.subscriptions, []);
+  });
+}
 
 test('benchmark driver actions follow backend permissions while ordinary resume remains available', async () => {
   const driver = driverResponse();

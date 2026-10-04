@@ -108,8 +108,10 @@ function launchHarness(intentResult?: unknown, running = true) {
   const clock = timers();
   const finalLogs = deferred<unknown>();
   let currentStatus = status();
+  let readStatus: () => Promise<unknown> = async () => currentStatus;
   let subscription: ApiEventOptions<unknown> | undefined;
   let closed = 0;
+  let connections = 0;
   const calls: string[] = [];
   const errors: string[] = [];
   const lines: Array<{ source: string; text: string }> = [];
@@ -128,10 +130,14 @@ function launchHarness(intentResult?: unknown, running = true) {
       if (intentResult !== undefined && path === '/launch') {
         assert.equal(method, 'POST'); calls.push(path); throw new Error('Launch response lost');
       }
+      if (method === 'POST' && path.endsWith('/kill')) {
+        calls.push(path);
+        return status(6, true);
+      }
       assert.equal(method, 'GET'); calls.push(path);
       if (path.startsWith('/launch/intents/') && intentResult !== undefined) return intentResult;
       if (path.endsWith('/logs')) return finalLogs.promise;
-      if (path.endsWith('/status')) return currentStatus;
+      if (path.endsWith('/status')) return readStatus();
       if (path === '/instances/instance-1') return readInstance();
       if (path === '/instances') return { instances: [await readInstance()], last_instance_id: null };
       throw new Error(`Unexpected launch read ${path}`);
@@ -143,9 +149,9 @@ function launchHarness(intentResult?: unknown, running = true) {
   const launch = source<typeof import('../../src/launch')>('launch.ts', {
     './api': api,
     './backend/events': { subscribeApiEvents: (_path: string, options: ApiEventOptions<unknown>) => {
-      subscription = options; return () => { closed++; };
+      connections++; subscription = options; return () => { closed++; };
     } },
-    './sound': { Sound: { init() {} } }, './music': { Music: { unsuppress() {} } },
+    './sound': { Sound: { init() {} } }, './music': { Music: { suppress() {}, unsuppress() {} } },
     './utils': { appendLog: (source: string, text: string) => lines.push({ source, text }), showError: (message: string) => errors.push(message), errMessage: String },
     './store': store, './actions': actions, './launch-notice-tracker': noticeContract,
     './launch-response-adapters': statusContract, './dto-contract': contract, './dto-core': {}, './dto-launch': logContract,
@@ -154,12 +160,149 @@ function launchHarness(intentResult?: unknown, running = true) {
   if (intentResult === undefined && running) launch.reconnectLaunchSession('instance-1', 'Example');
   return {
     store, actions, lines, calls, errors, clock, finalLogs, readiness, launch, closed: () => closed,
+    connections: () => connections,
     readInstance(next: typeof readInstance): void { readInstance = next; },
+    readStatus(next: typeof readStatus): void { readStatus = next; },
     emit(value: unknown, event: string): void { assert.ok(subscription); subscription.onValue(value, event, null); },
     interruptStream(): void { assert.ok(subscription); subscription.onError?.(new Error('Interrupted')); },
     pollTerminal(): void { currentStatus = status(2, true); for (const poll of clock.intervals.values()) poll(); },
   };
 }
+
+test('a known external session is adopted once and ordinary Stop targets its exact identity', async () => {
+  const h = launchHarness(undefined, false);
+  h.actions.startLaunch('other-instance');
+  const preparing = h.store.launchState.value;
+  await h.launch.adoptLaunchSession('session-1');
+  await flush();
+  assert.equal(h.store.launchSessions.value['instance-1'].sessionId, 'session-1');
+  assert.equal(h.store.launchState.value, preparing, 'adoption must preserve unrelated preparation');
+  assert.equal(h.connections(), 1);
+  assert.equal(h.clock.intervals.size, 1);
+  const reads = h.calls.length;
+  h.actions.updateLaunchSessionState('instance-1', { stopping: true });
+  h.emit(status(5), 'status');
+  await h.launch.adoptLaunchSession('session-1');
+  assert.equal(h.calls.length, reads);
+  assert.equal(h.connections(), 1);
+  assert.equal(h.store.launchSessions.value['instance-1'].statusRevision, 5);
+  assert.equal(h.store.launchSessions.value['instance-1'].stopping, true);
+
+  h.actions.updateLaunchSessionState('instance-1', { stopping: false });
+  await h.launch.killGame();
+  assert.equal(h.calls.filter((path) => path === '/launch/session-1/kill').length, 1);
+  h.finalLogs.resolve({ entries: [] });
+  await flush();
+  assert.equal(h.store.launchSessions.value['instance-1'], undefined);
+  assert.equal(h.closed(), 1);
+  assert.equal(h.store.launchState.value, preparing);
+});
+
+test('concurrent duplicate adoption never creates a second connection or replaces newer state', async () => {
+  const h = launchHarness(undefined, false);
+  const reply = deferred<unknown>();
+  h.readStatus(() => reply.promise);
+  const first = h.launch.adoptLaunchSession('session-1');
+  const duplicate = h.launch.adoptLaunchSession('session-1');
+  reply.resolve(status());
+  await Promise.all([first, duplicate]);
+  await flush();
+  assert.equal(h.connections(), 1);
+  assert.equal(h.clock.intervals.size, 1);
+  assert.equal(h.store.launchSessions.value['instance-1'].sessionId, 'session-1');
+});
+
+for (const [label, value] of [
+  ['malformed', { error: 'private provider detail' }],
+  ['mismatched identity', { ...status(), session_id: 'different-session' }],
+  ['invalid launch time', { ...status(), launched_at: 'invalid' }],
+  ['unsafe revision', { ...status(), revision: Number.MAX_SAFE_INTEGER + 1 }],
+] as const) {
+  test(`invalid external session response cannot publish controls: ${label}`, async () => {
+    const h = launchHarness(undefined, false);
+    const sessions = h.store.launchSessions.value;
+    h.readStatus(async () => value);
+    await h.launch.adoptLaunchSession('session-1');
+    assert.equal(h.store.launchSessions.value, sessions);
+    assert.equal(h.connections(), 0);
+    assert.equal(h.errors.length, 1);
+    assert.doesNotMatch(h.errors[0], /private provider detail/);
+    assert.equal(h.clock.timeouts.size + h.clock.intervals.size, 0);
+  });
+}
+
+test('an already terminal external session is not resurrected or connected', async () => {
+  const h = launchHarness(undefined, false);
+  const sessions = h.store.launchSessions.value;
+  h.readStatus(async () => status(2, true));
+  await h.launch.adoptLaunchSession('session-1');
+  assert.equal(h.store.launchSessions.value, sessions);
+  assert.equal(h.connections(), 0);
+  assert.equal(h.errors.length, 0);
+});
+
+for (const change of [
+  'replacement session',
+  'session lifetime',
+  'preparation',
+  'preparation lifetime',
+  'instance removal',
+] as const) {
+  test(`a delayed external session read cannot overwrite a newer ${change}`, async () => {
+    const h = launchHarness(undefined, false);
+    const reply = deferred<unknown>();
+    h.readStatus(() => reply.promise);
+    const adoption = h.launch.adoptLaunchSession('session-1');
+    if (change === 'replacement session' || change === 'session lifetime') {
+      const replacement = statusContract.launchSessionsResponse({
+        sessions: [{ ...status(), session_id: 'session-2' }],
+      });
+      h.actions.confirmLaunch('instance-1', replacement['instance-1']);
+      if (change === 'session lifetime') h.actions.endSessionIfCurrent('instance-1', 'session-2');
+    } else if (change === 'preparation' || change === 'preparation lifetime') {
+      h.actions.startLaunch('instance-1');
+      if (change === 'preparation lifetime') h.actions.endLaunchPrep();
+    } else h.store.instances.value = [];
+    const sessions = h.store.launchSessions.value;
+    const preparing = h.store.launchState.value;
+    reply.resolve(status());
+    await adoption;
+    assert.equal(h.store.launchSessions.value, sessions);
+    assert.equal(h.store.launchState.value, preparing);
+    assert.equal(h.connections(), 0);
+  });
+}
+
+test('external adoption cannot replace an existing session or strand same-instance preparation', async () => {
+  for (const occupied of ['session', 'preparation'] as const) {
+    const h = launchHarness(undefined, false);
+    if (occupied === 'session') {
+      const replacement = statusContract.launchSessionsResponse({
+        sessions: [{ ...status(), session_id: 'session-2' }],
+      });
+      h.actions.confirmLaunch('instance-1', replacement['instance-1']);
+    } else h.actions.startLaunch('instance-1');
+    const sessions = h.store.launchSessions.value;
+    const preparing = h.store.launchState.value;
+    await h.launch.adoptLaunchSession('session-1');
+    assert.equal(h.store.launchSessions.value, sessions);
+    assert.equal(h.store.launchState.value, preparing);
+    assert.equal(h.connections(), 0);
+  }
+});
+
+test('an obsolete external session read failure cannot surface after a preparation lifetime', async () => {
+  const h = launchHarness(undefined, false);
+  const reply = deferred<unknown>();
+  h.readStatus(() => reply.promise);
+  const adoption = h.launch.adoptLaunchSession('session-1');
+  h.actions.startLaunch('instance-1');
+  h.actions.endLaunchPrep();
+  reply.reject(new Error('private provider detail'));
+  await adoption;
+  assert.deepEqual(h.errors, []);
+  assert.equal(h.connections(), 0);
+});
 
 test('an interrupted durable launch stops recovery polling and prevents a fresh launch', async () => {
   const harness = launchHarness({ state: 'interrupted', session_id: 'session-1', error: 'Its process outcome is unknown.' });

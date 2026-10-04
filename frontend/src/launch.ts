@@ -19,7 +19,7 @@ import {
 } from './actions';
 import type { LaunchSessionOutcome } from './types-launch';
 import { createBackendLaunchNoticeTracker, type BackendLaunchNoticeTracker } from './launch-notice-tracker';
-import { launchStatusUpdate } from './launch-response-adapters';
+import { launchSessionsResponse, launchStatusUpdate } from './launch-response-adapters';
 import { dtoEnum, dtoError, dtoRecord, dtoString } from './dto-contract';
 import { enrichedInstanceResponse } from './dto-core';
 import { launchLogEntryResponse, launchLogsResponse } from './dto-launch';
@@ -266,6 +266,40 @@ function appendSessionLog(value: unknown, sessionId: string, instanceId: string,
   }
   appendLog(entry.source, entry.truncated ? `${entry.text} [truncated]` : entry.text, instanceId, instanceName);
   launchLogSequences.set(sessionId, entry.sequence);
+}
+
+export async function adoptLaunchSession(sessionId: string, isCurrent: () => boolean = () => true): Promise<void> {
+  if (!isCurrent()) return;
+  const sessions = launchSessions.value;
+  const preparation = launchState.value;
+  const stillCurrent = (): boolean =>
+    isCurrent() && launchSessions.value === sessions && launchState.value === preparation;
+  try {
+    const tracked = Object.entries(sessions).find(([, session]) => session.sessionId === sessionId);
+    if (tracked) {
+      const [instanceId] = tracked;
+      reconnectLaunchSession(
+        instanceId,
+        instances.value.find((instance) => instance.id === instanceId)?.name ?? instanceId,
+      );
+      return;
+    }
+    const value = await api('GET', `/launch/${encodeURIComponent(sessionId)}/status`);
+    if (!stillCurrent()) return;
+    const snapshot = dtoRecord(value, 'Launch session');
+    if (snapshot.session_id !== sessionId) throw new Error('Launch session identity did not match.');
+    const entry = Object.entries(launchSessionsResponse({ sessions: [snapshot] }))[0];
+    if (!entry) return;
+    const [instanceId, session] = entry;
+    const instance = instances.value.find((row) => row.id === instanceId);
+    if (!instance || sessions[instanceId]) return;
+    if (preparation.status === 'preparing' && preparation.instanceId === instanceId) return;
+    launchSessions.value = { ...sessions, [instanceId]: session };
+    Music.suppress();
+    reconnectLaunchSession(instanceId, instance.name);
+  } catch {
+    if (stillCurrent()) showError('Could not refresh the benchmark game session. Refresh the driver to try again.');
+  }
 }
 
 export function reconnectLaunchSession(instanceId: string, instanceName: string): void {

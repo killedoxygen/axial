@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { api } from '../../api';
+import { adoptLaunchSession } from '../../launch';
 import { instances, lastInstanceId, selectedInstanceId, versionById } from '../../store';
 import { toast } from '../../toast';
 import type {
@@ -104,6 +105,17 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
     });
   }, [suiteModes]);
 
+  const adoptDriverSessions = async (rows: BenchmarkSuiteDriverResponse[], requestId: number): Promise<void> => {
+    const isCurrent = (): boolean => aliveRef.current && requestRef.current === requestId;
+    const sessionIds = new Set(
+      rows.flatMap((row) => (row.driver.active_session_id ? [row.driver.active_session_id] : [])),
+    );
+    for (const sessionId of sessionIds) {
+      if (!isCurrent()) return;
+      await adoptLaunchSession(sessionId, isCurrent);
+    }
+  };
+
   const loadDrivers = async (): Promise<void> => {
     const requestId = requestRef.current + 1;
     requestRef.current = requestId;
@@ -112,6 +124,7 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
       const res = benchmarkSuiteDriversResponse(await api('GET', '/launch/benchmark/suite/drivers'));
       if (!aliveRef.current || requestId !== requestRef.current) return;
       setDriversState({ status: 'ready', data: res.drivers });
+      void adoptDriverSessions(res.drivers, requestId);
     } catch (err) {
       if (!aliveRef.current || requestId !== requestRef.current) return;
       setDriversState((prev) => ({ status: 'error', data: prev.data, error: errMessage(err) }));
@@ -168,6 +181,7 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
           ? [update, ...prev.data.filter((row) => row.driver.id !== update.driver.id)]
           : prev.data.map((row) => (row.driver.id === update.driver.id ? update : row)),
     }));
+    void adoptDriverSessions([update], requestRef.current);
   };
 
   const resumeDriver = async (row: BenchmarkSuiteDriverResponse): Promise<void> => {
