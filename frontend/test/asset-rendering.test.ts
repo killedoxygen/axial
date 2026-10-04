@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
@@ -84,13 +85,20 @@ test('Logo projects every path and viewBox directly from the sole brand manifest
   assert.equal((paths[0].props as LooseProps).fillRule, 'evenodd');
 });
 
-test('all LoaderKey values produce distinct neutral assets in create and instance glyphs', () => {
+test('all LoaderKey values retain their original assets and alignment in create and instance glyphs', async () => {
   const expected: Record<LoaderKey, string> = {
-    vanilla: 'loader-base.svg',
-    fabric: 'loader-grid.svg',
-    forge: 'loader-cross.svg',
-    neoforge: 'loader-orbit.svg',
-    quilt: 'loader-diamonds.svg',
+    vanilla: 'vanilla_icon.svg',
+    fabric: 'fabric_icon.svg',
+    forge: 'forge_icon.svg',
+    neoforge: 'neoforge_icon.svg',
+    quilt: 'quilt_icon.svg',
+  };
+  const originalHashes: Record<LoaderKey, string> = {
+    vanilla: '34abce831779c6bc43e91214e7e57c8ed8c4c3e0e63b58e38d6e7f9132585b28',
+    fabric: '724a6ace8aab39ffeca373e847782c5ff56abc0bc898f962519bd9aa0b696f8e',
+    forge: '48b1a0bd969b3f96dc9a154b1041c954aa6b76334873b6d332fffc47b4e7d908',
+    neoforge: 'cdccab15e2e71a10ad21d1e4cd766c29fa10dbb48768266e713b0c4b694a5dac',
+    quilt: 'bee418e2d25ef96bff9a5fd74851548098744580028042aaaf29baadfbef1fc5',
   };
   const loaderKeys = Object.keys(LOADER_LABELS) as LoaderKey[];
   assert.deepEqual(Object.fromEntries(loaderKeys.map((loader) => [loader, loaderLogoSrc(loader)])), expected);
@@ -99,6 +107,7 @@ test('all LoaderKey values produce distinct neutral assets in create and instanc
   for (const loader of loaderKeys) {
     const createMark = LoaderLogo({ loader, size: 18 });
     assert.equal(createMark.type, 'span');
+    assert.equal(createMark.props['data-loader'], loader);
     assert.equal(createMark.props.style['--cp-loader-src'], `url("${expected[loader]}")`);
     assert.equal(createMark.props.style.width, '18px');
 
@@ -111,9 +120,23 @@ test('all LoaderKey values produce distinct neutral assets in create and instanc
     };
     const glyph = functionalResult(InstanceGlyph({ inst: instance, className: 'fixture-glyph' }));
     assert.equal(glyph.type, 'span');
+    assert.equal((glyph.props as LooseProps)['data-loader'], loader);
     assert.equal((glyph.props as LooseProps).class, 'fixture-glyph fixture-glyph--mask');
     assert.equal((glyph.props as LooseProps).style['--cp-loader-src'], `url("${expected[loader]}")`);
+    assert.equal(
+      createHash('sha256')
+        .update(await readFile(`static/${expected[loader]}`))
+        .digest('hex'),
+      originalHashes[loader],
+    );
   }
+
+  const createStyle = await readFile('src/views/create/create.css', 'utf8');
+  assert.match(createStyle, /\.cp-cr-loader-mark\[data-loader='quilt'\]\s*\{\s*translate: 2\.1% 2\.1%;\s*\}/);
+  assert.match(createStyle, /\.cp-cr-loader-mark\[data-loader='forge'\]\s*\{\s*translate: 0 2\.1%;\s*\}/);
+  const tileStyle = await readFile('src/ui/instance-visual.css', 'utf8');
+  assert.match(tileStyle, /\.cp-tile-glyph--mask\[data-loader='quilt'\]\s*\{\s*translate: 2\.1cqmin 2\.1cqmin;\s*\}/);
+  assert.match(tileStyle, /\.cp-tile-glyph--mask\[data-loader='forge'\]\s*\{\s*translate: 0 2\.1cqmin;\s*\}/);
 });
 
 test('Microsoft authentication uses the exact local official symbol geometry', async () => {

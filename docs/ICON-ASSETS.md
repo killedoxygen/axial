@@ -44,11 +44,26 @@ explicit visual approval and native macOS packaging verification.
 
 ## Loader marks
 
-Loader identity uses five repository-authored neutral glyphs under
-`frontend/static/loader-*.svg`. They deliberately do not reproduce Fabric,
-Forge, NeoForge, Quilt, Mojang, or Microsoft brand geometry. The loader mapping
-is total and each glyph remains distinct in both text rows and icon-only
-instance surfaces.
+Loader identity retains `vanilla_icon.svg`, `fabric_icon.svg`, `forge_icon.svg`,
+`neoforge_icon.svg` and `quilt_icon.svg` under `frontend/static/`, byte-for-byte
+from [Axial's historical source](https://github.com/mateoltd/axial/tree/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static).
+Keep their original view boxes, monochrome CSS masks and Forge/Quilt optical
+offsets in creation rows and instance tiles. Preserve these recognizable marks;
+do not replace them with neutral glyphs or new brand geometry. A visual change
+requires an explicitly approved, specific correction and focused verification.
+
+The provenance entry identifies the exact historical input, not Axial ownership
+of third-party marks or a complete upstream rights chain. These SVGs contain
+historical adaptations and are not all byte-exact official downloads. Quilt's
+eight path geometries match its [official monochrome artwork](https://github.com/QuiltMC/art/blob/849d6dfd9ba639895e15c7b200e06b3bb50e9c2e/brand/svg/quilt_logo_mono_white_transparent.svg),
+whose [brand directory carries CC0](https://github.com/QuiltMC/art/blob/849d6dfd9ba639895e15c7b200e06b3bb50e9c2e/brand/LICENSE);
+the retained SVG changes the framing. Original derivation and rights evidence
+for the other four retained SVG adaptations remain incomplete. In particular,
+[NeoForged's official art](https://github.com/neoforged/.github/blob/382381b116e4a107c09fcd1fe7afaf48626d1ef3/art/README.md)
+credits Ridanisaurus under CC-BY-4.0, but does not establish the exact source of
+this historical monochrome SVG. The historical hashes prove restoration only,
+not a new license or trademark permission. Loader marks are retained inputs;
+the Axial icon generator does not regenerate them.
 
 ## Interface icons
 
@@ -74,8 +89,8 @@ separate base/accent geometry so theme colors remain CSS-owned.
 
 `assets/provenance.json` is the strict source, rights, revision, mode, refresh,
 generator, and exact-hash inventory for retained delivery assets. It covers the
-tracked desktop icons, frontend font files and notices, SND kit files, neutral
-loader glyphs, Worlds empty-state masks, interface icon notice, favicon, and
+tracked desktop icons, frontend font files and notices, SND kit files, historical
+loader marks, Worlds empty-state masks, interface icon notice, favicon, and
 Microsoft authentication symbol.
 
 The Microsoft symbol is the byte-exact asset published with Microsoft identity

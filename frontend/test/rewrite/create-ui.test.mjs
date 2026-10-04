@@ -65,7 +65,9 @@ const bundled = await build({
           if (
             args.path === 'create-test-seam' ||
             (args.importer === instanceFile &&
-              ['./api', './toast', './utils', './ui-state', './actions', './store', './machines/downloads'].includes(args.path))
+              ['./api', './toast', './utils', './ui-state', './actions', './store', './machines/downloads'].includes(
+                args.path,
+              ))
           ) {
             return { path: 'create-test-seam', namespace: 'create-test' };
           }
@@ -607,12 +609,25 @@ test('stale preferred build requires explicitly choosing the available older ins
   assert.equal(select(null), '');
 });
 
-test('preserved create styling and loader artwork remain identical to the baseline', async () => {
+test('create styling preserves the baseline except restored loader marks and their exact alignment', async () => {
   for (const filename of ['create.css', 'loader-logos.tsx']) {
     const [replacement, baseline] = await Promise.all([
       readFile(resolve(frontend, 'src/views/create', filename), 'utf8'),
       readFile(resolve(frontend, '../legacy/frontend/src/views/create', filename), 'utf8'),
     ]);
-    assert.equal(replacement, baseline);
+    const comparable =
+      filename === 'create.css'
+        ? replacement.replace(
+            ".cp-cr-loader-mark[data-loader='quilt'] {\n  translate: 2.1% 2.1%;\n}\n.cp-cr-loader-mark[data-loader='forge'] {\n  translate: 0 2.1%;\n}\n",
+            '',
+          )
+        : replacement
+            .replace('vanilla_icon.svg', 'loader-base.svg')
+            .replace('fabric_icon.svg', 'loader-grid.svg')
+            .replace('neoforge_icon.svg', 'loader-orbit.svg')
+            .replace('forge_icon.svg', 'loader-cross.svg')
+            .replace('quilt_icon.svg', 'loader-diamonds.svg')
+            .replace('      data-loader={loader}\n', '');
+    assert.equal(comparable, baseline);
   }
 });

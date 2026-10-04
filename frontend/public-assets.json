@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "files": [
+    "fabric_icon.svg",
     "favicon.png",
     "fonts/GeistMono-OFL.txt",
     "fonts/GeistMono-Variable.woff2",
@@ -11,17 +12,16 @@
     "fonts/Manrope-latin-ext.woff2",
     "fonts/Manrope-latin.woff2",
     "fonts/Manrope-vietnamese.woff2",
+    "forge_icon.svg",
     "index.html",
     "licenses/Lucide-ISC.txt",
-    "loader-base.svg",
-    "loader-cross.svg",
-    "loader-diamonds.svg",
-    "loader-grid.svg",
-    "loader-orbit.svg",
     "microsoft-auth-symbol.svg",
+    "neoforge_icon.svg",
+    "quilt_icon.svg",
     "sounds/SND-NOTICE.txt",
     "sounds/snd01/audioSprite.json",
     "sounds/snd01/audioSprite.mp3",
+    "vanilla_icon.svg",
     "worlds-empty-accent.svg",
     "worlds-empty-base.svg"
   ]

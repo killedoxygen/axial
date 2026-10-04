@@ -144,60 +144,60 @@
     {
       "id": "loader-marks",
       "source": {
-        "kind": "repository-owned",
-        "locator": "repository://frontend/static/loader-*.svg",
-        "revision": "neutral-loader-marks-v1"
+        "kind": "upstream",
+        "locator": "https://github.com/mateoltd/axial/tree/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static",
+        "revision": "4897a626eb0d01b7c6a2c237e6babcc091538e90"
       },
       "rights": {
-        "basis": "repository-owned",
+        "basis": "historical-source-only",
         "evidence": {
           "locator": "docs/ICON-ASSETS.md",
           "sha256": null
         },
         "current_policy": null,
-        "reviewed_at": "2026-07-20"
+        "reviewed_at": "2026-10-02"
       },
-      "refresh": "Keep five nonblank, mutually distinct neutral glyphs with no external brand geometry.",
+      "refresh": "Preserve the historical loader marks, view boxes, CSS masks and alignment. Change only for an explicitly approved visual correction; record its source and rights limitations without substituting new brand geometry.",
       "files": [
         {
-          "path": "frontend/static/loader-base.svg",
+          "path": "frontend/static/fabric_icon.svg",
           "mode": "100644",
-          "sha256": "71511273ea28dadbd043a20d0e2bf75b0c6e7cdf185790b0a700a5ba892743b5",
+          "sha256": "724a6ace8aab39ffeca373e847782c5ff56abc0bc898f962519bd9aa0b696f8e",
           "generator": null,
-          "locator": null,
-          "upstream_sha256": null
+          "locator": "https://raw.githubusercontent.com/mateoltd/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/fabric_icon.svg",
+          "upstream_sha256": "724a6ace8aab39ffeca373e847782c5ff56abc0bc898f962519bd9aa0b696f8e"
         },
         {
-          "path": "frontend/static/loader-cross.svg",
+          "path": "frontend/static/forge_icon.svg",
           "mode": "100644",
-          "sha256": "29415bd131f5cd1e570eba3930ed3a519e46317e8cd5dd78c5bb05057d3bf5f5",
+          "sha256": "48b1a0bd969b3f96dc9a154b1041c954aa6b76334873b6d332fffc47b4e7d908",
           "generator": null,
-          "locator": null,
-          "upstream_sha256": null
+          "locator": "https://raw.githubusercontent.com/mateoltd/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/forge_icon.svg",
+          "upstream_sha256": "48b1a0bd969b3f96dc9a154b1041c954aa6b76334873b6d332fffc47b4e7d908"
         },
         {
-          "path": "frontend/static/loader-diamonds.svg",
+          "path": "frontend/static/neoforge_icon.svg",
           "mode": "100644",
-          "sha256": "109ee1a59a2cbe3de9abe2501bd78a59239f9340233907a7cb5e2eb05eb12637",
+          "sha256": "cdccab15e2e71a10ad21d1e4cd766c29fa10dbb48768266e713b0c4b694a5dac",
           "generator": null,
-          "locator": null,
-          "upstream_sha256": null
+          "locator": "https://raw.githubusercontent.com/mateoltd/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/neoforge_icon.svg",
+          "upstream_sha256": "cdccab15e2e71a10ad21d1e4cd766c29fa10dbb48768266e713b0c4b694a5dac"
         },
         {
-          "path": "frontend/static/loader-grid.svg",
+          "path": "frontend/static/quilt_icon.svg",
           "mode": "100644",
-          "sha256": "f8648a4f1075df397a1b200ca624a58c56011bb814aaf44700e4c8579f3bfae7",
+          "sha256": "bee418e2d25ef96bff9a5fd74851548098744580028042aaaf29baadfbef1fc5",
           "generator": null,
-          "locator": null,
-          "upstream_sha256": null
+          "locator": "https://raw.githubusercontent.com/mateoltd/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/quilt_icon.svg",
+          "upstream_sha256": "bee418e2d25ef96bff9a5fd74851548098744580028042aaaf29baadfbef1fc5"
         },
         {
-          "path": "frontend/static/loader-orbit.svg",
+          "path": "frontend/static/vanilla_icon.svg",
           "mode": "100644",
-          "sha256": "c47b394e8772847569a981c103e5bbd86a42b37ab3feb0925fdb4f72e362df4f",
+          "sha256": "34abce831779c6bc43e91214e7e57c8ed8c4c3e0e63b58e38d6e7f9132585b28",
           "generator": null,
-          "locator": null,
-          "upstream_sha256": null
+          "locator": "https://raw.githubusercontent.com/mateoltd/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/vanilla_icon.svg",
+          "upstream_sha256": "34abce831779c6bc43e91214e7e57c8ed8c4c3e0e63b58e38d6e7f9132585b28"
         }
       ]
     },

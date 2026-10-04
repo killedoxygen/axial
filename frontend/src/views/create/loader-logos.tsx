@@ -2,11 +2,11 @@ import type { JSX } from 'preact';
 import type { LoaderKey } from './defaults';
 
 const LOADER_LOGO_SRC: Record<LoaderKey, string> = {
-  vanilla: 'loader-base.svg',
-  fabric: 'loader-grid.svg',
-  forge: 'loader-cross.svg',
-  neoforge: 'loader-orbit.svg',
-  quilt: 'loader-diamonds.svg',
+  vanilla: 'vanilla_icon.svg',
+  fabric: 'fabric_icon.svg',
+  forge: 'forge_icon.svg',
+  neoforge: 'neoforge_icon.svg',
+  quilt: 'quilt_icon.svg',
 };
 
 export function loaderLogoSrc(loader: LoaderKey): string {
@@ -27,6 +27,7 @@ export function LoaderLogo({
     <span
       aria-hidden="true"
       class={className}
+      data-loader={loader}
       style={{
         ['--cp-loader-src' as any]: `url("${src}")`,
         width: `${size}px`,
