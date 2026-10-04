@@ -1647,10 +1647,11 @@ mod tests {
 
     #[tokio::test]
     async fn profile_reconstruction_matches_install_and_leaves_all_managed_state_untouched() {
-        for (component, base_id, omit_mappings) in [
-            (LoaderComponentId::Fabric, "1.21.5", false),
-            (LoaderComponentId::Quilt, "1.21.5", false),
-            (LoaderComponentId::Quilt, "26.3", true),
+        for (component, base_id, omit_mappings, chained_integrity) in [
+            (LoaderComponentId::Fabric, "1.21.5", false, false),
+            (LoaderComponentId::Quilt, "1.21.5", false, false),
+            (LoaderComponentId::Quilt, "26.3", true, false),
+            (LoaderComponentId::Quilt, "1.21.5", false, true),
         ] {
             let root = temp_dir(match component {
                 LoaderComponentId::Fabric => "fabric-reconstruction-parity",
@@ -1727,7 +1728,16 @@ mod tests {
                 expected_fresh.0 = 0;
             }
             let profile_server = TestByteServer::start(profile_bytes);
-            let proof_server = TestByteServer::start(proof_bytes);
+            let proof_server = if chained_integrity {
+                let sidecar = sha1_hex(&profile_exact).into_bytes();
+                let mut proof: serde_json::Value = serde_json::from_slice(&proof_bytes).unwrap();
+                for field in ["loader", "hashed"] {
+                    proof[field]["hashes"]["sha1"] = serde_json::json!(sha1_hex(&sidecar));
+                }
+                TestByteServer::start_with_sha1_proof(serde_json::to_vec(&proof).unwrap(), sidecar)
+            } else {
+                TestByteServer::start(proof_bytes)
+            };
             record.install_source = LoaderInstallSource::ProfileJson {
                 url: profile_server.url.clone(),
             };
@@ -1787,7 +1797,7 @@ mod tests {
                 version_server.request_count(),
                 client_server.request_count(),
                 profile_server.request_count(),
-                proof_server.request_count(),
+                proof_server.request_count_for("/legacy-client.zip"),
                 vanilla_exact_server.request_count(),
                 exact_server.request_count(),
                 incomplete_server.request_count(),
@@ -1808,7 +1818,10 @@ mod tests {
             assert_eq!(version_server.request_count(), request_counts.0 + 1);
             assert_eq!(client_server.request_count(), request_counts.1);
             assert_eq!(profile_server.request_count(), request_counts.2 + 1);
-            assert_eq!(proof_server.request_count(), request_counts.3 + 1);
+            assert_eq!(
+                proof_server.request_count_for("/legacy-client.zip"),
+                request_counts.3 + 1
+            );
             assert_eq!(vanilla_exact_server.request_count(), request_counts.4);
             assert_eq!(exact_server.request_count(), request_counts.5);
             assert_eq!(
@@ -1844,6 +1857,9 @@ mod tests {
             .expect("retain exact profile VersionBundle sources");
             assert!(version_bundle.retained_version_bundle_sources_match_projection());
             assert_eq!(snapshot_tree(&root), before);
+            if chained_integrity {
+                assert_eq!(proof_server.request_count(), 9);
+            }
 
             for server in [
                 client_server,
@@ -1989,7 +2005,8 @@ mod tests {
             }
             assert_eq!(library_server.request_count(), 0);
             assert_eq!(profile_server.request_count(), 2);
-            assert_eq!(proof_server.request_count(), 2);
+            assert_eq!(proof_server.request_count_for("/legacy-client.zip"), 2);
+            assert_eq!(proof_server.request_count(), 4);
             assert_eq!(version_server.request_count(), 2);
             assert_eq!(client_server.request_count(), 1);
             assert_eq!(snapshot_tree(&root), before);
@@ -3649,6 +3666,17 @@ printf '%s' 'processor-terminal' > "$last"
 
     #[tokio::test]
     async fn checksumless_quilt_install_writes_sealed_metadata_and_returns_sha1_receipt() {
+        quilt_install_seals_artifact_integrity(None).await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_quilt_sidecars_keep_artifact_hash_and_size_verification() {
+        for mode in ["valid", "wrong_hash", "wrong_size"] {
+            quilt_install_seals_artifact_integrity(Some(mode)).await;
+        }
+    }
+
+    async fn quilt_install_seals_artifact_integrity(proof_mode: Option<&str>) {
         let root = temp_dir("quilt-profile-sealed-write");
         fs::create_dir_all(&root).expect("create root");
         let mut record = profile_record();
@@ -3691,16 +3719,47 @@ printf '%s' 'processor-terminal' > "$last"
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
-        let proof = ProfileInstallProof::from_test(
-            profile_id,
-            record.minecraft_version.clone(),
-            "org.quiltmc.loader.impl.launch.knot.KnotClient".to_string(),
-            vec![ProfileLibraryProof::from_test(
-                coordinate.clone(),
-                None,
-                None,
-            )],
-        );
+        let proof_server = proof_mode.map(|mode| {
+            let sidecar = if mode == "wrong_hash" {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
+            } else {
+                sha1_hex(&library_bytes)
+            };
+            TestByteServer::start_with_sha1_proof(
+                serde_json::to_vec(&serde_json::json!({
+                    "loader": {
+                        "version": record.loader_version,
+                        "maven": coordinate,
+                        "file_size": library_bytes.len() + usize::from(mode == "wrong_size"),
+                        "hashes": {"sha1": sha1_hex(sidecar.as_bytes())}
+                    },
+                    "launcherMeta": {"mainClass": {
+                        "client": "org.quiltmc.loader.impl.launch.knot.KnotClient"
+                    }}
+                }))
+                .unwrap(),
+                sidecar.into_bytes(),
+            )
+        });
+        let proof = if let Some(server) = &proof_server {
+            crate::loaders::providers::fetch_profile_install_proof_from_url_for_test(
+                &record,
+                &server.url,
+            )
+            .await
+            .expect("authenticated sidecar proof")
+        } else {
+            ProfileInstallProof::from_test(
+                profile_id,
+                record.minecraft_version.clone(),
+                "org.quiltmc.loader.impl.launch.knot.KnotClient".to_string(),
+                vec![ProfileLibraryProof::from_test(
+                    coordinate.clone(),
+                    None,
+                    None,
+                )],
+            )
+        };
         write_base_version(&root, &record.minecraft_version);
         let base_path = versions_dir(&root)
             .join(&record.minecraft_version)
@@ -3713,15 +3772,30 @@ printf '%s' 'processor-terminal' > "$last"
         let base = test_authenticated_receipt(&root, &record.minecraft_version);
         let library_root = test_library_operation(&root);
 
-        let receipt = install_profile_source_after_authenticated_base(
+        let result = install_profile_source_after_authenticated_base(
             &library_root,
             &plan,
             test_loader_base_derivation(base),
             proof,
             &mut |_progress| {},
         )
-        .await
-        .expect("quilt profile install");
+        .await;
+        if matches!(proof_mode, Some("wrong_hash" | "wrong_size")) {
+            assert!(matches!(
+                result,
+                Err(LoaderError::ArtifactDownloadFailed { .. })
+            ));
+            assert_eq!(library_server.request_count(), 1);
+            assert!(!versions_dir(&root).join(&record.version_id).exists());
+            assert!(!root.join("libraries").join(&artifact_path).exists());
+            proof_server.unwrap().stop();
+            profile_server.stop();
+            library_server.stop();
+            drop(library_root);
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let receipt = result.expect("quilt profile install");
         let version_path = versions_dir(&root)
             .join(&record.version_id)
             .join(format!("{}.json", record.version_id));
@@ -3760,6 +3834,9 @@ printf '%s' 'processor-terminal' > "$last"
                 )
         }));
         assert_eq!(library_server.request_count(), 1);
+        if let Some(server) = proof_server {
+            server.stop();
+        }
         profile_server.stop();
         library_server.stop();
         let _ = fs::remove_dir_all(root);

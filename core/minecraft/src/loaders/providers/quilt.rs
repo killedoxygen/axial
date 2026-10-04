@@ -6,7 +6,7 @@ use crate::launch::{VersionJson, library_merge_key};
 use crate::lifecycle::LifecycleMeta;
 use crate::loaders::api::build_id_for;
 use crate::loaders::compose::LoaderProfileFragment;
-use crate::loaders::http::fetch_json;
+use crate::loaders::http::{fetch_bytes, fetch_json};
 use crate::loaders::types::{
     LoaderArtifactKind, LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId, LoaderError,
     LoaderGameVersion, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
@@ -15,6 +15,7 @@ use crate::loaders::types::{
 use crate::types::VersionSubjectKind;
 use crate::version_meta::MinecraftVersionMeta;
 use serde::Deserialize;
+use sha1::{Digest as _, Sha1};
 
 use super::{ProfileInstallProof, ProfileLibraryProof};
 
@@ -108,7 +109,8 @@ async fn fetch_profile_install_proof_from_url(
     url: &str,
 ) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
     let entry = fetch_json::<QuiltInstallEntry>(url).await?;
-    profile_install_proof_from_entry(record, url, entry)
+    let proof = profile_install_proof_from_entry(record, url, entry)?;
+    resolve_sidecar_integrity(record, proof).await
 }
 
 #[cfg(test)]
@@ -119,7 +121,103 @@ pub(super) async fn fetch_profile_install_proof_from_url_for_test(
     use crate::loaders::http::fetch_json_for_test;
 
     let entry = fetch_json_for_test::<QuiltInstallEntry>(url).await?;
-    profile_install_proof_from_entry(record, url, entry)
+    let proof = profile_install_proof_from_entry(record, url, entry)?;
+    resolve_sidecar_integrity(record, proof).await
+}
+
+async fn resolve_sidecar_integrity(
+    record: &LoaderBuildRecord,
+    mut proof: ProfileInstallProof,
+) -> Result<ProfileInstallProof, LoaderError> {
+    for library in &mut proof.required_libraries {
+        let Some(meta_sha1) = library.sha1.as_deref() else {
+            continue;
+        };
+        let url = sidecar_url(record, &library.coordinate)?;
+        let Ok(bytes) = fetch_sidecar(url, &proof.provider_url).await else {
+            continue;
+        };
+        // Quilt Meta can authenticate the raw Maven checksum body rather than the JAR.
+        // Unauthenticated responses never replace the original exact artifact pair.
+        if format!("{:x}", Sha1::digest(&bytes)) != meta_sha1 {
+            continue;
+        }
+        if bytes.len() != 40 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+            return Err(LoaderError::ProviderDataInvalid {
+                kind: crate::loaders::types::LoaderProviderFailureKind::SchemaInvalid,
+                status: None,
+            });
+        }
+        library.sha1 = Some(
+            String::from_utf8(bytes)
+                .expect("verified ASCII digest")
+                .to_ascii_lowercase(),
+        );
+    }
+    Ok(proof)
+}
+
+fn sidecar_url(record: &LoaderBuildRecord, coordinate: &str) -> Result<reqwest::Url, LoaderError> {
+    let (base, group, artifact, version) =
+        if coordinate == format!("org.quiltmc:quilt-loader:{}", record.loader_version) {
+            (
+                "https://maven.quiltmc.org/repository/release/",
+                ["org", "quiltmc"],
+                "quilt-loader",
+                record.loader_version.as_str(),
+            )
+        } else if coordinate == format!("org.quiltmc:hashed:{}", record.minecraft_version) {
+            (
+                "https://maven.quiltmc.org/repository/release/",
+                ["org", "quiltmc"],
+                "hashed",
+                record.minecraft_version.as_str(),
+            )
+        } else if coordinate == format!("net.fabricmc:intermediary:{}", record.minecraft_version) {
+            (
+                "https://maven.fabricmc.net/",
+                ["net", "fabricmc"],
+                "intermediary",
+                record.minecraft_version.as_str(),
+            )
+        } else {
+            return Err(LoaderError::ProviderDataInvalid {
+                kind: crate::loaders::types::LoaderProviderFailureKind::SchemaInvalid,
+                status: None,
+            });
+        };
+    if matches!(version, "." | "..") {
+        return Err(LoaderError::ProviderDataInvalid {
+            kind: crate::loaders::types::LoaderProviderFailureKind::SchemaInvalid,
+            status: None,
+        });
+    }
+    let mut url = reqwest::Url::parse(base).expect("fixed Maven repository");
+    url.path_segments_mut()
+        .expect("hierarchical Maven repository")
+        .pop_if_empty()
+        .extend([
+            group[0],
+            group[1],
+            artifact,
+            version,
+            &format!("{artifact}-{version}.jar.sha1"),
+        ]);
+    Ok(url)
+}
+
+async fn fetch_sidecar(url: reqwest::Url, _proof_url: &str) -> Result<Vec<u8>, LoaderError> {
+    #[cfg(test)]
+    if let Ok(mut fixture) = reqwest::Url::parse(_proof_url)
+        && fixture.scheme() == "http"
+        && matches!(fixture.host_str(), Some("127.0.0.1" | "[::1]"))
+    {
+        fixture.set_path(url.path());
+        fixture.set_query(None);
+        fixture.set_fragment(None);
+        return crate::loaders::http::fetch_bytes_for_test(fixture.as_str(), 40).await;
+    }
+    fetch_bytes(url.as_str(), 40).await
 }
 
 fn profile_install_proof_from_entry(
@@ -316,6 +414,235 @@ mod tests {
         LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
     };
     use crate::loaders::{build_id_for, installed_version_id_for};
+    use sha1::{Digest as _, Sha1};
+
+    const LOADER_SIDECAR: &str = "/repository/release/org/quiltmc/quilt-loader/0.31.0-beta.4/quilt-loader-0.31.0-beta.4.jar.sha1";
+    const HASHED_SIDECAR: &str = "/repository/release/org/quiltmc/hashed/26.3/hashed-26.3.jar.sha1";
+    const INTERMEDIARY_SIDECAR: &str = "/net/fabricmc/intermediary/26.3/intermediary-26.3.jar.sha1";
+
+    async fn fetch_fixture_proof(
+        record: &LoaderBuildRecord,
+        source: serde_json::Value,
+        sidecars: Vec<(&str, Vec<u8>)>,
+    ) -> (
+        Result<ProfileInstallProof, crate::loaders::types::LoaderError>,
+        Vec<String>,
+    ) {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/metadata", listener.local_addr().unwrap());
+        let mut routes = sidecars
+            .into_iter()
+            .map(|(path, body)| (path.to_owned(), body))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        routes.insert("/metadata".into(), serde_json::to_vec(&source).unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 512];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0 && request.len() + count <= 8192);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let path = std::str::from_utf8(&request)
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                observed.lock().unwrap().push(path.to_owned());
+                let (status, body) = routes.get(path).map_or(("404 Not Found", &[][..]), |body| {
+                    ("200 OK", body.as_slice())
+                });
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+        let proof = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::fetch_profile_install_proof_from_url_for_test(record, &url),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        let requests = requests.lock().unwrap().clone();
+        (proof.expect("bounded fixture proof retrieval"), requests)
+    }
+
+    #[tokio::test]
+    async fn live_profile_proof_authenticates_raw_sidecars_before_decoding() {
+        let mut source = metadata();
+        let mut sidecars = Vec::new();
+        for (field, path, body, size) in [
+            (
+                "loader",
+                LOADER_SIDECAR,
+                "2fa21d6438f63c8dd40f2e81290b0a09de1442b3",
+                42,
+            ),
+            (
+                "hashed",
+                HASHED_SIDECAR,
+                "2348B0EC7955C354ECB49F700B8A7B3F78E65A75",
+                43,
+            ),
+            (
+                "intermediary",
+                INTERMEDIARY_SIDECAR,
+                "cccccccccccccccccccccccccccccccccccccccc",
+                44,
+            ),
+        ] {
+            source[field]["hashes"] =
+                serde_json::json!({"sha1": format!("{:x}", Sha1::digest(body.as_bytes()))});
+            source[field]["file_size"] = serde_json::json!(size);
+            sidecars.push((path, body.as_bytes().to_vec()));
+        }
+        let (proof, requests) = fetch_fixture_proof(&record(), source, sidecars).await;
+        let proof = proof.unwrap();
+        for (required, expected) in proof.required_libraries().iter().zip([
+            ("2fa21d6438f63c8dd40f2e81290b0a09de1442b3", 42),
+            ("2348b0ec7955c354ecb49f700b8a7b3f78e65a75", 43),
+            ("cccccccccccccccccccccccccccccccccccccccc", 44),
+        ]) {
+            assert_eq!(required.exact_integrity(), Some(expected));
+        }
+        assert_eq!(
+            requests,
+            [
+                "/metadata",
+                LOADER_SIDECAR,
+                HASHED_SIDECAR,
+                INTERMEDIARY_SIDECAR
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_profile_proof_preserves_direct_pair_for_unauthenticated_sidecars() {
+        let raw = b"2fa21d6438f63c8dd40f2e81290b0a09de1442b3";
+        let meta = format!("{:x}", Sha1::digest(raw));
+        for body in [
+            None,
+            Some(vec![b'b'; 40]),
+            Some(raw.to_ascii_uppercase()),
+            Some([raw.as_slice(), b"\n"].concat()),
+            Some(vec![b'a'; 4096]),
+        ] {
+            let mut source = metadata();
+            source.as_object_mut().unwrap().remove("hashed");
+            source.as_object_mut().unwrap().remove("intermediary");
+            source["loader"]["hashes"]["sha1"] = serde_json::json!(meta);
+            let sidecars = body
+                .into_iter()
+                .map(|body| (LOADER_SIDECAR, body))
+                .collect();
+            let (proof, requests) = fetch_fixture_proof(&record(), source, sidecars).await;
+            assert_eq!(
+                proof.unwrap().required_libraries()[0].exact_integrity(),
+                Some((meta.as_str(), 42))
+            );
+            assert_eq!(requests, ["/metadata", LOADER_SIDECAR]);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_profile_proof_rejects_authenticated_non_hex_sidecar() {
+        let mut source = metadata();
+        let body = vec![b'z'; 40];
+        source["loader"]["hashes"]["sha1"] =
+            serde_json::json!(format!("{:x}", Sha1::digest(&body)));
+        let (proof, requests) =
+            fetch_fixture_proof(&record(), source, vec![(LOADER_SIDECAR, body)]).await;
+        assert!(matches!(
+            proof,
+            Err(crate::loaders::types::LoaderError::ProviderDataInvalid {
+                kind: crate::loaders::types::LoaderProviderFailureKind::SchemaInvalid,
+                status: None
+            })
+        ));
+        assert_eq!(requests, ["/metadata", LOADER_SIDECAR]);
+    }
+
+    #[tokio::test]
+    async fn live_profile_proof_does_not_fetch_sidecars_without_complete_integrity() {
+        for partial in [false, true] {
+            let mut source = metadata();
+            for field in ["loader", "hashed", "intermediary"] {
+                source[field]["hashes"] = serde_json::json!({});
+                source[field]["file_size"] = serde_json::json!(0);
+            }
+            if partial {
+                source["loader"]["file_size"] = serde_json::json!(42);
+            }
+            let (proof, requests) = fetch_fixture_proof(&record(), source, vec![]).await;
+            if partial {
+                assert!(proof.is_err());
+            } else {
+                assert!(
+                    proof
+                        .unwrap()
+                        .required_libraries()
+                        .iter()
+                        .all(|library| library.exact_integrity().is_none())
+                );
+            }
+            assert_eq!(requests, ["/metadata"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_profile_proof_keeps_version_data_in_canonical_url_segments() {
+        let mut record = record();
+        record.loader_version = "0.31/../escape?query#fragment".into();
+        let mut source = metadata();
+        source.as_object_mut().unwrap().remove("hashed");
+        source.as_object_mut().unwrap().remove("intermediary");
+        source["loader"]["version"] = serde_json::json!(record.loader_version);
+        source["loader"]["maven"] = serde_json::json!(format!(
+            "org.quiltmc:quilt-loader:{}",
+            record.loader_version
+        ));
+        let body = vec![b'a'; 40];
+        source["loader"]["hashes"]["sha1"] =
+            serde_json::json!(format!("{:x}", Sha1::digest(&body)));
+        let path = "/repository/release/org/quiltmc/quilt-loader/0.31%2F..%2Fescape%3Fquery%23fragment/quilt-loader-0.31%2F..%2Fescape%3Fquery%23fragment.jar.sha1";
+        let (proof, requests) = fetch_fixture_proof(&record, source, vec![(path, body)]).await;
+        assert_eq!(
+            proof.unwrap().required_libraries()[0].exact_integrity(),
+            Some(("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 42))
+        );
+        assert_eq!(requests, ["/metadata", path]);
+    }
+
+    #[tokio::test]
+    async fn live_profile_proof_rejects_dot_segment_sidecar_versions() {
+        for version in [".", ".."] {
+            let mut record = record();
+            record.loader_version = version.into();
+            let mut source = metadata();
+            source["loader"]["version"] = serde_json::json!(version);
+            source["loader"]["maven"] =
+                serde_json::json!(format!("org.quiltmc:quilt-loader:{version}"));
+            let (proof, requests) = fetch_fixture_proof(&record, source, vec![]).await;
+            assert!(proof.is_err());
+            assert_eq!(requests, ["/metadata"]);
+        }
+    }
 
     #[test]
     fn official_unobfuscated_install_metadata_decodes_without_mapping_entries() {
