@@ -2127,10 +2127,59 @@ mod tests {
         }).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    fn fixture_lease_holders(root: &std::path::Path) -> String {
+        use std::os::unix::fs::MetadataExt;
+
+        let lease = match std::fs::metadata(root.join(".axial-root.lease")) {
+            Ok(lease) => lease,
+            Err(error) => return format!("lease metadata unavailable: {:?}", error.kind()),
+        };
+        let (major, minor) = (
+            libc::major(lease.dev()) as u64,
+            libc::minor(lease.dev()) as u64,
+        );
+        let inode = lease.ino();
+        let fds = std::fs::read_dir("/proc/self/fd")
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        std::fs::metadata(entry.path()).is_ok_and(|metadata| {
+                            metadata.dev() == lease.dev() && metadata.ino() == inode
+                        })
+                    })
+                    .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+                    .take(16)
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| error.kind());
+        let locks = std::fs::read_to_string("/proc/locks")
+            .map(|text| {
+                text.lines()
+                    .filter(|line| {
+                        line.split_whitespace().any(|field| {
+                            let mut identity = field.split(':');
+                            u64::from_str_radix(identity.next().unwrap_or(""), 16) == Ok(major)
+                                && u64::from_str_radix(identity.next().unwrap_or(""), 16)
+                                    == Ok(minor)
+                                && identity.next().unwrap_or("").parse::<u64>() == Ok(inode)
+                                && identity.next().is_none()
+                        })
+                    })
+                    .take(16)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| error.kind());
+        format!("lease={major:x}:{minor:x}:{inode}; self_fds={fds:?}; locks={locks:?}")
+    }
+
     fn restart_service(
         root: &std::path::Path,
         library_id: crate::library::LibraryId,
         context: &str,
+        prior: Option<&crate::library::LibrarySnapshot>,
     ) -> PerformanceService {
         use crate::{
             instances::directory::Registry,
@@ -2140,6 +2189,13 @@ mod tests {
         };
         let library = match LibraryLifecycle::open_with_id(root, library_id) {
             LibraryOpenOutcome::Ready(library) => library,
+            LibraryOpenOutcome::NoEffect(axial_fs::RootSessionError::Busy) => {
+                #[cfg(target_os = "linux")]
+                let lease = fixture_lease_holders(root);
+                #[cfg(not(target_os = "linux"))]
+                let lease = "lease holder diagnostics unavailable on this platform";
+                panic!("restart fixture library busy ({context}); prior={prior:?}; {lease}");
+            }
             other => panic!("restart fixture library unavailable ({context}): {other:?}"),
         };
         let storage = Arc::new(MetadataStore::open(root.join("metadata.sqlite")).unwrap());
@@ -2181,7 +2237,7 @@ mod tests {
             &std::env::var("AXIAL_PERFORMANCE_PREPARED_LIBRARY").unwrap(),
         )
         .unwrap();
-        let service = restart_service(&root, library_id, "child preparation");
+        let service = restart_service(&root, library_id, "child preparation", None);
         let instances = InstanceService::new(service.instances.clone(), service.tasks.clone());
         let mut request = request("Prepared remove restart");
         request.selection_id = "fixture-fabric".into();
@@ -2369,6 +2425,7 @@ mod tests {
             root.path(),
             library_id,
             &format!("{entry}/{action}: first reopen after crash"),
+            None,
         );
         assert!(service.instances.admit(&pending.instance_id).is_err());
         let bound = service
@@ -2423,12 +2480,14 @@ mod tests {
         service.instances.admit(&pending.instance_id).unwrap();
         let files = payload_files(&path);
         service.instances.library().try_preserve().unwrap();
+        let prior = service.instances.library().snapshot();
         drop(service);
 
         let reopened = restart_service(
             root.path(),
             library_id,
             &format!("{entry}/{action}: second reopen after settlement"),
+            Some(&prior),
         );
         assert_eq!(reopened.recover_pending().await.unwrap(), 0);
         assert!(reopened.tasks.status().is_idle());
@@ -2513,7 +2572,7 @@ mod tests {
                     .unwrap();
             }
             drop(storage);
-            let service = restart_service(root.path(), library_id, phase);
+            let service = restart_service(root.path(), library_id, phase, None);
             let id = command.instance_id.parse().unwrap();
             let path = if phase == "planning" {
                 service
@@ -2686,7 +2745,7 @@ mod tests {
     async fn prepared_restart_cancellation_settles_but_unknown_leaf_state_stays_reserved() {
         for case in ["cancel", "changed_leaf"] {
             let (root, library_id) = prepared_crash_fixture("queued", "remove", "prepared").await;
-            let service = restart_service(root.path(), library_id, case);
+            let service = restart_service(root.path(), library_id, case, None);
             let pending = service.pending().unwrap().pop().unwrap();
             let instance = service
                 .retained
@@ -2801,7 +2860,7 @@ mod tests {
                 })
                 .unwrap();
             drop(storage);
-            let service = restart_service(root.path(), library_id, field);
+            let service = restart_service(root.path(), library_id, field, None);
             let pending = service.pending().unwrap().pop().unwrap();
             let path = service
                 .retained
