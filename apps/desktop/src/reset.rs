@@ -99,8 +99,8 @@ impl NativeReset {
             if state.requested {
                 return Ok(false);
             }
-            self.library
-                .ensure_no_interrupted_launch()
+            lifecycle
+                .ensure_reset_allowed()
                 .map_err(|_| PREFLIGHT_FAILED)?;
             if state.pin.is_none() {
                 state.pin = Some(
@@ -379,8 +379,9 @@ pub async fn app_reset(
 mod tests {
     use super::*;
     use crate::{discord_presence::PresenceObserver, native_skin::NativeSkinFiles};
-    use axial_app::library::AdmissionState;
+    use axial_app::library::{AdmissionState, LibraryMode};
     use axial_app::{
+        instances::model::{Instance, InstanceId, InstanceResult},
         launch::{coordinator::LaunchIntents, reports::LaunchReportStore},
         storage::StorageError,
     };
@@ -865,22 +866,171 @@ mod tests {
     #[tokio::test]
     async fn external_library_payload_survives_development_profile_reset() {
         let (temporary, services, lifecycle, reset) = fixture().await;
+        let root = services.profile_root.clone();
+        lifecycle.prepare_exit(TerminalIntent::Close).await.unwrap();
+        drop(reset);
+        drop(lifecycle);
+        drop(services);
         let external = temporary.path().join("external-library");
         std::fs::create_dir(&external).unwrap();
         std::fs::write(external.join("keep.txt"), b"external library").unwrap();
-        let mut switch = services.library.begin_switch().unwrap();
-        switch
-            .prepare_existing(&external, LibraryId::new())
+        let library_id = LibraryId::new();
+        std::fs::write(
+            root.join("library.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "mode": "existing",
+                "library_id": library_id.to_string(),
+                "path": external,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let services = axial_api::start_in_profile(root.clone(), None)
+            .await
             .unwrap();
-        switch.commit_after_persistence().unwrap();
+        let selected = services.library.snapshot().current.unwrap();
+        assert_eq!(selected.mode, LibraryMode::Existing);
+        assert_eq!(selected.library_id, library_id);
+        let lifecycle = lifecycle_for(&services).without_interface_preferences_for_test();
+        let reset = NativeReset::new(services.library.clone(), services.tasks.clone()).unwrap();
         reset.prepare(&lifecycle).await.unwrap();
         let mut pending = reset.take_after_exit().unwrap();
         drop(lifecycle);
         drop(services);
         pending.try_clear().unwrap();
+        assert!(!root.join("metadata.sqlite").exists());
+        assert!(!root.join("library.json").exists());
         assert_eq!(
             std::fs::read(external.join("keep.txt")).unwrap(),
             b"external library"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_external_creation_intent_blocks_reset_but_allows_close() {
+        let (temporary, services, lifecycle, reset) = fixture().await;
+        let root = services.profile_root.clone();
+        lifecycle.prepare_exit(TerminalIntent::Close).await.unwrap();
+        drop(reset);
+        drop(lifecycle);
+        drop(services);
+        let external = temporary.path().join("external-library");
+        std::fs::create_dir(&external).unwrap();
+        let library_id = LibraryId::new();
+        let selection = serde_json::to_vec(&serde_json::json!({
+            "mode": "existing",
+            "library_id": library_id.to_string(),
+            "path": external,
+        }))
+        .unwrap();
+        std::fs::write(root.join("library.json"), &selection).unwrap();
+        let services = axial_api::start_in_profile(root.clone(), None)
+            .await
+            .unwrap();
+        let id = InstanceId::new();
+        let stage_name = format!("stage-{id}");
+        let instance = Instance {
+            id: id.clone(),
+            name: "Pending external creation".into(),
+            version_id: "1.21.4".into(),
+            created_at: "2026-10-04T00:00:00Z".into(),
+            last_played_at: String::new(),
+            art_seed: 0,
+            settings: Default::default(),
+            icon: String::new(),
+            accent: String::new(),
+            loader_key: "vanilla".into(),
+            minecraft_version: "1.21.4".into(),
+            revision: 0,
+        };
+        let record = {
+            let pin = services.library.admit().unwrap();
+            let _lease = services
+                .instances
+                .directories()
+                .exclusions()
+                .try_acquire([id.as_str()], [])
+                .unwrap();
+            let registry = services.instances.registry();
+            registry
+                .storage()
+                .transaction(|tx| -> InstanceResult<_> {
+                    let record = registry.reserve(tx, instance, &pin.library_id().to_string())?;
+                    let payload = serde_json::to_string(&record).unwrap();
+                    tx.execute(
+                        "INSERT INTO instance_creations(instance_id,record_json,stage_name,phase)
+                     VALUES(?1,?2,?3,'building')",
+                        axial_app::storage::rusqlite::params![id.as_str(), payload, stage_name],
+                    )?;
+                    Ok(record)
+                })
+                .unwrap()
+        };
+        // Persist the building boundary explicitly; this is not a simulated
+        // interruption of InstanceService::create.
+        let stage = external.join("instances").join(&stage_name);
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("keep.txt"), b"unreceipted creation payload").unwrap();
+        services.server.shutdown().await.unwrap();
+        drop(services);
+        let disconnected = temporary.path().join("disconnected-library");
+        std::fs::rename(&external, &disconnected).unwrap();
+
+        let services = axial_api::start_in_profile(root.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            services.library.snapshot().admission,
+            AdmissionState::Unavailable
+        );
+        assert!(!services.instances.has_unsettled_effects());
+        assert!(services.instances.has_pending_intents());
+        let lifecycle = lifecycle_for(&services);
+        let mut events = lifecycle.interface_preferences_events();
+        let mut direct = tokio::spawn({
+            let lifecycle = lifecycle.clone();
+            async move { lifecycle.prepare_exit(TerminalIntent::Reset).await }
+        });
+        let (refused, preferences_requested) = tokio::select! {
+            result = &mut direct => (result.unwrap(), false),
+            _ = events.changed() => {
+                let event = events.borrow_and_update().clone().unwrap();
+                lifecycle.interface_preferences_delivery_failed(&event);
+                (direct.await.unwrap(), true)
+            }
+        };
+        assert!(refused.is_err());
+        assert!(!preferences_requested);
+        let lifecycle = lifecycle.without_interface_preferences_for_test();
+        let reset = NativeReset::new(services.library.clone(), services.tasks.clone()).unwrap();
+        assert_eq!(
+            reset.prepare(&lifecycle).await,
+            Err(PREFLIGHT_FAILED.into())
+        );
+        assert!(reset.state.lock().unwrap().pin.is_none());
+        assert!(!services.tasks.status().closing);
+        assert!(!services.server.is_shutdown_settled());
+        assert!(reset.take_after_exit().is_none());
+        lifecycle.prepare_exit(TerminalIntent::Close).await.unwrap();
+        assert!(services.server.is_shutdown_settled());
+        assert_eq!(
+            services.instances.registry().get_record(&id).unwrap(),
+            record
+        );
+        let pending = services.instances.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].instance_id, id);
+        assert_eq!(pending[0].phase, "building");
+        assert_eq!(std::fs::read(root.join("library.json")).unwrap(), selection);
+        assert_eq!(
+            std::fs::read(
+                disconnected
+                    .join("instances")
+                    .join(stage_name)
+                    .join("keep.txt")
+            )
+            .unwrap(),
+            b"unreceipted creation payload"
         );
     }
 

@@ -36,6 +36,56 @@ const INTERRUPTED_CHILD_BENCHMARK: &str = "AXIAL_TEST_INTERRUPTED_GAME_BENCHMARK
 const INTERRUPTED_CLEANUP_PORT: &str = "AXIAL_TEST_INTERRUPTED_GAME_CLEANUP_PORT";
 const INTERRUPTED_CLEANUP_TOKEN: &str = "AXIAL_TEST_INTERRUPTED_GAME_CLEANUP_TOKEN";
 const INTERRUPTED_CHILD_EXIT: i32 = 75;
+const EXTERNAL_CANARY: &[u8] = b"external user file survives launch and profile reopen";
+
+fn configure_external(profile: &std::path::Path) -> (axial_app::library::LibraryId, PathBuf) {
+    let admitted = super::admit_profile(profile).unwrap();
+    let external = admitted.root.parent().unwrap().join("external");
+    std::fs::create_dir(&external).unwrap();
+    let external = std::fs::canonicalize(external).unwrap();
+    std::fs::write(external.join("user-canary.bin"), EXTERNAL_CANARY).unwrap();
+    let library_id = axial_app::library::LibraryId::new();
+    std::fs::write(
+        admitted.root.join("library.json"),
+        serde_json::to_vec(&json!({
+            "mode":"existing", "library_id":library_id.to_string(), "path":external,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    (library_id, external)
+}
+
+fn assert_external_library(
+    services: &DesktopServices,
+    profile: &std::path::Path,
+    selection: &(axial_app::library::LibraryId, PathBuf),
+) {
+    let (id, external) = selection;
+    let pin = services.library.admit().unwrap();
+    assert_eq!(pin.library_id(), *id);
+    assert_eq!(pin.read_projection().unwrap(), *external);
+    assert_eq!(
+        services.library.snapshot().current.unwrap().mode,
+        axial_app::library::LibraryMode::Existing
+    );
+    assert_eq!(
+        services
+            .library
+            .admit_application_root()
+            .unwrap()
+            .read_projection()
+            .unwrap(),
+        profile
+    );
+    let runtime = services.installs.runtime_cache().root();
+    assert!(runtime.starts_with(profile));
+    assert!(!runtime.starts_with(external));
+    assert_eq!(
+        std::fs::read(external.join("user-canary.bin")).unwrap(),
+        EXTERNAL_CANARY
+    );
+}
 
 fn sha1(bytes: &[u8]) -> String {
     format!("{:x}", Sha1::digest(bytes))
@@ -1346,25 +1396,34 @@ async fn ping_fixture_channels(channels: &mut [tokio::net::TcpStream]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_interrupted_launch_preserves_quit_and_restores_fences() {
-    interrupted_launch_preservation_journey(false).await;
+    interrupted_launch_preservation_journey(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_external_interrupted_launch_preserves_quit_and_restores_fences() {
+    interrupted_launch_preservation_journey(false, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_interrupted_benchmark_driver_does_not_repeat_unknown_session() {
-    interrupted_launch_preservation_journey(true).await;
+    interrupted_launch_preservation_journey(true, false).await;
 }
 
-async fn interrupted_launch_preservation_journey(benchmark: bool) {
+async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool) {
     use std::process::Stdio;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
+    let external = existing.then(|| configure_external(&profile));
     let provider = Provider::start(false).await;
     let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
         .await
         .unwrap();
+    if let Some(selection) = &external {
+        assert_external_library(&services, &profile, selection);
+    }
     let api = Api::new(&services);
     api.post(
         "/api/v1/accounts/offline",
@@ -1509,6 +1568,13 @@ async fn interrupted_launch_preservation_journey(benchmark: bool) {
         )
     };
     let accepted: Value = serde_json::from_slice(&payload).unwrap();
+    if let Some((id, _)) = &external {
+        assert_eq!(accepted["binding"]["library_id"], id.to_string());
+        assert_ne!(
+            accepted["binding"]["library_root"],
+            accepted["binding"]["application_root"]
+        );
+    }
     if !benchmark {
         assert_eq!(accepted["request"]["intent_key"], intent);
     }
@@ -1530,6 +1596,9 @@ async fn interrupted_launch_preservation_journey(benchmark: bool) {
 
     for _ in 0..2 {
         let reopened = start_in_profile(profile.clone(), None).await.unwrap();
+        if let Some(selection) = &external {
+            assert_external_library(&reopened, &profile, selection);
+        }
         let api = Api::new(&reopened);
         ping_fixture_channels(&mut channels).await;
         let status = api.get(&format!("/api/v1/launch/intents/{intent}")).await;
@@ -1642,6 +1711,12 @@ async fn interrupted_launch_preservation_journey(benchmark: bool) {
         assert!(reopened.server.is_shutdown_settled());
         ping_fixture_channels(&mut channels).await;
         drop(reopened);
+        if let Some((_, root)) = &external {
+            assert_eq!(
+                std::fs::read(root.join("user-canary.bin")).unwrap(),
+                EXTERNAL_CANARY
+            );
+        }
     }
 
     // Only the test closes its channels. This cannot mint an application proof.
@@ -1659,6 +1734,12 @@ async fn interrupted_launch_preservation_journey(benchmark: bool) {
     assert_eq!(unobserved_intent_payload(&storage, &intent), payload);
     for (path, bytes) in &native_files {
         assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
+    if let Some((_, root)) = &external {
+        assert_eq!(
+            std::fs::read(root.join("user-canary.bin")).unwrap(),
+            EXTERNAL_CANARY
+        );
     }
 }
 
@@ -2210,13 +2291,26 @@ async fn observed_settlement_crash_helper() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_offline_vanilla_install_launch_stop_and_restart() {
+    offline_vanilla_journey(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_external_offline_vanilla_install_launch_stop_and_restart() {
+    offline_vanilla_journey(true).await;
+}
+
+async fn offline_vanilla_journey(existing: bool) {
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
+    let external = existing.then(|| configure_external(&profile));
     let provider = Provider::start(false).await;
     let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
         .await
         .unwrap();
+    if let Some(selection) = &external {
+        assert_external_library(&services, &profile, selection);
+    }
     let api = Api::new(&services);
     assert_installed(&api, false).await;
     let account = api
@@ -2306,7 +2400,10 @@ async fn real_offline_vanilla_install_launch_stop_and_restart() {
     provider.shutdown().await;
 
     // No endpoint hook, live provider, injected ready state, or Java override.
-    let reopened = start_in_profile(profile, None).await.unwrap();
+    let reopened = start_in_profile(profile.clone(), None).await.unwrap();
+    if let Some(selection) = &external {
+        assert_external_library(&reopened, &profile, selection);
+    }
     let restarted_api = Api::new(&reopened);
     assert_ne!(api.capability, restarted_api.capability);
     assert_installed(&restarted_api, true).await;
@@ -2325,6 +2422,12 @@ async fn real_offline_vanilla_install_launch_stop_and_restart() {
     );
     reopened.server.shutdown().await.unwrap();
     assert!(reopened.server.is_shutdown_settled());
+    if let Some((_, root)) = &external {
+        assert_eq!(
+            std::fs::read(root.join("user-canary.bin")).unwrap(),
+            EXTERNAL_CANARY
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

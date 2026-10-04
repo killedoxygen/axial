@@ -18,10 +18,45 @@ use axial_fs::{
     RootSessionError,
 };
 use axial_minecraft::managed_path::{ManagedLibraryOperation, ManagedLibraryRoot};
+use serde::Deserialize;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::files::ScopedDirectory;
+
+const STARTUP_SELECTION_FILE: &str = "library.json";
+const MAX_STARTUP_SELECTION_BYTES: u64 = 16 << 10;
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum StartupSelection {
+    Managed {},
+    Existing { library_id: Uuid, path: PathBuf },
+}
+
+impl StartupSelection {
+    fn read(pin: &ApplicationRootPin) -> Result<Self, LibraryError> {
+        let name = axial_fs::LeafName::new(STARTUP_SELECTION_FILE).expect("fixed selection file");
+        let file = match pin.directory()?.open_file(&name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                pin.revalidate()?;
+                return Ok(Self::Managed {});
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let revision = file.revision()?;
+        if revision.size() > MAX_STARTUP_SELECTION_BYTES {
+            return Err(LibraryError::InvalidSelection("file exceeds 16 KiB"));
+        }
+        file.validate_revision(&revision)?;
+        let bytes = file.read_bounded(MAX_STARTUP_SELECTION_BYTES)?;
+        file.validate_revision(&revision)?;
+        pin.revalidate()?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| LibraryError::InvalidSelection("invalid JSON or selection fields"))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GenerationId(u64);
@@ -98,6 +133,8 @@ pub enum LibraryError {
     RetirementPending,
     #[error("library authority is unavailable")]
     Unavailable,
+    #[error("saved library selection is invalid: {0}")]
+    InvalidSelection(&'static str),
     #[error("library generation changed")]
     StaleGeneration,
     #[error("library generation limit reached")]
@@ -547,6 +584,88 @@ impl LibraryLifecycle {
                 changed,
             }),
         }
+    }
+
+    /// Restore the current application's private selection before constructing
+    /// library consumers or replaying their recovery. An unavailable external
+    /// root leaves application services usable without granting library access.
+    pub fn restore_startup_selection(
+        &self,
+        managed_library_id: LibraryId,
+    ) -> Result<(), LibraryError> {
+        let mut change = self.begin_switch()?;
+        let revision = change.revision;
+        {
+            let mut state = lock(&self.inner.state);
+            if state.admission != AdmissionState::Changing
+                || state.revision.checked_add(1) != Some(revision)
+            {
+                return Err(LibraryError::StaleGeneration);
+            }
+            if let Some(current) = state.current.take() {
+                state.retiring.push(current);
+            }
+            change.previous_admission = AdmissionState::Unavailable;
+        }
+        if managed_library_id.0.is_nil() {
+            return Err(LibraryError::InvalidSelection("managed identity is nil"));
+        }
+        let selection = StartupSelection::read(&change._application_pin)?;
+        let external = matches!(selection, StartupSelection::Existing { .. });
+        let prepared = match selection {
+            StartupSelection::Managed {} => change.prepare_managed(managed_library_id),
+            StartupSelection::Existing { library_id, path } => {
+                if library_id.is_nil() || library_id == managed_library_id.0 {
+                    return Err(LibraryError::InvalidSelection(
+                        "external identity must be nonnil and distinct from the profile",
+                    ));
+                }
+                if !path.is_absolute()
+                    || path.as_os_str().as_encoded_bytes().contains(&0)
+                    || path.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::CurDir | std::path::Component::ParentDir
+                        )
+                    })
+                {
+                    return Err(LibraryError::InvalidSelection(
+                        "external path must be absolute without relative components",
+                    ));
+                }
+                change.prepare_existing(&path, LibraryId(library_id))
+            }
+        };
+        let result = match prepared {
+            Ok(()) => change.commit_after_persistence().map(|_| ()),
+            Err(error) => {
+                drop(change);
+                Err(error)
+            }
+        };
+        if let Err(error) = result {
+            let unavailable = match &error {
+                LibraryError::Files(error) => error.kind() != io::ErrorKind::InvalidInput,
+                LibraryError::Root(_) => true,
+                _ => false,
+            };
+            if !external || !unavailable {
+                return Err(error);
+            }
+            let mut state = lock(&self.inner.state);
+            if state.admission != AdmissionState::Unavailable
+                || (state.revision != revision && state.revision.checked_add(1) != Some(revision))
+            {
+                return Err(error);
+            }
+            if let Some(current) = state.current.take() {
+                state.retiring.push(current);
+            }
+        }
+        if !self.collect_retired() {
+            return Err(LibraryError::RetirementPending);
+        }
+        Ok(())
     }
 
     /// Admission and pin creation linearize under the same short mutex.
@@ -1071,6 +1190,249 @@ mod tests {
             owner.revoke_application_root().unwrap(),
             RootRevokeOutcome::Revoked
         ));
+    }
+
+    fn save_existing(application: &Path, external: &Path, library_id: LibraryId) {
+        std::fs::write(
+            application.join("library.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "mode": "existing",
+                "library_id": library_id.to_string(),
+                "path": external,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn startup_absent_or_explicit_managed_selection_uses_the_profile_identity() {
+        for selection in [None, Some(br#"{"mode":"managed"}"#.as_slice())] {
+            let application = temporary();
+            if let Some(selection) = selection {
+                std::fs::write(application.path().join("library.json"), selection).unwrap();
+            }
+            let owner = open(application.path());
+            let managed_id = owner.snapshot().current.unwrap().library_id;
+            owner.restore_startup_selection(managed_id).unwrap();
+            let current = owner.snapshot().current.unwrap();
+            assert_eq!(current.mode, LibraryMode::Managed);
+            assert_eq!(current.library_id, managed_id);
+            assert_eq!(
+                owner.admit().unwrap().read_projection().unwrap(),
+                application.path()
+            );
+            revoke(&owner);
+        }
+    }
+
+    #[test]
+    fn startup_external_selection_keeps_identity_and_separate_application_root_on_reopen() {
+        let application = temporary();
+        let external = temporary();
+        let external_id = LibraryId::new();
+        save_existing(application.path(), external.path(), external_id);
+        std::fs::write(external.path().join("user-file.txt"), b"untouched").unwrap();
+        for _ in 0..2 {
+            let owner = open(application.path());
+            let managed_id = owner.snapshot().current.unwrap().library_id;
+            owner.restore_startup_selection(managed_id).unwrap();
+            let pin = owner.admit().unwrap();
+            assert_eq!(pin.library_id(), external_id);
+            assert_eq!(pin.read_projection().unwrap(), external.path());
+            assert_eq!(
+                owner.snapshot().current.unwrap().mode,
+                LibraryMode::Existing
+            );
+            let app = owner.admit_application_root().unwrap();
+            assert_eq!(app.read_projection().unwrap(), application.path());
+            drop((pin, app));
+            owner.try_preserve().unwrap();
+            let independent = open(external.path());
+            revoke(&independent);
+        }
+        assert_eq!(
+            std::fs::read(external.path().join("user-file.txt")).unwrap(),
+            b"untouched"
+        );
+    }
+
+    #[test]
+    fn startup_missing_external_root_is_unavailable_without_creation_or_managed_fallback() {
+        let application = temporary();
+        let external = temporary();
+        let missing = external.path().join("absent").join("library");
+        save_existing(application.path(), &missing, LibraryId::new());
+        let owner = open(application.path());
+        let managed_id = owner.snapshot().current.unwrap().library_id;
+        owner.restore_startup_selection(managed_id).unwrap();
+        assert_eq!(owner.snapshot().admission, AdmissionState::Unavailable);
+        assert!(owner.snapshot().current.is_none());
+        assert!(owner.snapshot().retiring.is_empty());
+        assert!(matches!(owner.admit(), Err(LibraryError::Unavailable)));
+        assert!(!external.path().join("absent").exists());
+        let app = owner.admit_application_root().unwrap();
+        app.revalidate().unwrap();
+        let runtime = owner.runtime_cache().unwrap();
+        runtime.settle().unwrap();
+        drop((app, runtime));
+        owner.try_preserve().unwrap();
+        let reopened = open(application.path());
+        revoke(&reopened);
+    }
+
+    #[test]
+    fn startup_rejects_invalid_selection_without_fallback() {
+        let application = temporary();
+        let managed_id = LibraryId::new();
+        let external_id = LibraryId::new();
+        let existing = |library_id: String, path: serde_json::Value| {
+            serde_json::to_vec(&serde_json::json!({
+                "mode": "existing", "library_id": library_id, "path": path,
+            }))
+            .unwrap()
+        };
+        let cases = [
+            b"{".to_vec(),
+            br#"{"mode":"other"}"#.to_vec(),
+            br#"{"mode":"managed","path":"ignored"}"#.to_vec(),
+            br#"{"mode":"existing"}"#.to_vec(),
+            existing("invalid".into(), serde_json::json!(application.path())),
+            existing(
+                Uuid::nil().to_string(),
+                serde_json::json!(application.path()),
+            ),
+            existing(
+                managed_id.to_string(),
+                serde_json::json!(application.path()),
+            ),
+            existing(external_id.to_string(), serde_json::json!(17)),
+            existing(external_id.to_string(), serde_json::json!("/invalid\0path")),
+            existing(
+                external_id.to_string(),
+                serde_json::json!("relative/library"),
+            ),
+            existing(
+                external_id.to_string(),
+                serde_json::json!(application.path().join("..")),
+            ),
+            vec![b' '; MAX_STARTUP_SELECTION_BYTES as usize + 1],
+        ];
+        for bytes in cases {
+            std::fs::write(application.path().join("library.json"), bytes).unwrap();
+            let owner = open(application.path());
+            assert!(matches!(
+                owner.restore_startup_selection(managed_id),
+                Err(LibraryError::InvalidSelection(_))
+            ));
+            assert_eq!(owner.snapshot().admission, AdmissionState::Unavailable);
+            assert!(owner.snapshot().current.is_none());
+            assert!(matches!(owner.admit(), Err(LibraryError::Unavailable)));
+            owner.try_preserve().unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_selection_file_must_be_regular_and_unaliased() {
+        for hard_link in [false, true] {
+            let application = temporary();
+            let path = application.path().join("library.json");
+            if hard_link {
+                let original = application.path().join("original.json");
+                std::fs::write(&original, br#"{"mode":"managed"}"#).unwrap();
+                std::fs::hard_link(original, &path).unwrap();
+            } else {
+                std::fs::create_dir(&path).unwrap();
+            }
+            let owner = open(application.path());
+            let managed_id = owner.snapshot().current.unwrap().library_id;
+            assert!(matches!(
+                owner.restore_startup_selection(managed_id),
+                Err(LibraryError::Files(_))
+            ));
+            assert!(owner.snapshot().current.is_none());
+            owner.try_preserve().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_selection_file_rejects_symlinks_including_dangling_links() {
+        for dangling in [false, true] {
+            let application = temporary();
+            let target = application.path().join("target.json");
+            if !dangling {
+                std::fs::write(&target, br#"{"mode":"managed"}"#).unwrap();
+            }
+            std::os::unix::fs::symlink(&target, application.path().join("library.json")).unwrap();
+            let owner = open(application.path());
+            let managed_id = owner.snapshot().current.unwrap().library_id;
+            assert!(matches!(
+                owner.restore_startup_selection(managed_id),
+                Err(LibraryError::Files(_))
+            ));
+            assert!(owner.snapshot().current.is_none());
+            owner.try_preserve().unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_external_selection_rejects_application_root() {
+        let application = temporary();
+        save_existing(application.path(), application.path(), LibraryId::new());
+        let owner = open(application.path());
+        let managed_id = owner.snapshot().current.unwrap().library_id;
+        assert!(matches!(
+            owner.restore_startup_selection(managed_id),
+            Err(LibraryError::InsideApplicationRoot)
+        ));
+        assert!(owner.snapshot().current.is_none());
+        owner.try_preserve().unwrap();
+    }
+
+    #[test]
+    fn startup_selection_retains_existing_pins_until_retirement() {
+        let application = temporary();
+        let external = temporary();
+        save_existing(application.path(), external.path(), LibraryId::new());
+        let owner = open(application.path());
+        let pin = owner.admit().unwrap();
+        assert!(matches!(
+            owner.restore_startup_selection(pin.library_id()),
+            Err(LibraryError::RetirementPending)
+        ));
+        pin.revalidate().unwrap();
+        assert_eq!(owner.snapshot().retiring[0].generation, pin.generation());
+        drop(pin);
+        assert!(owner.collect_retired());
+        owner.try_preserve().unwrap();
+    }
+
+    #[test]
+    fn startup_external_selection_reset_clears_only_the_application_root() {
+        let application = temporary();
+        let external = temporary();
+        save_existing(application.path(), external.path(), LibraryId::new());
+        std::fs::write(external.path().join("user-file.txt"), b"untouched").unwrap();
+        let owner = open(application.path());
+        let managed_id = owner.snapshot().current.unwrap().library_id;
+        owner.restore_startup_selection(managed_id).unwrap();
+        owner.close_admission();
+        let authority = match owner.begin_root_reset().unwrap() {
+            axial_fs::ResetStartOutcome::Ready(authority) => authority,
+            outcome => panic!("unexpected reset outcome: {outcome:?}"),
+        };
+        match authority.clear_root() {
+            axial_fs::RootClearOutcome::Cleared(receipt) => assert!(receipt.release().is_ok()),
+            outcome => panic!("unexpected clear outcome: {outcome:?}"),
+        }
+        assert!(!application.path().join("library.json").exists());
+        assert_eq!(
+            std::fs::read(external.path().join("user-file.txt")).unwrap(),
+            b"untouched"
+        );
+        let reopened = open(external.path());
+        revoke(&reopened);
     }
 
     #[test]

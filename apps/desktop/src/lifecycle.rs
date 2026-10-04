@@ -117,6 +117,10 @@ impl DesktopLifecycle {
             .ok_or_else(|| SHUTDOWN_INCOMPLETE.to_string())
     }
 
+    pub(crate) fn ensure_reset_allowed(&self) -> TerminalResult {
+        self.retained_services()?.server.ensure_reset_allowed()
+    }
+
     /// Tauri plugins and late IPC resolvers can retain managed facades after
     /// run_return. Release this shared payload only after actual shutdown joins;
     /// accepted effects keep their own strong captures until they return.
@@ -252,6 +256,14 @@ impl DesktopLifecycle {
                 state.intent = Some(TerminalIntent::Restart);
                 state.prepared = false;
             }
+            if intent == TerminalIntent::Close
+                && state.intent == Some(TerminalIntent::Reset)
+                && state.admitted
+                && !state.prepared
+                && state.active.is_none()
+            {
+                state.intent = Some(TerminalIntent::Close);
+            }
             match state.intent {
                 Some(active) if active != intent => return Err(TERMINAL_CONFLICT.into()),
                 // Reserve before any renderer/skin await. Same-intent callers
@@ -301,7 +313,9 @@ impl DesktopLifecycle {
             .unwrap_or_else(|error| error.into_inner())
             .admitted;
         if !admitted {
-            if intent != TerminalIntent::Close {
+            if intent == TerminalIntent::Reset {
+                services.server.ensure_reset_allowed()?;
+            } else if intent != TerminalIntent::Close {
                 services.server.ensure_no_interrupted_launch()?;
             }
             self.prepare_interface_preferences(intent).await?;
@@ -334,7 +348,11 @@ impl DesktopLifecycle {
             self.close_native_admission();
         }
         self.settle(&services, intent != TerminalIntent::Update)
-            .await
+            .await?;
+        if intent == TerminalIntent::Reset {
+            services.server.ensure_reset_allowed()?;
+        }
+        Ok(())
     }
 
     async fn prepare_interface_preferences(&self, intent: TerminalIntent) -> TerminalResult {
@@ -1105,6 +1123,126 @@ mod tests {
         reset.await.unwrap().unwrap();
         work.join().await.unwrap();
         assert!(lifecycle.tasks.shutdown_receipt().is_some());
+        assert_eq!(
+            lifecycle.prepare_exit(TerminalIntent::Close).await,
+            Err(TERMINAL_CONFLICT.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_rechecks_instance_intents_after_preferences_and_shutdown() {
+        use axial_app::instances::model::{Instance, InstanceId, InstanceResult};
+
+        let temporary =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let root = temporary.path().join("rewrite");
+        let services = axial_api::start_in_profile(root.clone(), None)
+            .await
+            .unwrap();
+        let lifecycle = DesktopLifecycle::new(
+            services.tasks.clone(),
+            services.server.clone(),
+            PresenceObserver::disabled_for_test(),
+            NativeSkinFiles::new(services.library.clone(), services.tasks.clone()),
+            services.skins.clone(),
+        );
+        let mut events = lifecycle.interface_preferences_events();
+        let reset = start_terminal(&lifecycle, TerminalIntent::Reset);
+        let request = preference_event(&mut events).await;
+        assert_eq!(request.phase, InterfacePreferencesPhase::Discard);
+        assert!(!services.instances.has_pending_intents());
+        assert!(!services.tasks.status().closing);
+        assert_eq!(
+            lifecycle.prepare_exit(TerminalIntent::Close).await,
+            Err(TERMINAL_CONFLICT.into())
+        );
+
+        let id = InstanceId::new();
+        let stage_name = format!("stage-{id}");
+        let instance = Instance {
+            id: id.clone(),
+            name: "Pending during reset".into(),
+            version_id: "1.21.4".into(),
+            created_at: "2026-10-04T00:00:00Z".into(),
+            last_played_at: String::new(),
+            art_seed: 0,
+            settings: Default::default(),
+            icon: String::new(),
+            accent: String::new(),
+            loader_key: "vanilla".into(),
+            minecraft_version: "1.21.4".into(),
+            revision: 0,
+        };
+        let (record, stage) = {
+            let pin = services.library.admit().unwrap();
+            let _lease = services
+                .instances
+                .directories()
+                .exclusions()
+                .try_acquire([id.as_str()], [])
+                .unwrap();
+            let registry = services.instances.registry();
+            // Author the persisted building boundary; no create interruption is simulated.
+            let record = registry
+                .storage()
+                .transaction(|tx| -> InstanceResult<_> {
+                    let record = registry.reserve(tx, instance, &pin.library_id().to_string())?;
+                    let payload = serde_json::to_string(&record).unwrap();
+                    tx.execute(
+                        "INSERT INTO instance_creations(instance_id,record_json,stage_name,phase)
+                     VALUES(?1,?2,?3,'building')",
+                        axial_app::storage::rusqlite::params![id.as_str(), payload, stage_name],
+                    )?;
+                    Ok(record)
+                })
+                .unwrap();
+            let stage = pin
+                .read_projection()
+                .unwrap()
+                .join("instances")
+                .join(stage_name);
+            std::fs::create_dir_all(&stage).unwrap();
+            std::fs::write(stage.join("keep.txt"), b"pending creation payload").unwrap();
+            (record, stage)
+        };
+        lifecycle
+            .complete_interface_preferences(&request.request_id, true)
+            .unwrap();
+        assert!(reset.await.unwrap().is_err());
+        assert!(lifecycle.tasks.shutdown_receipt().is_some());
+        assert!(services.server.is_shutdown_settled());
+        assert!(lifecycle.terminal.lock().unwrap().admitted);
+        assert!(!lifecycle.terminal.lock().unwrap().prepared);
+        assert!(!lifecycle.exit_allowed());
+        assert!(!services.instances.has_unsettled_effects());
+        assert!(services.instances.has_pending_intents());
+        assert_eq!(
+            lifecycle.prepare_exit(TerminalIntent::Restart).await,
+            Err(TERMINAL_CONFLICT.into())
+        );
+        lifecycle.prepare_exit(TerminalIntent::Close).await.unwrap();
+        assert_eq!(
+            lifecycle.terminal.lock().unwrap().intent,
+            Some(TerminalIntent::Close)
+        );
+        assert!(lifecycle.terminal.lock().unwrap().prepared);
+        lifecycle.allow_exit();
+        assert!(lifecycle.exit_allowed());
+        assert!(!lifecycle.restart_after_exit());
+        assert_eq!(
+            services.instances.registry().get_record(&id).unwrap(),
+            record
+        );
+        let pending = services.instances.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].instance_id, id);
+        assert_eq!(pending[0].phase, "building");
+        assert!(root.join("metadata.sqlite").exists());
+        assert!(!root.join(".axial-reset-intent").exists());
+        assert_eq!(
+            std::fs::read(stage.join("keep.txt")).unwrap(),
+            b"pending creation payload"
+        );
     }
 
     #[tokio::test]

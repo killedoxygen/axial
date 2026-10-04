@@ -5,6 +5,8 @@ pub mod events;
 mod frontend;
 #[cfg(test)]
 mod frontend_build_support;
+#[cfg(test)]
+mod library_tests;
 #[cfg(all(test, unix))]
 mod offline_journey_tests;
 mod open_folder;
@@ -243,6 +245,14 @@ impl ServerHandle {
             "A previous game process has not been proven settled. The local API remains available."
                 .to_string()
         })
+    }
+
+    pub fn ensure_reset_allowed(&self) -> Result<(), String> {
+        self.ensure_no_interrupted_launch()?;
+        if self.instances.has_pending_intents() {
+            return Err("Reset is blocked while instance changes still require recovery.".into());
+        }
+        Ok(())
     }
 
     /// Dropping this waiter retains the actual task handle for a later caller.
@@ -529,6 +539,8 @@ async fn start_profile_inner(
         }
         let retained_library = library.clone();
         (|| {
+        library.restore_startup_selection(library_id)
+            .map_err(|error| error.to_string())?;
         let metadata = Arc::new(MetadataStore::open(profile.root.join("metadata.sqlite"))
             .map_err(|_| "Could not open replacement metadata. Existing data has been preserved.".to_string())?);
         metadata.migrate(&[SETTINGS_MIGRATION, ACCOUNTS_MIGRATION,
@@ -813,7 +825,7 @@ async fn start_profile_inner(
         Arc::new(open_folder::PlatformFolderOpener),
     ));
     let router = Router::new()
-        .merge(routes::status_router(settings.clone()))
+        .merge(routes::status_router(settings.clone(), library.clone()))
         .merge(routes::config::router(config))
         .merge(routes::flags::router(
             settings.clone(),
