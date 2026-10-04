@@ -250,6 +250,105 @@ function inlineErrors(h: ReturnType<typeof harness>): unknown[] {
     .map((node) => node.props.children);
 }
 
+function nativeSkinBoundary(invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>) {
+  return source<typeof import('../../src/native')>(
+    'native.ts',
+    { './dto-contract': source<typeof import('../../src/dto-contract')>('dto-contract.ts', {}) },
+    { window: { __TAURI__: { core: { invoke } } }, File },
+  );
+}
+
+test('native picker validation failures reach the upload hook and wardrobe notice unchanged', async () => {
+  for (const message of ['Choose a valid PNG skin file.', 'Skin file is too large; choose a PNG under 256 KiB.']) {
+    const h = harness();
+    const commands: string[] = [];
+    const native = nativeSkinBoundary(async (command) => {
+      commands.push(command);
+      throw message;
+    });
+    const { useSavedSkinUploadWorkflow } = source<
+      typeof import('../../src/views/accounts/use-saved-skin-upload-workflow')
+    >('views/accounts/use-saved-skin-upload-workflow.ts', {
+      '../../native': native,
+      '../../machines/skin-wardrobe': h.machine,
+      './api': h.api,
+      './types': { NO_CAPE_VALUE: '__none' },
+      './use-saved-skin-upload-drop': { useSavedSkinUploadDrop: () => ({}) },
+      'preact/hooks': {
+        useEffect() {},
+        useRef: <V>(value: V) => ({ current: value }),
+        useState: <V>(value: V) => [value, () => {}],
+      },
+    });
+    let browserPickerOpened = false;
+    const workflow = useSavedSkinUploadWorkflow();
+    workflow.fileInputRef.current = {
+      value: '',
+      click() {
+        browserPickerOpened = true;
+      },
+    } as HTMLInputElement;
+    workflow.openUploadPicker();
+    await settle();
+    assert.deepEqual(inlineErrors(h), [message]);
+    assert.deepEqual(commands, ['pick_skin_file']);
+    assert.equal(browserPickerOpened, false);
+    assert.deepEqual(h.calls, []);
+  }
+});
+
+test('native drop refusal becomes an Error usable by the wardrobe read-error consumer', async () => {
+  const message = 'Dropped skin file is no longer available. Drop it again.';
+  const token = 'a'.repeat(64);
+  const native = nativeSkinBoundary(async (command, args) => {
+    assert.equal(command, 'consume_skin_drop');
+    assert.equal(args?.token, token);
+    throw message;
+  });
+  const h = harness();
+  await assert.rejects(native.consumeNativeSkinDrop(token), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(h.machine.wardrobeErrorMessage(error, 'Could not read dropped skin file.'), message);
+    return true;
+  });
+});
+
+test('unexpected native skin rejection shapes use safe copy and later file reads still succeed', async () => {
+  let reject = true;
+  let reason: unknown;
+  const native = nativeSkinBoundary(async () => {
+    if (reject) throw reason;
+    return { name: 'admitted.png', bytes: [137, 80, 78, 71] };
+  });
+  for (reason of [
+    '',
+    '  ',
+    new Error('private transport detail'),
+    {
+      message: 'private transport detail',
+      toString() {
+        throw new Error('unexpected coercion');
+      },
+    },
+    null,
+  ]) {
+    for (const read of [() => native.pickNativeSkinFile(), () => native.consumeNativeSkinDrop('a'.repeat(64))]) {
+      await assert.rejects(read(), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, 'Could not read skin file.');
+        return true;
+      });
+    }
+  }
+  reject = false;
+  for (const file of [await native.pickNativeSkinFile(), await native.consumeNativeSkinDrop('a'.repeat(64))]) {
+    assert.ok(file instanceof File);
+    assert.equal(file.name, 'admitted.png');
+    assert.deepEqual([...new Uint8Array(await file.arrayBuffer())], [137, 80, 78, 71]);
+  }
+  assert.equal(await nativeSkinBoundary(async () => null).pickNativeSkinFile(), null);
+});
+
 test('a post-import wardrobe refresh rejects an older in-flight skin list without changing account selection', async () => {
   const h = harness();
   h.machine.setWardrobeContext(context());

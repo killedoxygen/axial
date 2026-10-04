@@ -312,10 +312,14 @@ function nativeSkinFileFromPayload(payload: unknown): File {
   return new File([bytes], name, { type: 'image/png' });
 }
 
+function rethrowNativeSkinReadError(reason: unknown): never {
+  throw new Error(typeof reason === 'string' && reason.trim() ? reason : 'Could not read skin file.');
+}
+
 export async function pickNativeSkinFile(): Promise<File | null | undefined> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return undefined;
-  const payload = await tauri.core.invoke('pick_skin_file');
+  const payload = await tauri.core.invoke('pick_skin_file').catch(rethrowNativeSkinReadError);
   return payload === null ? null : nativeSkinFileFromPayload(payload);
 }
 
@@ -323,7 +327,7 @@ export async function consumeNativeSkinDrop(token: string): Promise<File | undef
   const tauri = getTauriBinding();
   if (!tauri?.core) return undefined;
 
-  const payload = await tauri.core.invoke('consume_skin_drop', { token });
+  const payload = await tauri.core.invoke('consume_skin_drop', { token }).catch(rethrowNativeSkinReadError);
   return nativeSkinFileFromPayload(payload);
 }
 
