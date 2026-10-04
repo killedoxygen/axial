@@ -10,6 +10,7 @@ import test from 'node:test';
  * @typedef {{
  *   'src/preferences/local.ts': typeof import('../../src/preferences/local'),
  *   'src/dto-contract.ts': typeof import('../../src/dto-contract'),
+ *   'src/native.ts': typeof import('../../src/native'),
  *   'src/launch-notice-tracker.ts': typeof import('../../src/launch-notice-tracker'),
  *   'src/launch-response-adapters.ts': typeof import('../../src/launch-response-adapters'),
  *   'src/dto-install.ts': typeof import('../../src/dto-install'),
@@ -82,6 +83,7 @@ function loadSource(path, imports = {}, globals = {}) {
         throw new Error(`Unreviewed UI composition dependency: ${id}`);
       },
       Date,
+      Error,
       setTimeout,
       clearTimeout,
       console: { error() {} },
@@ -343,7 +345,8 @@ test('a queued identity edit cannot adopt an account selected after the edit was
   assert.equal(writer.config.value.username, 'Different');
 });
 
-function accountRenameHarness({ invalidReply = false } = {}) {
+/** @param {{ invalidReply?: boolean, lostReply?: boolean, nativeInvoke?: (command: string) => Promise<unknown> }} [options] */
+function accountRenameHarness({ invalidReply = false, lostReply = false, nativeInvoke } = {}) {
   const disabled = { state_id: 'offline', label: 'Offline', enabled: false };
   let account = {
     account_id: 'offline-before',
@@ -402,6 +405,8 @@ function accountRenameHarness({ invalidReply = false } = {}) {
     instances: signal([instance('first', false), instance('second', false)]),
     launchSessions: signal({}),
   };
+  /** @type {(path: string, response: unknown) => Promise<unknown>} */
+  let read = async (_path, response) => response;
   /**
    * @param {string} method
    * @param {string} path
@@ -415,21 +420,27 @@ function accountRenameHarness({ invalidReply = false } = {}) {
       assert.equal(patch.expected_selection_revision, 4);
       account = { ...account, account_id: 'offline-after', display_name: patch.username, account_revision: 3 };
       selectionRevision++;
+      if (lostReply) throw new Error('Account response lost');
       return { status: 'account_updated', account: invalidReply ? undefined : account };
     }
-    if (path === '/config') return configSnapshot({ username: account.display_name });
+    if (path === '/config')
+      return read(
+        path,
+        configSnapshot({ username: account.display_name, account_selection_revision: selectionRevision }),
+      );
     if (path === '/instances')
-      return { instances: [instance('first', true), instance('second', true)], last_instance_id: 'first' };
+      return read(path, { instances: [instance('first', true), instance('second', true)], last_instance_id: 'first' });
+    if (path === '/instances/first') return read(path, instance('first', true));
     if (path === '/accounts')
-      return {
+      return read(path, {
         revision: selectionRevision,
         selection_revision: selectionRevision,
         launch_auth_mode: 'offline',
         active_account_id: account.account_id,
         accounts: [account],
-      };
+      });
     if (path === '/auth/status')
-      return {
+      return read(path, {
         selection_revision: selectionRevision,
         launch_auth_mode: 'offline',
         mode: 'offline',
@@ -438,8 +449,8 @@ function accountRenameHarness({ invalidReply = false } = {}) {
         provider: 'offline',
         verified: false,
         skin_source: 'default',
-        login_available: false,
-        login_reason: 'Desktop required',
+        login_available: !!nativeInvoke,
+        login_reason: nativeInvoke ? '' : 'Desktop required',
         msa_authenticated: false,
         msa_refresh_available: false,
         minecraft_profile_ready: false,
@@ -448,7 +459,7 @@ function accountRenameHarness({ invalidReply = false } = {}) {
         refresh_action: disabled,
         profile_sync_action: disabled,
         skin_action: disabled,
-      };
+      });
     throw new Error(`Unexpected account request ${method} ${path}`);
   };
   const accountsApi = loadSource('src/views/accounts/api.ts', {
@@ -467,28 +478,46 @@ function accountRenameHarness({ invalidReply = false } = {}) {
     },
     { window: { setTimeout } },
   );
-  const machine = loadSource('src/machines/accounts.ts', {
-    './accounts-state': accountState,
-    '../actions': {
-      setConfig: /** @param {Config} config */ (config) => {
-        store.config.value = config;
+  const machine = loadSource(
+    'src/machines/accounts.ts',
+    {
+      './accounts-state': accountState,
+      '../store': store,
+      '../actions': loadSource('src/actions.ts', { './store': store, './launch-response-adapters': sessions }),
+      '../api': { api, isApiError: () => false },
+      '../native': nativeInvoke
+        ? loadSource(
+            'src/native.ts',
+            { './dto-contract': contract },
+            { window: { __TAURI__: { core: { invoke: nativeInvoke } } } },
+          )
+        : {},
+      '../player-name': { promptPlayerName: async () => 'Renamed' },
+      '../player-skin': { refreshAccountSkin() {} },
+      '../toast': {
+        toast: /** @param {Parameters<typeof import('../../src/toast').toast>} args */ (...args) => toasts.push(args),
       },
+      '../ui/Dialog': {},
+      '../views/accounts/api': accountsApi,
+      '../views/accounts/auth': auth,
+      '../dto-core': core,
+      '../instance-readiness': readiness,
     },
-    '../api': { api, isApiError: () => false },
-    '../native': {},
-    '../player-name': { promptPlayerName: async () => 'Renamed' },
-    '../player-skin': { refreshAccountSkin() {} },
-    '../toast': {
-      toast: /** @param {Parameters<typeof import('../../src/toast').toast>} args */ (...args) => toasts.push(args),
-    },
-    '../ui/Dialog': {},
-    '../views/accounts/api': accountsApi,
-    '../views/accounts/auth': auth,
-    '../dto-core': core,
-    '../instance-readiness': readiness,
-  });
+    { console: { warn() {} } },
+  );
   assert.equal(machine.accountsSnapshot, accountState.accountsSnapshot);
-  return { machine, calls, toasts, store };
+  return {
+    machine,
+    calls,
+    toasts,
+    store,
+    readiness,
+    instance,
+    /** @param {typeof read} next */
+    read(next) {
+      read = next;
+    },
+  };
 }
 
 /** @param {SourceModules['src/machines/accounts.ts']} machine */
@@ -545,6 +574,267 @@ test('invalid rename confirmation reconciles accounts without publishing success
   assert.match(machine.accountsNotice.value, /did not return the renamed offline identity/);
   assert.equal(calls.filter(([method]) => method !== 'GET').length, 1);
   assert.equal(toasts.length, 0);
+});
+
+test('a lost committed account reply still refreshes readiness without replay or success', async () => {
+  const { machine, calls, toasts } = accountRenameHarness({ lostReply: true });
+  await machine.refreshAccountsData();
+  assert.equal(await machine.saveOfflineIdentityName(activeAccount(machine), 'Renamed'), false);
+  assert.equal(activeAccount(machine).account_id, 'offline-after');
+  assert.equal(calls.filter(([method]) => method === 'PATCH').length, 1);
+  assert.equal(calls.filter(([, path]) => path === '/instances').length, 1);
+  assert.match(machine.accountsNotice.value ?? '', /Account response lost/);
+  assert.deepEqual(toasts, []);
+});
+
+for (const accountless of [false, true]) {
+  test(`unchanged ${accountless ? 'accountless' : 'selected-account'} cancellation avoids rechecking six retained instances`, async () => {
+    const h = accountRenameHarness({ nativeInvoke: async () => ({ status: 'cancelled' }) });
+    const retained = Array.from({ length: 6 }, (_, index) => h.instance(`retained-${index}`, index !== 3));
+    h.store.instances.value = retained;
+    h.read(async (path, response) => {
+      if (path === '/instances') return { instances: retained, last_instance_id: null };
+      if (accountless && path === '/accounts')
+        return { ...contract.dtoRecord(response, 'Accounts'), active_account_id: null, accounts: [] };
+      if (accountless && path === '/auth/status')
+        return { ...contract.dtoRecord(response, 'Status'), username: '', uuid: '' };
+      return response;
+    });
+    await h.machine.refreshAccountsData();
+    const config = h.store.config.value;
+    h.calls.length = 0;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      assert.equal(await h.machine.signInWithMicrosoftAccount(), null);
+      assert.equal(h.machine.accountsOp.value, null);
+      assert.equal(h.machine.accountsNotice.value, null);
+    }
+    assert.deepEqual(
+      h.calls.map(([, path]) => path),
+      ['/config', '/accounts', '/auth/status', '/config', '/accounts', '/auth/status'],
+    );
+    assert.equal(h.store.config.value, config);
+    assert.equal(h.store.instances.value, retained);
+    assert.equal(h.store.instances.value[3].launch_action.launchable, false);
+    assert.deepEqual(h.toasts, []);
+  });
+}
+
+for (const change of [
+  'selection',
+  'selection-aba',
+  'settings',
+  'directory-action',
+  'status-action',
+  'config-unavailable',
+  'accounts-unavailable',
+  'incoherent-selection',
+  'missing-directory-action',
+  'missing-status-action',
+]) {
+  test(`sign-in cancellation still refreshes readiness after ${change}`, async () => {
+    const h = accountRenameHarness({ nativeInvoke: async () => ({ status: 'cancelled' }) });
+    const actionChange = change === 'directory-action' || change === 'status-action';
+    let changed = false;
+    h.read(async (path, response) => {
+      const value = contract.dtoRecord(response, 'Account fixture');
+      if (
+        changed &&
+        ((change === 'config-unavailable' && path === '/config') ||
+          (change === 'accounts-unavailable' && path === '/accounts'))
+      )
+        throw new Error('Read unavailable');
+      const selection =
+        changed && (change === 'selection' || change === 'selection-aba') ? (change === 'selection-aba' ? 6 : 5) : 4;
+      const online = { state_id: 'online_ready', label: 'Online ready', enabled: true };
+      const expired = { state_id: 'online_sign_in_required', label: 'Sign in required', enabled: false };
+      const profile = { id: '12345678123442348234123456789abc', name: 'Player', skins: [], capes: [] };
+      if (path === '/config')
+        return {
+          ...value,
+          launch_auth_mode: actionChange ? 'online' : 'offline',
+          revision: changed && change === 'settings' ? 8 : 7,
+          account_selection_revision: selection,
+        };
+      if (path === '/accounts') {
+        assert.ok(Array.isArray(value.accounts));
+        return {
+          ...value,
+          revision: selection,
+          selection_revision: selection,
+          launch_auth_mode: actionChange ? 'online' : 'offline',
+          accounts: value.accounts.map((account) =>
+            changed && change === 'missing-directory-action'
+              ? { ...account, online_action: undefined }
+              : actionChange
+                ? {
+                    ...account,
+                    kind: 'microsoft',
+                    login_id: 'current-login',
+                    minecraft_profile: profile,
+                    minecraft_profile_ready: true,
+                    minecraft_ownership_verified: true,
+                    online_action: changed && change === 'directory-action' ? expired : online,
+                  }
+                : account,
+          ),
+        };
+      }
+      if (path === '/auth/status')
+        return {
+          ...value,
+          selection_revision: changed && change === 'incoherent-selection' ? 5 : selection,
+          launch_auth_mode: actionChange ? 'online' : 'offline',
+          ...(changed && change === 'missing-status-action' ? { online_action: undefined } : {}),
+          ...(actionChange
+            ? {
+                minecraft_profile: profile,
+                minecraft_profile_ready: true,
+                minecraft_ownership_verified: true,
+                online_action: changed && change === 'status-action' ? expired : online,
+              }
+            : {}),
+        };
+      return response;
+    });
+    if (actionChange) h.store.config.value = configSnapshot({ launch_auth_mode: 'online' });
+    await h.machine.refreshAccountsData();
+    const pending = h.machine.signInWithMicrosoftAccount();
+    changed = true;
+    assert.equal(await pending, null);
+    assert.equal(h.calls.filter(([, path]) => path === '/instances').length, 1);
+    assert.equal(h.machine.accountsOp.value, null);
+    assert.deepEqual(h.toasts, []);
+    if (change === 'selection-aba') {
+      assert.equal(activeAccount(h.machine).account_id, 'offline-before');
+      assert.equal(h.machine.accountsSnapshot.value.selection_revision, 6);
+    }
+    if (change.startsWith('missing-')) assert.equal(h.machine.accountsSnapshot.value.state, 'unavailable');
+  });
+}
+
+test('unchanged sign-in cancellation preserves an in-flight readiness owner and its config fence', async () => {
+  const h = accountRenameHarness({ nativeInvoke: async () => ({ status: 'cancelled' }) });
+  await h.machine.refreshAccountsData();
+  /** @type {(value: unknown) => void} */
+  let reply = () => assert.fail('Readiness request was not started');
+  const response = new Promise((resolve) => {
+    reply = resolve;
+  });
+  h.read(async (path, value) => (path === '/instances/first' ? response : value));
+  const config = h.store.config.value;
+  const read = h.readiness.refreshInstanceReadiness('first');
+  await h.machine.signInWithMicrosoftAccount();
+  assert.equal(h.store.instances.value[0].launch_action.launchable, false);
+  reply(h.instance('first', true));
+  await read;
+  assert.equal(h.store.instances.value[0].launch_action.launchable, true);
+  assert.equal(h.store.config.value, config);
+  assert.equal(h.calls.filter(([, path]) => path === '/instances').length, 0);
+});
+
+test('native Microsoft sign-in preserves audited refusal causes through the accounts caller', async () => {
+  for (const message of [
+    'Microsoft sign-in timed out.',
+    'Microsoft sign-in services are unavailable (HTTP 503)',
+    'Secure credential storage is unavailable.',
+  ]) {
+    /** @type {string[]} */
+    const commands = [];
+    const { machine, calls, toasts } = accountRenameHarness({
+      nativeInvoke: async (command) => {
+        commands.push(command);
+        throw message;
+      },
+    });
+    await machine.refreshAccountsData();
+    assert.equal(machine.microsoftSignInAvailable(), true);
+    const before = JSON.stringify(machine.accountsSnapshot.value);
+    assert.equal(await machine.signInWithMicrosoftAccount(), null);
+    assert.deepEqual(commands, ['microsoft_sign_in']);
+    assert.equal(machine.accountsNotice.value, message);
+    assert.equal(machine.accountsOp.value, null);
+    assert.equal(JSON.stringify(machine.accountsSnapshot.value), before);
+    assert.ok(calls.every(([method]) => method === 'GET'));
+    assert.equal(calls.filter(([, path]) => path === '/instances').length, 1);
+    assert.deepEqual(toasts, []);
+  }
+});
+
+test('unexpected native Microsoft rejection shapes cannot expose transport details', async () => {
+  for (const reason of [
+    new Error('private transport detail'),
+    '',
+    '  ',
+    null,
+    {
+      get message() {
+        throw new Error('unexpected message access');
+      },
+      toString() {
+        throw new Error('unexpected coercion');
+      },
+    },
+  ]) {
+    let invocations = 0;
+    const { machine, calls, toasts } = accountRenameHarness({
+      nativeInvoke: async () => {
+        invocations++;
+        throw reason;
+      },
+    });
+    await machine.refreshAccountsData();
+    assert.equal(machine.microsoftSignInAvailable(), true);
+    const before = JSON.stringify(machine.accountsSnapshot.value);
+    assert.equal(await machine.signInWithMicrosoftAccount(), null);
+    assert.equal(invocations, 1);
+    assert.equal(machine.accountsNotice.value, 'Microsoft sign-in could not be completed.');
+    assert.equal(machine.accountsOp.value, null);
+    assert.equal(JSON.stringify(machine.accountsSnapshot.value), before);
+    assert.ok(calls.every(([method]) => method === 'GET'));
+    assert.equal(calls.filter(([, path]) => path === '/instances').length, 1);
+    assert.deepEqual(toasts, []);
+  }
+});
+
+test('native sign-in cancellation releases busy for retry without weakening DTO or selection checks', async () => {
+  /** @type {unknown} */
+  let response = { status: 'cancelled', login_id: null, profile_name: null, owns_minecraft_java: null };
+  let invocations = 0;
+  const { machine, calls, toasts } = accountRenameHarness({
+    nativeInvoke: async (command) => {
+      assert.equal(command, 'microsoft_sign_in');
+      invocations++;
+      return response;
+    },
+  });
+  await machine.refreshAccountsData();
+  assert.equal(machine.microsoftSignInAvailable(), true);
+  const before = JSON.stringify(machine.accountsSnapshot.value);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    assert.equal(await machine.signInWithMicrosoftAccount(), null);
+    assert.equal(machine.accountsNotice.value, null);
+    assert.equal(machine.accountsOp.value, null);
+  }
+  assert.equal(invocations, 2);
+  assert.equal(calls.filter(([, path]) => path === '/instances').length, 0);
+  response = { status: 'unexpected' };
+  assert.equal(await machine.signInWithMicrosoftAccount(), null);
+  assert.equal(machine.accountsNotice.value, 'Native Microsoft sign-in response was invalid.');
+  assert.equal(calls.filter(([, path]) => path === '/instances').length, 1);
+  response = {
+    status: 'authenticated',
+    login_id: 'different-login',
+    profile_name: 'Different',
+    owns_minecraft_java: true,
+  };
+  assert.equal(await machine.signInWithMicrosoftAccount(), null);
+  assert.equal(machine.accountsNotice.value, 'Microsoft sign-in completed, but account state is unavailable.');
+  assert.equal(machine.accountsOp.value, null);
+  assert.equal(invocations, 4);
+  assert.equal(calls.filter(([, path]) => path === '/instances').length, 2);
+  assert.equal(JSON.stringify(machine.accountsSnapshot.value), before);
+  assert.ok(calls.every(([method]) => method === 'GET'));
+  assert.deepEqual(toasts, []);
 });
 
 test('browser preferences persist edits and return independent preference maps', () => {

@@ -165,8 +165,7 @@ impl AuthService {
         .await
     }
 
-    /// Closing the native OAuth window invalidates even a callback whose
-    /// provider request has already started. No credentials are touched here.
+    /// Invalidate pending and in-flight login captures. No credentials are touched here.
     pub fn cancel_login(&self) {
         self.login_generation.fetch_add(1, Ordering::SeqCst);
     }

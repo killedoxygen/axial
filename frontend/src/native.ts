@@ -240,7 +240,9 @@ export async function getNativeApiTransportBootstrap(): Promise<NativeApiTranspo
 export async function signInWithMicrosoft(): Promise<NativeMicrosoftSignInResult | undefined> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return undefined;
-  const value = await tauri.core.invoke('microsoft_sign_in');
+  const value = await tauri.core
+    .invoke('microsoft_sign_in')
+    .catch((reason: unknown) => rethrowNativeCommandError(reason, 'Microsoft sign-in could not be completed.'));
   const record = dtoRecord(value, 'Native Microsoft sign-in');
   if (record.status !== 'authenticated' && record.status !== 'cancelled') {
     throw new Error('Native Microsoft sign-in response was invalid.');
@@ -312,14 +314,16 @@ function nativeSkinFileFromPayload(payload: unknown): File {
   return new File([bytes], name, { type: 'image/png' });
 }
 
-function rethrowNativeSkinReadError(reason: unknown): never {
-  throw new Error(typeof reason === 'string' && reason.trim() ? reason : 'Could not read skin file.');
+function rethrowNativeCommandError(reason: unknown, fallback: string): never {
+  throw new Error(typeof reason === 'string' && reason.trim() ? reason : fallback);
 }
 
 export async function pickNativeSkinFile(): Promise<File | null | undefined> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return undefined;
-  const payload = await tauri.core.invoke('pick_skin_file').catch(rethrowNativeSkinReadError);
+  const payload = await tauri.core
+    .invoke('pick_skin_file')
+    .catch((reason: unknown) => rethrowNativeCommandError(reason, 'Could not read skin file.'));
   return payload === null ? null : nativeSkinFileFromPayload(payload);
 }
 
@@ -327,7 +331,9 @@ export async function consumeNativeSkinDrop(token: string): Promise<File | undef
   const tauri = getTauriBinding();
   if (!tauri?.core) return undefined;
 
-  const payload = await tauri.core.invoke('consume_skin_drop', { token }).catch(rethrowNativeSkinReadError);
+  const payload = await tauri.core
+    .invoke('consume_skin_drop', { token })
+    .catch((reason: unknown) => rethrowNativeCommandError(reason, 'Could not read skin file.'));
   return nativeSkinFileFromPayload(payload);
 }
 

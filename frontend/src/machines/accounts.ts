@@ -22,6 +22,8 @@ import {
 import type { AccountActionState, AuthStatusRecord, LauncherAccount } from '../views/accounts/types';
 import { configResponse } from '../dto-core';
 import { refreshInstanceReadiness } from '../instance-readiness';
+import { config } from '../store';
+import type { Config } from '../types-settings';
 import { accountsSnapshot, activeAccount, type AccountsSnapshot } from './accounts-state';
 export { accountsSnapshot, activeAccount, type AccountsSnapshot } from './accounts-state';
 
@@ -109,14 +111,55 @@ function parseAuthStatus(value: unknown): AuthStatusRecord | null {
   return authStatusResponse(value);
 }
 
-async function afterAccountsChange(): Promise<void> {
+async function afterAccountsChange(cancelled?: { config: Config | null; accounts: AccountsSnapshot }): Promise<void> {
+  let refreshedConfig: Config | null = null;
   try {
-    setConfig(configResponse(await api('GET', '/config')));
+    refreshedConfig = configResponse(await api('GET', '/config'));
+    const current = config.value;
+    // An unchanged cancellation must not invalidate another readiness read's config fence.
+    if (
+      !cancelled ||
+      !current ||
+      current.revision !== refreshedConfig.revision ||
+      current.account_selection_revision !== refreshedConfig.account_selection_revision
+    ) {
+      setConfig(refreshedConfig);
+    }
   } catch (err: unknown) {
     console.warn('Could not refresh config after account change.', err);
   }
   await refreshAccountsData();
+  const previous = cancelled?.accounts;
+  const current = accountsSnapshot.value;
+  const previousAccount = previous && activeAccount(previous);
+  const currentAccount = activeAccount(current);
+  if (
+    cancelled?.config &&
+    refreshedConfig &&
+    config.value === cancelled.config &&
+    refreshedConfig.revision === cancelled.config.revision &&
+    refreshedConfig.account_selection_revision === cancelled.config.account_selection_revision &&
+    previous?.state === 'ready' &&
+    current.state === 'ready' &&
+    previous.revision !== null &&
+    previous.revision === current.revision &&
+    previous.selection_revision === cancelled.config.account_selection_revision &&
+    current.selection_revision === refreshedConfig.account_selection_revision &&
+    previous.status?.launch_auth_mode === cancelled.config.launch_auth_mode &&
+    current.status?.launch_auth_mode === refreshedConfig.launch_auth_mode &&
+    previousAccount?.account_id === currentAccount?.account_id &&
+    sameOnlineAction(previous.status?.online_action, current.status?.online_action) &&
+    ((!previousAccount && !currentAccount) ||
+      sameOnlineAction(previousAccount?.online_action, currentAccount?.online_action))
+  )
+    return;
   await refreshInstanceReadiness();
+}
+
+function sameOnlineAction(left: AccountActionState | undefined, right: AccountActionState | undefined): boolean {
+  return (
+    left !== undefined && right !== undefined && left.state_id === right.state_id && left.enabled === right.enabled
+  );
 }
 
 function accountsErrorText(error: unknown, fallback: string): string {
@@ -174,11 +217,12 @@ async function runAccountsOp(
   if (accountsOp.value) return false;
   accountsOp.value = kind;
   accountsNotice.value = null;
+  const before = { config: config.value, accounts: accountsSnapshot.value };
   let succeeded = false;
   try {
     const summary = await task();
     invalidateAccountsRead();
-    await afterAccountsChange();
+    await afterAccountsChange(summary === null ? before : undefined);
     if (summary && (accountsSnapshot.value.state !== 'ready' || (verify && !verify(accountsSnapshot.value)))) {
       throw new Error('The account request finished, but its current state could not be read. Refresh accounts.');
     }
