@@ -22,7 +22,7 @@ pub fn confine_content_policy(
     }
     let origin = url.origin().ascii_serialization();
     config.app.security.csp = Some(tauri::utils::config::Csp::Policy(format!(
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: {origin}; connect-src 'self' ipc: http://ipc.localhost {origin}; font-src 'self'; media-src 'self' blob: {origin}; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'"
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: {origin}; connect-src 'self' data: blob: ipc: http://ipc.localhost {origin}; font-src 'self'; media-src 'self' blob: {origin}; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'"
     )));
     Ok(())
 }
@@ -100,12 +100,25 @@ mod tests {
     fn packaged_policy_binds_only_the_actual_api_port() {
         let mut config: tauri::Config =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let Some(tauri::utils::config::Csp::Policy(packaged_policy)) =
+            config.app.security.csp.clone()
+        else {
+            panic!("expected one packaged content policy");
+        };
+        assert!(packaged_policy.contains(
+            "; connect-src 'self' data: blob: ipc: http://ipc.localhost http://127.0.0.1:*;"
+        ));
         confine_content_policy(&mut config, "http://127.0.0.1:38471").unwrap();
         let tauri::utils::config::Csp::Policy(policy) = config.app.security.csp.unwrap() else {
             panic!("expected one content policy");
         };
         assert!(policy.contains("http://127.0.0.1:38471"));
         assert!(!policy.contains("127.0.0.1:*"));
+        assert_eq!(
+            policy,
+            packaged_policy.replace("http://127.0.0.1:*", "http://127.0.0.1:38471")
+        );
+        assert!(policy.starts_with("default-src 'self'; script-src 'self';"));
         for invalid in [
             "http://localhost:38471",
             "https://127.0.0.1:38471",
