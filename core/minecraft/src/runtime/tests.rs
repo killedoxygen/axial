@@ -783,6 +783,198 @@ async fn ready_managed_runtime_matches_the_full_authenticated_source() {
 }
 
 #[tokio::test]
+async fn authenticated_empty_runtime_file_stages_verifies_and_rebuilds() {
+    for compressed in [false, true] {
+        let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        let component = RuntimeId::from("jre-legacy");
+        let root = cache
+            .component_root(component.as_str())
+            .expect("runtime root");
+        let java_bytes = b"authenticated Java fixture".to_vec();
+        let (java_url, java_requests) =
+            serve_runtime_retry_responses(vec![(200, java_bytes.clone()); 2]).await;
+        let (empty_url, empty_requests) =
+            serve_runtime_retry_responses(vec![(200, Vec::new())]).await;
+        let compressed_empty = lzma_compress_bytes(b"");
+        assert!(!compressed_empty.is_empty());
+        let (compressed_url, compressed_requests) =
+            serve_runtime_retry_responses(vec![(200, compressed_empty.clone()); 2]).await;
+        let empty = if compressed {
+            downloadable_lzma_manifest_file(
+                &empty_url,
+                0,
+                &sha1_hex(b""),
+                &compressed_url,
+                compressed_empty.len() as u64,
+                &sha1_hex(&compressed_empty),
+            )
+        } else {
+            downloadable_manifest_file(&empty_url, 0, &sha1_hex(b""))
+        };
+        let expected_download_bytes = java_bytes.len() as u64
+            + if compressed {
+                compressed_empty.len() as u64
+            } else {
+                0
+            };
+        let mut java =
+            downloadable_manifest_file(&java_url, java_bytes.len() as u64, &sha1_hex(&java_bytes));
+        java.executable = true;
+        let empty_path = "lib/security/empty-policy";
+        let manifest = ComponentManifest {
+            files: HashMap::from([
+                (runtime_java_manifest_path(), java),
+                (empty_path.into(), empty),
+            ]),
+        };
+        let bytes = serde_json::to_vec(&manifest).expect("runtime manifest");
+        let url = serve_runtime_json(200, bytes.clone(), None).await;
+        let source = acquire_runtime_source_for_test(
+            component.clone(),
+            RuntimeDownloadManifest {
+                url,
+                sha1: sha1_hex(&bytes),
+                size: bytes.len() as u64,
+            },
+        )
+        .await
+        .expect("authenticated manifest with empty file");
+        let mut events = Vec::new();
+        let staged =
+            stage_managed_runtime(&cache, &component, source, &mut |event| events.push(event))
+                .await
+                .expect("authenticated empty runtime file must materialize");
+        assert!(!root.exists());
+        assert_eq!(
+            fs::read(staged.staging_root_for_test().join(empty_path)).unwrap(),
+            b""
+        );
+        assert!(events.iter().any(|event| {
+            matches!(event,
+                RuntimeEnsureEvent::InstallingManagedRuntimeFiles { current: 2, total: 2, bytes_done, bytes_total, .. }
+                if *bytes_done == expected_download_bytes && *bytes_total == expected_download_bytes
+            )
+        }));
+        let verified = publish_staged_managed_runtime_and_finalize(staged)
+            .await
+            .expect("publish verified empty file")
+            .into_verified_runtime(&cache, &component, 8)
+            .expect("verified runtime tree");
+        let (runtime, source) = verified.into_parts();
+        assert!(admit_runtime_component(&cache, component.as_str()).contents_verified());
+        assert!(runtime_record_matches_source_for_test(&cache, &runtime, &source).await);
+        assert_eq!(java_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            compressed_requests.load(Ordering::SeqCst),
+            usize::from(compressed)
+        );
+        assert_eq!(
+            empty_requests.load(Ordering::SeqCst),
+            0,
+            "authenticated empty content needs no transfer"
+        );
+
+        fs::write(root.join(empty_path), b"unexpected bytes").expect("tamper empty runtime file");
+        assert!(!admit_runtime_component(&cache, component.as_str()).contents_verified());
+        assert!(!runtime_record_matches_source_for_test(&cache, &runtime, &source).await);
+        let rebuilt =
+            rebuild_managed_runtime_component_from_source(&cache, &component, source, &mut |_| {})
+                .await
+                .expect("rebuild exact empty file from authenticated source");
+        assert!(rebuilt.revalidate(&cache, &component).await);
+        assert_eq!(fs::read(root.join(empty_path)).unwrap(), b"");
+        assert_eq!(fs::read(java_executable(&root)).unwrap(), java_bytes);
+        assert!(admit_runtime_component(&cache, component.as_str()).contents_verified());
+        assert_eq!(java_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(empty_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            compressed_requests.load(Ordering::SeqCst),
+            2 * usize::from(compressed)
+        );
+    }
+}
+
+#[tokio::test]
+async fn authenticated_empty_runtime_file_requires_exact_size_and_empty_digest_before_effects() {
+    for (missing_size, empty_compressed) in [(false, false), (true, false), (false, true)] {
+        let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+        let mut empty = downloadable_manifest_file(&url, 0, &sha1_hex(b""));
+        let raw = empty.downloads.as_mut().unwrap().raw.as_mut().unwrap();
+        if missing_size {
+            raw.size = None;
+        } else if !empty_compressed {
+            raw.sha1 = Some(sha1_hex(b"not empty"));
+        }
+        if empty_compressed {
+            empty.downloads.as_mut().unwrap().lzma = Some(ComponentManifestDownload {
+                url: url.clone(),
+                sha1: Some(sha1_hex(b"")),
+                size: Some(0),
+            });
+        }
+        let manifest = ComponentManifest {
+            files: HashMap::from([
+                (
+                    runtime_java_manifest_path(),
+                    downloadable_manifest_file(&url, 6, &sha1_hex(b"unused")),
+                ),
+                ("lib/security/empty-policy".into(), empty),
+            ]),
+        };
+        assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
+    }
+}
+
+#[tokio::test]
+async fn authenticated_empty_runtime_file_cancelled_after_materialization_cleans_stage() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("runtime root");
+    let (url, requests) = serve_runtime_retry_responses(vec![(200, Vec::new())]).await;
+    let source = authenticated_runtime_source_from_manifest_for_test(
+        component.clone(),
+        ComponentManifest {
+            files: HashMap::from([(
+                runtime_java_manifest_path(),
+                downloadable_manifest_file(&url, 0, &sha1_hex(b"")),
+            )]),
+        },
+    )
+    .expect("authenticated empty fixture source");
+    let (sender, mut cancellation) = runtime_cancellation_channel();
+    let staging_root = root.with_file_name("jre-legacy.staging");
+    let mut observed_materialized_file = false;
+    let staged = stage_managed_runtime_until_cancelled(
+        &cache,
+        &component,
+        source,
+        &mut |event| {
+            if matches!(
+                event,
+                RuntimeEnsureEvent::InstallingManagedRuntimeFiles { current: 1, .. }
+            ) {
+                assert_eq!(
+                    fs::read(staging_root.join(runtime_java_manifest_path())).unwrap(),
+                    b""
+                );
+                observed_materialized_file = true;
+                sender.cancel();
+            }
+        },
+        &mut cancellation,
+    )
+    .await
+    .expect("cancelled staging settles");
+    assert!(observed_materialized_file);
+    assert!(staged.is_none());
+    assert!(!root.exists());
+    assert!(!staging_root.exists());
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn managed_runtime_materialization_scan_budgets_are_one_cached_and_three_fresh() {
     let cached = ManagedRuntimeCache::isolated_for_test().expect("cached runtime cache");
     let component = RuntimeId::from("jre-legacy");

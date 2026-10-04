@@ -2350,6 +2350,13 @@ fn validate_runtime_manifest_contract(
                 let selected_size = if let Some(lzma) = downloads.lzma.as_ref() {
                     let compressed_size =
                         exact_runtime_download_size(component, lzma, "compressed")?;
+                    if compressed_size == 0 {
+                        return Err(runtime_source_failure(
+                            component,
+                            RuntimeSourceFailureKind::MetadataInvalid,
+                            "runtime compressed file is empty",
+                        ));
+                    }
                     compressed_total =
                         compressed_total
                             .checked_add(compressed_size)
@@ -2566,7 +2573,7 @@ fn exact_runtime_download_size(
             format!("runtime {label} file is missing its source URL"),
         ));
     }
-    let size = download.size.filter(|size| *size > 0).ok_or_else(|| {
+    let size = download.size.ok_or_else(|| {
         runtime_source_failure(
             component,
             RuntimeSourceFailureKind::MetadataInvalid,
@@ -2580,12 +2587,26 @@ fn exact_runtime_download_size(
             format!("runtime {label} file exceeds the per-file bound"),
         ));
     }
-    if !download.sha1.as_deref().is_some_and(runtime_sha1_is_valid) {
-        return Err(runtime_source_failure(
-            component,
-            RuntimeSourceFailureKind::MetadataInvalid,
-            format!("runtime {label} file is missing exact checksum"),
-        ));
+    let sha1 = download
+        .sha1
+        .as_deref()
+        .and_then(runtime_sha1_bytes)
+        .ok_or_else(|| {
+            runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::MetadataInvalid,
+                format!("runtime {label} file is missing exact checksum"),
+            )
+        })?;
+    if size == 0 {
+        let empty_sha1: [u8; 20] = Sha1::digest(b"").into();
+        if sha1 != empty_sha1 {
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::MetadataInvalid,
+                format!("runtime {label} empty file checksum does not match empty content"),
+            ));
+        }
     }
     Ok(size)
 }
@@ -2972,6 +2993,16 @@ async fn install_runtime_manifest_file_until_cancelled(
             .import_relative_authenticated(
                 &relative,
                 std::io::Cursor::new(bytes),
+                raw_size,
+                raw_sha1,
+            )
+            .await
+            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    } else if raw_size == 0 {
+        temp_dir
+            .import_relative_authenticated(
+                &relative,
+                std::io::Cursor::new([0_u8; 0]),
                 raw_size,
                 raw_sha1,
             )
