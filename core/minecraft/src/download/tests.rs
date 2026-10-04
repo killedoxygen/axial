@@ -1499,6 +1499,30 @@ async fn behavior_contract_nonempty_assets_publish_once_and_match_reconstruction
         + b"nonempty-asset-client".len()
         + fixture.object.len()
         + fixture.distinct.len()) as u64;
+    let publication_start = progress_events
+        .iter()
+        .position(|event| event.phase == "game_publish")
+        .expect("publication follows acquisition");
+    assert!(progress_events[..publication_start].iter().any(|event| {
+        event.phase == "assets" && event.total > 0 && event.current == event.total
+    }));
+    assert_eq!(
+        progress_events[publication_start..]
+            .iter()
+            .map(|event| (event.phase.as_str(), event.current, event.total, event.done))
+            .collect::<Vec<_>>(),
+        [
+            ("game_publish", 0, 1, false),
+            ("game_publish", 1, 1, false),
+            ("done", 1, 1, true)
+        ]
+    );
+    assert!(progress_events[publication_start..].iter().all(|event| {
+        event.bytes_done == Some(expected_total)
+            && event.bytes_total == Some(expected_total)
+            && event.file.is_none()
+            && event.error.is_none()
+    }));
     let stamped = progress_events
         .iter()
         .filter_map(|progress| progress.bytes_total.map(|total| (progress, total)))
@@ -1627,14 +1651,24 @@ async fn behavior_contract_normal_install_settles_assets_rollback() {
         crate::managed_component_table::ManagedComponentKind::Assets,
     );
 
+    let mut progress_events = Vec::new();
     let error = timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version(version_id, |_| {}),
+        downloader.install_version(version_id, |event| progress_events.push(event)),
     )
     .await
     .expect("Assets rollback install should settle")
     .expect_err("Assets rollback install should fail");
 
+    assert_eq!(
+        progress_events
+            .iter()
+            .filter(|event| event.phase == "game_publish")
+            .map(|event| (event.current, event.total, event.done))
+            .collect::<Vec<_>>(),
+        [(0, 1, false)]
+    );
+    assert_eq!(progress_events.last().unwrap().phase, "error");
     assert!(
         error
             .to_string()
@@ -2171,11 +2205,25 @@ async fn cancelling_normal_install_does_not_cancel_started_bundle_publication() 
     let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
     let checkpoint_operation = downloader.managed_operation_for_test().clone();
 
-    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    let install = tokio::spawn(async move {
+        downloader
+            .install_version(version_id, |event| {
+                let _ = progress_tx.send(event);
+            })
+            .await
+    });
     timeout(DURABLE_OPERATION_TIMEOUT, reached)
         .await
         .expect("normal publication should reach its first promotion")
         .expect("normal publication pause signal");
+    let progress_events = std::iter::from_fn(|| progress_rx.try_recv().ok()).collect::<Vec<_>>();
+    let latest = progress_events.last().expect("publication progress");
+    assert_eq!(
+        (latest.phase.as_str(), latest.current, latest.total),
+        ("game_publish", 0, 1)
+    );
+    assert!(progress_events.iter().all(|event| !event.done));
     assert!(
         !install.is_finished(),
         "normal install must not return a receipt before publication settles"
@@ -2219,9 +2267,10 @@ async fn managed_install_owner_panic_retains_recovery_across_retry_cancellation(
     let checkpoint_operation = downloader.managed_operation_for_test().clone();
     panic_managed_install_owner_after_lease_once_for_test(version_id);
 
+    let mut progress_events = Vec::new();
     let recovery = match timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version(version_id, |_| {}),
+        downloader.install_version(version_id, |event| progress_events.push(event)),
     )
     .await
     .expect("panicked publication owner should return")
@@ -2230,6 +2279,15 @@ async fn managed_install_owner_panic_retains_recovery_across_retry_cancellation(
         DownloadError::PublicationIndeterminate(recovery) => recovery,
         error => panic!("owner panic dropped its recovery carrier: {error}"),
     };
+    assert_eq!(
+        progress_events
+            .iter()
+            .filter(|event| event.phase == "game_publish")
+            .map(|event| (event.current, event.total, event.done))
+            .collect::<Vec<_>>(),
+        [(0, 1, false)]
+    );
+    assert!(progress_events.iter().all(|event| !event.done));
 
     let (reached, release) =
         crate::version_bundle_publication::pause_after_promotions_for_test(version_id, 1);

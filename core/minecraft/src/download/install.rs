@@ -2218,7 +2218,10 @@ impl Downloader {
                     fact_tx.as_ref(),
                 )
                 .await?;
-            publish_prepared_managed_install(managed_root, prepared).await
+            send(progress("game_publish", 0, 1, None));
+            let receipt = publish_prepared_managed_install(managed_root, prepared).await?;
+            send(progress("game_publish", 1, 1, None));
+            Ok(receipt)
         }
         .await;
 

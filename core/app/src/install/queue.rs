@@ -5497,19 +5497,33 @@ pub(crate) mod tests {
     }
     #[test]
     fn terminal_status_is_separate_from_leaf_publication_progress() {
-        let event = DownloadProgress {
-            phase: "libraries".into(),
-            current: 10,
-            total: 10,
-            file: Some("private/path".into()),
-            error: None,
-            done: false,
-            bytes_done: None,
-            bytes_total: None,
-        };
-        let view = progress_view(&event);
-        assert!(!view.terminal);
-        assert_eq!(view.progress_pct, 99);
+        for (phase, label, current, total, percent) in [
+            ("libraries", "Downloading libraries", 10, 10, 99),
+            ("game_publish", "Installing game files", 0, 1, 0),
+            ("game_publish", "Installing game files", 1, 1, 99),
+        ] {
+            let event = DownloadProgress {
+                phase: phase.into(),
+                current,
+                total,
+                file: Some("private/path".into()),
+                error: None,
+                done: false,
+                bytes_done: None,
+                bytes_total: None,
+            };
+            assert_eq!(
+                serde_json::to_value(progress_view(&event)).unwrap(),
+                serde_json::json!({
+                    "phase_id": phase, "label": label, "progress_pct": percent,
+                    "terminal": false, "failed": false,
+                    "active_step": {
+                        "phase_id": phase, "label": label, "progress_pct": percent,
+                        "current": current, "total": total
+                    }
+                })
+            );
+        }
         assert!(!settlement_progress().terminal);
     }
     #[test]
