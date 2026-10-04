@@ -1679,7 +1679,13 @@ impl BenchmarkService {
                 if service.save_driver(&current).is_err() || matches!(current.state.as_str(), "complete" | "failed" | "interrupted") { break; }
                 tokio::select! { _ = cancel.cancelled() => break, _ = shutdown.cancelled() => break, _ = tokio::time::sleep(std::time::Duration::from_millis(current.interval_ms)) => {} }
             }
-            if let Ok(mut current) = service.driver(&id) { if matches!(current.state.as_str(), "running" | "waiting") { current.state = if cancel.is_cancelled() { "stopped" } else { "interrupted" }.into(); let _ = service.save_driver(&current); } }
+            if let Ok(mut current) = service.driver(&id) {
+                if matches!(current.state.as_str(), "running" | "waiting") {
+                    current.state = if cancel.is_cancelled() || shutdown.is_cancelled() { "stopped" } else { "interrupted" }.into();
+                    if shutdown.is_cancelled() { current.active_session_id = None; }
+                    let _ = service.save_driver(&current);
+                }
+            }
             service.active_drivers.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
         });
         if handle.is_err() {

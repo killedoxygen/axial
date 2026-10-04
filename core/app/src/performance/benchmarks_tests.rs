@@ -198,6 +198,78 @@ async fn persist_automatic_restart_fixture(
 }
 
 #[tokio::test]
+async fn graceful_driver_shutdown_stops_and_joins_before_reopen() {
+    let root = fixture_directory();
+    let path = root.path().join("metadata.sqlite");
+    let storage = open_storage(&path);
+    let (service, instance) = instance_service(root.path(), storage.clone()).await;
+    let input = serde_json::from_value(serde_json::json!({
+        "instance_id": instance, "suite_mode": "development", "interval_ms": 300_000
+    }))
+    .unwrap();
+    let accepted = service.start_driver(input).await.unwrap();
+    let suite = service.suite(&accepted.suite_id).unwrap().unwrap();
+    let request = storage
+        .read(|db| -> Result<Vec<u8>, StorageError> {
+            Ok(db.query_row(
+                "SELECT request FROM benchmark_drivers WHERE driver_id=?1",
+                [&accepted.id],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(accepted.state, "running");
+    assert_eq!(service.tasks.status().running.len(), 1);
+
+    // Cancellation reaches the accepted driver before its first tick on this
+    // current-thread runtime; no missing install can stand in for shutdown.
+    service
+        .tasks
+        .shutdown(std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(service.tasks.status().is_idle());
+    assert!(service.tasks.status().closing);
+    assert!(service.active_drivers.lock().unwrap().is_empty());
+    let stopped = service.driver(&accepted.id).unwrap();
+    let mut expected = accepted.clone();
+    expected.state = "stopped".into();
+    expected.updated_at = stopped.updated_at.clone();
+    assert_eq!(stopped, expected);
+    assert_eq!(
+        service.suite(&accepted.suite_id).unwrap(),
+        Some(suite.clone())
+    );
+    assert!(service.sessions.sessions().is_empty());
+    drop(service);
+    drop(storage);
+
+    let storage = open_storage(&path);
+    let reopened = self::service(root.path(), storage.clone());
+    assert_eq!(reopened.driver(&accepted.id).unwrap(), stopped);
+    assert_eq!(reopened.suite(&accepted.suite_id).unwrap(), Some(suite));
+    assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
+    assert!(reopened.can_resume_driver(&accepted.id).unwrap());
+    assert!(reopened.tasks.status().is_idle());
+    storage
+        .read(|db| -> Result<(), StorageError> {
+            let saved: Vec<u8> = db.query_row(
+                "SELECT request FROM benchmark_drivers WHERE driver_id=?1",
+                [&accepted.id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(saved, request);
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM launch_intents", [], |row| row
+                    .get::<_, usize>(0))?,
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
 async fn current_driver_history_reopens_and_resumes_the_same_driver() {
     for state in ["stopped", "failed", "interrupted"] {
         let root = fixture_directory();
@@ -354,6 +426,10 @@ async fn automatic_restart_schedules_owned_driver_once() {
     assert_eq!(
         reopened.driver(&accepted[0].id).unwrap().state,
         "interrupted"
+    );
+    assert_eq!(
+        reopened.driver(&accepted[0].id).unwrap().error.as_deref(),
+        Some(RESTART_INTERRUPTED_ERROR)
     );
     assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 1);
     assert_eq!(reopened.driver(&accepted[0].id).unwrap().state, "running");

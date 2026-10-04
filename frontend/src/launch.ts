@@ -88,16 +88,7 @@ export async function launchGame(): Promise<void> {
     }
 
     Music.suppress();
-    let launchStarted = false;
-    const onStarted = (): void => {
-      if (launchStarted) return;
-      launchStarted = true;
-      Sound.ui('launchSuccess');
-      const current = instances.value.find((item) => item.id === inst.id);
-      if (current) updateInstanceInList({ ...current, last_played_at: launchedAt });
-    };
-    if (initialStatus.viewModel.playing) onStarted();
-    connectLaunchEvents(sessionId, inst.id, inst.name, noticeTracker, onStarted);
+    connectLaunchEvents(sessionId, inst.id, inst.name, noticeTracker, () => Sound.ui('launchSuccess'));
   };
 
   try {
@@ -326,6 +317,17 @@ function connectLaunchEvents(
   onStarted?: () => void,
 ): void {
   if (launchConnections.has(sessionId)) return;
+  let launchStarted = false;
+  const onPlaying = (): void => {
+    const session = launchSessions.value[instanceId];
+    if (launchStarted || session?.sessionId !== sessionId || !session.viewModel.playing) return;
+    launchStarted = true;
+    const current = instances.value.find((instance) => instance.id === instanceId);
+    if (current && (!current.last_played_at || Date.parse(current.last_played_at) < Date.parse(session.launchedAt))) {
+      updateInstanceInList({ ...current, last_played_at: session.launchedAt });
+    }
+    onStarted?.();
+  };
   const onStatus = (data: unknown, handle: { close(): void }): void => {
     const session = launchSessions.value[instanceId];
     if (session?.sessionId !== sessionId) {
@@ -335,7 +337,7 @@ function connectLaunchEvents(
     const update = convergeLaunchStatus(instanceId, sessionId, data);
     if (!update) return;
     surfaceBackendLaunchNotice(update.notice, instanceId, instanceName, noticeTracker);
-    if (update.viewModel.playing) onStarted?.();
+    if (update.viewModel.playing) onPlaying();
     if (update.viewModel.terminal) {
       onSessionTerminal(update.outcome, instanceId, instanceName, sessionId, handle);
     }
@@ -360,6 +362,7 @@ function connectLaunchEvents(
     },
   };
   launchConnections.set(sessionId, streamHandle);
+  onPlaying();
   pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, (data) => {
     onStatus(data, streamHandle);
   });

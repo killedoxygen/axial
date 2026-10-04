@@ -127,6 +127,7 @@ function launchHarness(intentResult?: unknown, running = true) {
   let connections = 0;
   const calls: string[] = [];
   const errors: string[] = [];
+  const sounds: string[] = [];
   const lines: Array<{ source: string; text: string }> = [];
   let readInstance: () => Promise<unknown> = async () => instance(true);
   const store = {
@@ -164,7 +165,7 @@ function launchHarness(intentResult?: unknown, running = true) {
     './backend/events': { subscribeApiEvents: (_path: string, options: ApiEventOptions<unknown>) => {
       connections++; subscription = options; return () => { closed++; };
     } },
-    './sound': { Sound: { init() {} } }, './music': { Music: { suppress() {}, unsuppress() {} } },
+    './sound': { Sound: { init() {}, ui: (sound: string) => sounds.push(sound) } }, './music': { Music: { suppress() {}, unsuppress() {} } },
     './utils': { appendLog: (source: string, text: string) => lines.push({ source, text }), showError: (message: string) => errors.push(message), errMessage: String },
     './store': store, './actions': actions, './launch-notice-tracker': noticeContract,
     './launch-response-adapters': statusContract, './dto-contract': contract, './dto-core': {}, './dto-launch': logContract,
@@ -172,7 +173,7 @@ function launchHarness(intentResult?: unknown, running = true) {
   }, { ...clock, window: clock, crypto: { randomUUID: () => '9eb6ce58-c29a-44bc-a290-aea8973e9bdb' } });
   if (intentResult === undefined && running) launch.reconnectLaunchSession('instance-1', 'Example');
   return {
-    store, actions, lines, calls, errors, clock, finalLogs, readiness, launch, closed: () => closed,
+    store, actions, lines, calls, errors, sounds, clock, finalLogs, readiness, launch, closed: () => closed,
     connections: () => connections,
     readInstance(next: typeof readInstance): void { readInstance = next; },
     readStatus(next: typeof readStatus): void { readStatus = next; },
@@ -181,6 +182,69 @@ function launchHarness(intentResult?: unknown, running = true) {
     pollTerminal(): void { currentStatus = status(2, true); for (const poll of clock.intervals.values()) poll(); },
   };
 }
+
+test('already Playing adoption and bootstrap reconnect project recency once without replaying launch sound', async () => {
+  for (const entrypoint of ['adoption', 'reconnect']) {
+    const h = launchHarness(undefined, false);
+    h.store.instances.value = [{ ...instance(), name: 'Current name', java_path: '/fixture/java' }];
+    if (entrypoint === 'adoption') await h.launch.adoptLaunchSession('session-1');
+    else {
+      h.actions.confirmLaunch('instance-1', statusContract.launchSessionsResponse({ sessions: [status()] })['instance-1']);
+      h.launch.reconnectLaunchSession('instance-1', 'Example');
+    }
+    await flush();
+    const projected = h.store.instances.value[0];
+    assert.equal(projected.last_played_at, status().launched_at);
+    assert.equal(projected.name, 'Current name');
+    assert.equal(projected.java_path, '/fixture/java');
+    h.emit(status(2), 'status');
+    h.emit(status(2), 'status');
+    h.launch.reconnectLaunchSession('instance-1', 'Example');
+    assert.equal(h.store.instances.value[0], projected);
+    assert.deepEqual(h.sounds, []);
+    assert.equal(h.calls.some((path) => path.startsWith('/instances')), false);
+  }
+});
+
+for (const change of ['settings edit', 'newer recency', 'replacement session', 'session lifetime', 'instance removal']) {
+  test(`first Playing recency respects current ownership after ${change}`, async () => {
+    const h = launchHarness(undefined, false);
+    const starting = { ...status(), view_model: { ...status().view_model, state_id: 'starting', label: 'Starting', playing: false } };
+    h.readStatus(async () => starting);
+    await h.launch.adoptLaunchSession('session-1');
+    await flush();
+    assert.equal(h.store.instances.value[0].last_played_at, undefined);
+    if (change === 'settings edit') {
+      h.actions.updateInstanceInList({ ...instance(), name: 'Renamed while starting', java_path: '/fixture/new-java' });
+    } else if (change === 'newer recency') {
+      h.actions.updateInstanceInList({ ...instance(), last_played_at: '2026-10-04T08:00:00Z' });
+    } else if (change === 'instance removal') h.store.instances.value = [];
+    else {
+      h.actions.confirmLaunch('instance-1', statusContract.launchSessionsResponse({ sessions: [{ ...status(), session_id: 'session-2' }] })['instance-1']);
+      if (change === 'session lifetime') h.actions.endSessionIfCurrent('instance-1', 'session-2');
+    }
+    const before = h.store.instances.value;
+    h.emit(status(2), 'status');
+    if (change === 'settings edit') {
+      assert.equal(h.store.instances.value[0].last_played_at, status().launched_at);
+      assert.equal(h.store.instances.value[0].name, 'Renamed while starting');
+      assert.equal(h.store.instances.value[0].java_path, '/fixture/new-java');
+    } else assert.equal(h.store.instances.value, before);
+    const after = h.store.instances.value;
+    h.emit(status(3), 'status');
+    assert.equal(h.store.instances.value, after);
+    assert.deepEqual(h.sounds, []);
+  });
+}
+
+test('ordinary accepted Play retains one launch sound and accepted recency', async () => {
+  const h = launchHarness({ state: 'accepted', session: status() });
+  await h.launch.launchGame();
+  await flush();
+  assert.equal(h.store.instances.value[0].last_played_at, status().launched_at);
+  h.emit(status(2), 'status');
+  assert.deepEqual(h.sounds, ['launchSuccess']);
+});
 
 test('a known external session is adopted once and ordinary Stop targets its exact identity', async () => {
   const h = launchHarness(undefined, false);
