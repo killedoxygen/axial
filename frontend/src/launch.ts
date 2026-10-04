@@ -20,7 +20,7 @@ import {
 import type { LaunchSessionOutcome } from './types-launch';
 import { createBackendLaunchNoticeTracker, type BackendLaunchNoticeTracker } from './launch-notice-tracker';
 import { launchSessionsResponse, launchStatusUpdate } from './launch-response-adapters';
-import { dtoEnum, dtoError, dtoRecord, dtoString } from './dto-contract';
+import { dtoEnum, dtoError, dtoRecord, dtoString, isDtoRecord } from './dto-contract';
 import { enrichedInstanceResponse } from './dto-core';
 import { launchLogEntryResponse, launchLogsResponse } from './dto-launch';
 import { refreshInstanceReadiness } from './instance-readiness';
@@ -297,8 +297,17 @@ export async function adoptLaunchSession(sessionId: string, isCurrent: () => boo
     launchSessions.value = { ...sessions, [instanceId]: session };
     Music.suppress();
     reconnectLaunchSession(instanceId, instance.name);
-  } catch {
-    if (stillCurrent()) showError('Could not refresh the benchmark game session. Refresh the driver to try again.');
+  } catch (error) {
+    if (!stillCurrent()) return;
+    if (
+      isApiError(error) &&
+      error.status === 404 &&
+      isDtoRecord(error.payload) &&
+      error.payload.code === 'instance_not_found' &&
+      dtoError(error.payload) !== null
+    )
+      return;
+    showError('Could not refresh the benchmark game session. Refresh the driver to try again.');
   }
 }
 

@@ -73,6 +73,19 @@ const statusContract = source<typeof import('../../src/launch-response-adapters'
   './dto-contract': contract, './launch-notice-tracker': noticeContract,
 });
 
+function historicalStatusApi(statusCode = 404, payload: unknown = { error: 'The instance was not found.', code: 'instance_not_found' }) {
+  return source<typeof import('../../src/api')>('api.ts', {
+    './native': { getNativeApiTransportBootstrap: async () => null }, './dto-contract': contract,
+  }, {
+    URL, Headers, __AXIAL_WEB_API_BASE__: 'http://127.0.0.1:1', __AXIAL_TEST_API_CAPABILITY__: 'fixture-capability', __AXIAL_MOCK_API__: false,
+    fetch: async (url: string) => {
+      assert.equal(url, 'http://127.0.0.1:1/api/v1/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status');
+      return new Response(JSON.stringify(payload), { status: statusCode, headers: { 'Content-Type': 'application/json' } });
+    },
+  });
+}
+const apiContract = historicalStatusApi();
+
 function status(revision = 1, terminal = false) {
   return {
     session_id: 'session-1', instance_id: 'instance-1', revision,
@@ -126,7 +139,7 @@ function launchHarness(intentResult?: unknown, running = true) {
   const actions = source<typeof import('../../src/actions')>('actions.ts', {
     './store': store, './launch-response-adapters': statusContract,
   });
-  const api = { isApiError: () => false, api: async (method: string, path: string) => {
+  const api = { isApiError: apiContract.isApiError, api: async (method: string, path: string) => {
       if (intentResult !== undefined && path === '/launch') {
         assert.equal(method, 'POST'); calls.push(path); throw new Error('Launch response lost');
       }
@@ -239,6 +252,62 @@ test('an already terminal external session is not resurrected or connected', asy
   assert.equal(h.store.launchSessions.value, sessions);
   assert.equal(h.connections(), 0);
   assert.equal(h.errors.length, 0);
+});
+
+test('typed absence of a historical session is quiet and preserves any current game', async () => {
+  for (const running of [false, true]) {
+    const h = launchHarness(undefined, running);
+    await flush();
+    const response = historicalStatusApi();
+    h.readStatus(() => response.api('GET', '/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status'));
+    const sessions = h.store.launchSessions.value;
+    const preparation = h.store.launchState.value;
+    const connections = h.connections();
+    await h.launch.adoptLaunchSession('4772f752-5f75-48fb-a1f0-bb484f858ea0');
+    assert.equal(h.calls[h.calls.length - 1], '/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status');
+    assert.equal(h.store.launchSessions.value, sessions);
+    assert.equal(h.store.launchState.value, preparation);
+    assert.equal(h.connections(), connections);
+    assert.equal(h.closed(), 0);
+    assert.deepEqual(h.errors, []);
+  }
+});
+
+test('unclassified 404 and unavailable historical status remain visible safe failures', async () => {
+  for (const [code, payload] of [
+    [404, { error: 'private provider detail' }],
+    [404, { error: 'private provider detail', code: 'another_error' }],
+    [404, { code: 'instance_not_found' }],
+    [503, { error: 'private provider detail', code: 'instance_not_found' }],
+  ] as const) {
+    const h = launchHarness(undefined, false);
+    const sessions = h.store.launchSessions.value;
+    const response = historicalStatusApi(code, payload);
+    h.readStatus(() => response.api('GET', '/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status'));
+    await h.launch.adoptLaunchSession('4772f752-5f75-48fb-a1f0-bb484f858ea0');
+    assert.equal(h.store.launchSessions.value, sessions);
+    assert.equal(h.connections(), 0);
+    assert.equal(h.errors.length, 1);
+    assert.doesNotMatch(h.errors[0], /private provider detail/);
+  }
+});
+
+test('late historical absence cannot clear or reconnect a newer live projection', async () => {
+  const h = launchHarness();
+  await flush();
+  const pending = deferred<unknown>();
+  h.readStatus(() => pending.promise);
+  const adoption = h.launch.adoptLaunchSession('4772f752-5f75-48fb-a1f0-bb484f858ea0');
+  h.emit(status(5), 'status');
+  const sessions = h.store.launchSessions.value;
+  const response = historicalStatusApi();
+  await response.api('GET', '/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status').catch(pending.reject);
+  await adoption;
+  assert.equal(h.store.launchSessions.value, sessions);
+  assert.equal(h.store.launchSessions.value['instance-1'].statusRevision, 5);
+  assert.equal(h.connections(), 1);
+  assert.equal(h.closed(), 0);
+  assert.deepEqual(h.errors, []);
 });
 
 for (const change of [
