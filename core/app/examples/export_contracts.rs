@@ -1,13 +1,6 @@
 //! Export only reviewed public DTOs, never runtime commands or credentials.
 
 use axial_app::{
-    import::model::{
-        ImportPreview, InstanceImportMappings, InstanceImportRequest, InstanceImportResponse,
-        MetadataImportReceipt, MetadataImportRequest, MetadataImportResponse, MetadataImportStatus,
-        RulesImportRequest, RulesImportResponse, RulesImportStatus, SkinImportRequest,
-        SkinImportResponse, SkinImportStatus,
-    },
-    install::history::HistoryPage,
     instances::{delete::DeletionSnapshot, setup::CreateLoaderBuildsView},
     public::{ErrorResponse, OperationId},
     resources::{InstanceLogTailResponse, InstanceResourcesResponse},
@@ -25,7 +18,22 @@ use ts_rs::{Config, TS};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let destination = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../frontend/src/generated");
     match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [] => export(&destination),
+        [] => {
+            let expected = tempfile::tempdir()?;
+            export(expected.path())?;
+            let generated = files(expected.path())?;
+            fs::create_dir_all(&destination)?;
+            for entry in fs::read_dir(&destination)? {
+                let entry = entry?;
+                if !generated.contains_key(&entry.file_name()) {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+            for (name, contents) in generated {
+                fs::write(destination.join(name), contents)?;
+            }
+            Ok(())
+        }
         [flag] if flag == "--check" => {
             let expected = tempfile::tempdir()?;
             export(expected.path())?;
@@ -55,23 +63,8 @@ fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     InstanceResourcesResponse::export_all(&config)?;
     InstanceLogTailResponse::export_all(&config)?;
     PendingSkinStatus::export_all(&config)?;
-    ImportPreview::export_all(&config)?;
-    InstanceImportRequest::export_all(&config)?;
-    InstanceImportResponse::export_all(&config)?;
-    InstanceImportMappings::export_all(&config)?;
-    HistoryPage::export_all(&config)?;
     DeletionSnapshot::export_all(&config)?;
     CreateLoaderBuildsView::export_all(&config)?;
-    MetadataImportRequest::export_all(&config)?;
-    MetadataImportReceipt::export_all(&config)?;
-    MetadataImportResponse::export_all(&config)?;
-    MetadataImportStatus::export_all(&config)?;
-    SkinImportRequest::export_all(&config)?;
-    SkinImportResponse::export_all(&config)?;
-    SkinImportStatus::export_all(&config)?;
-    RulesImportRequest::export_all(&config)?;
-    RulesImportResponse::export_all(&config)?;
-    RulesImportStatus::export_all(&config)?;
     Ok(())
 }
 

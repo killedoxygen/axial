@@ -4,1332 +4,10 @@ fn fixture_directory() -> tempfile::TempDir {
     tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
 }
 
-fn suite() -> BenchmarkSuiteManifest {
-    BenchmarkSuiteManifest {
-        schema: "axial.launch.benchmark.suite".into(),
-        schema_version: 2,
-        suite_id: format!("legacy-suite-{}", "1".repeat(64)),
-        instance_id: "1c53a187-80d2-4396-9dc8-1d11dc3f03d0".into(),
-        mode: "release_validation".into(),
-        created_at: "2026-01-01T00:00:00Z".into(),
-        updated_at: "2026-01-01T00:05:00Z".into(),
-        historical: true,
-        runs: vec![BenchmarkSuiteManifestRun {
-            run_index: 5,
-            profile: "retained+custom".into(),
-            run_type: "warm".into(),
-            target_id: "older+target".into(),
-            benchmark_id: "benchmark-1234567890abcdef".into(),
-            session_id: Some(format!("legacy-{}", "a".repeat(64))),
-            launched_at: Some("2026-01-01T00:01:00Z".into()),
-            state: "completed".into(),
-            launch_intent: None,
-        }],
-    }
-}
-
-fn driver() -> BenchmarkSuiteDriverStatus {
-    BenchmarkSuiteDriverStatus {
-        id: format!("legacy-driver-{}", "2".repeat(64)),
-        suite_id: suite().suite_id,
-        mode: "release_validation".into(),
-        state: "interrupted".into(),
-        interval_ms: 5_000,
-        run_count: 8,
-        launched_run_count: 1,
-        pending_run_index: Some(1),
-        active_session_id: None,
-        last_run_index: Some(5),
-        last_session_id: Some(format!("legacy-{}", "b".repeat(64))),
-        error: Some("Driver interrupted by application restart".into()),
-        created_at: "2026-01-01T00:00:00Z".into(),
-        updated_at: "2026-01-01T00:03:00Z".into(),
-        historical: true,
-    }
-}
-
 fn open_storage(path: &std::path::Path) -> Arc<MetadataStore> {
     let storage = Arc::new(MetadataStore::open(path).unwrap());
+    storage.migrate(&[MIGRATION]).unwrap();
     storage
-        .migrate(&[MIGRATION, MIGRATION_V2, MIGRATION_V3])
-        .unwrap();
-    storage
-}
-
-const ARCHIVE_SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-fn archived_input(index: usize) -> (String, BenchmarkSuiteManifest, BenchmarkSuiteDriverStatus) {
-    let mut suite = suite();
-    suite.suite_id = format!("legacy-suite-{index:064x}");
-    suite.mode = "development".into();
-    suite.runs = benchmark_suite_plan("development")
-        .unwrap()
-        .into_iter()
-        .enumerate()
-        .map(|(index, run)| BenchmarkSuiteManifestRun {
-            run_index: index,
-            profile: run.profile.into(),
-            run_type: run.run_type.into(),
-            target_id: run.target_id.unwrap_or("").into(),
-            benchmark_id: benchmark_suite_run_id("development", index, run),
-            session_id: None,
-            launched_at: None,
-            state: "pending".into(),
-            launch_intent: None,
-        })
-        .collect();
-    let mut driver = driver();
-    driver.id = format!("legacy-driver-{index:064x}");
-    driver.suite_id = suite.suite_id.clone();
-    driver.mode = suite.mode.clone();
-    driver.state = "stopped".into();
-    driver.run_count = suite.runs.len();
-    driver.launched_run_count = 0;
-    driver.pending_run_index = Some(0);
-    driver.last_run_index = None;
-    driver.last_session_id = None;
-    driver.error = None;
-    (format!("{index:016x}"), suite, driver)
-}
-
-#[tokio::test]
-async fn detached_benchmark_driver_survives_parent_retention_and_reopens_read_only() {
-    let root = fixture_directory();
-    let path = root.path().join("metadata.sqlite");
-    let storage = open_storage(&path);
-    let (_, _, driver) = archived_input(18);
-    let prepared = PreparedBenchmarkImport::prepare_detached(ARCHIVE_SOURCE, vec![driver.clone()])
-        .expect("independently retained terminal driver history must be preparable");
-    let proof = prepared.completion_proof(ARCHIVE_SOURCE).unwrap();
-    assert_eq!(proof.count(), 1);
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    drop(storage);
-
-    let storage = open_storage(&path);
-    storage
-        .read(|db| {
-            assert!(stored_suite(db, &driver.suite_id)?.is_none());
-            assert_eq!(stored_driver(db, &driver.id)?, Some(driver.clone()));
-            assert_eq!(stored_drivers_in(db)?, vec![driver.clone()]);
-            proof.verify_in(db, ARCHIVE_SOURCE)?;
-            prepared.verify_in(db)
-        })
-        .unwrap();
-    let service = service(root.path(), storage.clone());
-    assert_eq!(service.driver(&driver.id).unwrap(), driver);
-    assert_eq!(service.drivers().unwrap(), vec![driver.clone()]);
-    assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
-    assert!(!service.can_resume_driver(&driver.id).unwrap());
-    assert!(matches!(
-        service.resume_driver(&driver.id),
-        Err(BenchmarkError::NotFound)
-    ));
-    assert!(matches!(
-        service.stop_driver(&driver.id),
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(service.sessions.sessions().is_empty());
-    assert!(service.tasks.status().is_idle());
-    let payload = driver_payload(driver);
-    assert_eq!(payload["view_model"]["can_resume"], false);
-    assert_eq!(payload["view_model"]["can_stop"], false);
-    assert!(payload["driver"].get("detached_source").is_none());
-}
-
-#[test]
-fn detached_benchmark_provenance_is_immutable_and_old_bound_proofs_remain_bound() {
-    let legacy_empty: ArchivedBenchmarkCompletionProof = serde_json::from_str(r#"{"source_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","suite_ids":[],"driver_ids":[],"digest":"98b096279bab25c11adc2fd9f242305b4f8af30063da640324c8fae90061af1e"}"#).unwrap();
-    assert_eq!(
-        PreparedBenchmarkImport::prepare_archived(ARCHIVE_SOURCE, vec![], vec![])
-            .unwrap()
-            .completion_proof(ARCHIVE_SOURCE)
-            .unwrap(),
-        legacy_empty
-    );
-    let empty_root = fixture_directory();
-    open_storage(&empty_root.path().join("metadata.sqlite"))
-        .read(|db| legacy_empty.verify_in(db, ARCHIVE_SOURCE))
-        .unwrap();
-    for detached in [false, true] {
-        for change in [
-            "source",
-            "source_null",
-            "request",
-            "lineage",
-            "payload",
-            "missing",
-        ] {
-            let root = fixture_directory();
-            let storage = open_storage(&root.path().join("metadata.sqlite"));
-            let (legacy, suite, driver) = archived_input(19);
-            let prepared = if detached {
-                PreparedBenchmarkImport::prepare_detached(ARCHIVE_SOURCE, vec![driver.clone()])
-            } else {
-                PreparedBenchmarkImport::prepare_archived(
-                    ARCHIVE_SOURCE,
-                    vec![(legacy, suite)],
-                    vec![driver.clone()],
-                )
-            }
-            .unwrap();
-            let proof = prepared.completion_proof(ARCHIVE_SOURCE).unwrap();
-            let wire = serde_json::to_value(&proof).unwrap();
-            assert_eq!(wire.get("detached_driver_indices").is_some(), detached);
-            let decoded: ArchivedBenchmarkCompletionProof = serde_json::from_value(wire).unwrap();
-            assert_eq!(decoded, proof);
-            storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-            storage
-                .read(|db| decoded.verify_in(db, ARCHIVE_SOURCE))
-                .unwrap();
-            storage.transaction(|tx| {
-                match change {
-                    "source" => { tx.execute("UPDATE benchmark_drivers SET detached_source=?1", ["b".repeat(64)])?; }
-                    "source_null" if detached => { tx.execute("UPDATE benchmark_drivers SET detached_source=NULL", [])?; }
-                    "source_null" => { tx.execute("UPDATE benchmark_drivers SET detached_source=?1", [ARCHIVE_SOURCE])?; }
-                    "request" => { tx.execute("UPDATE benchmark_drivers SET request=x'7b7d'", [])?; }
-                    "lineage" => { tx.execute("UPDATE benchmark_drivers SET source_driver_id='other'", [])?; }
-                    "payload" => { tx.execute("UPDATE benchmark_drivers SET payload=CAST(json_set(payload,'$.error','changed') AS BLOB)", [])?; }
-                    "missing" => { tx.execute("DELETE FROM benchmark_drivers", [])?; }
-                    _ => unreachable!(),
-                }
-                Ok::<_, BenchmarkError>(())
-            }).unwrap();
-            assert!(
-                storage
-                    .read(|db| proof.verify_in(db, ARCHIVE_SOURCE))
-                    .is_err(),
-                "{detached} {change}"
-            );
-            assert!(
-                storage.read(|db| prepared.verify_in(db)).is_err(),
-                "{detached} {change}"
-            );
-            if change != "missing" {
-                assert!(
-                    storage.transaction(|tx| prepared.insert_in(tx)).is_err(),
-                    "{detached} {change}"
-                );
-            }
-        }
-    }
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    let prepared = PreparedBenchmarkImport::prepare(vec![suite()], vec![driver()]).unwrap();
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    storage
-        .transaction(|tx| {
-            tx.execute("DELETE FROM benchmark_suites", [])?;
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    assert!(storage.read(|db| stored_driver(db, &driver().id)).is_err());
-    assert!(storage.read(stored_drivers_in).is_err());
-}
-
-#[test]
-fn detached_benchmark_later_parent_preserves_receipt_and_refuses_conflicts_atomically() {
-    for parent_kind in ["archived", "mapped", "wrong_mode", "wrong_source"] {
-        let root = fixture_directory();
-        let storage = open_storage(&root.path().join("metadata.sqlite"));
-        let (legacy, mut suite, driver) = archived_input(20);
-        let detached =
-            PreparedBenchmarkImport::prepare_detached(ARCHIVE_SOURCE, vec![driver.clone()])
-                .unwrap();
-        let proof = detached.completion_proof(ARCHIVE_SOURCE).unwrap();
-        storage.transaction(|tx| detached.insert_in(tx)).unwrap();
-        let original: (Vec<u8>, String) = storage
-            .read(|db| {
-                db.query_row(
-                    "SELECT payload,detached_source FROM benchmark_drivers",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(BenchmarkError::from)
-            })
-            .unwrap();
-        if parent_kind == "wrong_mode" {
-            suite.mode = "release_validation".into();
-        }
-        let parent = if parent_kind == "mapped" {
-            PreparedBenchmarkImport::prepare(vec![suite.clone()], vec![])
-        } else {
-            PreparedBenchmarkImport::prepare_archived(
-                if parent_kind == "wrong_source" {
-                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                } else {
-                    ARCHIVE_SOURCE
-                },
-                vec![(legacy, suite.clone())],
-                vec![],
-            )
-        }
-        .unwrap();
-        let result = storage.transaction(|tx| parent.insert_in(tx));
-        if parent_kind.starts_with("wrong_") {
-            assert!(
-                matches!(result, Err(BenchmarkError::ConflictingHistory)),
-                "{parent_kind}: {result:?}"
-            );
-            assert!(
-                storage
-                    .read(|db| stored_suite(db, &suite.suite_id))
-                    .unwrap()
-                    .is_none()
-            );
-        } else {
-            result.unwrap();
-            storage.transaction(|tx| parent.insert_in(tx)).unwrap();
-            storage.read(|db| parent.verify_in(db)).unwrap();
-            if parent_kind == "archived" {
-                let mut combined = detached.clone();
-                combined.append(&parent).unwrap();
-                let combined_proof = combined.completion_proof(ARCHIVE_SOURCE).unwrap();
-                assert_eq!(combined_proof.count(), 2);
-                storage.transaction(|tx| combined.insert_in(tx)).unwrap();
-                storage
-                    .read(|db| combined_proof.verify_in(db, ARCHIVE_SOURCE))
-                    .unwrap();
-            }
-        }
-        storage
-            .read(|db| {
-                let current: (Vec<u8>, String) = db.query_row(
-                    "SELECT payload,detached_source FROM benchmark_drivers",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?;
-                assert_eq!(current, original);
-                assert_eq!(stored_driver(db, &driver.id)?, Some(driver.clone()));
-                proof.verify_in(db, ARCHIVE_SOURCE)?;
-                detached.verify_in(db)
-            })
-            .unwrap();
-        assert_eq!(detached.completion_proof(ARCHIVE_SOURCE).unwrap(), proof);
-        if !parent_kind.starts_with("wrong_") {
-            storage.transaction(|tx| {
-                tx.execute("UPDATE benchmark_suites SET payload=CAST(json_set(payload,'$.mode','invalid') AS BLOB)", [])?;
-                Ok::<_, BenchmarkError>(())
-            }).unwrap();
-            assert!(storage.read(|db| stored_driver(db, &driver.id)).is_err());
-            assert!(
-                storage
-                    .read(|db| proof.verify_in(db, ARCHIVE_SOURCE))
-                    .is_err()
-            );
-            assert!(storage.read(|db| detached.verify_in(db)).is_err());
-        }
-    }
-}
-
-#[test]
-fn detached_benchmark_insert_and_final_verification_reject_suppressed_or_changed_provenance() {
-    for trigger in [
-        "CREATE TRIGGER refuse BEFORE INSERT ON benchmark_drivers BEGIN SELECT RAISE(IGNORE); END",
-        "CREATE TRIGGER refuse BEFORE INSERT ON benchmark_drivers BEGIN SELECT RAISE(ABORT,'refused'); END",
-        "CREATE TRIGGER refuse AFTER INSERT ON benchmark_drivers BEGIN UPDATE benchmark_drivers SET detached_source=NULL; END",
-        "CREATE TRIGGER refuse AFTER INSERT ON benchmark_drivers BEGIN UPDATE benchmark_drivers SET source_driver_id='other'; END",
-    ] {
-        let root = fixture_directory();
-        let storage = open_storage(&root.path().join("metadata.sqlite"));
-        let detached =
-            PreparedBenchmarkImport::prepare_detached(ARCHIVE_SOURCE, vec![archived_input(21).2])
-                .unwrap();
-        storage
-            .transaction(|tx| {
-                tx.execute_batch(trigger)?;
-                Ok::<_, BenchmarkError>(())
-            })
-            .unwrap();
-        assert!(
-            storage.transaction(|tx| detached.insert_in(tx)).is_err(),
-            "{trigger}"
-        );
-        assert_eq!(
-            storage
-                .read(|db| db
-                    .query_row("SELECT count(*) FROM benchmark_drivers", [], |row| row
-                        .get::<_, usize>(0))
-                    .map_err(BenchmarkError::from))
-                .unwrap(),
-            0
-        );
-    }
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    let (legacy, suite, driver) = archived_input(22);
-    let detached = PreparedBenchmarkImport::prepare_detached(ARCHIVE_SOURCE, vec![driver]).unwrap();
-    let parent =
-        PreparedBenchmarkImport::prepare_archived(ARCHIVE_SOURCE, vec![(legacy, suite)], vec![])
-            .unwrap();
-    storage.transaction(|tx| detached.insert_in(tx)).unwrap();
-    assert!(storage.transaction(|tx| {
-        parent.insert_in(tx)?;
-        tx.execute("UPDATE benchmark_drivers SET payload=CAST(json_set(payload,'$.mode','release_validation') AS BLOB)", [])?;
-        parent.verify_in(tx)
-    }).is_err());
-    storage.read(|db| detached.verify_in(db)).unwrap();
-    assert_eq!(
-        storage
-            .read(|db| db
-                .query_row("SELECT count(*) FROM benchmark_suites", [], |row| row
-                    .get::<_, usize>(0))
-                .map_err(BenchmarkError::from))
-            .unwrap(),
-        0
-    );
-}
-
-#[test]
-fn detached_benchmark_bounds_and_shared_parent_budget_are_enforced() {
-    let (_, suite, driver) = archived_input(23);
-    assert!(PreparedBenchmarkImport::prepare_detached("invalid", vec![]).is_err());
-    assert!(
-        PreparedBenchmarkImport::prepare_detached(
-            ARCHIVE_SOURCE,
-            vec![driver.clone(), driver.clone()]
-        )
-        .is_err()
-    );
-    let mut queued = driver.clone();
-    queued.state = "interrupted".into();
-    queued.error = Some("driver automatic resume queued after restart".into());
-    assert!(PreparedBenchmarkImport::prepare_detached(ARCHIVE_SOURCE, vec![queued]).is_err());
-    let mut active = driver.clone();
-    active.active_session_id = Some(format!("legacy-{}", "f".repeat(64)));
-    assert!(PreparedBenchmarkImport::prepare_detached(ARCHIVE_SOURCE, vec![active]).is_err());
-    let drivers = (0..1024)
-        .map(|index| {
-            let mut driver = driver.clone();
-            driver.id = format!("legacy-driver-{index:064x}");
-            driver
-        })
-        .collect::<Vec<_>>();
-    let full = PreparedBenchmarkImport::prepare_detached(ARCHIVE_SOURCE, drivers.clone()).unwrap();
-    let proof = full.completion_proof(ARCHIVE_SOURCE).unwrap();
-    assert_eq!(proof.count(), 1024);
-    assert!(serde_json::to_vec(&proof).unwrap().len() <= MAX_ARCHIVED_BENCHMARK_PROOF_BYTES);
-    let mut too_many = drivers;
-    too_many.push(archived_input(2048).2);
-    assert!(PreparedBenchmarkImport::prepare_detached(ARCHIVE_SOURCE, too_many).is_err());
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    storage.transaction(|tx| full.insert_in(tx)).unwrap();
-    let parent = PreparedBenchmarkImport::prepare(vec![suite.clone()], vec![]).unwrap();
-    storage.transaction(|tx| parent.insert_in(tx)).unwrap();
-    storage
-        .read(|db| {
-            proof.verify_in(db, ARCHIVE_SOURCE)?;
-            let mut remaining = parent.suites[0].1.len();
-            let mut parents = BTreeMap::new();
-            verify_imported_parent(
-                db,
-                &driver,
-                Some(ARCHIVE_SOURCE),
-                &mut parents,
-                &mut remaining,
-            )?;
-            assert_eq!(remaining, 0);
-            verify_imported_parent(
-                db,
-                &driver,
-                Some(ARCHIVE_SOURCE),
-                &mut parents,
-                &mut remaining,
-            )?;
-            assert_eq!(remaining, 0);
-            assert!(
-                verify_imported_parent(
-                    db,
-                    &driver,
-                    Some(ARCHIVE_SOURCE),
-                    &mut BTreeMap::new(),
-                    &mut remaining
-                )
-                .is_err()
-            );
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    for indices in [vec![], vec![0, 0], vec![1024], vec![1, 0]] {
-        let mut invalid = proof.clone();
-        invalid.detached_driver_indices = indices;
-        assert!(
-            storage
-                .read(|db| invalid.verify_in(db, ARCHIVE_SOURCE))
-                .is_err()
-        );
-    }
-}
-
-#[tokio::test]
-async fn detached_benchmark_later_mapped_parent_uses_existing_resume_admission() {
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-    let (suite, driver, report) = continuation_history(&instance, true);
-    let detached =
-        PreparedBenchmarkImport::prepare_detached(ARCHIVE_SOURCE, vec![driver.clone()]).unwrap();
-    let proof = detached.completion_proof(ARCHIVE_SOURCE).unwrap();
-    storage.transaction(|tx| detached.insert_in(tx)).unwrap();
-    assert!(!service.can_resume_driver(&driver.id).unwrap());
-    assert!(matches!(
-        service.resume_driver(&driver.id),
-        Err(BenchmarkError::NotFound)
-    ));
-    let parent = PreparedBenchmarkImport::prepare(vec![suite], vec![]).unwrap();
-    storage.transaction(|tx| parent.insert_in(tx)).unwrap();
-    // Parent presence alone is not authority: the retained completed run still
-    // requires its exact report before the existing continuation can be used.
-    assert!(!service.can_resume_driver(&driver.id).unwrap());
-    assert!(matches!(
-        service.resume_driver(&driver.id),
-        Err(BenchmarkError::Unavailable)
-    ));
-    assert!(service.resumed_driver(&driver.id).unwrap().is_none());
-    let reports =
-        crate::launch::reports::PreparedReportImport::prepare(report.into_iter().collect())
-            .unwrap();
-    storage.transaction(|tx| reports.insert_in(tx)).unwrap();
-    assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
-    assert!(service.can_resume_driver(&driver.id).unwrap());
-    let successor = service.resume_driver(&driver.id).unwrap();
-    assert!(!successor.historical);
-    assert_ne!(successor.id, driver.id);
-    assert_eq!(service.resume_driver(&driver.id).unwrap().id, successor.id);
-    service.stop_driver(&successor.id).unwrap();
-    service
-        .tasks
-        .shutdown(std::time::Duration::from_secs(2))
-        .await
-        .unwrap();
-    storage
-        .read(|db| {
-            proof.verify_in(db, ARCHIVE_SOURCE)?;
-            detached.verify_in(db)?;
-            assert_eq!(stored_driver(db, &driver.id)?, Some(driver));
-            assert_eq!(
-                db.query_row("SELECT count(*) FROM launch_intents", [], |row| row
-                    .get::<_, usize>(0))?,
-                0
-            );
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    assert!(service.sessions.sessions().is_empty());
-}
-
-#[test]
-fn detached_benchmark_corrupt_provenance_obeys_actual_byte_budget_before_decode() {
-    let root = fixture_directory();
-    let path = root.path().join("metadata.sqlite");
-    let storage = open_storage(&path);
-    let driver = archived_input(24).2;
-    let prepared =
-        PreparedBenchmarkImport::prepare_detached(ARCHIVE_SOURCE, vec![driver.clone()]).unwrap();
-    let proof = prepared.completion_proof(ARCHIVE_SOURCE).unwrap();
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    let budget = prepared.drivers[0].1.len() + ARCHIVE_SOURCE.len();
-    let raw = Connection::open(&path).unwrap();
-    raw.pragma_update(None, "ignore_check_constraints", true)
-        .unwrap();
-    raw.execute(
-        "UPDATE benchmark_drivers SET detached_source=?1",
-        ["é".repeat(64)],
-    )
-    .unwrap();
-    drop(raw);
-    storage
-        .read(|db| {
-            let mut remaining = budget;
-            assert!(matches!(
-                imported_driver_row(db, &driver.id, &mut remaining),
-                Err(BenchmarkError::Invalid)
-            ));
-            assert_eq!(remaining, budget);
-            assert!(proof.verify_in(db, ARCHIVE_SOURCE).is_err());
-            assert!(prepared.verify_in(db).is_err());
-            assert!(stored_driver(db, &driver.id).is_err());
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    drop(storage);
-    assert!(matches!(
-        MetadataStore::open(&path),
-        Err(StorageError::Corrupt)
-    ));
-}
-
-#[tokio::test]
-async fn archived_benchmarks_reopen_read_only_without_poisoning_other_driver_actions() {
-    let root = fixture_directory();
-    let path = root.path().join("metadata.sqlite");
-    let storage = open_storage(&path);
-    let (legacy, archived_suite, archived_driver) = archived_input(10);
-    let archived = PreparedBenchmarkImport::prepare_archived(
-        ARCHIVE_SOURCE,
-        vec![(legacy.clone(), archived_suite.clone())],
-        vec![archived_driver.clone()],
-    )
-    .unwrap();
-    let proof = archived.completion_proof(ARCHIVE_SOURCE).unwrap();
-    let mut combined = PreparedBenchmarkImport::prepare(vec![suite()], vec![driver()]).unwrap();
-    combined.append(&archived).unwrap();
-    assert!(combined.completion_proof(ARCHIVE_SOURCE).is_err());
-    storage.transaction(|tx| combined.insert_in(tx)).unwrap();
-    storage.transaction(|tx| combined.insert_in(tx)).unwrap();
-    drop(storage);
-
-    let storage = open_storage(&path);
-    let service = service(root.path(), storage.clone());
-    let mut expected = archived_suite;
-    expected.instance_id = format!("archived-{ARCHIVE_SOURCE}-{legacy}");
-    assert_eq!(
-        service.suite(&expected.suite_id).unwrap(),
-        Some(expected.clone())
-    );
-    assert_eq!(
-        service.driver(&archived_driver.id).unwrap(),
-        archived_driver
-    );
-    assert_eq!(service.drivers().unwrap().len(), 2);
-    assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
-    assert!(!service.can_resume_driver(&archived_driver.id).unwrap());
-    assert!(matches!(
-        service.resume_driver(&archived_driver.id),
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(matches!(
-        service.stop_driver(&archived_driver.id),
-        Err(BenchmarkError::Invalid)
-    ));
-    let input = serde_json::from_value(serde_json::json!({"suite_id":expected.suite_id})).unwrap();
-    assert!(matches!(
-        service.tick(input).await,
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(
-        service
-            .resumed_driver(&archived_driver.id)
-            .unwrap()
-            .is_none()
-    );
-    let input = serde_json::from_value(serde_json::json!({"instance_id":suite().instance_id,"suite_id":"ordinary-suite","suite_mode":"development"})).unwrap();
-    // A stopped ordinary row is read through the same combined projection.
-    let mut ordinary_suite = expected.clone();
-    ordinary_suite.instance_id = suite().instance_id;
-    ordinary_suite.suite_id = "ordinary-suite".into();
-    ordinary_suite.historical = false;
-    for run in &mut ordinary_suite.runs {
-        run.launch_intent = Some(uuid::Uuid::new_v4().to_string());
-    }
-    let mut ordinary_driver = archived_driver.clone();
-    ordinary_driver.id = "ordinary-driver".into();
-    ordinary_driver.suite_id = ordinary_suite.suite_id.clone();
-    ordinary_driver.historical = false;
-    storage
-        .transaction(|tx| {
-            tx.execute(
-                "INSERT INTO benchmark_suites(suite_id,payload) VALUES(?1,?2)",
-                params![
-                    ordinary_suite.suite_id,
-                    serde_json::to_vec(&ordinary_suite).unwrap()
-                ],
-            )?;
-            tx.execute(
-                "INSERT INTO benchmark_drivers(driver_id,payload,request) VALUES(?1,?2,?3)",
-                params![
-                    ordinary_driver.id,
-                    serde_json::to_vec(&ordinary_driver).unwrap(),
-                    serde_json::to_vec::<BenchmarkLaunchRequest>(&input).unwrap()
-                ],
-            )?;
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    let actions = service.resume_actions(&service.drivers().unwrap()).unwrap();
-    assert_eq!(actions[&archived_driver.id], (false, None));
-    assert_eq!(actions[&ordinary_driver.id], (true, None));
-    storage
-        .read(|db| {
-            combined.verify_in(db)?;
-            proof.verify_in(db, ARCHIVE_SOURCE)?;
-            assert_eq!(
-                db.query_row(
-                    "SELECT count(*) FROM benchmark_drivers WHERE source_driver_id IS NOT NULL",
-                    [],
-                    |row| row.get::<_, usize>(0)
-                )?,
-                0
-            );
-            assert_eq!(
-                db.query_row("SELECT count(*) FROM launch_intents", [], |row| row
-                    .get::<_, usize>(0))?,
-                0
-            );
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    assert!(service.sessions.sessions().is_empty());
-    assert!(service.tasks.status().is_idle());
-}
-
-#[test]
-fn archived_benchmarks_bound_admission_proof_and_atomic_append() {
-    let (legacy, suite, driver) = archived_input(1);
-    assert!(PreparedBenchmarkImport::prepare_archived("invalid", vec![], vec![]).is_err());
-    assert!(
-        PreparedBenchmarkImport::prepare_archived(
-            ARCHIVE_SOURCE,
-            vec![("ABCDEF0123456789".into(), suite.clone())],
-            vec![]
-        )
-        .is_err()
-    );
-    assert!(
-        PreparedBenchmarkImport::prepare_archived(ARCHIVE_SOURCE, vec![], vec![driver.clone()])
-            .is_err()
-    );
-    let archived = PreparedBenchmarkImport::prepare_archived(
-        ARCHIVE_SOURCE,
-        vec![(legacy, suite)],
-        vec![driver],
-    )
-    .unwrap();
-    assert!(PreparedBenchmarkImport::prepare(vec![archived.suites[0].0.clone()], vec![]).is_err());
-    assert!(archived.completion_proof(&"b".repeat(64)).is_err());
-    let mut duplicate = archived.clone();
-    let before = duplicate.completion_proof(ARCHIVE_SOURCE).unwrap();
-    assert!(duplicate.append(&archived).is_err());
-    assert_eq!(duplicate.completion_proof(ARCHIVE_SOURCE).unwrap(), before);
-    let inputs: Vec<_> = (1..=1024).map(archived_input).collect();
-    let mut full = PreparedBenchmarkImport::prepare_archived(
-        ARCHIVE_SOURCE,
-        inputs
-            .into_iter()
-            .map(|(id, suite, _)| (id, suite))
-            .collect(),
-        vec![],
-    )
-    .unwrap();
-    let proof = full.completion_proof(ARCHIVE_SOURCE).unwrap();
-    assert_eq!(proof.count(), 1024);
-    let encoded = serde_json::to_vec(&proof).unwrap();
-    assert!(encoded.len() > 64 * 1024 && encoded.len() <= MAX_ARCHIVED_BENCHMARK_PROOF_BYTES);
-    assert!(full.append(&archived).is_err());
-    assert_eq!(full.completion_proof(ARCHIVE_SOURCE).unwrap(), proof);
-    assert!(
-        PreparedBenchmarkImport::prepare_archived(
-            ARCHIVE_SOURCE,
-            (1..=1025)
-                .map(archived_input)
-                .map(|(id, suite, _)| (id, suite))
-                .collect(),
-            vec![]
-        )
-        .is_err()
-    );
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    let empty = PreparedBenchmarkImport::prepare_archived(ARCHIVE_SOURCE, vec![], vec![]).unwrap();
-    let empty_proof = empty.completion_proof(ARCHIVE_SOURCE).unwrap();
-    assert_eq!(empty_proof.count(), 0);
-    storage
-        .read(|db| empty_proof.verify_in(db, ARCHIVE_SOURCE))
-        .unwrap();
-    assert_ne!(
-        empty_proof,
-        empty.completion_proof(&"b".repeat(64)).unwrap()
-    );
-    let mut malformed = proof.clone();
-    malformed.suite_ids.reverse();
-    assert!(
-        storage
-            .read(|db| malformed.verify_in(db, ARCHIVE_SOURCE))
-            .is_err()
-    );
-    malformed = proof.clone();
-    malformed.suite_ids[1] = malformed.suite_ids[0].clone();
-    assert!(
-        storage
-            .read(|db| malformed.verify_in(db, ARCHIVE_SOURCE))
-            .is_err()
-    );
-    let wire = serde_json::to_string(&empty_proof).unwrap();
-    assert!(
-        serde_json::from_str::<ArchivedBenchmarkCompletionProof>(&format!(
-            "{{\"source_id\":\"{ARCHIVE_SOURCE}\",{}",
-            &wire[1..]
-        ))
-        .is_err()
-    );
-    let mut unknown = serde_json::to_value(empty_proof).unwrap();
-    unknown["unknown"] = true.into();
-    assert!(serde_json::from_value::<ArchivedBenchmarkCompletionProof>(unknown).is_err());
-}
-
-#[test]
-fn archived_benchmarks_suite_only_proof_is_sorted_and_snapshot_specific() {
-    let root = fixture_directory();
-    let path = root.path().join("metadata.sqlite");
-    let storage = open_storage(&path);
-    let inputs: Vec<_> = (1..=2)
-        .map(archived_input)
-        .map(|(id, suite, _)| (id, suite))
-        .collect();
-    let forward =
-        PreparedBenchmarkImport::prepare_archived(ARCHIVE_SOURCE, inputs.clone(), vec![]).unwrap();
-    let reverse = PreparedBenchmarkImport::prepare_archived(
-        ARCHIVE_SOURCE,
-        inputs.into_iter().rev().collect(),
-        vec![],
-    )
-    .unwrap();
-    let proof = forward.completion_proof(ARCHIVE_SOURCE).unwrap();
-    assert_eq!(proof.count(), 2);
-    assert_eq!(reverse.completion_proof(ARCHIVE_SOURCE).unwrap(), proof);
-    storage.transaction(|tx| forward.insert_in(tx)).unwrap();
-    let (id, suite, _) = archived_input(3);
-    let later =
-        PreparedBenchmarkImport::prepare_archived(ARCHIVE_SOURCE, vec![(id, suite)], vec![])
-            .unwrap();
-    storage.transaction(|tx| later.insert_in(tx)).unwrap();
-    drop(storage);
-    let storage = open_storage(&path);
-    let proof: ArchivedBenchmarkCompletionProof =
-        serde_json::from_slice(&serde_json::to_vec(&proof).unwrap()).unwrap();
-    storage
-        .read(|db| {
-            proof.verify_in(db, ARCHIVE_SOURCE)?;
-            forward.verify_in(db)?;
-            later.verify_in(db)?;
-            assert_eq!(
-                db.query_row("SELECT count(*) FROM benchmark_suites", [], |row| row
-                    .get::<_, usize>(0))?,
-                3
-            );
-            assert_eq!(
-                db.query_row("SELECT count(*) FROM benchmark_drivers", [], |row| row
-                    .get::<_, usize>(0))?,
-                0
-            );
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-}
-
-#[test]
-fn archived_benchmarks_snapshot_replay_refuses_missing_changed_and_linked_rows() {
-    for change in [
-        "suite_missing",
-        "driver_missing",
-        "suite_payload",
-        "driver_payload",
-        "suite_source",
-        "driver_source",
-        "request",
-        "spacing",
-    ] {
-        let root = fixture_directory();
-        let storage = open_storage(&root.path().join("metadata.sqlite"));
-        let (id, suite, driver) = archived_input(1);
-        let prepared = PreparedBenchmarkImport::prepare_archived(
-            ARCHIVE_SOURCE,
-            vec![(id, suite.clone())],
-            vec![driver.clone()],
-        )
-        .unwrap();
-        let proof = prepared.completion_proof(ARCHIVE_SOURCE).unwrap();
-        storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-        storage.transaction(|tx| {
-            match change {
-                "suite_missing" => { tx.execute("DELETE FROM benchmark_suites", [])?; }
-                "driver_missing" => { tx.execute("DELETE FROM benchmark_drivers", [])?; }
-                "suite_payload" => { tx.execute("UPDATE benchmark_suites SET payload=CAST(json_set(payload,'$.updated_at','2026-01-01T00:06:00Z') AS BLOB)", [])?; }
-                "driver_payload" => { tx.execute("UPDATE benchmark_drivers SET payload=CAST(json_set(payload,'$.error','Retained different outcome') AS BLOB)", [])?; }
-                "suite_source" => { tx.execute("UPDATE benchmark_suites SET source_suite_id='different'", [])?; }
-                "driver_source" => { tx.execute("UPDATE benchmark_drivers SET source_driver_id='different'", [])?; }
-                "request" => { tx.execute("UPDATE benchmark_drivers SET request=?1", [b"{}".as_slice()])?; }
-                "spacing" => { let mut bytes = prepared.suites[0].1.clone(); bytes.push(b' '); tx.execute("UPDATE benchmark_suites SET payload=?1", [bytes])?; }
-                _ => unreachable!(),
-            }
-            Ok::<_, BenchmarkError>(())
-        }).unwrap();
-        assert!(
-            storage
-                .read(|db| proof.verify_in(db, ARCHIVE_SOURCE))
-                .is_err(),
-            "{change}"
-        );
-        if change != "spacing" {
-            assert!(
-                storage.read(|db| prepared.verify_in(db)).is_err(),
-                "{change}"
-            );
-        }
-    }
-}
-
-#[test]
-fn archived_benchmarks_insert_rolls_back_ignored_and_late_corruption() {
-    for trigger in [
-        "CREATE TRIGGER refuse BEFORE INSERT ON benchmark_suites BEGIN SELECT RAISE(IGNORE); END",
-        "CREATE TRIGGER refuse BEFORE INSERT ON benchmark_drivers BEGIN SELECT RAISE(IGNORE); END",
-        "CREATE TRIGGER refuse BEFORE INSERT ON benchmark_drivers BEGIN SELECT RAISE(ABORT,'refused'); END",
-        "CREATE TRIGGER refuse AFTER INSERT ON benchmark_drivers BEGIN UPDATE benchmark_suites SET payload=CAST(json_set(payload,'$.updated_at','2026-01-01T00:06:00Z') AS BLOB); END",
-        "CREATE TRIGGER refuse AFTER INSERT ON benchmark_drivers BEGIN UPDATE benchmark_drivers SET request=x'7b7d'; END",
-    ] {
-        let root = fixture_directory();
-        let storage = open_storage(&root.path().join("metadata.sqlite"));
-        let (id, suite, driver) = archived_input(1);
-        let prepared = PreparedBenchmarkImport::prepare_archived(
-            ARCHIVE_SOURCE,
-            vec![(id, suite)],
-            vec![driver],
-        )
-        .unwrap();
-        storage
-            .transaction(|tx| {
-                tx.execute_batch(trigger)?;
-                Ok::<_, BenchmarkError>(())
-            })
-            .unwrap();
-        assert!(
-            storage.transaction(|tx| prepared.insert_in(tx)).is_err(),
-            "{trigger}"
-        );
-        storage
-            .read(|db| {
-                assert_eq!(
-                    db.query_row("SELECT count(*) FROM benchmark_suites", [], |row| row
-                        .get::<_, usize>(0))?,
-                    0
-                );
-                assert_eq!(
-                    db.query_row("SELECT count(*) FROM benchmark_drivers", [], |row| row
-                        .get::<_, usize>(0))?,
-                    0
-                );
-                Ok::<_, BenchmarkError>(())
-            })
-            .unwrap();
-    }
-}
-
-#[test]
-fn archived_benchmarks_charge_actual_stored_batch_bytes_before_decode() {
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    let inputs: Vec<_> = (1..=256).map(archived_input).collect();
-    let driver = inputs[0].2.clone();
-    let prepared = PreparedBenchmarkImport::prepare_archived(
-        ARCHIVE_SOURCE,
-        inputs
-            .into_iter()
-            .map(|(id, suite, _)| (id, suite))
-            .collect(),
-        vec![driver],
-    )
-    .unwrap();
-    let proof = prepared.completion_proof(ARCHIVE_SOURCE).unwrap();
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    storage
-        .transaction(|tx| {
-            for record in &prepared.suites {
-                let mut padded = record.1.clone();
-                padded.resize(MAX_SUITE_BYTES, b' ');
-                tx.execute(
-                    "UPDATE benchmark_suites SET payload=?1 WHERE suite_id=?2",
-                    params![padded, record.0.suite_id],
-                )?;
-            }
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    assert!(matches!(
-        storage.read(|db| prepared.verify_in(db)),
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(matches!(
-        storage.read(|db| proof.verify_in(db, ARCHIVE_SOURCE)),
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(matches!(
-        storage.transaction(|tx| prepared.insert_in(tx)),
-        Err(BenchmarkError::Invalid)
-    ));
-    // The same individually valid rows fit once one suite uses its canonical bytes.
-    storage
-        .transaction(|tx| {
-            tx.execute(
-                "UPDATE benchmark_suites SET payload=?1 WHERE suite_id=?2",
-                params![prepared.suites[0].1, prepared.suites[0].0.suite_id],
-            )?;
-            prepared.verify_in(tx)
-        })
-        .unwrap();
-}
-
-#[test]
-fn archived_benchmarks_refuse_destination_driver_overflow_without_pruning() {
-    let root = fixture_directory();
-    let path = root.path().join("metadata.sqlite");
-    let storage = open_storage(&path);
-    let (legacy, suite, driver) = archived_input(1);
-    let initial = PreparedBenchmarkImport::prepare_archived(
-        ARCHIVE_SOURCE,
-        vec![(legacy.clone(), suite.clone())],
-        vec![driver.clone()],
-    )
-    .unwrap();
-    storage
-        .transaction(|tx| {
-            initial.insert_in(tx)?;
-            for index in 2..MAX_STORED_DRIVERS {
-                let mut next = driver.clone();
-                next.id = format!("legacy-driver-{index:064x}");
-                tx.execute(
-                    "INSERT INTO benchmark_drivers(driver_id,payload) VALUES(?1,?2)",
-                    params![next.id, serde_json::to_vec(&next).unwrap()],
-                )?;
-            }
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    let mut last = driver;
-    last.id = format!("legacy-driver-{MAX_STORED_DRIVERS:064x}");
-    let boundary = PreparedBenchmarkImport::prepare_archived(
-        ARCHIVE_SOURCE,
-        vec![(legacy, suite)],
-        vec![last],
-    )
-    .unwrap();
-    storage.transaction(|tx| boundary.insert_in(tx)).unwrap();
-    storage.transaction(|tx| boundary.insert_in(tx)).unwrap();
-    let (id, suite, driver) = archived_input(MAX_STORED_DRIVERS + 1);
-    let overflow = PreparedBenchmarkImport::prepare_archived(
-        ARCHIVE_SOURCE,
-        vec![(id, suite.clone())],
-        vec![driver],
-    )
-    .unwrap();
-    assert!(matches!(
-        storage.transaction(|tx| overflow.insert_in(tx)),
-        Err(BenchmarkError::ConflictingHistory)
-    ));
-    drop(storage);
-    let storage = open_storage(&path);
-    storage
-        .read(|db| {
-            assert_eq!(stored_drivers_in(db)?.len(), MAX_STORED_DRIVERS);
-            assert!(stored_suite(db, &suite.suite_id)?.is_none());
-            initial.verify_in(db)?;
-            boundary.verify_in(db)?;
-            boundary
-                .completion_proof(ARCHIVE_SOURCE)?
-                .verify_in(db, ARCHIVE_SOURCE)
-        })
-        .unwrap();
-}
-
-#[tokio::test]
-async fn archived_benchmarks_capacity_fences_ordinary_and_successor_creation() {
-    for (count, resume) in [MAX_STORED_DRIVERS - 1, MAX_STORED_DRIVERS]
-        .into_iter()
-        .flat_map(|count| [false, true].map(|resume| (count, resume)))
-    {
-        let root = fixture_directory();
-        let path = root.path().join("metadata.sqlite");
-        let storage = open_storage(&path);
-        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-        let (source, previous, _) = continuation_history(&instance, false);
-        let history = insert_continuation_history(&storage, &source, &previous, None);
-        storage
-            .transaction(|tx| {
-                for index in 1..count {
-                    let mut retained = previous.clone();
-                    retained.id = format!("legacy-driver-{index:064x}");
-                    tx.execute(
-                        "INSERT INTO benchmark_drivers(driver_id,payload) VALUES(?1,?2)",
-                        params![retained.id, serde_json::to_vec(&retained).unwrap()],
-                    )?;
-                }
-                Ok::<_, BenchmarkError>(())
-            })
-            .unwrap();
-        let input = serde_json::from_value(serde_json::json!({
-            "instance_id":instance,"suite_id":"capacity-suite","suite_mode":"development"
-        }))
-        .unwrap();
-        service.ensure_suite(&input).unwrap();
-        let accepted = if resume {
-            service.resume_driver(&previous.id)
-        } else {
-            service.start_driver(input).await
-        };
-        if let Ok(driver) = &accepted {
-            service.stop_driver(&driver.id).unwrap();
-        }
-        service
-            .tasks
-            .shutdown(std::time::Duration::from_secs(2))
-            .await
-            .unwrap();
-        if count == MAX_STORED_DRIVERS {
-            assert!(
-                matches!(accepted, Err(BenchmarkError::ConflictingHistory)),
-                "resume={resume}"
-            );
-            assert!(service.resumed_driver(&previous.id).unwrap().is_none());
-            assert!(storage.read(|db| -> Result<_, BenchmarkError> {
-                Ok(db.query_row("SELECT count(*) FROM benchmark_suites WHERE source_suite_id IS NOT NULL", [], |row| row.get::<_, usize>(0))? == 0)
-            }).unwrap());
-        } else {
-            let driver = accepted.unwrap();
-            if resume {
-                assert_eq!(service.resume_driver(&previous.id).unwrap().id, driver.id);
-            }
-        }
-        storage
-            .read(|db| {
-                assert_eq!(stored_drivers_in(db)?.len(), MAX_STORED_DRIVERS);
-                history.verify_in(db)?;
-                assert_eq!(
-                    db.query_row("SELECT count(*) FROM launch_intents", [], |row| row
-                        .get::<_, usize>(0))?,
-                    0
-                );
-                Ok::<_, BenchmarkError>(())
-            })
-            .unwrap();
-        drop(service);
-        drop(storage);
-        let reopened = self::service(root.path(), open_storage(&path));
-        assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
-        assert!(reopened.tasks.status().is_idle());
-    }
-}
-
-#[test]
-fn imported_history_reopens_with_exact_plan_and_immutable_retry() {
-    let root = fixture_directory();
-    let path = root.path().join("metadata.sqlite");
-    let storage = open_storage(&path);
-    let prepared = PreparedBenchmarkImport::prepare(vec![suite()], vec![driver()]).unwrap();
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    drop(storage);
-    let storage = open_storage(&path);
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-    storage
-        .read(|db| {
-            assert_eq!(stored_suite(db, &suite().suite_id)?, Some(suite()));
-            assert_eq!(stored_driver(db, &driver().id)?, Some(driver()));
-            let count: i64 = db.query_row(
-                "SELECT count(*) FROM benchmark_drivers WHERE request IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )?;
-            assert_eq!(count, 0);
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    let view = driver_payload(driver());
-    assert_eq!(
-        view["view_model"]["state_label"],
-        "Historical interrupted (read-only)"
-    );
-    assert_eq!(view["view_model"]["can_stop"], false);
-    assert_eq!(view["view_model"]["can_resume"], false);
-    assert_eq!(view["view_model"]["can_check_family_c_qualification"], true);
-    assert_eq!(view["suite"]["pending_run_index"], 1);
-    assert!(
-        serde_json::to_value(suite()).unwrap()["runs"][0]
-            .get("launch_intent")
-            .is_none()
-    );
-}
-
-#[test]
-fn imported_history_conflict_rolls_back_whole_batch_and_rejects_changed_request() {
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    let prepared = PreparedBenchmarkImport::prepare(vec![suite()], vec![driver()]).unwrap();
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    let mut another = suite();
-    another.suite_id = format!("legacy-suite-{}", "3".repeat(64));
-    another.runs[0].session_id = Some(format!("legacy-{}", "c".repeat(64)));
-    let mut conflict = driver();
-    conflict.error = Some("Different retained failure".into());
-    let changed =
-        PreparedBenchmarkImport::prepare(vec![suite(), another.clone()], vec![conflict]).unwrap();
-    assert!(matches!(
-        storage.transaction(|tx| changed.insert_in(tx)),
-        Err(BenchmarkError::ConflictingHistory)
-    ));
-    storage
-        .read(|db| {
-            assert!(stored_suite(db, &another.suite_id)?.is_none());
-            assert_eq!(stored_driver(db, &driver().id)?, Some(driver()));
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    storage
-        .transaction(|tx| {
-            tx.execute(
-                "UPDATE benchmark_drivers SET request=?1 WHERE driver_id=?2",
-                params![b"{}".as_slice(), driver().id],
-            )?;
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    assert!(matches!(
-        storage.transaction(|tx| prepared.verify_in(tx)),
-        Err(BenchmarkError::Unavailable)
-    ));
-    storage
-        .transaction(|tx| {
-            tx.execute(
-                "DELETE FROM benchmark_drivers WHERE driver_id=?1",
-                [driver().id],
-            )?;
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    assert!(matches!(
-        storage.transaction(|tx| prepared.verify_in(tx)),
-        Err(BenchmarkError::ConflictingHistory)
-    ));
-}
-
-#[test]
-fn historical_admission_rejects_runnable_or_ambiguous_records() {
-    let mut malformed = suite();
-    malformed.runs[0].launch_intent = Some(uuid::Uuid::new_v4().to_string());
-    assert!(PreparedBenchmarkImport::prepare(vec![malformed], vec![]).is_err());
-    let mut missing_marker = suite();
-    missing_marker.historical = false;
-    assert!(validate_suite(&missing_marker).is_err());
-    let mut missing_driver_marker = driver();
-    missing_driver_marker.historical = false;
-    assert!(validate_driver(&missing_driver_marker).is_err());
-    let mut duplicate_session = suite();
-    duplicate_session.suite_id = format!("legacy-suite-{}", "3".repeat(64));
-    assert!(PreparedBenchmarkImport::prepare(vec![suite(), duplicate_session], vec![]).is_err());
-    for marker in [
-        "driver automatic resume queued after restart",
-        "driver automatic resume started after restart",
-        "driver ignored after restart resume limit",
-    ] {
-        let mut interrupted = driver();
-        interrupted.error = Some(marker.into());
-        PreparedBenchmarkImport::prepare(vec![suite()], vec![interrupted.clone()]).unwrap();
-        let view = driver_payload(interrupted.clone());
-        assert_eq!(view["driver"]["historical"], true);
-        assert_eq!(view["driver"]["error"], marker);
-        assert_eq!(view["view_model"]["can_stop"], false);
-        assert_eq!(view["view_model"]["can_resume"], false);
-        for state in ["complete", "failed", "stopped", "running"] {
-            let mut invalid = interrupted.clone();
-            invalid.state = state.into();
-            invalid.pending_run_index = None;
-            assert!(PreparedBenchmarkImport::prepare(vec![suite()], vec![invalid]).is_err());
-        }
-        interrupted.active_session_id = interrupted.last_session_id.clone();
-        assert!(PreparedBenchmarkImport::prepare(vec![suite()], vec![interrupted]).is_err());
-    }
-    let mut live = driver();
-    live.historical = false;
-    live.id = "benchmark-suite-driver-existing".into();
-    live.suite_id = "suite-existing".into();
-    let wire = serde_json::to_value(&live).unwrap();
-    assert!(wire.get("historical").is_none());
-    assert!(
-        !serde_json::from_value::<BenchmarkSuiteDriverStatus>(wire)
-            .unwrap()
-            .historical
-    );
-    assert_eq!(driver_payload(live)["view_model"]["can_resume"], true);
-}
-
-#[test]
-fn historical_pending_plans_preserve_absent_launches_and_reject_ambiguous_runs() {
-    let mut pending = suite();
-    pending.runs = (0..2)
-        .map(|index| {
-            let mut run = suite().runs.remove(0);
-            run.run_index = index;
-            run.benchmark_id = format!("benchmark-{index:016x}");
-            run.session_id = None;
-            run.launched_at = None;
-            run.state = "pending".into();
-            run
-        })
-        .collect();
-    let mut stopped = driver();
-    stopped.state = "stopped".into();
-    stopped.last_run_index = None;
-    stopped.last_session_id = None;
-    stopped.launched_run_count = 0;
-    stopped.pending_run_index = Some(0);
-    let mut mixed = suite();
-    mixed.suite_id = format!("legacy-suite-{}", "3".repeat(64));
-    mixed.runs.extend(pending.runs.clone());
-    let prepared = PreparedBenchmarkImport::prepare(
-        vec![pending.clone(), mixed.clone()],
-        vec![stopped.clone()],
-    )
-    .unwrap();
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-    storage
-        .read(|db| {
-            assert_eq!(stored_suite(db, &pending.suite_id)?, Some(pending.clone()));
-            assert_eq!(stored_suite(db, &mixed.suite_id)?, Some(mixed));
-            assert_eq!(stored_driver(db, &stopped.id)?, Some(stopped.clone()));
-            let request: Option<Vec<u8>> = db.query_row(
-                "SELECT request FROM benchmark_drivers WHERE driver_id=?1",
-                [&stopped.id],
-                |row| row.get(0),
-            )?;
-            assert!(request.is_none());
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    for case in [
-        "session_only",
-        "time_only",
-        "pending_with_launch",
-        "running",
-        "launching",
-        "terminal_without_launch",
-        "launch_intent",
-    ] {
-        let mut invalid = pending.clone();
-        let run = &mut invalid.runs[0];
-        match case {
-            "session_only" => run.session_id = suite().runs.remove(0).session_id,
-            "time_only" => run.launched_at = suite().runs.remove(0).launched_at,
-            "pending_with_launch" => {
-                run.session_id = suite().runs.remove(0).session_id;
-                run.launched_at = suite().runs.remove(0).launched_at;
-            }
-            "running" | "launching" => run.state = case.into(),
-            "terminal_without_launch" => run.state = "completed".into(),
-            "launch_intent" => run.launch_intent = Some(uuid::Uuid::new_v4().to_string()),
-            _ => unreachable!(),
-        }
-        assert!(
-            PreparedBenchmarkImport::prepare(vec![invalid], vec![]).is_err(),
-            "{case}"
-        );
-    }
-    stopped.pending_run_index = Some(7);
-    PreparedBenchmarkImport::prepare(vec![pending.clone()], vec![stopped.clone()]).unwrap();
-    stopped.last_run_index = Some(8);
-    assert!(PreparedBenchmarkImport::prepare(vec![pending], vec![stopped]).is_err());
 }
 
 fn service(root: &std::path::Path, storage: Arc<MetadataStore>) -> BenchmarkService {
@@ -1362,18 +40,12 @@ fn service_with_directories(
         .migrate(&[
             crate::instances::directory::MIGRATION,
             crate::instances::create::MIGRATION,
-            crate::instances::create::DUPLICATE_WITNESS_MIGRATION,
             crate::content::install::MIGRATION,
             crate::install::queue::MIGRATION,
-            crate::install::queue::MIGRATION_V2,
             crate::performance::rules::MIGRATION,
             crate::performance::mutation::MIGRATION,
-            crate::performance::mutation::MIGRATION_V2,
             crate::skins::store::MIGRATION,
             crate::launch::coordinator::INTENT_MIGRATION,
-            crate::launch::coordinator::INTENT_TERMINAL_MIGRATION,
-            crate::launch::coordinator::INTENT_SETTLEMENT_MIGRATION,
-            crate::launch::coordinator::INTENT_RECOVERY_MIGRATION,
         ])
         .unwrap();
     let library = match LibraryLifecycle::open(root) {
@@ -1450,7 +122,7 @@ fn service_with_directories(
     (service, directories)
 }
 
-async fn continuation_service(
+async fn instance_service(
     root: &std::path::Path,
     storage: Arc<MetadataStore>,
 ) -> (BenchmarkService, InstanceId) {
@@ -1459,7 +131,7 @@ async fn continuation_service(
     let instance = InstanceService::new(directories, service.tasks.clone())
         .create(
             CreateInstanceRequest {
-                name: "Imported benchmark continuation".into(),
+                name: "Benchmark fixture".into(),
                 selection_id: "1.21.1".into(),
                 ..Default::default()
             },
@@ -1526,14 +198,154 @@ async fn persist_automatic_restart_fixture(
 }
 
 #[tokio::test]
-async fn automatic_restart_schedules_owned_driver_once_without_historical_work() {
+async fn current_driver_history_reopens_and_resumes_the_same_driver() {
+    for state in ["stopped", "failed", "interrupted"] {
+        let root = fixture_directory();
+        let path = root.path().join("metadata.sqlite");
+        let storage = open_storage(&path);
+        let (service, instance) = instance_service(root.path(), storage.clone()).await;
+        let input = serde_json::from_value(serde_json::json!({
+            "instance_id": instance, "suite_mode": "development", "interval_ms": 5_000
+        }))
+        .unwrap();
+        let accepted = service.start_driver(input).await.unwrap();
+        service.stop_driver(&accepted.id).unwrap();
+        service
+            .tasks
+            .shutdown(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut driver = service.driver(&accepted.id).unwrap();
+        driver.state = state.into();
+        driver.error = (state != "stopped").then(|| "Benchmark work stopped before launch".into());
+        service.save_driver(&driver).unwrap();
+        let persisted = service.driver(&driver.id).unwrap();
+        let suite = service.suite(&driver.suite_id).unwrap().unwrap();
+        drop(service);
+        drop(storage);
+
+        let storage = open_storage(&path);
+        let reopened = self::service(root.path(), storage.clone());
+        assert_eq!(reopened.driver(&driver.id).unwrap(), persisted);
+        assert_eq!(
+            reopened.suite(&suite.suite_id).unwrap(),
+            Some(suite.clone())
+        );
+        assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
+        assert!(reopened.can_resume_driver(&driver.id).unwrap());
+        let resumed = reopened.resume_driver(&driver.id).unwrap();
+        assert_eq!(resumed.id, driver.id);
+        assert_eq!(resumed.suite_id, suite.suite_id);
+        assert_eq!(resumed.state, "running");
+        assert_eq!(resumed.error, None);
+        assert!(!reopened.can_resume_driver(&driver.id).unwrap());
+        assert!(matches!(
+            reopened.resume_driver(&driver.id),
+            Err(BenchmarkError::Busy)
+        ));
+        reopened.stop_driver(&driver.id).unwrap();
+        reopened
+            .tasks
+            .shutdown(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        storage
+            .read(|db| {
+                assert_eq!(stored_drivers_in(db)?.len(), 1);
+                assert_eq!(stored_suite(db, &suite.suite_id)?, Some(suite.clone()));
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM launch_intents", [], |row| row
+                        .get::<_, usize>(0))?,
+                    0
+                );
+                Ok::<_, BenchmarkError>(())
+            })
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn current_driver_capacity_refuses_new_work_without_pruning_history() {
+    for count in [MAX_STORED_DRIVERS - 1, MAX_STORED_DRIVERS] {
+        let root = fixture_directory();
+        let path = root.path().join("metadata.sqlite");
+        let storage = open_storage(&path);
+        let (service, instance) = instance_service(root.path(), storage.clone()).await;
+        let input = serde_json::from_value(serde_json::json!({
+            "instance_id": instance, "suite_id": "retained-suite", "suite_mode": "development"
+        }))
+        .unwrap();
+        let accepted = service.start_driver(input).await.unwrap();
+        service.stop_driver(&accepted.id).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !service.tasks.status().is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let retained = service.driver(&accepted.id).unwrap();
+        storage
+            .transaction(|tx| {
+                let request: Vec<u8> = tx.query_row(
+                    "SELECT request FROM benchmark_drivers WHERE driver_id=?1",
+                    [&retained.id],
+                    |row| row.get(0),
+                )?;
+                for index in 1..count {
+                    let mut driver = retained.clone();
+                    driver.id = format!("retained-driver-{index}");
+                    tx.execute(
+                        "INSERT INTO benchmark_drivers(driver_id,payload,request) VALUES(?1,?2,?3)",
+                        params![driver.id, serde_json::to_vec(&driver).unwrap(), request],
+                    )?;
+                }
+                Ok::<_, BenchmarkError>(())
+            })
+            .unwrap();
+        let input = serde_json::from_value(serde_json::json!({
+            "instance_id": instance, "suite_id": "capacity-suite", "suite_mode": "development"
+        }))
+        .unwrap();
+        service.ensure_suite(&input).unwrap();
+        let result = service.start_driver(input).await;
+        if count == MAX_STORED_DRIVERS {
+            assert!(matches!(result, Err(BenchmarkError::Unavailable)));
+        } else {
+            service.stop_driver(&result.unwrap().id).unwrap();
+        }
+        service
+            .tasks
+            .shutdown(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(service.driver(&retained.id).unwrap(), retained);
+        storage
+            .read(|db| {
+                assert_eq!(stored_drivers_in(db)?.len(), MAX_STORED_DRIVERS);
+                assert_eq!(
+                    db.query_row("SELECT count(*) FROM launch_intents", [], |row| row
+                        .get::<_, usize>(0))?,
+                    0
+                );
+                Ok::<_, BenchmarkError>(())
+            })
+            .unwrap();
+        drop(service);
+        drop(storage);
+        let reopened = self::service(root.path(), open_storage(&path));
+        assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
+        assert!(reopened.tasks.status().is_idle());
+    }
+}
+
+#[tokio::test]
+async fn automatic_restart_schedules_owned_driver_once() {
     let root = fixture_directory();
     let path = root.path().join("metadata.sqlite");
     let storage = open_storage(&path);
-    let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+    let (service, instance) = instance_service(root.path(), storage.clone()).await;
     let accepted = persist_automatic_restart_fixture(&service, &instance, 1).await;
-    let history = PreparedBenchmarkImport::prepare(vec![suite()], vec![driver()]).unwrap();
-    storage.transaction(|tx| history.insert_in(tx)).unwrap();
     drop(service);
     drop(storage);
 
@@ -1546,7 +358,6 @@ async fn automatic_restart_schedules_owned_driver_once_without_historical_work()
     assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 1);
     assert_eq!(reopened.driver(&accepted[0].id).unwrap().state, "running");
     assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
-    assert_eq!(reopened.driver(&driver().id).unwrap(), driver());
     assert!(reopened.sessions.sessions().is_empty());
     reopened.stop_driver(&accepted[0].id).unwrap();
     reopened
@@ -1554,7 +365,6 @@ async fn automatic_restart_schedules_owned_driver_once_without_historical_work()
         .shutdown(std::time::Duration::from_secs(2))
         .await
         .unwrap();
-    storage.transaction(|tx| history.verify_in(tx)).unwrap();
     drop(reopened);
     drop(storage);
     let reopened = self::service(root.path(), open_storage(&path));
@@ -1568,7 +378,7 @@ async fn automatic_restart_limit_is_durable_across_two_reopens() {
     let root = fixture_directory();
     let path = root.path().join("metadata.sqlite");
     let storage = open_storage(&path);
-    let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+    let (service, instance) = instance_service(root.path(), storage.clone()).await;
     persist_automatic_restart_fixture(&service, &instance, 9).await;
     drop(service);
     drop(storage);
@@ -1618,7 +428,7 @@ async fn automatic_restart_invalid_driver_does_not_suppress_unrelated_work() {
         let root = fixture_directory();
         let path = root.path().join("metadata.sqlite");
         let storage = open_storage(&path);
-        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+        let (service, instance) = instance_service(root.path(), storage.clone()).await;
         let accepted = persist_automatic_restart_fixture(&service, &instance, 2).await;
         let invalid = &accepted[1];
         storage.transaction(|tx| {
@@ -1673,11 +483,11 @@ async fn automatic_restart_invalid_driver_does_not_suppress_unrelated_work() {
 
 #[tokio::test]
 async fn automatic_restart_checkpoint_failure_cannot_schedule_or_change_proof() {
-    for effect in ["ignore", "abort", "payload", "request", "source"] {
+    for effect in ["ignore", "abort", "payload", "request"] {
         let root = fixture_directory();
         let path = root.path().join("metadata.sqlite");
         let storage = open_storage(&path);
-        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+        let (service, instance) = instance_service(root.path(), storage.clone()).await;
         let accepted = persist_automatic_restart_fixture(&service, &instance, 9).await;
         drop(service);
         drop(storage);
@@ -1685,8 +495,8 @@ async fn automatic_restart_checkpoint_failure_cannot_schedule_or_change_proof() 
         let reopened = self::service(root.path(), storage.clone());
         let snapshot = || {
             storage.read(|db| {
-                let mut query = db.prepare("SELECT driver_id,payload,request,source_driver_id FROM benchmark_drivers ORDER BY driver_id")?;
-                query.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Option<Vec<u8>>>(2)?, row.get::<_, Option<String>>(3)?)))?
+                let mut query = db.prepare("SELECT driver_id,payload,request FROM benchmark_drivers ORDER BY driver_id")?;
+                query.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Option<Vec<u8>>>(2)?)))?
                     .collect::<Result<Vec<_>, _>>().map_err(BenchmarkError::from)
             }).unwrap()
         };
@@ -1701,10 +511,6 @@ async fn automatic_restart_checkpoint_failure_cannot_schedule_or_change_proof() 
             "request" => (
                 "AFTER",
                 "UPDATE benchmark_drivers SET request=NULL WHERE driver_id=NEW.driver_id",
-            ),
-            "source" => (
-                "AFTER",
-                "UPDATE benchmark_drivers SET source_driver_id='unknown' WHERE driver_id=NEW.driver_id",
             ),
             _ => unreachable!(),
         };
@@ -1731,11 +537,11 @@ async fn automatic_restart_checkpoint_failure_cannot_schedule_or_change_proof() 
 
 #[tokio::test]
 async fn automatic_restart_global_failure_does_not_admit_later_drivers() {
-    for case in ["malformed_suite", "source_link", "busy", "task_owner"] {
+    for case in ["malformed_suite", "busy", "task_owner"] {
         let root = fixture_directory();
         let path = root.path().join("metadata.sqlite");
         let storage = open_storage(&path);
-        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+        let (service, instance) = instance_service(root.path(), storage.clone()).await;
         let accepted = persist_automatic_restart_fixture(&service, &instance, 2).await;
         drop(service);
         drop(storage);
@@ -1747,16 +553,6 @@ async fn automatic_restart_global_failure_does_not_admit_later_drivers() {
                     tx.execute(
                         "UPDATE benchmark_suites SET payload=?1 WHERE suite_id=?2",
                         params![b"{".as_slice(), accepted[1].suite_id],
-                    )?;
-                    Ok::<_, BenchmarkError>(())
-                })
-                .unwrap();
-        } else if case == "source_link" {
-            storage
-                .transaction(|tx| {
-                    tx.execute(
-                        "UPDATE benchmark_drivers SET source_driver_id=?1 WHERE driver_id=?2",
-                        params![accepted[0].id, accepted[1].id],
                     )?;
                     Ok::<_, BenchmarkError>(())
                 })
@@ -1786,752 +582,12 @@ async fn automatic_restart_global_failure_does_not_admit_later_drivers() {
     }
 }
 
-fn continuation_history(
-    instance: &InstanceId,
-    mixed: bool,
-) -> (
-    BenchmarkSuiteManifest,
-    BenchmarkSuiteDriverStatus,
-    Option<crate::launch::reports::LaunchProofRecord>,
-) {
-    use crate::launch::{
-        outcome::{SessionExitReason, SessionOutcome, SessionOutcomeKind},
-        reports::{LaunchProofRecord, SessionReportInput},
-    };
-    let mut source = suite();
-    source.instance_id = instance.to_string();
-    source.mode = "development".into();
-    source.runs = benchmark_suite_plan(&source.mode)
-        .unwrap()
-        .into_iter()
-        .enumerate()
-        .map(|(index, run)| BenchmarkSuiteManifestRun {
-            run_index: index,
-            profile: run.profile.into(),
-            run_type: run.run_type.into(),
-            target_id: run.target_id.unwrap_or("").into(),
-            benchmark_id: benchmark_suite_run_id(&source.mode, index, run),
-            session_id: None,
-            launched_at: None,
-            state: "pending".into(),
-            launch_intent: None,
-        })
-        .collect();
-    let mut previous = driver();
-    previous.mode = source.mode.clone();
-    previous.state = "stopped".into();
-    previous.run_count = source.runs.len();
-    previous.launched_run_count = usize::from(mixed);
-    previous.pending_run_index = Some(usize::from(mixed));
-    previous.last_run_index = mixed.then_some(0);
-    previous.last_session_id = None;
-    previous.error = None;
-    let report = mixed.then(|| {
-        let run = &mut source.runs[0];
-        run.session_id = Some(format!("legacy-{}", "a".repeat(64)));
-        run.launched_at = Some("2026-01-01T00:01:00.000Z".into());
-        run.state = "exited".into();
-        previous.last_session_id = run.session_id.clone();
-        let mut outcome = SessionOutcome {
-            kind: SessionOutcomeKind::Clean,
-            reason: SessionExitReason::CleanExit,
-            failure_class: None,
-            summary: String::new(),
-        };
-        outcome.summary = outcome.summary().into();
-        let mut report = LaunchProofRecord::from_session(SessionReportInput {
-            session_id: run.session_id.clone().unwrap(),
-            instance_id: source.instance_id.clone(),
-            version_id: "1.21.1".into(),
-            launched_at: run.launched_at.clone().unwrap(),
-            ended_at: "2026-01-02T00:00:00.000Z".into(),
-            outcome,
-            entries: Vec::new(),
-            exit_code: Some(0),
-            boot_duration_ms: None,
-            logs_dropped: 0,
-        });
-        report.scenario =
-            benchmark_scenario(&run.profile, &run.run_type, &source.mode, &run.benchmark_id);
-        report.stages.push(serde_json::from_value(serde_json::json!({
-            "stage":"imported_history", "label":"Imported terminal evidence", "started_at_ms":0,
-            "ended_at_ms":null, "duration_ms":null, "result":null, "warnings":[], "fallback_reason":null,
-            "evidence":[
-                {"id":"original_session", "system":"history", "summary":"Original session", "details":["session-a"]},
-                {"id":"original_outcome", "system":"history", "summary":"Original terminal report outcome", "details":["exited"]},
-                {"id":"original_reason", "system":"history", "summary":"Original exit reason", "details":["clean_exit"]}
-            ]
-        })).unwrap());
-        report
-    });
-    (source, previous, report)
-}
-
-fn insert_continuation_history(
-    storage: &MetadataStore,
-    source: &BenchmarkSuiteManifest,
-    previous: &BenchmarkSuiteDriverStatus,
-    report: Option<&crate::launch::reports::LaunchProofRecord>,
-) -> PreparedBenchmarkImport {
-    let prepared =
-        PreparedBenchmarkImport::prepare(vec![source.clone()], vec![previous.clone()]).unwrap();
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    let reports = crate::launch::reports::PreparedReportImport::prepare(
-        report.into_iter().cloned().collect(),
-    )
-    .unwrap();
-    storage.transaction(|tx| reports.insert_in(tx)).unwrap();
-    prepared
-}
-
-async fn explicit_imported_driver_resume(mixed: bool, terminal_state: &str, queued: bool) {
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-    let (mut source, mut previous, mut report) = continuation_history(&instance, mixed);
-    if queued {
-        previous.state = "interrupted".into();
-        previous.error = Some("driver automatic resume queued after restart".into());
-    }
-    if let Some(report) = &mut report {
-        source.runs[0].state = terminal_state.into();
-        report.stages[0].evidence[1].details[0] = terminal_state.into();
-    }
-    let prepared = insert_continuation_history(&storage, &source, &previous, report.as_ref());
-    assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
-    assert!(service.can_resume_driver(&previous.id).unwrap());
-    assert!(service.resumed_driver(&previous.id).unwrap().is_none());
-
-    let successor = service
-        .resume_driver(&previous.id)
-        .expect("explicit Resume must admit a separate operational successor");
-    assert!(!successor.historical);
-    assert_ne!(successor.id, previous.id);
-    assert_ne!(successor.suite_id, source.suite_id);
-    assert_eq!(successor.run_count, source.runs.len());
-    assert_eq!(successor.launched_run_count, usize::from(mixed));
-    assert_eq!(successor.interval_ms, previous.interval_ms);
-    let operational = service.suite(&successor.suite_id).unwrap().unwrap();
-    assert!(!operational.historical);
-    assert_eq!(operational.instance_id, source.instance_id);
-    assert_eq!(operational.mode, source.mode);
-    assert_eq!(operational.runs.len(), source.runs.len());
-    for (run, retained) in operational.runs.iter().zip(&source.runs) {
-        assert_eq!(run.run_index, retained.run_index);
-        assert_eq!(run.benchmark_id, retained.benchmark_id);
-        if retained.state == "pending" {
-            assert_eq!(run.state, "pending");
-            assert!(run.session_id.is_none());
-            assert!(run.launched_at.is_none());
-            assert!(run.launch_intent.is_some());
-        } else {
-            assert_eq!(run, retained);
-            assert!(run.launch_intent.is_none());
-        }
-    }
-    let retry = service.resume_driver(&previous.id).unwrap();
-    assert_eq!(retry.id, successor.id);
-    assert_eq!(retry.suite_id, successor.suite_id);
-    assert_eq!(service.resumed_driver(&previous.id).unwrap(), Some(retry));
-    assert!(!service.can_resume_driver(&previous.id).unwrap());
-    storage
-        .read(|db| {
-            let bytes: Vec<u8> = db.query_row(
-                "SELECT request FROM benchmark_drivers WHERE driver_id=?1",
-                [&successor.id],
-                |row| row.get(0),
-            )?;
-            let captured: BenchmarkLaunchRequest = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(captured.instance_id, Some(instance));
-            assert_eq!(
-                captured.suite_id.as_deref(),
-                Some(successor.suite_id.as_str())
-            );
-            assert_eq!(captured.suite_mode.as_deref(), Some(source.mode.as_str()));
-            assert!(captured.username.is_none());
-            assert!(captured.max_memory_mb.is_none());
-            assert!(captured.min_memory_mb.is_none());
-            assert!(captured.client_started_at_ms.is_none());
-            let source_request: Option<Vec<u8>> = db.query_row(
-                "SELECT request FROM benchmark_drivers WHERE driver_id=?1",
-                [&previous.id],
-                |row| row.get(0),
-            )?;
-            assert!(source_request.is_none());
-            for table in ["benchmark_suites", "benchmark_drivers"] {
-                let count: i64 =
-                    db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                        row.get(0)
-                    })?;
-                assert_eq!(count, 2);
-            }
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    // Admission is the boundary under test; no installed runtime or successful executor is invented.
-    service.stop_driver(&successor.id).unwrap();
-    service
-        .tasks
-        .shutdown(std::time::Duration::from_secs(2))
-        .await
-        .unwrap();
-    storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-    if let Some(report) = report {
-        assert_eq!(
-            service.reports.get(&report.session_id).unwrap(),
-            Some(report)
-        );
-    }
-    assert!(service.sessions.sessions().is_empty());
-    storage
-        .read(|db| {
-            let count: i64 =
-                db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get(0))?;
-            assert_eq!(count, 0);
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-}
-
-#[tokio::test]
-async fn explicit_imported_driver_resume_accepts_all_pending_current_plan() {
-    explicit_imported_driver_resume(false, "exited", false).await;
-}
-
-#[tokio::test]
-async fn explicit_imported_driver_resume_accepts_mixed_terminal_and_pending_current_plan() {
-    explicit_imported_driver_resume(true, "exited", false).await;
-}
-
-#[tokio::test]
-async fn explicit_imported_driver_resume_accepts_original_completed_outcome() {
-    explicit_imported_driver_resume(true, "completed", false).await;
-}
-
-#[tokio::test]
-async fn explicit_imported_queued_driver_resume_accepts_all_pending_current_plan() {
-    explicit_imported_driver_resume(false, "exited", true).await;
-}
-
-#[tokio::test]
-async fn explicit_imported_queued_driver_resume_preserves_prior_terminal_run() {
-    explicit_imported_driver_resume(true, "exited", true).await;
-}
-
-#[tokio::test]
-async fn explicit_imported_driver_resume_refuses_unsupported_or_contradictory_evidence() {
-    for case in [
-        "missing_report",
-        "wrong_instance",
-        "wrong_descriptor",
-        "wrong_outcome",
-        "wrong_launch_time",
-        "unsupported_plan",
-        "missing_destination",
-    ] {
-        let root = fixture_directory();
-        let storage = open_storage(&root.path().join("metadata.sqlite"));
-        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-        let (mut source, mut previous, mut report) = continuation_history(&instance, true);
-        previous.state = "interrupted".into();
-        previous.error = Some("driver automatic resume queued after restart".into());
-        match case {
-            "missing_report" => report = None,
-            "wrong_instance" => {
-                report.as_mut().unwrap().instance_id = InstanceId::new().to_string()
-            }
-            "wrong_descriptor" => {
-                report.as_mut().unwrap().scenario.benchmark_profile = Some("managed_default".into())
-            }
-            "wrong_outcome" => source.runs[0].state = "failed".into(),
-            "wrong_launch_time" => {
-                report.as_mut().unwrap().launched_at = "2026-01-01T00:06:00.000Z".into()
-            }
-            "unsupported_plan" => source.runs[1].profile = "retained+custom".into(),
-            "missing_destination" => {
-                source.instance_id = InstanceId::new().to_string();
-                report.as_mut().unwrap().instance_id = source.instance_id.clone();
-            }
-            _ => unreachable!(),
-        }
-        let prepared = insert_continuation_history(&storage, &source, &previous, report.as_ref());
-        assert!(!service.can_resume_driver(&previous.id).unwrap(), "{case}");
-        let result = service.resume_driver(&previous.id);
-        if case == "missing_destination" {
-            assert!(matches!(result, Err(BenchmarkError::NotFound)));
-        } else {
-            assert!(result.is_err(), "{case}");
-        }
-        storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-        assert_eq!(service.drivers().unwrap(), vec![previous]);
-        assert!(service.tasks.status().is_idle());
-        assert!(service.sessions.sessions().is_empty());
-        storage
-            .read(|db| {
-                let count: i64 =
-                    db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get(0))?;
-                assert_eq!(count, 0, "{case}");
-                let count: i64 =
-                    db.query_row("SELECT count(*) FROM benchmark_suites", [], |row| {
-                        row.get(0)
-                    })?;
-                assert_eq!(count, 1, "{case}");
-                Ok::<_, BenchmarkError>(())
-            })
-            .unwrap();
-    }
-}
-
-#[test]
-fn continuation_migration_preserves_existing_history_without_authority() {
-    let root = fixture_directory();
-    let storage = MetadataStore::open(root.path().join("metadata.sqlite")).unwrap();
-    storage.migrate(&[MIGRATION]).unwrap();
-    storage
-        .transaction(|tx| {
-            tx.execute(
-                "INSERT INTO benchmark_suites(suite_id,payload) VALUES(?1,?2)",
-                params![suite().suite_id, serde_json::to_vec(&suite()).unwrap()],
-            )?;
-            tx.execute(
-                "INSERT INTO benchmark_drivers(driver_id,payload,request) VALUES(?1,?2,NULL)",
-                params![driver().id, serde_json::to_vec(&driver()).unwrap()],
-            )?;
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    storage
-        .migrate(&[MIGRATION, MIGRATION_V2, MIGRATION_V3])
-        .unwrap();
-    storage
-        .migrate(&[MIGRATION, MIGRATION_V2, MIGRATION_V3])
-        .unwrap();
-    let prepared = PreparedBenchmarkImport::prepare(vec![suite()], vec![driver()]).unwrap();
-    storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-    storage
-        .read(|db| {
-            for (table, column) in [
-                ("benchmark_suites", "source_suite_id"),
-                ("benchmark_drivers", "source_driver_id"),
-                ("benchmark_drivers", "detached_source"),
-            ] {
-                let count: i64 = db.query_row(
-                    &format!("SELECT count(*) FROM {table} WHERE {column} IS NOT NULL"),
-                    [],
-                    |row| row.get(0),
-                )?;
-                assert_eq!(count, 0);
-            }
-            assert!(resumed_driver_in(db, &driver().id)?.is_none());
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-}
-
-#[tokio::test]
-async fn continuation_admission_rolls_back_suite_when_driver_insert_fails_or_is_ignored() {
-    for failure in ["ABORT, 'fixture failure'", "IGNORE"] {
-        let root = fixture_directory();
-        let storage = open_storage(&root.path().join("metadata.sqlite"));
-        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-        let (source, previous, report) = continuation_history(&instance, false);
-        let prepared = insert_continuation_history(&storage, &source, &previous, report.as_ref());
-        storage.transaction(|tx| {
-            tx.execute_batch(&format!("CREATE TRIGGER refuse_continuation BEFORE INSERT ON benchmark_drivers WHEN NEW.source_driver_id IS NOT NULL BEGIN SELECT RAISE({failure}); END;"))?;
-            Ok::<_, BenchmarkError>(())
-        }).unwrap();
-        assert!(service.resume_driver(&previous.id).is_err());
-        assert!(service.resumed_driver(&previous.id).unwrap().is_none());
-        assert!(service.tasks.status().is_idle());
-        storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-        storage
-            .read(|db| {
-                let count: i64 =
-                    db.query_row("SELECT count(*) FROM benchmark_suites", [], |row| {
-                        row.get(0)
-                    })?;
-                assert_eq!(count, 1);
-                let count: i64 =
-                    db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get(0))?;
-                assert_eq!(count, 0);
-                Ok::<_, BenchmarkError>(())
-            })
-            .unwrap();
-    }
-}
-
-#[tokio::test]
-async fn continuation_drivers_share_one_operational_suite_and_preserve_source_counts() {
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-    let (source, previous, _) = continuation_history(&instance, false);
-    let mut other = previous.clone();
-    other.id = format!("legacy-driver-{}", "3".repeat(64));
-    other.state = "complete".into();
-    other.launched_run_count = other.run_count;
-    other.pending_run_index = None;
-    let prepared = PreparedBenchmarkImport::prepare(
-        vec![source.clone()],
-        vec![previous.clone(), other.clone()],
-    )
-    .unwrap();
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    let first = service.resume_driver(&previous.id).unwrap();
-    assert!(matches!(
-        service.resume_driver(&other.id),
-        Err(BenchmarkError::Busy)
-    ));
-    assert!(service.resumed_driver(&other.id).unwrap().is_none());
-    service.stop_driver(&first.id).unwrap();
-    let second = service.resume_driver(&other.id).unwrap();
-    assert_ne!(first.id, second.id);
-    assert_eq!(first.suite_id, second.suite_id);
-    assert_eq!(second.launched_run_count, 0);
-    assert_eq!(second.pending_run_index, Some(0));
-    assert_eq!(
-        service.resume_driver(&previous.id).unwrap().state,
-        "stopped"
-    );
-    service.stop_driver(&second.id).unwrap();
-    service
-        .tasks
-        .shutdown(std::time::Duration::from_secs(2))
-        .await
-        .unwrap();
-    storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-    storage
-        .read(|db| {
-            let count: i64 = db.query_row(
-                "SELECT count(*) FROM benchmark_suites WHERE source_suite_id=?1",
-                [&source.suite_id],
-                |row| row.get(0),
-            )?;
-            assert_eq!(count, 1);
-            let count: i64 = db.query_row(
-                "SELECT count(*) FROM benchmark_drivers WHERE source_driver_id IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )?;
-            assert_eq!(count, 2);
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-}
-
-#[tokio::test]
-async fn historical_continuation_response_loss_and_task_refusal_reopen_the_same_successor() {
-    for marker in [
-        "driver ignored after restart resume limit",
-        "driver automatic resume queued after restart",
-    ] {
-        for refuse_task in [false, true] {
-            let root = fixture_directory();
-            let path = root.path().join("metadata.sqlite");
-            let storage = open_storage(&path);
-            let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-            let (source, mut previous, report) = continuation_history(&instance, true);
-            previous.state = "interrupted".into();
-            previous.error = Some(marker.into());
-            let prepared =
-                insert_continuation_history(&storage, &source, &previous, report.as_ref());
-            assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
-            assert!(service.can_resume_driver(&previous.id).unwrap());
-            assert!(service.resumed_driver(&previous.id).unwrap().is_none());
-            if refuse_task {
-                service
-                    .tasks
-                    .shutdown(std::time::Duration::from_secs(2))
-                    .await
-                    .unwrap();
-            }
-            let result = service.resume_driver(&previous.id);
-            assert_eq!(result.is_err(), refuse_task);
-            drop(result);
-            let accepted = service.resumed_driver(&previous.id).unwrap().unwrap();
-            if refuse_task {
-                assert_eq!(accepted.state, "failed");
-            } else {
-                service.stop_driver(&accepted.id).unwrap();
-                service
-                    .tasks
-                    .shutdown(std::time::Duration::from_secs(2))
-                    .await
-                    .unwrap();
-            }
-            let terminal = service.driver(&accepted.id).unwrap();
-            assert_eq!(service.resume_driver(&previous.id).unwrap(), terminal);
-            drop(service);
-            drop(storage);
-            let storage = open_storage(&path);
-            let reopened = self::service(root.path(), storage.clone());
-            assert_eq!(
-                reopened.resumed_driver(&previous.id).unwrap(),
-                Some(terminal.clone())
-            );
-            assert_eq!(reopened.resume_driver(&previous.id).unwrap(), terminal);
-            assert!(reopened.tasks.status().is_idle());
-            assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
-            assert!(!reopened.can_resume_driver(&previous.id).unwrap());
-            assert!(reopened.can_resume_driver(&accepted.id).unwrap());
-            storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-            assert_eq!(
-                reopened
-                    .reports
-                    .get(report.as_ref().unwrap().session_id.as_str())
-                    .unwrap(),
-                report
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn queued_handoff_history_continuation_serializes_shared_suite_and_reopens() {
-    for mixed in [false, true] {
-        let root = fixture_directory();
-        let path = root.path().join("metadata.sqlite");
-        let storage = open_storage(&path);
-        let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-        let (source, previous, report) = continuation_history(&instance, mixed);
-        let mut queued = previous.clone();
-        queued.id = format!("legacy-driver-{}", "3".repeat(64));
-        queued.state = "interrupted".into();
-        queued.error = Some("driver automatic resume queued after restart".into());
-        let prepared = insert_continuation_history(&storage, &source, &queued, report.as_ref());
-        let other =
-            PreparedBenchmarkImport::prepare(vec![source.clone()], vec![previous.clone()]).unwrap();
-        storage.transaction(|tx| other.insert_in(tx)).unwrap();
-        drop(service);
-        drop(storage);
-        let storage = open_storage(&path);
-        let service = self::service(root.path(), storage.clone());
-        assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
-        assert!(service.tasks.status().is_idle());
-        assert!(service.sessions.sessions().is_empty());
-        assert!(service.resumed_driver(&queued.id).unwrap().is_none());
-        for drivers in [
-            vec![previous.clone(), queued.clone()],
-            vec![queued.clone(), previous.clone()],
-        ] {
-            let actions = service.resume_actions(&drivers).unwrap();
-            assert_eq!(actions[&previous.id], (true, None));
-            assert_eq!(actions[&queued.id], (true, None));
-        }
-        assert!(matches!(
-            service.stop_driver(&queued.id),
-            Err(BenchmarkError::Invalid)
-        ));
-        let accepted = service.resume_driver(&queued.id).unwrap();
-        for drivers in [
-            vec![previous.clone(), queued.clone()],
-            vec![queued.clone(), previous.clone()],
-        ] {
-            let actions = service.resume_actions(&drivers).unwrap();
-            assert_eq!(actions[&previous.id], (false, None));
-            assert_eq!(actions[&queued.id], (false, Some(accepted.id.clone())));
-        }
-        assert!(matches!(
-            service.resume_driver(&previous.id),
-            Err(BenchmarkError::Busy)
-        ));
-        service.stop_driver(&accepted.id).unwrap();
-        service
-            .tasks
-            .shutdown(std::time::Duration::from_secs(2))
-            .await
-            .unwrap();
-        let terminal = service.driver(&accepted.id).unwrap();
-        drop(service);
-        drop(storage);
-        for _ in 0..2 {
-            let storage = open_storage(&path);
-            let service = self::service(root.path(), storage.clone());
-            storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-            assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
-            for drivers in [
-                vec![previous.clone(), queued.clone()],
-                vec![queued.clone(), previous.clone()],
-            ] {
-                let actions = service.resume_actions(&drivers).unwrap();
-                assert_eq!(actions[&previous.id], (true, None));
-                assert_eq!(actions[&queued.id], (false, Some(accepted.id.clone())));
-            }
-            assert!(!service.can_resume_driver(&queued.id).unwrap());
-            assert_eq!(service.resume_driver(&queued.id).unwrap(), terminal);
-            assert!(matches!(
-                service.stop_driver(&queued.id),
-                Err(BenchmarkError::Invalid)
-            ));
-            assert_eq!(
-                service.resumed_driver(&queued.id).unwrap(),
-                Some(terminal.clone())
-            );
-            assert_eq!(service.driver(&queued.id).unwrap(), queued);
-            assert_eq!(
-                service.suite(&source.suite_id).unwrap(),
-                Some(source.clone())
-            );
-            storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-            storage.transaction(|tx| other.verify_in(tx)).unwrap();
-            assert!(service.tasks.status().is_idle());
-            assert!(service.sessions.sessions().is_empty());
-            storage
-                .read(|db| {
-                    let count: usize = db.query_row(
-                        "SELECT count(*) FROM benchmark_drivers WHERE request IS NOT NULL OR source_driver_id IS NOT NULL",
-                        [],
-                        |row| row.get(0),
-                    )?;
-                    assert_eq!(count, 1);
-                    let count: usize = db.query_row(
-                        "SELECT count(*) FROM launch_intents",
-                        [],
-                        |row| row.get(0),
-                    )?;
-                    assert_eq!(count, 0);
-                    Ok::<_, BenchmarkError>(())
-                })
-                .unwrap();
-        }
-    }
-}
-
-#[tokio::test]
-async fn continuation_inherited_rows_and_private_links_are_checked_on_read_and_write() {
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-    let (source, previous, report) = continuation_history(&instance, true);
-    let prepared = insert_continuation_history(&storage, &source, &previous, report.as_ref());
-    let accepted = service.resume_driver(&previous.id).unwrap();
-    service.stop_driver(&accepted.id).unwrap();
-    service
-        .tasks
-        .shutdown(std::time::Duration::from_secs(2))
-        .await
-        .unwrap();
-    let operational = service.suite(&accepted.suite_id).unwrap().unwrap();
-    let mut invalid_source = previous.clone();
-    invalid_source.state = "stopped".into();
-    invalid_source.error = Some("driver automatic resume queued after restart".into());
-    storage
-        .transaction(|tx| {
-            tx.execute(
-                "UPDATE benchmark_drivers SET payload=?1 WHERE driver_id=?2",
-                params![
-                    serde_json::to_vec(&invalid_source).unwrap(),
-                    invalid_source.id
-                ],
-            )?;
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    assert!(service.driver(&accepted.id).is_err());
-    assert!(service.resumed_driver(&invalid_source.id).is_err());
-    assert!(matches!(
-        service.resume_driver(&invalid_source.id),
-        Err(BenchmarkError::Unavailable)
-    ));
-    storage
-        .transaction(|tx| {
-            tx.execute(
-                "UPDATE benchmark_drivers SET payload=?1 WHERE driver_id=?2",
-                params![serde_json::to_vec(&previous).unwrap(), previous.id],
-            )?;
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    for fake_intent in [false, true] {
-        let mut changed = operational.clone();
-        if fake_intent {
-            changed.runs[0].launch_intent = Some(uuid::Uuid::new_v4().to_string());
-        } else {
-            changed.runs[0].state = "failed".into();
-        }
-        assert!(service.save_suite(&changed).is_err());
-        assert_eq!(
-            service.suite(&accepted.suite_id).unwrap(),
-            Some(operational.clone())
-        );
-    }
-    let request: BenchmarkLaunchRequest =
-        serde_json::from_value(serde_json::json!({"suite_id":accepted.suite_id, "run_index":0}))
-            .unwrap();
-    assert!(matches!(
-        service.tick(request).await,
-        Err(BenchmarkError::Invalid)
-    ));
-    storage
-        .transaction(|tx| {
-            tx.execute(
-                "UPDATE benchmark_suites SET source_suite_id=NULL WHERE suite_id=?1",
-                [&accepted.suite_id],
-            )?;
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    assert!(service.suite(&accepted.suite_id).is_err());
-    assert!(service.driver(&accepted.id).is_err());
-    assert!(service.resumed_driver(&previous.id).is_err());
-    storage
-        .transaction(|tx| {
-            tx.execute(
-                "UPDATE benchmark_suites SET source_suite_id=?1 WHERE suite_id=?2",
-                params![source.suite_id, accepted.suite_id],
-            )?;
-            Ok::<_, BenchmarkError>(())
-        })
-        .unwrap();
-    storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-    assert_eq!(
-        service.suite(&accepted.suite_id).unwrap(),
-        Some(operational)
-    );
-}
-
-#[tokio::test]
-async fn continuation_launch_preparation_refusal_keeps_actual_pending_summary() {
-    let root = fixture_directory();
-    let storage = open_storage(&root.path().join("metadata.sqlite"));
-    let (service, instance) = continuation_service(root.path(), storage.clone()).await;
-    let (source, previous, _) = continuation_history(&instance, false);
-    let prepared = insert_continuation_history(&storage, &source, &previous, None);
-    let accepted = service.resume_driver(&previous.id).unwrap();
-    // The real launch owner refuses this fixture's missing selected account.
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while !service.tasks.status().is_idle() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let failed = service.driver(&accepted.id).unwrap();
-    let operational = service.suite(&accepted.suite_id).unwrap().unwrap();
-    assert_eq!(failed.state, "failed");
-    assert_eq!(failed.pending_run_index, Some(1));
-    assert_eq!(failed.launched_run_count, 1);
-    assert_eq!(operational.runs[0].state, "failed");
-    assert!(operational.runs[0].session_id.is_some());
-    assert_eq!(operational.runs[1].state, "pending");
-    assert!(matches!(
-        service
-            .launches
-            .intent(operational.runs[0].launch_intent.as_deref().unwrap())
-            .unwrap(),
-        Some(LaunchIntentStatus::Rejected { .. })
-    ));
-    assert!(service.sessions.sessions().is_empty());
-    assert_eq!(service.resume_driver(&previous.id).unwrap(), failed);
-    storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-}
-
 #[tokio::test]
 async fn observed_settlement_without_report_blocks_benchmarks_without_live_process_claims() {
     let root = fixture_directory();
     let path = root.path().join("metadata.sqlite");
     let storage = open_storage(&path);
-    let (service, instance) = continuation_service(root.path(), storage.clone()).await;
+    let (service, instance) = instance_service(root.path(), storage.clone()).await;
     let mut input: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
         "instance_id": instance,
         "suite_mode": "development",
@@ -2624,85 +680,6 @@ async fn observed_settlement_without_report_blocks_benchmarks_without_live_proce
                 db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get(0))?;
             assert_eq!(count, 1);
             Ok::<_, StorageError>(())
-        })
-        .unwrap();
-}
-
-#[tokio::test]
-async fn reopened_history_refuses_every_mutation_without_scheduling_or_intents() {
-    let root = fixture_directory();
-    let path = root.path().join("metadata.sqlite");
-    let storage = open_storage(&path);
-    let prepared = PreparedBenchmarkImport::prepare(vec![suite()], vec![driver()]).unwrap();
-    storage.transaction(|tx| prepared.insert_in(tx)).unwrap();
-    drop(storage);
-    let storage = open_storage(&path);
-    let service = service(root.path(), storage.clone());
-    assert_eq!(service.suite(&suite().suite_id).unwrap(), Some(suite()));
-    assert_eq!(service.driver(&driver().id).unwrap(), driver());
-    assert_eq!(service.drivers().unwrap(), vec![driver()]);
-    assert_eq!(service.resume_interrupted_drivers().unwrap(), 0);
-    let input: BenchmarkLaunchRequest =
-        serde_json::from_value(serde_json::json!({"suite_id":suite().suite_id})).unwrap();
-    assert!(matches!(
-        service.ensure_suite(&input),
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(matches!(
-        service.tick(input.clone()).await,
-        Err(BenchmarkError::Invalid)
-    ));
-    let mut rerun = input.clone();
-    rerun.run_index = Some(5);
-    assert!(matches!(
-        service.tick(rerun).await,
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(matches!(
-        service.start_driver(input.clone()).await,
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(matches!(
-        service.launch(input.clone()).await,
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(matches!(
-        service.stop_driver(&driver().id),
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(matches!(
-        service.resume_driver(&driver().id),
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(matches!(
-        service.run_driver(driver(), input),
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(matches!(
-        service.save_suite(&suite()),
-        Err(BenchmarkError::Invalid)
-    ));
-    assert!(matches!(
-        service.save_driver(&driver()),
-        Err(BenchmarkError::Invalid)
-    ));
-    storage.transaction(|tx| prepared.verify_in(tx)).unwrap();
-    assert!(service.sessions.sessions().is_empty());
-    assert!(service.tasks.status().is_idle());
-    assert!(
-        service
-            .gates
-            .lock()
-            .unwrap()
-            .values()
-            .all(|gate| gate.try_lock().is_ok())
-    );
-    storage
-        .read(|db| {
-            let count: i64 =
-                db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get(0))?;
-            assert_eq!(count, 0);
-            Ok::<_, BenchmarkError>(())
         })
         .unwrap();
 }

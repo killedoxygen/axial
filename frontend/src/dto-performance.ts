@@ -89,8 +89,6 @@ export function benchmarkSuiteDriverResponse(value: unknown): BenchmarkSuiteDriv
     driver: {
       id: dtoString(driver.id, 'Benchmark driver id'),
       state: dtoString(driver.state, 'Benchmark driver state'),
-      historical:
-        driver.historical === undefined ? false : dtoBoolean(driver.historical, 'Benchmark historical driver'),
       suite_id: dtoOptionalString(driver.suite_id, 'Benchmark driver suite'),
       mode: dtoOptionalString(driver.mode, 'Benchmark driver mode'),
       interval_ms: dtoOptionalNumber(driver.interval_ms, 'Benchmark driver interval'),
@@ -126,8 +124,6 @@ export function benchmarkSuiteDriverResponse(value: unknown): BenchmarkSuiteDriv
         'Benchmark driver qualification availability',
       ),
     },
-    resumed_from: dtoOptionalString(record.resumed_from, 'Benchmark driver resumed source'),
-    resumed_driver_id: dtoOptionalString(record.resumed_driver_id, 'Benchmark resumed driver id'),
   };
 }
 

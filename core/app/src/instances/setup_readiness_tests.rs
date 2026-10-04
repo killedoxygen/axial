@@ -32,15 +32,11 @@ fn fixture() -> (tempfile::TempDir, SetupService, Arc<AccountDirectory>) {
         .migrate(&[
             super::super::directory::MIGRATION,
             super::super::create::MIGRATION,
-            super::super::create::DUPLICATE_WITNESS_MIGRATION,
-            super::super::import::MIGRATION,
             super::super::delete::MIGRATION,
             crate::content::install::MIGRATION,
             crate::performance::mutation::MIGRATION,
-            crate::performance::mutation::MIGRATION_V2,
             crate::accounts::directory::MIGRATION,
             crate::install::queue::MIGRATION,
-            crate::install::queue::MIGRATION_V2,
             crate::performance::rules::MIGRATION,
             crate::skins::store::MIGRATION,
         ])
@@ -149,6 +145,30 @@ fn seed_catalog(service: &SetupService) {
         &serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
+}
+
+fn select_unowned_microsoft_account(accounts: &AccountDirectory) {
+    use crate::accounts::{microsoft::MinecraftProfile, model::MicrosoftIdentity};
+
+    let profile = uuid::Uuid::new_v4().simple().to_string();
+    accounts
+        .commit_microsoft(
+            accounts.selection_revision().unwrap(),
+            MicrosoftIdentity {
+                login_id: uuid::Uuid::new_v4().to_string(),
+                profile_id: profile.clone(),
+                display_name: "UnownedPlayer".into(),
+                credential_revision: 1,
+                profile: MinecraftProfile {
+                    id: profile,
+                    name: "UnownedPlayer".into(),
+                    skins: vec![],
+                    capes: vec![],
+                },
+                owns_minecraft_java: false,
+            },
+        )
+        .unwrap();
 }
 
 fn profile_build(
@@ -419,6 +439,7 @@ async fn scanner_ready_artifact_drift_offers_install_without_masking_transient_b
     crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
     let instance = super::super::create::tests::create(&service.instances, "Readiness").await;
     let versions = service.installed().await.unwrap();
+    select_unowned_microsoft_account(&accounts);
     let account_block = service.enrich(instance.clone(), &versions).await;
     assert_eq!(account_block.launch_action.primary_action, "blocked");
     assert!(account_block.status_detail.contains("account"));
@@ -488,10 +509,11 @@ async fn absent_or_unready_catalog_does_not_turn_launch_blocks_into_install_perm
             .any(|version| version.id == instance.version_id)
     );
 
-    let no_account = service.launch.preflight(instance.id.clone()).await;
+    select_unowned_microsoft_account(&accounts);
+    let unowned_account = service.launch.preflight(instance.id.clone()).await;
     assert_eq!(
-        no_account.error.unwrap().code,
-        LaunchError::AccountUnavailable
+        unowned_account.error.unwrap().code,
+        LaunchError::OnlineAccountUnavailable
     );
     for catalog in unready_catalogs(&versions) {
         let blocked = service.enrich(instance.clone(), &catalog).await;

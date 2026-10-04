@@ -201,6 +201,14 @@ impl ConfigPatch {
 }
 
 impl ConfigView {
+    pub fn offline_username(&self) -> &str {
+        if validate_username(&self.username).is_ok() {
+            &self.username
+        } else {
+            "Player"
+        }
+    }
+
     pub fn validate(&self) -> Result<(), SettingsError> {
         match self.launch_auth_mode {
             ConfigLaunchAuthMode::Offline => validate_username(&self.username)?,

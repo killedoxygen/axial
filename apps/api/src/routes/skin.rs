@@ -559,6 +559,7 @@ fn profile_error(value: ProfileMediaError) -> ApiError {
         | ProfileMediaError::InvalidImage
         | ProfileMediaError::Rejected => StatusCode::BAD_REQUEST,
         ProfileMediaError::AccountRequired => StatusCode::UNAUTHORIZED,
+        ProfileMediaError::OwnershipMissing => StatusCode::CONFLICT,
         ProfileMediaError::NotFound
         | ProfileMediaError::MissingSkin
         | ProfileMediaError::MissingCape
@@ -670,6 +671,7 @@ mod tests {
                         profile_id: profile_id.into(),
                         display_name: name.into(),
                         credential_revision: 1,
+                        owns_minecraft_java: true,
                         profile: MinecraftProfile {
                             id: profile_id.into(),
                             name: name.into(),

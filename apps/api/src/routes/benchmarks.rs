@@ -120,15 +120,9 @@ fn project_driver(service: &BenchmarkService, driver: BenchmarkSuiteDriverStatus
         .ok_or_else(|| error(BenchmarkError::Unavailable))?;
     Ok(Json(driver_response(driver, action)))
 }
-fn driver_response(
-    driver: BenchmarkSuiteDriverStatus,
-    (can_resume, resumed): (bool, Option<String>),
-) -> Value {
+fn driver_response(driver: BenchmarkSuiteDriverStatus, can_resume: bool) -> Value {
     let mut payload = driver_payload(driver);
     payload["view_model"]["can_resume"] = json!(can_resume);
-    if let Some(resumed) = resumed {
-        payload["resumed_driver_id"] = json!(resumed);
-    }
     payload
 }
 async fn suite(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult {
@@ -150,9 +144,7 @@ fn error(error: BenchmarkError) -> (StatusCode, Json<Value>) {
     let status = match error {
         BenchmarkError::Invalid => StatusCode::BAD_REQUEST,
         BenchmarkError::NotFound => StatusCode::NOT_FOUND,
-        BenchmarkError::Busy | BenchmarkError::Complete | BenchmarkError::ConflictingHistory => {
-            StatusCode::CONFLICT
-        }
+        BenchmarkError::Busy | BenchmarkError::Complete => StatusCode::CONFLICT,
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     (status, Json(json!({"error":error.to_string()})))
@@ -162,94 +154,73 @@ fn error(error: BenchmarkError) -> (StatusCode, Json<Value>) {
 mod tests {
     use super::*;
     use axial_app::{
-        performance::benchmarks::{benchmark_suite_plan, benchmark_suite_run_id},
-        storage::{MetadataStore, StorageError, rusqlite::params},
+        instances::create::{CreateInstanceRequest, CreateTarget},
+        storage::StorageError,
     };
     use reqwest::Method;
 
     const DRIVERS: &str = "/api/v1/launch/benchmark/suite/drivers";
 
-    fn history(key: &str) -> (Value, Value) {
-        let suite_id = format!("legacy-suite-{}", key.repeat(64));
-        let runs: Vec<_> = benchmark_suite_plan("development")
-            .unwrap()
-            .into_iter()
-            .enumerate()
-            .map(|(index, run)| {
-                json!({"run_index":index,"profile":run.profile,"run_type":run.run_type,
-                    "target_id":run.target_id.unwrap_or(""),
-                    "benchmark_id":benchmark_suite_run_id("development", index, run),
-                    "session_id":null,"launched_at":null,"state":"pending"})
-            })
-            .collect();
-        let suite = json!({
-            "schema":"axial.launch.benchmark.suite","schema_version":2,
-            "suite_id":suite_id,"instance_id":"12345678-1234-4234-8234-123456789abc",
-            "mode":"development","created_at":"2026-01-01T00:00:00Z",
-            "updated_at":"2026-01-01T00:00:02Z","runs":runs,"historical":true
-        });
-        let driver = json!({
-            "id":format!("legacy-driver-{}", key.repeat(64)),"suite_id":suite_id,
-            "mode":"development","state":"stopped","interval_ms":30000,
-            "run_count":runs.len(),"launched_run_count":0,"pending_run_index":0,
-            "active_session_id":null,"last_run_index":null,"last_session_id":null,
-            "error":null,"created_at":"2026-01-01T00:00:00Z",
-            "updated_at":"2026-01-01T00:00:02Z","historical":true
-        });
-        (suite, driver)
-    }
-
-    fn stored_rows(
-        storage: &MetadataStore,
-    ) -> Vec<(String, Vec<u8>, Option<Vec<u8>>, Option<String>)> {
-        storage
-            .read::<_, StorageError>(|connection| {
-                let mut query = connection.prepare(
-                    "SELECT suite_id,payload,NULL,source_suite_id FROM benchmark_suites
-                     UNION ALL SELECT driver_id,payload,request,source_driver_id FROM benchmark_drivers
-                     ORDER BY 1",
-                )?;
-                Ok(query
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
-                    .collect::<Result<Vec<_>, _>>()?)
-            })
-            .unwrap()
-    }
-
     #[tokio::test]
-    async fn historical_driver_routes_reconcile_exact_successor_without_mutating_evidence() {
+    async fn current_driver_routes_resume_the_same_driver_and_project_actions() {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let services = crate::start_in_profile(root.path().join("replacement"), None)
             .await
             .unwrap();
-        let storage = services.settings.metadata();
-        let (source_suite, source_driver) = history("a");
-        let (mut unsupported_suite, unsupported_driver) = history("b");
-        unsupported_suite["runs"][0]["profile"] = json!("retained_old_profile");
-        storage
-            .transaction::<_, StorageError>(|tx| {
-                for (suite, driver) in [
-                    (&source_suite, &source_driver),
-                    (&unsupported_suite, &unsupported_driver),
-                ] {
-                    tx.execute(
-                        "INSERT INTO benchmark_suites(suite_id,payload) VALUES(?1,?2)",
-                        params![
-                            suite["suite_id"].as_str().unwrap(),
-                            serde_json::to_vec(suite).unwrap()
-                        ],
-                    )?;
-                    tx.execute(
-                        "INSERT INTO benchmark_drivers(driver_id,payload) VALUES(?1,?2)",
-                        params![
-                            driver["id"].as_str().unwrap(),
-                            serde_json::to_vec(driver).unwrap()
-                        ],
-                    )?;
-                }
-                Ok(())
-            })
+        let target = CreateTarget::loader_for_tests(
+            axial_minecraft::LoaderComponentId::Fabric,
+            "1.21.1",
+            "0.16.9",
+        )
+        .unwrap();
+        let instance = services
+            .instances
+            .create(
+                CreateInstanceRequest {
+                    name: "Benchmark route fixture".into(),
+                    selection_id: target.selection_id().into(),
+                    ..Default::default()
+                },
+                target,
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
             .unwrap();
+        let accepted = services
+            .benchmarks
+            .start_driver(
+                serde_json::from_value(json!({
+                    "instance_id": instance.id,
+                    "suite_mode": "development",
+                    "interval_ms": 5_000
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        services.benchmarks.stop_driver(&accepted.id).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !services.tasks.status().is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let storage = services.settings.metadata();
+        let captured_request = || {
+            storage
+                .read::<_, StorageError>(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT request FROM benchmark_drivers WHERE driver_id=?1",
+                        [&accepted.id],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        let original_request = captured_request();
         let bootstrap = services.server.bootstrap();
         let client = reqwest::Client::new();
         let request = |method, path: &str| {
@@ -257,95 +228,17 @@ mod tests {
                 .request(method, format!("{}{path}", bootstrap.base_url))
                 .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
         };
-        let source_id = source_driver["id"].as_str().unwrap();
-        let unsupported_id = unsupported_driver["id"].as_str().unwrap();
-        let before = stored_rows(storage);
+        let path = format!("{DRIVERS}/{}", accepted.id);
         assert_eq!(
             client
-                .get(format!("{}{DRIVERS}/{source_id}", bootstrap.base_url))
+                .get(format!("{}{path}", bootstrap.base_url))
                 .send()
                 .await
                 .unwrap()
                 .status(),
             StatusCode::UNAUTHORIZED
         );
-        for (id, expected) in [
-            (source_id, &source_driver),
-            (unsupported_id, &unsupported_driver),
-        ] {
-            let detail: Value = request(Method::GET, &format!("{DRIVERS}/{id}"))
-                .send()
-                .await
-                .unwrap()
-                .error_for_status()
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            assert_eq!(&detail["driver"], expected);
-            assert_eq!(
-                detail["view_model"]["state_label"],
-                "Historical stopped (read-only)"
-            );
-            assert_eq!(detail["view_model"]["state_tone"], "warn");
-            assert_eq!(detail["view_model"]["can_stop"], false);
-            assert_eq!(detail["view_model"]["can_resume"], false);
-            assert!(detail.get("resumed_driver_id").is_none());
-        }
-        for action in ["resume", "stop"] {
-            assert_eq!(
-                request(
-                    Method::POST,
-                    &format!("{DRIVERS}/{unsupported_id}/{action}")
-                )
-                .send()
-                .await
-                .unwrap()
-                .status(),
-                StatusCode::BAD_REQUEST
-            );
-        }
-        assert_eq!(stored_rows(storage), before);
-
-        // Recreate an already accepted, stopped successor with exact owner proof.
-        // Acceptance and real execution are covered by the composed import journey.
-        let mut successor_suite = source_suite.clone();
-        successor_suite
-            .as_object_mut()
-            .unwrap()
-            .remove("historical");
-        successor_suite["suite_id"] = json!("suite-11111111111141118111111111111111");
-        for run in successor_suite["runs"].as_array_mut().unwrap() {
-            run["launch_intent"] = json!(uuid::Uuid::new_v4().to_string());
-        }
-        let mut successor_driver = source_driver.clone();
-        successor_driver
-            .as_object_mut()
-            .unwrap()
-            .remove("historical");
-        successor_driver["id"] = json!("benchmark-suite-driver-22222222222242228222222222222222");
-        successor_driver["suite_id"] = successor_suite["suite_id"].clone();
-        let captured = json!({"instance_id":source_suite["instance_id"],
-            "suite_id":successor_suite["suite_id"],"suite_mode":"development","interval_ms":30000});
-        storage.transaction::<_, StorageError>(|tx| {
-            tx.execute("INSERT INTO benchmark_suites(suite_id,payload,source_suite_id) VALUES(?1,?2,?3)",
-                params![successor_suite["suite_id"].as_str().unwrap(), serde_json::to_vec(&successor_suite).unwrap(), source_suite["suite_id"].as_str().unwrap()])?;
-            tx.execute("INSERT INTO benchmark_drivers(driver_id,payload,request,source_driver_id) VALUES(?1,?2,?3,?4)",
-                params![successor_driver["id"].as_str().unwrap(), serde_json::to_vec(&successor_driver).unwrap(), serde_json::to_vec(&captured).unwrap(), source_id])?;
-            Ok(())
-        }).unwrap();
-        let successor_id = successor_driver["id"].as_str().unwrap();
-        assert_eq!(
-            services
-                .benchmarks
-                .resumed_driver(source_id)
-                .unwrap()
-                .unwrap()
-                .id,
-            successor_id
-        );
-        let accepted = stored_rows(storage);
-        let source: Value = request(Method::GET, &format!("{DRIVERS}/{source_id}"))
+        let stopped: Value = request(Method::GET, &path)
             .send()
             .await
             .unwrap()
@@ -354,14 +247,12 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(source["driver"], source_driver);
-        assert_eq!(source["resumed_driver_id"], successor_id);
-        assert_eq!(source["view_model"]["can_resume"], false);
-        assert_eq!(
-            source["view_model"]["state_label"],
-            "Historical stopped (read-only)"
-        );
-        let successor: Value = request(Method::GET, &format!("{DRIVERS}/{successor_id}"))
+        assert_eq!(stopped["driver"]["id"], accepted.id);
+        assert_eq!(stopped["view_model"]["state_label"], "stopped");
+        assert_eq!(stopped["view_model"]["state_tone"], "warn");
+        assert_eq!(stopped["view_model"]["can_stop"], false);
+        assert_eq!(stopped["view_model"]["can_resume"], true);
+        let resumed: Value = request(Method::POST, &format!("{path}/resume"))
             .send()
             .await
             .unwrap()
@@ -370,23 +261,24 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(successor["driver"], successor_driver);
-        assert_eq!(successor["view_model"]["state_label"], "stopped");
-        assert_eq!(successor["view_model"]["can_resume"], true);
-        assert!(successor["driver"].get("historical").is_none());
-        assert!(successor.get("resumed_driver_id").is_none());
-        for _ in 0..2 {
-            let replay: Value = request(Method::POST, &format!("{DRIVERS}/{source_id}/resume"))
-                .send()
-                .await
-                .unwrap()
-                .error_for_status()
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            assert_eq!(replay, successor);
-        }
+        assert_eq!(resumed["driver"]["id"], accepted.id);
+        assert_eq!(resumed["driver"]["suite_id"], accepted.suite_id);
+        assert_eq!(resumed["driver"]["state"], "running");
+        assert_eq!(resumed["view_model"]["can_stop"], true);
+        assert_eq!(resumed["view_model"]["can_resume"], false);
+        let stopped: Value = request(Method::POST, &format!("{path}/stop"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(stopped["driver"]["id"], accepted.id);
+        assert_eq!(stopped["driver"]["state"], "stopped");
+        assert_eq!(stopped["view_model"]["can_stop"], false);
+        assert_eq!(stopped["view_model"]["can_resume"], true);
         let listed: Value = request(Method::GET, DRIVERS)
             .send()
             .await
@@ -397,34 +289,27 @@ mod tests {
             .await
             .unwrap();
         let drivers = listed["drivers"].as_array().unwrap();
-        assert_eq!(drivers.len(), 3);
-        assert_eq!(
-            drivers
-                .iter()
-                .find(|driver| driver["driver"]["id"] == source_id)
-                .unwrap(),
-            &source
-        );
-        assert_eq!(
-            drivers
-                .iter()
-                .find(|driver| driver["driver"]["id"] == successor_id)
-                .unwrap(),
-            &successor
-        );
-        assert_eq!(stored_rows(storage), accepted);
-        assert!(services.sessions.snapshots().is_empty());
+        assert_eq!(drivers.len(), 1);
+        assert_eq!(drivers[0]["driver"]["id"], accepted.id);
+        assert_eq!(drivers[0]["view_model"]["can_resume"], true);
+        assert_eq!(captured_request(), original_request);
         storage
             .read::<_, StorageError>(|connection| {
                 assert_eq!(
+                    connection.query_row("SELECT count(*) FROM benchmark_suites", [], |row| row
+                        .get::<_, usize>(0))?,
+                    1
+                );
+                assert_eq!(
                     connection
-                        .query_row("SELECT COUNT(*) FROM launch_intents", [], |row| row
-                            .get::<_, u64>(0))?,
-                    0
+                        .query_row("SELECT count(*) FROM benchmark_drivers", [], |row| row
+                            .get::<_, usize>(0))?,
+                    1
                 );
                 Ok(())
             })
             .unwrap();
+        assert!(services.sessions.snapshots().is_empty());
         services.server.shutdown().await.unwrap();
         services.server.wait().await.unwrap();
     }

@@ -52,7 +52,7 @@ CREATE TABLE install_queue (
  id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, library_id TEXT NOT NULL,
  request_json TEXT NOT NULL, target_json TEXT NOT NULL, status_json TEXT NOT NULL,
  phase TEXT NOT NULL CHECK(phase IN ('queued','running','settlement_required','terminal')),
- accepted_at INTEGER NOT NULL
+ accepted_at INTEGER NOT NULL, checkpoint_json TEXT
 );
 CREATE TABLE installed_versions (
  library_id TEXT NOT NULL, version_id TEXT NOT NULL, contract_id TEXT NOT NULL,
@@ -60,11 +60,6 @@ CREATE TABLE installed_versions (
  state TEXT NOT NULL CHECK(state IN ('activating','ready')),
  PRIMARY KEY(library_id, version_id)
 );",
-};
-
-pub const MIGRATION_V2: Migration = Migration {
-    id: "install.v2",
-    sql: "ALTER TABLE install_queue ADD COLUMN checkpoint_json TEXT;",
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3299,7 +3294,7 @@ pub(crate) mod tests {
             _ => panic!("isolated library admission"),
         };
         let storage = Arc::new(MetadataStore::in_memory().unwrap());
-        storage.migrate(&[MIGRATION, MIGRATION_V2]).unwrap();
+        storage.migrate(&[MIGRATION]).unwrap();
         let exclusions = Exclusions::new();
         let owner = TaskOwner::new(4).unwrap();
         let runtime = ManagedRuntimeCache::isolated_for_test().unwrap();
@@ -4051,11 +4046,9 @@ pub(crate) mod tests {
                 .migrate(&[
                     crate::instances::directory::MIGRATION,
                     crate::instances::create::MIGRATION,
-                    crate::instances::create::DUPLICATE_WITNESS_MIGRATION,
                     crate::instances::delete::MIGRATION,
                     crate::content::install::MIGRATION,
                     crate::performance::mutation::MIGRATION,
-                    crate::performance::mutation::MIGRATION_V2,
                 ])
                 .unwrap();
             let directories = InstanceDirectories::new(

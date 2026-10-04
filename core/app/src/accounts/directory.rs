@@ -10,8 +10,7 @@ use crate::storage::{
 use super::{
     model::{
         AccountError, AccountId, AccountKind, AccountPreconditions, AccountRecord, AccountSnapshot,
-        LaunchAuthMode, MicrosoftIdentity, MicrosoftIdentityImport, OfflineIdentityImport,
-        microsoft_account_id, offline_uuid, validate_username,
+        LaunchAuthMode, MicrosoftIdentity, microsoft_account_id, offline_uuid, validate_username,
     },
     selection::CapturedAccount,
 };
@@ -20,7 +19,8 @@ pub const MIGRATION: Migration = Migration {
     id: "accounts-directory-v1",
     sql: "CREATE TABLE account_directory (
         account_id TEXT PRIMARY KEY NOT NULL,
-        record_json TEXT NOT NULL CHECK(length(record_json) <= 262144)
+        record_json TEXT NOT NULL CHECK(length(record_json) <= 262144),
+        owns_minecraft_java INTEGER NOT NULL CHECK(owns_minecraft_java IN (0, 1))
     );
     CREATE TABLE account_selection (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -138,6 +138,7 @@ impl AccountDirectory {
                     minecraft_profile_id: None,
                     offline_uuid: Some(uuid),
                     minecraft_profile: None,
+                    owns_minecraft_java: false,
                     account_revision: revision,
                     profile_revision: revision,
                     credential_revision: 0,
@@ -315,64 +316,6 @@ impl AccountDirectory {
         })
     }
 
-    pub fn import_offline_identity(
-        &self,
-        input: OfflineIdentityImport,
-        select: bool,
-    ) -> Result<AccountSnapshot, AccountError> {
-        let id = AccountId::parse(&input.account_id)?;
-        self.mutate(move |snapshot, revision| {
-            import_offline(snapshot, revision, &input)?;
-            if select {
-                select_identity(snapshot, Some(id));
-            }
-            Ok(())
-        })
-    }
-
-    /// Microsoft rows are identities awaiting reauthentication, never secure
-    /// sessions. All rows and the selected mode share the caller's transaction.
-    /// No source selection explicitly clears the destination selection.
-    pub(crate) fn import_identities_in_transaction(
-        transaction: &Transaction<'_>,
-        offline: &[OfflineIdentityImport],
-        microsoft: &[MicrosoftIdentityImport],
-        active_id: Option<&str>,
-        expected_selection_revision: u64,
-    ) -> Result<AccountSnapshot, AccountError> {
-        let active_id = active_id.map(AccountId::parse).transpose()?;
-        mutate_transaction(transaction, |snapshot, revision| {
-            if snapshot.selection_revision != expected_selection_revision {
-                return Err(AccountError::StaleCapture);
-            }
-            let mut seen = std::collections::HashSet::new();
-            for input in offline {
-                if !seen.insert(input.account_id.clone()) {
-                    return Err(AccountError::InvalidInput(
-                        "Duplicate imported account identity.",
-                    ));
-                }
-                import_offline(snapshot, revision, input)?;
-            }
-            for input in microsoft {
-                if !seen.insert(input.account_id()?) {
-                    return Err(AccountError::InvalidInput(
-                        "Duplicate imported account identity.",
-                    ));
-                }
-                import_microsoft(snapshot, revision, input)?;
-            }
-            if active_id
-                .as_ref()
-                .is_some_and(|id| !seen.contains(id.as_str()))
-            {
-                return Err(AccountError::NoSelection);
-            }
-            select_identity(snapshot, active_id);
-            Ok(())
-        })
-    }
-
     /// The settings owner calls this inside its settings write transaction.
     /// A duplicate username selects the existing identity, as the legacy
     /// username setting did. Microsoft names are provider-owned.
@@ -448,93 +391,6 @@ impl AccountDirectory {
     }
 }
 
-fn import_offline(
-    snapshot: &mut AccountSnapshot,
-    revision: u64,
-    input: &OfflineIdentityImport,
-) -> Result<(), AccountError> {
-    input.validate()?;
-    let id = AccountId::parse(&input.account_id)?;
-    if let Some(existing) = snapshot
-        .accounts
-        .iter()
-        .find(|account| account.account_id == id)
-    {
-        if existing.kind != AccountKind::Offline
-            || existing.display_name != input.display_name
-            || existing.offline_uuid.as_deref() != Some(input.offline_uuid.as_str())
-            || existing.created_at != input.created_at
-            || existing.updated_at != input.updated_at
-        {
-            return Err(AccountError::AlreadyExists);
-        }
-        return Ok(());
-    }
-    check_capacity(snapshot)?;
-    snapshot.accounts.push(AccountRecord {
-        account_id: id,
-        kind: AccountKind::Offline,
-        display_name: input.display_name.clone(),
-        login_id: None,
-        minecraft_profile_id: None,
-        offline_uuid: Some(input.offline_uuid.clone()),
-        minecraft_profile: None,
-        account_revision: revision,
-        profile_revision: revision,
-        credential_revision: 0,
-        created_revision: revision,
-        created_at: input.created_at.clone(),
-        updated_at: input.updated_at.clone(),
-    });
-    Ok(())
-}
-
-fn import_microsoft(
-    snapshot: &mut AccountSnapshot,
-    revision: u64,
-    input: &MicrosoftIdentityImport,
-) -> Result<(), AccountError> {
-    input.validate()?;
-    let id = AccountId::parse(&input.account_id()?)?;
-    if let Some(existing) = snapshot
-        .accounts
-        .iter()
-        .find(|account| account.account_id == id)
-    {
-        if existing.kind != AccountKind::Microsoft
-            || existing.credential_revision != 0
-            || existing.display_name != input.display_name
-            || existing.created_at != input.created_at
-            || existing.updated_at != input.updated_at
-        {
-            return Err(AccountError::AlreadyExists);
-        }
-        return Ok(());
-    }
-    check_capacity(snapshot)?;
-    snapshot.accounts.push(AccountRecord {
-        account_id: id,
-        kind: AccountKind::Microsoft,
-        display_name: input.display_name.clone(),
-        login_id: None,
-        minecraft_profile_id: Some(
-            uuid::Uuid::parse_str(&input.profile_id)
-                .map_err(|_| AccountError::InvalidStoredData)?
-                .simple()
-                .to_string(),
-        ),
-        offline_uuid: None,
-        minecraft_profile: None,
-        account_revision: revision,
-        profile_revision: revision,
-        credential_revision: 0,
-        created_revision: revision,
-        created_at: input.created_at.clone(),
-        updated_at: input.updated_at.clone(),
-    });
-    Ok(())
-}
-
 fn mutate_transaction(
     transaction: &Transaction<'_>,
     mutation: impl FnOnce(&mut AccountSnapshot, u64) -> Result<(), AccountError>,
@@ -593,19 +449,29 @@ fn read_snapshot(connection: &Connection) -> Result<AccountSnapshot, AccountErro
     let (revision, active, mode): (u64, Option<String>, String) = connection.query_row(
         "SELECT revision, active_account_id, launch_auth_mode FROM account_selection WHERE singleton = 1", [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-    let mut statement =
-        connection.prepare("SELECT account_id, record_json FROM account_directory LIMIT 257")?;
+    let mut statement = connection.prepare(
+        "SELECT account_id, record_json, owns_minecraft_java FROM account_directory LIMIT 257",
+    )?;
     let records = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
     })?;
     let mut accounts = Vec::new();
     for record in records {
-        let (id, json) = record?;
+        let (id, json, owns_minecraft_java) = record?;
         if json.len() > 262_144 {
             return Err(AccountError::InvalidStoredData);
         }
-        let account: AccountRecord =
+        let mut account: AccountRecord =
             serde_json::from_str(&json).map_err(|_| AccountError::InvalidStoredData)?;
+        account.owns_minecraft_java = match owns_minecraft_java {
+            0 => false,
+            1 => true,
+            _ => return Err(AccountError::InvalidStoredData),
+        };
         if account.account_id.as_str() != id {
             return Err(AccountError::InvalidStoredData);
         }
@@ -653,7 +519,7 @@ fn write_snapshot(
             continue;
         }
         let json = serde_json::to_string(account).map_err(|_| AccountError::InvalidStoredData)?;
-        transaction.execute("INSERT INTO account_directory(account_id, record_json) VALUES(?1, ?2) ON CONFLICT(account_id) DO UPDATE SET record_json = excluded.record_json", params![account.account_id.as_str(), json])?;
+        transaction.execute("INSERT INTO account_directory(account_id, record_json, owns_minecraft_java) VALUES(?1, ?2, ?3) ON CONFLICT(account_id) DO UPDATE SET record_json = excluded.record_json, owns_minecraft_java = excluded.owns_minecraft_java", params![account.account_id.as_str(), json, account.owns_minecraft_java])?;
     }
     if transaction.execute("UPDATE account_selection SET revision = ?1, active_account_id = ?2, launch_auth_mode = ?3 WHERE singleton = 1",
         params![next.revision, next.active_account_id.as_ref().map(AccountId::as_str), match next.launch_auth_mode { LaunchAuthMode::Offline => "offline", LaunchAuthMode::Online => "online" }])? != 1
@@ -806,6 +672,7 @@ fn upsert_microsoft(
         ),
         offline_uuid: None,
         minecraft_profile: Some(identity.profile),
+        owns_minecraft_java: identity.owns_minecraft_java,
         account_revision: revision,
         profile_revision: if profile_changed {
             revision
@@ -862,36 +729,19 @@ fn validate_snapshot(snapshot: &AccountSnapshot) -> Result<(), AccountError> {
                     || account.minecraft_profile_id.is_some()
                     || account.minecraft_profile.is_some()
                     || account.credential_revision != 0
+                    || account.owns_minecraft_java
                 {
                     return Err(invalid());
                 }
             }
             AccountKind::Microsoft => {
-                if account.credential_revision == 0 {
-                    let input = MicrosoftIdentityImport {
-                        profile_id: account.minecraft_profile_id.clone().ok_or_else(invalid)?,
-                        display_name: account.display_name.clone(),
-                        created_at: account.created_at.clone(),
-                        updated_at: account.updated_at.clone(),
-                    };
-                    input.validate().map_err(|_| invalid())?;
-                    if input.account_id().map_err(|_| invalid())? != account.account_id.as_str()
-                        || account.minecraft_profile_id.as_deref()
-                            != Some(account.account_id.as_str().replace('-', "").as_str())
-                        || account.login_id.is_some()
-                        || account.minecraft_profile.is_some()
-                        || account.offline_uuid.is_some()
-                    {
-                        return Err(invalid());
-                    }
-                    continue;
-                }
                 let identity = MicrosoftIdentity {
                     login_id: account.login_id.clone().ok_or_else(invalid)?,
                     profile_id: account.minecraft_profile_id.clone().ok_or_else(invalid)?,
                     display_name: account.display_name.clone(),
                     credential_revision: account.credential_revision,
                     profile: account.minecraft_profile.clone().ok_or_else(invalid)?,
+                    owns_minecraft_java: account.owns_minecraft_java,
                 };
                 if validate_microsoft(&identity).map_err(|_| invalid())? != account.account_id
                     || account.offline_uuid.is_some()
@@ -914,225 +764,6 @@ fn validate_snapshot(snapshot: &AccountSnapshot) -> Result<(), AccountError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn imported_microsoft() -> MicrosoftIdentityImport {
-        MicrosoftIdentityImport {
-            profile_id: "12345678123442348234123456789ABC".into(),
-            display_name: "A".into(),
-            created_at: "2024-01-01T00:00:00Z".into(),
-            updated_at: "2024-01-02T00:00:00Z".into(),
-        }
-    }
-
-    #[test]
-    fn imported_microsoft_identity_and_online_selection_survive_restart() {
-        let root =
-            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-        let path = root.path().join("accounts.sqlite");
-        let input = imported_microsoft();
-        let expected = {
-            let store = Arc::new(MetadataStore::open(&path).unwrap());
-            let directory = AccountDirectory::new(store.clone()).unwrap();
-            let imported = store
-                .transaction(|tx| {
-                    AccountDirectory::import_identities_in_transaction(
-                        tx,
-                        &[],
-                        &[input.clone()],
-                        Some(&input.account_id()?),
-                        0,
-                    )
-                })
-                .unwrap();
-            let active = imported.active_account().unwrap();
-            assert_eq!(active.created_at, input.created_at);
-            assert_eq!(active.updated_at, input.updated_at);
-            assert!(active.login_id.is_none() && active.minecraft_profile.is_none());
-            assert_eq!(active.credential_revision, 0);
-            assert_eq!(active.minecraft_uuid(), "12345678123442348234123456789abc");
-            assert_eq!(imported.launch_auth_mode, LaunchAuthMode::Online);
-            let repeated = store
-                .transaction(|tx| {
-                    AccountDirectory::import_identities_in_transaction(
-                        tx,
-                        &[],
-                        &[input.clone()],
-                        Some(&input.account_id()?),
-                        imported.selection_revision,
-                    )
-                })
-                .unwrap();
-            assert_eq!(repeated, imported);
-            assert_eq!(directory.snapshot().unwrap(), imported);
-            imported
-        };
-        let reopened =
-            AccountDirectory::new(Arc::new(MetadataStore::open(&path).unwrap())).unwrap();
-        assert_eq!(reopened.snapshot().unwrap(), expected);
-    }
-
-    #[test]
-    fn mixed_import_conflicts_roll_back_every_row_and_never_downgrade_authentication() {
-        let store = Arc::new(MetadataStore::in_memory().unwrap());
-        let directory = AccountDirectory::new(store.clone()).unwrap();
-        let input = imported_microsoft();
-        let offline = OfflineIdentityImport {
-            account_id: format!("offline-{}", offline_uuid("Steve")),
-            display_name: "Steve".into(),
-            offline_uuid: offline_uuid("Steve"),
-            created_at: input.created_at.clone(),
-            updated_at: input.updated_at.clone(),
-        };
-        let original = store
-            .transaction(|tx| {
-                AccountDirectory::import_identities_in_transaction(
-                    tx,
-                    &[],
-                    &[input.clone()],
-                    Some(&input.account_id()?),
-                    0,
-                )
-            })
-            .unwrap();
-        let changed = MicrosoftIdentityImport {
-            display_name: "Different".into(),
-            ..input.clone()
-        };
-        assert!(
-            store
-                .transaction(|tx| AccountDirectory::import_identities_in_transaction(
-                    tx,
-                    &[offline.clone()],
-                    &[changed],
-                    Some(&offline.account_id),
-                    original.selection_revision
-                ))
-                .is_err()
-        );
-        assert_eq!(directory.snapshot().unwrap(), original);
-        assert!(
-            store
-                .transaction(|tx| AccountDirectory::import_identities_in_transaction(
-                    tx,
-                    &[offline.clone()],
-                    &[input.clone(), input.clone()],
-                    Some(&offline.account_id),
-                    original.selection_revision
-                ))
-                .is_err()
-        );
-        assert_eq!(directory.snapshot().unwrap(), original);
-        assert!(
-            store
-                .transaction(|tx| AccountDirectory::import_identities_in_transaction(
-                    tx,
-                    &[offline.clone()],
-                    &[],
-                    Some(&input.account_id()?),
-                    original.selection_revision
-                ))
-                .is_err()
-        );
-        assert_eq!(directory.snapshot().unwrap(), original);
-        assert!(
-            store
-                .transaction(|tx| AccountDirectory::import_identities_in_transaction(
-                    tx,
-                    &[offline.clone()],
-                    &[input.clone()],
-                    Some(&offline.account_id),
-                    0
-                ))
-                .is_err()
-        );
-        assert_eq!(directory.snapshot().unwrap(), original);
-
-        let mixed = store
-            .transaction(|tx| {
-                AccountDirectory::import_identities_in_transaction(
-                    tx,
-                    &[offline.clone()],
-                    &[input.clone()],
-                    Some(&offline.account_id),
-                    original.selection_revision,
-                )
-            })
-            .unwrap();
-        assert_eq!(mixed.accounts.len(), 2);
-        assert_eq!(mixed.launch_auth_mode, LaunchAuthMode::Offline);
-        directory
-            .commit_microsoft(
-                mixed.selection_revision,
-                MicrosoftIdentity {
-                    login_id: uuid::Uuid::new_v4().to_string(),
-                    profile_id: input.profile_id.clone(),
-                    display_name: input.display_name.clone(),
-                    credential_revision: 1,
-                    profile: super::super::microsoft::MinecraftProfile {
-                        id: input.profile_id.clone(),
-                        name: input.display_name.clone(),
-                        skins: vec![],
-                        capes: vec![],
-                    },
-                },
-            )
-            .unwrap();
-        let authenticated = directory.snapshot().unwrap();
-        assert!(matches!(
-            store.transaction(|tx| AccountDirectory::import_identities_in_transaction(
-                tx,
-                &[],
-                &[input.clone()],
-                Some(&input.account_id()?),
-                authenticated.selection_revision
-            )),
-            Err(AccountError::AlreadyExists)
-        ));
-        assert_eq!(directory.snapshot().unwrap(), authenticated);
-    }
-
-    #[test]
-    fn zero_credential_revision_requires_exact_unverified_record_shape() {
-        let store = Arc::new(MetadataStore::in_memory().unwrap());
-        AccountDirectory::new(store.clone()).unwrap();
-        let input = imported_microsoft();
-        let original = store
-            .transaction(|tx| {
-                AccountDirectory::import_identities_in_transaction(
-                    tx,
-                    &[],
-                    &[input.clone()],
-                    Some(&input.account_id()?),
-                    0,
-                )
-            })
-            .unwrap();
-        for field in [
-            "login",
-            "profile",
-            "offline_uuid",
-            "noncanonical_uuid",
-            "credential",
-        ] {
-            let mut invalid = original.clone();
-            let record = &mut invalid.accounts[0];
-            match field {
-                "login" => record.login_id = Some(uuid::Uuid::new_v4().to_string()),
-                "profile" => {
-                    record.minecraft_profile = Some(super::super::microsoft::MinecraftProfile {
-                        id: input.profile_id.clone(),
-                        name: input.display_name.clone(),
-                        skins: vec![],
-                        capes: vec![],
-                    })
-                }
-                "offline_uuid" => record.offline_uuid = Some(offline_uuid("Steve")),
-                "noncanonical_uuid" => record.minecraft_profile_id = Some(input.profile_id.clone()),
-                _ => record.credential_revision = 1,
-            }
-            assert!(validate_snapshot(&invalid).is_err(), "{field}");
-        }
-    }
 
     fn directory() -> AccountDirectory {
         AccountDirectory::new(Arc::new(MetadataStore::in_memory().unwrap())).unwrap()

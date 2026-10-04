@@ -35,28 +35,6 @@ fn client() -> ProviderClient {
 }
 
 pub(crate) fn fixture_catalog(body: Vec<u8>) -> (Catalog, std::thread::JoinHandle<()>) {
-    fixture_catalog_status(body, 200)
-}
-
-pub(crate) fn fixture_catalog_status(
-    body: Vec<u8>,
-    status: u16,
-) -> (Catalog, std::thread::JoinHandle<()>) {
-    fixture_catalog_response(body, status, || {})
-}
-
-pub(crate) fn fixture_catalog_on_request(
-    body: Vec<u8>,
-    on_request: impl FnOnce() + Send + 'static,
-) -> (Catalog, std::thread::JoinHandle<()>) {
-    fixture_catalog_response(body, 200, on_request)
-}
-
-fn fixture_catalog_response(
-    body: Vec<u8>,
-    status: u16,
-    on_request: impl FnOnce() + Send + 'static,
-) -> (Catalog, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -83,10 +61,9 @@ fn fixture_catalog_response(
             .unwrap();
         let mut request = [0_u8; 4096];
         assert!(stream.read(&mut request).unwrap() > 0);
-        on_request();
         write!(
             stream,
-            "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .unwrap();
@@ -98,124 +75,6 @@ fn fixture_catalog_response(
         OriginPolicy::loopback_for_tests([&origin], 0).unwrap(),
     ));
     (catalog, thread)
-}
-
-#[tokio::test]
-async fn fresh_selections_resolve_exact_deduplicated_ids_from_one_manifest() {
-    let (catalog, server) = fixture_catalog(manifest(&[
-        ("1.21.11", "release"),
-        ("b1.7.3", "old_beta"),
-        ("unrequested", "snapshot"),
-    ]));
-    let ids = ["1.21.11", "b1.7.3", "1.21.11", "B1.7.3", "missing"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    let selected = catalog
-        .resolve_fresh_selections(&ids, &CancellationToken::new())
-        .await
-        .unwrap();
-    server.join().unwrap();
-    assert_eq!(
-        selected.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["1.21.11", "b1.7.3"]
-    );
-    for (id, descriptor) in selected {
-        assert_eq!(descriptor.id(), id);
-        assert_eq!(
-            descriptor.metadata_url(),
-            "https://piston-meta.mojang.com/v1/packages/0123456789012345678901234567890123456789/version.json"
-        );
-        assert_eq!(
-            descriptor.metadata_sha1(),
-            "0123456789012345678901234567890123456789"
-        );
-    }
-}
-
-#[tokio::test]
-async fn fresh_selections_bound_inputs_before_fetch_and_accept_the_exact_limits() {
-    let longest_id = "v".repeat(MAX_SELECTION_ID_BYTES);
-    let (catalog, server) = fixture_catalog(manifest(&[(&longest_id, "release")]));
-    let cancel = CancellationToken::new();
-    assert!(
-        catalog
-            .resolve_fresh_selections(&BTreeSet::new(), &cancel)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let too_many = (0..=MAX_SELECTION_IDS)
-        .map(|index| format!("version-{index}"))
-        .collect();
-    for invalid in [
-        too_many,
-        BTreeSet::from(["v".repeat(MAX_SELECTION_ID_BYTES + 1)]),
-        BTreeSet::from(["../outside".to_owned()]),
-        BTreeSet::from(["CON".to_owned()]),
-    ] {
-        assert_eq!(
-            catalog
-                .resolve_fresh_selections(&invalid, &cancel)
-                .await
-                .unwrap_err(),
-            CatalogError::Malformed
-        );
-    }
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
-    for ids in [BTreeSet::new(), BTreeSet::from([longest_id.clone()])] {
-        assert_eq!(
-            catalog
-                .resolve_fresh_selections(&ids, &cancelled)
-                .await
-                .unwrap_err(),
-            CatalogError::Cancelled
-        );
-    }
-    // All preceding calls must leave the fixture's sole response untouched.
-    let mut ids: BTreeSet<_> = (0..MAX_SELECTION_IDS - 1)
-        .map(|index| format!("version-{index}"))
-        .collect();
-    ids.insert(longest_id.clone());
-    let selected = catalog
-        .resolve_fresh_selections(&ids, &cancel)
-        .await
-        .unwrap();
-    server.join().unwrap();
-    assert_eq!(selected.len(), 1);
-    assert_eq!(selected[&longest_id].id(), longest_id);
-}
-
-#[tokio::test]
-async fn fresh_selections_refuse_malformed_or_unavailable_provider_responses() {
-    let mut invalid_source: Value =
-        serde_json::from_slice(&manifest(&[("1.21.11", "release")])).unwrap();
-    invalid_source["versions"][0]["url"] = "https://untrusted.test/version.json".into();
-    for (body, status, expected) in [
-        (b"not json".to_vec(), 200, CatalogError::Malformed),
-        (
-            serde_json::to_vec(&invalid_source).unwrap(),
-            200,
-            CatalogError::Malformed,
-        ),
-        (
-            manifest(&[("1.21.11", "release"), ("1.21.11", "release")]),
-            200,
-            CatalogError::Malformed,
-        ),
-        (Vec::new(), 404, CatalogError::Unavailable),
-    ] {
-        let (catalog, server) = fixture_catalog_status(body, status);
-        let result = catalog
-            .resolve_fresh_selections(
-                &BTreeSet::from(["1.21.11".to_owned()]),
-                &CancellationToken::new(),
-            )
-            .await;
-        server.join().unwrap();
-        assert_eq!(result.unwrap_err(), expected);
-    }
 }
 
 fn version_file(root: &Path, id: &str, value: Value, jar: bool) {

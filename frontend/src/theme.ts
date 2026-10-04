@@ -1,12 +1,12 @@
 import { signal } from '@preact/signals';
-import { defaults, local, localStateVersion, saveLocalState, PRESET_HUES, canEditPreferences } from './state';
+import { defaults, local, saveLocalState, PRESET_HUES, canEditPreferences } from './state';
 import { saveConfigPatch } from './hooks/use-autosave';
 import { config } from './store';
 import { Sound } from './sound';
 import { buildTheme, type Theme } from './tokens';
 import { toast } from './toast';
 import { hasNativeDesktopRuntime, windowSetResizeBackground } from './native';
-import { flushNativePreferences, nativePreferencesHydrated } from './preferences/persistence';
+import { nativePreferencesHydrated } from './preferences/persistence';
 import type { Config } from './types-settings';
 
 const initialThemeHue = local.theme === 'custom' ? local.customHue : (PRESET_HUES[local.theme] ?? local.customHue);
@@ -203,20 +203,6 @@ export function applyConfigTheme(cfg: Config): void {
     vibrancy: cfg.custom_vibrancy ?? local.customVibrancy,
     lightness: cfg.lightness ?? local.lightness,
   });
-}
-
-export async function applyImportedConfigTheme(cfg: Config, preferenceVersion: number): Promise<void> {
-  if (!hasNativeDesktopRuntime()) { applyConfigTheme(cfg); return; }
-  if (!canEditPreferences()) throw new Error('Interface preferences are paused. Refresh the imported settings again.');
-  if (localStateVersion.value !== preferenceVersion) return;
-  if (local.theme === 'obsidian' && cfg.theme && cfg.theme !== 'obsidian') {
-    applyTheme(cfg.theme, cfg.custom_hue ?? local.customHue, {
-      silent: true, vibrancy: cfg.custom_vibrancy ?? local.customVibrancy,
-      lightness: cfg.lightness ?? local.lightness,
-    });
-    saveLocalState();
-  }
-  await flushNativePreferences();
 }
 
 export function resetThemeToDefault(): void {

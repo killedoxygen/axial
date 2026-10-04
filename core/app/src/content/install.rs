@@ -2679,11 +2679,9 @@ mod tests {
             .migrate(&[
                 crate::instances::directory::MIGRATION,
                 crate::instances::create::MIGRATION,
-                crate::instances::create::DUPLICATE_WITNESS_MIGRATION,
                 crate::instances::delete::MIGRATION,
                 MIGRATION,
                 crate::performance::mutation::MIGRATION,
-                crate::performance::mutation::MIGRATION_V2,
                 crate::performance::rules::MIGRATION,
             ])
             .unwrap();

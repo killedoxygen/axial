@@ -78,7 +78,6 @@ pub struct DesktopLifecycle {
     exit_allowed: Arc<AtomicBool>,
     presence: PresenceObserver,
     skin_files: NativeSkinFiles,
-    imports: Option<crate::import::NativeImports>,
 }
 
 #[derive(Clone)]
@@ -107,7 +106,6 @@ impl DesktopLifecycle {
             exit_allowed: Arc::new(AtomicBool::new(false)),
             presence,
             skin_files,
-            imports: None,
         }
     }
 
@@ -145,9 +143,6 @@ impl DesktopLifecycle {
             .is_some_and(|services| !services.server.is_shutdown_settled())
         {
             return Err(SHUTDOWN_INCOMPLETE.into());
-        }
-        if let Some(imports) = &self.imports {
-            imports.release_after_shutdown()?;
         }
         let retained = services.take();
         drop(services);
@@ -231,16 +226,8 @@ impl DesktopLifecycle {
         self
     }
 
-    pub fn with_imports(mut self, imports: crate::import::NativeImports) -> Self {
-        self.imports = Some(imports);
-        self
-    }
-
     fn close_native_admission(&self) {
         self.skin_files.close();
-        if let Some(imports) = &self.imports {
-            imports.close();
-        }
     }
 
     /// Native terminal effects use this only after all shutdown work succeeds.

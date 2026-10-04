@@ -1,7 +1,6 @@
 mod auth;
 mod bootstrap;
 mod discord_presence;
-mod import;
 mod lifecycle;
 mod native_skin;
 #[cfg(debug_assertions)]
@@ -88,21 +87,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let skin_files =
         native_skin::NativeSkinFiles::new(services.library.clone(), services.tasks.clone());
-    let imports = import::NativeImports::new(
-        services.library.clone(),
-        services.tasks.clone(),
-        services.imports.clone(),
-        services.catalog.clone(),
-        services.performance.rules().clone(),
-    );
     let lifecycle = DesktopLifecycle::new(
         services.tasks.clone(),
         services.server.clone(),
         presence,
         skin_files.clone(),
         services.skins.clone(),
-    )
-    .with_imports(imports.clone());
+    );
     #[cfg(debug_assertions)]
     let reset = match reset::NativeReset::new(services.library.clone(), services.tasks.clone()) {
         Ok(reset) => reset,
@@ -152,7 +143,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .manage(bootstrap)
         .manage(lifecycle.clone())
         .manage(skin_files)
-        .manage(imports)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -160,9 +150,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             auth::microsoft_sign_in,
             native_skin::pick_skin_file,
             native_skin::consume_skin_drop,
-            import::pick_import_profile,
-            import::pick_import_instance_source,
-            import::forget_import_profile,
             bootstrap::api_transport_bootstrap,
             window::desktop_chrome,
             window::window_minimize,

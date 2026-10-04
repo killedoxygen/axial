@@ -25,8 +25,8 @@ function queueFlagsAction(action: () => Promise<void>): Promise<void> {
   return request;
 }
 
-export function refreshFlags(options: { fresh?: boolean } = {}): Promise<void> {
-  if (pendingFlagsRefresh && !options.fresh) return pendingFlagsRefresh;
+export function refreshFlags(): Promise<void> {
+  if (pendingFlagsRefresh) return pendingFlagsRefresh;
 
   const pending = queueFlagsAction(async () => {
     featureFlagsLoadState.value = { status: 'loading', error: null };

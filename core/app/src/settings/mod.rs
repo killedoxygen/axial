@@ -2,14 +2,12 @@
 //! library lifecycle owns every root selection and its filesystem authority.
 
 mod flags;
-mod import;
 mod model;
 mod preferences;
 
 pub use flags::{
     FlagOverridePatch, FlagSource, FlagStage, FlagViewModel, FlagsResponse, STATE_INSPECTOR_FLAG,
 };
-pub use import::{PreparedSettingsImport, prepare_legacy_import};
 pub use model::{
     ConfigJvmPreset, ConfigLaunchAuthMode, ConfigPatch, ConfigPerformanceMode, ConfigTheme,
     ConfigView, EffectiveLaunchSettings, InstanceSettings, NullablePatch, validate_username,
@@ -74,9 +72,7 @@ struct Document {
     config: ConfigView,
     feature_overrides: BTreeMap<String, bool>,
     telemetry_install_id: Option<String>,
-    #[serde(default)]
     interface_preferences_revision: u64,
-    #[serde(default)]
     interface_preferences: Option<InterfacePreferences>,
 }
 

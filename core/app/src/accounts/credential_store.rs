@@ -156,11 +156,11 @@ impl CredentialStore {
         &self.tasks
     }
 
-    #[cfg(test)]
-    pub(crate) fn isolated_for_tests() -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn isolated_for_tests() -> Self {
         Self {
             profile: Uuid::new_v4(),
-            keyring: Arc::new(tests::MemoryEntries::default()),
+            keyring: Arc::new(memory::MemoryEntries::default()),
             gate: Arc::default(),
             tasks: TaskOwner::new(64).unwrap(),
         }
@@ -679,37 +679,34 @@ impl SecureEntries for OsKeyring {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "test-support"))]
+mod memory {
     use super::*;
     use std::sync::Condvar;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    const ACCOUNT: &str = "4f7d5a11-d427-48e8-8953-d0d2f3829e9c";
-    const OTHER_ACCOUNT: &str = "f92369e6-9c0a-48e7-a238-8ad1e11cc2e4";
-
     #[derive(Default)]
-    struct Faults {
-        unavailable: bool,
-        reject_chunks: bool,
-        reject_deletes: bool,
-        write_then_error: bool,
-        lose_live_ack: bool,
-        fail_next_get: bool,
+    pub(super) struct Faults {
+        pub(super) unavailable: bool,
+        pub(super) reject_chunks: bool,
+        pub(super) reject_deletes: bool,
+        pub(super) write_then_error: bool,
+        pub(super) lose_live_ack: bool,
+        pub(super) fail_next_get: bool,
     }
 
     #[derive(Default)]
     pub(super) struct MemoryEntries {
-        values: Mutex<HashMap<String, Vec<u8>>>,
-        faults: Mutex<Faults>,
-        block_next_write: Mutex<Option<Arc<WriteBlock>>>,
+        pub(super) values: Mutex<HashMap<String, Vec<u8>>>,
+        pub(super) faults: Mutex<Faults>,
+        pub(super) block_next_write: Mutex<Option<Arc<WriteBlock>>>,
     }
 
     #[derive(Default)]
-    struct WriteBlock {
-        entered: AtomicBool,
-        proceed: Mutex<bool>,
-        released: Condvar,
+    pub(super) struct WriteBlock {
+        pub(super) entered: AtomicBool,
+        pub(super) proceed: Mutex<bool>,
+        pub(super) released: Condvar,
     }
 
     impl SecureEntries for MemoryEntries {
@@ -758,6 +755,16 @@ mod tests {
             Ok(())
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::memory::{MemoryEntries, WriteBlock};
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    const ACCOUNT: &str = "4f7d5a11-d427-48e8-8953-d0d2f3829e9c";
+    const OTHER_ACCOUNT: &str = "f92369e6-9c0a-48e7-a238-8ad1e11cc2e4";
 
     fn fixture() -> (CredentialStore, Arc<MemoryEntries>) {
         let keyring = Arc::new(MemoryEntries::default());

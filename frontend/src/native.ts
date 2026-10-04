@@ -54,24 +54,6 @@ export function hasNativeDesktopRuntime(): boolean {
   return isTauriRuntime();
 }
 
-export async function pickNativeImportProfile(): Promise<unknown> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) throw new Error('Instance import is available in the desktop app.');
-  return tauri.core.invoke('pick_import_profile');
-}
-
-export async function pickNativeImportInstanceSource(fingerprint: string, legacyId: string): Promise<unknown> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) throw new Error('Instance import is available in the desktop app.');
-  return tauri.core.invoke('pick_import_instance_source', { fingerprint, legacyId });
-}
-
-export async function forgetNativeImportProfile(): Promise<void> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return;
-  await tauri.core.invoke('forget_import_profile');
-}
-
 export type DesktopPlatform = 'browser' | 'linux' | 'macos' | 'unknown' | 'windows';
 export type DesktopChromeMode = 'browser' | 'custom-frameless' | 'mac-overlay' | 'native-decorated';
 

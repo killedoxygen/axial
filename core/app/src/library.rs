@@ -272,19 +272,6 @@ impl ApplicationRootPin {
         })
     }
 
-    pub(crate) fn admit_native_directory(&self, path: &Path) -> io::Result<Directory> {
-        if !path.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "native directory selection must be absolute",
-            ));
-        }
-        let session = lock(&self.inner.application.session);
-        let session = session.as_ref().ok_or_else(closed_authority)?;
-        session.validate_reset_preflight()?;
-        session.admit_absolute_directory(path)
-    }
-
     pub(crate) fn directory(&self) -> io::Result<Directory> {
         let session = lock(&self.inner.application.session);
         let session = session.as_ref().ok_or_else(closed_authority)?;

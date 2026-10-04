@@ -43,6 +43,7 @@ pub const MIGRATION: Migration = Migration {
         stage_name TEXT NOT NULL,
         directory_receipt TEXT,
         park_receipt TEXT,
+        performance_witness TEXT CHECK(performance_witness IS NULL OR length(performance_witness) <= 256),
         phase TEXT NOT NULL CHECK(phase IN ('building','ready','published','cancelling','complete','cancelled'))
     );
     CREATE TABLE instance_setups (
@@ -51,12 +52,6 @@ pub const MIGRATION: Migration = Migration {
         request_json TEXT NOT NULL,
         phase TEXT NOT NULL CHECK(phase IN ('pending','complete'))
     );",
-};
-
-pub const DUPLICATE_WITNESS_MIGRATION: Migration = Migration {
-    id: "instance_creations.v2",
-    sql: "ALTER TABLE instance_creations ADD COLUMN performance_witness TEXT
-        CHECK(performance_witness IS NULL OR length(performance_witness) <= 256);",
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -87,6 +82,30 @@ pub struct CreateTarget {
 }
 
 impl CreateTarget {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn loader_for_tests(
+        component_id: axial_minecraft::LoaderComponentId,
+        minecraft_version: &str,
+        loader_version: &str,
+    ) -> InstanceResult<Self> {
+        let version_id = axial_minecraft::installed_version_id_for(
+            component_id,
+            minecraft_version,
+            loader_version,
+        )
+        .map_err(|_| InstanceError::InvalidInput)?;
+        Ok(Self {
+            selection_id: format!(
+                "loader_build|{}|{}",
+                component_id.short_key(),
+                axial_minecraft::build_id_for(component_id, minecraft_version, loader_version),
+            ),
+            version_id,
+            minecraft_version: minecraft_version.to_owned(),
+            loader_key: component_id.short_key().to_owned(),
+        })
+    }
+
     pub fn selection_id(&self) -> &str {
         &self.selection_id
     }
@@ -114,12 +133,9 @@ pub(crate) struct SetupIntent {
     pub request_json: String,
 }
 
-pub(crate) enum PublicationSource {
-    Duplicate {
-        source: super::directory::RegisteredInstance,
-        performance: crate::performance::duplicate::PreparedDuplicate,
-    },
-    Import(crate::import::PreparedInstanceImport),
+pub(crate) struct DuplicateSource {
+    pub source: super::directory::RegisteredInstance,
+    pub performance: crate::performance::duplicate::PreparedDuplicate,
 }
 
 #[derive(Clone)]
@@ -481,7 +497,6 @@ impl InstanceService {
                         .map_err(|_| InstanceError::DirectoryUnavailable)?,
                 ),
                 None,
-                None,
             )
         })();
         persisted.err().map(|_| {
@@ -613,15 +628,6 @@ impl InstanceService {
         id: &InstanceId,
         pin: &GenerationPin,
     ) -> InstanceResult<Option<Instance>> {
-        self.recover_creation_with_import(id, pin, None)
-    }
-
-    pub(crate) fn recover_creation_with_import(
-        &self,
-        id: &InstanceId,
-        pin: &GenerationPin,
-        imported: Option<&crate::import::PreparedInstanceImport>,
-    ) -> InstanceResult<Option<Instance>> {
         let (json, stage_name, receipt, park_receipt, phase, performance_witness) = self.registry().storage().read(|db| -> InstanceResult<_> {
             db.query_row("SELECT record_json,stage_name,directory_receipt,park_receipt,phase,performance_witness FROM instance_creations WHERE instance_id=?1",
                 [id.as_str()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?,
@@ -629,9 +635,6 @@ impl InstanceService {
         })?;
         if phase == "complete" {
             let record = self.registry().get_live(id)?;
-            if let Some(imported) = imported {
-                self.verify_imported_history(imported, &record.instance.id)?;
-            }
             return Ok(Some(public_instance(record.instance)));
         }
         if phase == "cancelled" {
@@ -650,15 +653,7 @@ impl InstanceService {
         {
             return Err(InstanceError::SettlementRequired);
         }
-        if let Some(imported) = imported {
-            super::import::validate_destination_parent(imported, pin)?;
-        }
         let parent = self.ensure_parent(pin)?;
-        if let Some(imported) = imported {
-            imported
-                .validate_destination_root(parent.capability())
-                .map_err(super::import::import_error)?;
-        }
         if phase == "cancelling" {
             let plan = crate::files::DirectoryParkReceipt::decode(
                 park_receipt
@@ -674,15 +669,6 @@ impl InstanceService {
                 )
             {
                 return Err(InstanceError::SettlementRequired);
-            }
-            if let Some(imported) = imported {
-                for name in [plan.source_name(), plan.park_name()] {
-                    if let Some(directory) = optional_directory(&parent, name)? {
-                        imported
-                            .validate_destination_root(directory.capability())
-                            .map_err(super::import::import_error)?;
-                    }
-                }
             }
             match parent
                 .recover_park(&plan)
@@ -705,13 +691,6 @@ impl InstanceService {
         }
         let stage = optional_directory(&parent, &stage_name)?;
         let canonical = optional_directory(&parent, &record.directory_name)?;
-        if let Some(imported) = imported {
-            for directory in stage.iter().chain(canonical.iter()) {
-                imported
-                    .validate_destination_root(directory.capability())
-                    .map_err(super::import::import_error)?;
-            }
-        }
         if phase == "building" {
             if canonical.is_some() {
                 return Err(InstanceError::SettlementRequired);
@@ -737,14 +716,11 @@ impl InstanceService {
                 stage
                     .verify_receipt(&receipt)
                     .map_err(|_| InstanceError::SettlementRequired)?;
-                self.verify_import_recovery(id, imported, &stage)?;
-                if imported.is_none() {
-                    crate::performance::duplicate::verify_recovered(
-                        &stage,
-                        performance_witness.as_deref(),
-                    )
-                    .map_err(|_| InstanceError::ManagedDuplicateUnavailable)?;
-                }
+                crate::performance::duplicate::verify_recovered(
+                    &stage,
+                    performance_witness.as_deref(),
+                )
+                .map_err(|_| InstanceError::ManagedDuplicateUnavailable)?;
                 self.promote(stage, &parent, &record)?
             }
             (None, Some(canonical)) if matches!(phase.as_str(), "ready" | "published") => canonical,
@@ -753,74 +729,19 @@ impl InstanceService {
         canonical
             .verify_receipt(&receipt)
             .map_err(|_| InstanceError::SettlementRequired)?;
-        self.verify_import_recovery(id, imported, &canonical)?;
-        if imported.is_none() {
-            crate::performance::duplicate::verify_recovered(
-                &canonical,
-                performance_witness.as_deref(),
-            )
+        crate::performance::duplicate::verify_recovered(&canonical, performance_witness.as_deref())
             .map_err(|_| InstanceError::ManagedDuplicateUnavailable)?;
-        }
-        let history = imported
-            .map(|imported| imported.bind_history(&record.instance.id))
-            .transpose()
-            .map_err(super::import::import_error)?;
         let committed = self
             .registry()
             .storage()
             .transaction(|tx| -> InstanceResult<_> {
-                if let Some(imported) = imported {
-                    super::import::validate_destination(tx, imported)?;
-                }
-                if let Some(history) = &history {
-                    history
-                        .reports
-                        .insert_in(tx)
-                        .map_err(super::import::report_error)?;
-                    history
-                        .benchmarks
-                        .insert_in(tx)
-                        .map_err(super::import::benchmark_error)?;
-                    history
-                        .operations
-                        .insert_in(tx)
-                        .map_err(super::import::operation_error)?;
-                    history
-                        .installs
-                        .insert_in(tx)
-                        .map_err(super::import::install_history_error)?;
-                    if let Some(rules) = &history.rules {
-                        rules.verify_in(tx).map_err(super::import::rules_error)?;
-                    }
-                }
                 let committed = self.registry().commit_reserved(tx, &record, &receipt)?;
-                if imported.is_some_and(|input| input.was_last_instance()) {
-                    self.registry().restore_import_selection(tx, &committed)?;
-                }
                 let completed = tx.execute(
                     "UPDATE instance_creations SET phase='complete' WHERE instance_id=?1",
                     [id.as_str()],
                 )?;
                 if completed != 1 {
                     return Err(InstanceError::Conflict);
-                }
-                if let Some(history) = &history {
-                    history
-                        .reports
-                        .verify_in(tx)
-                        .map_err(super::import::report_error)?;
-                    history
-                        .benchmarks
-                        .verify_in(tx)
-                        .map_err(super::import::benchmark_error)?;
-                    history
-                        .operations
-                        .verify_in(tx)
-                        .map_err(super::import::operation_error)?;
-                    history
-                        .installs
-                        .verify_in(tx)
-                        .map_err(super::import::install_history_error)?;
                 }
                 Ok(committed)
             })?;
@@ -933,29 +854,19 @@ impl InstanceService {
         instance: Instance,
         pin: GenerationPin,
         lease: ExclusionLease,
-        source: Option<PublicationSource>,
+        source: Option<DuplicateSource>,
         setup: Option<SetupIntent>,
         cancel: CancellationToken,
     ) -> InstanceResult<Instance> {
         if cancel.is_cancelled() {
             return Err(InstanceError::Cancelled);
         }
-        if let Some(PublicationSource::Import(imported)) = &source {
-            imported.revalidate().map_err(super::import::import_error)?;
-            super::import::validate_destination_parent(imported, &pin)?;
-        }
         let parent = self.ensure_parent(&pin)?;
-        if let Some(PublicationSource::Import(imported)) = &source {
-            imported
-                .validate_destination_root(parent.capability())
-                .map_err(super::import::import_error)?;
-        }
         let stage_name = PortableName::new_exact(&format!("stage-{}", instance.id))
             .map_err(|_| InstanceError::InvalidId)?;
         let record = self.registry().storage().transaction(|tx| -> InstanceResult<_> {
             let record = match &source {
-                Some(PublicationSource::Duplicate { source, .. }) => self.registry().reserve_duplicate(tx, source.record(), instance.id.clone(), Some(&instance.name), &pin.library_id().to_string())?,
-                Some(PublicationSource::Import(imported)) => self.reserve_import(tx, imported, instance, &pin)?,
+                Some(DuplicateSource { source, .. }) => self.registry().reserve_duplicate(tx, source.record(), instance.id.clone(), Some(&instance.name), &pin.library_id().to_string())?,
                 None => self.registry().reserve(tx, instance, &pin.library_id().to_string())?,
             };
             let changed = tx.execute("INSERT INTO instance_creations(instance_id,record_json,stage_name,phase) VALUES(?1,?2,?3,'building')
@@ -1005,42 +916,21 @@ impl InstanceService {
         let receipt = stage
             .receipt()
             .map_err(|_| InstanceError::DirectoryUnavailable);
-        let performance_witness = match &source {
-            Some(PublicationSource::Duplicate { performance, .. }) => Some(performance.witness()),
-            _ => None,
-        };
+        let performance_witness = source.as_ref().map(|source| source.performance.witness());
         let mut ready = false;
         let result = (|| -> InstanceResult<Instance> {
             let receipt = receipt?;
-            self.creation_phase(&record, "building", Some(&receipt), None, None)?;
-            let history = match &source {
-                Some(PublicationSource::Import(imported)) => Some(
-                    imported
-                        .bind_history(&record.instance.id)
-                        .map_err(super::import::import_error)?,
-                ),
-                _ => None,
-            };
-            if let Some(source) = &source {
-                match source {
-                    PublicationSource::Duplicate {
-                        source,
-                        performance,
-                    } => {
-                        super::duplicate::copy_payload(self, source, performance, &stage, &cancel)?;
-                        performance
-                            .verify_staged(&stage)
-                            .map_err(|_| InstanceError::ManagedDuplicateUnavailable)?;
-                        source.validate_current()?;
-                    }
-                    PublicationSource::Import(imported) => {
-                        super::import::copy_payload(self, imported, &stage, &cancel)?;
-                        imported
-                            .verify_staged(&stage, &cancel)
-                            .map_err(super::import::import_error)?;
-                        imported.revalidate().map_err(super::import::import_error)?;
-                    }
-                }
+            self.creation_phase(&record, "building", Some(&receipt), None)?;
+            if let Some(DuplicateSource {
+                source,
+                performance,
+            }) = &source
+            {
+                super::duplicate::copy_payload(self, source, performance, &stage, &cancel)?;
+                performance
+                    .verify_staged(&stage)
+                    .map_err(|_| InstanceError::ManagedDuplicateUnavailable)?;
+                source.validate_current()?;
             } else {
                 for name in INITIAL_DIRECTORIES {
                     self.fresh_directory(
@@ -1057,73 +947,28 @@ impl InstanceService {
                 .map_err(|_| InstanceError::DirectoryUnavailable)?;
             // Persist the ready witness before promotion. Once ready wins,
             // complete publication even if cancellation arrives afterwards.
-            self.creation_phase(
-                &record,
-                "ready",
-                None,
-                match &source {
-                    Some(PublicationSource::Import(imported)) => Some(imported),
-                    _ => None,
-                },
-                performance_witness.as_deref(),
-            )?;
+            self.creation_phase(&record, "ready", None, performance_witness.as_deref())?;
             ready = true;
             let canonical = self.promote(stage.clone(), &parent, &record)?;
             canonical
                 .verify_receipt(&receipt)
                 .map_err(|_| InstanceError::DirectoryUnavailable)?;
-            if let Some(PublicationSource::Import(imported)) = &source {
-                self.verify_import_recovery(&record.instance.id, Some(imported), &canonical)?;
-            }
             if let Some(witness) = &performance_witness {
                 crate::performance::duplicate::verify_recovered(&canonical, Some(witness))
                     .map_err(|_| InstanceError::ManagedDuplicateUnavailable)?;
             }
-            self.creation_phase(&record, "published", None, None, None)?;
+            self.creation_phase(&record, "published", None, None)?;
             let committed = self
                 .registry()
                 .storage()
                 .transaction(|tx| -> InstanceResult<_> {
-                    if let Some(PublicationSource::Import(imported)) = &source {
-                        super::import::validate_destination(tx, imported)?;
-                    }
-                    if let Some(history) = &history {
-                        history
-                            .reports
-                            .insert_in(tx)
-                            .map_err(super::import::report_error)?;
-                        history
-                            .benchmarks
-                            .insert_in(tx)
-                            .map_err(super::import::benchmark_error)?;
-                        history
-                            .operations
-                            .insert_in(tx)
-                            .map_err(super::import::operation_error)?;
-                        history
-                            .installs
-                            .insert_in(tx)
-                            .map_err(super::import::install_history_error)?;
-                        if let Some(rules) = &history.rules {
-                            rules.verify_in(tx).map_err(super::import::rules_error)?;
-                        }
-                    }
                     let committed = self.registry().commit_reserved(tx, &record, &receipt)?;
-                    if matches!(&source, Some(PublicationSource::Import(input)) if input.was_last_instance()) {
-                        self.registry().restore_import_selection(tx, &committed)?;
-                    }
                     let completed = tx.execute(
                         "UPDATE instance_creations SET phase='complete' WHERE instance_id=?1",
                         [record.instance.id.as_str()],
                     )?;
                     if completed != 1 {
                         return Err(InstanceError::Conflict);
-                    }
-                    if let Some(history) = &history {
-                        history.reports.verify_in(tx).map_err(super::import::report_error)?;
-                        history.benchmarks.verify_in(tx).map_err(super::import::benchmark_error)?;
-                        history.operations.verify_in(tx).map_err(super::import::operation_error)?;
-                        history.installs.verify_in(tx).map_err(super::import::install_history_error)?;
                     }
                     Ok(committed)
                 })?;
@@ -1198,20 +1043,6 @@ impl InstanceService {
         }
     }
 
-    pub(crate) fn remove_owned(&self, directory: ScopedDirectory) -> InstanceResult<()> {
-        let (park, pin) = directory.park().into_parts();
-        match park {
-            axial_fs::DirectoryParkOutcome::Parked(parked) => self.remove_parked(parked, pin),
-            axial_fs::DirectoryParkOutcome::NoEffect { .. } => {
-                Err(InstanceError::DirectoryUnavailable)
-            }
-            unresolved => {
-                self.retain(NativeEffect::DirectoryPark(unresolved, pin));
-                Err(InstanceError::SettlementRequired)
-            }
-        }
-    }
-
     fn cancel_reserved(
         &self,
         record: &InstanceRecord,
@@ -1270,13 +1101,9 @@ impl InstanceService {
         record: &InstanceRecord,
         phase: &str,
         receipt: Option<&str>,
-        imported: Option<&crate::import::PreparedInstanceImport>,
         performance_witness: Option<&str>,
     ) -> InstanceResult<()> {
         self.registry().storage().transaction(|tx| {
-            if let Some(imported) = imported {
-                super::import::validate_destination(tx, imported)?;
-            }
             let changed = tx.execute("UPDATE instance_creations SET phase=?2,directory_receipt=COALESCE(?3,directory_receipt),performance_witness=CASE WHEN ?2='ready' THEN ?4 ELSE performance_witness END WHERE instance_id=?1",
                 params![record.instance.id.as_str(), phase, receipt, performance_witness])?;
             if changed != 1 { return Err(InstanceError::Conflict); }
@@ -1392,17 +1219,11 @@ pub(crate) mod tests {
             .migrate(&[
                 super::super::directory::MIGRATION,
                 MIGRATION,
-                DUPLICATE_WITNESS_MIGRATION,
-                super::super::import::MIGRATION,
                 super::super::delete::MIGRATION,
                 crate::content::install::MIGRATION,
                 crate::performance::mutation::MIGRATION,
-                crate::performance::mutation::MIGRATION_V2,
                 crate::launch::reports::REPORT_MIGRATION,
-                crate::install::history::MIGRATION,
                 crate::performance::benchmarks::MIGRATION,
-                crate::performance::benchmarks::MIGRATION_V2,
-                crate::performance::benchmarks::MIGRATION_V3,
             ])
             .unwrap();
         crate::settings::SettingsStore::new(storage.clone()).unwrap();
@@ -2042,13 +1863,7 @@ pub(crate) mod tests {
             .fresh_directory(&parent, &PortableName::new_exact(&stage_name).unwrap())
             .unwrap();
         service
-            .creation_phase(
-                &record,
-                "ready",
-                Some(&stage.receipt().unwrap()),
-                None,
-                None,
-            )
+            .creation_phase(&record, "ready", Some(&stage.receipt().unwrap()), None)
             .unwrap();
         drop(stage);
         let lease = service

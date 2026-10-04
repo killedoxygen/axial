@@ -365,56 +365,6 @@ fn keyless_consent_persists_without_identity_and_configured_restart_creates_it_o
 }
 
 #[test]
-fn legacy_settings_preview_preserves_preferences_and_excludes_authority_and_identity() {
-    let prepared = prepare_legacy_import(&json!({
-        "username":"Alex_1","max_memory_mb":6144,"min_memory_mb":1024,
-        "theme":"custom","custom_hue":123,"custom_vibrancy":77,"lightness":55,
-        "music_enabled":false,"music_volume":0,"music_track":7,"onboarding_done":true,
-        "launch_auth_mode":"online","telemetry_enabled":true,"telemetry_install_id":"old-profile-id",
-        "feature_overrides":{"dev.state-inspector":true},"library_dir":"/baseline/private",
-        "library_mode":"existing","guardian_mode":"managed","guardian_idle_integrity_enabled":true
-    })).unwrap();
-    assert_eq!(prepared.config.revision, 0);
-    assert_eq!(prepared.config.username, "Alex_1");
-    assert_eq!(
-        prepared.config.launch_auth_mode,
-        ConfigLaunchAuthMode::Online
-    );
-    assert_eq!(prepared.config.custom_hue, Some(123));
-    assert_eq!(
-        (prepared.config.custom_vibrancy, prepared.config.lightness),
-        (Some(77), Some(55))
-    );
-    assert_eq!(
-        (
-            prepared.config.music_enabled,
-            prepared.config.music_volume,
-            prepared.config.music_track
-        ),
-        (Some(false), Some(0), 7)
-    );
-    assert!(prepared.config.onboarding_done && prepared.config.telemetry_enabled);
-    assert_eq!(
-        prepared.feature_overrides.get(STATE_INSPECTOR_FLAG),
-        Some(&true)
-    );
-    assert!(prepared.excluded_library_metadata);
-    let rendered = serde_json::to_string(&prepared.config).unwrap();
-    assert!(
-        !rendered.contains("old-profile-id")
-            && !rendered.contains("baseline")
-            && !rendered.contains("guardian")
-    );
-    for field in ["unsupported_preference", "revision", "expected_revision"] {
-        let mut source = json!({"username":"Player","max_memory_mb":4096,"min_memory_mb":512});
-        source[field] = json!(1);
-        assert!(prepare_legacy_import(&source).is_err());
-    }
-    assert!(prepare_legacy_import(&json!({"username":"Player"})).is_err());
-    assert!(prepare_legacy_import(&json!({"username":"Player","max_memory_mb":4096,"min_memory_mb":512,"feature_overrides":{"unknown.flag":true}})).is_err());
-}
-
-#[test]
 fn flags_reset_to_default_and_release_never_exposes_developer_capabilities() {
     let (_, settings) = store();
     assert_eq!(

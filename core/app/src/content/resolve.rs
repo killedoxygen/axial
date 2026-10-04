@@ -1247,7 +1247,8 @@ pub async fn available_updates(
         .filter(|entry| live.contains(entry))
         .cloned()
         .collect();
-    let mut updates = Vec::new();
+    let mut candidates = Vec::new();
+    let mut budget = ResolutionBudget::default();
     for entry in &installed {
         if entry.kind() == ContentKind::Modpack {
             continue;
@@ -1263,9 +1264,46 @@ pub async fn available_updates(
             Err(ContentError::Provider(_) | ContentError::ProviderMetadataInvalid(_)) => continue,
             Err(error) => return Err(error),
         };
-        if let Some(version) = newer_version(&versions, entry.version_id()).filter(|version| {
-            !version_conflicts_with_installed(version, entry.canonical_id(), &installed)
-        }) {
+        if let Some(version) = newer_version(&versions, entry.version_id()) {
+            budget
+                .admit_dependencies(version.dependencies.len())
+                .map_err(|_| {
+                    ContentError::Invalid(
+                        "content update candidates exceed their aggregate dependency bound".into(),
+                    )
+                })?;
+            budget.admit_output(version).map_err(|_| {
+                ContentError::Invalid(
+                    "content update candidates exceed their aggregate metadata bound".into(),
+                )
+            })?;
+            candidates.push((entry, version.clone()));
+        }
+    }
+    let mut dependency_ids = candidates
+        .iter()
+        .flat_map(|(_, version)| &version.dependencies)
+        .filter(|dependency| dependency.project_id.is_none())
+        .filter_map(|dependency| dependency.version_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    dependency_ids.sort_unstable();
+    let dependency_versions = match service.version_identities(&dependency_ids).await {
+        Ok(identities) => identities,
+        Err(error @ ContentError::Provider(crate::network::DownloadError::Cancelled)) => {
+            return Err(error);
+        }
+        Err(ContentError::Provider(_) | ContentError::ProviderMetadataInvalid(_)) => HashMap::new(),
+        Err(error) => return Err(error),
+    };
+    let mut updates = Vec::new();
+    for (entry, mut version) in candidates {
+        version.dependencies =
+            canonicalize_version_only_dependencies(&version.dependencies, &dependency_versions);
+        if !has_unresolved_version_only_incompatibility(&version.dependencies)
+            && !version_conflicts_with_installed(&version, entry.canonical_id(), &installed)
+        {
             updates.push(AvailableUpdate {
                 canonical_id: entry.canonical_id().clone(),
                 kind: entry.kind(),
@@ -1510,6 +1548,7 @@ mod tests {
     enum ProviderResponse {
         Json(Value),
         Status(u16),
+        Cancel(crate::tasks::CancellationToken),
     }
 
     struct ProviderFixture {
@@ -1520,6 +1559,14 @@ mod tests {
 
     impl ProviderFixture {
         async fn new(projects: Vec<Value>, versions: HashMap<String, ProviderResponse>) -> Self {
+            Self::with_version_identities(projects, versions, ProviderResponse::Status(404)).await
+        }
+
+        async fn with_version_identities(
+            projects: Vec<Value>,
+            versions: HashMap<String, ProviderResponse>,
+            identities: ProviderResponse,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind content provider fixture");
@@ -1535,6 +1582,7 @@ mod tests {
                     };
                     let projects = projects.clone();
                     let versions = versions.clone();
+                    let identities = identities.clone();
                     let recorded_requests = Arc::clone(&recorded_requests);
                     tokio::spawn(async move {
                         let mut request = Vec::with_capacity(2048);
@@ -1564,7 +1612,9 @@ mod tests {
                             .push(target.clone());
 
                         let path = target.split('?').next().unwrap_or(&target);
-                        let response = if path == "/v2/projects" {
+                        let response = if path == "/v2/versions" {
+                            identities
+                        } else if path == "/v2/projects" {
                             let requested_projects = projects
                                 .into_iter()
                                 .filter(|project| {
@@ -1587,6 +1637,10 @@ mod tests {
                             ProviderResponse::Status(404)
                         };
                         let (status, reason, body) = match response {
+                            ProviderResponse::Cancel(cancellation) => {
+                                cancellation.cancel();
+                                return;
+                            }
                             ProviderResponse::Json(value) => (
                                 200,
                                 "OK",
@@ -1699,11 +1753,20 @@ mod tests {
     }
 
     fn update_entry(project: &str, kind: ContentKind, title: Option<&str>) -> ManifestEntry {
+        update_entry_at(project, "v1", kind, title)
+    }
+
+    fn update_entry_at(
+        project: &str,
+        version_id: &str,
+        kind: ContentKind,
+        title: Option<&str>,
+    ) -> ManifestEntry {
         ManifestEntry::managed(
             CanonicalId::for_project(ProviderId::Modrinth, project),
             ProviderId::Modrinth,
             project.to_string(),
-            "v1".to_string(),
+            version_id.to_string(),
             kind,
             &file(&format!("{project}.jar"), Some(1)),
             Vec::new(),
@@ -1984,6 +2047,237 @@ mod tests {
             ))
         ));
         assert!(fixture.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn available_updates_resolve_version_only_incompatibilities_before_advertising() {
+        let identity = provider_version("blocked-pin", "blocker", Vec::new());
+        for (identities, resolved) in [
+            (provider_versions(Vec::new()), false),
+            (ProviderResponse::Status(503), false),
+            (
+                provider_versions(vec![provider_version("foreign-pin", "blocker", Vec::new())]),
+                false,
+            ),
+            (
+                provider_versions(vec![identity.clone(), identity.clone()]),
+                false,
+            ),
+            (provider_versions(vec![identity]), true),
+        ] {
+            let fixture = ProviderFixture::with_version_identities(
+                Vec::new(),
+                HashMap::from([
+                    (
+                        "dependent".into(),
+                        provider_versions(vec![provider_version(
+                            "v2",
+                            "dependent",
+                            vec![json!({
+                                "project_id":null, "version_id":"blocked-pin",
+                                "dependency_type":"incompatible"
+                            })],
+                        )]),
+                    ),
+                    (
+                        "also-dependent".into(),
+                        provider_versions(vec![provider_version(
+                            "v2",
+                            "also-dependent",
+                            vec![json!({
+                                "project_id":null, "version_id":"blocked-pin",
+                                "dependency_type":"incompatible"
+                            })],
+                        )]),
+                    ),
+                    (
+                        "healthy".into(),
+                        provider_versions(vec![provider_version("v2", "healthy", Vec::new())]),
+                    ),
+                ]),
+                identities,
+            )
+            .await;
+            let mut manifest = ContentManifest::default();
+            for project in ["dependent", "also-dependent", "healthy"] {
+                manifest
+                    .try_upsert(update_entry(project, ContentKind::Mod, None))
+                    .unwrap();
+            }
+            let updates = available_updates(
+                &fixture.service,
+                &resolver_target(),
+                &manifest,
+                &LiveManagedContent::from_entries(manifest.entries()),
+            )
+            .await
+            .unwrap();
+            let expected_projects = if resolved {
+                vec![
+                    "modrinth:dependent",
+                    "modrinth:also-dependent",
+                    "modrinth:healthy",
+                ]
+            } else {
+                vec!["modrinth:healthy"]
+            };
+            assert_eq!(
+                updates
+                    .iter()
+                    .map(|update| update.canonical_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_projects,
+            );
+            assert_eq!(fixture.request_count("/v2/versions"), 1);
+            let requests = fixture.requests.lock().unwrap();
+            let request = requests
+                .iter()
+                .find(|path| path.starts_with("/v2/versions?"))
+                .unwrap();
+            let url = reqwest::Url::parse(&format!("http://localhost{request}")).unwrap();
+            let ids = url.query_pairs().find(|(key, _)| key == "ids").unwrap().1;
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(&ids).unwrap(),
+                ["blocked-pin"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn available_updates_keep_resolved_incompatibilities_exact_and_live() {
+        for (installed_version, blocker_live, blocked) in [
+            ("blocked-pin", true, true),
+            ("another-pin", true, false),
+            ("blocked-pin", false, false),
+        ] {
+            let fixture = ProviderFixture::with_version_identities(
+                Vec::new(),
+                HashMap::from([(
+                    "dependent".into(),
+                    provider_versions(vec![provider_version(
+                        "v2",
+                        "dependent",
+                        vec![json!({
+                            "project_id":null, "version_id":"blocked-pin",
+                            "dependency_type":"incompatible"
+                        })],
+                    )]),
+                )]),
+                provider_versions(vec![provider_version("blocked-pin", "blocker", Vec::new())]),
+            )
+            .await;
+            let mut manifest = ContentManifest::default();
+            let dependent = update_entry("dependent", ContentKind::Mod, None);
+            manifest.try_upsert(dependent.clone()).unwrap();
+            manifest
+                .try_upsert(update_entry_at(
+                    "blocker",
+                    installed_version,
+                    ContentKind::Mod,
+                    None,
+                ))
+                .unwrap();
+            let live = if blocker_live {
+                LiveManagedContent::from_entries(manifest.entries())
+            } else {
+                LiveManagedContent::from_entries([&dependent])
+            };
+            let updates = available_updates(&fixture.service, &resolver_target(), &manifest, &live)
+                .await
+                .unwrap();
+            assert_eq!(updates.is_empty(), blocked);
+            if !blocked {
+                assert_eq!(updates[0].canonical_id.as_str(), "modrinth:dependent");
+                assert_eq!(updates[0].latest_version_id, "v2");
+            }
+            assert_eq!(fixture.request_count("/v2/versions"), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn available_updates_preserve_cancellation_during_identity_lookup() {
+        let cancellation = crate::tasks::CancellationToken::new();
+        let fixture = ProviderFixture::with_version_identities(
+            Vec::new(),
+            HashMap::from([(
+                "dependent".into(),
+                provider_versions(vec![provider_version(
+                    "v2",
+                    "dependent",
+                    vec![json!({
+                        "project_id":null, "version_id":"blocked-pin",
+                        "dependency_type":"incompatible"
+                    })],
+                )]),
+            )]),
+            ProviderResponse::Cancel(cancellation.clone()),
+        )
+        .await;
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert(update_entry("dependent", ContentKind::Mod, None))
+            .unwrap();
+        assert!(matches!(
+            available_updates(
+                &fixture.service.with_cancellation(cancellation),
+                &resolver_target(),
+                &manifest,
+                &LiveManagedContent::from_entries(manifest.entries()),
+            )
+            .await,
+            Err(ContentError::Provider(
+                crate::network::DownloadError::Cancelled
+            ))
+        ));
+        assert_eq!(fixture.request_count("/v2/project/dependent/version"), 1);
+        assert_eq!(fixture.request_count("/v2/versions"), 1);
+    }
+
+    #[tokio::test]
+    async fn available_updates_bound_aggregate_candidates_before_identity_lookup() {
+        for oversized_metadata in [false, true] {
+            let count = if oversized_metadata { 2 } else { 17 };
+            let mut responses = HashMap::new();
+            let mut manifest = ContentManifest::default();
+            for index in 0..count {
+                let project = format!("project-{index}");
+                let dependency_count = if oversized_metadata { 1 } else { 256 };
+                let dependencies = (0..dependency_count)
+                    .map(|dependency| {
+                        json!({
+                            "project_id":null, "version_id":format!("pin-{index}-{dependency}"),
+                            "dependency_type":"incompatible"
+                        })
+                    })
+                    .collect();
+                let mut version = provider_version("v2", &project, dependencies);
+                if oversized_metadata {
+                    version["name"] = json!("x".repeat(MAX_RESOLUTION_OUTPUT_BYTES / 2));
+                }
+                responses.insert(project.clone(), provider_versions(vec![version]));
+                manifest
+                    .try_upsert(update_entry(&project, ContentKind::Mod, None))
+                    .unwrap();
+            }
+            let fixture = ProviderFixture::new(Vec::new(), responses).await;
+            let error = available_updates(
+                &fixture.service,
+                &resolver_target(),
+                &manifest,
+                &LiveManagedContent::from_entries(manifest.entries()),
+            )
+            .await
+            .unwrap_err();
+            let ContentError::Invalid(message) = error else {
+                panic!("unexpected bound error: {error:?}");
+            };
+            assert!(message.contains(if oversized_metadata {
+                "metadata bound"
+            } else {
+                "dependency bound"
+            }));
+            assert_eq!(fixture.request_count("/v2/versions"), 0);
+        }
     }
 
     #[tokio::test]

@@ -5,8 +5,7 @@ use super::model::{
 };
 use crate::resolve::validate_manifest;
 use crate::rules_cache::{
-    RulesCacheSnapshot, RulesCacheState, RulesCacheStatus, bounded_warning, remote_rules_snapshot,
-    remote_snapshot_manifest,
+    RulesCacheState, RulesCacheStatus, bounded_warning, remote_rules_snapshot,
 };
 use crate::signature::{
     RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER, signature_metadata_from_header,
@@ -19,95 +18,8 @@ const REMOTE_RULES_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RULES_MAX_BYTES: usize = 1024 * 1024;
 
 impl PerformanceRulesAuthority {
-    /// Decode captured cache bytes without adopting their signing key or policy.
-    /// Signature authenticity still belongs to the configured authority below.
-    pub fn decode_cached_rules(bytes: &[u8]) -> Result<RulesCacheSnapshot, RulesRefreshError> {
-        if bytes.len() as u64 > crate::RULES_CACHE_MAX_BYTES {
-            return Err(RulesRefreshError::ResponseTooLarge);
-        }
-        let snapshot: RulesCacheSnapshot = serde_json::from_slice(bytes)?;
-        if snapshot.rule_source != RuleSource::Remote
-            || snapshot.rule_channel != RuleChannel::Remote
-            || snapshot.validation != RulesValidation::Valid
-            || chrono::DateTime::parse_from_rfc3339(&snapshot.updated_at).is_err()
-            || snapshot.schema_version != snapshot.manifest.schema_version
-            || snapshot.generated_at != snapshot.manifest.generated_at
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid rules cache envelope",
-            )
-            .into());
-        }
-        validate_manifest(&snapshot.manifest)?;
-        let signature = signature_metadata_from_header(
-            Some(&snapshot.signature.signature),
-            snapshot.signature.key_id.as_deref(),
-        )?;
-        if signature.signature != snapshot.signature.signature.to_ascii_lowercase() {
-            return Err(crate::signature::RulesSignatureError::InvalidSignatureEncoding.into());
-        }
-        Ok(snapshot)
-    }
-
-    /// Preserve recorded time. Import is not a new remote refresh and performs
-    /// no provider request; only this destination's configured key can admit it.
-    pub fn verify_cached_rules(
-        &self,
-        bytes: &[u8],
-    ) -> Result<VerifiedRemoteRules, RulesRefreshError> {
-        if self.manager.remote_rules_url.is_none() {
-            return Err(RulesRefreshError::Unconfigured);
-        }
-        let snapshot = Self::decode_cached_rules(bytes)?;
-        self.manager
-            .remote_rules_verifier
-            .verify_manifest(&snapshot.manifest, &snapshot.signature)?;
-        Ok(VerifiedRemoteRules {
-            active: ActiveRules {
-                manifest: snapshot.manifest.clone(),
-                rule_source: RuleSource::Remote,
-                rule_channel: RuleChannel::Remote,
-                rules_cache: RulesCacheStatus::from_snapshot(&snapshot, RulesCacheState::Recorded),
-                remote_refresh: true,
-                last_refresh_at: Some(snapshot.updated_at.clone()),
-                validation: RulesValidation::Valid,
-            },
-            snapshot,
-        })
-    }
-
     pub fn mutation_allowed(&self) -> bool {
         self.manager.rules_mutation_allowed
-    }
-
-    pub fn startup_source(&self) -> &crate::rules_cache::RulesCacheStartupSource {
-        &self.manager.rules_cache_startup_source
-    }
-
-    pub fn matches_loaded_cache(&self, bytes: &[u8]) -> bool {
-        if !self.mutation_allowed() {
-            return false;
-        }
-        let Ok(snapshot) = serde_json::from_slice::<RulesCacheSnapshot>(bytes) else {
-            return false;
-        };
-        let Ok(manifest) = remote_snapshot_manifest(&snapshot, &self.manager.remote_rules_verifier)
-        else {
-            return false;
-        };
-        let active = self
-            .manager
-            .active
-            .read()
-            .expect(ACTIVE_RULES_LOCK_INVARIANT);
-        active.manifest == manifest
-            && active.rule_source == RuleSource::Remote
-            && active.rule_channel == RuleChannel::Remote
-            && active.validation == RulesValidation::Valid
-            && active.last_refresh_at.as_deref() == Some(snapshot.updated_at.as_str())
-            && active.rules_cache.state == RulesCacheState::Recorded
-            && active.rules_cache.updated_at.as_deref() == Some(snapshot.updated_at.as_str())
     }
 
     pub async fn fetch_remote_rules(&self) -> Result<VerifiedRemoteRules, RulesRefreshError> {

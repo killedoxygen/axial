@@ -619,20 +619,6 @@ pub fn managed_install_evidence(
     evidence
 }
 
-pub(super) fn unavailable_managed_install_evidence(
-    manifest: &BenchmarkSuiteManifest,
-    proofs: &[LaunchProofRecord],
-) -> ManagedInstallEvidence {
-    let target = family_c_qualification_targets()[1];
-    let mut evidence = unobserved_managed_install_evidence(target);
-    evidence.missing = if family_c_qualification_target_proof(target, manifest, proofs).is_some() {
-        vec!["managed_install_state_invalid"]
-    } else {
-        Vec::new()
-    };
-    evidence
-}
-
 fn unobserved_managed_install_evidence(
     target: FamilyCQualificationTarget,
 ) -> ManagedInstallEvidence {

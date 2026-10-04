@@ -29,6 +29,8 @@ pub enum ProfileMediaError {
     RateLimited,
     #[error("Minecraft account login required")]
     AccountRequired,
+    #[error("This Microsoft account does not own Minecraft Java.")]
+    OwnershipMissing,
     #[error(
         "The account changed before this operation completed; reload the account and try again"
     )]

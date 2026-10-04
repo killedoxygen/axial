@@ -3,9 +3,12 @@ import { enrichedInstanceResponse, instancesResponse } from './dto-core';
 import { config, instances, launchSessions } from './store';
 import { showError } from './utils';
 
-const readinessReads = new Map<string, symbol>();
+const readinessReads = new Map<string, { token: symbol; isCurrent: () => boolean }>();
 
-export async function refreshInstanceReadiness(instanceId?: string): Promise<void> {
+export async function refreshInstanceReadiness(
+  instanceId?: string,
+  options: { isCurrent?: () => boolean; retry?: boolean } = {},
+): Promise<void> {
   const token = Symbol();
   const expectedConfig = config.value;
   const targets = new Map(instances.value
@@ -14,14 +17,18 @@ export async function refreshInstanceReadiness(instanceId?: string): Promise<voi
       instance,
       sessionId: launchSessions.value[instance.id]?.sessionId,
     }]));
-  for (const id of targets.keys()) readinessReads.set(id, token);
-
   const isCurrent = (id: string): boolean => {
     const target = targets.get(id);
-    return target !== undefined && readinessReads.get(id) === token && config.value === expectedConfig &&
+    return target !== undefined && (options.isCurrent?.() ?? true) &&
+      readinessReads.get(id)?.token === token && config.value === expectedConfig &&
       instances.value.find((instance) => instance.id === id) === target.instance &&
       launchSessions.value[id]?.sessionId === target.sessionId;
   };
+  for (const id of targets.keys()) {
+    // A quiet view read must not displace an owner's pending settlement retry.
+    if (options.retry === false && readinessReads.get(id)?.isCurrent()) targets.delete(id);
+    else readinessReads.set(id, { token, isCurrent: () => isCurrent(id) });
+  }
 
   try {
     // Terminal publication can briefly precede release of the launch reservation.
@@ -40,9 +47,10 @@ export async function refreshInstanceReadiness(instanceId?: string): Promise<voi
         if (!updates.size) return;
         instances.value = instances.value.map((instance) => updates.get(instance.id) ?? instance);
         for (const [id, instance] of updates) targets.get(id)!.instance = instance;
-        if ([...updates.values()].every((instance) => instance.launch_action.launchable)) return;
-      } catch {
+        if (options.retry === false || [...updates.values()].every((instance) => instance.launch_action.launchable)) return;
+      } catch (error) {
         if (![...targets.keys()].some(isCurrent)) return;
+        if (options.retry === false) throw error;
         if (attempt === 1) {
           showError('Could not refresh launch availability. Refresh the launcher to check again.');
           return;
@@ -52,7 +60,7 @@ export async function refreshInstanceReadiness(instanceId?: string): Promise<voi
     }
   } finally {
     for (const id of targets.keys()) {
-      if (readinessReads.get(id) === token) readinessReads.delete(id);
+      if (readinessReads.get(id)?.token === token) readinessReads.delete(id);
     }
   }
 }

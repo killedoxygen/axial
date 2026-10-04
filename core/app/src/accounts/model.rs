@@ -80,9 +80,11 @@ pub struct AccountRecord {
     pub offline_uuid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub minecraft_profile: Option<MinecraftProfile>,
+    #[serde(skip)]
+    pub(super) owns_minecraft_java: bool,
     pub account_revision: u64,
     pub profile_revision: u64,
-    /// Zero for offline identities and imported Microsoft identities awaiting sign-in.
+    /// Zero for offline identities.
     pub credential_revision: u64,
     pub created_revision: u64,
     pub created_at: String,
@@ -137,78 +139,7 @@ pub struct MicrosoftIdentity {
     pub display_name: String,
     pub credential_revision: u64,
     pub profile: MinecraftProfile,
-}
-
-/// Retained identity only. Legacy sessions and credentials are never imported.
-#[derive(Clone, Debug)]
-pub struct MicrosoftIdentityImport {
-    pub profile_id: String,
-    pub display_name: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-impl MicrosoftIdentityImport {
-    pub fn account_id(&self) -> Result<String, AccountError> {
-        let id = uuid::Uuid::parse_str(&self.profile_id)
-            .map_err(|_| AccountError::InvalidInput("Imported Microsoft identity is invalid."))?;
-        if id.is_nil() {
-            return Err(AccountError::InvalidInput(
-                "Imported Microsoft identity is invalid.",
-            ));
-        }
-        Ok(id.hyphenated().to_string())
-    }
-
-    pub fn validate(&self) -> Result<(), AccountError> {
-        self.account_id()?;
-        if !(1..=16).contains(&self.display_name.len())
-            || !self
-                .display_name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            || [&self.created_at, &self.updated_at]
-                .into_iter()
-                .any(|value| {
-                    value.len() > 64 || chrono::DateTime::parse_from_rfc3339(value).is_err()
-                })
-        {
-            return Err(AccountError::InvalidInput(
-                "Imported Microsoft identity is invalid.",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct OfflineIdentityImport {
-    pub account_id: String,
-    pub display_name: String,
-    pub offline_uuid: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-impl OfflineIdentityImport {
-    pub fn validate(&self) -> Result<(), AccountError> {
-        let name = validate_username(&self.display_name)?;
-        let uuid = offline_uuid(&name);
-        if self.display_name != name
-            || self.offline_uuid != uuid
-            || self.account_id != format!("offline-{uuid}")
-            || [&self.created_at, &self.updated_at]
-                .into_iter()
-                .any(|value| {
-                    value.len() > 64 || chrono::DateTime::parse_from_rfc3339(value).is_err()
-                })
-        {
-            return Err(AccountError::InvalidInput(
-                "Imported offline identity is invalid.",
-            ));
-        }
-        Ok(())
-    }
+    pub owns_minecraft_java: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -285,49 +216,6 @@ pub fn microsoft_account_id(profile_id: &str) -> Result<String, AccountError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn imported_microsoft_identity_is_non_nil_and_accepts_provider_names_not_offline_names() {
-        let input = MicrosoftIdentityImport {
-            profile_id: "12345678123442348234123456789ABC".into(),
-            display_name: "A".into(),
-            created_at: "2024-01-01T00:00:00Z".into(),
-            updated_at: "2024-01-02T00:00:00Z".into(),
-        };
-        input.validate().unwrap();
-        assert_eq!(
-            input.account_id().unwrap(),
-            "12345678-1234-4234-8234-123456789abc"
-        );
-        for id in ["", "../old-login", "00000000-0000-0000-0000-000000000000"] {
-            assert!(
-                MicrosoftIdentityImport {
-                    profile_id: id.into(),
-                    ..input.clone()
-                }
-                .validate()
-                .is_err()
-            );
-        }
-        for name in ["", "not a player", "é", "abcdefghijklmnopq"] {
-            assert!(
-                MicrosoftIdentityImport {
-                    display_name: name.into(),
-                    ..input.clone()
-                }
-                .validate()
-                .is_err()
-            );
-        }
-        assert!(
-            MicrosoftIdentityImport {
-                created_at: "yesterday".into(),
-                ..input
-            }
-            .validate()
-            .is_err()
-        );
-    }
 
     #[test]
     fn name_uuid_matches_minecraft_and_preserves_case() {

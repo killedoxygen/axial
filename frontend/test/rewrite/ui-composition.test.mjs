@@ -547,21 +547,19 @@ test('invalid rename confirmation reconciles accounts without publishing success
   assert.equal(toasts.length, 0);
 });
 
-test('replacement preferences never implicitly read or overwrite predecessor preferences', () => {
-  const localStorage = storage([['axial_ui', JSON.stringify({ theme: 'nether' })]]);
+test('browser preferences persist edits and return independent preference maps', () => {
+  const localStorage = storage();
   const state = loadSource('src/state.ts', browserPreferenceImports, { localStorage });
   assert.equal(state.local.theme, 'obsidian');
-  assert.equal(state.STORAGE_KEY, 'axial_rewrite_ui');
   state.local.theme = 'birch';
   state.saveLocalState();
-  assert.equal(JSON.parse(storedValue(localStorage, 'axial_ui')).theme, 'nether');
-  assert.equal(JSON.parse(storedValue(localStorage, 'axial_rewrite_ui')).theme, 'birch');
+  assert.equal(JSON.parse(storedValue(localStorage, state.STORAGE_KEY)).theme, 'birch');
   const first = state.loadLocalState();
   first.selectedSkinsByAccount.a = 'skin';
   assert.equal(state.loadLocalState().selectedSkinsByAccount.a, undefined);
 });
 
-test('stored replacement preferences validate values and recover with fresh defaults', () => {
+test('stored browser preferences validate values and recover with fresh defaults', () => {
   const localStorage = storage([['axial_rewrite_ui', JSON.stringify({ theme: 'end', sounds: false })]]);
   const state = loadSource('src/state.ts', browserPreferenceImports, { localStorage });
   assert.equal(state.local.theme, 'end');
@@ -573,8 +571,8 @@ test('stored replacement preferences validate values and recover with fresh defa
   assert.equal(state.loadLocalState().shortcuts.play, undefined);
 });
 
-test('route restoration uses the isolated key and rejects incomplete route identities', () => {
-  const localStorage = storage([['axial:route', JSON.stringify({ name: 'instance', id: 'old' })]]);
+test('route restoration reads saved routes and rejects incomplete route identities', () => {
+  const localStorage = storage();
   const ui = loadSource('src/ui-state.ts', browserPreferenceImports, { localStorage });
   ui.restoreRoute();
   const initialRoute = ui.route.value;
@@ -587,7 +585,6 @@ test('route restoration uses the isolated key and rejects incomplete route ident
   localStorage.setItem(ui.ROUTE_STORAGE_KEY, JSON.stringify({ name: 'instance', id: '' }));
   ui.restoreRoute();
   assert.equal(ui.route.value.name, 'content');
-  assert.equal(JSON.parse(storedValue(localStorage, 'axial:route')).id, 'old');
 });
 
 const progress = { phase_id: 'starting', label: 'Preparing', progress_pct: 0, terminal: false, failed: false };

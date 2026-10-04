@@ -13,7 +13,7 @@ import { launchSessionsResponse } from './launch-response-adapters';
 import { Music } from './music';
 import { getNativeAppVersion, hasNativeDesktopRuntime } from './native';
 import { initializeNativePreferences, nativePreferencesHydrated } from './preferences/persistence';
-import { local, localStateVersion } from './state';
+import { local } from './state';
 import { Sound, bindButtonSounds } from './sound';
 import { refreshAccountSkin } from './player-skin';
 import {
@@ -79,7 +79,6 @@ async function runApplicationBootstrap(): Promise<void> {
       const saved = await initializeNativePreferences(configRes);
       Object.assign(local, saved.preferences);
       route.value = saved.route ?? { name: 'home' };
-      localStateVersion.value += 1;
     }
     applyTheme(local.theme, local.customHue, {
       silent: true, vibrancy: local.customVibrancy, lightness: local.lightness,

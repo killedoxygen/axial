@@ -104,34 +104,12 @@ export const Music = {
     return !!audio && !audio.paused;
   },
 
-  applyConfig(
-    cfg: { music_enabled?: boolean | null; music_volume?: number | null; music_track?: number },
-    syncPlayback = false,
-  ): void {
-    const previousTrack = this.track;
-    if (syncPlayback) {
-      saveVersion += 1;
-      if (persistTimer) clearTimeout(persistTimer);
-      persistTimer = null;
-      persistPending = false;
-      this.enabled = cfg.music_enabled ?? false;
-      this.volume = 5;
-    }
+  applyConfig(cfg: { music_enabled?: boolean | null; music_volume?: number | null; music_track?: number }): void {
     if (cfg.music_enabled != null) this.enabled = cfg.music_enabled;
     if (cfg.music_volume != null && Number.isFinite(cfg.music_volume))
       this.volume = Math.max(0, Math.min(100, cfg.music_volume));
     if (cfg.music_track != null) this.track = clampTrack(cfg.music_track);
     acceptedMusic = { enabled: this.enabled, volume: this.volume, track: this.track };
-    if (syncPlayback) {
-      if (previousTrack !== this.track) {
-        playbackVersion += 1;
-        cancelFade();
-        audio?.pause();
-        this.ready = false;
-      }
-      if (this.enabled) void this.play();
-      else this.stop();
-    }
     this.syncUI();
   },
 

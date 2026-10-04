@@ -18,7 +18,7 @@ use sha2::Sha512;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Cursor, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -922,47 +922,18 @@ async fn real_prepared_performance_rejects_changed_provider_graph_without_file_e
 
 async fn prepared_performance_restart_journey(queued: bool, action: &str, changed_graph: bool) {
     use axial_app::{
-        import::{Inventory, ReadOnlySource},
+        instances::create::{CreateInstanceRequest, CreateTarget},
         storage::{MetadataStore, StorageError},
     };
-    use axial_minecraft::loaders::{LoaderComponentId, installed_version_id_for};
+    use axial_minecraft::loaders::LoaderComponentId;
     use std::process::Stdio;
 
     let temporary = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-    let profile = temporary.path().join("replacement");
-    let baseline = temporary.path().join("predecessor");
-    let source_mods = baseline.join("instances/0000000000000001/mods");
-    std::fs::create_dir_all(&source_mods).unwrap();
+    let profile = temporary.path().join("profile");
     let canary = archive(
         "fabric.mod.json",
         br#"{"schemaVersion":1,"id":"fixture_user","version":"1.0.0"}"#,
     );
-    std::fs::write(source_mods.join("user.jar"), &canary).unwrap();
-    let mut predecessor: Value = serde_json::from_str(include_str!(
-        "../../../acceptance/fixtures/profiles/offline-vanilla/instances.json"
-    ))
-    .unwrap();
-    predecessor["instances"][0]["version_id"] =
-        json!(installed_version_id_for(LoaderComponentId::Fabric, "1.21.4", "0.16.9").unwrap());
-    predecessor["instances"][0]["minecraft_version"] = json!("1.21.4");
-    predecessor["instances"][0]["loader_key"] = json!("fabric");
-    predecessor["instances"][0]["performance_mode"] = json!("managed");
-    let source_registry = serde_json::to_vec(&predecessor).unwrap();
-    std::fs::write(baseline.join("instances.json"), &source_registry).unwrap();
-    for (name, bytes) in [
-        (
-            "config.json",
-            include_bytes!("../../../acceptance/fixtures/profiles/offline-vanilla/config.json")
-                .as_slice(),
-        ),
-        (
-            "accounts.json",
-            include_bytes!("../../../acceptance/fixtures/profiles/offline-vanilla/accounts.json")
-                .as_slice(),
-        ),
-    ] {
-        std::fs::write(baseline.join(name), bytes).unwrap();
-    }
 
     let provider = PerformanceProvider::start().await;
     let services = start_profile_with_performance_test_inputs(
@@ -973,31 +944,32 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
     .await
     .unwrap();
     let api = Api::new(&services);
-    let source = ReadOnlySource::from_native_selection(
-        services.library.admit_application_root().unwrap(),
-        &baseline,
-    )
-    .unwrap();
-    services
-        .imports
-        .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
-        .unwrap();
-    let preview = api.get("/api/v1/import/preview").await;
-    assert_eq!(
-        preview["instances"][0]["ordinary_import_available"], true,
-        "{preview}"
-    );
-    let imported = api
-        .post(
-            "/api/v1/import/instances",
-            json!({
-                "fingerprint":preview["fingerprint"],"legacy_id":"0000000000000001"
-            }),
+    let target =
+        CreateTarget::loader_for_tests(LoaderComponentId::Fabric, "1.21.4", "0.16.9").unwrap();
+    let created = services
+        .instances
+        .create(
+            CreateInstanceRequest {
+                name: "Prepared recovery".into(),
+                selection_id: target.selection_id().to_owned(),
+                ..Default::default()
+            },
+            target,
         )
-        .await;
-    let instance = imported["instance"]["id"].as_str().unwrap().to_owned();
-    assert_eq!(imported["instance"]["loader_key"], "fabric");
-    assert_eq!(imported["instance"]["minecraft_version"], "1.21.4");
+        .unwrap()
+        .join()
+        .await
+        .unwrap()
+        .unwrap();
+    let instance = created.id.to_string();
+    assert_eq!(created.loader_key, "fabric");
+    assert_eq!(created.minecraft_version, "1.21.4");
+    api.request(
+        reqwest::Method::PUT,
+        &format!("/api/v1/instances/{instance}"),
+        Some(json!({"performance_mode":"managed"})),
+    )
+    .await;
     let mods = services
         .library
         .admit()
@@ -1007,8 +979,8 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
         .join("instances")
         .join(&instance)
         .join("mods");
-    services.imports.forget().unwrap();
-    drop(source);
+    std::fs::create_dir_all(&mods).unwrap();
+    std::fs::write(mods.join("user.jar"), &canary).unwrap();
     services.server.shutdown().await.unwrap();
     drop(services);
 
@@ -1220,7 +1192,7 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
         api.request(
             reqwest::Method::PUT,
             &format!("/api/v1/instances/{instance}"),
-            Some(json!({"name":imported["instance"]["name"]})),
+            Some(json!({"name":created.name})),
         )
         .await;
     } else {
@@ -1292,11 +1264,6 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
         })
         .unwrap();
     assert_eq!(std::fs::read(mods.join("user.jar")).unwrap(), canary);
-    assert_eq!(std::fs::read(source_mods.join("user.jar")).unwrap(), canary);
-    assert_eq!(
-        std::fs::read(baseline.join("instances.json")).unwrap(),
-        source_registry
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2309,6 +2276,29 @@ async fn real_offline_vanilla_install_launch_stop_and_restart() {
     );
     assert!(runtime.join(".axial-runtime-manifest.json").is_file());
     let first = launch_and_stop(&api, &instance).await;
+    let removed = api
+        .request(
+            reqwest::Method::DELETE,
+            &format!(
+                "/api/v1/accounts/{}?expected_selection_revision={}&expected_account_revision={}",
+                account["account"]["account_id"].as_str().unwrap(),
+                account["selection_revision"].as_u64().unwrap(),
+                account["account"]["account_revision"].as_u64().unwrap(),
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(removed["status"], "account_removed");
+    let empty_accounts = api.get("/api/v1/accounts").await;
+    assert_eq!(empty_accounts["accounts"], json!([]));
+    assert_eq!(empty_accounts["active_account_id"], Value::Null);
+    assert_eq!(empty_accounts["launch_auth_mode"], "offline");
+    let offline_config = api.get("/api/v1/config").await;
+    assert_eq!(offline_config["username"], PLAYER);
+    assert_eq!(offline_config["launch_auth_mode"], "offline");
+    let without_account = launch_and_stop(&api, &instance).await;
+    assert_ne!(first, without_account);
+    assert_eq!(api.get("/api/v1/accounts").await, empty_accounts);
     provider.assert_requests(true);
     services.server.shutdown().await.unwrap();
     assert!(services.server.is_shutdown_settled());
@@ -2320,12 +2310,14 @@ async fn real_offline_vanilla_install_launch_stop_and_restart() {
     let restarted_api = Api::new(&reopened);
     assert_ne!(api.capability, restarted_api.capability);
     assert_installed(&restarted_api, true).await;
+    assert_eq!(restarted_api.get("/api/v1/accounts").await, empty_accounts);
     assert_eq!(
-        reopened.accounts.capture_selected().unwrap().display_name(),
+        restarted_api.get("/api/v1/config").await["username"],
         PLAYER
     );
     let second = launch_and_stop(&restarted_api, &instance).await;
     assert_ne!(first, second);
+    assert_eq!(restarted_api.get("/api/v1/accounts").await, empty_accounts);
     assert_eq!(std::fs::read(executable).unwrap(), installed_java);
     assert_eq!(
         std::fs::read(save).unwrap(),
@@ -2843,472 +2835,6 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
     );
     reopened.server.shutdown().await.unwrap();
     assert!(reopened.server.is_shutdown_settled());
-}
-
-fn benchmark_predecessor_files(root: &Path, mixed: bool, queued: bool) -> Vec<(PathBuf, Vec<u8>)> {
-    use axial_app::performance::benchmarks::{benchmark_suite_plan, benchmark_suite_run_id};
-
-    const INSTANCE: &str = "0000000000000001";
-    const SUITE: &str = "suite-dev-0000000000000001";
-    const DRIVER: &str = "benchmark-suite-driver-0000000000000001";
-    let mut instances: Value = serde_json::from_str(include_str!(
-        "../../../acceptance/fixtures/profiles/offline-vanilla/instances.json"
-    ))
-    .unwrap();
-    instances["instances"][0]["version_id"] = json!(VERSION);
-    instances["instances"][0]["minecraft_version"] = json!(VERSION);
-    let runs: Vec<_> = benchmark_suite_plan("development")
-        .unwrap()
-        .into_iter()
-        .enumerate()
-        .map(|(index, run)| {
-            let inherited = mixed && index == 0;
-            json!({
-                "run_index":index,"profile":run.profile,"run_type":run.run_type,
-                "target_id":run.target_id.unwrap_or(""),
-                "benchmark_id":benchmark_suite_run_id("development", index, run),
-                "state":if inherited { "exited" } else { "pending" },
-                "session_id":inherited.then_some("session-a"),
-                "launched_at":inherited.then_some("2026-01-01T00:00:00.000Z")
-            })
-        })
-        .collect();
-    assert_eq!(runs.len(), 2, "the retained development plan has two runs");
-    let suite = json!({
-        "schema":"axial.launch.benchmark.suite","schema_version":2,
-        "suite_id":SUITE,"instance_id":INSTANCE,"mode":"development",
-        "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:02Z",
-        "runs":runs
-    });
-    let driver = json!({
-        "id":DRIVER,"suite_id":SUITE,"mode":"development","state":if queued { "interrupted" } else { "stopped" },
-        "interval_ms":5000,"run_count":2,"launched_run_count":usize::from(mixed),
-        "pending_run_index":usize::from(mixed),"active_session_id":null,
-        "last_run_index":mixed.then_some(0),"last_session_id":mixed.then_some("session-a"),
-        "error":if queued { "driver automatic resume queued after restart" } else { "Stopped by the user" },
-        "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:02Z"
-    });
-    let mut files = vec![
-        (
-            root.join("instances.json"),
-            serde_json::to_vec(&instances).unwrap(),
-        ),
-        (
-            root.join("config.json"),
-            include_bytes!("../../../acceptance/fixtures/profiles/offline-vanilla/config.json")
-                .to_vec(),
-        ),
-        (
-            root.join("accounts.json"),
-            include_bytes!("../../../acceptance/fixtures/profiles/offline-vanilla/accounts.json")
-                .to_vec(),
-        ),
-        (
-            root.join(format!("instances/{INSTANCE}/saves/user-level.dat")),
-            b"predecessor save survives benchmark continuation".to_vec(),
-        ),
-        (
-            root.join(format!("benchmarks/suites/{SUITE}.json")),
-            serde_json::to_vec(&suite).unwrap(),
-        ),
-        (
-            root.join(format!("benchmarks/suite-drivers/{DRIVER}.json")),
-            serde_json::to_vec(&driver).unwrap(),
-        ),
-    ];
-    if mixed {
-        // A predecessor report is imported as historical evidence. New runs
-        // below must acquire their reports from actual owned fixture processes.
-        let report = json!({
-            "schema":"axial.launch.proof","schema_version":3,
-            "session_id":"session-a","instance_id":INSTANCE,"version_id":VERSION,
-            "launched_at":"2026-01-01T00:00:00.000Z","recorded_at":"2026-01-01T00:00:02.000Z",
-            "outcome":"exited",
-            "session_outcome":{"reason":"clean_exit","kind":"clean","summary":"Minecraft exited cleanly."},
-            "scenario":{"scenario_id":"vanilla_launch","performance_mode":"vanilla",
-                "requested_memory_mb":2048,"version_id":VERSION,
-                "benchmark_profile":runs[0]["profile"],"benchmark_run_type":runs[0]["run_type"],
-                "benchmark_mode":"development","benchmark_id":runs[0]["benchmark_id"]},
-            "device":{"tier":"mid","total_memory_mb":8192,"cpu_threads":8},
-            "exit_code":0,"boot_duration_ms":1000,"stages":[]
-        });
-        files.push((
-            root.join("benchmarks/launch/session-a.json"),
-            serde_json::to_vec(&report).unwrap(),
-        ));
-    }
-    for (path, bytes) in &files {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, bytes).unwrap();
-    }
-    files
-}
-
-fn retained_benchmark_bytes(
-    services: &DesktopServices,
-    suite: &str,
-    driver: &str,
-    report: Option<&str>,
-) -> Vec<Vec<u8>> {
-    services
-        .instances
-        .registry()
-        .storage()
-        .read(|db| {
-            let suite: Vec<u8> = db.query_row(
-                "SELECT payload FROM benchmark_suites WHERE suite_id=?1",
-                [suite],
-                |row| row.get(0),
-            )?;
-            let (driver, request): (Vec<u8>, Option<Vec<u8>>) = db.query_row(
-                "SELECT payload,request FROM benchmark_drivers WHERE driver_id=?1",
-                [driver],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            assert!(
-                request.is_none(),
-                "historical source never acquires a runnable request"
-            );
-            let mut bytes = vec![suite, driver];
-            if let Some(report) = report {
-                bytes.push(db.query_row(
-                    "SELECT payload FROM launch_reports WHERE session_id=?1",
-                    [report],
-                    |row| row.get(0),
-                )?);
-            }
-            Ok::<_, axial_app::storage::StorageError>(bytes)
-        })
-        .unwrap()
-}
-
-async fn imported_benchmark_resume_journey(mixed: bool, queued: bool) {
-    use axial_app::import::{Inventory, ReadOnlySource};
-
-    let temporary =
-        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-    let baseline = temporary.path().join("predecessor");
-    let originals = benchmark_predecessor_files(&baseline, mixed, queued);
-    let original_modified: Vec<_> = originals
-        .iter()
-        .map(|(path, _)| std::fs::metadata(path).unwrap().modified().unwrap())
-        .collect();
-    let profile = temporary.path().join("replacement");
-    let provider = Provider::start(false).await;
-    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
-        .await
-        .unwrap();
-    let api = Api::new(&services);
-    api.post(
-        "/api/v1/accounts/offline",
-        json!({"username":PLAYER,"expected_selection_revision":0}),
-    )
-    .await;
-    api.request(
-        reqwest::Method::PUT,
-        "/api/v1/config",
-        Some(json!({
-            "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
-        })),
-    )
-    .await;
-    let installation = api
-        .post(
-            "/api/v1/install/queue",
-            json!({"kind":"vanilla","version_id":VERSION}),
-        )
-        .await;
-    let installed = install_terminal(&api, &installation).await;
-    assert_eq!(installed["outcome"], "succeeded", "{installed}");
-    let source = ReadOnlySource::from_native_selection(
-        services.library.admit_application_root().unwrap(),
-        &baseline,
-    )
-    .unwrap();
-    services
-        .imports
-        .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
-        .unwrap();
-    let preview = api.get("/api/v1/import/preview").await;
-    assert_eq!(
-        preview["instances"][0]["ordinary_import_available"], true,
-        "{preview}"
-    );
-    assert_eq!(preview["cutover_available"], false);
-    let import_request = json!({
-        "fingerprint":preview["fingerprint"],"legacy_id":"0000000000000001"
-    });
-    let imported = api
-        .post("/api/v1/import/instances", import_request.clone())
-        .await;
-    assert_eq!(imported["cutover_available"], false);
-    let instance = imported["instance"]["id"].as_str().unwrap().to_owned();
-    let repeated = api.post("/api/v1/import/instances", import_request).await;
-    assert_eq!(repeated["instance"]["id"], instance);
-    assert_eq!(repeated["cutover_available"], false);
-    wait_launchable(&api, &instance).await;
-    assert!(
-        services.sessions.snapshots().is_empty(),
-        "import cannot launch historical work"
-    );
-
-    let drivers = api.get("/api/v1/launch/benchmark/suite/drivers").await;
-    assert_eq!(drivers["drivers"].as_array().unwrap().len(), 1);
-    let original_driver = drivers["drivers"][0]["driver"].clone();
-    if queued {
-        assert_eq!(original_driver["state"], "interrupted");
-        assert_eq!(
-            original_driver["error"],
-            "driver automatic resume queued after restart"
-        );
-    }
-    let source_driver = original_driver["id"].as_str().unwrap().to_owned();
-    let source_suite = original_driver["suite_id"].as_str().unwrap().to_owned();
-    let driver_path = format!("/api/v1/launch/benchmark/suite/drivers/{source_driver}");
-    let suite_path = format!("/api/v1/launch/benchmark/suites/{source_suite}");
-    let original_suite = api.get(&suite_path).await;
-    let original_report = original_suite["runs"][0]["session_id"].as_str();
-    let historical_bytes =
-        retained_benchmark_bytes(&services, &source_suite, &source_driver, original_report);
-    let ready = api.get(&driver_path).await;
-    assert_eq!(ready["view_model"]["can_resume"], true, "{ready}");
-    assert!(ready.get("resumed_driver_id").is_none());
-    for run in original_suite["runs"].as_array().unwrap() {
-        assert!(run.get("launch_intent").is_none());
-    }
-
-    services.imports.forget().unwrap();
-    drop(source);
-    services.server.shutdown().await.unwrap();
-    assert!(services.server.is_shutdown_settled());
-    drop(services);
-    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
-        .await
-        .unwrap();
-    let api = Api::new(&services);
-    assert_eq!(api.get(&driver_path).await, ready);
-    assert_eq!(api.get(&suite_path).await, original_suite);
-    assert_eq!(services.benchmarks.resume_interrupted_drivers().unwrap(), 0);
-    assert!(services.sessions.snapshots().is_empty());
-    assert!(services.tasks.status().is_idle());
-    services.instances.registry().storage().read(|db| {
-        let (intents, drivers, runnable): (i64, i64, i64) = db.query_row(
-            "SELECT (SELECT COUNT(*) FROM launch_intents), (SELECT COUNT(*) FROM benchmark_drivers), (SELECT COUNT(*) FROM benchmark_drivers WHERE request IS NOT NULL)",
-            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        assert_eq!((intents, drivers, runnable), (0, 1, 0), "import and reopen must not schedule predecessor work");
-        Ok::<_, axial_app::storage::StorageError>(())
-    }).unwrap();
-    assert_eq!(
-        retained_benchmark_bytes(&services, &source_suite, &source_driver, original_report),
-        historical_bytes
-    );
-
-    // Discard the accepted HTTP response body. The source GET must recover the
-    // durable successor without issuing a second command or inventing an ID.
-    let response = api
-        .client
-        .post(format!("{}{driver_path}/resume", api.base))
-        .header(transport::CAPABILITY_HEADER, &api.capability)
-        .json(&json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert!(response.status().is_success(), "{}", response.status());
-    drop(response);
-    let reconciled = api.get(&driver_path).await;
-    assert_eq!(reconciled["driver"], original_driver);
-    assert_eq!(reconciled["view_model"]["can_resume"], false);
-    let successor_driver = reconciled["resumed_driver_id"].as_str().unwrap().to_owned();
-    assert_ne!(successor_driver, source_driver);
-    let successor_path = format!("/api/v1/launch/benchmark/suite/drivers/{successor_driver}");
-    let accepted = api.get(&successor_path).await;
-    assert_ne!(accepted["driver"]["historical"], true);
-    let successor_suite = accepted["driver"]["suite_id"].as_str().unwrap().to_owned();
-    assert_ne!(successor_suite, source_suite);
-    let successor_suite_path = format!("/api/v1/launch/benchmark/suites/{successor_suite}");
-    let accepted_suite = api.get(&successor_suite_path).await;
-    for (run, original) in accepted_suite["runs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .zip(original_suite["runs"].as_array().unwrap())
-    {
-        if original["state"] == "pending" {
-            assert!(uuid::Uuid::parse_str(run["launch_intent"].as_str().unwrap()).is_ok());
-        } else {
-            assert_eq!(run, original);
-            assert!(run.get("launch_intent").is_none());
-        }
-    }
-    let replay = api.post(&format!("{driver_path}/resume"), json!({})).await;
-    assert_eq!(replay["driver"]["id"], successor_driver);
-    assert_eq!(replay["driver"]["suite_id"], successor_suite);
-
-    let mut executed = BTreeSet::new();
-    for index in usize::from(mixed)..2 {
-        let run = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                let suite = api.get(&successor_suite_path).await;
-                if suite["runs"][index]["state"] == "running" {
-                    break suite["runs"][index].clone();
-                }
-                let driver = api.get(&successor_path).await;
-                assert_ne!(driver["driver"]["state"], "failed", "{driver}");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("remaining benchmark run must reach a real owned session");
-        let session = run["session_id"].as_str().unwrap();
-        let intent = run["launch_intent"].as_str().unwrap();
-        assert!(uuid::Uuid::parse_str(intent).is_ok());
-        assert!(
-            executed.insert(session.to_owned()),
-            "a remaining run must not reuse a session"
-        );
-        assert_ne!(Some(session), original_report);
-        observe_and_stop_session(&api, session).await;
-        let accepted_intent = api.get(&format!("/api/v1/launch/intents/{intent}")).await;
-        assert_eq!(accepted_intent["state"], "accepted");
-        assert_eq!(accepted_intent["session"]["session_id"], session);
-        let report = api.get(&format!("/api/v1/launch/reports/{session}")).await;
-        assert_eq!(report["instance_id"], instance);
-        assert_eq!(report["session_outcome"]["kind"], "stopped");
-        assert_eq!(
-            report["scenario"]["benchmark_id"],
-            original_suite["runs"][index]["benchmark_id"]
-        );
-        assert_eq!(
-            report["scenario"]["benchmark_profile"],
-            original_suite["runs"][index]["profile"]
-        );
-        assert_eq!(
-            report["scenario"]["benchmark_run_type"],
-            original_suite["runs"][index]["run_type"]
-        );
-    }
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let driver = api.get(&successor_path).await;
-            if driver["driver"]["state"] == "complete" {
-                assert!(driver["driver"]["pending_run_index"].is_null(), "{driver}");
-                break;
-            }
-            assert_ne!(driver["driver"]["state"], "failed", "{driver}");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("remaining benchmark runs must settle the successor driver");
-    let complete_suite = api.get(&successor_suite_path).await;
-    if mixed {
-        assert_eq!(complete_suite["runs"][0], original_suite["runs"][0]);
-        assert!(complete_suite["runs"][0].get("launch_intent").is_none());
-    }
-    assert_eq!(executed.len(), 2 - usize::from(mixed));
-    for session in &executed {
-        assert!(services.sessions.snapshot_by_session_id(session).is_some());
-    }
-    assert_eq!(
-        retained_benchmark_bytes(&services, &source_suite, &source_driver, original_report),
-        historical_bytes
-    );
-    provider.assert_requests(true);
-    services.imports.forget().unwrap();
-    services.server.shutdown().await.unwrap();
-    assert!(services.server.is_shutdown_settled());
-    drop(services);
-    provider.shutdown().await;
-
-    let reopened = start_in_profile(profile, None).await.unwrap();
-    let api = Api::new(&reopened);
-    let restored = api.get(&driver_path).await;
-    assert_eq!(restored["driver"], original_driver);
-    assert_eq!(restored["resumed_driver_id"], successor_driver);
-    assert_eq!(restored["view_model"]["can_resume"], false);
-    assert_eq!(api.get(&suite_path).await, original_suite);
-    assert_eq!(api.get(&successor_suite_path).await, complete_suite);
-    let replay = api.post(&format!("{driver_path}/resume"), json!({})).await;
-    assert_eq!(replay["driver"]["id"], successor_driver);
-    assert_eq!(replay["driver"]["state"], "complete");
-    assert_eq!(
-        api.get("/api/v1/launch/benchmark/suite/drivers").await["drivers"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    let reports = api.get("/api/v1/launch/reports").await;
-    let reports = reports["reports"].as_array().unwrap();
-    assert_eq!(reports.len(), 2, "one report per inherited or executed run");
-    for session in &executed {
-        assert_eq!(
-            reports
-                .iter()
-                .filter(|report| report["session_id"] == *session)
-                .count(),
-            1
-        );
-    }
-    reopened
-        .instances
-        .registry()
-        .storage()
-        .read(|db| {
-            let count: i64 =
-                db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get(0))?;
-            assert_eq!(
-                count,
-                executed.len() as i64,
-                "inherited history has no fabricated launch intent"
-            );
-            let suites: i64 = db.query_row("SELECT count(*) FROM benchmark_suites", [], |row| {
-                row.get(0)
-            })?;
-            assert_eq!(suites, 2, "Resume accepts only one successor suite");
-            Ok::<_, axial_app::storage::StorageError>(())
-        })
-        .unwrap();
-    assert!(
-        reopened.sessions.snapshots().is_empty(),
-        "source replay cannot execute completed runs"
-    );
-    assert_eq!(
-        retained_benchmark_bytes(&reopened, &source_suite, &source_driver, original_report),
-        historical_bytes
-    );
-    for ((path, bytes), modified) in originals.iter().zip(original_modified) {
-        assert_eq!(std::fs::read(path).unwrap(), *bytes, "{}", path.display());
-        assert_eq!(
-            std::fs::metadata(path).unwrap().modified().unwrap(),
-            modified,
-            "{}",
-            path.display()
-        );
-    }
-    reopened.server.shutdown().await.unwrap();
-    assert!(reopened.server.is_shutdown_settled());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_imported_benchmark_resume_all_pending_executes_once_and_reopens() {
-    imported_benchmark_resume_journey(false, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_imported_benchmark_resume_mixed_preserves_terminal_and_executes_remaining() {
-    imported_benchmark_resume_journey(true, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_imported_benchmark_resume_queued_all_pending_requires_explicit_command() {
-    imported_benchmark_resume_journey(false, true).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_imported_benchmark_resume_queued_mixed_preserves_source_and_executes_remaining() {
-    imported_benchmark_resume_journey(true, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

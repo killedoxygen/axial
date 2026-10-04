@@ -15,9 +15,6 @@ fn main() {
         "microsoft_sign_in",
         "pick_skin_file",
         "consume_skin_drop",
-        "pick_import_profile",
-        "pick_import_instance_source",
-        "forget_import_profile",
         #[cfg(debug_assertions)]
         "app_reset",
     ];

@@ -3,7 +3,6 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { api } from '../../api';
 import { configResponse } from '../../dto-core';
 import { hasNativeDesktopRuntime, requestNativeAppReset } from '../../native';
-import { exportBrowserPreferences } from '../../preferences-export';
 import { Button, Toggle } from '../../ui/Atoms';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
 import { navigate } from '../../ui-state';
@@ -69,27 +68,6 @@ export function AdvancedSettingsSection(): JSX.Element {
     }
   };
 
-  const downloadPreferences = (): void => {
-    try {
-      const exported = exportBrowserPreferences(window.localStorage);
-      const blob = new Blob([exported], { type: 'application/json' });
-      const anchor = document.createElement('a');
-      const objectUrl = URL.createObjectURL(blob);
-      try {
-        anchor.href = objectUrl;
-        anchor.download = 'axial-browser-preferences.json';
-        anchor.style.display = 'none';
-        document.body.append(anchor);
-        anchor.click();
-      } finally {
-        anchor.remove();
-        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30_000);
-      }
-    } catch {
-      toast('Could not export browser preferences. Stored values may be invalid, too large, or unavailable.', 'error');
-    }
-  };
-
   const resetLauncher = async (): Promise<void> => {
     if (resetInFlight.current) return;
     resetInFlight.current = true;
@@ -131,15 +109,6 @@ export function AdvancedSettingsSection(): JSX.Element {
         control={
           <Button variant="secondary" icon="refresh" onClick={() => location.reload()}>
             Reload
-          </Button>
-        }
-      />
-      <SettingRow
-        title="Browser preferences"
-        description="Save appearance, shortcuts, and the last page as a file to import into the new launcher."
-        control={
-          <Button variant="secondary" icon="download" onClick={downloadPreferences}>
-            Export browser preferences
           </Button>
         }
       />

@@ -10,6 +10,7 @@ import { JavaPathField, JvmArgsInput } from '../../../ui/RuntimeFields';
 import { canAutoSave, useAutoSave } from '../../../hooks/use-autosave';
 import { jvmPresetSelectLabel, normalizeJvmPreset, useJvmPresets } from '../../../hooks/use-jvm-presets';
 import { api } from '../../../api';
+import { refreshInstanceReadiness } from '../../../instance-readiness';
 import { config, systemInfo } from '../../../store';
 import { updateInstanceInList } from '../../../actions';
 import { fmtMem, memoryGb } from '../../../format';
@@ -105,12 +106,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
 
   useEffect(() => {
     let cancelled = false;
-    void api('GET', `/instances/${encodeURIComponent(inst.id)}`)
-      .then(enrichedInstanceResponse)
-      .then((res) => {
-        if (cancelled) return;
-        updateInstanceInList(res);
-      })
+    void refreshInstanceReadiness(inst.id, { isCurrent: () => !cancelled, retry: false })
       .catch(() => {});
     return () => {
       cancelled = true;

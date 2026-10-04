@@ -105,6 +105,9 @@ impl AuthService {
                 AccountKind::Microsoft if readiness.online_mode_ready => {
                     "Microsoft account ready for online play"
                 }
+                AccountKind::Microsoft if !account.owns_minecraft_java => {
+                    "This Microsoft account does not own Minecraft Java."
+                }
                 AccountKind::Microsoft if readiness.msa_refresh_available => {
                     "Refresh Microsoft sign-in before playing online"
                 }
@@ -136,14 +139,22 @@ impl AuthService {
             .as_ref()
             .map(|account| account.readiness.clone())
             .unwrap_or_else(|| readiness(None, None));
-        let online = active
+        let microsoft = active
             .as_ref()
             .is_some_and(|account| account.identity.kind == AccountKind::Microsoft);
+        let online = microsoft
+            && active
+                .as_ref()
+                .is_some_and(|account| account.identity.owns_minecraft_java);
         let skin_action = action(
             "online_profile_ready",
             "Online profile ready",
             readiness.online_mode_ready,
-            "A verified Microsoft account is required for online profile actions.",
+            if microsoft && !online {
+                "The selected Microsoft account has not verified Minecraft Java ownership."
+            } else {
+                "A verified Microsoft account is required for online profile actions."
+            },
             "Minecraft profile updated.",
         );
         Ok(AuthStatusResponse {
@@ -171,7 +182,7 @@ impl AuthService {
             } else {
                 "Microsoft sign-in is available in the desktop app"
             },
-            msa_provider: online.then_some("microsoft"),
+            msa_provider: microsoft.then_some("microsoft"),
             minecraft_profile: active.and_then(|a| a.identity.minecraft_profile),
             readiness,
             skin_action,
@@ -188,8 +199,9 @@ fn readiness(
     let msa_expiry = credentials.map(|c| c.microsoft_expires_at().saturating_sub(now));
     let game_expiry = credentials.map(|c| c.minecraft_expires_at().saturating_sub(now));
     let refresh = credentials.is_some_and(|c| c.microsoft_refresh_token().is_some());
-    let ready = microsoft && game_expiry.is_some_and(|expiry| expiry > 30);
-    let online_action = if ready {
+    let owned = account.is_some_and(|a| a.owns_minecraft_java);
+    let ready = microsoft && owned && game_expiry.is_some_and(|expiry| expiry > 30);
+    let mut online_action = if ready {
         action(
             "online_ready",
             "Online ready",
@@ -210,16 +222,24 @@ fn readiness(
             "online_sign_in_required",
             "Sign in required",
             false,
-            "Sign in with Microsoft to use Online mode.",
+            if microsoft && !owned {
+                "The selected Microsoft account has not verified Minecraft Java ownership."
+            } else {
+                "Sign in with Microsoft to use Online mode."
+            },
             "",
         )
     };
+    if microsoft && !owned {
+        online_action.detail =
+            Some("The selected Microsoft account has not verified Minecraft Java ownership.");
+    }
     AccountReadiness {
         msa_authenticated: msa_expiry.is_some_and(|expiry| expiry > 0),
         msa_token_expires_in: msa_expiry,
         msa_refresh_available: refresh,
         minecraft_profile_ready: account.is_some_and(|a| a.minecraft_profile.is_some()),
-        minecraft_ownership_verified: microsoft && credentials.is_some(),
+        minecraft_ownership_verified: owned && credentials.is_some(),
         minecraft_token_expires_in: game_expiry,
         online_mode_ready: ready,
         online_action,
@@ -233,7 +253,7 @@ fn readiness(
         profile_sync_action: action(
             "profile_sync_available",
             "Sync profile",
-            ready,
+            microsoft && game_expiry.is_some_and(|expiry| expiry > 0),
             "Refresh Microsoft sign-in before syncing this profile.",
             "Minecraft profile synced.",
         ),

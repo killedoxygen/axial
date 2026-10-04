@@ -8,7 +8,6 @@ import { navigate } from '../../ui-state';
 import { config, devMode } from '../../store';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
-import { InstanceImportRow } from './InstanceImportRow';
 import { reloadApplication } from '../../preferences/persistence';
 
 type PerformanceLabCardComponent = (typeof import('./PerformanceLabCard'))['PerformanceLabCard'];
@@ -118,7 +117,6 @@ export function AdvancedSettingsSection(): JSX.Element {
           </Button>
         }
       />
-      <InstanceImportRow />
       {__AXIAL_ENABLE_DEV_LAB__ && isDev && (
         <SettingRow
           title="Dev lab"

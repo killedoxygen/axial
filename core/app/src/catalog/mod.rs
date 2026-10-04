@@ -17,13 +17,12 @@ use crate::network::{
 };
 use crate::tasks::CancellationToken;
 use axial_minecraft::managed_path::ManagedLibraryOperation;
-use axial_minecraft::portable_path::{MAX_PORTABLE_FILE_NAME_BYTES, PortableFileName};
 use axial_minecraft::{
     LoaderGameVersion, VersionJson, VersionManifest, enrich_loader_game_versions,
     manifest_release_references,
 };
 use model::{MAX_MANIFEST_BYTES, MAX_VERSION_BYTES, decode_manifest, snapshot_from};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const METADATA_ORIGINS: [&str; 3] = [
@@ -31,8 +30,6 @@ const METADATA_ORIGINS: [&str; 3] = [
     "https://launchermeta.mojang.com",
     "https://launcher.mojang.com",
 ];
-const MAX_SELECTION_IDS: usize = 4096;
-const MAX_SELECTION_ID_BYTES: usize = MAX_PORTABLE_FILE_NAME_BYTES - ".json".len();
 
 pub struct Catalog {
     client: ProviderClient,
@@ -99,39 +96,6 @@ impl Catalog {
             .find(|entry| entry.id == id)
             .map(VersionDescriptor::new)
             .ok_or(CatalogError::UnknownVersion)
-    }
-
-    /// Resolve requested selections against one fresh provider manifest without touching the
-    /// library or its cache. Missing IDs stay absent; descriptors do not prove installed files.
-    pub(crate) async fn resolve_fresh_selections(
-        &self,
-        ids: &BTreeSet<String>,
-        cancel: &CancellationToken,
-    ) -> Result<BTreeMap<String, VersionDescriptor>, CatalogError> {
-        if cancel.is_cancelled() {
-            return Err(CatalogError::Cancelled);
-        }
-        if ids.len() > MAX_SELECTION_IDS || ids.iter().any(|id| id.len() > MAX_SELECTION_ID_BYTES) {
-            return Err(CatalogError::Malformed);
-        }
-        for id in ids {
-            PortableFileName::new_exact(id)
-                .and_then(|name| name.with_suffix(".json"))
-                .map_err(|_| CatalogError::Malformed)?;
-        }
-        if ids.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let (manifest, _) = self.fetch_manifest(cancel).await?;
-        if cancel.is_cancelled() {
-            return Err(CatalogError::Cancelled);
-        }
-        Ok(manifest
-            .versions
-            .into_iter()
-            .filter(|entry| ids.contains(&entry.id))
-            .map(|entry| (entry.id.clone(), VersionDescriptor::new(entry)))
-            .collect())
     }
 
     pub async fn fetch_version(

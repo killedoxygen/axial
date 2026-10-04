@@ -196,14 +196,9 @@ fn operation_payload(
         operation.state.as_str(),
         "complete" | "failed" | "interrupted"
     );
-    let title = if operation.history.is_some() {
-        "Historical Performance operation"
-    } else {
-        "Performance operation"
-    };
     let mut value = json!(operation);
     value["view_model"] = json!({"state_label":operation.state,"tone":if complete {"ok"} else if terminal {"warn"} else {"mute"},
-        "title":title,"detail":operation.error.unwrap_or_default(),"progress":{"phase":operation.state,"current":if terminal {1}else{0},"total":1,"done":terminal},"is_terminal":terminal,"is_complete":complete});
+        "title":"Performance operation","detail":operation.error.unwrap_or_default(),"progress":{"phase":operation.state,"current":if terminal {1}else{0},"total":1,"done":terminal},"is_terminal":terminal,"is_complete":complete});
     value
 }
 fn resolution(
@@ -283,8 +278,10 @@ fn unavailable() -> (StatusCode, Json<Value>) {
 mod tests {
     use super::*;
     use axial_app::{
-        import::{Inventory, ReadOnlySource},
-        instances::model::InstancePatch,
+        instances::{
+            create::{CreateInstanceRequest, CreateTarget},
+            model::InstancePatch,
+        },
         performance::rules::PerformanceRules,
         storage::StorageError,
     };
@@ -321,74 +318,39 @@ mod tests {
             let services = crate::start_in_profile(root.path().join("replacement"), None)
                 .await
                 .unwrap();
-            let source_path = root.path().join("predecessor");
-            std::fs::create_dir_all(source_path.join("instances/0000000000000001/mods")).unwrap();
-            for (name, bytes) in [
-                (
-                    "config.json",
-                    include_bytes!(
-                        "../../../../acceptance/fixtures/profiles/offline-vanilla/config.json"
-                    )
-                    .as_slice(),
-                ),
-                (
-                    "accounts.json",
-                    include_bytes!(
-                        "../../../../acceptance/fixtures/profiles/offline-vanilla/accounts.json"
-                    )
-                    .as_slice(),
-                ),
-            ] {
-                std::fs::write(source_path.join(name), bytes).unwrap();
-            }
-            let mut source: Value = serde_json::from_str(include_str!(
-                "../../../../acceptance/fixtures/profiles/offline-vanilla/instances.json"
-            ))
-            .unwrap();
-            source["instances"][0]["version_id"] = json!(
-                axial_minecraft::loaders::installed_version_id_for(
-                    axial_minecraft::loaders::LoaderComponentId::Fabric,
-                    "1.20.1",
-                    "0.16.9",
-                )
-                .unwrap()
-            );
-            source["instances"][0]["loader_key"] = json!("fabric");
-            source["instances"][0]["performance_mode"] = json!("managed");
-            std::fs::write(
-                source_path.join("instances.json"),
-                serde_json::to_vec(&source).unwrap(),
+            let target = CreateTarget::loader_for_tests(
+                axial_minecraft::LoaderComponentId::Fabric,
+                "1.20.1",
+                "0.16.9",
             )
             .unwrap();
-            std::fs::write(
-                source_path.join("instances/0000000000000001/mods/iris-mc1.20.1-1.7.0.jar"),
-                jar("iris"),
-            )
-            .unwrap();
-            let source = ReadOnlySource::from_native_selection(
-                services.library.admit_application_root().unwrap(),
-                &source_path,
-            )
-            .unwrap();
-            let preview = services
-                .imports
-                .admit(Inventory::capture(&source, &BTreeMap::new()).unwrap())
-                .unwrap();
-            assert!(preview.instances[0].ordinary_import_available);
-            let prepared = services
-                .imports
-                .prepare_instance(&preview.fingerprint, "0000000000000001")
-                .unwrap();
-            let imported = services
+            let created = services
                 .instances
-                .import_instance(prepared)
+                .create(
+                    CreateInstanceRequest {
+                        name: "Performance projection".into(),
+                        selection_id: target.selection_id().to_owned(),
+                        ..Default::default()
+                    },
+                    target,
+                )
                 .unwrap()
                 .join()
                 .await
                 .unwrap()
                 .unwrap();
-            services.imports.forget().unwrap();
-            drop(source);
+            services
+                .instances
+                .update(
+                    &created.id,
+                    InstancePatch {
+                        expected_revision: Some(created.revision),
+                        performance_mode: Some("managed".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let admission = services.instances.directories().admit(&created.id).unwrap();
             let mods = services
                 .library
                 .admit()
@@ -396,12 +358,16 @@ mod tests {
                 .read_projection()
                 .unwrap()
                 .join("instances")
-                .join(imported.id.as_str())
+                .join(&admission.record().directory_name)
                 .join("mods");
+            admission.validate_current().unwrap();
+            std::fs::write(mods.join("iris-mc1.20.1-1.7.0.jar"), jar("iris")).unwrap();
+            admission.validate_current().unwrap();
+            drop(admission);
             Self {
                 root,
                 services,
-                instance: imported.id,
+                instance: created.id,
                 mods,
             }
         }
@@ -746,37 +712,18 @@ mod tests {
     }
 
     #[test]
-    fn operation_projection_preserves_history_and_unchanged_live_wire() {
-        let mut record = json!({
+    fn operation_projection_preserves_current_terminal_wire() {
+        let record = json!({
             "id":"e89198a7-fc9a-4268-8237-1d03a7865d7d",
             "instance_id":"d6926227-f5e6-47a3-a736-f6c1cef14435", "action":"apply",
             "state":"failed", "error":"Operation failed",
             "created_at":"2026-01-01T00:00:00.000Z", "updated_at":"2026-01-01T00:00:01.000Z"
         });
-        let live = operation_payload(serde_json::from_value(record.clone()).unwrap());
-        assert!(live.get("history").is_none());
-        assert_eq!(live["view_model"]["title"], "Performance operation");
-        let history = json!({
-            "operation_id":"op-2b709312-e6ce-4ee3-89c6-2d15d9b30d66", "sequence":3,
-            "intent":{
-                "instance_id":"0000000000000001", "requested_action":"install", "action":"remove",
-                "base_target_id":"performance_composition_lock", "rollback":"Unavailable",
-                "game_version":"1.20.1", "loader":"fabric", "mode":"custom"
-            },
-            "terminal":{"outcome":"failed_before_effect", "error":"Operation failed"}
-        });
-        record["id"] = json!(format!("legacy-performance-{:064x}", 3));
-        record["action"] = json!("install");
-        record["history"] = history.clone();
-        let historical = operation_payload(serde_json::from_value(record).unwrap());
-        assert_eq!(historical["history"], history);
-        assert_eq!(historical["action"], "install");
-        assert_eq!(
-            historical["view_model"]["title"],
-            "Historical Performance operation"
-        );
-        assert_eq!(historical["view_model"]["is_terminal"], true);
-        assert_eq!(historical["view_model"]["is_complete"], false);
-        assert_eq!(historical["view_model"]["progress"]["done"], true);
+        let payload = operation_payload(serde_json::from_value(record.clone()).unwrap());
+        assert_eq!(payload["action"], record["action"]);
+        assert_eq!(payload["view_model"]["title"], "Performance operation");
+        assert_eq!(payload["view_model"]["is_terminal"], true);
+        assert_eq!(payload["view_model"]["is_complete"], false);
+        assert_eq!(payload["view_model"]["progress"]["done"], true);
     }
 }

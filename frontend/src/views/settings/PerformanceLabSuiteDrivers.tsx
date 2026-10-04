@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { api, isApiError } from '../../api';
+import { api } from '../../api';
 import { instances, lastInstanceId, selectedInstanceId, versionById } from '../../store';
 import { toast } from '../../toast';
 import type {
@@ -30,11 +30,6 @@ const BENCHMARK_SUITE_DRIVER_DEFAULT_INTERVAL_SECONDS = 30;
 const BENCHMARK_SUITE_DRIVER_MIN_INTERVAL_SECONDS = 5;
 const BENCHMARK_SUITE_DRIVER_MAX_INTERVAL_SECONDS = 3600;
 
-type ResumeState = {
-  status: 'resuming' | 'checking' | 'unconfirmed' | 'resolved';
-  successorId?: string;
-};
-
 function clampBenchmarkSuiteDriverIntervalSeconds(value: number): number {
   return Math.min(
     BENCHMARK_SUITE_DRIVER_MAX_INTERVAL_SECONDS,
@@ -53,10 +48,9 @@ function suiteProgressLabel(suite: BenchmarkSuiteDriverSuiteStatus): string {
   return `${suite.launched_run_count}/${suite.run_count} launched`;
 }
 
-function pendingRunLabel(suite: BenchmarkSuiteDriverSuiteStatus, historical: boolean): string {
-  const label = historical ? 'Recorded pending' : 'Pending';
-  if (typeof suite.pending_run_index !== 'number') return `${label} none`;
-  return `${label} #${suite.pending_run_index + 1}`;
+function pendingRunLabel(suite: BenchmarkSuiteDriverSuiteStatus): string {
+  if (typeof suite.pending_run_index !== 'number') return 'Pending none';
+  return `Pending #${suite.pending_run_index + 1}`;
 }
 
 function driverUpdatedLabel(driver: BenchmarkSuiteDriverStatus): string {
@@ -76,8 +70,8 @@ function preferredBenchmarkInstanceId(
 export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: BenchmarkMatrixState }): JSX.Element {
   const [driversState, setDriversState] = useState<BenchmarkDriversState>({ status: 'loading', data: [] });
   const [stoppingIds, setStoppingIds] = useState<Set<string>>(() => new Set());
-  const [resumeStates, setResumeStates] = useState<Record<string, ResumeState>>({});
-  const resumeStatesRef = useRef(resumeStates);
+  const [resumingIds, setResumingIds] = useState<Set<string>>(() => new Set());
+  const resumingIdsRef = useRef(resumingIds);
   const [qualificationChecks, setQualificationChecks] = useState<BenchmarkQualificationRowChecks>({});
   const instanceRows = instances.value;
   const preferredInstanceId = preferredBenchmarkInstanceId(
@@ -157,11 +151,12 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
     }
   };
 
-  const setResumeState = (id: string, state?: ResumeState): void => {
-    const next = state ? { ...resumeStatesRef.current, [id]: state } : { ...resumeStatesRef.current };
-    if (!state) delete next[id];
-    resumeStatesRef.current = next;
-    setResumeStates(next);
+  const setResuming = (id: string, resuming: boolean): void => {
+    const next = new Set(resumingIdsRef.current);
+    if (resuming) next.add(id);
+    else next.delete(id);
+    resumingIdsRef.current = next;
+    setResumingIds(next);
   };
 
   const publishDriver = (update: BenchmarkSuiteDriverResponse, prepend = true): void => {
@@ -175,87 +170,22 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
     }));
   };
 
-  const checkResume = async (id: string, returned?: BenchmarkSuiteDriverResponse): Promise<void> => {
-    let successorId = resumeStatesRef.current[id]?.successorId;
-    setResumeState(id, { status: 'checking', successorId });
-    try {
-      const source = benchmarkSuiteDriverResponse(
-        await api('GET', `/launch/benchmark/suite/drivers/${encodeURIComponent(id)}`),
-      );
-      if (!aliveRef.current) return;
-      if (source.driver.id !== id || !source.driver.historical) throw new Error('Invalid Resume source.');
-      const linkedId = source.resumed_driver_id;
-      if (!linkedId || linkedId === id || (successorId && linkedId !== successorId)) {
-        throw new Error('Resume acceptance is not confirmed.');
-      }
-      successorId = linkedId;
-      setResumeState(id, { status: 'checking', successorId });
-      publishDriver(source, false);
-      if (returned?.driver.id === successorId) {
-        setDriversState((prev) =>
-          prev.data.some((row) => row.driver.id === returned.driver.id)
-            ? prev
-            : { status: 'ready', data: [returned, ...prev.data] },
-        );
-      } else {
-        const requestId = requestRef.current;
-        const successor = benchmarkSuiteDriverResponse(
-          await api('GET', `/launch/benchmark/suite/drivers/${encodeURIComponent(successorId)}`),
-        );
-        if (!aliveRef.current) return;
-        if (successor.driver.id !== successorId || successor.driver.historical) {
-          throw new Error('Invalid Resume successor.');
-        }
-        if (requestId !== requestRef.current) {
-          setResumeState(id, { status: 'unconfirmed', successorId });
-          toast('Resume accepted. Check status.');
-          return;
-        }
-        publishDriver(successor);
-      }
-      setResumeState(id, { status: 'resolved', successorId });
-      toast('Driver resumed');
-    } catch {
-      if (!aliveRef.current) return;
-      setResumeState(id, { status: 'unconfirmed', successorId });
-      toast('Resume outcome unconfirmed. Check status.', 'error');
-    }
-  };
-
   const resumeDriver = async (row: BenchmarkSuiteDriverResponse): Promise<void> => {
     if (!aliveRef.current) return;
-    const { id, historical } = row.driver;
-    const state = resumeStatesRef.current[id];
-    if (!id || state?.status === 'resuming' || state?.status === 'checking' || state?.status === 'resolved') return;
-    if (historical && (state?.status === 'unconfirmed' || row.resumed_driver_id)) {
-      await checkResume(id);
-      return;
-    }
-    if (!row.view_model.can_resume) return;
-    setResumeState(id, { status: 'resuming' });
+    const { id } = row.driver;
+    if (!id || resumingIdsRef.current.has(id) || !row.view_model.can_resume) return;
+    setResuming(id, true);
     try {
       const nextDriver = benchmarkSuiteDriverResponse(
         await api('POST', `/launch/benchmark/suite/drivers/${encodeURIComponent(id)}/resume`),
       );
       if (!aliveRef.current) return;
-      if (historical && (!nextDriver.driver.id || nextDriver.driver.id === id || nextDriver.driver.historical)) {
-        throw new Error('Invalid Resume successor.');
-      }
-      if (historical) {
-        await checkResume(id, nextDriver);
-      } else {
-        publishDriver(nextDriver);
-        setResumeState(id);
-        toast('Driver resumed');
-      }
+      publishDriver(nextDriver);
+      toast('Driver resumed');
     } catch (err) {
-      if (!aliveRef.current) return;
-      if (historical && !(isApiError(err) && [400, 401, 403, 404].includes(err.status))) {
-        await checkResume(id);
-      } else {
-        setResumeState(id);
-        toast(`Resume failed: ${errMessage(err)}`, 'error');
-      }
+      if (aliveRef.current) toast(`Resume failed: ${errMessage(err)}`, 'error');
+    } finally {
+      if (aliveRef.current) setResuming(id, false);
     }
   };
 
@@ -437,15 +367,9 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
             );
             const checkingQualification = checkState?.status === 'loading';
             const canStop = Boolean(driver.id) && row.view_model.can_stop;
-            const resumeState = resumeStates[driver.id];
-            const unconfirmedResume = resumeState?.status === 'unconfirmed';
-            const canResume =
-              Boolean(driver.id) &&
-              row.view_model.can_resume &&
-              !row.resumed_driver_id &&
-              resumeState?.status !== 'resolved';
+            const canResume = Boolean(driver.id) && row.view_model.can_resume;
             const stopping = stoppingIds.has(driver.id);
-            const resuming = resumeState?.status === 'resuming' || resumeState?.status === 'checking';
+            const resuming = resumingIds.has(driver.id);
 
             return (
               <div class="cp-settings-driver-row" key={driver.id}>
@@ -458,7 +382,7 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
                 </div>
                 <div class="cp-settings-driver-meta">
                   <span>{suiteProgressLabel(suite)}</span>
-                  <span>{pendingRunLabel(suite, driver.historical)}</span>
+                  <span>{pendingRunLabel(suite)}</span>
                   <span>{driverUpdatedLabel(driver)}</span>
                 </div>
                 <div class="cp-settings-driver-sessions">
@@ -482,7 +406,7 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
                       {checkingQualification ? 'Checking' : 'Check'}
                     </Button>
                   )}
-                  {(canResume || unconfirmedResume || resuming) && (
+                  {(canResume || resuming) && (
                     <Button
                       variant="secondary"
                       size="sm"
@@ -490,13 +414,7 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
                       disabled={resuming}
                       onClick={() => void resumeDriver(row)}
                     >
-                      {resumeState?.status === 'checking'
-                        ? 'Checking'
-                        : resuming
-                          ? 'Resuming'
-                          : unconfirmedResume
-                            ? 'Check status'
-                            : 'Resume'}
+                      {resuming ? 'Resuming' : 'Resume'}
                     </Button>
                   )}
                   {canStop && (

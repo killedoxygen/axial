@@ -1,4 +1,3 @@
-import { signal } from '@preact/signals';
 import type { LocalPrefs } from './types-ui';
 import { LOCAL_PREFERENCES_KEY, defaultLocalPreferences, parseLocalPreferences } from './preferences/local';
 import { hasNativeDesktopRuntime } from './native';
@@ -22,27 +21,14 @@ export function loadLocalState(): LocalPrefs {
 }
 
 export const local: LocalPrefs = loadLocalState();
-export const localStateVersion = signal(0);
-let persistenceSuspended = false;
-
-/** Keep late callbacks from overwriting imported preferences while this document reloads. */
-export function suspendLocalStatePersistence(): () => void {
-  const previous = persistenceSuspended;
-  persistenceSuspended = true;
-  return () => {
-    persistenceSuspended = previous;
-  };
-}
 
 export function saveLocalState(): void {
-  if (persistenceSuspended || !canEditPreferences()) return;
+  if (!canEditPreferences()) return;
   if (hasNativeDesktopRuntime()) {
     saveNativeLocalPreferences(local);
-    localStateVersion.value += 1;
     return;
   }
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(local));
   } catch {}
-  localStateVersion.value += 1;
 }

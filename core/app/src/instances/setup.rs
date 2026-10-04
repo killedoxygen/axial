@@ -1914,11 +1914,7 @@ pub(crate) mod tests {
     #[test]
     fn registered_loader_retry_target_survives_restart_without_an_installed_version() {
         use crate::instances::directory::{MIGRATION, Registry};
-        let migrations = [
-            MIGRATION,
-            crate::instances::create::MIGRATION,
-            crate::instances::create::DUPLICATE_WITNESS_MIGRATION,
-        ];
+        let migrations = [MIGRATION, crate::instances::create::MIGRATION];
         let temp = tempfile::Builder::new()
             .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
             .unwrap();

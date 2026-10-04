@@ -606,18 +606,9 @@ mod tests {
         let pin = services.library.admit_application_root().unwrap();
         let escaped = pin.admit_native_file(&root.join("reset.txt"), 128).unwrap();
         drop(pin);
-        let imports = crate::import::NativeImports::new(
-            services.library.clone(),
-            services.tasks.clone(),
-            services.imports.clone(),
-            services.catalog.clone(),
-            services.performance.rules().clone(),
-        );
-        let lifecycle = lifecycle.with_imports(imports.clone());
         let app = tauri::test::mock_builder()
             .manage(lifecycle.clone())
             .manage(reset.clone())
-            .manage(imports)
             .manage(crate::auth::NativeSignIn::new(
                 services.auth.clone(),
                 root.join("oauth-webview"),

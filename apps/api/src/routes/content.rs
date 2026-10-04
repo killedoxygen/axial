@@ -510,13 +510,10 @@ mod tests {
                 .migrate(&[
                     axial_app::instances::directory::MIGRATION,
                     axial_app::instances::create::MIGRATION,
-                    axial_app::instances::create::DUPLICATE_WITNESS_MIGRATION,
                     axial_app::instances::delete::MIGRATION,
                     axial_app::content::install::MIGRATION,
                     axial_app::performance::mutation::MIGRATION,
-                    axial_app::performance::mutation::MIGRATION_V2,
                     axial_app::install::queue::MIGRATION,
-                    axial_app::install::queue::MIGRATION_V2,
                 ])
                 .unwrap();
             let exclusions = Exclusions::new();
@@ -574,6 +571,18 @@ mod tests {
                                     "hashes":{"sha512":"a".repeat(128)}}]
                             }]))
                             .into_response(),
+                            "/v2/project/dependent/version" => Json(json!([{
+                                "project_id":"dependent", "id":"v2", "name":"Release",
+                                "version_number":"2.0", "version_type":"release",
+                                "game_versions":["1.21.4"], "loaders":["minecraft"],
+                                "dependencies":[{"project_id":null,"version_id":"unresolved-pin",
+                                    "dependency_type":"incompatible"}],
+                                "files":[{"filename":"dependent-v2.zip", "size":3,
+                                    "url":"https://cdn.modrinth.com/dependent-v2.zip", "primary":true,
+                                    "hashes":{"sha512":"a".repeat(128)}}]
+                            }]))
+                            .into_response(),
+                            "/v2/versions" => Json(json!([])).into_response(),
                             "/v2/project/removed/version" => StatusCode::NOT_FOUND.into_response(),
                             "/v2/project/unavailable/version" => {
                                 StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -714,6 +723,46 @@ mod tests {
             .expect("accepted content task settles")
         }
 
+        fn write_managed_resource_packs(&self, projects: &[&str]) -> Vec<u8> {
+            let mut manifest = ContentManifest::default();
+            for &project in projects {
+                manifest
+                    .try_upsert(
+                        ManifestEntry::managed(
+                            CanonicalId::for_project(ProviderId::Modrinth, project),
+                            ProviderId::Modrinth,
+                            project.into(),
+                            "v1".into(),
+                            ContentKind::ResourcePack,
+                            &FileRef {
+                                filename: format!("{project}.zip"),
+                                url: format!("https://cdn.modrinth.com/{project}.zip"),
+                                size: Some(3),
+                                sha512: Some(concat!(
+                                    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2",
+                                    "192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+                                ).into()),
+                                sha1: None,
+                                primary: true,
+                            },
+                            Vec::new(),
+                            Some(format!("Installed {project}")),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                std::fs::write(
+                    self.game.join(format!("resourcepacks/{project}.zip")),
+                    b"abc",
+                )
+                .unwrap();
+            }
+            let raw = manifest.encode_managed().unwrap();
+            std::fs::write(self.game.join(MANIFEST_FILE), &raw).unwrap();
+            std::fs::write(self.game.join("resourcepacks/user.zip"), b"untouched").unwrap();
+            raw
+        }
+
         async fn close(self) {
             self.queue.close_admission();
             self.gate.add_permits(32);
@@ -802,42 +851,7 @@ mod tests {
         for unavailable in ["removed", "unavailable"] {
             let fixture = Fixture::new().await;
             let projects = [unavailable, "updateable"];
-            let mut manifest = ContentManifest::default();
-            for project in projects {
-                manifest
-                    .try_upsert(
-                        ManifestEntry::managed(
-                            CanonicalId::for_project(ProviderId::Modrinth, project),
-                            ProviderId::Modrinth,
-                            project.into(),
-                            "v1".into(),
-                            ContentKind::ResourcePack,
-                            &FileRef {
-                                filename: format!("{project}.zip"),
-                                url: format!("https://cdn.modrinth.com/{project}.zip"),
-                                size: Some(3),
-                                sha512: Some(concat!(
-                                    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2",
-                                    "192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
-                                ).into()),
-                                sha1: None,
-                                primary: true,
-                            },
-                            Vec::new(),
-                            Some(format!("Installed {project}")),
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-                std::fs::write(
-                    fixture.game.join(format!("resourcepacks/{project}.zip")),
-                    b"abc",
-                )
-                .unwrap();
-            }
-            let raw = manifest.encode_managed().unwrap();
-            std::fs::write(fixture.game.join(MANIFEST_FILE), &raw).unwrap();
-            std::fs::write(fixture.game.join("resourcepacks/user.zip"), b"untouched").unwrap();
+            let raw = fixture.write_managed_resource_packs(&projects);
             let before_queue = serde_json::to_value(fixture.queue.snapshot()).unwrap();
             let endpoint = format!("/api/v1/instances/{}/content", fixture.id);
             let (status, before_listing) = fixture.get(&endpoint).await;
@@ -888,6 +902,65 @@ mod tests {
             );
             fixture.close().await;
         }
+    }
+
+    #[tokio::test]
+    async fn content_updates_omit_unresolved_version_only_incompatibilities_without_mutation() {
+        let fixture = Fixture::new().await;
+        let projects = ["dependent", "updateable"];
+        let raw = fixture.write_managed_resource_packs(&projects);
+        let before_queue = serde_json::to_value(fixture.queue.snapshot()).unwrap();
+        let endpoint = format!("/api/v1/instances/{}/content", fixture.id);
+        let (status, before_listing) = fixture.get(&endpoint).await;
+        assert_eq!(status, StatusCode::OK, "{before_listing}");
+        assert_eq!(before_listing["entries"].as_array().unwrap().len(), 2);
+
+        let (status, updates) = fixture.get(&format!("{endpoint}/updates")).await;
+        assert_eq!(status, StatusCode::OK, "{updates}");
+        assert_eq!(
+            updates,
+            json!({"updates":[{
+                "canonical_id":"modrinth:updateable", "kind":"resource_pack",
+                "current_version_id":"v1", "latest_version_id":"v2",
+                "latest_version_number":"2.0", "title":"Installed updateable"
+            }]})
+        );
+        assert_eq!(
+            *fixture.paths.lock().unwrap(),
+            [
+                "/v2/project/dependent/version",
+                "/v2/project/updateable/version",
+                "/v2/versions"
+            ]
+        );
+        let (status, after_listing) = fixture.get(&endpoint).await;
+        assert_eq!(status, StatusCode::OK, "{after_listing}");
+        assert_eq!(after_listing, before_listing);
+        assert_eq!(
+            std::fs::read(fixture.game.join(MANIFEST_FILE)).unwrap(),
+            raw
+        );
+        for project in projects {
+            assert_eq!(
+                std::fs::read(fixture.game.join(format!("resourcepacks/{project}.zip"))).unwrap(),
+                b"abc"
+            );
+            assert!(
+                !fixture
+                    .game
+                    .join(format!("resourcepacks/{project}-v2.zip"))
+                    .exists()
+            );
+        }
+        assert_eq!(
+            std::fs::read(fixture.game.join("resourcepacks/user.zip")).unwrap(),
+            b"untouched"
+        );
+        assert_eq!(
+            serde_json::to_value(fixture.queue.snapshot()).unwrap(),
+            before_queue
+        );
+        fixture.close().await;
     }
 
     #[tokio::test]

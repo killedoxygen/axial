@@ -138,13 +138,17 @@ impl ProfileMedia {
         if capture.kind() != AccountKind::Microsoft || capture.profile().is_none() {
             return Err(ProfileMediaError::AccountRequired);
         }
+        if !capture.owns_minecraft_java() {
+            return Err(ProfileMediaError::OwnershipMissing);
+        }
         Ok(capture)
     }
 
     pub fn profile(&self) -> Result<SkinProfileResponse, ProfileMediaError> {
         let capture = self.selected()?;
         Ok(match capture.profile() {
-            Some(profile) => online_profile(profile),
+            Some(profile) if capture.owns_minecraft_java() => online_profile(profile),
+            Some(_) => unverified_profile(capture.display_name(), capture.minecraft_uuid()),
             None if capture.kind() == AccountKind::Microsoft => {
                 unverified_profile(capture.display_name(), capture.minecraft_uuid())
             }
@@ -505,6 +509,9 @@ impl ProfileMedia {
                                     || capture.profile().is_none()
                                 {
                                     return Err(ProfileMediaError::AccountRequired);
+                                }
+                                if !capture.owns_minecraft_java() {
+                                    return Err(ProfileMediaError::OwnershipMissing);
                                 }
                                 Ok(self.pending.queue(
                                     capture,
@@ -1190,6 +1197,7 @@ fn auth_error(error: AuthError) -> ProfileMediaError {
     match error {
         AuthError::Account(error) => account_error(error),
         AuthError::SignInRequired | AuthError::LoginExpired => ProfileMediaError::AccountRequired,
+        AuthError::OwnershipMissing => ProfileMediaError::OwnershipMissing,
         AuthError::Credentials(crate::accounts::credential_store::CredentialError::Stale) => {
             ProfileMediaError::StaleIdentity
         }
@@ -1212,7 +1220,7 @@ mod tests {
             credential_store::CredentialStore,
             credentials::Credentials,
             microsoft::{MinecraftCape, MinecraftSkin},
-            model::{MicrosoftIdentity, MicrosoftIdentityImport, microsoft_account_id},
+            model::{MicrosoftIdentity, microsoft_account_id},
         },
         library::{LibraryLifecycle, LibraryOpenOutcome},
         storage::MetadataStore,
@@ -1299,6 +1307,7 @@ mod tests {
                     profile_id: PROFILE_ID.into(),
                     display_name: initial.name.clone(),
                     credential_revision: receipt.revision(),
+                    owns_minecraft_java: true,
                     profile: initial,
                 },
             )
@@ -1358,155 +1367,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn imported_identity_displays_online_default_without_provider_or_credential_work() {
-        let (base, mut requests, server) = server(vec![Reply::json(profile(None, false))]).await;
-        let directory = tempfile::tempdir().unwrap();
-        let roots = match LibraryLifecycle::open(&directory.path().canonicalize().unwrap()) {
-            LibraryOpenOutcome::Ready(roots) => roots,
-            _ => panic!("isolated root"),
-        };
-        let root = roots.admit_application_root().unwrap();
-        let metadata = Arc::new(MetadataStore::in_memory().unwrap());
-        let accounts = Arc::new(AccountDirectory::new(metadata.clone()).unwrap());
-        metadata.migrate(&[MIGRATION]).unwrap();
-        let imported = MicrosoftIdentityImport {
-            profile_id: PROFILE_ID.into(),
-            display_name: "A".into(),
-            created_at: "2024-01-01T00:00:00Z".into(),
-            updated_at: "2024-01-02T00:00:00Z".into(),
-        };
-        metadata
-            .transaction(|transaction| {
-                AccountDirectory::import_identities_in_transaction(
-                    transaction,
-                    &[],
-                    &[imported.clone()],
-                    Some(&imported.account_id()?),
-                    0,
-                )
-            })
-            .unwrap();
-        let credentials = Arc::new(CredentialStore::isolated_for_tests());
-        let credential_work = credentials.task_owner().subscribe();
-        let tasks = TaskOwner::new(32).unwrap();
-        let auth = Arc::new(AuthService::new(
-            accounts.clone(),
-            credentials,
-            tasks.clone(),
-        ));
-        let service = ProfileMedia::with_clients(
-            Arc::new(SavedSkinLibrary::new(
-                SavedSkinStore::new(metadata),
-                root.clone(),
-            )),
-            accounts,
-            auth,
-            tasks,
-            root,
-            TextureDelivery::new(ProfileLookup::new().unwrap()),
-            ProfileProvider::fixture(&base),
-        )
-        .unwrap();
-        let response = service.profile().unwrap();
-        assert_eq!(response.auth_mode, "online");
-        assert_eq!(response.username, "A");
-        assert_eq!(response.uuid, PROFILE_ID);
-        assert_eq!(response.source, "default");
-        assert!(response.texture_url.is_none());
-        assert!(response.head_url.is_none());
+    async fn no_account_wardrobe_retains_saved_skins_and_allows_deletion() {
+        let (_directory, service, capture, first, _) =
+            fixture("http://127.0.0.1:9", profile(None, false)).await;
+        let saved = service.library.get(&first).unwrap().unwrap();
+        assert!(
+            service
+                .library
+                .mark_applied_if_current(capture.account_id(), &first, saved.revision,)
+                .unwrap()
+        );
+        service.auth.logout().await.unwrap();
+        assert!(
+            service
+                .accounts
+                .snapshot()
+                .unwrap()
+                .active_account_id
+                .is_none()
+        );
+        let public = service.list().unwrap();
+        assert_eq!(public.skins.len(), 2);
+        assert!(public.skins.iter().all(|skin| skin.applied_at.is_none()));
+        assert!(public.pending_apply_texture_key.is_none());
         assert!(matches!(
-            service.profile_file(None).await,
-            Err(ProfileMediaError::AccountRequired)
+            service.delete_saved(&first).await.unwrap(),
+            SavedSkinDeleteResult::Deleted(record) if record.texture_key == first
         ));
-        assert!(matches!(
-            service.cape_file("cape-one").await,
-            Err(ProfileMediaError::AccountRequired)
-        ));
-        assert!(matches!(
-            service.reset(true).await,
-            Err(ProfileMediaError::AccountRequired)
-        ));
-        assert!(matches!(
-            service.save_profile(None, None, false).await,
-            Err(SkinError::Profile(ProfileMediaError::AccountRequired))
-        ));
-        assert!(service.library.list().unwrap().is_empty());
-        assert!(!credential_work.has_changed().unwrap());
-        assert!(requests.try_recv().is_err());
+        assert_eq!(service.list().unwrap().skins.len(), 1);
         service.shutdown().await.unwrap();
-        server.abort();
-        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    fn change_ownership(
+        service: &ProfileMedia,
+        capture: &CapturedAccount,
+        owns_minecraft_java: bool,
+    ) -> CapturedAccount {
+        service
+            .accounts
+            .refresh_microsoft(
+                capture,
+                MicrosoftIdentity {
+                    login_id: capture.login_id().unwrap().into(),
+                    profile_id: capture.minecraft_uuid().into(),
+                    display_name: capture.display_name().into(),
+                    credential_revision: capture.credential_revision(),
+                    profile: capture.profile().unwrap().clone(),
+                    owns_minecraft_java,
+                },
+            )
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn no_account_wardrobe_keeps_imported_history_private_and_allows_deletion() {
-        let directory = tempfile::tempdir().unwrap();
-        let roots = match LibraryLifecycle::open(&directory.path().canonicalize().unwrap()) {
-            LibraryOpenOutcome::Ready(roots) => roots,
-            _ => panic!("isolated root"),
-        };
-        let root = roots.admit_application_root().unwrap();
-        let metadata = Arc::new(MetadataStore::in_memory().unwrap());
-        let accounts = Arc::new(AccountDirectory::new(metadata.clone()).unwrap());
-        metadata
-            .migrate(&[MIGRATION, crate::skins::store::IMPORT_MIGRATION])
-            .unwrap();
-        let library = Arc::new(SavedSkinLibrary::new(
-            SavedSkinStore::new(metadata),
-            root.clone(),
+    async fn negative_ownership_refuses_new_skin_work_and_fences_a_queued_apply() {
+        let (_directory, service, original, first, _) =
+            fixture("http://127.0.0.1:9", profile(None, false)).await;
+        queue(&service, &first);
+        let unowned = change_ownership(&service, &original, false);
+        assert!(service.auth.credentials(&unowned).await.is_ok());
+        assert!(matches!(
+            service.queue(&first, unowned.account_id(), unowned.selection_revision()),
+            Err(SkinError::Profile(ProfileMediaError::OwnershipMissing))
         ));
-        let bytes = crate::media::normalize_skin_png(&png(11))
-            .unwrap()
-            .png_bytes;
-        let historical = SavedSkinRecord {
-            texture_key: texture_key(&bytes),
-            name: "Imported history".into(),
-            variant: SkinVariant::Classic,
-            source: "minecraft_profile_skin".into(),
-            cape_id: None,
-            created_at: "2024-01-01T00:00:00Z".into(),
-            updated_at: "2024-01-02T00:00:00Z".into(),
-            applied_at: Some("2024-01-03T00:00:00Z".into()),
-            byte_size: bytes.len(),
-        };
-        let imported =
-            crate::skins::library::prepare_import_record(historical.clone(), bytes).unwrap();
-        library
-            .import_batch(
-                &"1".repeat(64),
-                &"2".repeat(64),
-                &[imported],
-                &crate::tasks::CancellationToken::new(),
-            )
-            .unwrap();
-        let tasks = TaskOwner::new(32).unwrap();
-        let auth = Arc::new(AuthService::new(
-            accounts.clone(),
-            Arc::new(CredentialStore::isolated_for_tests()),
-            tasks.clone(),
-        ));
-        let service = ProfileMedia::new(library, accounts.clone(), auth, tasks, root).unwrap();
-        assert!(accounts.snapshot().unwrap().active_account_id.is_none());
-        let public = service.list().unwrap();
-        let mut expected = historical.clone();
-        expected.applied_at = None;
-        assert_eq!(public.skins, vec![expected]);
-        assert!(public.pending_apply_texture_key.is_none());
         assert_eq!(
-            service
-                .library
-                .get(&historical.texture_key)
-                .unwrap()
-                .unwrap()
-                .record,
-            historical,
+            service.reset(true).await,
+            Err(ProfileMediaError::OwnershipMissing)
+        );
+        assert_eq!(
+            service.reset(false).await,
+            Err(ProfileMediaError::OwnershipMissing)
         );
         assert!(matches!(
-            service.delete_saved(&historical.texture_key).await.unwrap(),
-            SavedSkinDeleteResult::Deleted(record) if record == historical
+            service.profile_file(None).await,
+            Err(ProfileMediaError::OwnershipMissing)
         ));
-        assert!(service.list().unwrap().skins.is_empty());
+        assert!(matches!(
+            service.save_profile(None, None, false).await,
+            Err(SkinError::Profile(ProfileMediaError::OwnershipMissing))
+        ));
+        assert_eq!(
+            service.flush_account(unowned.account_id()).await,
+            Err(ProfileMediaError::StaleIdentity)
+        );
+        assert!(
+            service
+                .list()
+                .unwrap()
+                .skins
+                .iter()
+                .all(|skin| skin.applied_at.is_none())
+        );
+        assert!(
+            !service
+                .accounts
+                .capture_selected()
+                .unwrap()
+                .owns_minecraft_java()
+        );
         service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ownership_loss_during_upload_preserves_the_unsettled_effect() {
+        let (resume, paused) = oneshot::channel();
+        let mut upload = Reply::json(profile(Some(FIRST_URL), true));
+        upload.resume = Some(paused);
+        let (base, mut requests, server) =
+            server(vec![Reply::json(profile(None, true)), upload]).await;
+        let (_directory, service, capture, first, _) = fixture(&base, profile(None, true)).await;
+        queue(&service, &first);
+        let waiter_service = service.clone();
+        let account = capture.account_id().to_owned();
+        let waiter = tokio::spawn(async move { waiter_service.flush_account(&account).await });
+        assert!(requests.recv().await.unwrap().starts_with("GET"));
+        assert!(requests.recv().await.unwrap().starts_with("POST"));
+        let unowned = change_ownership(&service, &capture, false);
+        resume.send(()).unwrap();
+        assert_eq!(waiter.await.unwrap(), Err(ProfileMediaError::StaleIdentity));
+        assert_eq!(
+            service.shutdown().await,
+            Err(ProfileMediaError::UncertainChange)
+        );
+        assert!(
+            !service
+                .accounts
+                .capture_selected()
+                .unwrap()
+                .owns_minecraft_java()
+        );
+        assert!(service.auth.credentials(&unowned).await.is_ok());
+        server.await.unwrap();
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]

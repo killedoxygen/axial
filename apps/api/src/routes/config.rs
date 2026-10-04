@@ -80,9 +80,7 @@ impl ConfigRouteState {
                 config.launch_auth_mode = ConfigLaunchAuthMode::Offline;
                 // The last persisted projection may belong to a removed online
                 // account whose provider name is too short for offline input.
-                if axial_app::settings::validate_username(&config.username).is_err() {
-                    config.username = ConfigView::default().username;
-                }
+                config.username = config.offline_username().to_owned();
             }
         }
         Ok(())
@@ -400,6 +398,7 @@ mod tests {
                         profile_id: profile_id.clone(),
                         display_name: name.into(),
                         credential_revision: 1,
+                        owns_minecraft_java: true,
                         profile: MinecraftProfile {
                             id: profile_id,
                             name: name.into(),

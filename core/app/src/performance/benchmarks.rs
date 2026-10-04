@@ -9,29 +9,23 @@ use crate::{
     },
     storage::{
         MetadataStore, Migration, StorageError,
-        rusqlite::{self, Connection, OptionalExtension, Transaction, params},
+        rusqlite::{self, Connection, OptionalExtension, params},
     },
     tasks::{CancellationToken, TaskOwner},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 #[path = "benchmarks_tests.rs"]
-mod import_tests;
+mod recovery_tests;
 
 const MATRIX_SCHEMA: &str = "axial.launch.benchmark.matrix";
 const MATRIX_SCHEMA_VERSION: u32 = 1;
 const MAX_MATRIX_JSON_BYTES: usize = 12 * 1024;
 const MAX_RESTART_DRIVERS: usize = 8;
-const MAX_IMPORT_RECORDS: usize = 1024;
-const MAX_IMPORT_BYTES: usize = 64 * 1024 * 1024;
-const MAX_SUITE_BYTES: usize = 256 * 1024;
-const MAX_DRIVER_BYTES: usize = 16 * 1024;
 const MAX_STORED_DRIVERS: usize = 4096;
-pub(crate) const MAX_ARCHIVED_BENCHMARK_PROOF_BYTES: usize = 128 * 1024;
 const RESTART_INTERRUPTED_ERROR: &str = "Driver interrupted by application restart";
 const RESTART_LIMIT_ERROR: &str = "driver ignored after restart resume limit";
 
@@ -706,7 +700,7 @@ mod tests {
     }
 }
 
-/// Stable redacted descriptor identity, compatible with predecessor manifests.
+/// Stable redacted descriptor identity.
 pub fn bounded_descriptor_token(value: &str, prefix: &str) -> String {
     let value = value.trim();
     if valid_token(value) {
@@ -741,19 +735,6 @@ pub const MIGRATION: Migration = Migration {
     CREATE TABLE benchmark_drivers (driver_id TEXT PRIMARY KEY NOT NULL, payload BLOB NOT NULL CHECK(length(payload)<=16384), request BLOB CHECK(length(request)<=8192)) STRICT;",
 };
 
-pub const MIGRATION_V2: Migration = Migration {
-    id: "performance_benchmarks.v2",
-    sql: "ALTER TABLE benchmark_suites ADD COLUMN source_suite_id TEXT;
-    CREATE UNIQUE INDEX benchmark_suites_source ON benchmark_suites(source_suite_id) WHERE source_suite_id IS NOT NULL;
-    ALTER TABLE benchmark_drivers ADD COLUMN source_driver_id TEXT;
-    CREATE UNIQUE INDEX benchmark_drivers_source ON benchmark_drivers(source_driver_id) WHERE source_driver_id IS NOT NULL;",
-};
-
-pub const MIGRATION_V3: Migration = Migration {
-    id: "performance_benchmarks.v3",
-    sql: "ALTER TABLE benchmark_drivers ADD COLUMN detached_source TEXT CHECK(detached_source IS NULL OR (length(detached_source)=64 AND detached_source NOT GLOB '*[^0-9a-f]*'));",
-};
-
 #[derive(Debug, thiserror::Error)]
 pub enum BenchmarkError {
     #[error("benchmark input is invalid")]
@@ -768,8 +749,6 @@ pub enum BenchmarkError {
     LaunchFailed,
     #[error("benchmark evidence or storage is unavailable")]
     Unavailable,
-    #[error("imported benchmark history conflicts with retained metadata")]
-    ConflictingHistory,
     #[error("benchmark storage is unavailable")]
     Storage(#[from] StorageError),
 }
@@ -790,8 +769,6 @@ pub struct BenchmarkSuiteManifest {
     pub created_at: String,
     pub updated_at: String,
     pub runs: Vec<BenchmarkSuiteManifestRun>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub historical: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -844,591 +821,6 @@ pub struct BenchmarkSuiteDriverStatus {
     pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub historical: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !value
-}
-
-fn require_mutable(historical: bool) -> Result<(), BenchmarkError> {
-    if historical {
-        Err(BenchmarkError::Invalid)
-    } else {
-        Ok(())
-    }
-}
-
-/// Historical metadata only. Preparation is outside the instance publication
-/// transaction; insertion grants neither launch intent nor driver authority.
-#[derive(Clone)]
-pub(crate) struct PreparedBenchmarkImport {
-    suites: Vec<Arc<(BenchmarkSuiteManifest, Vec<u8>)>>,
-    drivers: Vec<Arc<(BenchmarkSuiteDriverStatus, Vec<u8>, Option<String>)>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ArchivedBenchmarkCompletionProof {
-    source_id: String,
-    suite_ids: Vec<String>,
-    driver_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    detached_driver_indices: Vec<usize>,
-    digest: String,
-}
-
-impl PreparedBenchmarkImport {
-    pub(crate) fn prepare(
-        suites: Vec<BenchmarkSuiteManifest>,
-        drivers: Vec<BenchmarkSuiteDriverStatus>,
-    ) -> Result<Self, BenchmarkError> {
-        Self::prepare_bound(suites, drivers, None)
-    }
-
-    pub(crate) fn prepare_archived(
-        source: &str,
-        suites: Vec<(String, BenchmarkSuiteManifest)>,
-        drivers: Vec<BenchmarkSuiteDriverStatus>,
-    ) -> Result<Self, BenchmarkError> {
-        if !lower_hex(source, 64) || suites.len().saturating_add(drivers.len()) > MAX_IMPORT_RECORDS
-        {
-            return Err(BenchmarkError::Invalid);
-        }
-        let suites = suites
-            .into_iter()
-            .map(|(legacy_id, mut suite)| {
-                if !lower_hex(&legacy_id, 16) {
-                    return Err(BenchmarkError::Invalid);
-                }
-                suite.instance_id = format!("archived-{source}-{legacy_id}");
-                Ok(suite)
-            })
-            .collect::<Result<_, BenchmarkError>>()?;
-        Self::prepare_bound(suites, drivers, Some(source))
-    }
-
-    pub(crate) fn prepare_detached(
-        source: &str,
-        drivers: Vec<BenchmarkSuiteDriverStatus>,
-    ) -> Result<Self, BenchmarkError> {
-        if !lower_hex(source, 64) || drivers.len() > MAX_IMPORT_RECORDS {
-            return Err(BenchmarkError::Invalid);
-        }
-        let mut ids = BTreeSet::new();
-        let mut total = 0usize;
-        let drivers = drivers
-            .into_iter()
-            .map(|driver| {
-                validate_driver(&driver).map_err(|_| BenchmarkError::Invalid)?;
-                validate_detached_driver(&driver, Some(source))
-                    .map_err(|_| BenchmarkError::Invalid)?;
-                if !ids.insert(driver.id.clone()) {
-                    return Err(BenchmarkError::Invalid);
-                }
-                let bytes = serde_json::to_vec(&driver).map_err(|_| BenchmarkError::Invalid)?;
-                total = total.saturating_add(bytes.len() + source.len());
-                if bytes.len() > MAX_DRIVER_BYTES || total > MAX_IMPORT_BYTES {
-                    return Err(BenchmarkError::Invalid);
-                }
-                Ok(Arc::new((driver, bytes, Some(source.to_owned()))))
-            })
-            .collect::<Result<_, BenchmarkError>>()?;
-        Ok(Self {
-            suites: Vec::new(),
-            drivers,
-        })
-    }
-
-    fn prepare_bound(
-        suites: Vec<BenchmarkSuiteManifest>,
-        drivers: Vec<BenchmarkSuiteDriverStatus>,
-        source: Option<&str>,
-    ) -> Result<Self, BenchmarkError> {
-        if suites.len().saturating_add(drivers.len()) > MAX_IMPORT_RECORDS {
-            return Err(BenchmarkError::Invalid);
-        }
-        let mut suite_modes = BTreeMap::new();
-        let mut sessions = BTreeSet::new();
-        for suite in &suites {
-            if !suite.historical
-                || validate_suite(suite).is_err()
-                || match source {
-                    Some(source) => archived_instance_source(&suite.instance_id) != Some(source),
-                    None => suite.instance_id.parse::<InstanceId>().is_err(),
-                }
-                || suite_modes
-                    .insert(suite.suite_id.as_str(), suite.mode.as_str())
-                    .is_some()
-                || suite
-                    .runs
-                    .iter()
-                    .filter_map(|run| run.session_id.as_deref())
-                    .any(|session| !sessions.insert(session))
-            {
-                return Err(BenchmarkError::Invalid);
-            }
-        }
-        let mut driver_ids = BTreeSet::new();
-        for driver in &drivers {
-            if !driver.historical
-                || validate_driver(driver).is_err()
-                || !driver_ids.insert(driver.id.as_str())
-                || suite_modes.get(driver.suite_id.as_str()).copied() != Some(driver.mode.as_str())
-            {
-                return Err(BenchmarkError::Invalid);
-            }
-        }
-        let mut bytes = 0usize;
-        let suites = suites
-            .into_iter()
-            .map(|suite| {
-                let encoded = serde_json::to_vec(&suite).map_err(|_| BenchmarkError::Invalid)?;
-                bytes = bytes.saturating_add(encoded.len());
-                if encoded.len() > MAX_SUITE_BYTES || bytes > MAX_IMPORT_BYTES {
-                    return Err(BenchmarkError::Invalid);
-                }
-                Ok(Arc::new((suite, encoded)))
-            })
-            .collect::<Result<_, BenchmarkError>>()?;
-        let drivers = drivers
-            .into_iter()
-            .map(|driver| {
-                let encoded = serde_json::to_vec(&driver).map_err(|_| BenchmarkError::Invalid)?;
-                bytes = bytes.saturating_add(encoded.len());
-                if encoded.len() > MAX_DRIVER_BYTES || bytes > MAX_IMPORT_BYTES {
-                    return Err(BenchmarkError::Invalid);
-                }
-                Ok(Arc::new((driver, encoded, None)))
-            })
-            .collect::<Result<_, BenchmarkError>>()?;
-        Ok(Self { suites, drivers })
-    }
-
-    pub(crate) fn append(&mut self, other: &Self) -> Result<(), BenchmarkError> {
-        if self.suites.len() + self.drivers.len() + other.suites.len() + other.drivers.len()
-            > MAX_IMPORT_RECORDS
-        {
-            return Err(BenchmarkError::Invalid);
-        }
-        let mut ids = BTreeSet::new();
-        let mut sessions = BTreeSet::new();
-        let mut bytes = 0usize;
-        for record in self.suites.iter().chain(&other.suites) {
-            if !ids.insert(&record.0.suite_id)
-                || record
-                    .0
-                    .runs
-                    .iter()
-                    .filter_map(|run| run.session_id.as_ref())
-                    .any(|id| !sessions.insert(id))
-            {
-                return Err(BenchmarkError::Invalid);
-            }
-            bytes = bytes.saturating_add(record.1.len());
-        }
-        ids.clear();
-        for record in self.drivers.iter().chain(&other.drivers) {
-            if !ids.insert(&record.0.id) {
-                return Err(BenchmarkError::Invalid);
-            }
-            bytes = bytes.saturating_add(record.1.len() + record.2.as_ref().map_or(0, String::len));
-        }
-        if bytes > MAX_IMPORT_BYTES {
-            return Err(BenchmarkError::Invalid);
-        }
-        self.suites.extend(other.suites.iter().cloned());
-        self.drivers.extend(other.drivers.iter().cloned());
-        Ok(())
-    }
-
-    pub(crate) fn completion_proof(
-        &self,
-        source: &str,
-    ) -> Result<ArchivedBenchmarkCompletionProof, BenchmarkError> {
-        if !lower_hex(source, 64)
-            || self
-                .suites
-                .iter()
-                .any(|record| archived_instance_source(&record.0.instance_id) != Some(source))
-            || self.drivers.iter().any(|record| {
-                record
-                    .2
-                    .as_deref()
-                    .is_some_and(|detached| detached != source)
-            })
-        {
-            return Err(BenchmarkError::Invalid);
-        }
-        let mut suites: Vec<_> = self.suites.iter().collect();
-        let mut drivers: Vec<_> = self.drivers.iter().collect();
-        suites.sort_unstable_by_key(|record| &record.0.suite_id);
-        drivers.sort_unstable_by_key(|record| &record.0.id);
-        let suite_ids: Vec<_> = suites
-            .iter()
-            .map(|record| record.0.suite_id.clone())
-            .collect();
-        let driver_ids: Vec<_> = drivers.iter().map(|record| record.0.id.clone()).collect();
-        let detached_driver_indices = drivers
-            .iter()
-            .enumerate()
-            .filter_map(|(index, record)| record.2.is_some().then_some(index))
-            .collect::<Vec<_>>();
-        let mut digest =
-            archived_completion_hash(source, &suite_ids, &driver_ids, &detached_driver_indices);
-        for bytes in suites
-            .iter()
-            .map(|record| &record.1)
-            .chain(drivers.iter().map(|record| &record.1))
-        {
-            digest.update((bytes.len() as u64).to_be_bytes());
-            digest.update(bytes);
-        }
-        let proof = ArchivedBenchmarkCompletionProof {
-            source_id: source.to_owned(),
-            suite_ids,
-            driver_ids,
-            detached_driver_indices,
-            digest: hex::encode(digest.finalize()),
-        };
-        proof.validate(source)?;
-        Ok(proof)
-    }
-
-    pub(crate) fn insert_in(&self, tx: &Transaction<'_>) -> Result<(), BenchmarkError> {
-        let mut remaining = MAX_IMPORT_BYTES;
-        for record in &self.suites {
-            let (suite, bytes) = record.as_ref();
-            match imported_suite_row(tx, &suite.suite_id, &mut remaining)? {
-                Some((saved, _)) if saved == *suite => {}
-                Some(_) => return Err(BenchmarkError::ConflictingHistory),
-                None => {
-                    remaining = remaining
-                        .checked_sub(bytes.len())
-                        .ok_or(BenchmarkError::Invalid)?;
-                    if tx.execute(
-                        "INSERT INTO benchmark_suites(suite_id,payload) VALUES(?1,?2)",
-                        params![suite.suite_id, bytes],
-                    )? != 1
-                    {
-                        return Err(BenchmarkError::ConflictingHistory);
-                    }
-                }
-            }
-        }
-        for record in &self.drivers {
-            let (driver, bytes, detached) = record.as_ref();
-            match imported_driver_row(tx, &driver.id, &mut remaining)? {
-                Some((saved, _, source)) if saved == *driver && source == *detached => {}
-                Some(_) => return Err(BenchmarkError::ConflictingHistory),
-                None => {
-                    remaining = remaining
-                        .checked_sub(bytes.len() + detached.as_ref().map_or(0, String::len))
-                        .ok_or(BenchmarkError::Invalid)?;
-                    if tx.execute("INSERT INTO benchmark_drivers(driver_id,payload,request,detached_source) VALUES(?1,?2,NULL,?3)", params![driver.id, bytes, detached])? != 1 {
-                        return Err(BenchmarkError::ConflictingHistory);
-                    }
-                }
-            }
-        }
-        self.verify_in(tx)
-    }
-
-    pub(crate) fn verify_in(&self, db: &Connection) -> Result<(), BenchmarkError> {
-        verify_driver_capacity(db)?;
-        let mut remaining = MAX_IMPORT_BYTES;
-        let mut suites = BTreeMap::new();
-        for record in &self.suites {
-            let (suite, _) = imported_suite_row(db, &record.0.suite_id, &mut remaining)?
-                .ok_or(BenchmarkError::ConflictingHistory)?;
-            if suite != record.0 {
-                return Err(BenchmarkError::ConflictingHistory);
-            }
-            suites.insert(suite.suite_id, Some((suite.mode, suite.instance_id)));
-        }
-        let mut verified = BTreeSet::new();
-        let bound_suites: BTreeSet<_> = self
-            .suites
-            .iter()
-            .map(|record| record.0.suite_id.as_str())
-            .collect();
-        for record in &self.drivers {
-            let (driver, _, detached) = imported_driver_row(db, &record.0.id, &mut remaining)?
-                .ok_or(BenchmarkError::ConflictingHistory)?;
-            if driver != record.0
-                || detached != record.2
-                || (detached.is_none() && !bound_suites.contains(driver.suite_id.as_str()))
-            {
-                return Err(BenchmarkError::ConflictingHistory);
-            }
-            verify_imported_parent(
-                db,
-                &driver,
-                detached.as_deref(),
-                &mut suites,
-                &mut remaining,
-            )?;
-            verified.insert(driver.id);
-        }
-        // A later parent publication must not make already retained detached
-        // drivers unreadable. Scan once and decode only matching rows.
-        if !self.suites.is_empty() {
-            let scan_bytes: usize = db.query_row(
-                "SELECT coalesce(sum(length(payload)+length(CAST(detached_source AS BLOB))),0) FROM (SELECT payload,detached_source FROM benchmark_drivers WHERE detached_source IS NOT NULL LIMIT ?1)",
-                [MAX_STORED_DRIVERS + 1], |row| row.get(0),
-            )?;
-            remaining = remaining
-                .checked_sub(scan_bytes)
-                .ok_or(BenchmarkError::Invalid)?;
-            let incoming: BTreeSet<_> = self
-                .suites
-                .iter()
-                .map(|record| record.0.suite_id.as_str())
-                .collect();
-            let mut query = db.prepare("SELECT driver_id,CASE WHEN json_valid(payload) THEN json_extract(payload,'$.suite_id') END FROM benchmark_drivers WHERE detached_source IS NOT NULL LIMIT ?1")?;
-            let mut rows = query.query([MAX_STORED_DRIVERS + 1])?;
-            while let Some(row) = rows.next()? {
-                let id: String = row.get(0)?;
-                let parent: Option<String> = row.get(1)?;
-                let parent = parent.ok_or(BenchmarkError::Unavailable)?;
-                if incoming.contains(parent.as_str()) && !verified.contains(&id) {
-                    let (driver, _, detached) = imported_driver_row(db, &id, &mut remaining)?
-                        .ok_or(BenchmarkError::ConflictingHistory)?;
-                    verify_imported_parent(
-                        db,
-                        &driver,
-                        detached.as_deref(),
-                        &mut suites,
-                        &mut remaining,
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-fn imported_suite_row(
-    db: &Connection,
-    id: &str,
-    remaining: &mut usize,
-) -> Result<Option<(BenchmarkSuiteManifest, Vec<u8>)>, BenchmarkError> {
-    let row: Option<(Option<Vec<u8>>, bool)> = db.query_row(
-        "SELECT CASE WHEN length(payload)<=?2 THEN payload END,source_suite_id IS NULL FROM benchmark_suites WHERE suite_id=?1",
-        params![id, MAX_SUITE_BYTES.min(*remaining)],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).optional()?;
-    row.map(|(bytes, unlinked)| {
-        let bytes = bytes.ok_or(BenchmarkError::Invalid)?;
-        *remaining -= bytes.len();
-        let suite: BenchmarkSuiteManifest =
-            serde_json::from_slice(&bytes).map_err(|_| BenchmarkError::Unavailable)?;
-        if !unlinked || !suite.historical || suite.suite_id != id {
-            return Err(BenchmarkError::Unavailable);
-        }
-        validate_suite(&suite)?;
-        Ok((suite, bytes))
-    })
-    .transpose()
-}
-
-fn imported_driver_row(
-    db: &Connection,
-    id: &str,
-    remaining: &mut usize,
-) -> Result<Option<(BenchmarkSuiteDriverStatus, Vec<u8>, Option<String>)>, BenchmarkError> {
-    let row: Option<(Option<Vec<u8>>, bool, Option<String>)> = db.query_row(
-        "SELECT CASE WHEN length(payload)<=?3 AND length(payload)+coalesce(length(CAST(detached_source AS BLOB)),0)<=?2 AND coalesce(length(CAST(detached_source AS BLOB)),0)<=64 THEN payload END,request IS NULL AND source_driver_id IS NULL,CASE WHEN length(CAST(detached_source AS BLOB))<=64 THEN detached_source END FROM benchmark_drivers WHERE driver_id=?1",
-        params![id, *remaining, MAX_DRIVER_BYTES],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    ).optional()?;
-    row.map(|(bytes, unlinked, detached)| {
-        let bytes = bytes.ok_or(BenchmarkError::Invalid)?;
-        *remaining = remaining
-            .checked_sub(bytes.len() + detached.as_ref().map_or(0, String::len))
-            .ok_or(BenchmarkError::Invalid)?;
-        let driver = decode_driver(id, &bytes, None)?;
-        if !unlinked || !driver.historical {
-            return Err(BenchmarkError::Unavailable);
-        }
-        validate_detached_driver(&driver, detached.as_deref())?;
-        Ok((driver, bytes, detached))
-    })
-    .transpose()
-}
-
-fn verify_imported_parent(
-    db: &Connection,
-    driver: &BenchmarkSuiteDriverStatus,
-    detached: Option<&str>,
-    suites: &mut BTreeMap<String, Option<(String, String)>>,
-    remaining: &mut usize,
-) -> Result<(), BenchmarkError> {
-    if !suites.contains_key(&driver.suite_id) {
-        if detached.is_none() {
-            return Err(BenchmarkError::ConflictingHistory);
-        }
-        let parent = imported_suite_row(db, &driver.suite_id, remaining)?
-            .map(|(suite, _)| (suite.mode, suite.instance_id));
-        suites.insert(driver.suite_id.clone(), parent);
-    }
-    match &suites[&driver.suite_id] {
-        Some((mode, instance))
-            if mode == &driver.mode
-                && archived_instance_source(instance)
-                    .is_none_or(|source| detached.is_none_or(|expected| source == expected)) =>
-        {
-            Ok(())
-        }
-        None if detached.is_some() => Ok(()),
-        _ => Err(BenchmarkError::ConflictingHistory),
-    }
-}
-
-fn validate_detached_driver(
-    driver: &BenchmarkSuiteDriverStatus,
-    source: Option<&str>,
-) -> Result<(), BenchmarkError> {
-    if source.is_some_and(|source| {
-        !lower_hex(source, 64)
-            || !driver.historical
-            || driver.error.as_deref() == Some("driver automatic resume queued after restart")
-    }) {
-        return Err(BenchmarkError::Unavailable);
-    }
-    Ok(())
-}
-
-impl ArchivedBenchmarkCompletionProof {
-    pub(crate) fn count(&self) -> usize {
-        self.suite_ids.len() + self.driver_ids.len()
-    }
-
-    fn validate(&self, source: &str) -> Result<(), BenchmarkError> {
-        if !lower_hex(source, 64)
-            || self.source_id != source
-            || !lower_hex(&self.digest, 64)
-            || self.count() > MAX_IMPORT_RECORDS
-            || self
-                .suite_ids
-                .iter()
-                .any(|id| !imported_id(id, "legacy-suite-"))
-            || self
-                .driver_ids
-                .iter()
-                .any(|id| !imported_id(id, "legacy-driver-"))
-            || self.suite_ids.windows(2).any(|ids| ids[0] >= ids[1])
-            || self.driver_ids.windows(2).any(|ids| ids[0] >= ids[1])
-            || self
-                .detached_driver_indices
-                .iter()
-                .any(|index| *index >= self.driver_ids.len())
-            || self
-                .detached_driver_indices
-                .windows(2)
-                .any(|indices| indices[0] >= indices[1])
-            || serde_json::to_vec(self)
-                .map_err(|_| BenchmarkError::Invalid)?
-                .len()
-                > MAX_ARCHIVED_BENCHMARK_PROOF_BYTES
-        {
-            return Err(BenchmarkError::Invalid);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn verify_in(&self, db: &Connection, source: &str) -> Result<(), BenchmarkError> {
-        self.validate(source)?;
-        verify_driver_capacity(db)?;
-        let mut digest = archived_completion_hash(
-            source,
-            &self.suite_ids,
-            &self.driver_ids,
-            &self.detached_driver_indices,
-        );
-        let mut remaining = MAX_IMPORT_BYTES;
-        let mut suites = BTreeMap::new();
-        let mut sessions = BTreeSet::new();
-        for id in &self.suite_ids {
-            let (suite, bytes) = imported_suite_row(db, id, &mut remaining)?
-                .ok_or(BenchmarkError::ConflictingHistory)?;
-            if archived_instance_source(&suite.instance_id) != Some(source)
-                || suite
-                    .runs
-                    .iter()
-                    .filter_map(|run| run.session_id.as_ref())
-                    .any(|id| !sessions.insert(id.clone()))
-            {
-                return Err(BenchmarkError::Invalid);
-            }
-            suites.insert(suite.suite_id, Some((suite.mode, suite.instance_id)));
-            digest.update((bytes.len() as u64).to_be_bytes());
-            digest.update(bytes);
-        }
-        for (index, id) in self.driver_ids.iter().enumerate() {
-            let (driver, bytes, detached) = imported_driver_row(db, id, &mut remaining)?
-                .ok_or(BenchmarkError::ConflictingHistory)?;
-            let expected = self
-                .detached_driver_indices
-                .binary_search(&index)
-                .is_ok()
-                .then_some(source);
-            if detached.as_deref() != expected
-                || (expected.is_none() && self.suite_ids.binary_search(&driver.suite_id).is_err())
-            {
-                return Err(BenchmarkError::ConflictingHistory);
-            }
-            verify_imported_parent(db, &driver, expected, &mut suites, &mut remaining)?;
-            digest.update((bytes.len() as u64).to_be_bytes());
-            digest.update(bytes);
-        }
-        if hex::encode(digest.finalize()) != self.digest {
-            return Err(BenchmarkError::ConflictingHistory);
-        }
-        Ok(())
-    }
-}
-
-fn archived_completion_hash(
-    source: &str,
-    suites: &[String],
-    drivers: &[String],
-    detached: &[usize],
-) -> Sha256 {
-    let mut hash = Sha256::new();
-    hash.update(if detached.is_empty() {
-        b"axial.legacy.benchmarks.completion.v1\0"
-    } else {
-        b"axial.legacy.benchmarks.completion.v2\0"
-    });
-    hash.update(source.as_bytes());
-    for ids in [suites, drivers] {
-        hash.update((ids.len() as u64).to_be_bytes());
-        for id in ids {
-            hash.update((id.len() as u64).to_be_bytes());
-            hash.update(id.as_bytes());
-        }
-    }
-    if !detached.is_empty() {
-        hash.update((detached.len() as u64).to_be_bytes());
-        for index in detached {
-            hash.update((*index as u64).to_be_bytes());
-        }
-    }
-    hash
-}
-
-fn lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn archived_instance_source(value: &str) -> Option<&str> {
-    let (source, legacy) = value.strip_prefix("archived-")?.split_once('-')?;
-    (lower_hex(source, 64) && lower_hex(legacy, 16)).then_some(source)
 }
 
 fn verify_driver_capacity(db: &Connection) -> Result<(), BenchmarkError> {
@@ -1438,7 +830,7 @@ fn verify_driver_capacity(db: &Connection) -> Result<(), BenchmarkError> {
         |row| row.get(0),
     )?;
     if count > MAX_STORED_DRIVERS {
-        return Err(BenchmarkError::ConflictingHistory);
+        return Err(BenchmarkError::Unavailable);
     }
     Ok(())
 }
@@ -1447,33 +839,22 @@ fn stored_suite(
     connection: &Connection,
     id: &str,
 ) -> Result<Option<BenchmarkSuiteManifest>, BenchmarkError> {
-    read_suite(connection, id)?
-        .map(|(suite, source)| {
-            validate_suite_in(connection, &suite, source.as_deref())?;
-            Ok(suite)
-        })
-        .transpose()
-}
-
-fn read_suite(
-    connection: &Connection,
-    id: &str,
-) -> Result<Option<(BenchmarkSuiteManifest, Option<String>)>, BenchmarkError> {
-    let record: Option<(Vec<u8>, Option<String>)> = connection
+    let record: Option<Vec<u8>> = connection
         .query_row(
-            "SELECT payload,source_suite_id FROM benchmark_suites WHERE suite_id=?1",
+            "SELECT payload FROM benchmark_suites WHERE suite_id=?1",
             [id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .optional()?;
     record
-        .map(|(bytes, source)| {
+        .map(|bytes| {
             let suite: BenchmarkSuiteManifest =
                 serde_json::from_slice(&bytes).map_err(|_| BenchmarkError::Unavailable)?;
             if suite.suite_id != id {
                 return Err(BenchmarkError::Unavailable);
             }
-            Ok((suite, source))
+            validate_suite(&suite)?;
+            Ok(suite)
         })
         .transpose()
 }
@@ -1496,280 +877,42 @@ fn current_plan_matches(suite: &BenchmarkSuiteManifest) -> bool {
     })
 }
 
-fn validate_source_suite(
-    connection: &Connection,
-    source: &BenchmarkSuiteManifest,
-) -> Result<(), BenchmarkError> {
-    if !source.historical
-        || archived_instance_source(&source.instance_id).is_some()
-        || !current_plan_matches(source)
-    {
-        return Err(BenchmarkError::Invalid);
-    }
-    validate_historical_suite(source)?;
-    for run in &source.runs {
-        let Some(session) = run.session_id.as_deref() else {
-            continue;
-        };
-        let proof = LaunchReportStore::get_in(connection, session)
-            .map_err(|_| BenchmarkError::Unavailable)?
-            .ok_or(BenchmarkError::Unavailable)?;
-        if proof.instance_id != source.instance_id
-            || proof.scenario.benchmark_id.as_deref() != Some(run.benchmark_id.as_str())
-            || proof.scenario.benchmark_profile.as_deref() != Some(run.profile.as_str())
-            || proof.scenario.benchmark_run_type.as_deref() != Some(run.run_type.as_str())
-            || proof.scenario.benchmark_mode.as_deref() != Some(source.mode.as_str())
-            || historical_time(&proof.launched_at)?
-                != historical_time(
-                    run.launched_at
-                        .as_deref()
-                        .ok_or(BenchmarkError::Unavailable)?,
-                )?
-            || !proof.matches_imported_terminal_state(&run.state)
-        {
-            return Err(BenchmarkError::Unavailable);
-        }
-    }
-    Ok(())
-}
-
-fn validate_suite_in(
-    connection: &Connection,
-    suite: &BenchmarkSuiteManifest,
-    source_id: Option<&str>,
-) -> Result<(), BenchmarkError> {
-    let Some(source_id) = source_id else {
-        return validate_suite(suite);
-    };
-    let (source, parent) = read_suite(connection, source_id)?.ok_or(BenchmarkError::Unavailable)?;
-    if suite.historical
-        || parent.is_some()
-        || suite.instance_id != source.instance_id
-        || suite.mode != source.mode
-    {
-        return Err(BenchmarkError::Unavailable);
-    }
-    validate_source_suite(connection, &source)?;
-    validate_live_suite(suite, Some(&source))
-}
-
 fn stored_driver(
     connection: &Connection,
     id: &str,
 ) -> Result<Option<BenchmarkSuiteDriverStatus>, BenchmarkError> {
-    let record: Option<(Vec<u8>, Option<Vec<u8>>, Option<String>, Option<String>)> = connection
+    let record: Option<Vec<u8>> = connection
         .query_row(
-            "SELECT payload,request,source_driver_id,detached_source FROM benchmark_drivers WHERE driver_id=?1",
+            "SELECT payload FROM benchmark_drivers WHERE driver_id=?1",
             [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    record
-        .map(|(bytes, request, source, detached)| {
-            let driver = decode_driver(id, &bytes, request.as_deref())?;
-            validate_driver_link(
-                connection,
-                &driver,
-                request.as_deref(),
-                source.as_deref(),
-                detached.as_deref(),
-                &mut BTreeMap::new(),
-            )?;
-            Ok(driver)
-        })
-        .transpose()
-}
-
-fn validate_driver_link(
-    connection: &Connection,
-    driver: &BenchmarkSuiteDriverStatus,
-    request: Option<&[u8]>,
-    source_id: Option<&str>,
-    detached: Option<&str>,
-    suites: &mut BTreeMap<String, Option<(BenchmarkSuiteManifest, Option<String>)>>,
-) -> Result<(), BenchmarkError> {
-    validate_detached_driver(driver, detached)?;
-    if driver.historical {
-        if request.is_some() || source_id.is_some() {
-            return Err(BenchmarkError::Unavailable);
-        }
-        if !suites.contains_key(&driver.suite_id) {
-            let record = read_suite(connection, &driver.suite_id)?;
-            if let Some((suite, source)) = &record {
-                validate_suite_in(connection, suite, source.as_deref())?;
-            }
-            suites.insert(driver.suite_id.clone(), record);
-        }
-        return match &suites[&driver.suite_id] {
-            None if detached.is_some() => Ok(()),
-            Some((suite, parent))
-                if suite.historical
-                    && parent.is_none()
-                    && suite.mode == driver.mode
-                    && archived_instance_source(&suite.instance_id).is_none_or(|source| {
-                        detached.is_none_or(|expected| source == expected)
-                    }) =>
-            {
-                Ok(())
-            }
-            _ => Err(BenchmarkError::Unavailable),
-        };
-    }
-    let Some(source_id) = source_id else {
-        return Ok(());
-    };
-    let (bytes, source_request, parent, source_detached): (Vec<u8>, Option<Vec<u8>>, Option<String>, Option<String>) = connection
-        .query_row(
-            "SELECT payload,request,source_driver_id,detached_source FROM benchmark_drivers WHERE driver_id=?1",
-            [source_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?
-        .ok_or(BenchmarkError::Unavailable)?;
-    let source = decode_driver(source_id, &bytes, source_request.as_deref())?;
-    if !source.historical || parent.is_some() {
-        return Err(BenchmarkError::Unavailable);
-    }
-    validate_driver_link(
-        connection,
-        &source,
-        source_request.as_deref(),
-        None,
-        source_detached.as_deref(),
-        suites,
-    )?;
-    if !suites.contains_key(&driver.suite_id) {
-        let record =
-            read_suite(connection, &driver.suite_id)?.ok_or(BenchmarkError::Unavailable)?;
-        validate_suite_in(connection, &record.0, record.1.as_deref())?;
-        suites.insert(driver.suite_id.clone(), Some(record));
-    }
-    let (suite, source_suite) = suites[&driver.suite_id]
-        .as_ref()
-        .ok_or(BenchmarkError::Unavailable)?;
-    let input: BenchmarkLaunchRequest =
-        serde_json::from_slice(request.ok_or(BenchmarkError::Unavailable)?)
-            .map_err(|_| BenchmarkError::Unavailable)?;
-    if source_suite.as_deref() != Some(source.suite_id.as_str())
-        || source.mode != suite.mode
-        || driver.mode != suite.mode
-        || driver.run_count != suite.runs.len()
-        || driver.interval_ms != source.interval_ms
-        || input.instance_id.as_ref().map(InstanceId::as_str) != Some(suite.instance_id.as_str())
-        || input.suite_id.as_deref() != Some(suite.suite_id.as_str())
-        || input.suite_mode.as_deref() != Some(suite.mode.as_str())
-        || input.interval_ms != Some(source.interval_ms)
-        || input.username.is_some()
-        || input.max_memory_mb.is_some()
-        || input.min_memory_mb.is_some()
-        || input.client_started_at_ms.is_some()
-        || input.profile.is_some()
-        || input.run_type.is_some()
-        || input.benchmark_mode.is_some()
-        || input.run_index.is_some()
-    {
-        return Err(BenchmarkError::Unavailable);
-    }
-    Ok(())
-}
-
-fn resumed_driver_in(
-    connection: &Connection,
-    source_id: &str,
-) -> Result<Option<BenchmarkSuiteDriverStatus>, BenchmarkError> {
-    let id: Option<String> = connection
-        .query_row(
-            "SELECT driver_id FROM benchmark_drivers WHERE source_driver_id=?1",
-            [source_id],
             |row| row.get(0),
         )
         .optional()?;
-    id.map(|id| stored_driver(connection, &id)?.ok_or(BenchmarkError::Unavailable))
-        .transpose()
-}
-
-fn continuation_in(
-    connection: &Connection,
-    id: &str,
-) -> Result<
-    (
-        BenchmarkSuiteDriverStatus,
-        BenchmarkSuiteManifest,
-        Option<BenchmarkSuiteManifest>,
-    ),
-    BenchmarkError,
-> {
-    let driver = stored_driver(connection, id)?.ok_or(BenchmarkError::NotFound)?;
-    if !driver.historical {
-        return Err(BenchmarkError::Invalid);
-    }
-    let (source, parent) =
-        read_suite(connection, &driver.suite_id)?.ok_or(BenchmarkError::NotFound)?;
-    if parent.is_some() || driver.mode != source.mode {
-        return Err(BenchmarkError::Unavailable);
-    }
-    validate_source_suite(connection, &source)?;
-    let successor: Option<String> = connection
-        .query_row(
-            "SELECT suite_id FROM benchmark_suites WHERE source_suite_id=?1",
-            [&source.suite_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let successor = successor
-        .map(|id| stored_suite(connection, &id)?.ok_or(BenchmarkError::Unavailable))
-        .transpose()?;
-    if !successor
-        .as_ref()
-        .unwrap_or(&source)
-        .runs
-        .iter()
-        .any(|run| run.state == "pending")
-    {
-        return Err(BenchmarkError::Complete);
-    }
-    Ok((driver, source, successor))
+    record.map(|bytes| decode_driver(id, &bytes)).transpose()
 }
 
 fn stored_drivers_in(
     connection: &Connection,
 ) -> Result<Vec<BenchmarkSuiteDriverStatus>, BenchmarkError> {
-    let mut query = connection.prepare("SELECT driver_id,payload,request,source_driver_id,detached_source FROM benchmark_drivers ORDER BY rowid DESC LIMIT ?1")?;
+    let mut query = connection
+        .prepare("SELECT driver_id,payload FROM benchmark_drivers ORDER BY rowid DESC LIMIT ?1")?;
     let mut rows = query.query([MAX_STORED_DRIVERS + 1])?;
     let mut drivers = Vec::new();
-    let mut suites = BTreeMap::new();
     while let Some(row) = rows.next()? {
         if drivers.len() == MAX_STORED_DRIVERS {
             return Err(BenchmarkError::Unavailable);
         }
         let id: String = row.get(0)?;
         let bytes: Vec<u8> = row.get(1)?;
-        let request: Option<Vec<u8>> = row.get(2)?;
-        let source: Option<String> = row.get(3)?;
-        let detached: Option<String> = row.get(4)?;
-        let driver = decode_driver(&id, &bytes, request.as_deref())?;
-        validate_driver_link(
-            connection,
-            &driver,
-            request.as_deref(),
-            source.as_deref(),
-            detached.as_deref(),
-            &mut suites,
-        )?;
-        drivers.push(driver);
+        drivers.push(decode_driver(&id, &bytes)?);
     }
     Ok(drivers)
 }
 
-fn decode_driver(
-    id: &str,
-    bytes: &[u8],
-    request: Option<&[u8]>,
-) -> Result<BenchmarkSuiteDriverStatus, BenchmarkError> {
+fn decode_driver(id: &str, bytes: &[u8]) -> Result<BenchmarkSuiteDriverStatus, BenchmarkError> {
     let driver: BenchmarkSuiteDriverStatus =
         serde_json::from_slice(bytes).map_err(|_| BenchmarkError::Unavailable)?;
-    validate_driver(&driver)?;
-    if driver.id != id || (driver.historical && request.is_some()) {
+    if driver.id != id {
         return Err(BenchmarkError::Unavailable);
     }
     Ok(driver)
@@ -1828,7 +971,7 @@ impl BenchmarkService {
         // The existing driver resumes only after tick reconciles each durable
         // session mapping; an uncertain accepted process remains interrupted.
         for mut driver in service.stored_drivers()? {
-            if !driver.historical && matches!(driver.state.as_str(), "running" | "waiting") {
+            if matches!(driver.state.as_str(), "running" | "waiting") {
                 driver.state = "interrupted".into();
                 driver.error = Some(RESTART_INTERRUPTED_ERROR.into());
                 service.save_driver(&driver)?;
@@ -1848,8 +991,7 @@ impl BenchmarkService {
             .stored_drivers()?
             .into_iter()
             .filter(|driver| {
-                !driver.historical
-                    && driver.state == "interrupted"
+                driver.state == "interrupted"
                     && driver.error.as_deref() == Some(RESTART_INTERRUPTED_ERROR)
             })
             .collect::<Vec<_>>();
@@ -1895,10 +1037,10 @@ impl BenchmarkService {
             if stored_driver(tx, &expected.id)?.as_ref() != Some(expected) {
                 return Err(BenchmarkError::Busy);
             }
-            let (request, source, detached): (Option<Vec<u8>>, Option<String>, Option<String>) = tx.query_row(
-                "SELECT request,source_driver_id,detached_source FROM benchmark_drivers WHERE driver_id=?1",
+            let request: Option<Vec<u8>> = tx.query_row(
+                "SELECT request FROM benchmark_drivers WHERE driver_id=?1",
                 [&expected.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| row.get(0),
             )?;
             if tx.execute(
                 "UPDATE benchmark_drivers SET payload=?1 WHERE driver_id=?2",
@@ -1907,12 +1049,12 @@ impl BenchmarkService {
             {
                 return Err(BenchmarkError::Unavailable);
             }
-            let saved: (Vec<u8>, Option<Vec<u8>>, Option<String>, Option<String>) = tx.query_row(
-                "SELECT payload,request,source_driver_id,detached_source FROM benchmark_drivers WHERE driver_id=?1",
+            let saved: (Vec<u8>, Option<Vec<u8>>) = tx.query_row(
+                "SELECT payload,request FROM benchmark_drivers WHERE driver_id=?1",
                 [&expected.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            if saved != (payload, request, source, detached)
+            if saved != (payload, request)
                 || stored_driver(tx, &expected.id)?.as_ref() != Some(&updated)
             {
                 return Err(BenchmarkError::Unavailable);
@@ -1938,16 +1080,6 @@ impl BenchmarkService {
                     proofs.push(proof);
                 }
             }
-        }
-        if suite.historical && archived_instance_source(&suite.instance_id).is_some() {
-            let managed =
-                super::qualification::unavailable_managed_install_evidence(&suite, &proofs);
-            return Ok(super::qualification::qualification_payload(
-                &suite,
-                &proofs,
-                Some(&managed),
-                true,
-            ));
         }
         let instance_id = suite
             .instance_id
@@ -2050,7 +1182,6 @@ impl BenchmarkService {
             .transpose()?
             .flatten()
         {
-            require_mutable(existing.historical)?;
             if input
                 .instance_id
                 .as_ref()
@@ -2073,11 +1204,7 @@ impl BenchmarkService {
                 bounded_descriptor_token(&format!("{}:{}", request.instance_id, mode), "id")
             )
         });
-        if id.starts_with("legacy-") {
-            return Err(BenchmarkError::Invalid);
-        }
         if let Some(existing) = self.suite(&id)? {
-            require_mutable(existing.historical)?;
             if existing.instance_id != request.instance_id.as_str() || existing.mode != mode {
                 return Err(BenchmarkError::Invalid);
             }
@@ -2092,7 +1219,6 @@ impl BenchmarkService {
             mode: mode.into(),
             created_at: now.clone(),
             updated_at: now,
-            historical: false,
             runs: plan
                 .iter()
                 .copied()
@@ -2138,14 +1264,8 @@ impl BenchmarkService {
         let mut suite = self
             .suite(&suite.suite_id)?
             .ok_or(BenchmarkError::NotFound)?;
-        require_mutable(suite.historical)?;
         let mut preparing_index = None;
         for index in 0..suite.runs.len() {
-            // A linked terminal row was verified against immutable imported
-            // evidence by `suite`; it has no live intent to reconcile or replace.
-            if suite.runs[index].launch_intent.is_none() {
-                continue;
-            }
             if let Some(id) = suite.runs[index].session_id.clone() {
                 if let Some(session) = self.sessions.snapshot_by_session_id(&id) {
                     if session.phase != SessionPhase::Exited {
@@ -2209,7 +1329,7 @@ impl BenchmarkService {
                 suite.runs[index].state.as_str(),
                 "launching" | "running" | "interrupted"
             ) {
-                // Old manifests may have crashed before mapping their session.
+                // A benchmark may have crashed before mapping its session.
                 // Absence of a mapping cannot prove that no process was started.
                 suite.runs[index].state = "interrupted".into();
                 self.save_suite(&suite)?;
@@ -2384,7 +1504,6 @@ impl BenchmarkService {
             error: None,
             created_at: now.clone(),
             updated_at: now,
-            historical: false,
         };
         let mut captured = input.clone();
         captured.instance_id = Some(
@@ -2415,7 +1534,6 @@ impl BenchmarkService {
 
     pub fn stop_driver(&self, id: &str) -> Result<BenchmarkSuiteDriverStatus, BenchmarkError> {
         let mut driver = self.driver(id)?;
-        require_mutable(driver.historical)?;
         if let Some(cancel) = self
             .active_drivers
             .lock()
@@ -2431,9 +1549,6 @@ impl BenchmarkService {
 
     pub fn resume_driver(&self, id: &str) -> Result<BenchmarkSuiteDriverStatus, BenchmarkError> {
         let mut driver = self.driver(id)?;
-        if driver.historical {
-            return self.resume_historical_driver(driver);
-        }
         let lease = self.admit_suite(&driver.suite_id)?;
         if matches!(driver.state.as_str(), "running" | "waiting" | "complete") {
             return Err(BenchmarkError::Busy);
@@ -2444,7 +1559,6 @@ impl BenchmarkService {
         let suite = self
             .suite(&driver.suite_id)?
             .ok_or(BenchmarkError::NotFound)?;
-        require_mutable(suite.historical)?;
         let input = self.storage.read(|connection| {
             stored_resume_request(connection, &driver, &suite)?.ok_or(BenchmarkError::Unavailable)
         })?;
@@ -2456,187 +1570,48 @@ impl BenchmarkService {
         Ok(driver)
     }
 
-    /// Reconcile an uncertain historical Resume response without scheduling work.
-    pub fn resumed_driver(
-        &self,
-        source_id: &str,
-    ) -> Result<Option<BenchmarkSuiteDriverStatus>, BenchmarkError> {
-        let source = self.driver(source_id)?;
-        if !source.historical {
-            return Ok(None);
-        }
-        self.storage
-            .read(|connection| resumed_driver_in(connection, source_id))
-    }
-
     pub fn can_resume_driver(&self, id: &str) -> Result<bool, BenchmarkError> {
         let driver = self.driver(id)?;
         Ok(self
             .resume_actions(&[driver])?
             .get(id)
-            .is_some_and(|action| action.0))
+            .copied()
+            .unwrap_or(false))
     }
 
-    /// One bounded projection shares driver activity, source links and suite
-    /// proofs. These hints never replace exact command admission.
+    /// One bounded projection shares driver activity. These hints never
+    /// replace exact command admission.
     pub fn resume_actions(
         &self,
         drivers: &[BenchmarkSuiteDriverStatus],
-    ) -> Result<BTreeMap<String, (bool, Option<String>)>, BenchmarkError> {
+    ) -> Result<BTreeMap<String, bool>, BenchmarkError> {
         if drivers.len() > 64 {
             return Err(BenchmarkError::Invalid);
         }
-        let candidates = self.storage.read(|connection| {
+        self.storage.read(|connection| {
             let current = stored_drivers_in(connection)?;
-            let active = current.iter().filter(|driver| matches!(driver.state.as_str(), "running" | "waiting"))
-                .map(|driver| driver.suite_id.as_str()).collect::<BTreeSet<_>>();
-            let by_id = current.iter().map(|driver| (driver.id.as_str(), driver)).collect::<BTreeMap<_, _>>();
-            let mut links = connection.prepare("SELECT source_driver_id,driver_id FROM benchmark_drivers WHERE source_driver_id IS NOT NULL")?;
-            let links = links.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
-                .collect::<Result<BTreeMap<_, _>, _>>()?;
-            let mut suites: BTreeMap<String, Option<(String, String, InstanceId)>> = BTreeMap::new();
-            let mut actions = BTreeMap::new();
-            for requested in drivers {
-                let driver = by_id.get(requested.id.as_str()).ok_or(BenchmarkError::NotFound)?;
-                let (available, successor, instance) = if !driver.historical {
-                    (matches!(driver.state.as_str(), "stopped" | "failed" | "interrupted") && !active.contains(driver.suite_id.as_str()), None, None)
-                } else if let Some(successor) = links.get(&driver.id) {
-                    (false, Some(successor.clone()), None)
-                } else {
-                    if !suites.contains_key(&driver.suite_id) {
-                        let candidate = match continuation_in(connection, &driver.id) {
-                            Ok((_, source, successor)) => {
-                                let suite = successor.as_ref().unwrap_or(&source);
-                                Some((suite.mode.clone(), suite.suite_id.clone(), suite.instance_id.parse().map_err(|_| BenchmarkError::Unavailable)?))
-                            }
-                            Err(BenchmarkError::Storage(error)) => return Err(BenchmarkError::Storage(error)),
-                            Err(_) => None,
-                        };
-                        suites.insert(driver.suite_id.clone(), candidate);
-                    }
-                    match &suites[&driver.suite_id] {
-                        Some((mode, suite_id, instance)) => (driver.mode == *mode && !active.contains(suite_id.as_str()), None, Some(instance.clone())),
-                        None => (false, None, None),
-                    }
-                };
-                actions.insert(driver.id.clone(), (available, successor, instance));
-            }
-            Ok::<_, BenchmarkError>(actions)
-        })?;
-        let mut live = BTreeMap::new();
-        Ok(candidates
-            .into_iter()
-            .map(|(id, (mut available, successor, instance))| {
-                if let Some(instance) = instance {
-                    available &= *live
-                        .entry(instance.clone())
-                        .or_insert_with(|| self.registry.get_live(&instance).is_ok());
-                }
-                (id, (available, successor))
-            })
-            .collect())
-    }
-
-    fn resume_historical_driver(
-        &self,
-        source_driver: BenchmarkSuiteDriverStatus,
-    ) -> Result<BenchmarkSuiteDriverStatus, BenchmarkError> {
-        // Explicit Resume accepts separate destination work without consuming source history.
-        let _source_lease = self.admit_suite(&source_driver.suite_id)?;
-        if let Some(existing) = self
-            .storage
-            .read(|connection| resumed_driver_in(connection, &source_driver.id))?
-        {
-            return Ok(existing);
-        }
-        let (source_driver, source, existing) = self
-            .storage
-            .read(|connection| continuation_in(connection, &source_driver.id))?;
-        let suite = existing.clone().unwrap_or_else(|| {
-            let mut suite = source.clone();
-            suite.suite_id = format!("suite-{}", uuid::Uuid::new_v4().simple());
-            suite.historical = false;
-            suite.created_at = now();
-            suite.updated_at = suite.created_at.clone();
-            for run in &mut suite.runs {
-                if run.state == "pending" {
-                    run.launch_intent = Some(uuid::Uuid::new_v4().to_string());
-                }
-            }
-            suite
-        });
-        let lease = self.admit_suite(&suite.suite_id)?;
-        if self.suite_driver_running(&suite.suite_id)? {
-            return Err(BenchmarkError::Busy);
-        }
-        let request = BenchmarkLaunchRequest {
-            instance_id: Some(
-                suite
-                    .instance_id
-                    .parse()
-                    .map_err(|_| BenchmarkError::Unavailable)?,
-            ),
-            username: None,
-            max_memory_mb: None,
-            min_memory_mb: None,
-            client_started_at_ms: None,
-            profile: None,
-            run_type: None,
-            benchmark_mode: None,
-            suite_mode: Some(suite.mode.clone()),
-            suite_id: Some(suite.suite_id.clone()),
-            run_index: None,
-            interval_ms: Some(source_driver.interval_ms),
-        };
-        self.launch_request(&request)?;
-        let timestamp = now();
-        let driver = BenchmarkSuiteDriverStatus {
-            id: format!("benchmark-suite-driver-{}", uuid::Uuid::new_v4().simple()),
-            suite_id: suite.suite_id.clone(),
-            mode: suite.mode.clone(),
-            state: "running".into(),
-            interval_ms: source_driver.interval_ms,
-            run_count: suite.runs.len(),
-            launched_run_count: suite
-                .runs
+            let active = current
                 .iter()
-                .filter(|run| run.session_id.is_some())
-                .count(),
-            pending_run_index: suite.runs.iter().position(|run| run.state == "pending"),
-            active_session_id: None,
-            last_run_index: None,
-            last_session_id: None,
-            error: None,
-            created_at: timestamp.clone(),
-            updated_at: timestamp,
-            historical: false,
-        };
-        let accepted = self.storage.transaction(|tx| {
-            if let Some(accepted) = resumed_driver_in(tx, &source_driver.id)? { return Ok((accepted, false)); }
-            let (current_driver, current_source, current_suite) = continuation_in(tx, &source_driver.id)?;
-            if current_driver != source_driver || current_source != source || current_suite != existing {
-                return Err(BenchmarkError::Busy);
-            }
-            if existing.is_none() {
-                let payload = serde_json::to_vec(&suite).map_err(|_| BenchmarkError::Unavailable)?;
-                if tx.execute("INSERT INTO benchmark_suites(suite_id,payload,source_suite_id) VALUES(?1,?2,?3)", params![suite.suite_id, payload, source.suite_id])? != 1 {
-                    return Err(BenchmarkError::Unavailable);
-                }
-            }
-            let payload = serde_json::to_vec(&driver).map_err(|_| BenchmarkError::Unavailable)?;
-            let captured = serde_json::to_vec(&request).map_err(|_| BenchmarkError::Unavailable)?;
-            if tx.execute("INSERT INTO benchmark_drivers(driver_id,payload,request,source_driver_id) VALUES(?1,?2,?3,?4)", params![driver.id, payload, captured, source_driver.id])? != 1 {
-                return Err(BenchmarkError::Unavailable);
-            }
-            verify_driver_capacity(tx)?;
-            if stored_driver(tx, &driver.id)?.as_ref() != Some(&driver) { return Err(BenchmarkError::Unavailable); }
-            Ok((driver.clone(), true))
-        })?;
-        drop(lease);
-        if accepted.1 {
-            self.run_driver(accepted.0.clone(), request)?;
-        }
-        Ok(accepted.0)
+                .filter(|driver| matches!(driver.state.as_str(), "running" | "waiting"))
+                .map(|driver| driver.suite_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let by_id = current
+                .iter()
+                .map(|driver| (driver.id.as_str(), driver))
+                .collect::<BTreeMap<_, _>>();
+            drivers
+                .iter()
+                .map(|requested| {
+                    let driver = by_id
+                        .get(requested.id.as_str())
+                        .ok_or(BenchmarkError::NotFound)?;
+                    let available =
+                        matches!(driver.state.as_str(), "stopped" | "failed" | "interrupted")
+                            && !active.contains(driver.suite_id.as_str());
+                    Ok((driver.id.clone(), available))
+                })
+                .collect()
+        })
     }
 
     fn run_driver(
@@ -2644,7 +1619,6 @@ impl BenchmarkService {
         driver: BenchmarkSuiteDriverStatus,
         mut input: BenchmarkLaunchRequest,
     ) -> Result<(), BenchmarkError> {
-        require_mutable(driver.historical)?;
         input.suite_id = Some(driver.suite_id.clone());
         input.suite_mode = Some(driver.mode.clone());
         input.run_index = None;
@@ -2723,13 +1697,11 @@ impl BenchmarkService {
     }
 
     fn save_suite(&self, suite: &BenchmarkSuiteManifest) -> Result<(), BenchmarkError> {
-        require_mutable(suite.historical)?;
         let mut suite = suite.clone();
         suite.updated_at = now();
         let bytes = serde_json::to_vec(&suite).map_err(|_| BenchmarkError::Unavailable)?;
         self.storage.transaction(|tx| {
-            let (_, source) = read_suite(tx, &suite.suite_id)?.ok_or(BenchmarkError::NotFound)?;
-            validate_suite_in(tx, &suite, source.as_deref())?;
+            validate_suite(&suite)?;
             if tx.execute(
                 "UPDATE benchmark_suites SET payload=?1 WHERE suite_id=?2",
                 params![bytes, suite.suite_id],
@@ -2741,28 +1713,10 @@ impl BenchmarkService {
         })
     }
     fn save_driver(&self, driver: &BenchmarkSuiteDriverStatus) -> Result<(), BenchmarkError> {
-        require_mutable(driver.historical)?;
-        validate_driver(driver)?;
         let mut driver = driver.clone();
         driver.updated_at = now();
         let bytes = serde_json::to_vec(&driver).map_err(|_| BenchmarkError::Unavailable)?;
         self.storage.transaction(|tx| {
-            let (request, source, detached): (Option<Vec<u8>>, Option<String>, Option<String>) = tx
-                .query_row(
-                    "SELECT request,source_driver_id,detached_source FROM benchmark_drivers WHERE driver_id=?1",
-                    [&driver.id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?
-                .ok_or(BenchmarkError::NotFound)?;
-            validate_driver_link(
-                tx,
-                &driver,
-                request.as_deref(),
-                source.as_deref(),
-                detached.as_deref(),
-                &mut BTreeMap::new(),
-            )?;
             if tx.execute(
                 "UPDATE benchmark_drivers SET payload=?1 WHERE driver_id=?2",
                 params![bytes, driver.id],
@@ -2798,20 +1752,9 @@ fn validate_descriptor(profile: &str, run_type: &str, mode: &str) -> Result<(), 
     }
 }
 fn validate_suite(suite: &BenchmarkSuiteManifest) -> Result<(), BenchmarkError> {
-    if suite.historical {
-        return validate_historical_suite(suite);
-    }
-    validate_live_suite(suite, None)
-}
-
-fn validate_live_suite(
-    suite: &BenchmarkSuiteManifest,
-    source: Option<&BenchmarkSuiteManifest>,
-) -> Result<(), BenchmarkError> {
     if suite.schema != "axial.launch.benchmark.suite"
         || suite.schema_version != 2
         || !valid_token(&suite.suite_id)
-        || suite.suite_id.starts_with("legacy-")
         || suite.instance_id.parse::<InstanceId>().is_err()
         || !current_plan_matches(suite)
         || chrono::DateTime::parse_from_rfc3339(&suite.created_at).is_err()
@@ -2819,16 +1762,7 @@ fn validate_live_suite(
     {
         return Err(BenchmarkError::Unavailable);
     }
-    for (index, run) in suite.runs.iter().enumerate() {
-        if let Some(inherited) = source
-            .and_then(|source| source.runs.get(index))
-            .filter(|run| run.state != "pending")
-        {
-            if run != inherited {
-                return Err(BenchmarkError::Unavailable);
-            }
-            continue;
-        }
+    for run in &suite.runs {
         if run.launch_intent.as_deref().is_none_or(|id| {
             !uuid::Uuid::parse_str(id).is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == id)
         }) || !matches!(
@@ -2849,155 +1783,12 @@ fn validate_live_suite(
     Ok(())
 }
 
-fn imported_id(id: &str, prefix: &str) -> bool {
-    id.strip_prefix(prefix).is_some_and(|suffix| {
-        suffix.len() == 64
-            && suffix
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-    })
-}
-
-fn historical_token(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 96
-        && value
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b"-_.+".contains(&c))
-        && crate::launch::logs::Redactor::new(Vec::new()).redact_line(value) == value
-}
-
-fn historical_time(value: &str) -> Result<chrono::DateTime<chrono::FixedOffset>, BenchmarkError> {
-    if value.len() > 40 {
-        return Err(BenchmarkError::Unavailable);
-    }
-    chrono::DateTime::parse_from_rfc3339(value).map_err(|_| BenchmarkError::Unavailable)
-}
-
-fn validate_historical_suite(suite: &BenchmarkSuiteManifest) -> Result<(), BenchmarkError> {
-    let updated_at = historical_time(&suite.updated_at)?;
-    if suite.schema != "axial.launch.benchmark.suite"
-        || suite.schema_version != 2
-        || !imported_id(&suite.suite_id, "legacy-suite-")
-        || (suite.instance_id.parse::<InstanceId>().is_err()
-            && archived_instance_source(&suite.instance_id).is_none())
-        || !matches!(
-            suite.mode.as_str(),
-            "development" | "qualification" | "release_validation"
-        )
-        || historical_time(&suite.created_at)? > updated_at
-        || suite.runs.is_empty()
-        || suite.runs.len() > 64
-    {
-        return Err(BenchmarkError::Unavailable);
-    }
-    let mut indices = BTreeSet::new();
-    let mut sessions = BTreeSet::new();
-    for run in &suite.runs {
-        if run.run_index >= 64
-            || !indices.insert(run.run_index)
-            || !historical_token(&run.profile)
-            || !historical_token(&run.run_type)
-            || (!run.target_id.is_empty() && !historical_token(&run.target_id))
-            || !run
-                .benchmark_id
-                .strip_prefix("benchmark-")
-                .is_some_and(|suffix| {
-                    suffix.len() == 16
-                        && suffix
-                            .bytes()
-                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-                })
-            || run.launch_intent.is_some()
-        {
-            return Err(BenchmarkError::Unavailable);
-        }
-        match (
-            run.state.as_str(),
-            run.session_id.as_deref(),
-            run.launched_at.as_deref(),
-        ) {
-            ("pending", None, None) => {}
-            ("failed" | "stopped" | "exited" | "completed", Some(session), Some(launched)) => {
-                if !imported_id(session, "legacy-")
-                    || !sessions.insert(session)
-                    || historical_time(launched)? > updated_at
-                {
-                    return Err(BenchmarkError::Unavailable);
-                }
-            }
-            _ => return Err(BenchmarkError::Unavailable),
-        }
-    }
-    Ok(())
-}
-
-fn validate_driver(driver: &BenchmarkSuiteDriverStatus) -> Result<(), BenchmarkError> {
-    if !driver.historical {
-        return if driver.id.starts_with("legacy-") || driver.suite_id.starts_with("legacy-") {
-            Err(BenchmarkError::Unavailable)
-        } else {
-            Ok(())
-        };
-    }
-    if !imported_id(&driver.id, "legacy-driver-")
-        || !imported_id(&driver.suite_id, "legacy-suite-")
-        || !matches!(
-            driver.mode.as_str(),
-            "development" | "qualification" | "release_validation"
-        )
-        || !matches!(
-            driver.state.as_str(),
-            "complete" | "failed" | "stopped" | "interrupted"
-        )
-        || !(5_000..=3_600_000).contains(&driver.interval_ms)
-        || driver.run_count == 0
-        || driver.run_count > 64
-        || driver.launched_run_count > driver.run_count
-        || driver
-            .pending_run_index
-            .is_some_and(|index| index >= driver.run_count)
-        || driver
-            .last_run_index
-            .is_some_and(|index| index >= driver.run_count)
-        || driver.active_session_id.is_some()
-        || (driver.state == "complete" && driver.pending_run_index.is_some())
-        || driver
-            .last_session_id
-            .as_deref()
-            .is_some_and(|id| !imported_id(id, "legacy-") || driver.last_run_index.is_none())
-        || historical_time(&driver.created_at)? > historical_time(&driver.updated_at)?
-        || driver.error.as_deref().is_some_and(|error| {
-            error.chars().count() > 160
-                || error.contains(['/', '\\'])
-                || error.trim() != error
-                || error.chars().any(char::is_control)
-                || crate::launch::logs::Redactor::new(Vec::new()).redact_line(error) != error
-                || (matches!(
-                    error,
-                    "driver automatic resume queued after restart"
-                        | "driver automatic resume started after restart"
-                        | "driver ignored after restart resume limit"
-                ) && driver.state != "interrupted")
-        })
-    {
-        return Err(BenchmarkError::Unavailable);
-    }
-    Ok(())
-}
-
 pub fn driver_payload(driver: BenchmarkSuiteDriverStatus) -> serde_json::Value {
-    let running = !driver.historical && matches!(driver.state.as_str(), "running" | "waiting");
-    let resumable =
-        !driver.historical && matches!(driver.state.as_str(), "stopped" | "failed" | "interrupted");
-    let state_label = if driver.historical {
-        format!("Historical {} (read-only)", driver.state)
-    } else {
-        driver.state.clone()
-    };
+    let running = matches!(driver.state.as_str(), "running" | "waiting");
+    let resumable = matches!(driver.state.as_str(), "stopped" | "failed" | "interrupted");
     serde_json::json!({"status":"ok","suite":{"suite_id":driver.suite_id,"mode":driver.mode,"run_count":driver.run_count,
         "launched_run_count":driver.launched_run_count,"pending_run_index":driver.pending_run_index},
-        "view_model":{"state_label":state_label,"state_tone":if driver.state=="complete" {"ok"} else if matches!(driver.state.as_str(), "stopped" | "failed" | "interrupted") {"warn"} else {"neutral"},
+        "view_model":{"state_label":driver.state,"state_tone":if driver.state=="complete" {"ok"} else if matches!(driver.state.as_str(), "stopped" | "failed" | "interrupted") {"warn"} else {"neutral"},
             "can_stop":running,"can_resume":resumable,"can_check_family_c_qualification":driver.mode=="release_validation"},"driver":driver})
 }
 
@@ -3012,7 +1803,6 @@ pub fn qualification_preview() -> serde_json::Value {
         created_at: now.clone(),
         updated_at: now,
         runs: Vec::new(),
-        historical: false,
     };
     super::qualification::qualification_payload(&manifest, &[], None, false)
 }

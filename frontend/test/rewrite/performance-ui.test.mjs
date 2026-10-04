@@ -370,24 +370,15 @@ test('Performance Lab remains a developer disclosure with all existing blocks', 
   );
 });
 
-/** @param {{ id?: string, historical?: boolean, state?: string, pending?: number | null, canResume?: boolean, resumedDriverId?: string | null }} [options] */
-function driverResponse({
-  id = 'driver',
-  historical,
-  state = 'stopped',
-  pending = null,
-  canResume,
-  resumedDriverId,
-} = {}) {
+/** @param {{ id?: string, state?: string, pending?: number | null, canResume?: boolean }} [options] */
+function driverResponse({ id = 'driver', state = 'stopped', pending = null, canResume } = {}) {
   return {
     status: 'ok',
-    ...(resumedDriverId === undefined ? {} : { resumed_driver_id: resumedDriverId }),
     driver: {
       id,
       state,
       suite_id: 'suite',
       mode: 'release_validation',
-      ...(historical === undefined ? {} : { historical }),
       active_session_id: null,
       last_session_id: 'recorded-session',
     },
@@ -398,10 +389,10 @@ function driverResponse({
       pending_run_index: pending,
     },
     view_model: {
-      state_label: historical ? `Historical ${state} (read-only)` : 'Backend stopped',
+      state_label: `Backend ${state}`,
       state_tone: state === 'complete' ? 'ok' : 'warn',
-      can_stop: false,
-      can_resume: canResume ?? (!historical && state !== 'complete'),
+      can_stop: state === 'running' || state === 'waiting',
+      can_resume: canResume ?? state !== 'complete',
       can_check_family_c_qualification: true,
     },
   };
@@ -437,7 +428,6 @@ test('benchmark driver actions follow backend permissions while ordinary resume 
   assert.match(visibleText(tree), /Backend stopped/);
   assert.match(visibleText(tree), /2\/4 launched/);
   assert.match(visibleText(tree), /Pending none/);
-  assert.doesNotMatch(visibleText(tree), /Recorded pending/);
   assert.equal(control(tree, 'Button', 'Start').disabled, true);
   control(tree, 'Button', 'Resume').onClick();
   await h.settle();
@@ -451,10 +441,10 @@ test('benchmark driver actions follow backend permissions while ordinary resume 
   assert.equal(h.notices[0][0], 'Driver resumed');
 });
 
-test('historical terminal drivers retain recorded pending evidence without mutation controls and still check qualification', async () => {
+test('native terminal drivers retain pending evidence and follow backend qualification permissions', async () => {
   for (const state of ['failed', 'stopped', 'interrupted', 'complete']) {
     const pending = state === 'complete' ? null : 2;
-    const driver = driverResponse({ historical: true, state, pending });
+    const driver = driverResponse({ state, pending, canResume: false });
     const qualification = {
       schema: 'axial.launch.benchmark.qualification',
       schema_version: 1,
@@ -468,7 +458,7 @@ test('historical terminal drivers retain recorded pending evidence without mutat
         target_label: 'Family C',
         suite_label: 'suite',
         schema_label: 'Schema 1',
-        missing_summary: 'Historical evidence checked',
+        missing_summary: 'Suite evidence checked',
         suite_summary: 'Recorded suite',
         evidence_summary: 'Proof incomplete',
       },
@@ -485,12 +475,12 @@ test('historical terminal drivers retain recorded pending evidence without mutat
       .filter((node) => node.type === 'Button')
       .map((node) => visibleText(node).trim());
     assert.deepEqual(buttons, ['Refresh', 'Start', 'Check']);
-    assert.ok(visibleText(tree).includes(`Historical ${state} (read-only)`));
-    assert.ok(visibleText(tree).includes(pending === null ? 'Recorded pending none' : 'Recorded pending #3'));
+    assert.ok(visibleText(tree).includes(`Backend ${state}`));
+    assert.ok(visibleText(tree).includes(pending === null ? 'Pending none' : 'Pending #3'));
     assert.doesNotMatch(visibleText(tree), /Active /);
     control(tree, 'Button', 'Check').onClick();
     await h.settle();
-    assert.match(visibleText(h.render(BenchmarkSuiteDriversBlock, driverProps)), /Historical evidence checked/);
+    assert.match(visibleText(h.render(BenchmarkSuiteDriversBlock, driverProps)), /Suite evidence checked/);
     assert.deepEqual(
       h.calls.map((call) => call.slice(0, 2)),
       [
@@ -500,29 +490,6 @@ test('historical terminal drivers retain recorded pending evidence without mutat
     );
   }
 });
-
-test('historical driver wire flag is validated without requiring or inventing launch intents', () => {
-  const { benchmarkSuiteDriverResponse } = viewHarness().load('dto-performance');
-  assert.equal(benchmarkSuiteDriverResponse(driverResponse()).driver.historical, false);
-  assert.equal(benchmarkSuiteDriverResponse(driverResponse({ historical: false })).driver.historical, false);
-  assert.equal(benchmarkSuiteDriverResponse(driverResponse({ historical: true })).driver.historical, true);
-  for (const historical of [null, 'true', 1, {}]) {
-    const value = driverResponse();
-    assert.throws(() => benchmarkSuiteDriverResponse({ ...value, driver: { ...value.driver, historical } }));
-  }
-});
-
-function continuationFixture() {
-  const source = driverResponse({ id: 'recorded-driver', historical: true, pending: 2, canResume: true });
-  const successor = driverResponse({ id: 'successor-driver', historical: false, state: 'running', canResume: false });
-  successor.view_model.state_label = 'Running successor';
-  const linked = {
-    ...source,
-    resumed_driver_id: successor.driver.id,
-    view_model: { ...source.view_model, can_resume: false },
-  };
-  return { source, successor, linked };
-}
 
 function deferredResponse() {
   /** @type {(value: unknown) => void} */
@@ -538,200 +505,17 @@ function driverRows(tree) {
   return nodes(tree).filter((node) => node.props.class === 'cp-settings-driver-row');
 }
 
-test('historical Resume publishes the distinct successor, refreshes its source and guards duplicate and stale clicks', async () => {
-  const { source, successor, linked } = continuationFixture();
-  const original = JSON.stringify(source);
-  const post = deferredResponse();
-  const h = viewHarness({
-    api: async (method, path) => {
-      if (method === 'POST') return post.promise;
-      if (path.endsWith('/drivers')) return { status: 'ok', drivers: [source] };
-      assert.equal(path, '/launch/benchmark/suite/drivers/recorded-driver');
-      return linked;
-    },
-  });
-  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
-  const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
-  render();
-  await h.settle();
-  const resume = control(render(), 'Button', 'Resume');
-  resume.onClick();
-  resume.onClick();
-  assert.equal(control(render(), 'Button', 'Resuming').disabled, true);
-  post.resolve(successor);
-  await h.settle();
-  const tree = render();
-  assert.equal(driverRows(tree).length, 2);
-  assert.match(visibleText(driverRows(tree)[0]), /Running successor/);
-  assert.match(visibleText(driverRows(tree)[1]), /Historical stopped \(read-only\).*Recorded pending #3/);
-  assert.equal(
-    nodes(tree).some((node) => node.type === 'Button' && visibleText(node).trim() === 'Resume'),
-    false,
-  );
-  resume.onClick();
-  await h.settle();
-  assert.deepEqual(
-    h.calls.map((call) => call.slice(0, 2)),
-    [
-      ['GET', '/launch/benchmark/suite/drivers'],
-      ['POST', '/launch/benchmark/suite/drivers/recorded-driver/resume'],
-      ['GET', '/launch/benchmark/suite/drivers/recorded-driver'],
-    ],
-  );
-  assert.equal(JSON.stringify(source), original);
-  assert.deepEqual(h.notices, [['Driver resumed']]);
-});
-
-test('lost historical Resume responses reconcile through the exact source link without replaying POST', async () => {
-  for (const failure of [
-    new Error('Connection closed'),
-    Object.assign(new Error('Unavailable'), { name: 'ApiError', status: 503 }),
-    Object.assign(new Error('Driver task refused'), { name: 'ApiError', status: 409 }),
-    Object.assign(new Error('Unclassified refusal'), { name: 'ApiError', status: 422 }),
-    { invalid: true },
-  ]) {
-    const { source, successor, linked } = continuationFixture();
-    if (failure instanceof Error && 'status' in failure && failure.status === 409) {
-      successor.driver.state = 'failed';
-      successor.view_model.state_label = 'Failed successor';
-      successor.view_model.can_resume = true;
-    }
-    const h = viewHarness({
-      api: async (method, path) => {
-        if (method === 'POST') {
-          if (failure instanceof Error) throw failure;
-          return failure;
-        }
-        if (path.endsWith('/drivers')) return { status: 'ok', drivers: [source] };
-        if (path.endsWith('/recorded-driver')) return linked;
-        assert.equal(path, '/launch/benchmark/suite/drivers/successor-driver');
-        return successor;
-      },
-    });
-    const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
-    const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
-    render();
-    await h.settle();
-    control(render(), 'Button', 'Resume').onClick();
-    await h.settle();
-    assert.equal(driverRows(render()).length, 2);
-    if (successor.driver.state === 'failed') assert.match(visibleText(driverRows(render())[0]), /Failed successor/);
-    assert.deepEqual(
-      h.calls.map((call) => call.slice(0, 2)),
-      [
-        ['GET', '/launch/benchmark/suite/drivers'],
-        ['POST', '/launch/benchmark/suite/drivers/recorded-driver/resume'],
-        ['GET', '/launch/benchmark/suite/drivers/recorded-driver'],
-        ['GET', '/launch/benchmark/suite/drivers/successor-driver'],
-      ],
-    );
-    assert.deepEqual(h.notices, [['Driver resumed']]);
-  }
-});
-
-test('an absent Resume link and failed status reads stay unconfirmed across refresh and only retry GET', async () => {
-  const { source, successor, linked } = continuationFixture();
-  let sourceReads = 0;
-  let lists = 0;
-  const h = viewHarness({
-    api: async (method, path) => {
-      if (method === 'POST') throw new Error('Connection closed');
-      if (path.endsWith('/drivers')) {
-        lists += 1;
-        return {
-          status: 'ok',
-          drivers: [lists === 1 ? source : { ...source, view_model: { ...source.view_model, can_resume: false } }],
-        };
-      }
-      if (path.endsWith('/recorded-driver')) {
-        sourceReads += 1;
-        if (sourceReads === 1) return { ...source, resumed_driver_id: null };
-        if (sourceReads === 2) throw new Error('Read unavailable');
-        return linked;
-      }
-      assert.equal(path, '/launch/benchmark/suite/drivers/successor-driver');
-      return successor;
-    },
-  });
-  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
-  const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
-  render();
-  await h.settle();
-  const originalResume = control(render(), 'Button', 'Resume');
-  originalResume.onClick();
-  await h.settle();
-  assert.equal(control(render(), 'Button', 'Check status').disabled, false);
-  control(render(), 'Button', 'Refresh').onClick();
-  await h.settle();
-  control(render(), 'Button', 'Check status').onClick();
-  await h.settle();
-  assert.equal(control(render(), 'Button', 'Check status').disabled, false);
-  originalResume.onClick();
-  originalResume.onClick();
-  await h.settle();
-  assert.equal(h.calls.filter(([method]) => method === 'POST').length, 1);
-  assert.equal(sourceReads, 3);
-  assert.equal(driverRows(render()).length, 2);
-  assert.equal(h.notices.filter(([message]) => message === 'Driver resumed').length, 1);
-  assert.equal(h.notices.filter(([message]) => message === 'Resume outcome unconfirmed. Check status.').length, 2);
-});
-
-test('definite Resume refusal is retryable but failed reads cannot erase an already observed successor link', async () => {
-  const { source, successor, linked } = continuationFixture();
-  const refusal = Object.assign(new Error('Invalid driver request'), { name: 'ApiError', status: 400 });
-  let refused = true;
-  let sourceReads = 0;
-  const h = viewHarness({
-    api: async (method, path) => {
-      if (method === 'POST') {
-        if (refused) throw refusal;
-        throw new Error('Connection closed');
-      }
-      if (path.endsWith('/drivers')) return { status: 'ok', drivers: [source] };
-      if (path.endsWith('/recorded-driver')) {
-        sourceReads += 1;
-        if (sourceReads === 2) throw refusal;
-        if (sourceReads === 3) return { ...linked, resumed_driver_id: 'different-driver' };
-        return linked;
-      }
-      assert.equal(path, '/launch/benchmark/suite/drivers/successor-driver');
-      if (sourceReads === 1) throw Object.assign(new Error('Unavailable'), { name: 'ApiError', status: 404 });
-      return successor;
-    },
-  });
-  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
-  const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
-  render();
-  await h.settle();
-  control(render(), 'Button', 'Resume').onClick();
-  await h.settle();
-  assert.equal(sourceReads, 0);
-  assert.equal(h.notices[0][0], 'Resume failed: Invalid driver request');
-  refused = false;
-  control(render(), 'Button', 'Resume').onClick();
-  await h.settle();
-  for (let i = 0; i < 3; i += 1) {
-    control(render(), 'Button', 'Check status').onClick();
-    await h.settle();
-  }
-  assert.equal(h.calls.filter(([method]) => method === 'POST').length, 2);
-  assert.equal(
-    h.calls.some(([, path]) => path.endsWith('/different-driver')),
-    false,
-  );
-  assert.equal(driverRows(render()).length, 2);
-  assert.equal(h.notices[h.notices.length - 1]?.[0], 'Driver resumed');
-});
-
-test('late list reads cannot overwrite an acknowledged historical continuation', async () => {
-  const { source, successor, linked } = continuationFixture();
+test('late list reads cannot overwrite an acknowledged native Resume and the same driver remains stoppable', async () => {
+  const stopped = driverResponse();
+  const running = driverResponse({ state: 'running', canResume: false });
   const refresh = deferredResponse();
+  const post = deferredResponse();
   let lists = 0;
   const h = viewHarness({
     api: async (method, path) => {
-      if (method === 'POST') return successor;
-      if (path.endsWith('/drivers')) return ++lists === 1 ? { status: 'ok', drivers: [source] } : refresh.promise;
-      return linked;
+      if (method === 'POST') return path.endsWith('/resume') ? post.promise : stopped;
+      assert.equal(path, '/launch/benchmark/suite/drivers');
+      return ++lists === 1 ? { status: 'ok', drivers: [stopped] } : refresh.promise;
     },
   });
   const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
@@ -740,74 +524,35 @@ test('late list reads cannot overwrite an acknowledged historical continuation',
   await h.settle();
   const tree = render();
   control(tree, 'Button', 'Refresh').onClick();
-  control(tree, 'Button', 'Resume').onClick();
+  const resume = control(tree, 'Button', 'Resume');
+  resume.onClick();
+  resume.onClick();
+  assert.equal(control(render(), 'Button', 'Resuming').disabled, true);
+  post.resolve(running);
   await h.settle();
-  refresh.resolve({ status: 'ok', drivers: [source] });
+  refresh.resolve({ status: 'ok', drivers: [stopped] });
   await h.settle();
-  assert.equal(driverRows(render()).length, 2);
-  assert.match(visibleText(driverRows(render())[0]), /Running successor/);
+  assert.equal(driverRows(render()).length, 1);
+  assert.match(visibleText(driverRows(render())[0]), /Backend running/);
   assert.equal(
     nodes(render()).some((node) => node.type === 'Button' && visibleText(node).trim() === 'Resume'),
     false,
   );
-});
-
-test('a held successor read cannot overwrite a newer Refresh and Stop publication', async () => {
-  const { source, successor, linked } = continuationFixture();
-  successor.view_model.can_stop = true;
-  const stopped = {
-    ...successor,
-    driver: { ...successor.driver, state: 'stopped' },
-    view_model: { ...successor.view_model, state_label: 'Stopped successor', can_stop: false, can_resume: true },
-  };
-  const successorRead = deferredResponse();
-  let lists = 0;
-  const h = viewHarness({
-    api: async (method, path) => {
-      if (method === 'POST') {
-        if (path.endsWith('/stop')) return stopped;
-        throw new Error('Connection closed');
-      }
-      if (path.endsWith('/drivers')) return { status: 'ok', drivers: ++lists === 1 ? [source] : [successor, linked] };
-      if (path.endsWith('/recorded-driver')) return linked;
-      assert.equal(path, '/launch/benchmark/suite/drivers/successor-driver');
-      return successorRead.promise;
-    },
-  });
-  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
-  const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
-  render();
-  await h.settle();
-  control(render(), 'Button', 'Resume').onClick();
-  await h.settle();
-  control(render(), 'Button', 'Refresh').onClick();
-  await h.settle();
   control(render(), 'Button', 'Stop').onClick();
   await h.settle();
-  successorRead.resolve(successor);
-  await h.settle();
-  assert.match(visibleText(driverRows(render())[0]), /Stopped successor/);
-  assert.equal(
-    nodes(render()).some((node) => node.type === 'Button' && visibleText(node).trim() === 'Stop'),
-    false,
-  );
-  assert.equal(control(driverRows(render())[0], 'Button', 'Resume').disabled, false);
+  assert.match(visibleText(driverRows(render())[0]), /Backend stopped/);
+  assert.equal(control(render(), 'Button', 'Resume').disabled, false);
   assert.equal(h.calls.filter(([method, path]) => method === 'POST' && path.endsWith('/resume')).length, 1);
+  assert.equal(h.calls.filter(([method, path]) => method === 'POST' && path.endsWith('/stop')).length, 1);
+  assert.deepEqual(h.notices, [['Driver resumed'], ['Driver stopped']]);
 });
 
-test('a historical POST result is not published until its identity matches the source link', async () => {
-  const { source, successor, linked } = continuationFixture();
-  const wrong = { ...successor, driver: { ...successor.driver, id: 'unrelated-driver' } };
-  wrong.view_model = { ...wrong.view_model, state_label: 'Unrelated driver' };
-  const sourceRead = deferredResponse();
+test('disposed native Resume handlers do not publish a late response', async () => {
+  const stopped = driverResponse();
+  const running = driverResponse({ state: 'running', canResume: false });
+  const pending = deferredResponse();
   const h = viewHarness({
-    api: async (method, path) => {
-      if (method === 'POST') return wrong;
-      if (path.endsWith('/drivers')) return { status: 'ok', drivers: [source] };
-      if (path.endsWith('/recorded-driver')) return sourceRead.promise;
-      assert.equal(path, '/launch/benchmark/suite/drivers/successor-driver');
-      return successor;
-    },
+    api: async (method) => (method === 'POST' ? pending.promise : { status: 'ok', drivers: [stopped] }),
   });
   const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
   const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
@@ -815,131 +560,11 @@ test('a historical POST result is not published until its identity matches the s
   await h.settle();
   control(render(), 'Button', 'Resume').onClick();
   await h.settle();
+  h.dispose();
+  pending.resolve(running);
+  await h.settle();
+  assert.equal(h.calls.length, 2);
   assert.equal(driverRows(render()).length, 1);
-  sourceRead.resolve(linked);
-  await h.settle();
-  assert.equal(driverRows(render()).length, 2);
-  assert.doesNotMatch(visibleText(render()), /Unrelated driver/);
-  assert.deepEqual(
-    h.calls.map((call) => call.slice(0, 2)),
-    [
-      ['GET', '/launch/benchmark/suite/drivers'],
-      ['POST', '/launch/benchmark/suite/drivers/recorded-driver/resume'],
-      ['GET', '/launch/benchmark/suite/drivers/recorded-driver'],
-      ['GET', '/launch/benchmark/suite/drivers/successor-driver'],
-    ],
-  );
-});
-
-test('a Refresh that fences the successor read but then fails retains read-only status recovery', async () => {
-  const { source, successor, linked } = continuationFixture();
-  const successorRead = deferredResponse();
-  const refresh = deferredResponse();
-  let lists = 0;
-  let successorReads = 0;
-  const h = viewHarness({
-    api: async (method, path) => {
-      if (method === 'POST') throw new Error('Connection closed');
-      if (path.endsWith('/drivers')) return ++lists === 1 ? { status: 'ok', drivers: [source] } : refresh.promise;
-      if (path.endsWith('/recorded-driver')) return linked;
-      return ++successorReads === 1 ? successorRead.promise : successor;
-    },
-  });
-  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
-  const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
-  render();
-  await h.settle();
-  control(render(), 'Button', 'Resume').onClick();
-  await h.settle();
-  control(render(), 'Button', 'Refresh').onClick();
-  successorRead.resolve(successor);
-  await h.settle();
-  refresh.resolve({ invalid: true });
-  await h.settle();
-  assert.equal(driverRows(render()).length, 1);
-  assert.equal(control(render(), 'Button', 'Check status').disabled, false);
-  assert.equal(h.notices[h.notices.length - 1]?.[0], 'Resume accepted. Check status.');
-  control(render(), 'Button', 'Check status').onClick();
-  await h.settle();
-  assert.equal(driverRows(render()).length, 2);
-  assert.equal(h.calls.filter(([method]) => method === 'POST').length, 1);
-});
-
-test('historical Resume rejects inconsistent source and successor responses without enabling replay', async () => {
-  const { source, successor, linked } = continuationFixture();
-  for (const [sourceResponse, successorResponse] of [
-    [{ ...linked, driver: { ...source.driver, id: 'wrong-source' } }, successor],
-    [{ ...linked, driver: { ...source.driver, historical: false } }, successor],
-    [{ ...linked, resumed_driver_id: source.driver.id }, successor],
-    [linked, { ...successor, driver: { ...successor.driver, id: 'wrong-successor' } }],
-    [linked, { ...successor, driver: { ...successor.driver, historical: true } }],
-    [linked, { ...successor, driver: { ...successor.driver, id: 123 } }],
-  ]) {
-    const h = viewHarness({
-      api: async (method, path) => {
-        if (method === 'POST') return source;
-        if (path.endsWith('/drivers')) return { status: 'ok', drivers: [source] };
-        return path.endsWith('/recorded-driver') ? sourceResponse : successorResponse;
-      },
-    });
-    const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
-    const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
-    render();
-    await h.settle();
-    control(render(), 'Button', 'Resume').onClick();
-    await h.settle();
-    control(render(), 'Button', 'Check status').onClick();
-    await h.settle();
-    assert.equal(h.calls.filter(([method]) => method === 'POST').length, 1);
-    assert.equal(driverRows(render()).length, 1);
-    assert.equal(
-      h.notices.some(([message]) => message === 'Driver resumed'),
-      false,
-    );
-  }
-});
-
-test('disposed historical Resume handlers neither publish nor continue reconciliation', async () => {
-  for (const stage of ['post', 'source', 'successor']) {
-    const { source, successor, linked } = continuationFixture();
-    const pending = deferredResponse();
-    const h = viewHarness({
-      api: async (method, path) => {
-        if (method === 'POST') {
-          if (stage === 'post') return pending.promise;
-          throw new Error('Connection closed');
-        }
-        if (path.endsWith('/drivers')) return { status: 'ok', drivers: [source] };
-        if (path.endsWith('/recorded-driver')) return stage === 'source' ? pending.promise : linked;
-        return pending.promise;
-      },
-    });
-    const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
-    const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
-    render();
-    await h.settle();
-    control(render(), 'Button', 'Resume').onClick();
-    await h.settle();
-    const callCount = h.calls.length;
-    h.dispose();
-    pending.resolve(stage === 'source' ? linked : successor);
-    await h.settle();
-    assert.equal(h.calls.length, callCount);
-    assert.equal(driverRows(render()).length, 1);
-    assert.deepEqual(h.notices, []);
-  }
-});
-
-test('historical continuation links decode omitted and null absence and reject malformed wire values', () => {
-  const { benchmarkSuiteDriverResponse } = viewHarness().load('dto-performance');
-  const source = driverResponse({ historical: true });
-  assert.equal(benchmarkSuiteDriverResponse(source).resumed_driver_id, undefined);
-  assert.equal(benchmarkSuiteDriverResponse({ ...source, resumed_driver_id: null }).resumed_driver_id, undefined);
-  assert.equal(
-    benchmarkSuiteDriverResponse({ ...source, resumed_driver_id: 'successor' }).resumed_driver_id,
-    'successor',
-  );
-  for (const resumed_driver_id of [1, false, {}, []]) {
-    assert.throws(() => benchmarkSuiteDriverResponse({ ...source, resumed_driver_id }));
-  }
+  assert.match(visibleText(driverRows(render())[0]), /Backend stopped/);
+  assert.deepEqual(h.notices, []);
 });

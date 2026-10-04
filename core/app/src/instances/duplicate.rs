@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use super::{
     copy::{CopyBudget, check_cancel, copy_file, copy_tree, copy_tree_excluding},
-    create::{InstanceService, PublicationSource},
+    create::{DuplicateSource, InstanceService},
     directory::{InstanceDirectories, RegisteredInstance},
     model::{Instance, InstanceError, InstanceId, InstanceResult},
 };
@@ -79,7 +79,7 @@ impl InstanceService {
                             instance,
                             pin,
                             lease,
-                            Some(PublicationSource::Duplicate {
+                            Some(DuplicateSource {
                                 source,
                                 performance,
                             }),

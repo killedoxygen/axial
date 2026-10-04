@@ -215,6 +215,7 @@ pub(super) fn auth_error(error: AuthError) -> ApiError {
         AuthError::SignInRequired | AuthError::LoginExpired => {
             (StatusCode::PRECONDITION_FAILED, "sign_in_required")
         }
+        AuthError::OwnershipMissing => (StatusCode::CONFLICT, "minecraft_ownership_missing"),
         AuthError::Credentials(axial_app::accounts::credential_store::CredentialError::Stale) => {
             (StatusCode::CONFLICT, "account_changed")
         }

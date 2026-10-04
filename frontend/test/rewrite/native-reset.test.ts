@@ -101,7 +101,6 @@ function harness(options: { native?: boolean; development?: boolean; devLab?: bo
       '../../store': { config: { value: { telemetry_enabled: false } }, devMode },
       '../../toast': { toast() {} },
       '../../utils': { errMessage: String },
-      './InstanceImportRow': { InstanceImportRow: 'InstanceImportRow' },
       '../../preferences/persistence': { reloadApplication() {} },
       '../../ui/Dialog': {
         showConfirm(message: string, options: { destructive: boolean; confirmText: string }) {

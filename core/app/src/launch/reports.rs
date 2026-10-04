@@ -2,7 +2,6 @@
 //! Artifact bytes must be admitted by the instance resource owner; this module never reads paths.
 
 use serde::{Deserialize, Deserializer, Serialize, de};
-use sha2::{Digest, Sha256};
 
 use super::logs::{LogEntry, MAX_LOG_ENTRIES, MAX_LOG_LINE_CHARS, Redactor};
 use super::outcome::{SessionOutcome, SessionOutcomeKind};
@@ -14,9 +13,6 @@ use std::sync::Arc;
 
 pub const MAX_REPORT_BYTES: usize = 256 * 1024;
 pub const MAX_RECENT_REPORTS: usize = 25;
-pub(crate) const MAX_COMPLETION_PROOF_BYTES: usize = 128 * 1024;
-const MAX_IMPORT_REPORTS: usize = 1024;
-const MAX_IMPORT_BYTES: usize = 64 * 1024 * 1024;
 const LAUNCH_STAGE_COMPARISON_METRIC_NAME: &str = "total_completed_stage_duration_ms";
 const LAUNCH_BOOT_COMPARISON_METRIC_NAME: &str = "boot_duration_ms";
 type LaunchComparisonMetric = (&'static str, u64, fn(&LaunchProofRecord) -> Option<u64>);
@@ -141,83 +137,6 @@ impl LaunchProofRecord {
             logs_dropped: input.logs_dropped,
         }
     }
-
-    pub(crate) fn matches_imported_terminal_state(&self, state: &str) -> bool {
-        // The converter appends this block after preserved predecessor stages.
-        let start = self.stages.iter().rposition(|stage| {
-            stage.stage == "imported_history"
-                && stage
-                    .evidence
-                    .iter()
-                    .any(|item| item.system == "history" && item.id == "original_session")
-        });
-        let Some(start) = start else {
-            return state == self.outcome && matches!(state, "exited" | "failed" | "stopped");
-        };
-        let mut original = None;
-        let mut reason = false;
-        for stage in &self.stages[start..] {
-            if stage.stage != "imported_history" {
-                return false;
-            }
-            for item in &stage.evidence {
-                if item.system != "history" {
-                    return false;
-                }
-                match item.id.as_str() {
-                    "original_outcome" if original.is_none() && item.details.len() == 1 => {
-                        original = Some(item.details[0].as_str())
-                    }
-                    "original_reason" if !reason && item.details.len() == 1 => reason = true,
-                    "original_outcome" | "original_reason" => return false,
-                    _ => {}
-                }
-            }
-        }
-        let Some(original) = original else {
-            return false;
-        };
-        if !imported_outcome_matches(original, reason.then_some(self.session_outcome.kind)) {
-            return false;
-        }
-        let (original, terminal) =
-            imported_suite_states(original, reason.then_some(self.session_outcome.kind));
-        state == original || state == terminal
-    }
-}
-
-/// The predecessor suite records either its report outcome or its terminal
-/// observer's classification. Normalizing a report must not erase that choice.
-pub(crate) fn imported_suite_states(
-    original: &str,
-    kind: Option<SessionOutcomeKind>,
-) -> (String, String) {
-    (
-        match original {
-            "failed" | "stopped" | "exited" | "completed" => original,
-            _ => "failed",
-        }
-        .into(),
-        match kind {
-            Some(SessionOutcomeKind::Clean | SessionOutcomeKind::Unknown) => "exited",
-            Some(SessionOutcomeKind::Stopped) => "stopped",
-            Some(SessionOutcomeKind::Failed) => "failed",
-            None => original,
-        }
-        .into(),
-    )
-}
-
-pub(crate) fn imported_outcome_matches(outcome: &str, kind: Option<SessionOutcomeKind>) -> bool {
-    match (outcome, kind) {
-        ("failed" | "exited" | "completed" | "stopped" | "cancelled" | "canceled", None) => true,
-        ("exited", Some(_)) => true,
-        ("failed", Some(SessionOutcomeKind::Failed | SessionOutcomeKind::Unknown)) => true,
-        ("completed", Some(SessionOutcomeKind::Clean)) => true,
-        ("stopped" | "cancelled" | "canceled", Some(SessionOutcomeKind::Stopped)) => true,
-        ("unknown", Some(SessionOutcomeKind::Unknown)) => true,
-        _ => false,
-    }
 }
 
 fn outcome_name(outcome: &SessionOutcome) -> &'static str {
@@ -233,188 +152,6 @@ fn outcome_name(outcome: &SessionOutcome) -> &'static str {
 #[derive(Clone)]
 pub struct LaunchReportStore {
     metadata: Arc<MetadataStore>,
-}
-
-/// Canonical historical records prepared before an instance publication transaction.
-/// This value grants metadata insertion only, never session or process authority.
-#[derive(Clone)]
-pub(crate) struct PreparedReportImport {
-    records: Vec<Arc<ImportedReport>>,
-}
-
-struct ImportedReport {
-    report: LaunchProofRecord,
-    payload: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ArchivedReportCompletionProof {
-    source_id: String,
-    ids: Vec<String>,
-    digest: String,
-}
-
-impl PreparedReportImport {
-    pub(crate) fn prepare(reports: Vec<LaunchProofRecord>) -> Result<Self, ReportError> {
-        Self::prepare_canonical(reports, None)
-    }
-
-    pub(crate) fn prepare_archived(
-        source_id: &str,
-        reports: Vec<(String, LaunchProofRecord)>,
-    ) -> Result<Self, ReportError> {
-        if !lower_hex(source_id, 64) {
-            return Err(ReportError::Invalid);
-        }
-        if reports.len() > MAX_IMPORT_REPORTS {
-            return Err(ReportError::TooLarge);
-        }
-        let mut bound = Vec::with_capacity(reports.len());
-        for (legacy_id, mut report) in reports {
-            if !lower_hex(&legacy_id, 16) {
-                return Err(ReportError::Invalid);
-            }
-            report.instance_id = format!("archived-{source_id}-{legacy_id}");
-            bound.push(report);
-        }
-        Self::prepare_canonical(bound, Some(source_id))
-    }
-
-    fn prepare_canonical(
-        reports: Vec<LaunchProofRecord>,
-        archived_source: Option<&str>,
-    ) -> Result<Self, ReportError> {
-        if reports.len() > MAX_IMPORT_REPORTS {
-            return Err(ReportError::TooLarge);
-        }
-        let mut records = Vec::with_capacity(reports.len());
-        let mut ids = std::collections::BTreeSet::new();
-        let mut bytes = 0usize;
-        for report in reports {
-            if !imported_report_id(&report.session_id)
-                || !ids.insert(report.session_id.clone())
-                || match archived_source {
-                    Some(source) => !archived_instance_matches(&report.instance_id, source),
-                    None => report
-                        .instance_id
-                        .parse::<crate::instances::model::InstanceId>()
-                        .is_err(),
-                }
-            {
-                return Err(ReportError::Invalid);
-            }
-            let encoded = encode_report(&report)?;
-            // Import must never silently discard evidence to fit the current schema.
-            if decode_report(&encoded)? != report {
-                return Err(ReportError::Invalid);
-            }
-            bytes = bytes
-                .checked_add(encoded.len())
-                .ok_or(ReportError::TooLarge)?;
-            if bytes > MAX_IMPORT_BYTES {
-                return Err(ReportError::TooLarge);
-            }
-            records.push(Arc::new(ImportedReport {
-                report,
-                payload: encoded,
-            }));
-        }
-        Ok(Self { records })
-    }
-
-    pub(crate) fn append(&mut self, other: &Self) -> Result<(), ReportError> {
-        if self.records.len() + other.records.len() > MAX_IMPORT_REPORTS {
-            return Err(ReportError::TooLarge);
-        }
-        let mut ids = std::collections::BTreeSet::new();
-        let mut bytes = 0usize;
-        for record in self.records.iter().chain(&other.records) {
-            if !ids.insert(&record.report.session_id) {
-                return Err(ReportError::Invalid);
-            }
-            bytes = bytes
-                .checked_add(record.payload.len())
-                .ok_or(ReportError::TooLarge)?;
-            if bytes > MAX_IMPORT_BYTES {
-                return Err(ReportError::TooLarge);
-            }
-        }
-        self.records.extend(other.records.iter().cloned());
-        Ok(())
-    }
-
-    pub(crate) fn completion_proof(
-        &self,
-        source_id: &str,
-    ) -> Result<ArchivedReportCompletionProof, ReportError> {
-        if !lower_hex(source_id, 64)
-            || self
-                .records
-                .iter()
-                .any(|record| !archived_instance_matches(&record.report.instance_id, source_id))
-        {
-            return Err(ReportError::Invalid);
-        }
-        let mut records: Vec<_> = self.records.iter().collect();
-        records.sort_unstable_by_key(|record| &record.report.session_id);
-        let ids: Vec<_> = records
-            .iter()
-            .map(|record| record.report.session_id.clone())
-            .collect();
-        let mut digest = archived_completion_hash(source_id, &ids);
-        for record in records {
-            digest.update((record.payload.len() as u64).to_be_bytes());
-            digest.update(&record.payload);
-        }
-        Ok(ArchivedReportCompletionProof {
-            source_id: source_id.to_owned(),
-            ids,
-            digest: hex::encode(digest.finalize()),
-        })
-    }
-
-    pub(crate) fn insert_in(&self, tx: &Transaction<'_>) -> Result<(), ReportError> {
-        let mut remaining = MAX_IMPORT_BYTES;
-        for record in &self.records {
-            let report = &record.report;
-            match stored_report_row(tx, &report.session_id, MAX_REPORT_BYTES.min(remaining))? {
-                Some((instance, recorded_at, bytes)) => {
-                    let bytes = bytes.ok_or(ReportError::TooLarge)?;
-                    remaining -= bytes.len();
-                    if decode_stored_report(&report.session_id, &instance, &recorded_at, &bytes)?
-                        != *report
-                    {
-                        return Err(ReportError::ConflictingSession);
-                    }
-                }
-                None => {
-                    remaining = remaining
-                        .checked_sub(record.payload.len())
-                        .ok_or(ReportError::TooLarge)?;
-                    insert_report(tx, report, &record.payload)?;
-                }
-            }
-        }
-        self.verify_in(tx)
-    }
-
-    pub(crate) fn verify_in(&self, db: &rusqlite::Connection) -> Result<(), ReportError> {
-        let mut remaining = MAX_IMPORT_BYTES;
-        for record in &self.records {
-            let report = &record.report;
-            let (instance, recorded_at, bytes) =
-                stored_report_row(db, &report.session_id, MAX_REPORT_BYTES.min(remaining))?
-                    .ok_or(ReportError::ConflictingSession)?;
-            let bytes = bytes.ok_or(ReportError::TooLarge)?;
-            remaining -= bytes.len();
-            if decode_stored_report(&report.session_id, &instance, &recorded_at, &bytes)? != *report
-            {
-                return Err(ReportError::ConflictingSession);
-            }
-        }
-        Ok(())
-    }
 }
 
 fn stored_report(
@@ -465,84 +202,6 @@ fn decode_stored_report(
         return Err(ReportError::Invalid);
     }
     Ok(saved)
-}
-
-impl ArchivedReportCompletionProof {
-    pub(crate) fn count(&self) -> usize {
-        self.ids.len()
-    }
-
-    /// Verify the entire receipt snapshot in the caller's metadata read. PK
-    /// lookups and the remaining byte budget bound work to 1024 rows / 64 MiB.
-    pub(crate) fn verify_in(
-        &self,
-        db: &rusqlite::Connection,
-        source_id: &str,
-    ) -> Result<(), ReportError> {
-        if !lower_hex(source_id, 64)
-            || self.source_id != source_id
-            || !lower_hex(&self.digest, 64)
-            || self.ids.len() > MAX_IMPORT_REPORTS
-            || self.ids.iter().any(|id| !imported_report_id(id))
-            || self.ids.windows(2).any(|ids| ids[0] >= ids[1])
-        {
-            return Err(ReportError::Invalid);
-        }
-        let mut digest = archived_completion_hash(source_id, &self.ids);
-        let mut total = 0usize;
-        for id in &self.ids {
-            let (instance, recorded_at, bytes) =
-                stored_report_row(db, id, MAX_REPORT_BYTES.min(MAX_IMPORT_BYTES - total))?
-                    .ok_or(ReportError::ConflictingSession)?;
-            let bytes = bytes.ok_or(ReportError::TooLarge)?;
-            total += bytes.len();
-            let report = decode_stored_report(id, &instance, &recorded_at, &bytes)?;
-            if !archived_instance_matches(&report.instance_id, source_id) {
-                return Err(ReportError::Invalid);
-            }
-            digest.update((bytes.len() as u64).to_be_bytes());
-            digest.update(&bytes);
-        }
-        if hex::encode(digest.finalize()) != self.digest {
-            return Err(ReportError::ConflictingSession);
-        }
-        Ok(())
-    }
-}
-
-fn archived_completion_hash(source_id: &str, ids: &[String]) -> Sha256 {
-    let mut hash = Sha256::new();
-    hash.update(b"axial.legacy.reports.completion.v1\0");
-    hash.update((source_id.len() as u64).to_be_bytes());
-    hash.update(source_id.as_bytes());
-    hash.update((ids.len() as u64).to_be_bytes());
-    for id in ids {
-        hash.update((id.len() as u64).to_be_bytes());
-        hash.update(id.as_bytes());
-    }
-    hash
-}
-
-fn archived_instance_matches(value: &str, source_id: &str) -> bool {
-    value
-        .strip_prefix("archived-")
-        .and_then(|value| value.split_once('-'))
-        .is_some_and(|(source, legacy)| {
-            source == source_id && lower_hex(source, 64) && lower_hex(legacy, 16)
-        })
-}
-
-fn imported_report_id(value: &str) -> bool {
-    value
-        .strip_prefix("legacy-")
-        .is_some_and(|suffix| lower_hex(suffix, 64))
-}
-
-fn lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn insert_report(
@@ -1108,7 +767,7 @@ fn report_precedes(candidate: &LaunchProofRecord, current: &LaunchProofRecord) -
 }
 
 fn launch_proof_outcome_is_comparable(outcome: &str) -> bool {
-    matches!(outcome.trim(), "running" | "exited" | "completed")
+    outcome == "exited"
 }
 
 fn launch_comparison_metric_for_current(
@@ -1908,12 +1567,7 @@ fn sanitized_mod_id(value: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    const ARCHIVE_SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const OTHER_ARCHIVE_SOURCE: &str =
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const ARCHIVE_INSTANCE: &str = "0123456789abcdef";
-
-    fn imported_report() -> LaunchProofRecord {
+    fn session_report() -> LaunchProofRecord {
         let mut outcome = SessionOutcome {
             kind: SessionOutcomeKind::Clean,
             reason: super::super::outcome::SessionExitReason::CleanExit,
@@ -1922,7 +1576,7 @@ mod tests {
         };
         outcome.summary = outcome.summary().to_owned();
         let mut report = LaunchProofRecord::from_session(SessionReportInput {
-            session_id: format!("legacy-{}", "a".repeat(64)),
+            session_id: uuid::Uuid::new_v4().to_string(),
             instance_id: crate::instances::model::InstanceId::new().to_string(),
             version_id: "1.21.1".into(),
             launched_at: "2026-01-01T00:00:00.000Z".into(),
@@ -1938,7 +1592,7 @@ mod tests {
         report.scenario.version_id = Some("1.21.1".into());
         report.device.tier = "mid".into();
         report.comparison = Some(LaunchProofComparison {
-            baseline_session_id: format!("legacy-{}", "b".repeat(64)),
+            baseline_session_id: uuid::Uuid::new_v4().to_string(),
             baseline_recorded_at: "2025-12-31T00:00:00.000Z".into(),
             baseline: LaunchProofComparisonBaseline {
                 performance_mode: "vanilla".into(),
@@ -1969,7 +1623,7 @@ mod tests {
             LoaderComponentId::NeoForge,
         ] {
             let version = installed_version_id_for(component, "1.20.1", "0.19.5").unwrap();
-            let mut report = imported_report();
+            let mut report = session_report();
             report.version_id = version.clone();
             report.scenario.version_id = Some(version.clone());
             report.comparison.as_mut().unwrap().baseline.version_id = version.clone();
@@ -2040,14 +1694,14 @@ mod tests {
         ];
         for (version, secrets) in cases {
             let redactor = Redactor::new(secrets);
-            let mut report = imported_report();
+            let mut report = session_report();
             report.comparison = None;
             report.version_id = version.clone();
             report.scenario.version_id = Some(version.clone());
             sanitize_report(&mut report, &redactor).unwrap();
             assert_eq!(report.version_id, "unknown");
             assert!(report.scenario.version_id.is_none());
-            let mut comparison = imported_report();
+            let mut comparison = session_report();
             comparison.comparison.as_mut().unwrap().baseline.version_id = version;
             assert!(sanitize_report(&mut comparison, &redactor).is_err());
         }
@@ -2062,7 +1716,7 @@ mod tests {
         )
         .unwrap();
         assert!(version.len() > 96);
-        let mut report = imported_report();
+        let mut report = session_report();
         report.version_id = version.clone();
         report.scenario.version_id = Some(version.clone());
         report.comparison.as_mut().unwrap().baseline.version_id = version.clone();
@@ -2076,368 +1730,88 @@ mod tests {
     }
 
     #[test]
-    fn imported_report_reopen_is_immutable_including_its_historical_comparison() {
+    fn session_report_reopen_preserves_its_committed_comparison() {
         let temporary_parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let root = tempfile::tempdir_in(temporary_parent).unwrap();
         let path = root.path().join("metadata.sqlite");
         let metadata = Arc::new(MetadataStore::open(&path).unwrap());
         let store = LaunchReportStore::new(metadata.clone()).unwrap();
-        let report = imported_report();
-        let prepared = PreparedReportImport::prepare(vec![report.clone()]).unwrap();
-        metadata.transaction(|tx| prepared.insert_in(tx)).unwrap();
-        assert_eq!(store.get(&report.session_id).unwrap(), Some(report.clone()));
-        drop(store);
-        drop(metadata);
-        let metadata = Arc::new(MetadataStore::open(&path).unwrap());
-        let store = LaunchReportStore::new(metadata.clone()).unwrap();
-        metadata.transaction(|tx| prepared.insert_in(tx)).unwrap();
-        metadata.transaction(|tx| prepared.verify_in(tx)).unwrap();
-        assert_eq!(store.list_recent(25).unwrap(), vec![report.clone()]);
-        let mut changed = report.clone();
-        changed.comparison.as_mut().unwrap().matched_sample_count = 4;
-        let changed = PreparedReportImport::prepare(vec![changed]).unwrap();
-        assert!(matches!(
-            metadata.transaction(|tx| changed.insert_in(tx)),
-            Err(ReportError::ConflictingSession)
-        ));
-        assert_eq!(store.get(&report.session_id).unwrap(), Some(report));
-    }
-
-    #[test]
-    fn imported_batch_rolls_back_and_index_corruption_is_not_an_identical_retry() {
-        let metadata = Arc::new(MetadataStore::in_memory().unwrap());
-        let store = LaunchReportStore::new(metadata.clone()).unwrap();
-        let report = imported_report();
-        let prepared = PreparedReportImport::prepare(vec![report.clone()]).unwrap();
-        metadata.transaction(|tx| prepared.insert_in(tx)).unwrap();
-        let mut new = report.clone();
-        new.session_id = format!("legacy-{}", "c".repeat(64));
-        let mut conflict = report.clone();
-        conflict.exit_code = Some(1);
-        let batch = PreparedReportImport::prepare(vec![new.clone(), conflict]).unwrap();
-        assert!(matches!(
-            metadata.transaction(|tx| batch.insert_in(tx)),
-            Err(ReportError::ConflictingSession)
-        ));
-        assert!(store.get(&new.session_id).unwrap().is_none());
-        metadata
-            .transaction(|tx| -> Result<(), ReportError> {
-                tx.execute(
-                    "UPDATE launch_reports SET instance_id='different' WHERE session_id=?1",
-                    [&report.session_id],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        assert!(matches!(
-            metadata.transaction(|tx| prepared.verify_in(tx)),
-            Err(ReportError::Invalid)
-        ));
-        assert!(matches!(
-            metadata.transaction(|tx| prepared.insert_in(tx)),
-            Err(ReportError::Invalid)
-        ));
-    }
-
-    #[test]
-    fn imported_preparation_rejects_noncanonical_lossy_and_duplicate_records() {
-        let report = imported_report();
-        assert!(PreparedReportImport::prepare(vec![report.clone(), report.clone()]).is_err());
-        let mut ordinary = report.clone();
-        ordinary.session_id = uuid::Uuid::new_v4().to_string();
-        assert!(PreparedReportImport::prepare(vec![ordinary]).is_err());
-        let mut noncanonical = report;
-        noncanonical.session_outcome.summary = "Invented successful summary".into();
-        assert!(PreparedReportImport::prepare(vec![noncanonical]).is_err());
-    }
-
-    fn archived_inputs(count: usize) -> Vec<(String, LaunchProofRecord)> {
-        let original = imported_report();
-        (1..=count)
-            .map(|index| {
-                let mut report = original.clone();
-                report.session_id = format!("legacy-{index:064x}");
-                (ARCHIVE_INSTANCE.into(), report)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn archived_reports_keep_ids_comparisons_and_exact_snapshot_across_reopen() {
-        let root =
-            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-        let path = root.path().join("reports.sqlite");
-        let metadata = Arc::new(MetadataStore::open(&path).unwrap());
-        let store = LaunchReportStore::new(metadata.clone()).unwrap();
-        let mut inputs = archived_inputs(2);
-        inputs[1].0 = "fedcba9876543210".into();
-        let mut expected: Vec<_> = inputs
-            .iter()
-            .map(|(legacy, report)| {
-                let mut report = report.clone();
-                report.instance_id = format!("archived-{ARCHIVE_SOURCE}-{legacy}");
-                assert!(
-                    report
-                        .instance_id
-                        .parse::<crate::instances::model::InstanceId>()
-                        .is_err()
-                );
-                report
-            })
-            .collect();
-        let archived = PreparedReportImport::prepare_archived(ARCHIVE_SOURCE, inputs).unwrap();
-        let proof = archived.completion_proof(ARCHIVE_SOURCE).unwrap();
-        assert_eq!(proof.count(), 2);
-        let mut mapped = imported_report();
-        mapped.session_id = format!("legacy-{}", "c".repeat(64));
-        let mut combined = PreparedReportImport::prepare(vec![mapped.clone()]).unwrap();
-        combined.append(&archived).unwrap();
-        metadata.transaction(|tx| combined.insert_in(tx)).unwrap();
-        metadata.transaction(|tx| combined.insert_in(tx)).unwrap();
-        expected.push(mapped);
-        for report in &expected {
-            assert_eq!(
-                store.get(&report.session_id).unwrap().as_ref(),
-                Some(report)
-            );
-        }
-        assert!(combined.completion_proof(ARCHIVE_SOURCE).is_err());
-        let mut later = archived_inputs(3).pop().unwrap();
-        later.0 = "1111111111111111".into();
-        let later = PreparedReportImport::prepare_archived(ARCHIVE_SOURCE, vec![later]).unwrap();
-        metadata.transaction(|tx| later.insert_in(tx)).unwrap();
+        let redactor = Redactor::new(vec![]);
+        let baseline = session_report();
+        store.record(baseline.clone(), &redactor).unwrap();
+        let mut report = baseline.clone();
+        report.session_id = uuid::Uuid::new_v4().to_string();
+        report.recorded_at = "2026-01-01T00:00:03.000Z".into();
+        report.boot_duration_ms = Some(500);
+        store.record(report.clone(), &redactor).unwrap();
+        let saved = store.get(&report.session_id).unwrap().unwrap();
+        let comparison = saved.comparison.as_ref().unwrap();
+        assert_eq!(comparison.baseline_session_id, baseline.session_id);
+        assert_eq!(comparison.matched_sample_count, 1);
+        assert_eq!(comparison.current_value_ms, 500);
+        assert_eq!(comparison.baseline_value_ms, 1000);
+        let mut later = report.clone();
+        later.session_id = uuid::Uuid::new_v4().to_string();
+        later.recorded_at = "2026-01-01T00:00:04.000Z".into();
+        store.record(later, &redactor).unwrap();
         drop(store);
         drop(metadata);
 
         let metadata = Arc::new(MetadataStore::open(&path).unwrap());
-        let store = LaunchReportStore::new(metadata.clone()).unwrap();
-        let proof: ArchivedReportCompletionProof =
-            serde_json::from_slice(&serde_json::to_vec(&proof).unwrap()).unwrap();
-        metadata
-            .read(|db| proof.verify_in(db, ARCHIVE_SOURCE))
-            .unwrap();
-        metadata.read(|db| combined.verify_in(db)).unwrap();
-        assert_eq!(store.list_recent(25).unwrap().len(), 4);
-        for report in &expected {
-            assert_eq!(
-                store.get(&report.session_id).unwrap().as_ref(),
-                Some(report)
-            );
-        }
-    }
-
-    #[test]
-    fn archived_reports_preserve_mapped_uuid_validation_and_bound_their_proof() {
-        let input = archived_inputs(1).remove(0);
-        assert!(PreparedReportImport::prepare_archived("invalid", vec![input.clone()]).is_err());
-        assert!(
-            PreparedReportImport::prepare_archived(
-                ARCHIVE_SOURCE,
-                vec![("ABCDEF0123456789".into(), input.1.clone())]
-            )
-            .is_err()
-        );
-        let mut invalid = input.clone();
-        invalid.1.session_outcome.summary = "Invented summary".into();
-        assert!(PreparedReportImport::prepare_archived(ARCHIVE_SOURCE, vec![invalid]).is_err());
-        assert!(
-            PreparedReportImport::prepare_archived(
-                ARCHIVE_SOURCE,
-                vec![input.clone(), input.clone()]
-            )
-            .is_err()
-        );
+        let store = LaunchReportStore::new(metadata).unwrap();
+        store.record(report.clone(), &redactor).unwrap();
+        assert_eq!(store.get(&report.session_id).unwrap(), Some(saved.clone()));
+        assert_eq!(store.list_recent(25).unwrap()[1], saved);
+        report.exit_code = Some(1);
         assert!(matches!(
-            PreparedReportImport::prepare_archived(ARCHIVE_SOURCE, archived_inputs(1025)),
-            Err(ReportError::TooLarge)
+            store.record(report.clone(), &redactor),
+            Err(ReportError::ConflictingSession)
         ));
-        let archived = PreparedReportImport::prepare_archived(ARCHIVE_SOURCE, vec![input]).unwrap();
-        assert!(PreparedReportImport::prepare(vec![archived.records[0].report.clone()]).is_err());
-        assert!(archived.completion_proof(OTHER_ARCHIVE_SOURCE).is_err());
-
-        let mut full =
-            PreparedReportImport::prepare_archived(ARCHIVE_SOURCE, archived_inputs(1024)).unwrap();
-        let proof = full.completion_proof(ARCHIVE_SOURCE).unwrap();
-        assert_eq!(proof.count(), 1024);
-        let encoded = serde_json::to_vec(&proof).unwrap();
-        assert!(encoded.len() > 16 * 1024 && encoded.len() <= MAX_COMPLETION_PROOF_BYTES);
-        assert!(matches!(full.append(&archived), Err(ReportError::TooLarge)));
-        assert_eq!(full.completion_proof(ARCHIVE_SOURCE).unwrap(), proof);
-        let mut duplicate = archived.clone();
-        assert!(duplicate.append(&archived).is_err());
-        assert_eq!(
-            duplicate.completion_proof(ARCHIVE_SOURCE).unwrap().count(),
-            1
-        );
-
-        let metadata = Arc::new(MetadataStore::in_memory().unwrap());
-        let _store = LaunchReportStore::new(metadata.clone()).unwrap();
-        let empty = PreparedReportImport::prepare_archived(ARCHIVE_SOURCE, vec![]).unwrap();
-        let empty_proof = empty.completion_proof(ARCHIVE_SOURCE).unwrap();
-        assert_eq!(empty_proof.count(), 0);
-        metadata
-            .read(|db| empty_proof.verify_in(db, ARCHIVE_SOURCE))
-            .unwrap();
-        assert!(
-            metadata
-                .read(|db| empty_proof.verify_in(db, OTHER_ARCHIVE_SOURCE))
-                .is_err()
-        );
-        assert_ne!(
-            empty_proof.digest,
-            empty.completion_proof(OTHER_ARCHIVE_SOURCE).unwrap().digest
-        );
-        for mutation in ["order", "duplicate", "id", "source", "digest", "count"] {
-            let mut changed = proof.clone();
-            match mutation {
-                "order" => changed.ids.reverse(),
-                "duplicate" => changed.ids[1] = changed.ids[0].clone(),
-                "id" => changed.ids[0] = "ordinary-session".into(),
-                "source" => changed.source_id = OTHER_ARCHIVE_SOURCE.into(),
-                "digest" => changed.digest = "Z".repeat(64),
-                "count" => changed.ids.push(format!("legacy-{:064x}", 1025)),
-                _ => unreachable!(),
-            }
-            assert!(
-                matches!(
-                    metadata.read(|db| changed.verify_in(db, ARCHIVE_SOURCE)),
-                    Err(ReportError::Invalid)
-                ),
-                "{mutation}"
-            );
-        }
-        let encoded = serde_json::to_string(&proof).unwrap();
-        let duplicate = format!("{{\"source_id\":\"{ARCHIVE_SOURCE}\",{}", &encoded[1..]);
-        assert!(serde_json::from_str::<ArchivedReportCompletionProof>(&duplicate).is_err());
-        let mut unknown = serde_json::to_value(&proof).unwrap();
-        unknown["unknown"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<ArchivedReportCompletionProof>(unknown).is_err());
+        assert_eq!(store.get(&report.session_id).unwrap(), Some(saved));
     }
 
     #[test]
-    fn archived_reports_completion_rejects_missing_changed_and_foreign_evidence_without_repair() {
-        for corruption in ["missing", "comparison", "source", "index", "canonical"] {
+    fn session_report_retry_rejects_misindexed_or_noncanonical_storage() {
+        for corruption in ["instance", "recorded_at", "payload"] {
             let metadata = Arc::new(MetadataStore::in_memory().unwrap());
             let store = LaunchReportStore::new(metadata.clone()).unwrap();
-            let archived =
-                PreparedReportImport::prepare_archived(ARCHIVE_SOURCE, archived_inputs(2)).unwrap();
-            let proof = archived.completion_proof(ARCHIVE_SOURCE).unwrap();
-            metadata.transaction(|tx| archived.insert_in(tx)).unwrap();
-            let id = proof.ids.last().unwrap();
-            metadata.transaction(|tx| -> Result<(), ReportError> {
-                if corruption == "missing" {
-                    tx.execute("DELETE FROM launch_reports WHERE session_id=?1", [id])?;
-                    return Ok(());
-                }
-                let bytes: Vec<u8> = tx.query_row("SELECT payload FROM launch_reports WHERE session_id=?1", [id], |row| row.get(0))?;
-                let mut report: LaunchProofRecord = serde_json::from_slice(&bytes).unwrap();
-                match corruption {
-                    "comparison" => report.comparison.as_mut().unwrap().matched_sample_count += 1,
-                    "source" => {
-                        report.instance_id = format!("archived-{OTHER_ARCHIVE_SOURCE}-{ARCHIVE_INSTANCE}");
-                        tx.execute("UPDATE launch_reports SET instance_id=?1 WHERE session_id=?2", params![report.instance_id, id])?;
-                    }
-                    "index" => { tx.execute("UPDATE launch_reports SET recorded_at='2026-01-02T00:00:02.000Z' WHERE session_id=?1", [id])?; }
-                    "canonical" => report.session_outcome.summary = "Invented summary".into(),
-                    _ => unreachable!(),
-                }
-                tx.execute("UPDATE launch_reports SET payload=?1 WHERE session_id=?2", params![serde_json::to_vec(&report).unwrap(), id])?;
-                Ok(())
-            }).unwrap();
-            assert!(
-                metadata
-                    .read(|db| proof.verify_in(db, ARCHIVE_SOURCE))
-                    .is_err(),
-                "{corruption}"
-            );
-            assert!(
-                metadata.read(|db| archived.verify_in(db)).is_err(),
-                "{corruption}"
-            );
-            if corruption == "missing" {
-                assert!(store.get(id).unwrap().is_none());
-            }
-            let count: usize = metadata
-                .read(|db| -> Result<_, ReportError> {
-                    Ok(db.query_row("SELECT count(*) FROM launch_reports", [], |row| row.get(0))?)
-                })
-                .unwrap();
-            assert_eq!(count, if corruption == "missing" { 1 } else { 2 });
-        }
-    }
-
-    #[test]
-    fn archived_reports_combined_publication_rolls_back_ignored_and_late_corrupted_rows() {
-        for rewrite in [false, true] {
-            let metadata = Arc::new(MetadataStore::in_memory().unwrap());
-            let store = LaunchReportStore::new(metadata.clone()).unwrap();
-            let mapped = imported_report();
-            let first = mapped.session_id.clone();
-            let mut batch = PreparedReportImport::prepare(vec![mapped]).unwrap();
-            let archived =
-                PreparedReportImport::prepare_archived(ARCHIVE_SOURCE, archived_inputs(2)).unwrap();
-            let last = archived.records.last().unwrap().report.session_id.clone();
-            batch.append(&archived).unwrap();
-            let trigger = if rewrite {
-                format!(
-                    "CREATE TRIGGER break_reports AFTER INSERT ON launch_reports WHEN NEW.session_id='{last}' BEGIN UPDATE launch_reports SET payload=CAST('{{}}' AS BLOB) WHERE session_id='{first}'; END;"
-                )
-            } else {
-                format!(
-                    "CREATE TRIGGER break_reports BEFORE INSERT ON launch_reports WHEN NEW.session_id='{last}' BEGIN SELECT RAISE(IGNORE); END;"
-                )
-            };
+            let redactor = Redactor::new(vec![]);
+            let report = session_report();
+            store.record(report.clone(), &redactor).unwrap();
             metadata
                 .transaction(|tx| -> Result<(), ReportError> {
-                    tx.execute_batch(&trigger)?;
+                    match corruption {
+                        "instance" => {
+                            tx.execute("UPDATE launch_reports SET instance_id='different'", [])?;
+                        }
+                        "recorded_at" => {
+                            tx.execute(
+                                "UPDATE launch_reports SET recorded_at='2026-01-02T00:00:02.000Z'",
+                                [],
+                            )?;
+                        }
+                        "payload" => {
+                            let mut saved = stored_report(tx, &report.session_id)?.unwrap();
+                            saved.session_outcome.summary = "Invented summary".into();
+                            tx.execute(
+                                "UPDATE launch_reports SET payload=?1",
+                                [serde_json::to_vec(&saved).unwrap()],
+                            )?;
+                        }
+                        _ => unreachable!(),
+                    }
                     Ok(())
                 })
                 .unwrap();
-            assert!(metadata.transaction(|tx| batch.insert_in(tx)).is_err());
-            assert!(store.list_recent(25).unwrap().is_empty());
-            assert!(
-                metadata
-                    .read(|db| archived
-                        .completion_proof(ARCHIVE_SOURCE)?
-                        .verify_in(db, ARCHIVE_SOURCE))
-                    .is_err()
-            );
-            assert!(store.list_recent(25).unwrap().is_empty());
+            assert!(matches!(
+                store.get(&report.session_id),
+                Err(ReportError::Invalid)
+            ));
+            assert!(matches!(
+                store.record(report, &redactor),
+                Err(ReportError::Invalid)
+            ));
         }
-    }
-
-    #[test]
-    fn archived_reports_verification_and_replay_bound_actual_stored_bytes() {
-        let metadata = Arc::new(MetadataStore::in_memory().unwrap());
-        let store = LaunchReportStore::new(metadata.clone()).unwrap();
-        let limit = MAX_IMPORT_BYTES / MAX_REPORT_BYTES;
-        let batch =
-            PreparedReportImport::prepare_archived(ARCHIVE_SOURCE, archived_inputs(limit + 2))
-                .unwrap();
-        metadata.transaction(|tx| batch.insert_in(tx)).unwrap();
-        let last = &batch.records.last().unwrap().report.session_id;
-        metadata.transaction(|tx| -> Result<(), ReportError> {
-            tx.execute(
-                "UPDATE launch_reports SET payload=CAST(payload || replace(hex(zeroblob(?1-length(payload))),'00',' ') AS BLOB) WHERE session_id<>?2",
-                params![MAX_REPORT_BYTES, last],
-            )?;
-            tx.execute("UPDATE launch_reports SET payload=CAST('{}' AS BLOB) WHERE session_id=?1", [last])?;
-            Ok(())
-        }).unwrap();
-        let exact =
-            PreparedReportImport::prepare_archived(ARCHIVE_SOURCE, archived_inputs(limit)).unwrap();
-        metadata.read(|db| exact.verify_in(db)).unwrap();
-        // The over-budget row must stop both passes before the later malformed
-        // row. A final-only budget check would instead report Invalid on replay.
-        assert!(matches!(
-            metadata.read(|db| batch.verify_in(db)),
-            Err(ReportError::TooLarge)
-        ));
-        assert!(matches!(
-            metadata.transaction(|tx| batch.insert_in(tx)),
-            Err(ReportError::TooLarge)
-        ));
-        assert!(matches!(store.get(last), Err(ReportError::Invalid)));
     }
 
     const VANILLA: &[u8] = r###"---- Minecraft Crash Report ----

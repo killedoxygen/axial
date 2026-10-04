@@ -2,7 +2,7 @@
 //! capability inside the validated command until the session settles.
 
 use crate::{
-    accounts::{directory::AccountDirectory, selection::CapturedAccount},
+    accounts::{directory::AccountDirectory, selection::CapturedSelection},
     instances::directory::RegisteredInstance,
     instances::model::InstanceId,
     settings::SettingsStore,
@@ -18,7 +18,7 @@ pub(super) struct PreparedSession {
     version_id: String,
     command: ValidatedLaunchCommand,
     accounts: Arc<AccountDirectory>,
-    account: CapturedAccount,
+    account: CapturedSelection,
     settings: Arc<SettingsStore>,
     settings_revision: u64,
     secrets: Vec<String>,
@@ -38,7 +38,7 @@ impl PreparedSession {
         version_id: String,
         command: ValidatedLaunchCommand,
         accounts: Arc<AccountDirectory>,
-        account: CapturedAccount,
+        account: CapturedSelection,
         settings: Arc<SettingsStore>,
         settings_revision: u64,
         secrets: Vec<String>,
@@ -140,8 +140,8 @@ impl PreparedSession {
         self.performance
             .validate_current()
             .map_err(|_| LaunchError::PerformanceUnsettled)?;
-        self.accounts
-            .validate_capture(&self.account)
+        self.account
+            .validate(&self.accounts)
             .map_err(|_| LaunchError::AccountChanged)?;
         let current = self
             .settings
@@ -219,10 +219,8 @@ pub(super) mod tests {
             .migrate(&[
                 crate::instances::directory::MIGRATION,
                 crate::instances::create::MIGRATION,
-                crate::instances::create::DUPLICATE_WITNESS_MIGRATION,
                 crate::content::install::MIGRATION,
                 crate::performance::mutation::MIGRATION,
-                crate::performance::mutation::MIGRATION_V2,
                 crate::performance::rules::MIGRATION,
             ])
             .unwrap();
@@ -330,7 +328,7 @@ pub(super) mod tests {
             instance_id: instance.record().instance.id.clone(),
             version_id: "1.20.1".into(),
             command,
-            account: accounts.capture_selected().unwrap(),
+            account: CapturedSelection::capture(&accounts).unwrap(),
             accounts,
             settings_revision: settings.current().unwrap().revision,
             settings,
@@ -406,6 +404,46 @@ pub(super) mod tests {
                     Err(LaunchError::SettingsChanged)
                 ));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_offline_selection_is_fenced_at_the_actual_pre_spawn_boundary() {
+        for change_account in [true, false] {
+            let (_root, mut prepared, _application) = fixture().await;
+            let selected = prepared.accounts.capture_selected().unwrap();
+            prepared.accounts.remove(selected.account_id()).unwrap();
+            prepared.account = CapturedSelection::capture(&prepared.accounts).unwrap();
+            let prepared = construct(prepared).unwrap();
+            prepared.validate_before_spawn().unwrap();
+
+            let expected = if change_account {
+                let changed = prepared
+                    .accounts
+                    .create_offline_account("Elsewhere")
+                    .unwrap();
+                prepared
+                    .accounts
+                    .remove(changed.active_account_id.as_ref().unwrap().as_str())
+                    .unwrap();
+                assert!(
+                    prepared
+                        .accounts
+                        .snapshot()
+                        .unwrap()
+                        .active_account_id
+                        .is_none()
+                );
+                LaunchError::AccountChanged
+            } else {
+                prepared.settings.update(
+                    serde_json::from_value(serde_json::json!({
+                        "expected_revision": prepared.settings_revision, "username": "Elsewhere",
+                    })).unwrap(),
+                ).unwrap();
+                LaunchError::SettingsChanged
+            };
+            assert_eq!(prepared.validate_before_spawn().unwrap_err(), expected);
         }
     }
 

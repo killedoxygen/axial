@@ -4,7 +4,6 @@ pub mod benchmarks;
 pub mod config;
 pub mod content;
 pub mod flags;
-pub mod import;
 pub mod install;
 pub mod instances;
 pub mod java;

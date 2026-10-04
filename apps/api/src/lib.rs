@@ -21,7 +21,6 @@ use axial_app::{
     },
     catalog::Catalog,
     content::{catalog::ContentService, install::ContentMutations},
-    import::ImportPreviews,
     install::queue::InstallQueue,
     instances::{
         create::InstanceService,
@@ -188,7 +187,6 @@ pub struct DesktopServices {
     pub auth: Arc<AuthService>,
     pub telemetry: Arc<Telemetry>,
     pub updates: UpdateService,
-    pub imports: Arc<ImportPreviews>,
     pub catalog: Arc<Catalog>,
     pub instances: Arc<InstanceService>,
     pub installs: Arc<InstallQueue>,
@@ -534,30 +532,14 @@ async fn start_profile_inner(
         let metadata = Arc::new(MetadataStore::open(profile.root.join("metadata.sqlite"))
             .map_err(|_| "Could not open replacement metadata. Existing data has been preserved.".to_string())?);
         metadata.migrate(&[SETTINGS_MIGRATION, ACCOUNTS_MIGRATION,
-            axial_app::import::METADATA_IMPORT_MIGRATION,
-            axial_app::import::METADATA_IMPORT_IDENTITIES_MIGRATION,
-            axial_app::import::METADATA_IMPORT_HISTORY_MIGRATION,
-            axial_app::import::METADATA_IMPORT_ARCHIVED_REPORTS_MIGRATION,
-            axial_app::import::METADATA_IMPORT_ARCHIVED_BENCHMARKS_MIGRATION,
-            axial_app::import::METADATA_IMPORT_ARCHIVED_OPERATIONS_MIGRATION,
-            axial_app::import::METADATA_IMPORT_ARCHIVED_CONTENT_MIGRATION,
-            axial_app::import::METADATA_IMPORT_UNSELECTED_ACCOUNTS_MIGRATION,
             axial_app::instances::directory::MIGRATION, axial_app::instances::delete::MIGRATION,
-            axial_app::instances::create::MIGRATION, axial_app::instances::create::DUPLICATE_WITNESS_MIGRATION,
-            axial_app::instances::import::MIGRATION,
-            axial_app::install::queue::MIGRATION, axial_app::install::queue::MIGRATION_V2,
-            axial_app::install::history::MIGRATION,
+            axial_app::instances::create::MIGRATION,
+            axial_app::install::queue::MIGRATION,
             axial_app::content::install::MIGRATION, axial_app::performance::rules::MIGRATION,
-            axial_app::performance::rules::IMPORT_MIGRATION,
-            axial_app::performance::mutation::MIGRATION, axial_app::performance::mutation::MIGRATION_V2,
+            axial_app::performance::mutation::MIGRATION,
             axial_app::performance::benchmarks::MIGRATION,
-            axial_app::performance::benchmarks::MIGRATION_V2,
-            axial_app::performance::benchmarks::MIGRATION_V3,
-            axial_app::skins::store::MIGRATION, axial_app::skins::store::IMPORT_MIGRATION,
-            axial_app::launch::coordinator::INTENT_MIGRATION,
-            axial_app::launch::coordinator::INTENT_TERMINAL_MIGRATION,
-            axial_app::launch::coordinator::INTENT_SETTLEMENT_MIGRATION,
-            axial_app::launch::coordinator::INTENT_RECOVERY_MIGRATION])
+            axial_app::skins::store::MIGRATION,
+            axial_app::launch::coordinator::INTENT_MIGRATION])
             .map_err(|_| "Could not migrate replacement metadata. Existing data has been preserved.".to_string())?;
         let settings = Arc::new(SettingsStore::new_with_telemetry_identity(metadata.clone(), telemetry_for_init.export_configured())
             .map_err(|error| error.to_string())?);
@@ -825,7 +807,6 @@ async fn start_profile_inner(
         std::env::consts::OS,
         std::env::consts::ARCH,
     );
-    let imports = Arc::new(ImportPreviews::new());
     let folders = Arc::new(FolderService::new(
         instances.clone(),
         tasks.clone(),
@@ -843,30 +824,13 @@ async fn start_profile_inner(
         .merge(routes::auth::router(auth.clone(), native_login))
         .merge(routes::telemetry::router(telemetry.clone()))
         .merge(routes::update::router(updates.clone()))
-        .merge(
-            routes::import::router(
-                imports.clone(),
-                instances.clone(),
-                settings.clone(),
-                accounts.clone(),
-                skins.library.clone(),
-                performance.rules().clone(),
-                telemetry.clone(),
-                tasks.clone(),
-            )
-            .map_err(|error| StartupError::with_library(error.to_string(), library.clone()))?,
-        )
         .merge(routes::instances::router(
             instances.clone(),
             setup.clone(),
             sessions.clone(),
         ))
         .merge(routes::setup::router(setup.clone()))
-        .merge(routes::install::router(
-            installs.clone(),
-            setup.clone(),
-            instances.clone(),
-        ))
+        .merge(routes::install::router(installs.clone(), setup.clone()))
         .merge(routes::loaders::router(
             library.clone(),
             catalog.clone(),
@@ -973,7 +937,6 @@ async fn start_profile_inner(
         auth,
         telemetry,
         updates,
-        imports,
         catalog,
         instances,
         installs,

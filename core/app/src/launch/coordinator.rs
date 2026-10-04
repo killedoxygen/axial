@@ -18,37 +18,15 @@ pub const INTENT_MIGRATION: Migration = Migration {
         intent_key TEXT PRIMARY KEY NOT NULL CHECK(length(intent_key)=36),
         payload BLOB NOT NULL CHECK(length(payload) BETWEEN 1 AND 16384),
         state TEXT NOT NULL CHECK(state IN ('pending','accepted','rejected','interrupted')),
-        error TEXT
-    ) STRICT;",
-};
-
-pub const INTENT_TERMINAL_MIGRATION: Migration = Migration {
-    id: "launch_intents.v2",
-    sql: "ALTER TABLE launch_intents ADD COLUMN terminal_ack INTEGER NOT NULL DEFAULT 0 CHECK(terminal_ack IN (0,1));
+        error TEXT,
+        terminal_ack INTEGER NOT NULL DEFAULT 0 CHECK(terminal_ack IN (0,1)),
+        settlement BLOB CHECK(settlement IS NULL OR length(settlement) BETWEEN 1 AND 4096)
+    ) STRICT;
     CREATE INDEX launch_intents_unresolved ON launch_intents(intent_key)
         WHERE state IN ('accepted','interrupted') AND terminal_ack=0;
     CREATE INDEX launch_intents_session ON launch_intents(
         json_extract(CASE WHEN json_valid(CAST(payload AS TEXT)) THEN CAST(payload AS TEXT) ELSE '{}' END, '$.session_id'))
         WHERE state IN ('accepted','interrupted');",
-};
-
-pub const INTENT_SETTLEMENT_MIGRATION: Migration = Migration {
-    id: "launch_intents.v3",
-    sql: "ALTER TABLE launch_intents ADD COLUMN settlement BLOB
-        CHECK(settlement IS NULL OR length(settlement) BETWEEN 1 AND 4096);
-    DROP INDEX launch_intents_unresolved;
-    CREATE INDEX launch_intents_unresolved ON launch_intents(intent_key)
-        WHERE state IN ('accepted','interrupted') AND terminal_ack=0 AND
-        CASE WHEN json_valid(CAST(settlement AS TEXT))
-             THEN json_type(CAST(settlement AS TEXT), '$.version') IS NOT 'integer'
-               OR json_extract(CAST(settlement AS TEXT), '$.version') IS NOT 1 ELSE 1 END;",
-};
-
-pub const INTENT_RECOVERY_MIGRATION: Migration = Migration {
-    id: "launch_intents.v4",
-    sql: "DROP INDEX launch_intents_unresolved;
-    CREATE INDEX launch_intents_unresolved ON launch_intents(intent_key)
-        WHERE state IN ('accepted','interrupted') AND terminal_ack=0;",
 };
 
 use super::session::SessionSnapshot;
@@ -61,7 +39,7 @@ use crate::{
     accounts::{
         directory::AccountDirectory,
         model::{AccountKind, LaunchAuthMode},
-        selection::CapturedAccount,
+        selection::{CapturedAccount, CapturedSelection},
         session::AuthService,
     },
     install::queue::{InstallError, InstallQueue, InstalledVersionReceipt},
@@ -502,13 +480,18 @@ impl LaunchCoordinator {
                         proof
                     };
                     let version = proof.installed.version();
-                    let (account, settings) =
+                    let (selection, settings, _) =
                         coordinator.capture(&admitted.record().instance, None)?;
                     let result = async {
-                        if account.kind() == AccountKind::Microsoft {
+                        if let Some(account) = selection.account()
+                            && account.kind() == AccountKind::Microsoft
+                        {
+                            if !account.owns_minecraft_java() {
+                                return Err(LaunchError::OnlineAccountUnavailable);
+                            }
                             coordinator
                                 .auth
-                                .credentials(&account)
+                                .credentials(account)
                                 .await
                                 .map_err(|_| LaunchError::OnlineAccountUnavailable)?;
                         }
@@ -555,9 +538,8 @@ impl LaunchCoordinator {
                         Ok::<(), LaunchError>(())
                     }
                     .await;
-                    coordinator
-                        .accounts
-                        .validate_capture(&account)
+                    selection
+                        .validate(&coordinator.accounts)
                         .map_err(|_| LaunchError::AccountChanged)?;
                     coordinator
                         .settings
@@ -598,20 +580,20 @@ impl LaunchCoordinator {
         &self,
         instance: &crate::instances::model::Instance,
         username: Option<&str>,
-    ) -> Result<(CapturedAccount, EffectiveLaunchSettings), LaunchError> {
-        let account = self
-            .accounts
-            .capture_selected()
+    ) -> Result<(CapturedSelection, EffectiveLaunchSettings, String), LaunchError> {
+        let selection = CapturedSelection::capture(&self.accounts)
             .map_err(|_| LaunchError::AccountUnavailable)?;
-        if account.kind().launch_mode() != account.launch_auth_mode() {
-            return Err(LaunchError::OnlineAccountUnavailable);
-        }
-        if account.kind() == AccountKind::Offline
-            && username
-                .filter(|value| !value.trim().is_empty())
-                .is_some_and(|name| name.trim() != account.display_name())
-        {
-            return Err(LaunchError::AccountChanged);
+        if let Some(account) = selection.account() {
+            if account.kind().launch_mode() != account.launch_auth_mode() {
+                return Err(LaunchError::OnlineAccountUnavailable);
+            }
+            if account.kind() == AccountKind::Offline
+                && username
+                    .filter(|value| !value.trim().is_empty())
+                    .is_some_and(|name| name.trim() != account.display_name())
+            {
+                return Err(LaunchError::AccountChanged);
+            }
         }
         let global = self
             .settings
@@ -623,7 +605,19 @@ impl LaunchCoordinator {
             .map_err(|_| LaunchError::PlanRejected)?;
         super::plan::split_extra_args(&settings.extra_jvm_args)
             .map_err(|_| LaunchError::PlanRejected)?;
-        Ok((account, settings))
+        let player_name = selection
+            .account()
+            .map_or_else(
+                || {
+                    username
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| global.offline_username())
+                },
+                CapturedAccount::display_name,
+            )
+            .to_owned();
+        Ok((selection, settings, player_name))
     }
 
     async fn prepare(
@@ -635,7 +629,7 @@ impl LaunchCoordinator {
         native_retention: &Mutex<Option<Arc<crate::install::vanilla::PreparedNatives>>>,
         telemetry: Arc<super::session::LaunchAttemptTelemetry>,
     ) -> Result<PreparedSession, LaunchError> {
-        let (account, mut effective) =
+        let (selection, mut effective, player_name) =
             self.capture(&admitted.record().instance, request.username.as_deref())?;
         if let Some(value) = request.max_memory_mb.filter(|value| *value > 0) {
             effective.max_memory_mb = value;
@@ -717,7 +711,26 @@ impl LaunchCoordinator {
             .insert("has_custom_resolution".into(), resolution.is_some());
         // Complete fallible account/settings work before publishing a fresh
         // native directory. Once published, every rejection must settle it.
-        let (account, auth, secrets, credential_expires_at) = self.prepare_auth(account).await?;
+        let (selection, auth, secrets, credential_expires_at) =
+            if let Some(account) = selection.account() {
+                let (account, auth, secrets, expires) = self.prepare_auth(account.clone()).await?;
+                (
+                    CapturedSelection::from_account(account),
+                    auth,
+                    secrets,
+                    expires,
+                )
+            } else {
+                selection
+                    .validate(&self.accounts)
+                    .map_err(|_| LaunchError::AccountChanged)?;
+                (
+                    selection,
+                    LaunchAuthContext::offline(player_name),
+                    Vec::new(),
+                    None,
+                )
+            };
         let game_dir = admitted
             .game_directory()
             .read_projection()
@@ -770,7 +783,7 @@ impl LaunchCoordinator {
                 instance.version_id,
                 command,
                 self.accounts.clone(),
-                account,
+                selection,
                 self.settings.clone(),
                 effective.global_config_revision,
                 secrets,
@@ -800,6 +813,9 @@ impl LaunchCoordinator {
                 return Err(LaunchError::AccountUnavailable);
             }
             return Ok((capture, auth, Vec::new(), None));
+        }
+        if !capture.owns_minecraft_java() {
+            return Err(LaunchError::OnlineAccountUnavailable);
         }
         if self.auth.launch_credentials(&capture).await.is_err() {
             capture = self
@@ -1993,8 +2009,17 @@ mod tests {
 
     #[cfg(unix)]
     async fn preflight_fixture() -> (tempfile::TempDir, LaunchCoordinator, InstanceId) {
+        preflight_fixture_with_credentials(Arc::new(
+            crate::accounts::credential_store::CredentialStore::isolated_for_tests(),
+        ))
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn preflight_fixture_with_credentials(
+        credentials: Arc<crate::accounts::credential_store::CredentialStore>,
+    ) -> (tempfile::TempDir, LaunchCoordinator, InstanceId) {
         use crate::{
-            accounts::credential_store::CredentialStore,
             network::{ClientConfig, ProviderClient},
             skins::{ProfileMedia, library::SavedSkinLibrary, store::SavedSkinStore},
         };
@@ -2004,7 +2029,6 @@ mod tests {
         storage
             .migrate(&[
                 crate::install::queue::MIGRATION,
-                crate::install::queue::MIGRATION_V2,
                 crate::performance::rules::MIGRATION,
                 crate::skins::store::MIGRATION,
             ])
@@ -2048,7 +2072,7 @@ mod tests {
         accounts.create_offline_account("Preflight").unwrap();
         let auth = Arc::new(AuthService::new(
             accounts.clone(),
-            Arc::new(CredentialStore::isolated_for_tests()),
+            credentials,
             tasks.clone(),
         ));
         let content = Arc::new(
@@ -2293,7 +2317,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_failure_keeps_existing_code_and_legacy_deserialization() {
+    fn runtime_failure_keeps_existing_code_and_current_deserialization() {
         let cause = JavaDiscoveryError::IncompatibleVersion {
             required: 17,
             actual: 21,
@@ -2312,6 +2336,111 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn known_missing_ownership_blocks_preflight_and_implicit_refresh() {
+        use crate::accounts::{
+            credential_store::CredentialStore, credentials::Credentials,
+            microsoft::MinecraftProfile, model::MicrosoftIdentity, session::AuthError,
+        };
+
+        let credentials = Arc::new(CredentialStore::isolated_for_tests());
+        let (root, coordinator, id) = preflight_fixture_with_credentials(credentials.clone()).await;
+        let profile = uuid::Uuid::new_v4();
+        let account_id = profile.to_string();
+        // A refresh regression may schedule work, but cannot contact a provider.
+        let secrets = Credentials::new(
+            "private-microsoft-token".into(),
+            None,
+            u64::MAX,
+            "private-minecraft-token".into(),
+            u64::MAX,
+        )
+        .unwrap();
+        let fence = credentials.begin_change(&account_id, 0).await.unwrap();
+        let receipt = credentials.save(&fence, secrets.clone()).await.unwrap();
+        let mut identity = MicrosoftIdentity {
+            login_id: uuid::Uuid::new_v4().to_string(),
+            profile_id: profile.simple().to_string(),
+            display_name: "UnownedPlayer".into(),
+            credential_revision: receipt.revision(),
+            profile: MinecraftProfile {
+                id: profile.simple().to_string(),
+                name: "UnownedPlayer".into(),
+                skins: vec![],
+                capes: vec![],
+            },
+            owns_minecraft_java: false,
+        };
+        let capture = coordinator
+            .accounts
+            .commit_microsoft(
+                coordinator.accounts.selection_revision().unwrap(),
+                identity.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator.auth.credentials(&capture).await.unwrap(),
+            secrets
+        );
+        assert!(matches!(
+            coordinator.auth.launch_credentials(&capture).await,
+            Err(AuthError::OwnershipMissing)
+        ));
+        let secure_before = credentials.status(&account_id).await.unwrap();
+        let preflight = coordinator.preflight(id.clone()).await;
+        let mut work = coordinator.tasks.subscribe();
+        let prepared = coordinator.prepare_auth(capture.clone()).await;
+        let implicit_refresh = work.has_changed().unwrap();
+        work.borrow_and_update();
+        let unchanged = coordinator.accounts.validate_capture(&capture).is_ok();
+        let secure_after = credentials.status(&account_id).await.unwrap();
+        let probe_absent = !root.path().join("probe-started").exists();
+        assert_eq!(
+            coordinator.auth.credentials(&capture).await.unwrap(),
+            secrets
+        );
+
+        identity.owns_minecraft_java = true;
+        coordinator
+            .accounts
+            .refresh_account_microsoft(&capture, identity)
+            .unwrap();
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        let owned = coordinator.preflight(id).await;
+        let stale = coordinator.prepare_auth(capture).await;
+        coordinator
+            .tasks
+            .shutdown(std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        credentials
+            .task_owner()
+            .shutdown(std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        assert!(!preflight.launchable && probe_absent);
+        assert_eq!(
+            preflight.error.unwrap().code,
+            LaunchError::OnlineAccountUnavailable
+        );
+        assert!(matches!(
+            prepared,
+            Err(LaunchError::OnlineAccountUnavailable)
+        ));
+        assert!(
+            !implicit_refresh,
+            "known false ownership must not schedule a refresh"
+        );
+        assert!(unchanged);
+        assert_eq!(secure_after, secure_before);
+        assert!(owned.launchable, "{owned:?}");
+        assert!(matches!(stale, Err(LaunchError::AccountChanged)));
+        assert!(coordinator.sessions.snapshots().is_empty());
+        assert!(coordinator.tasks.status().is_idle());
     }
 
     #[cfg(unix)]
@@ -2602,6 +2731,8 @@ mod tests {
             ("instance", true, Some(LaunchError::InstanceChanged)),
             ("global", true, Some(LaunchError::SettingsChanged)),
             ("account", true, Some(LaunchError::AccountChanged)),
+            ("absent_account", false, Some(LaunchError::AccountChanged)),
+            ("absent_account", true, Some(LaunchError::AccountChanged)),
             ("foreground", false, Some(LaunchError::InstanceBusy)),
             ("foreground", true, Some(LaunchError::InstanceBusy)),
             ("display", false, None),
@@ -2612,6 +2743,10 @@ mod tests {
             ),
         ] {
             let (root, coordinator, id) = preflight_fixture().await;
+            if change == "absent_account" {
+                let account = coordinator.accounts.capture_selected().unwrap();
+                coordinator.accounts.remove(account.account_id()).unwrap();
+            }
             let mut projection = coordinator.preflight_projection();
             std::fs::write(root.path().join("probe-release"), b"release").unwrap();
             assert!(
@@ -2683,11 +2818,17 @@ mod tests {
                             )
                             .map_err(|_| LaunchError::SettingsChanged)?;
                     }
-                    "account" => {
-                        coordinator
+                    "account" | "absent_account" => {
+                        let changed = coordinator
                             .accounts
                             .create_offline_account("Elsewhere")
                             .map_err(|_| LaunchError::AccountChanged)?;
+                        if change == "absent_account" {
+                            coordinator
+                                .accounts
+                                .remove(changed.active_account_id.as_ref().unwrap().as_str())
+                                .map_err(|_| LaunchError::AccountChanged)?;
+                        }
                     }
                     "foreground" => foreground = Some(coordinator.admit(&id)?),
                     "none" => {}
@@ -2804,6 +2945,7 @@ mod tests {
         .unwrap();
         let profile_id = uuid::Uuid::new_v4().simple().to_string();
         let mut identity = MicrosoftIdentity {
+            owns_minecraft_java: true,
             login_id: uuid::Uuid::new_v4().to_string(),
             profile_id: profile_id.clone(),
             display_name: "PlayerOne".into(),
@@ -2890,14 +3032,7 @@ mod tests {
     }
 
     pub(super) fn durable_intents(storage: Arc<MetadataStore>) -> LaunchIntents {
-        storage
-            .migrate(&[
-                INTENT_MIGRATION,
-                INTENT_TERMINAL_MIGRATION,
-                INTENT_SETTLEMENT_MIGRATION,
-                INTENT_RECOVERY_MIGRATION,
-            ])
-            .unwrap();
+        storage.migrate(&[INTENT_MIGRATION]).unwrap();
         let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
         LaunchIntents::with_storage(storage, reports, 8).unwrap()
     }
@@ -3038,20 +3173,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observed_settlement_v3_upgrade_checks_mixed_evidence_after_reopen() {
+    async fn observed_settlement_checks_mixed_evidence_after_reopen() {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let path = root.path().join("metadata.sqlite");
         let storage = Arc::new(MetadataStore::open(&path).unwrap());
-        storage
-            .migrate(&[
-                INTENT_MIGRATION,
-                INTENT_TERMINAL_MIGRATION,
-                INTENT_SETTLEMENT_MIGRATION,
-            ])
-            .unwrap();
-        let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
-        let legacy = LaunchIntents::with_storage(storage.clone(), reports, 8).unwrap();
-        let (intents, valid, acceptance, _, _) = observed_fixture(legacy).await;
+        let (intents, valid, acceptance, _, _) =
+            observed_fixture(durable_intents(storage.clone())).await;
         let mut invalid = request();
         invalid.intent_key = Some("ffffffff-ffff-ffff-ffff-ffffffffffff".into());
         let invalid_key = invalid.intent_key.as_deref().unwrap();
@@ -3428,7 +3555,7 @@ mod tests {
         report
     }
 
-    fn insert_historical_report(
+    fn insert_unacknowledged_report(
         storage: &MetadataStore,
         report: &super::super::reports::LaunchProofRecord,
     ) {
@@ -3463,7 +3590,7 @@ mod tests {
             "raw_secret",
             "coordinate_secret",
             "different_loader",
-            "lossy_old_report",
+            "missing_version_proof",
         ] {
             let storage = Arc::new(MetadataStore::in_memory().unwrap());
             let intents = durable_intents(storage.clone());
@@ -3487,7 +3614,7 @@ mod tests {
                     report.scenario.version_id = Some(report.version_id.clone());
                     vec![]
                 }
-                "lossy_old_report" => {
+                "missing_version_proof" => {
                     report.version_id = "unknown".into();
                     report.scenario.version_id = None;
                     vec![]
@@ -3585,7 +3712,7 @@ mod tests {
     }
 
     #[test]
-    fn old_terminal_history_makes_bounded_durable_progress() {
+    fn unacknowledged_terminal_reports_make_bounded_durable_progress() {
         let storage = Arc::new(MetadataStore::in_memory().unwrap());
         let intents = durable_intents(storage.clone());
         let mut saved = Vec::new();
@@ -3597,7 +3724,7 @@ mod tests {
             intents
                 .accept(request.intent_key.as_deref().unwrap(), binding(&request))
                 .unwrap();
-            insert_historical_report(&storage, &terminal_report(&request, session_id));
+            insert_unacknowledged_report(&storage, &terminal_report(&request, session_id));
             saved.push(request);
         }
         assert!(matches!(
@@ -3650,7 +3777,7 @@ mod tests {
                 intents.accept(key, binding(&request)).unwrap();
             }
             let report = terminal_report(&request, session_id.clone());
-            insert_historical_report(&storage, &report);
+            insert_unacknowledged_report(&storage, &report);
             storage
                 .transaction(|tx| -> Result<(), StorageError> {
                     match corruption {
@@ -3712,14 +3839,9 @@ mod tests {
             .migrate(&[
                 crate::instances::directory::MIGRATION,
                 crate::instances::create::MIGRATION,
-                crate::instances::create::DUPLICATE_WITNESS_MIGRATION,
                 crate::content::install::MIGRATION,
                 crate::performance::mutation::MIGRATION,
-                crate::performance::mutation::MIGRATION_V2,
                 INTENT_MIGRATION,
-                INTENT_TERMINAL_MIGRATION,
-                INTENT_SETTLEMENT_MIGRATION,
-                INTENT_RECOVERY_MIGRATION,
             ])
             .unwrap();
         let directories =
@@ -3824,9 +3946,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_or_changed_binding_refuses_startup_and_leaves_lifecycle_fenced() {
+    async fn missing_or_changed_binding_refuses_startup_and_leaves_lifecycle_fenced() {
         for change in [
-            "old",
+            "missing",
             "version",
             "library",
             "application",
@@ -3839,7 +3961,7 @@ mod tests {
             let key = request.intent_key.as_deref().unwrap();
             let mut record = intents.record(key).unwrap().unwrap();
             match change {
-                "old" => record.binding = None,
+                "missing" => record.binding = None,
                 "version" => record.binding.as_mut().unwrap().version = 2,
                 "library" => record.binding.as_mut().unwrap().library_root[0] ^= 1,
                 "application" => record.binding.as_mut().unwrap().application_root[0] ^= 1,
@@ -3926,14 +4048,7 @@ mod tests {
         let storage = Arc::new(MetadataStore::in_memory().unwrap());
         let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
         assert!(LaunchIntents::needs_recovery(storage.clone(), reports.clone()).is_err());
-        storage
-            .migrate(&[
-                INTENT_MIGRATION,
-                INTENT_TERMINAL_MIGRATION,
-                INTENT_SETTLEMENT_MIGRATION,
-                INTENT_RECOVERY_MIGRATION,
-            ])
-            .unwrap();
+        storage.migrate(&[INTENT_MIGRATION]).unwrap();
         storage.transaction(|tx| -> Result<(), StorageError> {
             for _ in 0..=MAX_RECOVERY_INTENTS {
                 let request = request();
@@ -4127,7 +4242,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_terminal_proof_remains_historical_acceptance_after_disk_reopen() {
+    fn accepted_terminal_proof_survives_disk_reopen() {
         use crate::launch::{
             logs::Redactor,
             outcome::SessionOutcome,
@@ -4180,26 +4295,8 @@ mod tests {
                             .is_err()
                     );
                 }
-                // Simulate a pre-acknowledgement profile, including malformed
-                // historical linkage that the new report writer rejects.
-                insert_historical_report(intents.storage.as_ref().unwrap(), &report);
-                // Historical rows did not capture physical bindings. Exact
-                // session-owned terminal proof is still their settlement evidence.
-                let mut old = intents.record(key).unwrap().unwrap();
-                old.binding = None;
-                let payload = serde_json::to_vec(&old).unwrap();
-                intents
-                    .storage
-                    .as_ref()
-                    .unwrap()
-                    .transaction(|tx| -> Result<(), StorageError> {
-                        tx.execute(
-                            "UPDATE launch_intents SET payload=?2 WHERE intent_key=?1",
-                            params![key, payload],
-                        )?;
-                        Ok(())
-                    })
-                    .unwrap();
+                // Exercise retained proof validation independently of write admission.
+                insert_unacknowledged_report(intents.storage.as_ref().unwrap(), &report);
                 session_id
             };
             let recovered = durable_intents(Arc::new(MetadataStore::open(&path).unwrap()));

@@ -217,9 +217,59 @@ pub async fn refresh_login(
     minecraft_session_from_oauth(oauth, &device_pair, None).await
 }
 
-pub async fn sync_profile(token: &str) -> Result<MinecraftProfile, MicrosoftAuthError> {
-    minecraft_entitlements(token).await?;
-    minecraft_profile(token).await
+#[derive(Clone)]
+pub(super) struct ProfileClient {
+    profile_endpoint: String,
+    entitlements_endpoint: String,
+}
+
+pub(super) struct SyncedProfile {
+    pub profile: MinecraftProfile,
+    pub owns_minecraft_java: bool,
+}
+
+impl Default for ProfileClient {
+    fn default() -> Self {
+        Self {
+            profile_endpoint: MINECRAFT_PROFILE_ENDPOINT.into(),
+            entitlements_endpoint: MINECRAFT_ENTITLEMENTS_ENDPOINT.into(),
+        }
+    }
+}
+
+impl ProfileClient {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn fixture(base: &str) -> Self {
+        let url = url::Url::parse(base).unwrap();
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert!(url.port().is_some() && url.username().is_empty() && url.password().is_none());
+        assert!(url.path() == "/" && url.query().is_none() && url.fragment().is_none());
+        Self {
+            profile_endpoint: url.join("profile").unwrap().into(),
+            entitlements_endpoint: url.join("entitlements").unwrap().into(),
+        }
+    }
+
+    pub(super) async fn sync(&self, token: &str) -> Result<SyncedProfile, MicrosoftAuthError> {
+        let profile = minecraft_profile(token, &self.profile_endpoint).await?;
+        let owns_minecraft_java =
+            minecraft_entitlements(token, &self.entitlements_endpoint).await?;
+        Ok(SyncedProfile {
+            profile,
+            owns_minecraft_java,
+        })
+    }
+
+    async fn owned_profile(&self, token: &str) -> Result<MinecraftProfile, MicrosoftAuthError> {
+        if !minecraft_entitlements(token, &self.entitlements_endpoint).await? {
+            return Err(MicrosoftAuthError::new(
+                MicrosoftAuthErrorKind::OwnershipMissing,
+                MicrosoftAuthStep::MinecraftEntitlements,
+            ));
+        }
+        minecraft_profile(token, &self.profile_endpoint).await
+    }
 }
 
 /// Compare parsed URL components: string prefix checks admit lookalike paths.
@@ -621,8 +671,9 @@ async fn minecraft_session_from_oauth(
     .await?;
     let xsts = xsts_authorize(&authorized, device_pair, authorized.current_date).await?;
     let minecraft = minecraft_token(&xsts).await?;
-    minecraft_entitlements(&minecraft.access_token).await?;
-    let profile = minecraft_profile(&minecraft.access_token).await?;
+    let profile = ProfileClient::default()
+        .owned_profile(&minecraft.access_token)
+        .await?;
     if oauth.access_token.trim().is_empty() || minecraft.access_token.trim().is_empty() {
         return Err(MicrosoftAuthError::new(
             MicrosoftAuthErrorKind::Parse,
@@ -751,10 +802,10 @@ async fn minecraft_token(
     parse_response(response, MicrosoftAuthStep::MinecraftToken).await
 }
 
-async fn minecraft_entitlements(token: &str) -> Result<(), MicrosoftAuthError> {
+async fn minecraft_entitlements(token: &str, endpoint: &str) -> Result<bool, MicrosoftAuthError> {
     let client = auth_client()?;
     let response = client
-        .get(MINECRAFT_ENTITLEMENTS_ENDPOINT)
+        .get(endpoint)
         .query(&[("requestId", Uuid::new_v4().to_string())])
         .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::USER_AGENT, MINECRAFT_SERVICES_USER_AGENT)
@@ -770,23 +821,19 @@ async fn minecraft_entitlements(token: &str) -> Result<(), MicrosoftAuthError> {
 
     let entitlements: MinecraftEntitlementsResponse =
         parse_response(response, MicrosoftAuthStep::MinecraftEntitlements).await?;
-    if !entitlements
+    Ok(entitlements
         .items
         .iter()
-        .any(|item| matches!(item.name.as_str(), "game_minecraft" | "product_minecraft"))
-    {
-        return Err(MicrosoftAuthError::new(
-            MicrosoftAuthErrorKind::OwnershipMissing,
-            MicrosoftAuthStep::MinecraftEntitlements,
-        ));
-    }
-    Ok(())
+        .any(|item| matches!(item.name.as_str(), "game_minecraft" | "product_minecraft")))
 }
 
-async fn minecraft_profile(token: &str) -> Result<MinecraftProfile, MicrosoftAuthError> {
+async fn minecraft_profile(
+    token: &str,
+    endpoint: &str,
+) -> Result<MinecraftProfile, MicrosoftAuthError> {
     let client = auth_client()?;
     let response = client
-        .get(MINECRAFT_PROFILE_ENDPOINT)
+        .get(endpoint)
         .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::USER_AGENT, MINECRAFT_SERVICES_USER_AGENT)
         .bearer_auth(token)
@@ -1024,6 +1071,47 @@ pub fn validate_profile(profile: &MinecraftProfile) -> Result<(), MicrosoftAuthE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn login_and_refresh_profile_admission_requires_positive_entitlements() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = ProfileClient::fixture(&format!("http://{}", listener.local_addr().unwrap()));
+        let response = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0; 1024];
+                let read = stream.read(&mut bytes).await.unwrap();
+                assert!(read > 0 && request.len() + read <= 8192);
+                request.extend_from_slice(&bytes[..read]);
+                if request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(request.starts_with(b"GET /entitlements?"));
+            let body = br#"{"items":[]}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        let error = client
+            .owned_profile("synthetic-minecraft")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), MicrosoftAuthErrorKind::OwnershipMissing);
+        assert_eq!(error.step(), MicrosoftAuthStep::MinecraftEntitlements);
+        response.await.unwrap();
+    }
+
     #[test]
     fn callback_requires_exact_redirect_and_unique_matching_state_and_code() {
         let accepted = url::Url::parse(

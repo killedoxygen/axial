@@ -512,66 +512,6 @@ test('a refused save remains a draft and native release does not replay it', asy
   assert.equal(h.state.local.selectedSkin, 'default:alex');
 });
 
-test('native import drains before its final witness and never replays stale drafts after atomic replacement', async () => {
-  const h = harness();
-  await h.hydrate();
-  h.skin.setSelectedSkin('default:alex');
-  let witnessCalls = 0;
-  const imported = envelope({ theme: 'custom', customHue: 130.25, sounds: false });
-  imported.route = { name: 'downloads' };
-  await h.owner.replaceNativePreferences(imported, () => {
-    witnessCalls++;
-    assert.equal(h.backend.snapshot.value?.preferences.selectedSkin, 'default:alex');
-    h.skin.setSelectedSkin('default:steve');
-    return true;
-  });
-  assert.equal(witnessCalls, 1);
-  assert.equal(h.reloads(), 1);
-  assert.equal(h.backend.snapshot.value?.preferences.customHue, 130.25);
-  assert.equal(h.backend.snapshot.value?.route?.name, 'downloads');
-  assert.equal(h.owner.canEditPreferences(), false);
-  assert.equal(h.state.local.selectedSkin, 'default:alex');
-});
-
-test('unknown native import stays sealed and repeated Reload only reconciles until commit is proven', async () => {
-  const h = harness();
-  await h.hydrate();
-  h.write(async () => {
-    throw new Error('Response lost');
-  });
-  await assert.rejects(
-    h.owner.replaceNativePreferences(envelope({ theme: 'end' }), () => true),
-    /needs confirmation/,
-  );
-  assert.equal(await h.owner.reloadApplication(), false);
-  assert.equal(await h.owner.reloadApplication(), false);
-  assert.equal(h.reloads(), 0);
-  assert.equal(h.owner.canEditPreferences(), false);
-  assert.equal(h.writes.length, 1);
-  h.commit(h.writes[0]);
-  assert.equal(await h.owner.reloadApplication(), true);
-  assert.equal(h.reloads(), 1);
-  assert.equal(h.writes.length, 1);
-});
-
-test('explicit imported theme uses the native owner and yields to newer edits or a writer seal', async () => {
-  const h = harness();
-  await h.hydrate();
-  const before = h.state.localStateVersion.value;
-  h.skin.setSelectedSkin('default:alex');
-  await h.theme.applyImportedConfigTheme(config({ theme: 'end' }), before);
-  assert.equal(h.state.local.theme, 'obsidian');
-  await h.theme.applyImportedConfigTheme(config({ theme: 'end' }), h.state.localStateVersion.value);
-  assert.equal(h.backend.snapshot.value?.preferences.theme, 'end');
-  assert.equal(h.backend.snapshot.value?.preferences.selectedSkin, 'default:alex');
-  assert.equal(h.configWrites.length, 0);
-  h.emit('discard');
-  await assert.rejects(
-    h.theme.applyImportedConfigTheme(config({ theme: 'nether' }), h.state.localStateVersion.value),
-    /paused/,
-  );
-});
-
 test('bootstrap retains its visible retry state until native hydration succeeds before theme, sound and deferred writers', async () => {
   const h = harness({ value: envelope({ theme: 'obsidian', customHue: 125.25, sounds: false }) });
   h.Sound.enabled = false;

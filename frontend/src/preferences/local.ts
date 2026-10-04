@@ -3,7 +3,6 @@ import type { Route } from '../ui-state';
 
 export const LOCAL_PREFERENCES_KEY = 'axial_rewrite_ui';
 export const ROUTE_PREFERENCES_KEY = 'axial-rewrite:route';
-export const PREFERENCE_BYTES_LIMIT = 1024 * 1024;
 
 export function defaultLocalPreferences(): LocalPrefs {
   return {
@@ -14,7 +13,7 @@ export function defaultLocalPreferences(): LocalPrefs {
 }
 
 function invalid(): never {
-  throw new Error('The preference profile contains unsupported or invalid values.');
+  throw new Error('The preferences contain unsupported or invalid values.');
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -69,7 +68,7 @@ function mapped<T>(value: unknown, parse: (entry: unknown) => T): Record<string,
     .map(([key, entry]) => [key, parse(entry)]));
 }
 
-/** Missing fields are predecessor defaults; malformed/unknown fields are never silently discarded. */
+/** Missing fields use defaults; malformed/unknown fields are never silently discarded. */
 export function parseLocalPreferences(value: unknown): LocalPrefs {
   const data = record(value);
   const result = defaultLocalPreferences();

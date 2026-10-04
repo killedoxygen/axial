@@ -56,8 +56,7 @@ export function microsoftSignInAvailable(snapshot = accountsSnapshot.value): boo
   return snapshot.state === 'ready' && snapshot.status?.login_available === true;
 }
 
-export function refreshAccountsData(options: { fresh?: boolean } = {}): Promise<void> {
-  if (options.fresh) invalidateAccountsRead();
+export function refreshAccountsData(): Promise<void> {
   if (accountsRefresh) return accountsRefresh;
   const requestId = ++accountsRequestId;
   const pending = readAccountsData(requestId).finally(() => {

@@ -37,6 +37,8 @@ pub enum AuthError {
     Provider(#[from] MicrosoftAuthError),
     #[error("Sign in with Microsoft again to continue.")]
     SignInRequired,
+    #[error("This Microsoft account does not own Minecraft Java.")]
+    OwnershipMissing,
     #[error("Microsoft sign-in expired. Start sign-in again.")]
     LoginExpired,
     #[error("Account work is unavailable while the application is closing.")]
@@ -69,6 +71,7 @@ pub struct AuthService {
     service: Uuid,
     login_generation: Arc<AtomicU64>,
     account_removed: Arc<RwLock<Option<Arc<AccountRemovedObserver>>>>,
+    profile_client: microsoft::ProfileClient,
 }
 
 type AccountRemovedObserver = dyn Fn(&str) + Send + Sync;
@@ -87,7 +90,14 @@ impl AuthService {
             service: Uuid::new_v4(),
             login_generation: Arc::default(),
             account_removed: Arc::default(),
+            profile_client: microsoft::ProfileClient::default(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_profile_endpoints_for_tests(mut self, base: &str) -> Self {
+        self.profile_client = microsoft::ProfileClient::fixture(base);
+        self
     }
 
     pub fn directory(&self) -> &Arc<AccountDirectory> {
@@ -196,7 +206,12 @@ impl AuthService {
             .await?;
         let (credentials, profile) = split_session(result)?;
         let receipt = self.credentials.save(&fence, credentials).await?;
-        let identity = identity(profile, Uuid::new_v4().to_string(), receipt.revision());
+        let identity = identity(
+            profile,
+            Uuid::new_v4().to_string(),
+            receipt.revision(),
+            true,
+        );
         let committed = self.validate_login(revision, generation).and_then(|()| {
             self.directory
                 .commit_microsoft(revision, identity)
@@ -249,6 +264,9 @@ impl AuthService {
     ) -> Result<Credentials, AuthError> {
         self.directory.validate_capture(capture)?;
         let credentials = self.credentials(capture).await?;
+        if !capture.owns_minecraft_java() {
+            return Err(AuthError::OwnershipMissing);
+        }
         if credentials.minecraft_expires_at() <= now_seconds().saturating_add(30) {
             return Err(AuthError::SignInRequired);
         }
@@ -266,7 +284,7 @@ impl AuthService {
         self.retain(async move {
             match service.launch_credentials(&capture).await {
                 Ok(_) => return Ok(capture),
-                Err(AuthError::SignInRequired) => {}
+                Err(AuthError::SignInRequired | AuthError::OwnershipMissing) => {}
                 Err(error) => return Err(error),
             }
             let (fence, refresh_token) = service.begin_refresh(&capture).await?;
@@ -316,6 +334,7 @@ impl AuthService {
                 .ok_or(AuthError::SignInRequired)?
                 .to_owned(),
             receipt.revision(),
+            true,
         );
         self.directory
             .refresh_microsoft(capture, identity)
@@ -330,9 +349,25 @@ impl AuthService {
             if credentials.minecraft_expires_at() <= now_seconds() {
                 return Err(AuthError::SignInRequired);
             }
-            let profile = microsoft::sync_profile(credentials.minecraft_access_token()).await?;
-            service.directory.validate_capture(&capture)?;
-            service.commit_profile(&capture, profile).await
+            let synced = service
+                .profile_client
+                .sync(credentials.minecraft_access_token())
+                .await?;
+            let _gate = service.mutation.lock().await;
+            service.credentials_inner(&capture).await?;
+            let identity = identity(
+                synced.profile,
+                capture
+                    .login_id()
+                    .ok_or(AuthError::SignInRequired)?
+                    .to_owned(),
+                capture.credential_revision(),
+                synced.owns_minecraft_java,
+            );
+            service
+                .directory
+                .refresh_microsoft(&capture, identity)
+                .map_err(Into::into)
         })
         .await
     }
@@ -353,6 +388,7 @@ impl AuthService {
                 .ok_or(AuthError::SignInRequired)?
                 .to_owned(),
             capture.credential_revision(),
+            capture.owns_minecraft_java(),
         );
         self.directory
             .refresh_account_microsoft(capture, identity)
@@ -413,11 +449,9 @@ impl AuthService {
                     .remove_offline_with_preconditions(&account_id, expected)?
             } else {
                 // Delete also revokes an in-flight refresh's pending fence.
-                if capture.credential_revision() != 0 {
-                    let receipt = service.credentials.delete(&account_id, None).await?;
-                    if receipt.cleanup_pending() {
-                        return Err(CredentialError::CleanupPending.into());
-                    }
+                let receipt = service.credentials.delete(&account_id, None).await?;
+                if receipt.cleanup_pending() {
+                    return Err(CredentialError::CleanupPending.into());
                 }
                 service.directory.remove_microsoft(&capture)?
             };
@@ -492,14 +526,12 @@ impl AuthService {
                 .filter(|account| account.kind == AccountKind::Microsoft)
             {
                 let capture = service.directory.capture(account.account_id.as_str())?;
-                if capture.credential_revision() != 0 {
-                    let receipt = service
-                        .credentials
-                        .delete(capture.account_id(), None)
-                        .await?;
-                    if receipt.cleanup_pending() {
-                        return Err(CredentialError::CleanupPending.into());
-                    }
+                let receipt = service
+                    .credentials
+                    .delete(capture.account_id(), None)
+                    .await?;
+                if receipt.cleanup_pending() {
+                    return Err(CredentialError::CleanupPending.into());
                 }
                 service.directory.remove_microsoft(&capture)?;
                 service.notify_account_removed(capture.account_id());
@@ -540,6 +572,7 @@ fn identity(
     profile: MinecraftProfile,
     login_id: String,
     credential_revision: u64,
+    owns_minecraft_java: bool,
 ) -> MicrosoftIdentity {
     MicrosoftIdentity {
         login_id,
@@ -547,6 +580,7 @@ fn identity(
         display_name: profile.name.clone(),
         credential_revision,
         profile,
+        owns_minecraft_java,
     }
 }
 
@@ -573,7 +607,6 @@ pub(crate) fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::model::MicrosoftIdentityImport;
     use crate::storage::MetadataStore;
 
     fn service() -> AuthService {
@@ -613,154 +646,6 @@ mod tests {
 
     const FIRST: &str = "12345678123442348234123456789abc";
     const SECOND: &str = "22345678123442348234123456789abc";
-
-    fn imported_service() -> (AuthService, MicrosoftIdentityImport) {
-        let store = Arc::new(MetadataStore::in_memory().unwrap());
-        let directory = Arc::new(AccountDirectory::new(store.clone()).unwrap());
-        let input = MicrosoftIdentityImport {
-            profile_id: FIRST.into(),
-            display_name: "A".into(),
-            created_at: "2024-01-01T00:00:00Z".into(),
-            updated_at: "2024-01-02T00:00:00Z".into(),
-        };
-        store
-            .transaction(|tx| {
-                AccountDirectory::import_identities_in_transaction(
-                    tx,
-                    &[],
-                    &[input.clone()],
-                    Some(&input.account_id()?),
-                    0,
-                )
-            })
-            .unwrap();
-        (
-            AuthService::new(
-                directory,
-                Arc::new(CredentialStore::isolated_for_tests()),
-                TaskOwner::new(32).unwrap(),
-            ),
-            input,
-        )
-    }
-
-    #[tokio::test]
-    async fn imported_microsoft_identity_never_adopts_or_touches_credential_remnants() {
-        for logout in [false, true] {
-            let (service, input) = imported_service();
-            let capture = service.directory.capture_selected().unwrap();
-            // Even valid replacement-keyring remnants for this UUID confer no
-            // authority on a credential-free imported identity.
-            let id = input.account_id().unwrap();
-            let fence = service.credentials.begin_change(&id, 0).await.unwrap();
-            let receipt = service
-                .credentials
-                .save(
-                    &fence,
-                    Credentials::new(
-                        "untouched-microsoft".into(),
-                        Some("untouched-refresh".into()),
-                        now_seconds() + 3600,
-                        "untouched-game".into(),
-                        now_seconds() + 3600,
-                    )
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-            let credential_work = service.credentials.task_owner().subscribe();
-            assert!(matches!(
-                service.credentials(&capture).await,
-                Err(AuthError::SignInRequired)
-            ));
-            assert!(matches!(
-                service.launch_credentials(&capture).await,
-                Err(AuthError::SignInRequired)
-            ));
-            assert!(matches!(
-                service.refresh(capture.clone()).await,
-                Err(AuthError::SignInRequired)
-            ));
-            assert!(matches!(
-                service.sync_selected_profile().await,
-                Err(AuthError::SignInRequired)
-            ));
-            assert!(matches!(
-                service
-                    .select_account(id.clone(), AccountPreconditions::default())
-                    .await,
-                Err(AuthError::SignInRequired)
-            ));
-            let status = service.status(true).await.unwrap();
-            assert_eq!(status.mode, "online");
-            assert_eq!(
-                status.launch_auth_mode,
-                super::super::model::LaunchAuthMode::Online
-            );
-            assert_eq!(status.skin_source, "default");
-            assert!(!status.verified && status.minecraft_profile.is_none());
-            assert!(!status.readiness.online_mode_ready);
-            assert!(!status.readiness.minecraft_ownership_verified);
-            assert!(!status.readiness.minecraft_profile_ready);
-            assert!(!status.readiness.msa_authenticated && !status.readiness.msa_refresh_available);
-            assert_eq!(
-                status.readiness.online_action.state_id,
-                "online_sign_in_required"
-            );
-            let accounts = service.account_list().await.unwrap();
-            assert_eq!(accounts.accounts.len(), 1);
-            assert!(accounts.accounts[0].identity.login_id.is_none());
-            let after = if logout {
-                service.logout().await.unwrap()
-            } else {
-                service
-                    .remove_account(id.clone(), AccountPreconditions::default())
-                    .await
-                    .unwrap()
-            };
-            assert!(after.accounts.is_empty());
-            // Every secure store operation is admitted by its own TaskOwner.
-            // No change notification proves none was admitted by these calls.
-            assert!(!credential_work.has_changed().unwrap());
-            let retained = service.credentials.load(&id).await.unwrap().unwrap();
-            assert_eq!(retained.revision(), receipt.revision());
-            assert_eq!(
-                retained.credentials().minecraft_access_token(),
-                "untouched-game"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn reauthentication_upgrades_only_matching_imported_identity_and_preserves_creation() {
-        let (service, input) = imported_service();
-        let initial = service.directory.snapshot().unwrap();
-        let original = initial.active_account().unwrap().clone();
-        let stale = service.directory.capture_selected().unwrap();
-        login(&service, SECOND, "OtherPlayer").await;
-        let after_other = service.directory.snapshot().unwrap();
-        assert_eq!(after_other.accounts.len(), 2);
-        assert_eq!(
-            after_other
-                .accounts
-                .iter()
-                .find(|account| account.account_id == original.account_id)
-                .unwrap(),
-            &original
-        );
-        let verified = login(&service, FIRST, "CurrentName").await;
-        assert_eq!(verified.account_id(), input.account_id().unwrap());
-        assert!(verified.credential_revision() > 0 && verified.profile().is_some());
-        assert!(uuid::Uuid::parse_str(verified.login_id().unwrap()).is_ok());
-        let after = service.directory.snapshot().unwrap();
-        assert_eq!(after.accounts.len(), 2);
-        let active = after.active_account().unwrap();
-        assert_eq!(active.created_at, input.created_at);
-        assert_eq!(active.created_revision, original.created_revision);
-        assert_eq!(active.display_name, "CurrentName");
-        assert!(service.launch_credentials(&verified).await.is_ok());
-        assert!(service.directory.validate_account_capture(&stale).is_err());
-    }
 
     #[tokio::test]
     async fn provider_result_commits_credentials_before_metadata_and_projects_no_tokens() {
@@ -1037,6 +922,62 @@ mod tests {
             "Steve"
         );
         assert!(service.commit_profile(&capture, profile).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn profile_only_commit_preserves_negative_ownership_and_explicit_refresh_can_recheck() {
+        let service = service();
+        let original = login(&service, FIRST, "PlayerOne").await;
+        let credentials = service.credentials(&original).await.unwrap();
+        let unowned = service
+            .directory
+            .refresh_microsoft(
+                &original,
+                identity(
+                    original.profile().unwrap().clone(),
+                    original.login_id().unwrap().into(),
+                    original.credential_revision(),
+                    false,
+                ),
+            )
+            .unwrap();
+        let mut profile = unowned.profile().unwrap().clone();
+        profile.name = "UpdatedPlayer".into();
+        let updated = service.commit_profile(&unowned, profile).await.unwrap();
+        assert!(!updated.owns_minecraft_java());
+        assert_eq!(
+            updated.credential_revision(),
+            original.credential_revision()
+        );
+        assert_eq!(service.credentials(&updated).await.unwrap(), credentials);
+        assert!(matches!(
+            service.launch_credentials(&updated).await,
+            Err(AuthError::OwnershipMissing)
+        ));
+        let status = service.status(false).await.unwrap();
+        assert!(!status.readiness.online_mode_ready);
+        assert!(
+            status.readiness.refresh_action.enabled && status.readiness.profile_sync_action.enabled
+        );
+        assert!(
+            status
+                .readiness
+                .online_action
+                .detail
+                .unwrap()
+                .contains("ownership")
+        );
+        let (fence, _) = service.begin_refresh(&updated).await.unwrap();
+        let refreshed = service
+            .finish_refresh(
+                &updated,
+                &fence,
+                provider_result(FIRST, "UpdatedPlayer", "refreshed"),
+            )
+            .await
+            .unwrap();
+        assert!(refreshed.owns_minecraft_java());
+        assert!(service.launch_credentials(&refreshed).await.is_ok());
     }
 
     #[tokio::test]

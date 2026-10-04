@@ -1,6 +1,6 @@
 # Conventions
 
-The preserved application lives in `legacy/`. Its conventions remain at `legacy/docs/CONVENTIONS.md` and govern that reference tree. Do not modify legacy source during the rewrite except for a separately owned, necessary preference-export bridge.
+The preserved application lives in `legacy/`. Its conventions remain at `legacy/docs/CONVENTIONS.md` and govern that reference tree. Do not modify legacy source during the rewrite. The superseded rewrite-added preference bridge is removed; predecessor-profile compatibility is outside this breaking pre-release.
 
 ## Replacement
 

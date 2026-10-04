@@ -32,7 +32,6 @@ let routeDraft: Route | null | undefined;
 let running: Promise<void> | null = null;
 const seals = new Set<symbol>();
 let nativeRequest: { request: NativePreferencesRequest; release: () => void } | null = null;
-let importRelease: (() => void) | null = null;
 let reloadPending: Promise<boolean> | null = null;
 let lastNativeRequest = '0';
 let lastNativePhase: NativePreferencesRequest['phase'] = 'release';
@@ -276,15 +275,10 @@ export function initializeNativePreferences(cfg: Config): Promise<InterfacePrefe
   return initialization;
 }
 
-export function nativePreferenceBaseline(preferences: LocalPrefs, currentRoute: Route): string {
-  return JSON.stringify([preferences, currentRoute]);
-}
-
 function reloadSealed(): void {
   location.reload();
 }
 
-/** Browser callers remain synchronous so preference import keeps its rollback semantics. */
 export function reloadApplication(): boolean | Promise<boolean> {
   if (!hasNativeDesktopRuntime()) {
     reloadSealed();
@@ -320,40 +314,4 @@ export function reloadApplication(): boolean | Promise<boolean> {
       reloadPending = null;
     });
   return reloadPending;
-}
-
-export async function replaceNativePreferences(value: InterfacePreferences, current: () => boolean): Promise<void> {
-  if (!canEditPreferences())
-    throw new Error('Interface preference changes are paused. Try again after the current operation.');
-  const release = seal();
-  try {
-    await flushNativePreferences();
-    if (!current() || nativeRequest)
-      throw new Error('References or current preferences changed. Review the export again.');
-    if (!accepted) throw new Error('Interface preferences have not loaded.');
-    const normalized: InterfacePreferences = {
-      version: 1,
-      preferences: parseLocalPreferences(value.preferences),
-      route: value.route === null ? null : parseRoutePreference(value.route),
-    };
-    const write: PendingWrite = {
-      update: { expected_revision: accepted.revision, change: { kind: 'replace', value: normalized } },
-      value: normalized,
-      local: undefined,
-      route: undefined,
-    };
-    await commit(write);
-    importRelease = release;
-    reloadSealed();
-  } catch (error) {
-    if (uncertain || importRelease === release) {
-      importRelease = release;
-      throw Object.assign(
-        new Error('Preference import needs confirmation before reload. Keep this window open and retry Reload.'),
-        { rollbackIncomplete: true },
-      );
-    }
-    release();
-    throw error;
-  }
 }

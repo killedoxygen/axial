@@ -10,15 +10,6 @@ import type { InterfaceRoute as Route } from './generated/InterfaceRoute';
 export const ROUTE_STORAGE_KEY = ROUTE_PREFERENCES_KEY;
 
 export const route = signal<Route>({ name: 'home' });
-let routePersistenceSuspended = false;
-
-export function suspendRoutePersistence(): () => void {
-  const previous = routePersistenceSuspended;
-  routePersistenceSuspended = true;
-  return () => {
-    routePersistenceSuspended = previous;
-  };
-}
 
 const routeBackStack: Route[] = [];
 const routeForwardStack: Route[] = [];
@@ -209,7 +200,6 @@ function setRoute(r: Route): void {
   if (!canEditPreferences()) return;
   cancelViewScrollRestore();
   route.value = r;
-  if (routePersistenceSuspended) return;
   if (hasNativeDesktopRuntime()) { saveNativeRoute(r); return; }
   try {
     localStorage.setItem(ROUTE_STORAGE_KEY, JSON.stringify(r));

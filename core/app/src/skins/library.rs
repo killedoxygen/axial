@@ -10,7 +10,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::library::ApplicationRootPin;
 use crate::media::{MediaError, SkinVariant, normalize_skin_png};
-use crate::tasks::CancellationToken;
 
 use super::store::SavedSkinStore;
 
@@ -61,53 +60,6 @@ pub struct SavedSkinRecord {
     pub updated_at: String,
     pub applied_at: Option<String>,
     pub byte_size: usize,
-}
-
-/// Validated exact legacy bytes, never a source pathname or provider intent.
-#[derive(Clone, Debug)]
-pub(crate) struct PreparedSkinRecord {
-    pub(super) record: SavedSkinRecord,
-    pub(super) png: Arc<[u8]>,
-}
-
-pub(crate) fn prepare_import_record(
-    record: SavedSkinRecord,
-    png: Vec<u8>,
-) -> Result<PreparedSkinRecord, SkinLibraryError> {
-    super::store::validate_import_record(&record, &png)?;
-    Ok(PreparedSkinRecord {
-        record,
-        png: png.into(),
-    })
-}
-
-/// Exact content keys admitted by a completed import. This does not claim any
-/// account currently wears a skin, or that full profile cutover is complete.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ts_rs::TS)]
-pub struct SkinImportReceipt {
-    pub skin_import_id: String,
-    pub fingerprint: String,
-    pub texture_keys: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SkinImportCommit {
-    pub receipt: SkinImportReceipt,
-    pub already_imported: bool,
-}
-
-pub(crate) fn skin_import_id(
-    source_id: &str,
-    fingerprint: &str,
-) -> Result<String, SkinLibraryError> {
-    for value in [source_id, fingerprint] {
-        if validate_texture_key(value).is_err() || value.trim() != value {
-            return Err(SkinLibraryError::InvalidData);
-        }
-    }
-    Ok(crate::media::texture_key(
-        format!("axial.saved-skin-import.v1\0{source_id}\0{fingerprint}").as_bytes(),
-    ))
 }
 
 /// A monotonic incarnation prevents a late provider completion from marking a
@@ -473,46 +425,6 @@ impl SavedSkinLibrary {
         self.store.clear_applied(account_id)
     }
 
-    /// The import owner checks source separation against this exact retained root.
-    pub(crate) fn root_pin(&self) -> ApplicationRootPin {
-        self.root.clone()
-    }
-
-    /// Atomically imports one source snapshot. Completed replay never restores
-    /// skins the user subsequently changed or removed.
-    pub(crate) fn import_batch(
-        &self,
-        source_id: &str,
-        fingerprint: &str,
-        records: &[PreparedSkinRecord],
-        cancel: &CancellationToken,
-    ) -> Result<SkinImportCommit, SkinLibraryError> {
-        // Retain the existing library-then-metadata lock order. PNG decoding
-        // happened when preparing immutable records, before this admission.
-        let _guard = self.lock()?;
-        self.store
-            .import_batch(source_id, fingerprint, records, cancel)
-    }
-
-    /// Reconciles an uncertain response without reopening the source or
-    /// inspecting mutable destination skin records.
-    pub fn import_status(
-        &self,
-        import_id: &str,
-    ) -> Result<Option<SkinImportReceipt>, SkinLibraryError> {
-        let _guard = self.lock()?;
-        self.store.import_status(import_id)
-    }
-
-    /// A legacy applied timestamp lacks an account identity. Preserve that marker
-    /// during import; the profile owner may clear it after explicit reconciliation
-    /// or reset. This command never clears new accounts' applied references.
-    pub fn clear_imported_applied(&self, texture_key: &str) -> Result<(), SkinLibraryError> {
-        let texture_key = validate_texture_key(texture_key)?;
-        let _guard = self.lock()?;
-        self.store.clear_imported_applied(&texture_key)
-    }
-
     fn lock(&self) -> Result<MutexGuard<'_, ()>, SkinLibraryError> {
         self.root
             .revalidate()
@@ -731,11 +643,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn skin_import_revalidates_actual_library_root_before_any_database_write() {
+    fn upload_revalidates_actual_library_root_before_any_database_write() {
         use crate::{
             accounts::directory::AccountDirectory,
             library::{LibraryLifecycle, LibraryOpenOutcome},
-            skins::store::{IMPORT_MIGRATION, MIGRATION},
+            skins::store::MIGRATION,
             storage::MetadataStore,
         };
         let parent = tempfile::tempdir().unwrap();
@@ -748,32 +660,27 @@ mod tests {
         };
         let metadata = Arc::new(MetadataStore::in_memory().unwrap());
         AccountDirectory::new(metadata.clone()).unwrap();
-        metadata.migrate(&[MIGRATION, IMPORT_MIGRATION]).unwrap();
+        metadata.migrate(&[MIGRATION]).unwrap();
         let library = SavedSkinLibrary::new(
             SavedSkinStore::new(metadata),
             roots.admit_application_root().unwrap(),
         );
-        let retained = library.root_pin();
+        let retained = roots.admit_application_root().unwrap();
         retained.revalidate().unwrap();
         std::fs::rename(&path, parent.join("original-profile")).unwrap();
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("canary"), b"unrelated replacement").unwrap();
         assert!(retained.revalidate().is_err());
         assert_eq!(
-            library.import_batch(
-                &"1".repeat(64),
-                &"2".repeat(64),
-                &[],
-                &CancellationToken::new()
+            library.save_upload(
+                &crate::skins::tests::png(11),
+                SaveSkinOptions {
+                    name: "Retained skin".into(),
+                    ..Default::default()
+                },
+                None,
             ),
             Err(SkinLibraryError::Storage)
-        );
-        assert!(
-            library
-                .store
-                .import_status(&skin_import_id(&"1".repeat(64), &"2".repeat(64)).unwrap())
-                .unwrap()
-                .is_none()
         );
         assert!(library.store.list(None).unwrap().is_empty());
         assert_eq!(

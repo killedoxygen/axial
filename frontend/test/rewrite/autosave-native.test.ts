@@ -6,10 +6,16 @@ import test from 'node:test';
 import vm from 'node:vm';
 import * as contract from '../../src/dto-contract';
 import * as dto from '../../src/dto-core';
+import * as installDto from '../../src/dto-install';
+import * as installItems from '../../src/install-item';
+import * as downloadViews from '../../src/machines/download-view-models';
 import * as preferences from '../../src/preferences/local';
 import type { Config } from '../../src/types-settings';
 import type { EnrichedInstance } from '../../src/types-instance';
 import type { NativePreferencesRequest } from '../../src/native';
+import type { InstallQueueStateResponse } from '../../src/types-install';
+import type { LaunchSession } from '../../src/types-launch';
+import type { LaunchState } from '../../src/store';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const dependencies = createRequire(resolve(frontend, 'package.json'));
@@ -166,13 +172,28 @@ function controls(value: unknown): Node[] {
   return [node, ...controls(node.props.children), ...controls(node.props.control), ...controls(node.props.aside)];
 }
 
+function queue(revision = 1): InstallQueueStateResponse {
+  return {
+    queue_epoch: 'current-process', revision, registry_revision: 2,
+    active: null, items: [], latest_failure: null,
+    view_model: { state_id: 'empty', status_label: 'Idle', title: 'Downloads', summary: '', queued_count: 0,
+      queued_count_label: '0', queued_item_label: 'Queued', section_title: 'Queue', empty_title: 'Empty', empty_summary: '' },
+  };
+}
+
 function harness() {
   const viewHooks = hooks();
   const configState = signals.signal(config());
   const instances = signals.signal([structuredClone(instance)]);
+  const store = {
+    config: configState, instances, versions: signals.signal([]), lastInstanceId: signals.signal<string | null>(null),
+    launchSessions: signals.signal<Record<string, LaunchSession>>({}),
+    launchState: signals.signal<LaunchState>({ status: 'idle' }),
+  };
   let storedConfig = config();
   let storedInstance = structuredClone(instance);
   const writes: Array<{ path: string; patch: Record<string, unknown> }> = [];
+  const reads: string[] = [];
   const notices: string[] = [];
   const completions: Array<{ requestId: string; saved: boolean }> = [];
   const timers = new Map<number, () => void>();
@@ -181,16 +202,31 @@ function harness() {
   let listener: ((event: { payload: unknown }) => void) | undefined;
   let admit: (path: string) => void = () => {};
   let respond: (path: string, value: unknown) => Promise<unknown> = async (_path, value) => value;
+  let readInstance: (value: EnrichedInstance) => Promise<unknown> = async (value) => value;
+  let currentQueue = queue();
+  let queueSubscription: ((snapshot: InstallQueueStateResponse) => void) | undefined;
+  const clock = {
+    setTimeout(run: () => void) {
+      const id = ++nextTimer;
+      timers.set(id, run);
+      return id;
+    },
+    clearTimeout(id: number) { timers.delete(id); },
+  };
   const api = {
     async api(method: string, path: string, body?: Record<string, unknown>): Promise<unknown> {
       if (method === 'GET') {
+        reads.push(path);
+        if (path === '/install/queue') return currentQueue;
+        if (path === '/versions') return { versions: [] };
+        if (path === '/instances') return { instances: [structuredClone(storedInstance)], last_instance_id: instance.id };
         if (path === '/config/interface-preferences')
           return {
             revision: 0,
             value: { version: 1, preferences: preferences.defaultLocalPreferences(), route: null },
           };
         if (path === '/config') return structuredClone(storedConfig);
-        if (path === `/instances/${instance.id}`) return structuredClone(storedInstance);
+        if (path === `/instances/${instance.id}`) return readInstance(structuredClone(storedInstance));
       }
       assert.equal(method, 'PUT');
       assert.ok(body);
@@ -209,9 +245,25 @@ function harness() {
     isApiError: (error: unknown) => error instanceof Error && 'status' in error,
   };
   const actions = source<typeof import('../../src/actions')>('actions.ts', {
-    './store': { config: configState, instances },
+    './store': store,
     './launch-response-adapters': {},
   });
+  const readiness = source<typeof import('../../src/instance-readiness')>('instance-readiness.ts', {
+    './api': api, './dto-core': dto, './store': store,
+    './utils': { showError: (message: string) => notices.push(message) },
+  }, { window: clock });
+  const downloads = source<typeof import('../../src/machines/downloads')>('machines/downloads.ts', {
+    '../api': api,
+    '../utils': { errMessage: String, showError: (message: string) => notices.push(message) },
+    '../toast': { toast: (message: string) => notices.push(message) },
+    '../loaders/api': { connectInstallQueueSSE(next: typeof queueSubscription) {
+      queueSubscription = next;
+      return () => { queueSubscription = undefined; };
+    } },
+    '../store': store, '../content-activity': { markContentChanged() {} },
+    '../dto-install': installDto, '../dto-core': dto, '../install-item': installItems,
+    './download-view-models': downloadViews,
+  }, clock);
   const autosave = source<typeof import('../../src/hooks/use-autosave')>('hooks/use-autosave.ts', {
     'preact/hooks': viewHooks,
     '../actions': actions,
@@ -341,6 +393,7 @@ function harness() {
       '../../../hooks/use-autosave': autosave,
       '../../../hooks/use-jvm-presets': common.presets,
       '../../../api': api,
+      '../../../instance-readiness': readiness,
       '../../../store': common.store,
       '../../../actions': actions,
       '../../../format': common.format,
@@ -370,8 +423,12 @@ function harness() {
   return {
     owner,
     autosave,
+    downloads,
+    readiness,
+    store,
     music: music.Music,
     writes,
+    reads,
     notices,
     completions,
     timers,
@@ -380,6 +437,12 @@ function harness() {
     reloads: () => reloads,
     respond(next: typeof respond) {
       respond = next;
+    },
+    readInstance(next: typeof readInstance) { readInstance = next; },
+    emitQueue(snapshot: InstallQueueStateResponse) {
+      currentQueue = snapshot;
+      assert.ok(queueSubscription);
+      queueSubscription(snapshot);
     },
     admit(next: typeof admit) {
       admit = next;
@@ -411,9 +474,170 @@ function harness() {
       timers.clear();
       callbacks.forEach((run) => run());
     },
-    dispose: viewHooks.dispose,
+    dispose() {
+      viewHooks.dispose();
+      downloads.disconnectInstallQueue();
+    },
   };
 }
+
+test('a delayed settings detail cannot replace newer Ready from the download registry', async () => {
+  const h = harness();
+  const oldReply = deferred<unknown>();
+  const busy: EnrichedInstance = {
+    ...structuredClone(instance), launchable: false,
+    launch_action: { state_id: 'blocked', label: 'Unavailable', tone: 'warn', launchable: false,
+      primary_action: 'blocked', disabled_reason: 'The instance is busy. Wait for its current operation to finish.' },
+  };
+  h.store.instances.value = [busy];
+  h.readInstance(() => oldReply.promise);
+  try {
+    h.render('instance');
+    await tick();
+    assert.deepEqual(h.reads, [`/instances/${instance.id}`]);
+    await h.downloads.refreshInstallQueue({ connectActive: true });
+    const ready = h.store.instances.value[0];
+    assert.equal(ready.launch_action.label, 'Launch');
+    oldReply.resolve(busy);
+    await tick();
+    assert.equal(h.store.instances.value[0], ready, 'the older detail must not restore Busy after Ready');
+    const listReads = (): number => h.reads.filter((path) => path === '/instances').length;
+    assert.equal(listReads(), 1);
+    h.emitQueue(queue(2));
+    await tick();
+    assert.equal(listReads(), 1, 'the settled cursor must not need another read to repair stale publication');
+    h.downloads.disconnectInstallQueue();
+    await h.downloads.refreshInstallQueue({ connectActive: true });
+    h.emitQueue(queue(2));
+    await tick();
+    assert.equal(h.store.instances.value[0], ready);
+    assert.equal(listReads(), 1);
+    await h.downloads.refreshInstallQueue({ requireInstalledState: true });
+    assert.equal(listReads(), 2, 'an explicit required refresh must still request a fresh projection');
+    assert.equal(h.store.instances.value[0].launch_action.label, 'Launch');
+    assert.equal(h.notices.length, 0);
+    assert.equal(h.timers.size, 0);
+  } finally {
+    oldReply.resolve(busy);
+    await tick();
+    h.dispose();
+  }
+});
+
+test('a settings detail failure stays quiet and unmounted or mismatched responses are discarded', async () => {
+  for (const outcome of ['failure', 'unmount', 'mismatched']) {
+    const h = harness();
+    const reply = deferred<unknown>();
+    h.readInstance(() => reply.promise);
+    h.render('instance');
+    await tick();
+    const before = h.store.instances.value[0];
+    if (outcome === 'unmount') {
+      h.dispose();
+      reply.resolve({ ...instance, name: 'Late settings detail' });
+    } else if (outcome === 'mismatched') reply.resolve({ ...instance, id: 'another-instance' });
+    else reply.reject(new Error('Settings detail unavailable'));
+    await tick();
+    assert.equal(h.store.instances.value[0], before);
+    assert.equal(h.notices.length, 0);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.reads.length, 1);
+    h.dispose();
+  }
+});
+
+test('unmounting an older settings read cannot clear a newer readiness read or its settlement retry', async () => {
+  const h = harness();
+  const oldReply = deferred<unknown>();
+  h.readInstance(() => oldReply.promise);
+  h.render('instance');
+  await tick();
+  let reads = 0;
+  h.readInstance(async (value) => ++reads === 1 ? {
+    ...value, launchable: false,
+    launch_action: { state_id: 'blocked', label: 'Unavailable', tone: 'warn', launchable: false, primary_action: 'blocked' },
+  } : value);
+  const current = h.readiness.refreshInstanceReadiness(instance.id);
+  try {
+    await tick();
+    assert.equal(h.store.instances.value[0].launchable, false);
+    assert.equal(h.timers.size, 1);
+    h.dispose();
+    oldReply.resolve({ ...instance, name: 'Obsolete detail' });
+    await tick();
+    h.timersRun();
+    await current;
+    assert.equal(h.store.instances.value[0].launch_action.label, 'Launch');
+    assert.equal(h.store.instances.value[0].name, instance.name);
+    assert.equal(reads, 2);
+    assert.equal(h.notices.length, 0);
+    assert.equal(h.timers.size, 0);
+  } finally {
+    oldReply.resolve(instance);
+    await tick();
+    h.timersRun();
+    await current;
+    h.dispose();
+  }
+});
+
+test('mounting settings cannot preempt the active readiness settlement retry', async () => {
+  const h = harness();
+  let settled = false;
+  h.readInstance(async (value) => settled ? value : {
+    ...value, launchable: false,
+    launch_action: { state_id: 'blocked', label: 'Unavailable', tone: 'warn', launchable: false, primary_action: 'blocked' },
+  });
+  const current = h.readiness.refreshInstanceReadiness(instance.id);
+  try {
+    await tick();
+    assert.equal(h.store.instances.value[0].launchable, false);
+    assert.equal(h.timers.size, 1);
+    h.render('instance');
+    await tick();
+    h.dispose();
+    settled = true;
+    h.timersRun();
+    await current;
+    assert.equal(h.store.instances.value[0].launch_action.label, 'Launch');
+    assert.equal(h.reads.length, 2, 'the view must leave the active owner to complete its two reads');
+    assert.equal(h.notices.length, 0);
+    assert.equal(h.timers.size, 0);
+  } finally {
+    settled = true;
+    h.timersRun();
+    await current;
+    h.dispose();
+  }
+});
+
+test('remounting settings replaces an abandoned read without letting its cleanup clear the new owner', async () => {
+  const h = harness();
+  const oldReply = deferred<unknown>();
+  const currentReply = deferred<unknown>();
+  h.readInstance(() => oldReply.promise);
+  h.render('instance');
+  await tick();
+  h.dispose();
+  h.readInstance(() => currentReply.promise);
+  try {
+    h.render('instance');
+    await tick();
+    assert.equal(h.reads.length, 2, 'an unmounted view cannot block the new view read');
+    oldReply.resolve({ ...instance, name: 'Abandoned detail' });
+    await tick();
+    currentReply.resolve({ ...instance, name: 'Current detail' });
+    await tick();
+    assert.equal(h.store.instances.value[0].name, 'Current detail');
+    assert.equal(h.notices.length, 0);
+    assert.equal(h.timers.size, 0);
+  } finally {
+    oldReply.resolve(instance);
+    currentReply.resolve(instance);
+    await tick();
+    h.dispose();
+  }
+});
 
 test('native flush joins a committed settings reply and the next queued real control before acknowledging', async () => {
   const h = harness();
@@ -741,24 +965,6 @@ test('native discard parks the music slider timer and late edits until release',
   h.timersRun();
   await tick();
   assert.equal(h.writes.length, 1);
-  h.dispose();
-});
-
-test('an imported music snapshot supersedes the parked slider draft before native release', async () => {
-  const h = harness();
-  await h.hydrate();
-  h.music.applyConfig({ music_enabled: true, music_volume: 20, music_track: 0 });
-  h.render('audio');
-  h.control<{ onChange(value: number): void }>('Slider').onChange(70);
-  h.emit('discard');
-  h.timersRun();
-  h.music.applyConfig({ music_enabled: false, music_volume: 35, music_track: 1 }, true);
-  h.emit('release');
-  h.timersRun();
-  await tick();
-  assert.equal(h.music.volume, 35);
-  assert.equal(h.music.enabled, false);
-  assert.equal(h.writes.length, 0);
   h.dispose();
 });
 

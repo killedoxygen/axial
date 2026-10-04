@@ -8,9 +8,7 @@ use ts_rs::TS;
 
 use super::{MAX_REVISION, SettingsError, SettingsStore, encode, next_revision, required_document};
 
-/// A predecessor export is at most 1 MiB. A separate 1 MiB allowance covers
-/// normalization and reference expansion; the maximum-export fixture measures
-/// those effects. This encoded UTF-8 cap is not a UTF-16 string-length limit.
+/// Bound the full encoded UTF-8 document independently of per-field UTF-16 limits.
 pub const MAX_INTERFACE_PREFERENCES_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 
@@ -387,7 +385,7 @@ fn bounded_size(value: &impl Serialize) -> Result<(), SettingsError> {
 mod tests {
     use super::*;
     use crate::{
-        settings::{ConfigPatch, ConfigTheme, ConfigView, prepare_legacy_import},
+        settings::{ConfigPatch, ConfigTheme, ConfigView},
         storage::{MetadataStore, StorageError},
     };
     use serde_json::{Value, json};
@@ -439,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn old_document_and_disk_reopen_preserve_independent_preferences() {
+    fn defaults_and_disk_reopen_preserve_independent_preferences() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory
             .path()
@@ -450,24 +448,6 @@ mod tests {
         {
             let metadata = Arc::new(MetadataStore::open(&database).unwrap());
             let settings = SettingsStore::new(metadata.clone()).unwrap();
-            let mut original: Value = serde_json::from_str(&raw(&metadata)).unwrap();
-            original
-                .as_object_mut()
-                .unwrap()
-                .remove("interface_preferences_revision");
-            original
-                .as_object_mut()
-                .unwrap()
-                .remove("interface_preferences");
-            metadata
-                .transaction(|tx| -> Result<(), StorageError> {
-                    tx.execute(
-                        "UPDATE settings_config SET document=?1",
-                        [original.to_string()],
-                    )?;
-                    Ok(())
-                })
-                .unwrap();
             let before = raw(&metadata);
             assert_eq!(
                 settings.interface_preferences().unwrap(),
@@ -558,9 +538,9 @@ mod tests {
     }
 
     #[test]
-    fn ui_writes_preserve_config_fences_notifications_and_metadata_import() {
+    fn ui_and_config_writes_preserve_independent_fences_and_notifications() {
         let (_, settings) = store();
-        let mut changes = settings.subscribe().unwrap();
+        let changes = settings.subscribe().unwrap();
         let global = settings.current().unwrap();
         let launch = crate::settings::InstanceSettings::default()
             .effective(&global)
@@ -585,26 +565,10 @@ mod tests {
         let patch: ConfigPatch =
             serde_json::from_value(json!({"expected_revision":0,"theme":"birch"})).unwrap();
         settings.update(patch).unwrap();
-        assert!(changes.has_changed().unwrap());
-        changes.borrow_and_update();
-        let imported = prepare_legacy_import(
-            &json!({"username":"Imported","min_memory_mb":512,"max_memory_mb":6144}),
-        )
-        .unwrap();
-        settings
-            .commit_prepared_import(
-                &imported,
-                1,
-                |_, config| {
-                    config.account_selection_revision = 7;
-                    Ok((true, ()))
-                },
-                |_, _| Ok(()),
-            )
-            .unwrap();
         assert_eq!(settings.interface_preferences().unwrap(), snapshot);
-        assert_eq!(settings.current().unwrap().revision, 2);
-        assert_eq!(settings.current().unwrap().account_selection_revision, 7);
+        assert_eq!(settings.current().unwrap().revision, 1);
+        assert_eq!(settings.current().unwrap().theme, ConfigTheme::Birch);
+        assert_eq!(settings.current().unwrap().account_selection_revision, 0);
         assert!(changes.has_changed().unwrap());
     }
 
@@ -726,8 +690,6 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<LocalPreferences>(malformed).is_err());
         }
-        // Normal UI identifiers come from valid-Unicode owners. An export with
-        // a lone UTF-16 surrogate is malformed input, not a lossy replacement.
         assert!(serde_json::from_str::<LocalPreferences>(r#"{"selectedSkin":"\ud800"}"#).is_err());
         for malformed in [
             json!({"name":"home","id":"x"}),
@@ -830,12 +792,13 @@ mod tests {
         assert_eq!(raw(&metadata), before);
     }
 
-    fn expanded_export() -> (usize, InterfacePreferences) {
+    fn maximum_envelope() -> InterfacePreferences {
         let mut preferences = LocalPreferences::default();
         for index in 0..MAX_ENTRIES {
-            preferences
-                .selected_skins_by_account
-                .insert(format!("account:{index:016x}"), String::new());
+            preferences.selected_skins_by_account.insert(
+                format!("account:microsoft-{}", uuid::Uuid::from_u128(index as u128)),
+                String::new(),
+            );
             preferences.shortcuts.insert(
                 format!("🔉{index}"),
                 ShortcutBinding {
@@ -856,59 +819,33 @@ mod tests {
                 },
             );
         }
-        let export = |preferences: &LocalPreferences| {
-            json!({
-                "format":"axial-browser-preferences","version":1,"preferences":{
-                    "selectedSkinsByAccount":preferences.selected_skins_by_account,
-                    "shortcuts":preferences.shortcuts,
-                    "overlayPositions":preferences.overlay_positions
-                },
-                "route":{"name":"instance","id":"0000000000000001"}
-            })
+        let mut value = InterfacePreferences {
+            version: 1,
+            preferences,
+            route: Some(InterfaceRoute::Instance {
+                id: "12345678-1234-4234-8234-123456789abc".into(),
+            }),
         };
-        let limit = 1024 * 1024;
-        let remaining = limit - serde_json::to_vec(&export(&preferences)).unwrap().len();
-        for (index, value) in preferences
+        let remaining = MAX_INTERFACE_PREFERENCES_BYTES - serde_json::to_vec(&value).unwrap().len();
+        for (index, selected) in value
+            .preferences
             .selected_skins_by_account
             .values_mut()
             .enumerate()
         {
-            *value =
+            *selected =
                 "x".repeat(remaining / MAX_ENTRIES + usize::from(index < remaining % MAX_ENTRIES));
         }
-        let source = export(&preferences);
-        let source_bytes = serde_json::to_vec(&source).unwrap().len();
-        assert_eq!(source_bytes, limit);
-        preferences = serde_json::from_value(source["preferences"].clone()).unwrap();
-        preferences.selected_skins_by_account = preferences
-            .selected_skins_by_account
-            .into_values()
-            .enumerate()
-            .map(|(index, value)| {
-                (
-                    format!("account:microsoft-{}", uuid::Uuid::from_u128(index as u128)),
-                    value,
-                )
-            })
-            .collect();
-        (
-            source_bytes,
-            InterfacePreferences {
-                version: 1,
-                preferences,
-                route: Some(InterfaceRoute::Instance {
-                    id: "12345678-1234-4234-8234-123456789abc".into(),
-                }),
-            },
-        )
+        value
     }
 
     #[test]
-    fn maximum_export_and_reference_expansion_fit_without_narrowing_to_config_limit() {
-        let (source_bytes, value) = expanded_export();
-        let normalized_bytes = serde_json::to_vec(&value).unwrap().len();
-        assert!(normalized_bytes > source_bytes);
-        assert!(normalized_bytes <= MAX_INTERFACE_PREFERENCES_BYTES);
+    fn maximum_preferences_round_trip_and_reject_excess_entries_or_bytes() {
+        let value = maximum_envelope();
+        assert_eq!(
+            serde_json::to_vec(&value).unwrap().len(),
+            MAX_INTERFACE_PREFERENCES_BYTES
+        );
         value.validate().unwrap();
         let (_, settings) = store();
         replace(&settings, 0, Some(value.clone())).unwrap();
@@ -929,15 +866,17 @@ mod tests {
         );
         assert!(replace(&settings, 1, Some(excessive_entries)).is_err());
         let mut excessive_bytes = value;
-        for selected in excessive_bytes
+        excessive_bytes
             .preferences
             .selected_skins_by_account
             .values_mut()
-        {
-            *selected = "界".repeat(200);
-        }
-        assert!(
-            serde_json::to_vec(&excessive_bytes).unwrap().len() > MAX_INTERFACE_PREFERENCES_BYTES
+            .next()
+            .unwrap()
+            .push('x');
+        excessive_bytes.preferences.validate().unwrap();
+        assert_eq!(
+            serde_json::to_vec(&excessive_bytes).unwrap().len(),
+            MAX_INTERFACE_PREFERENCES_BYTES + 1
         );
         assert!(replace(&settings, 1, Some(excessive_bytes)).is_err());
         assert_eq!(settings.interface_preferences().unwrap().revision, 1);
@@ -950,18 +889,12 @@ mod tests {
             .unwrap();
         assert_eq!(settings.current().unwrap().max_memory_mb, 8192);
         assert_eq!(settings.interface_preferences().unwrap(), snapshot);
-        eprintln!(
-            "interface preferences source_bytes={source_bytes} normalized_bytes={normalized_bytes} limit={MAX_INTERFACE_PREFERENCES_BYTES}"
-        );
     }
 
     #[test]
     #[ignore = "bounded settings cost diagnostic; run explicitly with --nocapture"]
     fn maximum_envelope_read_and_route_write_cost() {
-        for (label, value) in [
-            ("small", envelope()),
-            ("maximum_export", expanded_export().1),
-        ] {
+        for (label, value) in [("small", envelope()), ("maximum", maximum_envelope())] {
             let (_, settings) = store();
             replace(&settings, 0, Some(value)).unwrap();
             let read_started = std::time::Instant::now();
