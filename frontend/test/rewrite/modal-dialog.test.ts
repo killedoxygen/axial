@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
+import type { EnrichedInstance } from '../../src/types-instance';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
@@ -106,6 +107,9 @@ function hooks() {
 
 class Element {
   inert = false;
+  disabled = false;
+  slot = '';
+  tabIndex = 0;
   isConnected = true;
   offsetParent = {};
   parent: Element | null = null;
@@ -116,10 +120,16 @@ class Element {
     readonly onFocus: (target: Element) => void,
   ) {}
   focus() {
-    if (this.isConnected && !this.closest('[inert]')) this.onFocus(this);
+    if (this.isConnected && !this.disabled && !this.closest('[inert]')) this.onFocus(this);
   }
-  closest(_selector: string): Element | null {
-    return this.inert ? this : (this.parent?.closest('[inert]') ?? null);
+  matches(selector: string): boolean {
+    if (selector === ':disabled') return this.disabled;
+    if (selector === '[inert]') return this.inert;
+    if (selector === '[data-slot="modal-content"]') return this.slot === 'modal-content';
+    throw new Error(`Unreviewed focus selector: ${selector}`);
+  }
+  closest(selector: string): Element | null {
+    return this.matches(selector) ? this : (this.parent?.closest(selector) ?? null);
   }
   contains(target: Element | null): boolean {
     return target !== null && (target === this || this.children.some((child) => child.contains(target)));
@@ -128,7 +138,7 @@ class Element {
     return this.children[0];
   }
   querySelectorAll() {
-    return this.children;
+    return this.children.filter((child) => !child.disabled);
   }
   addEventListener(name: string, listener: Listener) {
     if (!this.listeners.has(name)) this.listeners.set(name, new Set());
@@ -139,7 +149,29 @@ class Element {
   }
 }
 
-function harness() {
+const instance: EnrichedInstance = {
+  id: 'screenshot-instance',
+  name: 'Screenshot fixture',
+  version_id: 'fixture',
+  created_at: '2026-10-04T12:00:00Z',
+  version_display: {
+    loader_key: 'vanilla',
+    loader_label: 'Vanilla',
+    minecraft_label: 'Fixture',
+    loader_version_label: '',
+    loader_detail_label: '',
+    summary_label: 'Fixture',
+    supports_mods: false,
+  },
+  launchable: true,
+  launch_action: { state_id: 'ready', label: 'Launch', tone: 'ok', launchable: true, primary_action: 'launch' },
+  saves_count: 0,
+  mods_count: 0,
+  resource_count: 0,
+  shader_count: 0,
+};
+
+function harness(apiResult: () => Promise<unknown> = async () => ({ status: 'ok', name: 'after.png' })) {
   const docListeners = new Map<string, Set<Listener>>();
   let active: Element;
   const element = (name: string): Element =>
@@ -151,8 +183,10 @@ function harness() {
   active = body;
   const panel = element('lightbox');
   const opener = element('Rename screenshot');
+  const folder = element('Open screenshots folder');
+  const remove = element('Delete screenshot');
   const close = element('Close lightbox');
-  panel.children = [opener, close];
+  panel.children = [opener, folder, remove, close];
   for (const child of panel.children) child.parent = panel;
   const dialog = element('prompt');
   const input = element('filename');
@@ -162,6 +196,7 @@ function harness() {
   const frames = new Map<number, () => void>();
   let frameId = 0;
   const globals = {
+    Error,
     HTMLElement: Element,
     document: {
       body,
@@ -217,12 +252,105 @@ function harness() {
     },
     globals,
   );
+  const calls: Parameters<typeof import('../../src/api').api>[] = [];
+  const requestEntered = heldResponse();
+  const api = {
+    api: (...args: Parameters<typeof import('../../src/api').api>) => {
+      calls.push(args);
+      requestEntered.resolve(undefined);
+      return apiResult();
+    },
+    apiResourceUrl: (path: string) => path,
+  };
+  const notices: string[] = [];
+  const toast = { toast: (message: string) => notices.push(message) };
+  const utils = source<typeof import('../../src/utils')>('utils.ts', { './store': {}, './toast': toast }, globals);
+  const dto = source<typeof import('../../src/dto-contract')>('dto-contract.ts', {}, globals);
+  const resources = source<typeof import('../../src/views/instance/resources')>(
+    'views/instance/resources.ts',
+    { '../../api': api, '../../dto-core': {}, '../../dto-contract': dto },
+    globals,
+  );
+  const mutations = source<typeof import('../../src/views/instance/bulk-actions')>(
+    'views/instance/bulk-actions.ts',
+    { '../../ui/Dialog': dialogs, '../../toast': toast, '../../utils': utils },
+    globals,
+  );
+  const actions = source<typeof import('../../src/views/instance/screenshot-actions')>(
+    'views/instance/screenshot-actions.ts',
+    {
+      '../../api': api,
+      '../../toast': toast,
+      '../../ui/Dialog': dialogs,
+      './instance-actions': {},
+      './bulk-actions': mutations,
+      '../../dto-contract': dto,
+      './resources': resources,
+    },
+    globals,
+  );
+  const atoms = source<typeof import('../../src/ui/Atoms')>('ui/Atoms.tsx', { './Icons': { Icon: 'Icon' } }, globals);
+  const lightboxHooks = hooks();
+  let mutation: Promise<void> | undefined;
+  let shot = { name: 'before.png', size: 512, modified_at: '2026-10-04T12:00:00Z' };
+  const renamed: string[] = [];
+  const lightbox = source<typeof import('../../src/views/instance/components/screenshot-lightbox')>(
+    'views/instance/components/screenshot-lightbox.tsx',
+    {
+      'preact/hooks': lightboxHooks,
+      '../../../ui/Modal': modal,
+      '../../../ui/Atoms': atoms,
+      '../../../format': source('format.ts', {}, globals),
+      '../instance-actions': {},
+      '../bulk-actions': mutations,
+      './resource-bits': { ResourceMutationStatus: 'ResourceMutationStatus' },
+      '../screenshot-actions': {
+        ...actions,
+        renameScreenshot(...args: Parameters<typeof actions.renameScreenshot>) {
+          mutation = actions.renameScreenshot(...args);
+          return mutation;
+        },
+      },
+    },
+    globals,
+  );
+  let renameClick: (() => void) | undefined;
   let modalTree: Node[] = [];
   let dialogTree: Node[] = [];
   function render() {
+    lightboxHooks.begin();
+    const tree = nodes(
+      lightbox.ScreenshotLightbox({
+        inst: instance,
+        shots: [shot],
+        name: shot.name,
+        onSelect: () => undefined,
+        onClose: () => {
+          closed++;
+        },
+        onRename: (_previous, name) => {
+          renamed.push(name);
+          shot = { ...shot, name };
+        },
+        onRefresh: () => undefined,
+      }),
+    );
+    lightboxHooks.flush();
+    for (const [label, target] of [
+      ['Rename', opener],
+      ['Delete', remove],
+    ] as const) {
+      const iconButton = tree.find((node) => node.type === atoms.IconButton && node.props.tooltip === label)!;
+      const button = nodes(atoms.IconButton(iconButton.props as Parameters<typeof atoms.IconButton>[0]))[0]!;
+      target.disabled = button.props.disabled === true;
+      if (target === opener) renameClick = button.props.onClick as (() => void) | undefined;
+    }
+    const modalContent = tree.find((node) => node.type === modal.ModalContent)!;
     modalHooks.begin();
-    modalTree = nodes(modal.ModalContent({ children: null, showCloseButton: false }));
+    modalTree = nodes(modal.ModalContent(modalContent.props));
     const content = modalTree.find((node) => node.props['data-slot'] === 'modal-content')!;
+    panel.slot = content.props['data-slot'] as string;
+    panel.tabIndex = content.props.tabIndex as number;
     panel.inert = content.props.inert === true;
     if (panel.inert && panel.contains(active)) active = body;
     assert.ok(content.ref);
@@ -244,7 +372,9 @@ function harness() {
         const field = dialogTree.find((node) => node.type === 'Input');
         if (field?.props.inputRef) (field.props.inputRef as { current: unknown }).current = input;
         for (const node of dialogTree.filter((node) => node.type === 'Button' && node.props.buttonRef)) {
-          (node.props.buttonRef as { current: unknown }).current = node.props.children === 'Cancel' ? cancel : confirm;
+          const button = node.props.children === 'Cancel' ? cancel : confirm;
+          button.disabled = node.props.disabled === true;
+          (node.props.buttonRef as { current: unknown }).current = button;
         }
       } else if (dialog.contains(active)) active = body;
       dialogHooks.flush();
@@ -275,6 +405,13 @@ function harness() {
       for (const listener of dialog.listeners.get('keydown') ?? []) listener(value);
     }
     if (!value.stopped) for (const listener of docListeners.get('keydown') ?? []) listener(value);
+    if (!value.defaultPrevented && !value.stopped && panel.contains(active) && !panel.inert) {
+      if (key === 'Tab') {
+        const buttons = panel.querySelectorAll();
+        const index = buttons.indexOf(active);
+        buttons[index + (shiftKey ? -1 : 1)]?.focus();
+      } else if (key === ' ' && active === opener && !opener.disabled) renameClick?.();
+    }
     return value;
   }
   render();
@@ -289,6 +426,22 @@ function harness() {
     element,
     render,
     sendKey,
+    calls,
+    notices,
+    renamed,
+    requested: () => requestEntered.promise,
+    mutationState: () => mutations.resourceMutationState(instance.id),
+    async settled() {
+      assert.ok(mutation, 'the real lightbox must have started a mutation');
+      await mutation;
+      render();
+    },
+    draft(value: string) {
+      const field = dialogTree.find((node) => node.type === 'Input');
+      assert.ok(field);
+      (field.props.onChange as (value: string) => void)(value);
+      render();
+    },
     active: () => active,
     closed: () => closed,
     modalTree: () => modalTree,
@@ -421,6 +574,112 @@ test('closing a prompt before its focus frame cannot focus its detached input', 
   h.render();
   const other = h.element('other action');
   other.focus();
+  h.frames();
+  assert.equal(h.active(), other);
+  assert.equal(h.pendingFrames(), 0);
+  assert.equal(h.focusListeners(), 0);
+});
+
+function heldResponse() {
+  let resolve!: (value: unknown) => void;
+  const promise = new Promise<unknown>((yes) => {
+    resolve = yes;
+  });
+  return { promise, resolve };
+}
+
+function submitScreenshotRename(h: ReturnType<typeof harness>) {
+  assert.equal(h.active(), h.opener);
+  h.sendKey(' ');
+  h.render();
+  h.frames();
+  assert.equal(h.active(), h.input);
+  assert.equal(h.mutationState().status, 'pending');
+  h.draft('after.png');
+  h.sendKey('Enter');
+}
+
+for (const outcome of ['success', 'refusal'] as const) {
+  test(`a slow screenshot rename ${outcome} retains modal keyboard focus while its invoker is disabled`, async () => {
+    const response = heldResponse();
+    const h = harness(() => response.promise);
+    submitScreenshotRename(h);
+    await h.requested();
+    h.render();
+    assert.equal(
+      JSON.stringify(h.calls),
+      JSON.stringify([['PUT', '/instances/screenshot-instance/screenshots/before.png', { name: 'after.png' }]]),
+    );
+    assert.equal(h.opener.disabled, true);
+    assert.equal(h.active(), h.body);
+    assert.equal(h.panel.inert, false);
+    assert.equal(h.panel.tabIndex, -1);
+    assert.equal(h.modalTree().find((node) => node.props.role === 'dialog')?.props['aria-modal'], 'true');
+    h.frames();
+    assert.equal(h.active(), h.panel, 'the still-disabled invoker falls back to its existing modal panel');
+    assert.equal(h.pendingFrames(), 0);
+    assert.equal(h.focusListeners(), 0);
+
+    response.resolve(
+      outcome === 'success' ? { status: 'ok', name: 'after.png' } : { error: 'Screenshot name already exists.' },
+    );
+    await h.settled();
+    h.frames();
+    assert.equal(h.opener.disabled, false);
+    assert.equal(h.mutationState().status, outcome === 'success' ? 'idle' : 'error');
+    assert.deepEqual(h.renamed, outcome === 'success' ? ['after.png'] : []);
+    assert.deepEqual(
+      h.notices,
+      outcome === 'success' ? ['Screenshot renamed'] : ['Rename screenshot: Screenshot name already exists.'],
+    );
+    assert.equal(h.active(), h.panel, 'settlement does not introduce a later focus transfer');
+    h.sendKey('Tab');
+    assert.equal(h.active(), h.opener);
+    h.sendKey(' ');
+    h.render();
+    h.frames();
+    assert.equal(h.active(), h.input, 'Tab then Space reopens the real screenshot prompt');
+    h.draft('invalid.jpg');
+    assert.equal(h.confirm.disabled, true);
+    h.sendKey('Escape');
+    await h.settled();
+    h.frames();
+    assert.equal(h.active(), h.opener, 'cancellation still restores the exact enabled invoker');
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.closed(), 0);
+  });
+}
+
+test('a screenshot rename settled before the return frame restores its exact invoker', async () => {
+  const response = heldResponse();
+  const h = harness(() => response.promise);
+  submitScreenshotRename(h);
+  await h.requested();
+  h.render();
+  assert.equal(h.opener.disabled, true);
+  response.resolve({ status: 'ok', name: 'after.png' });
+  await h.settled();
+  assert.equal(h.opener.disabled, false);
+  h.frames();
+  assert.equal(h.active(), h.opener);
+  assert.deepEqual(h.renamed, ['after.png']);
+  assert.equal(h.mutationState().status, 'idle');
+  assert.equal(h.pendingFrames(), 0);
+  assert.equal(h.focusListeners(), 0);
+});
+
+test('a pending screenshot rename cannot steal intentional focus for its modal fallback', async () => {
+  const response = heldResponse();
+  const h = harness(() => response.promise);
+  submitScreenshotRename(h);
+  await h.requested();
+  h.render();
+  const other = h.element('other action');
+  other.focus();
+  h.frames();
+  assert.equal(h.active(), other);
+  response.resolve({ status: 'ok', name: 'after.png' });
+  await h.settled();
   h.frames();
   assert.equal(h.active(), other);
   assert.equal(h.pendingFrames(), 0);

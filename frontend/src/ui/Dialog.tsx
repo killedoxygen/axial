@@ -69,7 +69,10 @@ function finishDialog(spec: DialogSpec, result: DialogResult): void {
       !target.closest('[inert]') &&
       (document.activeElement === focused || document.activeElement === document.body)
     ) {
-      target.focus();
+      const focusTarget = target.matches(':disabled')
+        ? target.closest<HTMLElement>('[data-slot="modal-content"]')
+        : target;
+      if (focusTarget?.isConnected && !focusTarget.closest('[inert]')) focusTarget.focus();
     }
   });
   const cancel = (): void => {
