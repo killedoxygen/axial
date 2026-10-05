@@ -2263,23 +2263,37 @@ fn observed(proof: Option<&Proof>) -> ManagedContentObservedState {
     }
 }
 
-fn transaction_outcome(
-    outcome: ManagedContentTransactionOutcome,
+async fn transaction_outcome(
+    mut outcome: ManagedContentTransactionOutcome,
     effects: &mut Vec<Effect>,
 ) -> Result<(), MutationError> {
-    match outcome {
-        ManagedContentTransactionOutcome::Committed(_) => Ok(()),
-        ManagedContentTransactionOutcome::Cancelled(_) => {
-            effects.push(Effect::RolledBack);
-            Err(MutationError::Cancelled)
-        }
-        ManagedContentTransactionOutcome::Failed(_) => {
-            effects.push(Effect::RolledBack);
-            Err(MutationError::Files)
-        }
-        ManagedContentTransactionOutcome::RecoveryRequired(effect) => {
-            effects.push(Effect::Recovery(effect));
-            Err(MutationError::Pending)
+    const DELAYS_MS: [u64; 4] = [25, 100, 250, 1_000];
+    let mut retry = 0;
+    loop {
+        match outcome {
+            ManagedContentTransactionOutcome::Committed(_) => return Ok(()),
+            ManagedContentTransactionOutcome::Cancelled(_) => {
+                effects.push(Effect::RolledBack);
+                return Err(MutationError::Cancelled);
+            }
+            ManagedContentTransactionOutcome::Failed(_) => {
+                effects.push(Effect::RolledBack);
+                return Err(MutationError::Files);
+            }
+            ManagedContentTransactionOutcome::RecoveryRequired(recovery) => {
+                tokio::time::sleep(std::time::Duration::from_millis(DELAYS_MS[retry])).await;
+                retry = (retry + 1).min(DELAYS_MS.len() - 1);
+                // Cancellation cannot release native effects; the accepted task
+                // retains instance admission until this exact recovery settles.
+                outcome = tokio::task::spawn_blocking(move || recovery.reconcile())
+                    .await
+                    .unwrap_or_else(|error| {
+                        if error.is_panic() {
+                            std::panic::resume_unwind(error.into_panic());
+                        }
+                        panic!("content recovery worker stopped before settlement");
+                    });
+            }
         }
     }
 }
@@ -2287,15 +2301,13 @@ fn transaction_outcome(
 /// A cancelled native transaction can be a successful compensation for a
 /// failed transfer. Preserve that original failure instead of telling the user
 /// they cancelled an operation which actually lacked a platform primitive.
-fn unwind_outcome(
+async fn unwind_outcome(
     outcome: ManagedContentTransactionOutcome,
     effects: &mut Vec<Effect>,
     failure: MutationError,
 ) -> Result<(), MutationError> {
-    match transaction_outcome(outcome, effects) {
-        Err(MutationError::Pending) => Err(MutationError::Pending),
-        _ => Err(failure),
-    }
+    let _ = transaction_outcome(outcome, effects).await;
+    Err(failure)
 }
 
 /// The existing leaf owns private staging, authenticated stream copies,
@@ -2444,15 +2456,18 @@ async fn apply_streamed(
             return Err(MutationError::Changed);
         }
         ManagedContentPreparationOutcome::RecoveryRequired(effect) => {
-            effects.push(Effect::Recovery(effect));
-            return Err(MutationError::Pending);
+            return transaction_outcome(
+                ManagedContentTransactionOutcome::RecoveryRequired(effect),
+                effects,
+            )
+            .await;
         }
     };
     loop {
         if let Err(error) =
             owner.persist_checkpoint(receipt, transfers.checkpoint(checkpoint_binding))
         {
-            return unwind_outcome(transfers.cancel(), effects, error);
+            return unwind_outcome(transfers.cancel(), effects, error).await;
         }
         if completed > 0 {
             report_progress(
@@ -2466,10 +2481,10 @@ async fn apply_streamed(
         match transfers.next() {
             ManagedContentTransferStep::Issued(issued) => {
                 if cancel.is_cancelled() {
-                    return transaction_outcome(issued.cancel(), effects);
+                    return transaction_outcome(issued.cancel(), effects).await;
                 }
                 let Some(size) = payload_sizes.remove(issued.id().as_str()) else {
-                    return unwind_outcome(issued.cancel(), effects, MutationError::Changed);
+                    return unwind_outcome(issued.cancel(), effects, MutationError::Changed).await;
                 };
                 if completed == 0 {
                     report_progress(
@@ -2492,19 +2507,21 @@ async fn apply_streamed(
                     };
                     let bytes = match bytes {
                         Ok(bytes) => bytes,
-                        Err(error) => return unwind_outcome(issued.cancel(), effects, error),
+                        Err(error) => return unwind_outcome(issued.cancel(), effects, error).await,
                     };
                     match issued.copy_external(io::Cursor::new(bytes), cancellation) {
                         Ok(settlement) => settlement,
                         Err(issued) => {
-                            return unwind_outcome(issued.cancel(), effects, MutationError::Files);
+                            return unwind_outcome(issued.cancel(), effects, MutationError::Files)
+                                .await;
                         }
                     }
                 } else if issued.is_local() {
                     issued.copy_local(cancellation)
                 } else {
                     let Some(raw_url) = downloads.remove(issued.id().as_str()) else {
-                        return unwind_outcome(issued.cancel(), effects, MutationError::Changed);
+                        return unwind_outcome(issued.cancel(), effects, MutationError::Changed)
+                            .await;
                     };
                     let url =
                         validate_download_url(&raw_url).map_err(|_| MutationError::Unavailable);
@@ -2524,7 +2541,8 @@ async fn apply_streamed(
                             issued.cancel(),
                             effects,
                             MutationError::Unavailable,
-                        );
+                        )
+                        .await;
                     };
                     let running = match issued.start(
                         client,
@@ -2534,7 +2552,8 @@ async fn apply_streamed(
                     ) {
                         Ok(running) => running,
                         Err(issued) => {
-                            return unwind_outcome(issued.cancel(), effects, MutationError::Files);
+                            return unwind_outcome(issued.cancel(), effects, MutationError::Files)
+                                .await;
                         }
                     };
                     let joined = running.join();
@@ -2559,7 +2578,7 @@ async fn apply_streamed(
                 transfers = match settlement.advance() {
                     ManagedContentTransferAdvance::Continue(transfers) => transfers,
                     ManagedContentTransferAdvance::Unwind(outcome) => {
-                        return unwind_outcome(outcome, effects, failure);
+                        return unwind_outcome(outcome, effects, failure).await;
                     }
                 };
                 completed += 1;
@@ -2569,7 +2588,7 @@ async fn apply_streamed(
                 return match complete.stage() {
                     ManagedContentStageOutcome::Ready(ready) => {
                         if cancel.is_cancelled() {
-                            return transaction_outcome(ready.cancel(), effects);
+                            return transaction_outcome(ready.cancel(), effects).await;
                         }
                         let mut ready = match ready.prepare_publication(checkpoint_binding) {
                             ManagedContentStageOutcome::Ready(ready) => ready,
@@ -2584,23 +2603,23 @@ async fn apply_streamed(
                                 } else {
                                     MutationError::Files
                                 };
-                                return unwind_outcome(outcome, effects, failure);
+                                return unwind_outcome(outcome, effects, failure).await;
                             }
                         };
                         if let Err(error) = owner.persist_checkpoint(
                             receipt,
                             ready.checkpoint(checkpoint_binding).map(Some),
                         ) {
-                            return unwind_outcome(ready.cancel(), effects, error);
+                            return unwind_outcome(ready.cancel(), effects, error).await;
                         }
                         report_progress(progress, "content_commit", 0, 1, None);
                         if cancel.is_cancelled() {
-                            return transaction_outcome(ready.cancel(), effects);
+                            return transaction_outcome(ready.cancel(), effects).await;
                         }
-                        transaction_outcome(ready.commit(), effects)
+                        transaction_outcome(ready.commit(), effects).await
                     }
                     ManagedContentStageOutcome::Unwind(outcome) => {
-                        unwind_outcome(outcome, effects, MutationError::Files)
+                        unwind_outcome(outcome, effects, MutationError::Files).await
                     }
                 };
             }
@@ -4385,6 +4404,225 @@ mod tests {
         assert!(!owner.has_unsettled_effects());
         assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).ok(), original);
         assert!(!game.join("config/cancelled.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn live_content_recovery_completes_original_task_after_cleanup_refusal() {
+        live_content_cleanup_refusal(false).await;
+    }
+
+    #[tokio::test]
+    async fn live_content_recovery_keeps_cancelled_task_until_rollback_cleanup() {
+        live_content_cleanup_refusal(true).await;
+    }
+
+    async fn live_content_cleanup_refusal(cancel_before_commit: bool) {
+        use std::{
+            io::Read,
+            path::{Path, PathBuf},
+            time::Duration,
+        };
+
+        const CANARY: &[u8] = b"not owned by the transaction";
+        fn locate_canary(root: &Path, name: &str) -> io::Result<PathBuf> {
+            if !std::fs::symlink_metadata(root)?.is_dir() {
+                return Err(io::Error::other("fixture private root changed"));
+            }
+            let mut directories = vec![(root.to_path_buf(), 0)];
+            let mut entries = 0;
+            let mut found = None;
+            while let Some((directory, depth)) = directories.pop() {
+                for entry in std::fs::read_dir(directory)? {
+                    let entry = entry?;
+                    entries += 1;
+                    let metadata = std::fs::symlink_metadata(entry.path())?;
+                    if entries > 16 || metadata.file_type().is_symlink() {
+                        return Err(io::Error::other("unexpected fixture tree"));
+                    }
+                    if metadata.is_dir() {
+                        if depth >= 2 {
+                            return Err(io::Error::other("fixture tree is too deep"));
+                        }
+                        directories.push((entry.path(), depth + 1));
+                    } else if entry.file_name() == name {
+                        let mut bytes = Vec::new();
+                        std::fs::File::open(entry.path())?
+                            .take(CANARY.len() as u64 + 1)
+                            .read_to_end(&mut bytes)?;
+                        if !metadata.is_file() || bytes != CANARY || found.is_some() {
+                            return Err(io::Error::other("fixture canary is not exact and unique"));
+                        }
+                        found = Some(entry.path());
+                    }
+                }
+            }
+            found.ok_or_else(|| io::Error::other("fixture canary was not preserved"))
+        }
+
+        let (root, owner, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        let registry = owner.directories.registry().clone();
+        let captured_id = id.clone();
+        let captured_game = game.clone();
+        let accepted_task = Arc::new(Mutex::new(None));
+        let captured_task = accepted_task.clone();
+        let tasks = owner.tasks.clone();
+        let canary_name = format!("foreign-cleanup-canary-{}", uuid::Uuid::new_v4());
+        let captured_name = canary_name.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let sender = Mutex::new(Some(sender));
+        let reporting = owner.clone().with_progress(Arc::new(move |event| {
+            if event.phase != "content_commit" || event.current != 0 {
+                return;
+            }
+            let raw: String = registry
+                .storage()
+                .read(|db| {
+                    db.query_row(
+                        "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
+                        [captured_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .map_err(StorageError::from)
+                })
+                .unwrap();
+            let receipt: Receipt = serde_json::from_str(&raw).unwrap();
+            let checkpoint = ManagedContentStagingCheckpoint::decode(
+                receipt.ready_checkpoint.as_deref().unwrap(),
+            )
+            .unwrap();
+            let checkpoint: serde_json::Value =
+                serde_json::from_str(&checkpoint.encode(MAX_RECEIPT_BYTES).unwrap()).unwrap();
+            let private = captured_game.join(checkpoint["private_name"].as_str().unwrap());
+            let canary = private.join("stage").join(&captured_name);
+            std::fs::write(&canary, CANARY).unwrap();
+            let handle = std::fs::File::open(&canary).unwrap();
+            if cancel_before_commit {
+                assert!(tasks.cancel(captured_task.lock().unwrap().expect("accepted task")));
+            }
+            sender
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send((private, handle, receipt))
+                .unwrap();
+        }));
+        let task = reporting
+            .install_pack(
+                &catalog(&owner),
+                &id,
+                pack(&[], &[("overrides/config/live-recovery.txt", b"published")]),
+                true,
+            )
+            .unwrap();
+        let task_id = task.id();
+        *accepted_task.lock().unwrap() = Some(task_id);
+        let mut joined = Box::pin(task.join());
+        let (private, handle, receipt) = tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        let early = tokio::time::timeout(Duration::from_millis(200), &mut joined)
+            .await
+            .ok();
+        let published = std::fs::read(game.join("config/live-recovery.txt")).ok();
+        let manifest = std::fs::read(game.join(MANIFEST_FILE)).ok();
+        let mut canary_bytes = Vec::new();
+        let canary_read = handle
+            .take(CANARY.len() as u64 + 1)
+            .read_to_end(&mut canary_bytes);
+        let canary = locate_canary(&private, &canary_name);
+        let fenced = owner.directories.admit(&id).is_err();
+        let task_retained = owner.tasks.status().running.contains(&task_id);
+        let premature_recovery = owner.pending.lock().unwrap().get(&id).is_some_and(|batch| {
+            batch
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Recovery(_)))
+        });
+        let raw: Result<String, StorageError> = owner.directories.registry().storage().read(|db| {
+            db.query_row(
+                "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
+        });
+
+        // Native empty-directory cleanup can park stage; only remove our own file.
+        let cleanup = canary.and_then(|path| {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.len() != CANARY.len() as u64 {
+                return Err(io::Error::other("fixture canary changed before cleanup"));
+            }
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)?
+                .take(CANARY.len() as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes != CANARY {
+                return Err(io::Error::other(
+                    "fixture canary bytes changed before cleanup",
+                ));
+            }
+            std::fs::remove_file(path)
+        });
+        let result = if early.is_some() {
+            // Settle the unfixed implementation before asserting its premature return.
+            tokio::time::timeout(Duration::from_secs(5), owner.resume(&id).unwrap().join())
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), &mut joined)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
+        owner.directories.library().try_preserve().unwrap();
+
+        cleanup.unwrap();
+        canary_read.unwrap();
+        let expected_payload = (!cancel_before_commit).then(|| b"published".to_vec());
+        let expected_manifest = if cancel_before_commit {
+            receipt.before_manifest.clone()
+        } else {
+            Some(receipt.after_manifest.clone())
+        };
+        assert_eq!(published, expected_payload);
+        assert_eq!(manifest, expected_manifest);
+        assert_eq!(canary_bytes, CANARY);
+        let blocked_receipt: Receipt = serde_json::from_str(&raw.unwrap()).unwrap();
+        assert!(fenced && !blocked_receipt.native_settled);
+        assert!(
+            early.is_none(),
+            "accepted task returned before its live native recovery settled: {early:?}; retained native recovery: {premature_recovery}"
+        );
+        assert!(
+            task_retained,
+            "original task must retain admission during recovery"
+        );
+        if cancel_before_commit {
+            assert!(
+                matches!(result, Err(MutationError::Cancelled)),
+                "{result:?}"
+            );
+        } else {
+            let result = result.unwrap();
+            assert_eq!(result.operation_id, receipt.operation_id);
+            assert_eq!(result.status, "complete");
+        }
+        assert!(!private.exists());
+        assert!(!owner.has_unsettled_effects());
+        assert_eq!(
+            std::fs::read(game.join("config/live-recovery.txt")).ok(),
+            expected_payload
+        );
+        assert_eq!(
+            std::fs::read(game.join(MANIFEST_FILE)).ok(),
+            expected_manifest
+        );
     }
 
     #[tokio::test]

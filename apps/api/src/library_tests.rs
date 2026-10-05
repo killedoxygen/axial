@@ -556,14 +556,21 @@ async fn pending_external_instance_exit_helper() {
 
 const PENDING_CONTENT_PROFILE: &str = "AXIAL_TEST_PENDING_CONTENT_PROFILE";
 const PENDING_CONTENT_QUEUED: &str = "AXIAL_TEST_PENDING_CONTENT_QUEUED";
+const PENDING_CONTENT_PUBLIC_MOVE: &str = "AXIAL_TEST_PENDING_CONTENT_PUBLIC_MOVE";
 const PENDING_CONTENT_EXIT: i32 = 42;
 const CONTENT_OVERRIDE: &[u8] = b"preserved content override\n";
+const CONTENT_PUBLIC_PATH: &str = "config/published.txt";
+const CONTENT_PUBLIC_BYTES: &[u8] = b"published before manifest commit\n";
 
 fn override_pack() -> ResolvedPack {
+    override_pack_at("config/preserved.txt", CONTENT_OVERRIDE)
+}
+
+fn override_pack_at(path: &str, bytes: &[u8]) -> ResolvedPack {
     let mut archive = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
     for (path, bytes) in [
         (
-            "modrinth.index.json",
+            "modrinth.index.json".to_owned(),
             serde_json::to_vec(&json!({
                 "name":"Interrupted content fixture",
                 "dependencies":{"minecraft":"1.21.1", "fabric-loader":"0.16.9"},
@@ -571,7 +578,7 @@ fn override_pack() -> ResolvedPack {
             }))
             .unwrap(),
         ),
-        ("overrides/config/preserved.txt", CONTENT_OVERRIDE.to_vec()),
+        (format!("overrides/{path}"), bytes.to_vec()),
     ] {
         archive
             .start_file(path, zip::write::SimpleFileOptions::default())
@@ -640,7 +647,7 @@ fn content_tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     tree
 }
 
-async fn content_fence(services: &DesktopServices, id: &InstanceId) -> (u16, bool, bool) {
+async fn content_fence(services: &DesktopServices, id: &InstanceId) -> (u16, bool, bool, bool) {
     let read = get(services, &format!("instances/{id}/content"))
         .await
         .status()
@@ -662,6 +669,7 @@ async fn content_fence(services: &DesktopServices, id: &InstanceId) -> (u16, boo
         read,
         refused,
         services.server.ensure_reset_allowed().is_err(),
+        services.server.ensure_update_allowed().is_err(),
     )
 }
 
@@ -694,17 +702,30 @@ async fn cleanup_refused_content_exit(services: DesktopServices) {
 
 #[tokio::test]
 async fn interrupted_content_blocks_reset_but_allows_preserved_exit() {
-    interrupted_content_exit(false).await;
+    interrupted_content_exit(ContentExit::Acknowledgement).await;
 }
 
 #[tokio::test]
 async fn interrupted_queued_content_blocks_reset_but_allows_preserved_exit() {
-    interrupted_content_exit(true).await;
+    interrupted_content_exit(ContentExit::QueuedAcknowledgement).await;
 }
 
-async fn interrupted_content_exit(queued: bool) {
+#[tokio::test]
+async fn interrupted_content_public_moves_preserve_fences_and_allow_exit() {
+    interrupted_content_exit(ContentExit::PublicMoves).await;
+}
+
+enum ContentExit {
+    Acknowledgement,
+    QueuedAcknowledgement,
+    PublicMoves,
+}
+
+async fn interrupted_content_exit(boundary: ContentExit) {
     use std::io::{Seek, SeekFrom};
 
+    let queued = matches!(boundary, ContentExit::QueuedAcknowledgement);
+    let public_moves = matches!(boundary, ContentExit::PublicMoves);
     let temporary = temporary();
     let root = admit_profile(&temporary.path().join("replacement"))
         .unwrap()
@@ -720,6 +741,10 @@ async fn interrupted_content_exit(queued: bool) {
         ])
         .env(PENDING_CONTENT_PROFILE, &root)
         .env(PENDING_CONTENT_QUEUED, if queued { "1" } else { "0" })
+        .env(
+            PENDING_CONTENT_PUBLIC_MOVE,
+            if public_moves { "1" } else { "0" },
+        )
         .stdout(output.try_clone().unwrap())
         .stderr(output.try_clone().unwrap())
         .kill_on_drop(true)
@@ -762,6 +787,17 @@ async fn interrupted_content_exit(queued: bool) {
         fs::read(payload.join("config/preserved.txt")).unwrap(),
         CONTENT_OVERRIDE
     );
+    if public_moves {
+        assert_eq!(
+            fs::read(payload.join(CONTENT_PUBLIC_PATH)).unwrap(),
+            CONTENT_PUBLIC_BYTES
+        );
+        let recorded: Value = serde_json::from_str(&receipt.1).unwrap();
+        assert_eq!(
+            fs::read(payload.join(MANIFEST_FILE)).unwrap(),
+            serde_json::from_value::<Vec<u8>>(recorded["before_manifest"].clone()).unwrap()
+        );
+    }
     drop(storage);
 
     let mut observations = Vec::new();
@@ -887,16 +923,21 @@ async fn interrupted_content_exit(queued: bool) {
             before_fence.2 && after_fence.2,
             "destructive reset must retain the Content fence"
         );
+        assert!(
+            before_fence.3 && after_fence.3,
+            "update must retain the Content fence"
+        );
     }
 }
 
 #[tokio::test]
-#[ignore = "subprocess helper exiting after a real Content commit with refused acknowledgement"]
+#[ignore = "subprocess helper exiting at a real Content publication boundary"]
 async fn pending_content_exit_helper() {
     let root = PathBuf::from(std::env::var_os(PENDING_CONTENT_PROFILE).unwrap());
     assert_eq!(fs::canonicalize(&root).unwrap(), root);
     let services = start_in_profile(root.clone(), None).await.unwrap();
     let queued = std::env::var(PENDING_CONTENT_QUEUED).unwrap() == "1";
+    let public_moves = std::env::var(PENDING_CONTENT_PUBLIC_MOVE).unwrap() == "1";
     let target = CreateTarget::loader_for_tests(
         axial_minecraft::LoaderComponentId::Fabric,
         "1.21.1",
@@ -921,7 +962,7 @@ async fn pending_content_exit_helper() {
     let storage = services.instances.registry().storage();
     let service =
         ContentService::new(ProviderClient::new(ClientConfig::default()).unwrap()).unwrap();
-    if queued {
+    if queued || public_moves {
         services
             .content_mutations
             .install_pack(&service, &instance.id, override_pack(), true)
@@ -930,6 +971,64 @@ async fn pending_content_exit_helper() {
             .await
             .unwrap()
             .unwrap();
+    }
+    if public_moves {
+        use axial_minecraft::managed_path::{
+            ManagedContentStagingCheckpoint, ManagedContentTransactionRoot,
+        };
+
+        let record = services
+            .instances
+            .registry()
+            .get_record(&instance.id)
+            .unwrap();
+        let payload = root.join("instances").join(record.directory_name);
+        let before_manifest = fs::read(payload.join(MANIFEST_FILE)).unwrap();
+        let observed_payload = payload.clone();
+        let observed_registry = services.instances.registry().clone();
+        let id = instance.id.clone();
+        ManagedContentTransactionRoot::before_manifest_revalidation_for_test(&payload, move || {
+            let receipt = content_receipt(observed_registry.storage(), &id);
+            let recorded: Value = serde_json::from_str(&receipt.1).unwrap();
+            assert_eq!(recorded["native_settled"], false);
+            ManagedContentStagingCheckpoint::decode(recorded["ready_checkpoint"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(recorded["changes"].as_array().unwrap().len(), 1);
+            assert_eq!(recorded["changes"][0]["path"], CONTENT_PUBLIC_PATH);
+            assert_eq!(
+                serde_json::from_value::<Vec<u8>>(recorded["before_manifest"].clone()).unwrap(),
+                before_manifest
+            );
+            assert_ne!(recorded["before_manifest"], recorded["after_manifest"]);
+            assert_eq!(
+                fs::read(observed_payload.join(MANIFEST_FILE)).unwrap(),
+                before_manifest
+            );
+            assert_eq!(
+                fs::read(observed_payload.join("config/preserved.txt")).unwrap(),
+                CONTENT_OVERRIDE
+            );
+            assert_eq!(
+                fs::read(observed_payload.join(CONTENT_PUBLIC_PATH)).unwrap(),
+                CONTENT_PUBLIC_BYTES
+            );
+            content_tree(&observed_payload);
+            std::process::exit(PENDING_CONTENT_EXIT);
+        })
+        .unwrap();
+        let result = services
+            .content_mutations
+            .install_pack(
+                &service,
+                &instance.id,
+                override_pack_at(CONTENT_PUBLIC_PATH, CONTENT_PUBLIC_BYTES),
+                true,
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap();
+        panic!("Content must exit after public moves and before manifest publication: {result:?}");
     }
     storage.transaction(|db| -> Result<(), StorageError> {
         db.execute_batch("CREATE TRIGGER refuse_content_acknowledgement BEFORE UPDATE ON content_batches WHEN json_extract(NEW.receipt_json,'$.native_settled') = 1 BEGIN SELECT RAISE(ABORT, 'injected content acknowledgement refusal'); END;")?;

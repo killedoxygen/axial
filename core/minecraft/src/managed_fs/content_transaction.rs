@@ -49,6 +49,14 @@ const PRIVATE_STAGE_NAME: &str = "stage";
 const PRIVATE_BACKUP_NAME: &str = "backup";
 const MAX_STAGING_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
 
+#[cfg(any(test, feature = "test-support"))]
+type BeforeManifestRevalidation = Box<dyn FnOnce() + Send>;
+
+#[cfg(any(test, feature = "test-support"))]
+static BEFORE_MANIFEST_REVALIDATION: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, BeforeManifestRevalidation>>,
+> = std::sync::OnceLock::new();
+
 #[cfg(test)]
 thread_local! {
     static AFTER_STAGING_PARENT_REMOVAL: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
@@ -826,6 +834,32 @@ impl fmt::Debug for ManagedContentTransactionRoot {
 }
 
 impl ManagedContentTransactionRoot {
+    /// Arms only the next transaction prepared for this canonical fixture root.
+    #[cfg(feature = "test-support")]
+    pub fn before_manifest_revalidation_for_test(
+        root: &std::path::Path,
+        callback: impl FnOnce() + Send + 'static,
+    ) -> io::Result<()> {
+        if std::fs::canonicalize(root)? != root {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "noncanonical test root",
+            ));
+        }
+        let mut hooks = BEFORE_MANIFEST_REVALIDATION
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .expect("content test hook lock");
+        if hooks.contains_key(root) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "content test hook already armed",
+            ));
+        }
+        hooks.insert(root.to_path_buf(), Box::new(callback));
+        Ok(())
+    }
+
     pub fn bind(directory: ManagedTreeDirectory, authority: ManagedTransferAuthority) -> Self {
         Self {
             directory,
@@ -1963,8 +1997,8 @@ struct TransactionState {
     backup_cleanup: CleanupDirectoryState,
     private_cleanup: CleanupDirectoryState,
     created_parents: Vec<CreatedTransactionParent>,
-    #[cfg(test)]
-    before_manifest_revalidation: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(any(test, feature = "test-support"))]
+    before_manifest_revalidation: Option<BeforeManifestRevalidation>,
 }
 
 enum CleanupDirectoryState {
@@ -2171,6 +2205,15 @@ fn prepare_transaction(
     let stage_cleanup = CleanupDirectoryState::Known(stage.clone());
     let backup_cleanup = CleanupDirectoryState::Known(backup.clone());
     let private_cleanup = CleanupDirectoryState::Known(private.clone());
+    #[cfg(any(test, feature = "test-support"))]
+    let before_manifest_revalidation = BEFORE_MANIFEST_REVALIDATION.get().and_then(|hooks| {
+        let mut hooks = hooks.lock().expect("content test hook lock");
+        let root = hooks
+            .keys()
+            .find(|path| session.root.validate_absolute_projection(path).is_ok())
+            .cloned()?;
+        hooks.remove(&root)
+    });
     ManagedContentPreparationOutcome::Prepared(ManagedContentPreparedTransaction {
         state: TransactionState {
             root: session.root,
@@ -2198,8 +2241,8 @@ fn prepare_transaction(
             backup_cleanup,
             private_cleanup,
             created_parents: Vec::new(),
-            #[cfg(test)]
-            before_manifest_revalidation: None,
+            #[cfg(any(test, feature = "test-support"))]
+            before_manifest_revalidation,
         },
         slots,
     })
@@ -4071,7 +4114,7 @@ fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome
             return recovery(state, TransactionIntent::Fail);
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(hook) = state.before_manifest_revalidation.take() {
         hook();
     }
@@ -4452,16 +4495,7 @@ fn cleanup_committed(mut state: TransactionState) -> ManagedContentTransactionOu
         }
         state.manifest_claimed = false;
     }
-    let path_count = state.mutations.len();
-    let payload_count = state.payloads.len();
-    if cleanup_private(&mut state).is_err() {
-        state.terminal_failure = ManagedContentTransactionFailure::CleanupFailed;
-        return recovery(state, TransactionIntent::Commit);
-    }
-    ManagedContentTransactionOutcome::Committed(ManagedContentCommitReceipt {
-        path_count,
-        payload_count,
-    })
+    finish_transaction_cleanup(state, TransactionIntent::Commit)
 }
 
 fn drive_rollback(
@@ -4604,33 +4638,44 @@ fn drive_rollback(
             state.mutations[index].claimed = false;
         }
     }
+    finish_transaction_cleanup(
+        state,
+        if cancelled {
+            TransactionIntent::Cancel
+        } else {
+            TransactionIntent::Fail
+        },
+    )
+}
+
+fn finish_transaction_cleanup(
+    mut state: TransactionState,
+    intent: TransactionIntent,
+) -> ManagedContentTransactionOutcome {
+    // Public effects are settled; only the retained exact cleanup capabilities remain.
+    if state.root.inner.root.settle().is_err()
+        || cleanup_private(&mut state).is_err()
+        || (intent != TransactionIntent::Commit
+            && cleanup_created_transaction_parents(&mut state).is_err())
+    {
+        state.terminal_failure = ManagedContentTransactionFailure::CleanupFailed;
+        state.read_preconditions.clear();
+        return ManagedContentTransactionOutcome::RecoveryRequired(ManagedContentRecovery {
+            state: Some(RecoveryState::TransactionCleanup { state, intent }),
+        });
+    }
     let path_count = state.mutations.len();
-    if cleanup_private(&mut state).is_err() {
-        state.terminal_failure = ManagedContentTransactionFailure::CleanupFailed;
-        return recovery(
-            state,
-            if cancelled {
-                TransactionIntent::Cancel
-            } else {
-                TransactionIntent::Fail
-            },
-        );
-    }
-    if cleanup_created_transaction_parents(&mut state).is_err() {
-        state.terminal_failure = ManagedContentTransactionFailure::CleanupFailed;
-        return recovery(
-            state,
-            if cancelled {
-                TransactionIntent::Cancel
-            } else {
-                TransactionIntent::Fail
-            },
-        );
-    }
-    if cancelled {
-        ManagedContentTransactionOutcome::Cancelled(ManagedContentCancelReceipt { path_count })
-    } else {
-        ManagedContentTransactionOutcome::Failed(state.terminal_failure)
+    match intent {
+        TransactionIntent::Commit => {
+            ManagedContentTransactionOutcome::Committed(ManagedContentCommitReceipt {
+                path_count,
+                payload_count: state.payloads.len(),
+            })
+        }
+        TransactionIntent::Cancel => {
+            ManagedContentTransactionOutcome::Cancelled(ManagedContentCancelReceipt { path_count })
+        }
+        TransactionIntent::Fail => ManagedContentTransactionOutcome::Failed(state.terminal_failure),
     }
 }
 
@@ -4757,6 +4802,10 @@ enum RecoveryState {
         remaining: Vec<StageRecoveryMember>,
     },
     Transaction {
+        state: TransactionState,
+        intent: TransactionIntent,
+    },
+    TransactionCleanup {
         state: TransactionState,
         intent: TransactionIntent,
     },
@@ -4974,6 +5023,9 @@ impl ManagedContentRecovery {
                     drive_rollback(state, intent == TransactionIntent::Cancel)
                 }
             }
+            RecoveryState::TransactionCleanup { state, intent } => {
+                finish_transaction_cleanup(state, intent)
+            }
         }
     }
 }
@@ -5126,59 +5178,129 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
         let Some(payload_index) = state.staged_by_id.get(id).copied() else {
             return false;
         };
+        let was_installed = state.mutations[mutation_index].installed_guard.is_some();
         let mut guard = state.mutations[mutation_index]
             .installed_guard
             .take()
             .or_else(|| state.payloads[payload_index].guard.take());
-        if let Some(current) = guard.as_mut() {
-            match state
-                .stage
-                .reproject_guard_at(state.payloads[payload_index].name.as_str(), current)
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    if reproject_transaction_parent_guard(
+        let classified = (|| {
+            if let Some(current) = guard.as_mut() {
+                match state
+                    .stage
+                    .reproject_guard_at(state.payloads[payload_index].name.as_str(), current)
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if reproject_transaction_parent_guard(
+                            &state.root,
+                            &state.mutations[mutation_index].parent,
+                            state.mutations[mutation_index].name.as_str(),
+                            current,
+                        )
+                        .is_err()
+                        {
+                            return false;
+                        }
+                    }
+                    Err(_) => return false,
+                }
+            }
+            if guard.is_none() {
+                let staged = match inspect_exact_file(
+                    &state.stage,
+                    state.payloads[payload_index].name.as_str(),
+                ) {
+                    Ok(value) => value,
+                    Err(()) => return false,
+                };
+                if let Some(staged) = staged {
+                    if !payload_guard_matches_report(
+                        &state.stage,
+                        state.payloads[payload_index].name.as_str(),
+                        &staged,
+                        &state.payloads[payload_index].report,
+                    ) {
+                        return false;
+                    }
+                    guard = Some(staged);
+                } else {
+                    let installed = match inspect_transaction_parent_file(
                         &state.root,
                         &state.mutations[mutation_index].parent,
                         state.mutations[mutation_index].name.as_str(),
-                        current,
-                    )
-                    .is_err()
-                    {
-                        return false;
+                    ) {
+                        Ok(value) => value,
+                        Err(()) => return false,
+                    };
+                    if let Some(installed) = installed {
+                        if transaction_parent_directory(
+                            &state.root,
+                            &state.mutations[mutation_index].parent,
+                        )
+                        .is_ok_and(|parent| {
+                            parent.is_some_and(|parent| {
+                                payload_guard_matches_report(
+                                    &parent,
+                                    state.mutations[mutation_index].name.as_str(),
+                                    &installed,
+                                    &state.payloads[payload_index].report,
+                                )
+                            })
+                        }) {
+                            guard = Some(installed);
+                        } else if !destination_matches_prior(state, mutation_index) {
+                            return false;
+                        }
                     }
                 }
-                Err(_) => return false,
             }
-        }
-        if guard.is_none() {
-            let staged =
-                match inspect_exact_file(&state.stage, state.payloads[payload_index].name.as_str())
-                {
-                    Ok(value) => value,
-                    Err(()) => return false,
-                };
-            if let Some(staged) = staged {
-                if !payload_guard_matches_report(
-                    &state.stage,
-                    state.payloads[payload_index].name.as_str(),
-                    &staged,
-                    &state.payloads[payload_index].report,
-                ) {
+            let Some(current) = guard.as_ref() else {
+                if state.manifest_committed || !destination_matches_prior(state, mutation_index) {
                     return false;
                 }
-                guard = Some(staged);
-            } else {
-                let installed = match inspect_transaction_parent_file(
-                    &state.root,
-                    &state.mutations[mutation_index].parent,
-                    state.mutations[mutation_index].name.as_str(),
-                ) {
-                    Ok(value) => value,
-                    Err(()) => return false,
-                };
-                if let Some(installed) = installed {
-                    if transaction_parent_directory(
+                state.mutations[mutation_index].installed = false;
+                return true;
+            };
+            let staged = classify_exact_file(
+                &state.stage,
+                state.payloads[payload_index].name.as_str(),
+                current,
+            );
+            let installed = classify_transaction_parent_file(
+                &state.root,
+                &state.mutations[mutation_index].parent,
+                state.mutations[mutation_index].name.as_str(),
+                current,
+            );
+            match (staged, installed) {
+                (ExactBindingState::Exact, ExactBindingState::Absent) => {
+                    if !payload_guard_matches_report(
+                        &state.stage,
+                        state.payloads[payload_index].name.as_str(),
+                        current,
+                        &state.payloads[payload_index].report,
+                    ) {
+                        return false;
+                    }
+                    state.payloads[payload_index].guard = guard.take();
+                    state.mutations[mutation_index].installed = false;
+                }
+                (ExactBindingState::Exact, ExactBindingState::Foreign)
+                    if destination_matches_prior(state, mutation_index) =>
+                {
+                    if !payload_guard_matches_report(
+                        &state.stage,
+                        state.payloads[payload_index].name.as_str(),
+                        current,
+                        &state.payloads[payload_index].report,
+                    ) {
+                        return false;
+                    }
+                    state.payloads[payload_index].guard = guard.take();
+                    state.mutations[mutation_index].installed = false;
+                }
+                (ExactBindingState::Absent, ExactBindingState::Exact) => {
+                    if !transaction_parent_directory(
                         &state.root,
                         &state.mutations[mutation_index].parent,
                     )
@@ -5187,95 +5309,40 @@ fn classify_transaction(state: &mut TransactionState) -> bool {
                             payload_guard_matches_report(
                                 &parent,
                                 state.mutations[mutation_index].name.as_str(),
-                                &installed,
+                                current,
                                 &state.payloads[payload_index].report,
                             )
                         })
                     }) {
-                        guard = Some(installed);
-                    } else if !destination_matches_prior(state, mutation_index) {
                         return false;
                     }
+                    state.mutations[mutation_index].installed_guard = guard.take();
+                    state.mutations[mutation_index].installed = true;
                 }
-            }
-        }
-        let Some(guard) = guard else {
-            if state.manifest_committed || !destination_matches_prior(state, mutation_index) {
-                return false;
-            }
-            state.mutations[mutation_index].installed = false;
-            continue;
-        };
-        let staged = classify_exact_file(
-            &state.stage,
-            state.payloads[payload_index].name.as_str(),
-            &guard,
-        );
-        let installed = classify_transaction_parent_file(
-            &state.root,
-            &state.mutations[mutation_index].parent,
-            state.mutations[mutation_index].name.as_str(),
-            &guard,
-        );
-        match (staged, installed) {
-            (ExactBindingState::Exact, ExactBindingState::Absent) => {
-                if !payload_guard_matches_report(
-                    &state.stage,
-                    state.payloads[payload_index].name.as_str(),
-                    &guard,
-                    &state.payloads[payload_index].report,
-                ) {
-                    return false;
+                (ExactBindingState::Absent, ExactBindingState::Absent)
+                    if !state.manifest_committed =>
+                {
+                    state.mutations[mutation_index].installed = false;
                 }
-                state.payloads[payload_index].guard = Some(guard);
-                state.mutations[mutation_index].installed = false;
+                _ => return false,
             }
-            (ExactBindingState::Exact, ExactBindingState::Foreign)
-                if destination_matches_prior(state, mutation_index) =>
-            {
-                if !payload_guard_matches_report(
-                    &state.stage,
-                    state.payloads[payload_index].name.as_str(),
-                    &guard,
-                    &state.payloads[payload_index].report,
-                ) {
-                    return false;
-                }
-                state.payloads[payload_index].guard = Some(guard);
-                state.mutations[mutation_index].installed = false;
+            true
+        })();
+        if !classified {
+            if was_installed {
+                state.mutations[mutation_index].installed_guard = guard;
+            } else {
+                state.payloads[payload_index].guard = guard;
             }
-            (ExactBindingState::Absent, ExactBindingState::Exact) => {
-                if !transaction_parent_directory(
-                    &state.root,
-                    &state.mutations[mutation_index].parent,
-                )
-                .is_ok_and(|parent| {
-                    parent.is_some_and(|parent| {
-                        payload_guard_matches_report(
-                            &parent,
-                            state.mutations[mutation_index].name.as_str(),
-                            &guard,
-                            &state.payloads[payload_index].report,
-                        )
-                    })
-                }) {
-                    return false;
-                }
-                state.mutations[mutation_index].installed_guard = Some(guard);
-                state.mutations[mutation_index].installed = true;
-            }
-            (ExactBindingState::Absent, ExactBindingState::Absent) if !state.manifest_committed => {
-                state.mutations[mutation_index].installed = false;
-            }
-            _ => return false,
+            return false;
         }
     }
 
     if state.manifest_publication_started && !state.manifest_committed {
-        if let Some(guard) = state.manifest_installed.take() {
-            match classify_exact_file(&state.root, MANIFEST_NAME, &guard) {
-                ExactBindingState::Exact => state.manifest_installed = Some(guard),
-                ExactBindingState::Absent => {}
+        if let Some(guard) = state.manifest_installed.as_ref() {
+            match classify_exact_file(&state.root, MANIFEST_NAME, guard) {
+                ExactBindingState::Exact => {}
+                ExactBindingState::Absent => state.manifest_installed = None,
                 ExactBindingState::Foreign | ExactBindingState::Unknown => return false,
             }
         }
@@ -5724,6 +5791,158 @@ mod tests {
             panic!("checkpoint fixture must become Ready");
         };
         (tree, ready)
+    }
+
+    #[test]
+    fn committed_cleanup_recovers_after_foreign_stage_file_is_removed() {
+        recover_private_cleanup(false);
+    }
+
+    #[test]
+    fn cancelled_cleanup_recovers_after_foreign_stage_file_is_removed() {
+        recover_private_cleanup(true);
+    }
+
+    fn recover_private_cleanup(cancelled: bool) {
+        const CANARY_NAME: &str = "foreign-cleanup-canary";
+        const CANARY: &[u8] = b"foreign file must remain";
+        fn canary(private: &std::path::Path) -> std::path::PathBuf {
+            let mut candidates = Vec::new();
+            for entry in std::fs::read_dir(private).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    let candidate = entry.path().join(CANARY_NAME);
+                    if candidate.try_exists().unwrap() {
+                        assert!(std::fs::symlink_metadata(&candidate).unwrap().is_file());
+                        assert_eq!(std::fs::read(&candidate).unwrap(), CANARY);
+                        candidates.push(candidate);
+                    }
+                }
+            }
+            assert_eq!(candidates.len(), 1);
+            candidates.pop().unwrap()
+        }
+
+        let temporary = test_tempdir().unwrap();
+        let (tree, ready) = checkpoint_fixture(&temporary);
+        let ManagedContentStageOutcome::Ready(ready) = ready.prepare_publication([23; 32]) else {
+            panic!("fixture must prepare publication");
+        };
+        let private = ready.state.private.inner.path.clone();
+        std::fs::write(ready.state.stage.inner.path.join(CANARY_NAME), CANARY).unwrap();
+        let mut outcome = if cancelled {
+            ready.cancel()
+        } else {
+            ready.commit()
+        };
+        for _ in 0..3 {
+            let ManagedContentTransactionOutcome::RecoveryRequired(recovery) = outcome else {
+                panic!("foreign stage file must retain cleanup");
+            };
+            canary(&private);
+            outcome = recovery.reconcile();
+        }
+        let ManagedContentTransactionOutcome::RecoveryRequired(recovery) = outcome else {
+            panic!("foreign stage file must remain an obligation");
+        };
+        std::fs::remove_file(canary(&private)).unwrap();
+        let settled = recovery.reconcile();
+        if cancelled {
+            assert!(matches!(
+                settled,
+                ManagedContentTransactionOutcome::Cancelled(_)
+            ));
+            assert_eq!(
+                std::fs::read(temporary.path().join("mods/first.jar")).unwrap(),
+                b"original"
+            );
+            assert!(!temporary.path().join("mods/second.jar").exists());
+            assert!(!temporary.path().join("config").exists());
+            assert_eq!(
+                std::fs::read(temporary.path().join(MANIFEST_NAME)).unwrap(),
+                b"original manifest"
+            );
+        } else {
+            assert!(matches!(
+                settled,
+                ManagedContentTransactionOutcome::Committed(_)
+            ));
+            for path in [
+                "mods/first.jar",
+                "mods/second.jar",
+                "config/nested/options.txt",
+            ] {
+                assert_eq!(
+                    std::fs::read(temporary.path().join(path)).unwrap(),
+                    b"staged replacement"
+                );
+            }
+            assert_eq!(
+                std::fs::read(temporary.path().join(MANIFEST_NAME)).unwrap(),
+                b"replacement manifest"
+            );
+        }
+        assert!(!private.exists());
+        tree.authority.root.settle().unwrap();
+    }
+
+    #[test]
+    fn refused_recovery_keeps_installed_guard_until_exact_payload_returns() {
+        let temporary = test_tempdir().unwrap();
+        let (tree, mut ready) = checkpoint_fixture(&temporary);
+        let destination = temporary.path().join("mods/first.jar");
+        let retained = temporary.path().join("retained-payload");
+        let moved_destination = destination.clone();
+        let moved_retained = retained.clone();
+        ready.state.before_manifest_revalidation = Some(Box::new(move || {
+            std::fs::rename(&moved_destination, moved_retained).unwrap();
+            std::fs::write(moved_destination, b"staged replacement").unwrap();
+        }));
+        let ManagedContentTransactionOutcome::RecoveryRequired(recovery) = ready.commit() else {
+            panic!("foreign replacement must retain rollback");
+        };
+        let Some(RecoveryState::Transaction { state, .. }) = recovery.state.as_ref() else {
+            panic!("public effects still require classification");
+        };
+        let mutation_index = state
+            .mutations
+            .iter()
+            .position(|mutation| mutation.name.as_str() == "first.jar")
+            .unwrap();
+        let identity = state.mutations[mutation_index]
+            .installed_guard
+            .as_ref()
+            .unwrap()
+            .identity
+            .clone();
+        let ManagedContentTransactionOutcome::RecoveryRequired(recovery) = recovery.reconcile()
+        else {
+            panic!("foreign replacement cannot settle rollback");
+        };
+        let Some(RecoveryState::Transaction { state, .. }) = recovery.state.as_ref() else {
+            panic!("public effects still require classification");
+        };
+        assert_eq!(
+            state.mutations[mutation_index]
+                .installed_guard
+                .as_ref()
+                .unwrap()
+                .identity,
+            identity
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"staged replacement");
+        std::fs::remove_file(&destination).unwrap();
+        std::fs::rename(retained, &destination).unwrap();
+        assert!(matches!(
+            recovery.reconcile(),
+            ManagedContentTransactionOutcome::Failed(_)
+        ));
+        assert_eq!(std::fs::read(destination).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(temporary.path().join(MANIFEST_NAME)).unwrap(),
+            b"original manifest"
+        );
+        tree.authority.root.settle().unwrap();
     }
 
     #[test]
