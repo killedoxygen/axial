@@ -49,6 +49,11 @@ const PRIVATE_STAGE_NAME: &str = "stage";
 const PRIVATE_BACKUP_NAME: &str = "backup";
 const MAX_STAGING_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_STAGING_PARENT_REMOVAL: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedContentPathPolicy {
     Managed,
@@ -2847,6 +2852,21 @@ impl fmt::Debug for ManagedContentReadyTransaction {
 }
 
 impl ManagedContentReadyTransaction {
+    pub fn prepare_publication(mut self, binding: [u8; 32]) -> ManagedContentStageOutcome {
+        match self.checkpoint(binding) {
+            Ok(_)
+            | Err(
+                ManagedContentCheckpointError::Unsupported
+                | ManagedContentCheckpointError::Capacity,
+            ) => {}
+            Err(_) => return ManagedContentStageOutcome::Unwind(drive_rollback(self.state, false)),
+        }
+        if prepare_publication_prefix(&mut self.state).is_err() {
+            return ManagedContentStageOutcome::Unwind(drive_rollback(self.state, false));
+        }
+        ManagedContentStageOutcome::Ready(self)
+    }
+
     pub fn checkpoint(
         &mut self,
         binding: [u8; 32],
@@ -2906,6 +2926,12 @@ struct StagingCheckpoint {
     mutation_count: usize,
     #[serde(deserialize_with = "staging_directories")]
     directories: BTreeMap<String, Option<[u8; 32]>>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "staging_directories"
+    )]
+    created_parents: BTreeMap<String, [u8; 32]>,
     files: Vec<StagingFile>,
     payloads: Vec<StagingPayload>,
 }
@@ -2932,12 +2958,12 @@ struct StagingFileProof {
     sha512: String,
 }
 
-fn staging_directories<'de, D: serde::Deserializer<'de>>(
+fn staging_directories<'de, D: serde::Deserializer<'de>, V: Deserialize<'de>>(
     deserializer: D,
-) -> Result<BTreeMap<String, Option<[u8; 32]>>, D::Error> {
-    struct Directories;
-    impl<'de> serde::de::Visitor<'de> for Directories {
-        type Value = BTreeMap<String, Option<[u8; 32]>>;
+) -> Result<BTreeMap<String, V>, D::Error> {
+    struct Directories<V>(std::marker::PhantomData<V>);
+    impl<'de, V: Deserialize<'de>> serde::de::Visitor<'de> for Directories<V> {
+        type Value = BTreeMap<String, V>;
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("bounded distinct content parent witnesses")
         }
@@ -2956,7 +2982,7 @@ fn staging_directories<'de, D: serde::Deserializer<'de>>(
             Ok(directories)
         }
     }
-    deserializer.deserialize_map(Directories)
+    deserializer.deserialize_map(Directories(std::marker::PhantomData))
 }
 
 impl ManagedContentStagingCheckpoint {
@@ -3023,12 +3049,17 @@ impl ManagedContentStagingCheckpoint {
             || record.files.is_empty()
             || record.files.len() > policy.planning_path_limit() + 1
             || record.payloads.len() > record.mutation_count
-            || record.directories.len() > MAX_STAGING_CHECKPOINT_BYTES / 4
+            || record
+                .directories
+                .len()
+                .saturating_add(record.created_parents.len())
+                > MAX_STAGING_CHECKPOINT_BYTES / 4
         {
             return Err(invalid);
         }
         let mut paths = BTreeSet::new();
         let mut required_directories = BTreeSet::new();
+        let mut creatable_parents = BTreeSet::new();
         let mut bytes = 0u64;
         for file in &record.files {
             let path = PortableRelativePath::new_exact(&file.path).map_err(|_| invalid)?;
@@ -3049,16 +3080,31 @@ impl ManagedContentStagingCheckpoint {
                 bytes = bytes.checked_add(proof.size).ok_or(invalid)?;
             }
             let mut prefix = String::new();
+            let mut missing = false;
             let segments = file.path.split('/').collect::<Vec<_>>();
             for segment in &segments[..segments.len() - 1] {
                 if !prefix.is_empty() {
                     prefix.push('/');
                 }
                 prefix.push_str(segment);
+                if missing {
+                    if record.created_parents.contains_key(&prefix) {
+                        creatable_parents.insert(prefix.clone());
+                    }
+                    continue;
+                }
                 required_directories.insert(prefix.clone());
                 match record.directories.get(&prefix).ok_or(invalid)? {
                     Some(_) => {}
-                    None if file.proof.is_none() => break,
+                    None if file.proof.is_none() => {
+                        if record.created_parents.is_empty() {
+                            break;
+                        }
+                        missing = true;
+                        if record.created_parents.contains_key(&prefix) {
+                            creatable_parents.insert(prefix.clone());
+                        }
+                    }
                     None => return Err(invalid),
                 }
             }
@@ -3068,6 +3114,27 @@ impl ManagedContentStagingCheckpoint {
             || record.mutation_count >= record.files.len()
         {
             return Err(invalid);
+        }
+        let mut parent_keys = BTreeMap::new();
+        for path in record.directories.keys() {
+            let portable = PortableRelativePath::new_exact(path).map_err(|_| invalid)?;
+            if parent_keys.insert(portable.key(), path).is_some() {
+                return Err(invalid);
+            }
+        }
+        for path in record.created_parents.keys() {
+            let portable = PortableRelativePath::new_exact(path).map_err(|_| invalid)?;
+            let (parent, _) = path.rsplit_once('/').unwrap_or(("", path));
+            if parent_keys
+                .insert(portable.key(), path)
+                .is_some_and(|prior| prior != path)
+                || !creatable_parents.contains(path)
+                || (!parent.is_empty()
+                    && !record.directories.get(parent).is_some_and(Option::is_some)
+                    && !record.created_parents.contains_key(parent))
+            {
+                return Err(invalid);
+            }
         }
         for (index, payload) in record.payloads.iter().enumerate() {
             if payload.name != format!("payload-{index}") {
@@ -3212,6 +3279,9 @@ fn staging_checkpoint(
     let update = (|| {
         let checkpoint = cache.checkpoint.as_mut().map_err(|error| *error)?;
         append_staging_payloads(state, checkpoint, &mut cache.remaining)?;
+        if final_ready {
+            append_staging_parents(state, checkpoint, &mut cache.remaining)?;
+        }
         if final_ready
             && (!unpublished_before_bindings_match(state)
                 || state.payloads.len() != state.planned_payloads.len())
@@ -3244,7 +3314,6 @@ fn unpublished_before_bindings_match(state: &TransactionState) -> bool {
         && !state.manifest_publication_started
         && !state.manifest_committed
         && state.manifest_installed.is_none()
-        && state.created_parents.is_empty()
         && state.mutations.iter().all(|mutation| {
             !mutation.claimed && !mutation.installed && mutation.installed_guard.is_none()
         })
@@ -3255,7 +3324,7 @@ fn capture_staging_checkpoint(
     binding: [u8; 32],
 ) -> Result<(ManagedContentStagingCheckpoint, usize), ManagedContentCheckpointError> {
     let changed = ManagedContentCheckpointError::Changed;
-    if !unpublished_before_bindings_match(state) {
+    if !state.created_parents.is_empty() || !unpublished_before_bindings_match(state) {
         return Err(changed);
     }
     let mut remaining = MAX_STAGING_CHECKPOINT_BYTES - 1024;
@@ -3370,6 +3439,7 @@ fn capture_staging_checkpoint(
                 backup: directory_incarnation(&state.backup)?,
                 mutation_count: state.mutations.len(),
                 directories,
+                created_parents: BTreeMap::new(),
                 files,
                 payloads: Vec::new(),
             },
@@ -3414,10 +3484,41 @@ fn append_staging_payloads(
     Ok(())
 }
 
+fn append_staging_parents(
+    state: &TransactionState,
+    checkpoint: &mut ManagedContentStagingCheckpoint,
+    remaining: &mut usize,
+) -> Result<(), ManagedContentCheckpointError> {
+    let changed = ManagedContentCheckpointError::Changed;
+    for created in &state.created_parents {
+        let CleanupDirectoryState::Known(directory) = &created.cleanup else {
+            return Err(changed);
+        };
+        let path = directory
+            .inner
+            .path
+            .strip_prefix(&state.root.inner.path)
+            .map_err(|_| changed)?;
+        let path = PortableRelativePath::from_path(path)
+            .map_err(|_| changed)?
+            .as_str()
+            .to_string();
+        if !checkpoint.record.created_parents.contains_key(&path) {
+            let witness = directory_incarnation(directory)?;
+            charge_checkpoint(remaining, &(&path, witness))?;
+            checkpoint.record.created_parents.insert(path, witness);
+        }
+    }
+    if checkpoint.record.created_parents.len() != state.created_parents.len() {
+        return Err(changed);
+    }
+    Ok(())
+}
+
 fn staging_public_bindings(
     root: &ManagedDir,
     checkpoint: &ManagedContentStagingCheckpoint,
-) -> Result<(), ManagedContentCheckpointError> {
+) -> Result<Vec<CreatedTransactionParent>, ManagedContentCheckpointError> {
     let changed = ManagedContentCheckpointError::Changed;
     if directory_incarnation(root)? != checkpoint.record.root {
         return Err(changed);
@@ -3430,10 +3531,52 @@ fn staging_public_bindings(
             .and_then(Option::as_ref)
             .ok_or(changed)?;
         let current = parent.open_child_if_exists(name).map_err(|_| changed)?;
-        if current.as_ref().map(directory_incarnation).transpose()? != *expected {
+        let witness = current.as_ref().map(directory_incarnation).transpose()?;
+        let expected = expected.or_else(|| checkpoint.record.created_parents.get(path).copied());
+        if witness != expected
+            && !(witness.is_none() && checkpoint.record.created_parents.contains_key(path))
+        {
             return Err(changed);
         }
         directories.insert(path.clone(), current);
+    }
+    let mut children = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut created_parents = Vec::new();
+    for (path, witness) in &checkpoint.record.created_parents {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        children.entry(parent).or_default().insert(name);
+        let parent = directories.get(parent).ok_or(changed)?.as_ref();
+        let current = parent
+            .map(|parent| checkpoint_directory(parent, name, *witness))
+            .transpose()?
+            .flatten();
+        if let (Some(parent), Some(directory)) = (parent, &current) {
+            created_parents.push(CreatedTransactionParent {
+                parent: parent.clone(),
+                name: PortableFileName::new_exact(name).map_err(|_| changed)?,
+                cleanup: CleanupDirectoryState::Known(directory.clone()),
+            });
+        }
+        directories.insert(path.clone(), current);
+    }
+    for path in checkpoint.record.created_parents.keys() {
+        let Some(directory) = directories.get(path).and_then(Option::as_ref) else {
+            continue;
+        };
+        let expected = children.get(path.as_str());
+        for name in directory
+            .entries_bounded(expected.map_or(1, |names| names.len().max(1)))
+            .map_err(|_| changed)?
+        {
+            let name = name.to_str().ok_or(changed)?;
+            if !expected.is_some_and(|names| names.contains(name))
+                || directories
+                    .get(&format!("{path}/{name}"))
+                    .is_none_or(Option::is_none)
+            {
+                return Err(changed);
+            }
+        }
     }
     let mut bindings = Vec::new();
     for file in &checkpoint.record.files {
@@ -3471,7 +3614,8 @@ fn staging_public_bindings(
         },
         bindings.iter().map(|(parent, name)| (*parent, name)),
     )
-    .map_err(|_| changed)
+    .map_err(|_| changed)?;
+    Ok(created_parents)
 }
 
 fn admit_checkpoint_file(
@@ -3522,6 +3666,7 @@ fn checkpoint_directory(
 }
 
 struct StagingCleanup {
+    created_parents: Vec<CreatedTransactionParent>,
     private: Option<ManagedDir>,
     stage: Option<ManagedDir>,
     backup: Option<ManagedDir>,
@@ -3534,13 +3679,17 @@ fn inspect_staging_checkpoint(
     complete: bool,
 ) -> Result<StagingCleanup, ManagedContentCheckpointError> {
     let changed = ManagedContentCheckpointError::Changed;
-    staging_public_bindings(root, checkpoint)?;
+    let created_parents = staging_public_bindings(root, checkpoint)?;
+    if complete && created_parents.len() != checkpoint.record.created_parents.len() {
+        return Err(changed);
+    }
     let record = &checkpoint.record;
     let Some(private) = checkpoint_directory(root, &record.private_name, record.private)? else {
         if complete {
             return Err(changed);
         }
         return Ok(StagingCleanup {
+            created_parents,
             private: None,
             stage: None,
             backup: None,
@@ -3592,6 +3741,7 @@ fn inspect_staging_checkpoint(
         }
     }
     Ok(StagingCleanup {
+        created_parents,
         private: Some(private),
         stage,
         backup,
@@ -3630,7 +3780,21 @@ fn rollback_staging_checkpoint(
             return Err(changed);
         }
     }
-    staging_public_bindings(root, checkpoint)?;
+    for mut created in cleanup.created_parents.into_iter().rev() {
+        advance_cleanup_directory(&created.parent, created.name.as_str(), &mut created.cleanup);
+        if !matches!(created.cleanup, CleanupDirectoryState::Done) {
+            return Err(changed);
+        }
+        #[cfg(test)]
+        AFTER_STAGING_PARENT_REMOVAL.with(|hook| {
+            if let Some(callback) = hook.take() {
+                callback();
+            }
+        });
+    }
+    if !staging_public_bindings(root, checkpoint)?.is_empty() {
+        return Err(changed);
+    }
     if root
         .has_portably_exact_child_name(&checkpoint.record.private_name)
         .map_err(|_| changed)?
@@ -3798,15 +3962,22 @@ fn resolve_observed_parent(
     }
 }
 
-fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome {
-    if !revalidate_all(&state) {
-        return drive_rollback(state, false);
+fn prepare_publication_prefix(state: &mut TransactionState) -> Result<(), ()> {
+    if !revalidate_all(state) {
+        return Err(());
     }
-    if materialize_transaction_parents(&mut state).is_err() {
+    if materialize_transaction_parents(state).is_err() {
         state.terminal_failure = ManagedContentTransactionFailure::ClaimFailed;
-        return drive_rollback(state, false);
+        return Err(());
     }
-    if !revalidate_all(&state) {
+    if !revalidate_all(state) {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn drive_commit(mut state: TransactionState) -> ManagedContentTransactionOutcome {
+    if prepare_publication_prefix(&mut state).is_err() {
         return drive_rollback(state, false);
     }
     for index in 0..state.mutations.len() {
@@ -5347,6 +5518,12 @@ mod tests {
         for child in ["mods", "resourcepacks", "shaderpacks"] {
             std::fs::create_dir_all(path.join(child)).expect("content parent");
         }
+        reopen_content_root(path)
+    }
+
+    fn reopen_content_root(
+        path: &std::path::Path,
+    ) -> (super::super::ManagedTreeRoot, ManagedContentTransactionRoot) {
         let tree = super::super::ManagedTreeRoot::open_for_test(path).expect("managed tree");
         let operation = tree.try_acquire().expect("tree operation");
         let directory = operation.directory().expect("tree directory");
@@ -5547,6 +5724,424 @@ mod tests {
             panic!("checkpoint fixture must become Ready");
         };
         (tree, ready)
+    }
+
+    #[test]
+    fn staging_checkpoint_records_materialized_parents_without_replacing_before_proofs() {
+        let temporary = test_tempdir().unwrap();
+        let (tree, mut ready) = checkpoint_fixture(&temporary);
+        let initial = ready.checkpoint([12; 32]).unwrap().clone();
+        assert!(!temporary.path().join("config").exists());
+        assert_eq!(initial.record.directories.get("config"), Some(&None));
+        assert!(!initial.record.directories.contains_key("config/nested"));
+        let private = ready.state.private.inner.path.clone();
+
+        let materialized = materialize_transaction_parents(&mut ready.state);
+        let created_count = ready.state.created_parents.len();
+        let parent_proofs = (|| -> Result<_, LoaderError> {
+            let config = ready.state.root.open_child("config")?;
+            let nested = config.open_child("nested")?;
+            Ok(serde_json::json!({
+                "config": config.inner.directory.incarnation_witness()?,
+                "config/nested": nested.inner.directory.incarnation_witness()?,
+            }))
+        })();
+        let payloads_still_private = ready.state.payloads.iter().all(|payload| {
+            std::fs::read(private.join(PRIVATE_STAGE_NAME).join(payload.name.as_str()))
+                .is_ok_and(|bytes| bytes == b"staged replacement")
+        });
+        let updated = ready.checkpoint([12; 32]).cloned();
+        let outcome = ready.cancel();
+
+        assert!(matches!(
+            outcome,
+            ManagedContentTransactionOutcome::Cancelled(_)
+        ));
+        materialized.expect("the real parent publication boundary must be reached");
+        assert_eq!(created_count, 2);
+        assert!(payloads_still_private);
+        assert!(!private.exists());
+        assert!(!temporary.path().join("config").exists());
+        assert!(!temporary.path().join("mods/second.jar").exists());
+        assert_eq!(
+            std::fs::read(temporary.path().join("mods/first.jar")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join(MANIFEST_NAME)).unwrap(),
+            b"original manifest"
+        );
+        drop(tree);
+
+        let updated = updated.expect("parent-only publication must remain checkpointable");
+        assert_eq!(
+            serde_json::to_value(&updated.record.files).unwrap(),
+            serde_json::to_value(&initial.record.files).unwrap()
+        );
+        assert_eq!(updated.record.directories, initial.record.directories);
+        assert_eq!(
+            serde_json::to_value(&updated.record.payloads).unwrap(),
+            serde_json::to_value(&initial.record.payloads).unwrap()
+        );
+        let encoded = updated.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(record["created_parents"], parent_proofs.unwrap());
+    }
+
+    #[test]
+    fn staging_checkpoint_parent_codec_preserves_original_missing_boundaries() {
+        let temporary = test_tempdir().unwrap();
+        let (tree, mut ready) = checkpoint_fixture(&temporary);
+        let initial = ready.checkpoint([13; 32]).unwrap().clone();
+        let encoded = initial.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
+        assert!(!encoded.contains("created_parents"));
+        ManagedContentStagingCheckpoint::decode(&encoded).unwrap();
+        let ManagedContentStageOutcome::Ready(mut ready) = ready.prepare_publication([13; 32])
+        else {
+            panic!("parent preparation must succeed");
+        };
+        let checkpoint = ready.checkpoint([13; 32]).unwrap().clone();
+        let ManagedContentStageOutcome::Ready(mut ready) = ready.prepare_publication([13; 32])
+        else {
+            panic!("repeated parent preparation must retain its original proof");
+        };
+        let encoded = checkpoint.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
+        assert_eq!(
+            ready
+                .checkpoint([13; 32])
+                .unwrap()
+                .encode(MAX_STAGING_CHECKPOINT_BYTES)
+                .unwrap(),
+            encoded
+        );
+        assert!(matches!(
+            ready.cancel(),
+            ManagedContentTransactionOutcome::Cancelled(_)
+        ));
+        drop(tree);
+
+        let record: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let duplicate = encoded.replacen(
+            "\"created_parents\":{",
+            &format!(
+                "\"created_parents\":{{\"config\":{},",
+                record["created_parents"]["config"]
+            ),
+            1,
+        );
+        assert!(matches!(
+            ManagedContentStagingCheckpoint::decode(&duplicate),
+            Err(ManagedContentCheckpointError::Invalid)
+        ));
+        for change in [
+            "original",
+            "missing_ancestor",
+            "alias",
+            "unrelated",
+            "union_alias",
+        ] {
+            let mut changed = record.clone();
+            match change {
+                "original" => {
+                    changed["directories"]["config"] = changed["created_parents"]["config"].clone()
+                }
+                "missing_ancestor" => {
+                    changed["created_parents"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("config");
+                }
+                "alias" => {
+                    changed["created_parents"]["Config"] =
+                        changed["created_parents"]["config"].clone()
+                }
+                "unrelated" => {
+                    changed["created_parents"]["unrelated"] =
+                        changed["created_parents"]["config"].clone()
+                }
+                "union_alias" => {
+                    changed["files"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({"path":"Config/other.txt","proof":null}));
+                    changed["directories"]["Config"] = serde_json::Value::Null;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    ManagedContentStagingCheckpoint::decode(&changed.to_string()),
+                    Err(ManagedContentCheckpointError::Invalid)
+                ),
+                "{change}"
+            );
+        }
+        // The previous checkpoint must not acquire the later parent authority.
+        assert!(initial.record.created_parents.is_empty());
+        assert_eq!(initial.record.directories.get("config"), Some(&None));
+    }
+
+    #[test]
+    fn staging_checkpoint_parent_refusal_preserves_staged_and_foreign_objects() {
+        for change in [
+            "file",
+            "hidden",
+            "directory",
+            "replaced",
+            "unrecorded",
+            "original_missing",
+            "race",
+        ] {
+            let temporary = test_tempdir().unwrap();
+            let (tree, ready) = checkpoint_fixture(&temporary);
+            let ManagedContentStageOutcome::Ready(mut ready) = ready.prepare_publication([14; 32])
+            else {
+                panic!("parent preparation must succeed");
+            };
+            let checkpoint = ready.checkpoint([14; 32]).unwrap().clone();
+            let private = ready.state.private.inner.path.clone();
+            let config = temporary.path().join("config");
+            match change {
+                "file" => std::fs::write(config.join("nested/unowned"), b"keep").unwrap(),
+                "hidden" => std::fs::write(config.join(".unowned"), b"keep").unwrap(),
+                "directory" => std::fs::create_dir(config.join("unowned")).unwrap(),
+                "replaced" => {
+                    std::fs::rename(&config, temporary.path().join("displaced-config")).unwrap();
+                    std::fs::create_dir_all(config.join("nested")).unwrap();
+                }
+                "unrecorded" => {
+                    std::fs::create_dir(config.join("nested/extra")).unwrap();
+                }
+                "original_missing" => {
+                    std::fs::remove_dir(config.join("nested")).unwrap();
+                    std::fs::rename(
+                        temporary.path().join("mods"),
+                        temporary.path().join("displaced-mods"),
+                    )
+                    .unwrap();
+                }
+                "race" => {}
+                _ => unreachable!(),
+            }
+            drop((ready, tree));
+            let (tree, root) = reopen_content_root(temporary.path());
+            let restored = root
+                .for_pack()
+                .restore_staging_checkpoint(checkpoint, [14; 32]);
+            let retained = if change == "race" {
+                let recovery = restored.unwrap();
+                std::fs::write(config.join("nested/unowned"), b"keep").unwrap();
+                let outcome = recovery.reconcile();
+                assert!(matches!(
+                    outcome,
+                    ManagedContentTransactionOutcome::RecoveryRequired(_)
+                ));
+                Some(outcome)
+            } else {
+                assert!(
+                    matches!(restored, Err(ManagedContentCheckpointError::Changed)),
+                    "{change}"
+                );
+                None
+            };
+            for index in 0..3 {
+                assert_eq!(
+                    std::fs::read(private.join(format!("stage/payload-{index}"))).unwrap(),
+                    b"staged replacement",
+                    "{change}"
+                );
+            }
+            let original = if change == "original_missing" {
+                "displaced-mods/first.jar"
+            } else {
+                "mods/first.jar"
+            };
+            assert_eq!(
+                std::fs::read(temporary.path().join(original)).unwrap(),
+                b"original"
+            );
+            assert_eq!(
+                std::fs::read(temporary.path().join(MANIFEST_NAME)).unwrap(),
+                b"original manifest"
+            );
+            match change {
+                "file" | "race" => assert_eq!(
+                    std::fs::read(config.join("nested/unowned")).unwrap(),
+                    b"keep"
+                ),
+                "hidden" => assert_eq!(std::fs::read(config.join(".unowned")).unwrap(), b"keep"),
+                "directory" => assert!(config.join("unowned").is_dir()),
+                "unrecorded" => assert!(config.join("nested/extra").is_dir()),
+                "replaced" => {
+                    assert!(config.join("nested").is_dir());
+                    assert!(temporary.path().join("displaced-config/nested").is_dir());
+                }
+                "original_missing" => assert!(!temporary.path().join("mods").exists()),
+                _ => unreachable!(),
+            }
+            drop((retained, tree));
+        }
+    }
+
+    #[test]
+    fn staging_checkpoint_parent_preparation_retains_optional_refusal_and_binding_fence() {
+        for refusal in [
+            ManagedContentCheckpointError::Unsupported,
+            ManagedContentCheckpointError::Capacity,
+        ] {
+            let temporary = test_tempdir().unwrap();
+            let (tree, mut ready) = checkpoint_fixture(&temporary);
+            ready.checkpoint([16; 32]).unwrap();
+            // Exercise an already classified optional refusal without assuming
+            // this fixture filesystem lacks birth-time support.
+            ready.state.checkpoint.as_mut().unwrap().checkpoint = Err(refusal);
+            for _ in 0..2 {
+                let ManagedContentStageOutcome::Ready(prepared) =
+                    ready.prepare_publication([16; 32])
+                else {
+                    panic!("an optional checkpoint refusal must not reduce live admission");
+                };
+                ready = prepared;
+                assert!(matches!(ready.checkpoint([16; 32]), Err(error) if error == refusal));
+                assert_eq!(ready.state.created_parents.len(), 2);
+            }
+            assert!(matches!(
+                ready.commit(),
+                ManagedContentTransactionOutcome::Committed(_)
+            ));
+            assert_eq!(
+                std::fs::read(temporary.path().join("config/nested/options.txt")).unwrap(),
+                b"staged replacement"
+            );
+            drop(tree);
+        }
+        let temporary = test_tempdir().unwrap();
+        let (tree, ready) = checkpoint_fixture(&temporary);
+        let ManagedContentStageOutcome::Ready(ready) = ready.prepare_publication([16; 32]) else {
+            panic!("parent preparation must succeed");
+        };
+        assert!(temporary.path().join("config/nested").is_dir());
+        assert!(matches!(
+            ready.prepare_publication([17; 32]),
+            ManagedContentStageOutcome::Unwind(ManagedContentTransactionOutcome::Failed(_))
+        ));
+        assert!(!temporary.path().join("config").exists());
+        assert_eq!(
+            std::fs::read(temporary.path().join("mods/first.jar")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read(temporary.path().join(MANIFEST_NAME)).unwrap(),
+            b"original manifest"
+        );
+        drop(tree);
+    }
+
+    #[test]
+    fn staging_checkpoint_parent_cleanup_survives_two_process_exits() {
+        const FIXTURE: &str = "AXIAL_CONTENT_PARENT_CHECKPOINT_FIXTURE";
+        const PHASE: &str = "AXIAL_CONTENT_PARENT_CHECKPOINT_PHASE";
+        if let Some(container) = std::env::var_os(FIXTURE) {
+            let container = std::path::PathBuf::from(container);
+            if std::env::var(PHASE).unwrap() == "stage" {
+                let temporary = tempfile::tempdir_in(&container).unwrap();
+                let (_tree, ready) = checkpoint_fixture(&temporary);
+                let ManagedContentStageOutcome::Ready(mut ready) =
+                    ready.prepare_publication([15; 32])
+                else {
+                    panic!("parent preparation must succeed");
+                };
+                let encoded = ready
+                    .checkpoint([15; 32])
+                    .unwrap()
+                    .encode(MAX_STAGING_CHECKPOINT_BYTES)
+                    .unwrap();
+                assert!(temporary.path().join("config/nested").is_dir());
+                assert!(!temporary.path().join("config/nested/options.txt").exists());
+                std::fs::write(
+                    container.join("root-path"),
+                    temporary.path().to_str().unwrap(),
+                )
+                .unwrap();
+                std::fs::write(container.join("checkpoint"), encoded).unwrap();
+                std::process::exit(42);
+            }
+            let path = std::path::PathBuf::from(
+                std::fs::read_to_string(container.join("root-path")).unwrap(),
+            );
+            let encoded = std::fs::read_to_string(container.join("checkpoint")).unwrap();
+            let checkpoint = ManagedContentStagingCheckpoint::decode(&encoded).unwrap();
+            let (_tree, root) = reopen_content_root(&path);
+            let recovery = root
+                .for_pack()
+                .restore_staging_checkpoint(checkpoint, [15; 32])
+                .unwrap();
+            AFTER_STAGING_PARENT_REMOVAL.with(|hook| hook.set(Some(|| std::process::exit(43))));
+            let _outcome = recovery.reconcile();
+            panic!("cleanup must exit after an actual recorded parent removal");
+        }
+
+        let container = test_tempdir().unwrap();
+        for (phase, code) in [("stage", 42), ("cleanup", 43)] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "managed_fs::content_transaction::tests::staging_checkpoint_parent_cleanup_survives_two_process_exits", "--nocapture"])
+                .env(FIXTURE, container.path())
+                .env(PHASE, phase)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let timed_out = child.try_wait().unwrap().is_none();
+            if timed_out {
+                child.kill().unwrap();
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !timed_out && output.status.code() == Some(code),
+                "{phase}: timed_out={timed_out}, status={:?}; {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let path = std::path::PathBuf::from(
+            std::fs::read_to_string(container.path().join("root-path")).unwrap(),
+        );
+        let encoded = std::fs::read_to_string(container.path().join("checkpoint")).unwrap();
+        let checkpoint = ManagedContentStagingCheckpoint::decode(&encoded).unwrap();
+        let private = path.join(&checkpoint.record.private_name);
+        assert!(!private.exists());
+        assert!(!path.join("config/nested").exists());
+        assert_eq!(std::fs::read_dir(path.join("config")).unwrap().count(), 0);
+        for _ in 0..2 {
+            let (tree, root) = reopen_content_root(&path);
+            let outcome = root
+                .for_pack()
+                .restore_staging_checkpoint(checkpoint.clone(), [15; 32])
+                .unwrap()
+                .reconcile();
+            assert!(matches!(
+                outcome,
+                ManagedContentTransactionOutcome::Cancelled(_)
+            ));
+            assert!(!path.join("config").exists());
+            assert!(!path.join("mods/second.jar").exists());
+            assert_eq!(
+                std::fs::read(path.join("mods/first.jar")).unwrap(),
+                b"original"
+            );
+            assert_eq!(
+                std::fs::read(path.join(MANIFEST_NAME)).unwrap(),
+                b"original manifest"
+            );
+            drop(tree);
+        }
+        assert_eq!(
+            std::fs::read_to_string(container.path().join("checkpoint")).unwrap(),
+            encoded
+        );
     }
 
     #[test]

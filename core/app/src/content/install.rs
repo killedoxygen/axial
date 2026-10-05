@@ -2567,10 +2567,26 @@ async fn apply_streamed(
             }
             ManagedContentTransferStep::Complete(complete) => {
                 return match complete.stage() {
-                    ManagedContentStageOutcome::Ready(mut ready) => {
+                    ManagedContentStageOutcome::Ready(ready) => {
                         if cancel.is_cancelled() {
                             return transaction_outcome(ready.cancel(), effects);
                         }
+                        let mut ready = match ready.prepare_publication(checkpoint_binding) {
+                            ManagedContentStageOutcome::Ready(ready) => ready,
+                            ManagedContentStageOutcome::Unwind(outcome) => {
+                                let failure = if matches!(
+                                    outcome,
+                                    ManagedContentTransactionOutcome::Failed(
+                                        ManagedContentTransactionFailure::ObservationDrift
+                                    )
+                                ) {
+                                    MutationError::Changed
+                                } else {
+                                    MutationError::Files
+                                };
+                                return unwind_outcome(outcome, effects, failure);
+                            }
+                        };
                         if let Err(error) = owner.persist_checkpoint(
                             receipt,
                             ready.checkpoint(checkpoint_binding).map(Some),
@@ -4229,6 +4245,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_exit_after_content_parent_preparation_rolls_back_empty_parents() {
+        content_crash_restart(false, Some("parents")).await;
+    }
+
+    #[tokio::test]
     async fn hard_exit_after_content_metadata_commit_preserves_publication() {
         content_crash_restart(true, None).await;
     }
@@ -4428,6 +4449,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parent_checkpoint_refusal_removes_observed_parents_before_publication() {
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+        for rewrite in [false, true] {
+            let (root, owner, id) = fixture().await;
+            let game = root.path().join("instances").join(id.as_str());
+            assert!(!game.join("new-root").exists());
+            let original = std::fs::read(game.join(MANIFEST_FILE)).ok();
+            let before = original.clone();
+            let observing_game = game.clone();
+            let registry = owner.directories.registry().clone();
+            let (begin, started) = mpsc::sync_channel(1);
+            let (locked, admitted) = mpsc::sync_channel(1);
+            let admitted = Mutex::new(admitted);
+            let observer = std::thread::spawn(move || {
+                if started.recv_timeout(Duration::from_secs(10)).is_err() {
+                    return false;
+                }
+                registry.storage().transaction(|db| -> Result<bool, StorageError> {
+                    db.execute_batch(if rewrite {
+                        "CREATE TRIGGER refuse_parent_checkpoint AFTER UPDATE ON content_batches
+                         WHEN EXISTS(SELECT 1 FROM json_each(json_extract(NEW.receipt_json,'$.ready_checkpoint'),'$.created_parents'))
+                         BEGIN UPDATE content_batches SET receipt_json=OLD.receipt_json WHERE instance_id=NEW.instance_id; END;"
+                    } else {
+                        "CREATE TRIGGER refuse_parent_checkpoint BEFORE UPDATE ON content_batches
+                         WHEN EXISTS(SELECT 1 FROM json_each(json_extract(NEW.receipt_json,'$.ready_checkpoint'),'$.created_parents'))
+                         BEGIN SELECT RAISE(IGNORE); END;"
+                    })?;
+                    locked.send(()).unwrap();
+                    let nested = observing_game.join("new-root/nested");
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !nested.is_dir() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(nested.is_dir()
+                        && std::fs::read_dir(observing_game.join("new-root")).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>() == [std::ffi::OsString::from("nested")]
+                        && std::fs::read_dir(nested).unwrap().count() == 0
+                        && !observing_game.join("new-root/nested/staged.txt").exists()
+                        && std::fs::read(observing_game.join(MANIFEST_FILE)).ok() == before)
+                }).unwrap()
+            });
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let captured = events.clone();
+            let reporting = owner.clone().with_progress(Arc::new(move |event| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((event.phase.clone(), event.current));
+                if event.phase == "content_download" && event.current == 1 {
+                    begin.send(()).unwrap();
+                    admitted
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                }
+            }));
+            let result = reporting
+                .install_pack(
+                    &catalog(&owner),
+                    &id,
+                    pack(
+                        &[],
+                        &[("overrides/new-root/nested/staged.txt", b"new payload")],
+                    ),
+                    true,
+                )
+                .unwrap()
+                .join()
+                .await
+                .unwrap();
+            let observed = observer.join().unwrap();
+            owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
+            owner.directories.library().try_preserve().unwrap();
+            assert!(
+                observed,
+                "parent checkpoint refusal must follow actual empty-parent materialization"
+            );
+            assert!(matches!(result, Err(MutationError::Changed)), "{result:?}");
+            assert!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(phase, _)| phase != "content_commit")
+            );
+            assert!(!owner.has_unsettled_effects());
+            assert!(!game.join("new-root").exists());
+            assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).ok(), original);
+        }
+    }
+
+    #[tokio::test]
     async fn oversized_utf8_receipt_remains_fenced_without_decoding() {
         let (_root, owner, id) = fixture().await;
         let instance = owner.directories.admit(&id).unwrap();
@@ -4579,6 +4695,17 @@ mod tests {
         const WITNESS: &str = "committed-tree.json";
         const WITNESS_BYTES: usize = 512 * 1024;
         let prefix = checkpoint_fault == Some("prefix");
+        let parents = checkpoint_fault == Some("parents");
+        let payload_path = if parents {
+            "new-root/nested/staged.txt"
+        } else {
+            "config/staged.txt"
+        };
+        let override_path = if parents {
+            "overrides/new-root/nested/staged.txt"
+        } else {
+            "overrides/config/staged.txt"
+        };
 
         fn open(root: &Path, library_id: LibraryId) -> ContentMutations {
             let library = match LibraryLifecycle::open_with_id(root, library_id) {
@@ -4693,6 +4820,10 @@ mod tests {
             let game = root.join("instances").join(instance.id.as_str());
             std::fs::write(game.join(MANIFEST_FILE), ORIGINAL).unwrap();
             std::fs::write(game.join("config/user.txt"), b"unrelated payload").unwrap();
+            if parents {
+                assert!(!game.join("new-root").exists());
+                assert!(!game.join("new-root/nested").exists());
+            }
             if !committed {
                 let witness = serde_json::to_vec(&files(&game)).unwrap();
                 assert!(witness.len() <= WITNESS_BYTES);
@@ -4743,14 +4874,67 @@ mod tests {
                     assert!(receipt.ready_checkpoint.is_some());
                     assert_eq!(receipt.before_manifest.as_deref(), Some(ORIGINAL));
                     assert_eq!(receipt.changes.len(), 1);
-                    assert_eq!(receipt.changes[0].path, "config/staged.txt");
+                    assert_eq!(receipt.changes[0].path, payload_path);
                     assert_eq!(receipt.changes[0].after, Some(Proof::bytes(b"new payload")));
                     assert!(matches!(
                         receipt.changes[0].source,
                         Some(Source::PackOverride)
                     ));
                     assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), ORIGINAL);
-                    assert!(!game.join("config/staged.txt").exists());
+                    assert!(!game.join(payload_path).exists());
+                    if parents {
+                        if !game.join("new-root/nested").is_dir() {
+                            eprintln!("content_commit(0) reached without publication parents");
+                            std::process::exit(43);
+                        }
+                        let children = std::fs::read_dir(game.join("new-root"))
+                            .unwrap()
+                            .map(|entry| entry.unwrap().file_name())
+                            .collect::<Vec<_>>();
+                        assert_eq!(children, [std::ffi::OsString::from("nested")]);
+                        assert_eq!(
+                            std::fs::read_dir(game.join("new-root/nested"))
+                                .unwrap()
+                                .count(),
+                            0
+                        );
+                        let proof = ManagedContentStagingCheckpoint::decode(
+                            receipt.ready_checkpoint.as_deref().unwrap(),
+                        )
+                        .unwrap();
+                        let proof: serde_json::Value =
+                            serde_json::from_str(&proof.encode(MAX_RECEIPT_BYTES).unwrap())
+                                .unwrap();
+                        let created = proof["created_parents"]
+                            .as_object()
+                            .expect("sealed native parent proof");
+                        assert_eq!(created.len(), 2);
+                        assert!(
+                            created.contains_key("new-root")
+                                && created.contains_key("new-root/nested")
+                        );
+                        let private = game.join(proof["private_name"].as_str().unwrap());
+                        let payloads = proof["payloads"].as_array().unwrap();
+                        assert_eq!(payloads.len(), 1);
+                        let stage = private.join("stage");
+                        assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 1);
+                        assert_eq!(
+                            std::fs::read_dir(private.join("backup")).unwrap().count(),
+                            0
+                        );
+                        let staged = stage.join(payloads[0]["name"].as_str().unwrap());
+                        let metadata = std::fs::symlink_metadata(&staged).unwrap();
+                        assert!(
+                            metadata.is_file() && metadata.len() == b"new payload".len() as u64
+                        );
+                        let mut body = Vec::new();
+                        std::fs::File::open(staged)
+                            .unwrap()
+                            .take(b"new payload".len() as u64 + 1)
+                            .read_to_end(&mut body)
+                            .unwrap();
+                        assert_eq!(body, b"new payload");
+                    }
                     // The zero callback follows native stage(), before commit().
                     if committed {
                         return;
@@ -4778,7 +4962,7 @@ mod tests {
                     if prefix {
                         prefix_pack()
                     } else {
-                        pack(&[], &[("overrides/config/staged.txt", b"new payload")])
+                        pack(&[], &[(override_path, b"new payload")])
                     },
                     true,
                 )
@@ -4811,6 +4995,9 @@ mod tests {
             }
             (false, Some("prefix")) => {
                 "content::install::tests::hard_exit_after_512_content_payloads_rolls_back_recorded_prefix"
+            }
+            (false, Some("parents")) => {
+                "content::install::tests::hard_exit_after_content_parent_preparation_rolls_back_empty_parents"
             }
             _ => unreachable!(),
         };
@@ -4869,7 +5056,7 @@ mod tests {
             assert_eq!(pending(&owner, id).as_deref(), Some(receipt.as_str()));
             assert_eq!(files(&game), snapshot);
         }
-        if let Some(fault) = checkpoint_fault.filter(|_| !prefix) {
+        if let Some(fault) = checkpoint_fault.filter(|_| !prefix && !parents) {
             let owner = open(root.path(), library_id);
             let records = owner.directories.registry().list().unwrap();
             let id = &records[0].instance.id;
@@ -5005,7 +5192,7 @@ mod tests {
                 );
             } else if attempt == 0 {
                 assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), ORIGINAL);
-                assert!(!game.join("config/staged.txt").exists());
+                assert!(!game.join(payload_path).exists());
                 assert!(matches!(
                     owner.installed(id),
                     Err(MutationError::Unavailable)
@@ -5070,7 +5257,7 @@ mod tests {
                     if prefix {
                         prefix_pack()
                     } else {
-                        pack(&[], &[("overrides/config/staged.txt", b"new payload")])
+                        pack(&[], &[(override_path, b"new payload")])
                     },
                     true,
                 )
@@ -5096,7 +5283,7 @@ mod tests {
                 }
             } else {
                 assert_eq!(
-                    std::fs::read(game.join("config/staged.txt")).unwrap(),
+                    std::fs::read(game.join(payload_path)).unwrap(),
                     b"new payload"
                 );
             }
