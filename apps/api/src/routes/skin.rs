@@ -111,6 +111,12 @@ struct PendingCommandQuery {
     expected_selection_revision: u64,
     expected_generation: u64,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResetQuery {
+    expected_account_id: String,
+    expected_selection_revision: u64,
+}
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FromProfile {
@@ -494,13 +500,35 @@ async fn cancel(
     Ok(Json(json!({"status":"cleared","cleared":cleared,"view_model":{"summary":"Skin change canceled."}})).into_response())
 }
 
-async fn reset_skin(State(service): State<SkinState>) -> ApiResult {
-    service.reset(true).await.map_err(profile_error)?;
+async fn reset_skin(
+    State(service): State<SkinState>,
+    parameters: Result<Query<ResetQuery>, QueryRejection>,
+) -> ApiResult {
+    let parameters = query(parameters)?;
+    service
+        .reset(
+            true,
+            &parameters.expected_account_id,
+            parameters.expected_selection_revision,
+        )
+        .await
+        .map_err(profile_error)?;
     Ok(Json(json!({"status":"reset","profile_updated":true,"view_model":{"summary":"Profile skin reset."}})).into_response())
 }
 
-async fn reset_cape(State(service): State<SkinState>) -> ApiResult {
-    service.reset(false).await.map_err(profile_error)?;
+async fn reset_cape(
+    State(service): State<SkinState>,
+    parameters: Result<Query<ResetQuery>, QueryRejection>,
+) -> ApiResult {
+    let parameters = query(parameters)?;
+    service
+        .reset(
+            false,
+            &parameters.expected_account_id,
+            parameters.expected_selection_revision,
+        )
+        .await
+        .map_err(profile_error)?;
     Ok(Json(
         json!({"status":"reset","profile_updated":true,"view_model":{"summary":"Cape reset."}}),
     )
@@ -617,11 +645,9 @@ mod tests {
                 .migrate(&[axial_app::skins::store::MIGRATION])
                 .unwrap();
             let tasks = TaskOwner::new(16).unwrap();
-            // Construction never opens the keyring. Every intent is cancelled
-            // before debounce or flush can reach credentials/provider I/O.
             let auth = Arc::new(AuthService::new(
                 accounts.clone(),
-                Arc::new(CredentialStore::open(uuid::Uuid::new_v4())),
+                Arc::new(CredentialStore::isolated_for_tests()),
                 tasks.clone(),
             ));
             let library = Arc::new(SavedSkinLibrary::new(
@@ -796,6 +822,105 @@ mod tests {
             );
         }
         fixture.finish().await;
+    }
+
+    async fn assert_stale_reset_preserves_pending(route: &str, reselected: bool) {
+        let fixture = Fixture::new();
+        let first = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
+        let second = fixture.add_account("22345678123442348234123456789abc", "PlayerTwo");
+        fixture.accounts.select(first.account_id()).unwrap();
+        let confirmed = fixture.accounts.capture_selected().unwrap();
+        let delayed = format!("{route}?{}", selection_query(&confirmed));
+        fixture.accounts.select(second.account_id()).unwrap();
+        if reselected {
+            fixture.accounts.select(first.account_id()).unwrap();
+        }
+        let current = fixture.accounts.capture_selected().unwrap();
+        fixture.queue(&current).await;
+        let before = fixture.request(Method::GET, "/api/v1/skins/pending").await;
+        assert_eq!(before.1["phase"], "queued");
+        let (status, body) = fixture.request(Method::POST, &delayed).await;
+        let after = fixture.request(Method::GET, "/api/v1/skins/pending").await;
+        fixture.finish().await;
+        assert_eq!(
+            after, before,
+            "stale reset must not cancel the current choice"
+        );
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+
+    #[tokio::test]
+    async fn stale_profile_resets_cannot_cancel_another_accounts_pending_skin() {
+        for route in ["/api/v1/skin/profile/reset", "/api/v1/skin/cape/reset"] {
+            assert_stale_reset_preserves_pending(route, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_profile_resets_cannot_cancel_a_reselected_accounts_pending_skin() {
+        for route in ["/api/v1/skin/profile/reset", "/api/v1/skin/cape/reset"] {
+            assert_stale_reset_preserves_pending(route, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_reset_requires_a_complete_valid_selection_fence_before_cancelling() {
+        let fixture = Fixture::new();
+        let capture = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
+        fixture.queue(&capture).await;
+        let before = fixture.request(Method::GET, "/api/v1/skins/pending").await;
+        for route in ["/api/v1/skin/profile/reset", "/api/v1/skin/cape/reset"] {
+            for suffix in [
+                String::new(),
+                format!("?expected_account_id={}", capture.account_id()),
+                format!(
+                    "?expected_selection_revision={}",
+                    capture.selection_revision()
+                ),
+                format!(
+                    "?expected_account_id={}&expected_selection_revision=invalid",
+                    capture.account_id()
+                ),
+                format!(
+                    "?expected_account_id={}&expected_selection_revision=18446744073709551616",
+                    capture.account_id()
+                ),
+            ] {
+                let (status, _) = fixture
+                    .request(Method::POST, &format!("{route}{suffix}"))
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(
+                    fixture.request(Method::GET, "/api/v1/skins/pending").await,
+                    before
+                );
+            }
+        }
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn current_profile_reset_only_cancels_its_captured_pending_skin() {
+        for route in ["/api/v1/skin/profile/reset", "/api/v1/skin/cape/reset"] {
+            let fixture = Fixture::new();
+            let first = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
+            fixture.queue(&first).await;
+            let second = fixture.add_account("22345678123442348234123456789abc", "PlayerTwo");
+            fixture.queue(&second).await;
+            let other = fixture.request(Method::GET, "/api/v1/skins/pending").await;
+            fixture.accounts.select(first.account_id()).unwrap();
+            let current = fixture.accounts.capture_selected().unwrap();
+            let path = format!("{route}?{}", selection_query(&current));
+            let (status, _) = fixture.request(Method::POST, &path).await;
+            let after = fixture.request(Method::GET, "/api/v1/skins/pending").await;
+            fixture.accounts.select(second.account_id()).unwrap();
+            let other_after = fixture.request(Method::GET, "/api/v1/skins/pending").await;
+            fixture.finish().await;
+            // Admission cancels only its target before the absent fixture credentials refuse I/O.
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(after.1["phase"], "idle");
+            assert_eq!(other_after, other);
+        }
     }
 
     #[tokio::test]

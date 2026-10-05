@@ -1078,22 +1078,23 @@ impl ProfileMedia {
         Err(error)
     }
 
-    pub async fn reset(self: &Arc<Self>, skin: bool) -> Result<(), ProfileMediaError> {
-        let capture = self.selected_online()?;
-        let account_id = capture.account_id().to_owned();
+    pub async fn reset(
+        self: &Arc<Self>,
+        skin: bool,
+        expected_account_id: &str,
+        expected_selection_revision: u64,
+    ) -> Result<(), ProfileMediaError> {
         let service = self.clone();
         let handle = {
             let mut admission = self.admission.lock().expect("skin admission lock poisoned");
             if admission.closing {
                 return Err(ProfileMediaError::ShuttingDown);
             }
-            let (send, receive) = oneshot::channel::<()>();
+            let (send, receive) = oneshot::channel::<CapturedAccount>();
             let handle = self
                 .tasks
                 .try_spawn(self.root.clone(), move |_| async move {
-                    if receive.await.is_err() {
-                        return Err(ProfileMediaError::Cancelled);
-                    }
+                    let capture = receive.await.map_err(|_| ProfileMediaError::Cancelled)?;
                     let outcome = service.reset_account(&capture, skin).await;
                     {
                         let mut admission = service
@@ -1106,9 +1107,25 @@ impl ProfileMedia {
                     outcome
                 })
                 .map_err(|_| ProfileMediaError::Busy)?;
-            self.pending.cancel_account(&account_id)?;
+            let capture = self
+                .accounts
+                .with_selected_account(
+                    expected_account_id,
+                    expected_selection_revision,
+                    |capture| {
+                        if capture.kind() != AccountKind::Microsoft || capture.profile().is_none() {
+                            return Err(ProfileMediaError::AccountRequired);
+                        }
+                        if !capture.owns_minecraft_java() {
+                            return Err(ProfileMediaError::OwnershipMissing);
+                        }
+                        self.pending.cancel_account(capture.account_id())?;
+                        Ok(capture.clone())
+                    },
+                )
+                .map_err(account_error)??;
             admission.resets += 1;
-            let _ = send.send(());
+            let _ = send.send(capture);
             self.changed.notify_waiters();
             handle
         };
@@ -1431,11 +1448,15 @@ mod tests {
             Err(SkinError::Profile(ProfileMediaError::OwnershipMissing))
         ));
         assert_eq!(
-            service.reset(true).await,
+            service
+                .reset(true, unowned.account_id(), unowned.selection_revision())
+                .await,
             Err(ProfileMediaError::OwnershipMissing)
         );
         assert_eq!(
-            service.reset(false).await,
+            service
+                .reset(false, unowned.account_id(), unowned.selection_revision())
+                .await,
             Err(ProfileMediaError::OwnershipMissing)
         );
         assert!(matches!(

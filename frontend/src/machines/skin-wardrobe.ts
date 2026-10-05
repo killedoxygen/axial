@@ -546,8 +546,8 @@ export async function resetProfileSkin(): Promise<void> {
   );
   if (!ok) return;
   await wardrobeAction({ kind: 'reset-profile-skin' }, 'Could not reset Minecraft profile skin.', async () => {
-    requireCurrentWardrobeContext(capture);
-    const response = await api('POST', '/skin/profile/reset', {});
+    const query = skinCommandQuery(capture);
+    const response = await api('POST', `/skin/profile/reset?${query.toString()}`, {});
     void refreshWardrobe();
     void refreshAccountsData();
     refreshAccountSkin();
@@ -564,8 +564,8 @@ export async function resetProfileCape(): Promise<void> {
   );
   if (!ok) return;
   await wardrobeAction({ kind: 'reset-profile-cape' }, 'Could not reset Minecraft profile cape.', async () => {
-    requireCurrentWardrobeContext(capture);
-    const response = await api('POST', '/skin/cape/reset', {});
+    const query = skinCommandQuery(capture);
+    const response = await api('POST', `/skin/cape/reset?${query.toString()}`, {});
     void refreshWardrobe();
     void refreshAccountsData();
     refreshAccountSkin();

@@ -80,6 +80,18 @@ function context(accountId = accountA, selectionRevision: number | null = 7): Wa
   return { accountKey: `account:${accountId}`, selectionRevision, skinActionsEnabled: true, profile: null };
 }
 
+function profileContext(selectionRevision = 7): WardrobeContext {
+  return {
+    ...context(accountA, selectionRevision),
+    profile: {
+      id: accountA,
+      name: 'Player',
+      skins: [{ id: 'profile-skin', state: 'ACTIVE', variant: 'CLASSIC', url: 'https://textures.minecraft.net/texture/abc' }],
+      capes: [{ id: 'profile-cape', state: 'ACTIVE', url: 'https://textures.minecraft.net/texture/def' }],
+    },
+  };
+}
+
 type ViewNode = { type: unknown; props: Record<string, unknown> };
 function nodes(tree: unknown): ViewNode[] {
   if (Array.isArray(tree)) return tree.flatMap(nodes);
@@ -99,6 +111,7 @@ function harness() {
   let skinsRead: (() => Promise<unknown>) | null = null;
   let statusRead: (() => Promise<unknown>) | null = null;
   let cancelRead: (() => Promise<unknown>) | null = null;
+  let confirm: () => Promise<boolean> = async () => true;
   const transport = {
     async api(method: string, path: string) {
       calls.push([method, path]);
@@ -106,6 +119,7 @@ function harness() {
       if (method === 'GET' && url.pathname === '/skins')
         return skinsRead ? skinsRead() : { skins: [skin], pending_apply_texture_key: status?.texture_key ?? null };
       if (method === 'GET' && url.pathname === '/skins/pending') return statusRead ? statusRead() : status;
+      if (method === 'POST' && url.pathname === '/skins/from-profile') return skin;
       if (method !== 'GET') {
         assert.ok(url.searchParams.get('expected_account_id'));
         assert.ok(url.searchParams.get('expected_selection_revision'));
@@ -126,6 +140,9 @@ function harness() {
         status = pending({ phase: 'idle', texture_key: null });
         return { status: 'cleared', cleared: true, view_model: { summary: 'Skin change canceled.' } };
       }
+      if (method === 'POST' && (url.pathname === '/skin/profile/reset' || url.pathname === '/skin/cape/reset')) {
+        return { status: 'reset', profile_updated: true, view_model: { summary: 'Profile reset.' } };
+      }
       throw new Error(`Unexpected skin request: ${method} ${path}`);
     },
     isApiError: () => false,
@@ -143,7 +160,7 @@ function harness() {
       '../default-skins': defaults,
       '../views/accounts/api': api,
       '../toast': { toast: (message: string) => notices.push(message) },
-      '../ui/Dialog': { showConfirm: async () => true },
+      '../ui/Dialog': { showConfirm: () => confirm() },
       './accounts': {
         refreshAccountsData: async () => {
           accountRefreshes += 1;
@@ -226,6 +243,9 @@ function harness() {
     },
     setCancelRead(read: () => Promise<unknown>) {
       cancelRead = read;
+    },
+    setConfirm(read: () => Promise<boolean>) {
+      confirm = read;
     },
     get accountRefreshes() {
       return accountRefreshes;
@@ -581,6 +601,45 @@ test('a changed selection revision invalidates delayed apply even when the selec
   await settle();
   await assert.rejects(h.machine.applySavedSkin(skin.texture_key, { capture }), /The account changed/);
   assert.equal(h.calls.filter(([method]) => method !== 'GET').length, 0);
+});
+
+test('profile reset commands bind the confirmed account and selection', async () => {
+  for (const [action, route] of [
+    ['resetProfileSkin', '/skin/profile/reset'],
+    ['resetProfileCape', '/skin/cape/reset'],
+  ] as const) {
+    const h = harness();
+    h.machine.setWardrobeContext(profileContext());
+    await settle();
+    h.calls.length = 0;
+    await h.machine[action]();
+    const commands = h.calls.filter(([method]) => method !== 'GET');
+    assert.equal(commands.length, 1);
+    const url = new URL(commands[0][1], 'http://skin-fixture.invalid');
+    assert.equal(url.pathname, route);
+    assert.equal(url.searchParams.get('expected_account_id'), accountA);
+    assert.equal(url.searchParams.get('expected_selection_revision'), '7');
+    assert.equal(h.machine.wardrobeNotice.value, null);
+  }
+});
+
+test('cancelled or stale profile reset confirmations never send a reset', async () => {
+  for (const action of ['resetProfileSkin', 'resetProfileCape'] as const) {
+    for (const outcome of ['cancel', 'switch', 'reselect'] as const) {
+      const h = harness();
+      h.machine.setWardrobeContext(profileContext());
+      await settle();
+      h.calls.length = 0;
+      const confirmation = deferred<boolean>();
+      h.setConfirm(() => confirmation.promise);
+      const resetting = h.machine[action]();
+      if (outcome !== 'cancel') h.machine.setWardrobeContext(context(accountB, 8));
+      if (outcome === 'reselect') h.machine.setWardrobeContext(profileContext(9));
+      confirmation.resolve(outcome !== 'cancel');
+      await resetting;
+      assert.equal(h.calls.filter(([method, path]) => method === 'POST' && path.startsWith('/skin/')).length, 0);
+    }
+  }
 });
 
 test('missing selection or pending generation refuses commands with a visible actionable error', async () => {
