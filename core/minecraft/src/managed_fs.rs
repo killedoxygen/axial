@@ -164,6 +164,8 @@ struct ManagedRoot {
     effect_transition: Mutex<()>,
     continuations: Mutex<ManagedEffectContinuations>,
     file_identities: Mutex<Vec<Weak<ManagedFileProof>>>,
+    #[cfg(test)]
+    file_identity_comparisons: std::sync::atomic::AtomicUsize,
     publication_locks: Mutex<HashMap<PublicationLockKey, Weak<PublicationLock>>>,
     publication_mutex: Arc<tokio::sync::Mutex<()>>,
     install_flights: Mutex<HashMap<PortablePathKey, Weak<tokio::sync::Mutex<()>>>>,
@@ -1018,7 +1020,17 @@ impl ManagedRoot {
                 .capability
                 .lock()
                 .ok()
-                .and_then(|capability| capability.as_ref().map(|value| value.same_file(&candidate)))
+                .and_then(|capability| {
+                    capability
+                        .as_ref()
+                        .filter(|value| value.could_be_same_file(&candidate))
+                        .map(|value| {
+                            #[cfg(test)]
+                            self.file_identity_comparisons
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            value.same_file(&candidate)
+                        })
+                })
                 .transpose()
                 .ok()
                 .flatten()
@@ -1579,6 +1591,8 @@ impl ManagedDir {
                 receipts: BTreeMap::new(),
             }),
             file_identities: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            file_identity_comparisons: std::sync::atomic::AtomicUsize::new(0),
             publication_locks: Mutex::new(HashMap::new()),
             publication_mutex: Arc::new(tokio::sync::Mutex::new(())),
             install_flights: Mutex::new(HashMap::new()),
@@ -1627,6 +1641,8 @@ impl ManagedDir {
                 receipts: BTreeMap::new(),
             }),
             file_identities: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            file_identity_comparisons: std::sync::atomic::AtomicUsize::new(0),
             publication_locks: Mutex::new(HashMap::new()),
             publication_mutex: Arc::new(tokio::sync::Mutex::new(())),
             install_flights: Mutex::new(HashMap::new()),
@@ -6898,6 +6914,50 @@ mod library_lifecycle_tests {
                 .is_none()
         );
         assert_eq!(batch.parent_walks, 2);
+    }
+
+    #[test]
+    fn file_batch_avoids_comparing_unrelated_retained_files() {
+        use std::sync::atomic::Ordering;
+
+        let (temporary, root, operation) = file_batch_fixture();
+        let native_parent = temporary.path().join("cache/natives/retained");
+        std::fs::create_dir_all(&native_parent).unwrap();
+        let mut retained = Vec::new();
+        for index in 0..32 {
+            let name = format!("native-{index}");
+            std::fs::write(native_parent.join(&name), b"native").unwrap();
+            let path =
+                PortableRelativePath::new_exact(&format!("cache/natives/retained/{name}")).unwrap();
+            let file = operation.observe_file(&path).unwrap().unwrap();
+            retained.push((path, file));
+            std::fs::write(
+                temporary
+                    .path()
+                    .join(format!("assets/objects/aa/observed-{index}")),
+                b"asset",
+            )
+            .unwrap();
+        }
+
+        let comparisons = &root.authority.root.inner.root.file_identity_comparisons;
+        comparisons.store(0, Ordering::Relaxed);
+        let mut batch = operation.file_batch();
+        for index in 0..32 {
+            let file = batch
+                .observe_file(&batch_path(&format!("observed-{index}")))
+                .unwrap()
+                .unwrap();
+            assert_eq!(file.size(), 5);
+        }
+        let unrelated_comparisons = comparisons.swap(0, Ordering::Relaxed);
+
+        let (path, expected) = &retained[0];
+        let reopened = batch.observe_file(path).unwrap().unwrap();
+        assert_eq!(reopened.guard.identity, expected.guard.identity);
+        assert_eq!(reopened.read_bounded(6).unwrap(), b"native");
+        assert_eq!(comparisons.load(Ordering::Relaxed), 1);
+        assert_eq!(unrelated_comparisons, 0);
     }
 
     #[test]

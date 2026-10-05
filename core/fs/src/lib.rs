@@ -11696,6 +11696,12 @@ impl FileCapability {
         Ok(executable)
     }
 
+    /// A negative filter using captured identities, not validation or authority.
+    /// A possible match must still be verified with `same_file`.
+    pub fn could_be_same_file(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.authority, &other.authority) && self.identity == other.identity
+    }
+
     pub fn same_file(&self, other: &Self) -> io::Result<bool> {
         let authority = self.parent.authority()?;
         let operation = authority.enter()?;
@@ -19974,8 +19980,19 @@ mod tests {
             .open_file(&LeafName::new("second.bin").expect("second leaf"))
             .expect("second capability");
 
+        assert!(first.could_be_same_file(&first_again));
+        assert!(!first.could_be_same_file(&second));
         assert!(first.same_file(&first_again).expect("same-file proof"));
         assert!(!first.same_file(&second).expect("distinct-file proof"));
+
+        std::fs::hard_link(
+            temporary.path().join("first.bin"),
+            temporary.path().join("alias.bin"),
+        )
+        .expect("hard-link original");
+        assert!(first.could_be_same_file(&first_again));
+        assert!(first.same_file(&first_again).is_err());
+        assert!(first.same_file(&second).is_err());
         drop((root, first, first_again, second));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
