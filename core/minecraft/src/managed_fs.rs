@@ -59,6 +59,14 @@ const MANAGED_IMPORT_SCRATCH_BYTES: u64 = 64 << 10;
 const ROOT_LEASE_NAME: &str = ".axial-root.lease";
 
 #[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY: std::cell::Cell<bool>
+        = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_NEXT_GUARDED_REMOVAL_AFTER_APPLY: std::cell::Cell<bool>
+        = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
 type ManagedSha1ReadIdentity = (u64, [u8; 20]);
 
 #[cfg(test)]
@@ -840,6 +848,13 @@ pub(crate) enum ManagedGuardedFileMoveFailure {
     NoEffect,
     AppliedUnsettled,
     Indeterminate,
+}
+
+#[derive(Debug)]
+pub(crate) enum FileRemovalFailure {
+    NoEffect(LoaderError),
+    AppliedUnsettled(LoaderError),
+    Indeterminate(LoaderError),
 }
 
 impl std::fmt::Debug for ManagedDir {
@@ -3239,6 +3254,10 @@ impl ManagedDir {
         destination
             .revalidate_locked(&transition)
             .map_err(|_| ManagedGuardedFileMoveFailure::AppliedUnsettled)?;
+        #[cfg(test)]
+        if FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY.with(|fail| fail.replace(false)) {
+            return Err(ManagedGuardedFileMoveFailure::AppliedUnsettled);
+        }
         Ok(())
     }
 
@@ -3341,9 +3360,23 @@ impl ManagedDir {
         name: &str,
         guard: &ManagedFileGuard,
     ) -> Result<(), LoaderError> {
+        self.remove_guarded_file_classified(name, guard)
+            .map_err(|failure| match failure {
+                FileRemovalFailure::NoEffect(error)
+                | FileRemovalFailure::AppliedUnsettled(error)
+                | FileRemovalFailure::Indeterminate(error) => error,
+            })
+    }
+
+    pub(crate) fn remove_guarded_file_classified(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+    ) -> Result<(), FileRemovalFailure> {
         let root = self.inner.root.clone();
         let transition = root.transition();
-        root.settle_locked(&transition)?;
+        root.settle_locked(&transition)
+            .map_err(FileRemovalFailure::Indeterminate)?;
         self.remove_guarded_file_locked(&transition, name, guard)
     }
 
@@ -3352,64 +3385,85 @@ impl ManagedDir {
         transition: &ManagedEffectTransition<'_>,
         name: &str,
         guard: &ManagedFileGuard,
-    ) -> Result<(), LoaderError> {
-        let name_leaf = leaf(name)?;
-        if !self.file_guard_matches_locked(transition, name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed file removal source changed".to_string(),
-            ));
-        }
-        let file = self.inner.directory.open_file(&name_leaf)?;
-        if !guard.identity.matches(&file)? {
-            return Err(LoaderError::Verify(
-                "managed file removal source changed before parking".to_string(),
-            ));
-        }
-        if guard.size > MAX_MANAGED_GUARDED_REMOVAL_BYTES {
-            return Err(LoaderError::Verify(
-                "managed file removal source exceeds its bound".to_string(),
-            ));
-        }
-        file.validate_revision(&guard.revision)?;
-        let mut reader = file.reader(MAX_MANAGED_GUARDED_REMOVAL_BYTES)?;
-        let mut observed = 0_u64;
-        let mut hasher = Sha256::new();
-        let mut chunk = [0_u8; 64 * 1024];
-        loop {
-            let read = reader.read(&mut chunk)?;
-            if read == 0 {
-                break;
+    ) -> Result<(), FileRemovalFailure> {
+        use FileRemovalFailure::{AppliedUnsettled, Indeterminate, NoEffect};
+        let (file, expected) = (|| {
+            let name_leaf = leaf(name)?;
+            if !self.file_guard_matches_locked(transition, name, guard)? {
+                return Err(LoaderError::Verify(
+                    "managed file removal source changed".to_string(),
+                ));
             }
-            observed = observed.checked_add(read as u64).ok_or_else(|| {
-                LoaderError::Verify("managed file removal size overflowed".to_string())
-            })?;
-            hasher.update(&chunk[..read]);
-        }
-        reader.finish()?;
-        file.validate_revision(&guard.revision)?;
-        if observed != guard.size {
-            return Err(LoaderError::Verify(
-                "managed file removal source changed size".to_string(),
-            ));
-        }
-        let expected =
-            ExpectedFileContent::new(guard.revision.retained(), hasher.finalize().into());
+            let file = self.inner.directory.open_file(&name_leaf)?;
+            if !guard.identity.matches(&file)? {
+                return Err(LoaderError::Verify(
+                    "managed file removal source changed before parking".to_string(),
+                ));
+            }
+            if guard.size > MAX_MANAGED_GUARDED_REMOVAL_BYTES {
+                return Err(LoaderError::Verify(
+                    "managed file removal source exceeds its bound".to_string(),
+                ));
+            }
+            file.validate_revision(&guard.revision)?;
+            let mut reader = file.reader(MAX_MANAGED_GUARDED_REMOVAL_BYTES)?;
+            let mut observed = 0_u64;
+            let mut hasher = Sha256::new();
+            let mut chunk = [0_u8; 64 * 1024];
+            loop {
+                let read = reader.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                observed = observed.checked_add(read as u64).ok_or_else(|| {
+                    LoaderError::Verify("managed file removal size overflowed".to_string())
+                })?;
+                hasher.update(&chunk[..read]);
+            }
+            reader.finish()?;
+            file.validate_revision(&guard.revision)?;
+            if observed != guard.size {
+                return Err(LoaderError::Verify(
+                    "managed file removal source changed size".to_string(),
+                ));
+            }
+            let expected =
+                ExpectedFileContent::new(guard.revision.retained(), hasher.finalize().into());
+            Ok((file, expected))
+        })()
+        .map_err(NoEffect)?;
         match self.inner.directory.park_file(file.park_request(expected)) {
             FileParkOutcome::Parked(parked) => {
                 retain_parked_file_removal_locked(transition, parked);
-                self.inner.root.settle_locked(transition)?;
+                self.inner
+                    .root
+                    .settle_locked(transition)
+                    .map_err(AppliedUnsettled)?;
             }
-            FileParkOutcome::NoEffect { error, request: _ } => return Err(error.into()),
-            FileParkOutcome::Preserved { error, file: _ } => return Err(error.into()),
+            FileParkOutcome::NoEffect { error, request: _ }
+            | FileParkOutcome::Preserved { error, file: _ } => {
+                return Err(NoEffect(error.into()));
+            }
             FileParkOutcome::AppliedUnverified(obligation) => {
                 self.inner.root.retain_linear_locked(
                     transition,
                     obligation,
                     EffectOwner::retain_file_park_removal,
                 );
-                self.inner.root.settle_locked(transition)?;
-                return Err(unsettled("managed file removal remains unsettled"));
+                self.inner
+                    .root
+                    .settle_locked(transition)
+                    .map_err(Indeterminate)?;
+                return Err(Indeterminate(unsettled(
+                    "managed file removal remains unsettled",
+                )));
             }
+        }
+        #[cfg(test)]
+        if FAIL_NEXT_GUARDED_REMOVAL_AFTER_APPLY.with(|fail| fail.replace(false)) {
+            return Err(AppliedUnsettled(LoaderError::Io(io::Error::other(
+                "injected guarded removal post-effect failure",
+            ))));
         }
         Ok(())
     }

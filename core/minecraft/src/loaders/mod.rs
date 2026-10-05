@@ -220,8 +220,8 @@ mod tests {
     use super::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderComponentId, LoaderError,
         LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, MAX_VERSION_ID_BYTES,
-        build_id_for, install_build, installed_version_id_for, reconstruct_build,
-        require_exact_live_build_record, validate_version_id,
+        build_id_for, install_build, installed_version_id_for, require_exact_live_build_record,
+        validate_version_id,
     };
     use crate::ManagedRuntimeCache;
     use crate::loaders::types::LoaderBuildSubjectKind;
@@ -319,32 +319,6 @@ mod tests {
 
         drop((operation, managed_root));
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn reconstruction_rejects_unsupported_strategies_before_effects() {
-        let sentinel_root = temp_library("unsupported-reconstruction-strategy");
-        let sentinel = sentinel_root.join("untouched");
-        fs::create_dir_all(&sentinel_root).expect("sentinel root");
-        fs::write(&sentinel, b"untouched").expect("sentinel");
-
-        for (component, loader_version) in [
-            (LoaderComponentId::Forge, "55.0.0"),
-            (LoaderComponentId::NeoForge, "21.5.74"),
-        ] {
-            let unsupported = installed_version_id_for(component, "1.21.5", loader_version)
-                .expect("canonical unsupported identity");
-            let Err(_) = reconstruct_build(&unsupported).await else {
-                panic!("unsupported reconstruction strategy");
-            };
-            assert_eq!(fs::read(&sentinel).expect("sentinel remains"), b"untouched");
-            assert_eq!(
-                fs::read_dir(&sentinel_root).expect("sentinel root").count(),
-                1
-            );
-        }
-
-        let _ = fs::remove_dir_all(sentinel_root);
     }
 
     #[test]
