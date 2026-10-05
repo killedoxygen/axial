@@ -294,7 +294,10 @@ for (const readFails of [false, true]) {
     const state = bulk.resourceMutationState('instance-a');
     assert.equal(state.status, 'error');
     assert.ok(state.status === 'error');
-    assert.match(state.error, /Queued 40 of 85 updates.*Admission response lost/);
+    assert.match(
+      state.error,
+      /Queued 40 of 85 updates\. Could not confirm the remaining update requests: Admission response lost/,
+    );
     assert.equal(
       h.notices.some(([message]) => /updates queued$/.test(String(message))),
       false,

@@ -90,7 +90,7 @@ export async function applyModUpdates(inst: EnrichedInstance, updates: ContentUp
       toast(single ? `${single} update queued` : `${updates.length} mod updates queued`);
     } catch (err) {
       const prefix = queuedCount > 0 ? `Queued ${queuedCount} of ${updates.length} updates. ` : '';
-      throw new Error(`${prefix}Could not queue the remaining updates: ${errMessage(err)}`);
+      throw new Error(`${prefix}Could not confirm the remaining update requests: ${errMessage(err)}`);
     }
   });
 }
