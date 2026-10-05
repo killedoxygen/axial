@@ -7310,8 +7310,14 @@ mod tests {
     #[test]
     fn staging_checkpoint_preserves_post_move_pre_manifest_process_exit() {
         const FIXTURE: &str = "AXIAL_CONTENT_PUBLIC_MOVE_FIXTURE";
+        const PHASE: &str = "AXIAL_CONTENT_PUBLIC_MOVE_PHASE";
 
         if let Some(container) = std::env::var_os(FIXTURE) {
+            let before_save = match std::env::var(PHASE).unwrap().as_str() {
+                "before-save" => true,
+                "omitted" => false,
+                _ => panic!("fixture publication phase"),
+            };
             let container = std::path::PathBuf::from(container);
             let temporary = tempfile::tempdir_in(&container).unwrap();
             let (_tree, ready) = checkpoint_fixture(&temporary, true);
@@ -7352,8 +7358,15 @@ mod tests {
             let root = temporary.path().to_path_buf();
             let private = ready.state.private_name.as_str().to_string();
             std::fs::write(container.join("root-path"), root.to_str().unwrap()).unwrap();
-            std::fs::write(container.join("checkpoint"), encoded).unwrap();
-            ready.state.before_manifest_revalidation = Some(Box::new(move || {
+            std::fs::write(container.join("checkpoint"), &encoded).unwrap();
+            let witness_and_exit = move || {
+                assert_eq!(
+                    std::fs::read_to_string(container.join("checkpoint")).unwrap(),
+                    encoded
+                );
+                let saved = ManagedContentStagingCheckpoint::decode(&encoded).unwrap();
+                assert!(saved.record.published.is_empty());
+                assert!(saved.record.restored.is_none());
                 let original = backup
                     .inspect_regular_file(backup_name.as_str())
                     .unwrap()
@@ -7397,64 +7410,91 @@ mod tests {
                 )
                 .unwrap();
                 std::process::exit(42);
-            }));
+            };
+            let mut witness_and_exit: Option<BeforeManifestRevalidation> =
+                Some(Box::new(witness_and_exit));
+            if !before_save {
+                ready.state.before_manifest_revalidation = witness_and_exit.take();
+            }
             let _outcome =
-                ready.commit_with_checkpoint([18; 32], MAX_STAGING_CHECKPOINT_BYTES, |_| Ok(false));
+                ready.commit_with_checkpoint([18; 32], MAX_STAGING_CHECKPOINT_BYTES, |offered| {
+                    assert_eq!(offered.record.published.len(), 3);
+                    assert_eq!(
+                        offered
+                            .record
+                            .published
+                            .iter()
+                            .filter(|payload| payload.backup.is_some())
+                            .count(),
+                        1
+                    );
+                    assert!(offered.record.restored.is_none());
+                    if before_save {
+                        witness_and_exit.take().unwrap()();
+                        unreachable!("fixture must exit before saving publication evidence");
+                    }
+                    Ok(false)
+                });
             panic!("production commit must reach the pre-manifest hard exit");
         }
 
-        let container = test_tempdir().unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "managed_fs::content_transaction::tests::staging_checkpoint_preserves_post_move_pre_manifest_process_exit", "--nocapture"])
-            .env(FIXTURE, container.path())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let timed_out = child.try_wait().unwrap().is_none();
-        if timed_out {
-            child.kill().unwrap();
-        }
-        let output = child.wait_with_output().unwrap();
-        assert!(
-            !timed_out && output.status.code() == Some(42),
-            "timed_out={timed_out}, status={:?}; {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let root = std::path::PathBuf::from(
-            std::fs::read_to_string(container.path().join("root-path")).unwrap(),
-        );
-        let encoded = std::fs::read_to_string(container.path().join("checkpoint")).unwrap();
-        let checkpoint = ManagedContentStagingCheckpoint::decode(&encoded).unwrap();
-        let witness: BTreeMap<String, Option<Vec<u8>>> = serde_json::from_slice(
-            &std::fs::read(container.path().join("publication-witness")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            published_file_tree(&root, &checkpoint.record.private_name),
-            witness
-        );
-        for _ in 0..2 {
-            let (tree, admitted) = reopen_content_root(&root);
-            assert!(matches!(
-                admitted
-                    .for_pack()
-                    .restore_staging_checkpoint(checkpoint.clone(), [18; 32]),
-                Err(ManagedContentCheckpointError::Changed)
-            ));
-            drop(tree);
+        for phase in ["omitted", "before-save"] {
+            let container = test_tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "managed_fs::content_transaction::tests::staging_checkpoint_preserves_post_move_pre_manifest_process_exit", "--nocapture"])
+                .env(FIXTURE, container.path())
+                .env(PHASE, phase)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let timed_out = child.try_wait().unwrap().is_none();
+            if timed_out {
+                child.kill().unwrap();
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !timed_out && output.status.code() == Some(42),
+                "phase={phase}, timed_out={timed_out}, status={:?}; {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let root = std::path::PathBuf::from(
+                std::fs::read_to_string(container.path().join("root-path")).unwrap(),
+            );
+            let encoded = std::fs::read_to_string(container.path().join("checkpoint")).unwrap();
+            let checkpoint = ManagedContentStagingCheckpoint::decode(&encoded).unwrap();
+            assert!(checkpoint.record.published.is_empty());
+            assert!(checkpoint.record.restored.is_none());
+            let witness: BTreeMap<String, Option<Vec<u8>>> = serde_json::from_slice(
+                &std::fs::read(container.path().join("publication-witness")).unwrap(),
+            )
+            .unwrap();
             assert_eq!(
                 published_file_tree(&root, &checkpoint.record.private_name),
                 witness
             );
-            assert_eq!(
-                std::fs::read_to_string(container.path().join("checkpoint")).unwrap(),
-                encoded
-            );
+            for _ in 0..2 {
+                let (tree, admitted) = reopen_content_root(&root);
+                assert!(matches!(
+                    admitted
+                        .for_pack()
+                        .restore_staging_checkpoint(checkpoint.clone(), [18; 32]),
+                    Err(ManagedContentCheckpointError::Changed)
+                ));
+                drop(tree);
+                assert_eq!(
+                    published_file_tree(&root, &checkpoint.record.private_name),
+                    witness
+                );
+                assert_eq!(
+                    std::fs::read_to_string(container.path().join("checkpoint")).unwrap(),
+                    encoded
+                );
+            }
         }
     }
 
