@@ -18,7 +18,6 @@ use super::credentials::{Credentials, MAX_CREDENTIAL_BYTES};
 /// Never use the legacy `axial-auth` service, including in development.
 pub const KEYRING_SERVICE: &str = "com.mateoltd.axial.rewrite.credentials";
 const CHUNK_BYTES: usize = 900;
-const MAX_CHUNKS: usize = MAX_CREDENTIAL_BYTES.div_ceil(CHUNK_BYTES);
 const MAX_HEAD_BYTES: usize = 900;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -271,12 +270,22 @@ impl CredentialStore {
         let fence = fence.clone();
         self.run(move |store| {
             let bytes = credentials.encode_for_keyring()?;
+            let mut head = store.fenced_head(&fence)?;
+            let layout = match &head.state {
+                HeadState::Live { blob }
+                | HeadState::Pending {
+                    candidate: Some(blob),
+                    ..
+                } => blob.layout,
+                _ if cfg!(target_os = "macos") => BlobLayout::Single,
+                _ => BlobLayout::Chunks,
+            };
             let blob = Blob {
                 id: fence.operation,
-                chunks: bytes.len().div_ceil(CHUNK_BYTES),
+                chunks: bytes.len().div_ceil(layout.chunk_bytes()),
                 digest: hex::encode(Sha256::digest(&bytes)),
+                layout,
             };
-            let mut head = store.fenced_head(&fence)?;
             let previous = match &head.state {
                 HeadState::Live { blob: committed } if committed == &blob => {
                     // Idempotent recovery also validates the actual secret bytes.
@@ -304,7 +313,7 @@ impl CredentialStore {
                 candidate: Some(blob.clone()),
             };
             store.write_head(fence.account, &head)?;
-            for (index, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
+            for (index, chunk) in bytes.chunks(layout.chunk_bytes()).enumerate() {
                 store.write_entry(&store.chunk_key(fence.account, blob.id, index), chunk)?;
             }
             if store.read_blob(fence.account, &blob)? != credentials {
@@ -488,15 +497,16 @@ impl CredentialStore {
 
     fn read_blob(&self, account: Uuid, blob: &Blob) -> Result<Credentials, CredentialError> {
         blob.validate()?;
-        let mut bytes = Vec::with_capacity(blob.chunks * CHUNK_BYTES);
+        let chunk_bytes = blob.layout.chunk_bytes();
+        let mut bytes = Vec::with_capacity(blob.chunks * chunk_bytes);
         for index in 0..blob.chunks {
             let chunk = self
                 .keyring
                 .get(&self.chunk_key(account, blob.id, index))?
                 .ok_or(CredentialError::Malformed)?;
             if chunk.is_empty()
-                || chunk.len() > CHUNK_BYTES
-                || (index + 1 < blob.chunks && chunk.len() != CHUNK_BYTES)
+                || chunk.len() > chunk_bytes
+                || (index + 1 < blob.chunks && chunk.len() != chunk_bytes)
             {
                 return Err(CredentialError::Malformed);
             }
@@ -559,6 +569,25 @@ struct Blob {
     id: Uuid,
     chunks: usize,
     digest: String,
+    #[serde(default)]
+    layout: BlobLayout,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BlobLayout {
+    #[default]
+    Chunks,
+    Single,
+}
+
+impl BlobLayout {
+    fn chunk_bytes(self) -> usize {
+        match self {
+            Self::Chunks => CHUNK_BYTES,
+            Self::Single => MAX_CREDENTIAL_BYTES,
+        }
+    }
 }
 
 impl Head {
@@ -618,7 +647,7 @@ impl Blob {
     fn validate(&self) -> Result<(), CredentialError> {
         if self.id.is_nil()
             || self.chunks == 0
-            || self.chunks > MAX_CHUNKS
+            || self.chunks > MAX_CREDENTIAL_BYTES.div_ceil(self.layout.chunk_bytes())
             || self.digest.len() != 64
             || !self.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -683,7 +712,7 @@ impl SecureEntries for OsKeyring {
 mod memory {
     use super::*;
     use std::sync::Condvar;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]
     pub(super) struct Faults {
@@ -700,6 +729,7 @@ mod memory {
         pub(super) values: Mutex<HashMap<String, Vec<u8>>>,
         pub(super) faults: Mutex<Faults>,
         pub(super) block_next_write: Mutex<Option<Arc<WriteBlock>>>,
+        pub(super) reads: AtomicUsize,
     }
 
     #[derive(Default)]
@@ -711,6 +741,7 @@ mod memory {
 
     impl SecureEntries for MemoryEntries {
         fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             let mut faults = self.faults.lock().unwrap();
             if faults.unavailable || std::mem::take(&mut faults.fail_next_get) {
                 return Err(CredentialError::Unavailable);
@@ -1112,13 +1143,18 @@ mod tests {
         .unwrap();
         let fence = store.begin_change(ACCOUNT, 0).await.unwrap();
         store.save(&fence, secrets.clone()).await.unwrap();
+        let item_limit = if cfg!(target_os = "macos") {
+            65_536
+        } else {
+            900
+        };
         assert!(
             keyring
                 .values
                 .lock()
                 .unwrap()
                 .values()
-                .all(|value| value.len() <= CHUNK_BYTES)
+                .all(|value| value.len() <= item_limit)
         );
         assert_eq!(
             store.load(ACCOUNT).await.unwrap().unwrap().credentials(),
@@ -1126,6 +1162,206 @@ mod tests {
         );
         store.delete(ACCOUNT, Some(1)).await.unwrap();
         assert_eq!(keyring.values.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_large_credentials_reopen_with_two_secure_reads() {
+        let (store, keyring) = fixture();
+        let secrets = credentials(&"a".repeat(16_000));
+        let fence = store.begin_change(ACCOUNT, 0).await.unwrap();
+        store.save(&fence, secrets.clone()).await.unwrap();
+        let before = keyring.reads.load(Ordering::SeqCst);
+        let loaded = restart(&store).load(ACCOUNT).await.unwrap().unwrap();
+        assert_eq!(loaded.revision(), 1);
+        assert_eq!(loaded.credentials(), &secrets);
+        assert_eq!(keyring.reads.load(Ordering::SeqCst) - before, 2);
+    }
+
+    #[tokio::test]
+    async fn current_chunked_records_reopen_retry_and_retire_their_exact_items() {
+        for pending in [false, true] {
+            let (store, keyring) = fixture();
+            let account = parse_account(ACCOUNT).unwrap();
+            let operation = Uuid::new_v4();
+            let secrets = credentials(&"a".repeat(1_000));
+            let bytes = secrets.encode_for_keyring().unwrap();
+            let chunks = bytes.chunks(900).collect::<Vec<_>>();
+            let blob = serde_json::json!({
+                "id": operation,
+                "chunks": chunks.len(),
+                "digest": hex::encode(Sha256::digest(&bytes)),
+            });
+            let state = if pending {
+                serde_json::json!({ "kind": "pending", "previous": null, "candidate": blob })
+            } else {
+                serde_json::json!({ "kind": "live", "blob": blob })
+            };
+            let head = serde_json::to_vec(&serde_json::json!({
+                "schema": 1, "revision": 1, "operation": operation,
+                "state": state, "retired": [],
+            }))
+            .unwrap();
+            {
+                let mut entries = keyring.values.lock().unwrap();
+                entries.insert(store.head_key(account), head);
+                for (index, chunk) in chunks.iter().enumerate() {
+                    entries.insert(store.chunk_key(account, operation, index), chunk.to_vec());
+                }
+            }
+            let reopened = restart(&store);
+            if pending {
+                assert_eq!(
+                    reopened.load(ACCOUNT).await.unwrap_err(),
+                    CredentialError::Unresolved
+                );
+            } else {
+                assert_eq!(
+                    reopened.load(ACCOUNT).await.unwrap().unwrap().credentials(),
+                    &secrets
+                );
+            }
+            let fence = CredentialFence {
+                profile: store.profile,
+                account,
+                revision: 1,
+                operation,
+            };
+            assert_eq!(
+                reopened
+                    .save(&fence, secrets.clone())
+                    .await
+                    .unwrap()
+                    .revision(),
+                1
+            );
+            assert_eq!(keyring.values.lock().unwrap().len(), chunks.len() + 1);
+            let next = reopened.begin_change(ACCOUNT, 1).await.unwrap();
+            reopened.save(&next, credentials("next")).await.unwrap();
+            assert_eq!(keyring.values.lock().unwrap().len(), 2);
+            assert_eq!(
+                restart(&store)
+                    .load(ACCOUNT)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .credentials(),
+                &credentials("next")
+            );
+            reopened.delete(ACCOUNT, Some(2)).await.unwrap();
+            assert_eq!(keyring.values.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_payload_layouts_refuse_before_reading_any_payload() {
+        let (store, keyring) = fixture();
+        save_first(&store, "first").await;
+        let key = store.head_key(parse_account(ACCOUNT).unwrap());
+        let original: serde_json::Value =
+            serde_json::from_slice(keyring.values.lock().unwrap().get(&key).unwrap()).unwrap();
+        for (layout, chunks) in [("single", 2), ("future", 1)] {
+            let mut value = original.clone();
+            value["state"]["blob"]["layout"] = layout.into();
+            value["state"]["blob"]["chunks"] = chunks.into();
+            let bytes = serde_json::to_vec(&value).unwrap();
+            keyring
+                .values
+                .lock()
+                .unwrap()
+                .insert(key.clone(), bytes.clone());
+            let before = keyring.reads.load(Ordering::SeqCst);
+            assert_eq!(
+                store.load(ACCOUNT).await.unwrap_err(),
+                CredentialError::Malformed
+            );
+            assert_eq!(keyring.reads.load(Ordering::SeqCst) - before, 1);
+            assert_eq!(keyring.values.lock().unwrap().get(&key).unwrap(), &bytes);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "Requires a locally signed executable and an unlocked macOS test keychain"]
+    fn macos_keyring_accepts_a_complete_bounded_payload() {
+        let key = format!("native-capacity-test:{}", Uuid::new_v4());
+        let bytes = vec![0xa5; MAX_CREDENTIAL_BYTES];
+        let written = OsKeyring.set(&key, &bytes);
+        let observed = OsKeyring.get(&key);
+        let removed = OsKeyring.delete(&key);
+        let absent = OsKeyring.get(&key);
+        assert!(written.is_ok(), "Synthetic payload write failed");
+        assert!(
+            matches!(observed, Ok(Some(value)) if value == bytes),
+            "Synthetic payload readback failed"
+        );
+        assert!(removed.is_ok(), "Synthetic item cleanup failed");
+        assert!(matches!(absent, Ok(None)), "Synthetic item remains");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "Requires a locally signed executable and an unlocked macOS test keychain"]
+    async fn macos_saved_credentials_reopen_in_a_signed_process() {
+        const CHILD_PROFILE: &str = "AXIAL_TEST_KEYCHAIN_REOPEN_PROFILE";
+        let child_profile = std::env::var(CHILD_PROFILE).ok();
+        let profile = child_profile
+            .as_deref()
+            .map(|value| Uuid::parse_str(value).unwrap())
+            .unwrap_or_else(Uuid::new_v4);
+        let store = CredentialStore::open(profile);
+        let secrets = credentials(&"a".repeat(16_000));
+        if child_profile.is_some() {
+            let loaded = store.load(ACCOUNT).await.unwrap().unwrap();
+            assert_eq!(loaded.revision(), 1);
+            assert_eq!(loaded.credentials(), &secrets);
+            return;
+        }
+        let outcome = async {
+            let fence = store.begin_change(ACCOUNT, 0).await.map_err(|_| "Publication")?;
+            store.save(&fence, secrets).await.map_err(|_| "Publication")?;
+            let mut child = tokio::process::Command::new(std::env::current_exe().map_err(|_| "Executable")?)
+            .args([
+                "--ignored", "--exact",
+                "accounts::credential_store::tests::macos_saved_credentials_reopen_in_a_signed_process",
+                "--test-threads=1",
+            ])
+            .env(CHILD_PROFILE, profile.to_string())
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| "Spawn")?;
+            match tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await {
+                Ok(Ok(status)) if status.success() => Ok(()),
+                Ok(Ok(_)) => Err("Reopen"),
+                _ => {
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), child.kill()).await, Ok(Ok(()))) {
+                        return Err("Unsettled child");
+                    }
+                    Err("Reopen")
+                }
+            }
+        }.await;
+        assert_ne!(
+            outcome,
+            Err("Unsettled child"),
+            "Retained synthetic profile {profile}"
+        );
+        let cleanup = async {
+            let deleted = store.delete(ACCOUNT, None).await?;
+            if deleted.cleanup_pending() {
+                return Err(CredentialError::CleanupPending);
+            }
+            let key = store.head_key(parse_account(ACCOUNT)?);
+            OsKeyring.delete(&key)?;
+            match OsKeyring.get(&key)? {
+                None => Ok(()),
+                Some(_) => Err(CredentialError::CleanupPending),
+            }
+        }
+        .await;
+        assert!(cleanup.is_ok(), "Retained synthetic profile {profile}");
+        assert!(outcome.is_ok(), "Signed process reopen failed: {outcome:?}");
     }
 
     #[tokio::test]
