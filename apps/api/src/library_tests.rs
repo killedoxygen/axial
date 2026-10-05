@@ -561,6 +561,7 @@ const PENDING_CONTENT_EXIT: i32 = 42;
 const CONTENT_OVERRIDE: &[u8] = b"preserved content override\n";
 const CONTENT_PUBLIC_PATH: &str = "config/published.txt";
 const CONTENT_PUBLIC_BYTES: &[u8] = b"published before manifest commit\n";
+const CONTENT_BEFORE_TREE: &str = "content-before-tree.json";
 
 fn override_pack() -> ResolvedPack {
     override_pack_at("config/preserved.txt", CONTENT_OVERRIDE)
@@ -711,7 +712,7 @@ async fn interrupted_queued_content_blocks_reset_but_allows_preserved_exit() {
 }
 
 #[tokio::test]
-async fn interrupted_content_public_moves_preserve_fences_and_allow_exit() {
+async fn interrupted_content_created_file_rolls_back_before_fresh_install() {
     interrupted_content_exit(ContentExit::PublicMoves).await;
 }
 
@@ -799,6 +800,12 @@ async fn interrupted_content_exit(boundary: ContentExit) {
         );
     }
     drop(storage);
+
+    if public_moves {
+        recover_created_content(&root, &payload, &id, &receipt.0).await;
+        assert_eq!(fs::read(root.join(PROFILE_MARKER)).unwrap(), identity);
+        return;
+    }
 
     let mut observations = Vec::new();
     for _ in 0..2 {
@@ -930,6 +937,122 @@ async fn interrupted_content_exit(boundary: ContentExit) {
     }
 }
 
+async fn recover_created_content(root: &Path, payload: &Path, id: &InstanceId, operation: &str) {
+    let mut before = Vec::new();
+    fs::File::open(root.parent().unwrap().join(CONTENT_BEFORE_TREE))
+        .unwrap()
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut before)
+        .unwrap();
+    assert!(before.len() <= 64 * 1024);
+    let original: BTreeMap<PathBuf, Option<Vec<u8>>> = serde_json::from_slice(&before).unwrap();
+    let services = start_in_profile(root.to_path_buf(), None).await.unwrap();
+    let bootstrap = services.server.bootstrap();
+    let before_fence = content_fence(&services, id).await;
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/instances/{id}/content/settle",
+            bootstrap.base_url
+        ))
+        .header(transport::CAPABILITY_HEADER, &bootstrap.capability)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body: Value = response.json().await.unwrap();
+    let receipt_absent =
+        !axial_app::content::install::has_pending(services.instances.registry().storage(), id)
+            .unwrap();
+    let restored = content_tree(payload);
+    let readable = get(&services, &format!("instances/{id}/content"))
+        .await
+        .status()
+        .is_success();
+    let admitted = services.instances.directories().admit(id).map(drop).is_ok();
+    let destructive_allowed = services.server.ensure_reset_allowed().is_ok()
+        && services.server.ensure_update_allowed().is_ok();
+    let fresh = if receipt_absent && admitted {
+        let content =
+            ContentService::new(ProviderClient::new(ClientConfig::default()).unwrap()).unwrap();
+        Some(
+            services
+                .content_mutations
+                .install_pack(
+                    &content,
+                    id,
+                    override_pack_at(CONTENT_PUBLIC_PATH, CONTENT_PUBLIC_BYTES),
+                    true,
+                )
+                .unwrap()
+                .join()
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let installed = content_tree(payload);
+    let pending = services.content_mutations.has_unsettled_effects();
+    let shutdown = services.server.shutdown().await;
+    let settled = services.server.is_shutdown_settled();
+    let joined = services.tasks.shutdown_receipt().is_some();
+    let http_closed = reqwest::Client::new()
+        .get(format!("{}/api/v1/status", bootstrap.base_url))
+        .header(transport::CAPABILITY_HEADER, &bootstrap.capability)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .is_err();
+    if shutdown.is_err() {
+        cleanup_refused_content_exit(services).await;
+    } else {
+        drop(services);
+    }
+
+    assert_eq!(status, 409);
+    assert_eq!(
+        body,
+        json!({"error":"content operation was cancelled before publication"})
+    );
+    assert_eq!(before_fence, (503, true, true, true));
+    assert!(receipt_absent && readable && admitted && destructive_allowed);
+    assert_eq!(restored, original);
+    let fresh = fresh
+        .expect("settled instance must admit a fresh installation")
+        .unwrap();
+    assert_eq!(fresh.status, "complete");
+    assert_ne!(fresh.operation_id, operation);
+    assert!(!pending);
+    assert_eq!(shutdown, Ok(()));
+    assert!(settled && joined && http_closed);
+    assert_eq!(
+        installed.get(Path::new(CONTENT_PUBLIC_PATH)),
+        Some(&Some(CONTENT_PUBLIC_BYTES.to_vec()))
+    );
+    let mut untouched = installed.clone();
+    untouched.remove(Path::new(CONTENT_PUBLIC_PATH));
+    untouched.insert(
+        PathBuf::from(MANIFEST_FILE),
+        original.get(Path::new(MANIFEST_FILE)).unwrap().clone(),
+    );
+    assert_eq!(untouched, original);
+
+    let reopened = start_in_profile(root.to_path_buf(), None).await.unwrap();
+    let reopened_tree = content_tree(payload);
+    let readable = get(&reopened, &format!("instances/{id}/content"))
+        .await
+        .status()
+        .is_success();
+    let admitted = reopened.instances.directories().admit(id).map(drop).is_ok();
+    let receipt_absent =
+        !axial_app::content::install::has_pending(reopened.instances.registry().storage(), id)
+            .unwrap();
+    reopened.server.shutdown().await.unwrap();
+    drop(reopened);
+    assert_eq!(reopened_tree, installed);
+    assert!(readable && admitted && receipt_absent);
+}
+
 #[tokio::test]
 #[ignore = "subprocess helper exiting at a real Content publication boundary"]
 async fn pending_content_exit_helper() {
@@ -984,6 +1107,15 @@ async fn pending_content_exit_helper() {
             .unwrap();
         let payload = root.join("instances").join(record.directory_name);
         let before_manifest = fs::read(payload.join(MANIFEST_FILE)).unwrap();
+        let before_tree = content_tree(&payload);
+        assert!(!before_tree.contains_key(Path::new(CONTENT_PUBLIC_PATH)));
+        let before_tree = serde_json::to_vec(&before_tree).unwrap();
+        assert!(before_tree.len() <= 64 * 1024);
+        fs::write(
+            root.parent().unwrap().join(CONTENT_BEFORE_TREE),
+            before_tree,
+        )
+        .unwrap();
         let observed_payload = payload.clone();
         let observed_registry = services.instances.registry().clone();
         let id = instance.id.clone();
@@ -991,8 +1123,13 @@ async fn pending_content_exit_helper() {
             let receipt = content_receipt(observed_registry.storage(), &id);
             let recorded: Value = serde_json::from_str(&receipt.1).unwrap();
             assert_eq!(recorded["native_settled"], false);
-            ManagedContentStagingCheckpoint::decode(recorded["ready_checkpoint"].as_str().unwrap())
-                .unwrap();
+            let checkpoint = ManagedContentStagingCheckpoint::decode(
+                recorded["ready_checkpoint"].as_str().unwrap(),
+            )
+            .unwrap();
+            let checkpoint: Value =
+                serde_json::from_str(&checkpoint.encode(16 * 1024 * 1024).unwrap()).unwrap();
+            assert!(!checkpoint["published"].as_array().unwrap().is_empty());
             assert_eq!(recorded["changes"].as_array().unwrap().len(), 1);
             assert_eq!(recorded["changes"][0]["path"], CONTENT_PUBLIC_PATH);
             assert_eq!(

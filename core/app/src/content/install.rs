@@ -2616,7 +2616,20 @@ async fn apply_streamed(
                         if cancel.is_cancelled() {
                             return transaction_outcome(ready.cancel(), effects).await;
                         }
-                        transaction_outcome(ready.commit(), effects).await
+                        let mut checkpoint_error = None;
+                        let outcome = ready.commit_with_checkpoint(checkpoint_binding, |proof| {
+                            match owner.persist_checkpoint(receipt, Ok(Some(proof))) {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    checkpoint_error = Some(error);
+                                    false
+                                }
+                            }
+                        });
+                        match checkpoint_error {
+                            Some(error) => unwind_outcome(outcome, effects, error).await,
+                            None => transaction_outcome(outcome, effects).await,
+                        }
                     }
                     ManagedContentStageOutcome::Unwind(outcome) => {
                         unwind_outcome(outcome, effects, MutationError::Files).await
@@ -4471,10 +4484,7 @@ mod tests {
         let captured_name = canary_name.clone();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let sender = Mutex::new(Some(sender));
-        let reporting = owner.clone().with_progress(Arc::new(move |event| {
-            if event.phase != "content_commit" || event.current != 0 {
-                return;
-            }
+        let inject = move || {
             let raw: String = registry
                 .storage()
                 .read(|db| {
@@ -4493,6 +4503,16 @@ mod tests {
             .unwrap();
             let checkpoint: serde_json::Value =
                 serde_json::from_str(&checkpoint.encode(MAX_RECEIPT_BYTES).unwrap()).unwrap();
+            let publication_recorded = cancel_before_commit
+                || (checkpoint["published"]
+                    .as_array()
+                    .is_some_and(|published| published.len() == 1)
+                    && std::fs::read(captured_game.join("config/live-recovery.txt"))
+                        .ok()
+                        .as_deref()
+                        == Some(b"published")
+                    && std::fs::read(captured_game.join(MANIFEST_FILE)).ok()
+                        == receipt.before_manifest);
             let private = captured_game.join(checkpoint["private_name"].as_str().unwrap());
             let canary = private.join("stage").join(&captured_name);
             std::fs::write(&canary, CANARY).unwrap();
@@ -4505,9 +4525,23 @@ mod tests {
                 .unwrap()
                 .take()
                 .unwrap()
-                .send((private, handle, receipt))
+                .send((private, handle, receipt, publication_recorded))
                 .unwrap();
-        }));
+        };
+        let reporting = if cancel_before_commit {
+            owner.clone().with_progress(Arc::new(move |event| {
+                if event.phase == "content_commit" && event.current == 0 {
+                    inject();
+                }
+            }))
+        } else {
+            ManagedContentTransactionRoot::before_manifest_revalidation_for_test(
+                &game.canonicalize().unwrap(),
+                inject,
+            )
+            .unwrap();
+            owner.clone()
+        };
         let task = reporting
             .install_pack(
                 &catalog(&owner),
@@ -4519,10 +4553,11 @@ mod tests {
         let task_id = task.id();
         *accepted_task.lock().unwrap() = Some(task_id);
         let mut joined = Box::pin(task.join());
-        let (private, handle, receipt) = tokio::time::timeout(Duration::from_secs(5), receiver)
-            .await
-            .unwrap()
-            .unwrap();
+        let (private, handle, receipt, publication_recorded) =
+            tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .unwrap()
+                .unwrap();
         let early = tokio::time::timeout(Duration::from_millis(200), &mut joined)
             .await
             .ok();
@@ -4584,6 +4619,10 @@ mod tests {
 
         cleanup.unwrap();
         canary_read.unwrap();
+        assert!(
+            publication_recorded,
+            "cleanup fault must follow the saved post-move proof"
+        );
         let expected_payload = (!cancel_before_commit).then(|| b"published".to_vec());
         let expected_manifest = if cancel_before_commit {
             receipt.before_manifest.clone()
@@ -4778,6 +4817,122 @@ mod tests {
             assert!(!owner.has_unsettled_effects());
             assert!(!game.join("new-root").exists());
             assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).ok(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn published_checkpoint_refusal_compensates_before_manifest_publication() {
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+
+        for refusal in ["ignore", "old", "abort"] {
+            let (root, owner, id) = fixture().await;
+            owner
+                .install_pack(
+                    &catalog(&owner),
+                    &id,
+                    pack(&[], &[("overrides/config/preserved.txt", b"original")]),
+                    true,
+                )
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap();
+            let game = root.path().join("instances").join(id.as_str());
+            let original_manifest = std::fs::read(game.join(MANIFEST_FILE)).unwrap();
+            assert!(!game.join("config/published.txt").exists());
+            let before_manifest = original_manifest.clone();
+            let observing_game = game.clone();
+            let registry = owner.directories.registry().clone();
+            let (begin, started) = mpsc::sync_channel(1);
+            let (locked, admitted) = mpsc::sync_channel(1);
+            let admitted = Mutex::new(admitted);
+            let observer = std::thread::spawn(move || {
+                if started.recv_timeout(Duration::from_secs(10)).is_err() {
+                    return false;
+                }
+                registry.storage().transaction(|db| -> Result<bool, StorageError> {
+                    db.execute_batch(match refusal {
+                        "old" =>
+                        "CREATE TRIGGER refuse_published_checkpoint AFTER UPDATE ON content_batches
+                         WHEN json_array_length(json_extract(NEW.receipt_json,'$.ready_checkpoint'),'$.published') > 0
+                         BEGIN UPDATE content_batches SET receipt_json=OLD.receipt_json WHERE instance_id=NEW.instance_id; END;",
+                        "abort" =>
+                        "CREATE TRIGGER refuse_published_checkpoint BEFORE UPDATE ON content_batches
+                         WHEN json_array_length(json_extract(NEW.receipt_json,'$.ready_checkpoint'),'$.published') > 0
+                         BEGIN SELECT RAISE(ABORT, 'injected checkpoint refusal'); END;",
+                        _ =>
+                        "CREATE TRIGGER refuse_published_checkpoint BEFORE UPDATE ON content_batches
+                         WHEN json_array_length(json_extract(NEW.receipt_json,'$.ready_checkpoint'),'$.published') > 0
+                         BEGIN SELECT RAISE(IGNORE); END;",
+                    })?;
+                    locked.send(()).unwrap();
+                    let published = observing_game.join("config/published.txt");
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !published.is_file() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(std::fs::read(&published).ok().as_deref() == Some(b"new payload")
+                        && std::fs::read(observing_game.join("config/preserved.txt")).ok().as_deref() == Some(b"original")
+                        && std::fs::read(observing_game.join(MANIFEST_FILE)).ok().as_deref() == Some(before_manifest.as_slice()))
+                }).unwrap()
+            });
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let captured = events.clone();
+            let reporting = owner.clone().with_progress(Arc::new(move |event| {
+                if event.phase == "content_commit" {
+                    captured.lock().unwrap().push(event.current);
+                    if event.current == 0 {
+                        begin.send(()).unwrap();
+                        admitted
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
+                    }
+                }
+            }));
+            let result = reporting
+                .install_pack(
+                    &catalog(&owner),
+                    &id,
+                    pack(&[], &[("overrides/config/published.txt", b"new payload")]),
+                    true,
+                )
+                .unwrap()
+                .join()
+                .await
+                .unwrap();
+            let observed = observer.join().unwrap();
+            owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
+            owner.directories.library().try_preserve().unwrap();
+
+            assert!(
+                observed,
+                "refusal must follow public moves with the old manifest"
+            );
+            if refusal == "abort" {
+                assert!(
+                    matches!(result, Err(MutationError::Storage(_))),
+                    "{result:?}"
+                );
+            } else {
+                assert!(matches!(result, Err(MutationError::Changed)), "{result:?}");
+            }
+            assert_eq!(*events.lock().unwrap(), [0]);
+            assert!(!owner.has_unsettled_effects());
+            assert!(!game.join("config/published.txt").exists());
+            assert_eq!(
+                std::fs::read(game.join("config/preserved.txt")).unwrap(),
+                b"original"
+            );
+            assert_eq!(
+                std::fs::read(game.join(MANIFEST_FILE)).unwrap(),
+                original_manifest
+            );
         }
     }
 
