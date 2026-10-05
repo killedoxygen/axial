@@ -281,11 +281,16 @@ fn action(
 mod tests {
     use super::*;
     use crate::{
-        accounts::{credential_store::CredentialStore, directory::AccountDirectory},
+        accounts::{
+            credential_store::{CredentialError, CredentialStore},
+            directory::AccountDirectory,
+            microsoft::MinecraftProfile,
+            model::{MicrosoftIdentity, microsoft_account_id},
+        },
         storage::MetadataStore,
         tasks::TaskOwner,
     };
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     #[tokio::test]
     async fn offline_status_and_list_expose_coherent_revisions_without_credentials() {
@@ -308,5 +313,101 @@ mod tests {
         assert_eq!(json["accounts"][0]["active"], true);
         assert_eq!(json["accounts"][0]["minecraft_profile_ready"], false);
         assert!(!json.to_string().contains("access_token"));
+    }
+
+    #[tokio::test]
+    async fn denied_credentials_preserve_identity_and_allow_shutdown() {
+        const PROFILE: &str = "12345678123442348234123456789abc";
+        let directory =
+            Arc::new(AccountDirectory::new(Arc::new(MetadataStore::in_memory().unwrap())).unwrap());
+        let tasks = TaskOwner::new(8).unwrap();
+        let (credentials, deny_reads) = CredentialStore::with_read_denial_for_tests(tasks.clone());
+        let bundle = Credentials::new(
+            "fixture-msa".into(),
+            Some("fixture-refresh".into()),
+            now_seconds() + 3600,
+            "fixture-minecraft".into(),
+            now_seconds() + 3600,
+        )
+        .unwrap();
+        let fence = credentials
+            .begin_change(&microsoft_account_id(PROFILE).unwrap(), 0)
+            .await
+            .unwrap();
+        let receipt = credentials.save(&fence, bundle.clone()).await.unwrap();
+        let profile = MinecraftProfile {
+            id: PROFILE.into(),
+            name: "SavedPlayer".into(),
+            skins: vec![],
+            capes: vec![],
+        };
+        let capture = directory
+            .commit_microsoft(
+                directory.selection_revision().unwrap(),
+                MicrosoftIdentity {
+                    login_id: uuid::Uuid::new_v4().to_string(),
+                    profile_id: PROFILE.into(),
+                    display_name: profile.name.clone(),
+                    credential_revision: receipt.revision(),
+                    profile: profile.clone(),
+                    owns_minecraft_java: true,
+                },
+            )
+            .unwrap();
+        let before = directory.snapshot().unwrap();
+        let service = AuthService::new(directory.clone(), Arc::new(credentials), tasks.clone());
+        assert_eq!(service.launch_credentials(&capture).await.unwrap(), bundle);
+        assert!(service.status(true).await.unwrap().verified);
+
+        deny_reads();
+        let (list, status, exact, launch) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                service.account_list(),
+                service.status(true),
+                service.credentials(&capture),
+                service.launch_credentials(&capture),
+            )
+        })
+        .await
+        .expect("denied secure storage must return without interaction");
+        tasks.try_close_idle().unwrap();
+        tasks.shutdown(Duration::from_secs(2)).await.unwrap();
+        assert!(tasks.shutdown_receipt().unwrap().belongs_to(&tasks));
+
+        assert!(matches!(
+            exact,
+            Err(AuthError::Credentials(CredentialError::Unavailable))
+        ));
+        assert!(matches!(
+            launch,
+            Err(AuthError::Credentials(CredentialError::Unavailable))
+        ));
+        let list = list.unwrap();
+        let status = status.unwrap();
+        assert_eq!(directory.snapshot().unwrap(), before);
+        assert_eq!(list.accounts.len(), 1);
+        assert_eq!(list.accounts[0].identity, before.accounts[0]);
+        assert!(list.accounts[0].active);
+        assert_eq!(list.active_account_id, before.active_account_id);
+        assert_eq!(list.selection_revision, status.selection_revision);
+        assert_eq!(status.launch_auth_mode, LaunchAuthMode::Online);
+        assert_eq!((status.mode, status.provider), ("online", "microsoft"));
+        assert_eq!(status.username, "SavedPlayer");
+        assert_eq!(status.uuid, PROFILE);
+        assert_eq!(status.minecraft_profile, Some(profile));
+        assert!(status.login_available);
+        assert!(!status.verified && !status.skin_action.enabled);
+        for readiness in [&list.accounts[0].readiness, &status.readiness] {
+            assert!(readiness.minecraft_profile_ready);
+            assert!(!readiness.msa_authenticated);
+            assert!(!readiness.msa_refresh_available);
+            assert!(!readiness.minecraft_ownership_verified);
+            assert!(!readiness.online_mode_ready);
+            assert_eq!(readiness.msa_token_expires_in, None);
+            assert_eq!(readiness.minecraft_token_expires_in, None);
+            assert!(!readiness.online_action.enabled);
+            assert!(!readiness.refresh_action.enabled);
+            assert!(!readiness.profile_sync_action.enabled);
+        }
     }
 }

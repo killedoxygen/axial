@@ -165,6 +165,21 @@ impl CredentialStore {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn with_read_denial_for_tests(tasks: TaskOwner) -> (Self, impl Fn()) {
+        let keyring = Arc::new(memory::MemoryEntries::default());
+        let denied = keyring.clone();
+        (
+            Self {
+                profile: Uuid::new_v4(),
+                keyring,
+                gate: Arc::default(),
+                tasks,
+            },
+            move || denied.faults.lock().unwrap().unavailable = true,
+        )
+    }
+
     pub async fn status(&self, account_id: &str) -> Result<CredentialStatus, CredentialError> {
         let account = parse_account(account_id)?;
         self.run(move |store| {
@@ -680,10 +695,32 @@ trait SecureEntries: Send + Sync {
 
 struct OsKeyring;
 
+impl OsKeyring {
+    fn entry(key: &str) -> Result<keyring::Entry, CredentialError> {
+        #[cfg(target_os = "macos")]
+        {
+            // Security.framework's legacy interaction switch is process-wide.
+            // Never restore it between concurrent operations: this application
+            // has no interactive credential-storage path.
+            static POLICY: OnceLock<Result<(), CredentialError>> = OnceLock::new();
+            (*POLICY.get_or_init(|| {
+                let status = unsafe {
+                    security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed(0)
+                };
+                if status == 0 {
+                    Ok(())
+                } else {
+                    Err(CredentialError::Unavailable)
+                }
+            }))?;
+        }
+        keyring::Entry::new(KEYRING_SERVICE, key).map_err(|_| CredentialError::Unavailable)
+    }
+}
+
 impl SecureEntries for OsKeyring {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CredentialError> {
-        let entry =
-            keyring::Entry::new(KEYRING_SERVICE, key).map_err(|_| CredentialError::Unavailable)?;
+        let entry = Self::entry(key)?;
         match entry.get_secret() {
             Ok(bytes) => Ok(Some(bytes)),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -692,15 +729,13 @@ impl SecureEntries for OsKeyring {
     }
 
     fn set(&self, key: &str, bytes: &[u8]) -> Result<(), CredentialError> {
-        keyring::Entry::new(KEYRING_SERVICE, key)
-            .map_err(|_| CredentialError::Unavailable)?
+        Self::entry(key)?
             .set_secret(bytes)
             .map_err(|_| CredentialError::Unavailable)
     }
 
     fn delete(&self, key: &str) -> Result<(), CredentialError> {
-        let entry =
-            keyring::Entry::new(KEYRING_SERVICE, key).map_err(|_| CredentialError::Unavailable)?;
+        let entry = Self::entry(key)?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(_) => Err(CredentialError::Unavailable),
@@ -796,6 +831,23 @@ mod tests {
 
     const ACCOUNT: &str = "4f7d5a11-d427-48e8-8953-d0d2f3829e9c";
     const OTHER_ACCOUNT: &str = "f92369e6-9c0a-48e7-a238-8ad1e11cc2e4";
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_credential_access_cannot_request_authentication_ui() {
+        // Entry construction performs no credential I/O. Observe the real
+        // process policy before any operation can reach Security.framework.
+        OsKeyring::entry("interaction-policy-test").unwrap();
+        let mut allowed = 1;
+        let status = unsafe {
+            security_framework_sys::keychain::SecKeychainGetUserInteractionAllowed(&mut allowed)
+        };
+        assert_eq!(status, 0);
+        assert_eq!(
+            allowed, 0,
+            "Credential access must never open a system dialog"
+        );
+    }
 
     fn fixture() -> (CredentialStore, Arc<MemoryEntries>) {
         let keyring = Arc::new(MemoryEntries::default());
