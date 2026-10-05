@@ -45,6 +45,8 @@ ts-rs.workspace = true
 keyring.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "=0.10.1"
+security-framework = "=3.7.0"
 security-framework-sys = "=2.17.0"
 
 [target.'cfg(unix)'.dependencies]

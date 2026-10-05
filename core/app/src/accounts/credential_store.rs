@@ -695,29 +695,14 @@ trait SecureEntries: Send + Sync {
 
 struct OsKeyring;
 
+#[cfg(not(target_os = "macos"))]
 impl OsKeyring {
     fn entry(key: &str) -> Result<keyring::Entry, CredentialError> {
-        #[cfg(target_os = "macos")]
-        {
-            // Security.framework's legacy interaction switch is process-wide.
-            // Never restore it between concurrent operations: this application
-            // has no interactive credential-storage path.
-            static POLICY: OnceLock<Result<(), CredentialError>> = OnceLock::new();
-            (*POLICY.get_or_init(|| {
-                let status = unsafe {
-                    security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed(0)
-                };
-                if status == 0 {
-                    Ok(())
-                } else {
-                    Err(CredentialError::Unavailable)
-                }
-            }))?;
-        }
         keyring::Entry::new(KEYRING_SERVICE, key).map_err(|_| CredentialError::Unavailable)
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 impl SecureEntries for OsKeyring {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CredentialError> {
         let entry = Self::entry(key)?;
@@ -738,6 +723,108 @@ impl SecureEntries for OsKeyring {
         let entry = Self::entry(key)?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err(CredentialError::Unavailable),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl OsKeyring {
+    fn noninteractive() -> Result<(), CredentialError> {
+        // SecItem's file-based shim shares the process-wide interaction policy.
+        // Never restore it between concurrent credential operations.
+        static POLICY: OnceLock<Result<(), CredentialError>> = OnceLock::new();
+        *POLICY.get_or_init(|| {
+            let status = unsafe {
+                security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed(0)
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(CredentialError::Unavailable)
+            }
+        })
+    }
+
+    fn entry(
+        key: &str,
+    ) -> Result<
+        (
+            security_framework::item::ItemSearchOptions,
+            security_framework::os::macos::keychain::SecKeychain,
+        ),
+        CredentialError,
+    > {
+        use security_framework::{
+            item::{ItemClass, ItemSearchOptions},
+            os::macos::keychain::{SecKeychain, SecPreferencesDomain},
+        };
+
+        Self::noninteractive()?;
+        let keychain = SecKeychain::default_for_domain(SecPreferencesDomain::User)
+            .map_err(|_| CredentialError::Unavailable)?;
+        let mut query = ItemSearchOptions::new();
+        query
+            .class(ItemClass::generic_password())
+            .service(KEYRING_SERVICE)
+            .account(key)
+            .keychains(std::slice::from_ref(&keychain));
+        Ok((query, keychain))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl SecureEntries for OsKeyring {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+        use security_framework::item::SearchResult;
+        use security_framework_sys::base::errSecItemNotFound;
+
+        let (mut query, _) = Self::entry(key)?;
+        match query.load_data(true).limit(1).search() {
+            Ok(mut results) if results.len() == 1 => match results.pop() {
+                Some(SearchResult::Data(bytes)) => Ok(Some(bytes)),
+                _ => Err(CredentialError::Unavailable),
+            },
+            Err(error) if error.code() == errSecItemNotFound => Ok(None),
+            _ => Err(CredentialError::Unavailable),
+        }
+    }
+
+    fn set(&self, key: &str, bytes: &[u8]) -> Result<(), CredentialError> {
+        use core_foundation::data::CFData;
+        use security_framework::item::{
+            ItemAddOptions, ItemAddValue, ItemClass, ItemUpdateOptions, ItemUpdateValue, Location,
+            update_item,
+        };
+        use security_framework_sys::base::errSecDuplicateItem;
+
+        let (query, keychain) = Self::entry(key)?;
+        let data = CFData::from_buffer(bytes);
+        let mut item = ItemAddOptions::new(ItemAddValue::Data {
+            class: ItemClass::generic_password(),
+            data: data.clone(),
+        });
+        item.set_service(KEYRING_SERVICE)
+            .set_account_name(key)
+            .set_location(Location::FileKeychain(keychain));
+        match item.add() {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == errSecDuplicateItem => {
+                let mut update = ItemUpdateOptions::new();
+                update.set_value(ItemUpdateValue::Data(data));
+                update_item(&query, &update).map_err(|_| CredentialError::Unavailable)
+            }
+            Err(_) => Err(CredentialError::Unavailable),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<(), CredentialError> {
+        use security_framework_sys::base::errSecItemNotFound;
+
+        let (query, _) = Self::entry(key)?;
+        match query.delete() {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == errSecItemNotFound => Ok(()),
             Err(_) => Err(CredentialError::Unavailable),
         }
     }
@@ -835,9 +922,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_credential_access_cannot_request_authentication_ui() {
-        // Entry construction performs no credential I/O. Observe the real
-        // process policy before any operation can reach Security.framework.
-        OsKeyring::entry("interaction-policy-test").unwrap();
+        // Observe the process policy without opening a keychain.
+        OsKeyring::noninteractive().unwrap();
         let mut allowed = 1;
         let status = unsafe {
             security_framework_sys::keychain::SecKeychainGetUserInteractionAllowed(&mut allowed)
@@ -1338,17 +1424,44 @@ mod tests {
     fn macos_keyring_accepts_a_complete_bounded_payload() {
         let key = format!("native-capacity-test:{}", Uuid::new_v4());
         let bytes = vec![0xa5; MAX_CREDENTIAL_BYTES];
-        let written = OsKeyring.set(&key, &bytes);
+        OsKeyring::noninteractive().unwrap();
+        let existing = keyring::Entry::new(KEYRING_SERVICE, &key).unwrap();
+        let written = existing.set_secret(&bytes);
         let observed = OsKeyring.get(&key);
+        let replacement = vec![0x5a; MAX_CREDENTIAL_BYTES];
+        let updated = OsKeyring.set(&key, &replacement);
+        let reopened = existing.get_secret();
         let removed = OsKeyring.delete(&key);
+        let created = OsKeyring.set(&key, &bytes);
+        let created_readback = OsKeyring.get(&key);
+        let final_cleanup = OsKeyring.delete(&key);
         let absent = OsKeyring.get(&key);
+        let repeated_cleanup = OsKeyring.delete(&key);
         assert!(written.is_ok(), "Synthetic payload write failed");
         assert!(
             matches!(observed, Ok(Some(value)) if value == bytes),
             "Synthetic payload readback failed"
         );
         assert!(removed.is_ok(), "Synthetic item cleanup failed");
+        assert!(created.is_ok(), "Synthetic native item creation failed");
+        assert!(
+            matches!(created_readback, Ok(Some(value)) if value == bytes),
+            "Synthetic native item readback failed"
+        );
+        assert!(
+            final_cleanup.is_ok(),
+            "Synthetic native item cleanup failed"
+        );
         assert!(matches!(absent, Ok(None)), "Synthetic item remains");
+        assert!(updated.is_ok(), "Synthetic payload update failed");
+        assert!(
+            matches!(reopened, Ok(value) if value == replacement),
+            "Existing reader lost the synthetic item"
+        );
+        assert!(
+            repeated_cleanup.is_ok(),
+            "Absent synthetic item cleanup failed"
+        );
     }
 
     #[cfg(target_os = "macos")]
