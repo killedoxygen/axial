@@ -5963,11 +5963,12 @@ mod tests {
 
     fn checkpoint_fixture(
         temporary: &tempfile::TempDir,
+        replace_existing: bool,
     ) -> (
         super::super::ManagedTreeRoot,
         ManagedContentReadyTransaction,
     ) {
-        let (tree, mut batch) = checkpoint_batch_fixture(temporary, 3, true);
+        let (tree, mut batch) = checkpoint_batch_fixture(temporary, 3, replace_existing);
         for _ in 0..3 {
             batch = advance_checkpoint_payload(batch);
         }
@@ -5976,25 +5977,6 @@ mod tests {
         };
         let ManagedContentStageOutcome::Ready(ready) = complete.stage() else {
             panic!("checkpoint fixture must become Ready");
-        };
-        (tree, ready)
-    }
-
-    fn create_only_checkpoint_fixture(
-        temporary: &tempfile::TempDir,
-    ) -> (
-        super::super::ManagedTreeRoot,
-        ManagedContentReadyTransaction,
-    ) {
-        let (tree, mut batch) = checkpoint_batch_fixture(temporary, 3, false);
-        for _ in 0..3 {
-            batch = advance_checkpoint_payload(batch);
-        }
-        let ManagedContentTransferStep::Complete(complete) = batch.next() else {
-            panic!("fixture transfers must complete");
-        };
-        let ManagedContentStageOutcome::Ready(ready) = complete.stage() else {
-            panic!("fixture must stage");
         };
         (tree, ready)
     }
@@ -6030,7 +6012,7 @@ mod tests {
         }
 
         let temporary = test_tempdir().unwrap();
-        let (tree, ready) = checkpoint_fixture(&temporary);
+        let (tree, ready) = checkpoint_fixture(&temporary, true);
         let ManagedContentStageOutcome::Ready(ready) = ready.prepare_publication([23; 32]) else {
             panic!("fixture must prepare publication");
         };
@@ -6095,7 +6077,7 @@ mod tests {
     #[test]
     fn refused_recovery_keeps_installed_guard_until_exact_payload_returns() {
         let temporary = test_tempdir().unwrap();
-        let (tree, mut ready) = checkpoint_fixture(&temporary);
+        let (tree, mut ready) = checkpoint_fixture(&temporary, true);
         let destination = temporary.path().join("mods/first.jar");
         let retained = temporary.path().join("retained-payload");
         let moved_destination = destination.clone();
@@ -6154,7 +6136,7 @@ mod tests {
     #[test]
     fn staging_checkpoint_records_materialized_parents_without_replacing_before_proofs() {
         let temporary = test_tempdir().unwrap();
-        let (tree, mut ready) = checkpoint_fixture(&temporary);
+        let (tree, mut ready) = checkpoint_fixture(&temporary, true);
         let initial = ready.checkpoint([12; 32]).unwrap().clone();
         assert!(!temporary.path().join("config").exists());
         assert_eq!(initial.record.directories.get("config"), Some(&None));
@@ -6216,7 +6198,7 @@ mod tests {
     #[test]
     fn staging_checkpoint_parent_codec_preserves_original_missing_boundaries() {
         let temporary = test_tempdir().unwrap();
-        let (tree, mut ready) = checkpoint_fixture(&temporary);
+        let (tree, mut ready) = checkpoint_fixture(&temporary, true);
         let initial = ready.checkpoint([13; 32]).unwrap().clone();
         let encoded = initial.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
         assert!(!encoded.contains("created_parents"));
@@ -6318,7 +6300,7 @@ mod tests {
             "race",
         ] {
             let temporary = test_tempdir().unwrap();
-            let (tree, ready) = checkpoint_fixture(&temporary);
+            let (tree, ready) = checkpoint_fixture(&temporary, true);
             let ManagedContentStageOutcome::Ready(mut ready) = ready.prepare_publication([14; 32])
             else {
                 panic!("parent preparation must succeed");
@@ -6415,7 +6397,7 @@ mod tests {
             ManagedContentCheckpointError::Capacity,
         ] {
             let temporary = test_tempdir().unwrap();
-            let (tree, mut ready) = create_only_checkpoint_fixture(&temporary);
+            let (tree, mut ready) = checkpoint_fixture(&temporary, false);
             ready.checkpoint([16; 32]).unwrap();
             // Exercise an already classified optional refusal without assuming
             // this fixture filesystem lacks birth-time support.
@@ -6441,7 +6423,7 @@ mod tests {
             drop(tree);
         }
         let temporary = test_tempdir().unwrap();
-        let (tree, ready) = checkpoint_fixture(&temporary);
+        let (tree, ready) = checkpoint_fixture(&temporary, true);
         let ManagedContentStageOutcome::Ready(ready) = ready.prepare_publication([16; 32]) else {
             panic!("parent preparation must succeed");
         };
@@ -6472,7 +6454,7 @@ mod tests {
             let container = std::path::PathBuf::from(container);
             if std::env::var(PHASE).unwrap() == "stage" {
                 let temporary = tempfile::tempdir_in(&container).unwrap();
-                let (_tree, ready) = checkpoint_fixture(&temporary);
+                let (_tree, ready) = checkpoint_fixture(&temporary, true);
                 let ManagedContentStageOutcome::Ready(mut ready) =
                     ready.prepare_publication([15; 32])
                 else {
@@ -6607,7 +6589,7 @@ mod tests {
         if let Some(container) = std::env::var_os(FIXTURE) {
             let container = std::path::PathBuf::from(container);
             let temporary = tempfile::tempdir_in(&container).unwrap();
-            let (_tree, ready) = checkpoint_fixture(&temporary);
+            let (_tree, ready) = checkpoint_fixture(&temporary, true);
             let ManagedContentStageOutcome::Ready(mut ready) = ready.prepare_publication([18; 32])
             else {
                 panic!("parent preparation must succeed");
@@ -6772,7 +6754,7 @@ mod tests {
                 panic!("cleanup must exit after an actual guarded public file removal");
             }
             let temporary = tempfile::tempdir_in(&container).unwrap();
-            let (_tree, ready) = create_only_checkpoint_fixture(&temporary);
+            let (_tree, ready) = checkpoint_fixture(&temporary, false);
             std::fs::write(temporary.path().join("mods/keep.jar"), b"keep original").unwrap();
             let ManagedContentStageOutcome::Ready(mut ready) = ready.prepare_publication(BINDING)
             else {
@@ -6928,7 +6910,7 @@ mod tests {
     #[test]
     fn published_checkpoint_supports_direct_ready_commit_with_new_parents() {
         let temporary = test_tempdir().unwrap();
-        let (_tree, ready) = create_only_checkpoint_fixture(&temporary);
+        let (_tree, ready) = checkpoint_fixture(&temporary, false);
         let mut published = false;
         let outcome = ready.commit_with_checkpoint([20; 32], |checkpoint| {
             published = checkpoint.record.published.len() == 3;
@@ -6949,7 +6931,7 @@ mod tests {
     fn published_checkpoint_callback_refusal_and_drift_do_not_commit() {
         for drift in [false, true] {
             let temporary = test_tempdir().unwrap();
-            let (_tree, ready) = create_only_checkpoint_fixture(&temporary);
+            let (_tree, ready) = checkpoint_fixture(&temporary, false);
             let path = temporary.path().join("config/nested/options.txt");
             let mut called = false;
             let outcome = ready.commit_with_checkpoint([21; 32], |checkpoint| {
@@ -7341,7 +7323,7 @@ mod tests {
     fn staging_checkpoint_reopens_and_repeats_exact_staged_rollback() {
         for partial_cleanup in [false, true] {
             let temporary = test_tempdir().unwrap();
-            let (tree, mut ready) = checkpoint_fixture(&temporary);
+            let (tree, mut ready) = checkpoint_fixture(&temporary, true);
             let checkpoint = ready.checkpoint([7; 32]).unwrap();
             let encoded = checkpoint.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
             assert_eq!(
@@ -7403,7 +7385,7 @@ mod tests {
             "install",
         ] {
             let temporary = test_tempdir().unwrap();
-            let (tree, mut ready) = checkpoint_fixture(&temporary);
+            let (tree, mut ready) = checkpoint_fixture(&temporary, true);
             let checkpoint = ready.checkpoint([8; 32]).unwrap().clone();
             let private = ready.state.private.inner.path.clone();
             let stage = private.join(PRIVATE_STAGE_NAME);
@@ -7568,7 +7550,7 @@ mod tests {
     #[test]
     fn staging_checkpoint_rejects_wrong_authority_codec_and_capture_drift() {
         let temporary = test_tempdir().unwrap();
-        let (tree, mut ready) = checkpoint_fixture(&temporary);
+        let (tree, mut ready) = checkpoint_fixture(&temporary, true);
         let checkpoint = ready.checkpoint([9; 32]).unwrap().clone();
         let encoded = checkpoint.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
         let duplicate_parent =
