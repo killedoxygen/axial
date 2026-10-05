@@ -6145,6 +6145,179 @@ mod tests {
     }
 
     #[test]
+    fn staging_checkpoint_preserves_post_move_pre_manifest_process_exit() {
+        const FIXTURE: &str = "AXIAL_CONTENT_PUBLIC_MOVE_FIXTURE";
+        fn snapshot(root: &std::path::Path, private: &str) -> BTreeMap<String, Option<Vec<u8>>> {
+            let mut entries = BTreeMap::new();
+            let mut pending = vec![
+                "mods".to_string(),
+                "config".to_string(),
+                private.to_string(),
+                MANIFEST_NAME.to_string(),
+            ];
+            while let Some(relative) = pending.pop() {
+                assert!(entries.len() < 16);
+                let path = root.join(&relative);
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                let bytes = if metadata.is_dir() {
+                    for child in std::fs::read_dir(&path).unwrap() {
+                        assert!(pending.len() < 16);
+                        pending.push(format!(
+                            "{relative}/{}",
+                            child.unwrap().file_name().to_str().unwrap()
+                        ));
+                    }
+                    None
+                } else {
+                    assert!(metadata.is_file() && metadata.len() <= 64);
+                    Some(std::fs::read(path).unwrap())
+                };
+                assert!(entries.insert(relative, bytes).is_none());
+            }
+            entries
+        }
+
+        if let Some(container) = std::env::var_os(FIXTURE) {
+            let container = std::path::PathBuf::from(container);
+            let temporary = tempfile::tempdir_in(&container).unwrap();
+            let (_tree, ready) = checkpoint_fixture(&temporary);
+            let ManagedContentStageOutcome::Ready(mut ready) = ready.prepare_publication([18; 32])
+            else {
+                panic!("parent preparation must succeed");
+            };
+            let encoded = ready
+                .checkpoint([18; 32])
+                .unwrap()
+                .encode(MAX_STAGING_CHECKPOINT_BYTES)
+                .unwrap();
+            let original = ready
+                .state
+                .mutations
+                .iter()
+                .find(|mutation| mutation.old_guard.is_some())
+                .unwrap();
+            let original_identity = original.old_guard.as_ref().unwrap().identity();
+            let backup_name = original.backup_name.clone();
+            let backup = ready.state.backup.clone();
+            let replacements = ready
+                .state
+                .mutations
+                .iter()
+                .map(|mutation| {
+                    let ManagedContentPathResult::Download(id) = &mutation.result else {
+                        panic!("fixture download");
+                    };
+                    let payload = &ready.state.payloads[ready.state.staged_by_id[id]];
+                    (
+                        mutation.parent.resolved().clone(),
+                        mutation.name.clone(),
+                        payload.guard.as_ref().unwrap().identity(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let root = temporary.path().to_path_buf();
+            let private = ready.state.private_name.as_str().to_string();
+            std::fs::write(container.join("root-path"), root.to_str().unwrap()).unwrap();
+            std::fs::write(container.join("checkpoint"), encoded).unwrap();
+            ready.state.before_manifest_revalidation = Some(Box::new(move || {
+                let original = backup
+                    .inspect_regular_file(backup_name.as_str())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(original.identity(), original_identity);
+                for (parent, name, identity) in replacements {
+                    let installed = parent.inspect_regular_file(name.as_str()).unwrap().unwrap();
+                    assert_eq!(installed.identity(), identity);
+                }
+                let mut expected = BTreeMap::new();
+                for directory in [
+                    "mods".to_string(),
+                    "config".to_string(),
+                    "config/nested".to_string(),
+                    private.clone(),
+                    format!("{private}/stage"),
+                    format!("{private}/backup"),
+                ] {
+                    expected.insert(directory, None);
+                }
+                for path in [
+                    "mods/first.jar",
+                    "mods/second.jar",
+                    "config/nested/options.txt",
+                ] {
+                    expected.insert(path.to_string(), Some(b"staged replacement".to_vec()));
+                }
+                expected.insert(
+                    MANIFEST_NAME.to_string(),
+                    Some(b"original manifest".to_vec()),
+                );
+                expected.insert(
+                    format!("{private}/backup/{}", backup_name.as_str()),
+                    Some(b"original".to_vec()),
+                );
+                let observed = snapshot(&root, &private);
+                assert_eq!(observed, expected);
+                std::fs::write(
+                    container.join("publication-witness"),
+                    serde_json::to_vec(&observed).unwrap(),
+                )
+                .unwrap();
+                std::process::exit(42);
+            }));
+            let _outcome = ready.commit();
+            panic!("production commit must reach the pre-manifest hard exit");
+        }
+
+        let container = test_tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "managed_fs::content_transaction::tests::staging_checkpoint_preserves_post_move_pre_manifest_process_exit", "--nocapture"])
+            .env(FIXTURE, container.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let timed_out = child.try_wait().unwrap().is_none();
+        if timed_out {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !timed_out && output.status.code() == Some(42),
+            "timed_out={timed_out}, status={:?}; {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let root = std::path::PathBuf::from(
+            std::fs::read_to_string(container.path().join("root-path")).unwrap(),
+        );
+        let encoded = std::fs::read_to_string(container.path().join("checkpoint")).unwrap();
+        let checkpoint = ManagedContentStagingCheckpoint::decode(&encoded).unwrap();
+        let witness: BTreeMap<String, Option<Vec<u8>>> = serde_json::from_slice(
+            &std::fs::read(container.path().join("publication-witness")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot(&root, &checkpoint.record.private_name), witness);
+        for _ in 0..2 {
+            let (tree, admitted) = reopen_content_root(&root);
+            assert!(matches!(
+                admitted
+                    .for_pack()
+                    .restore_staging_checkpoint(checkpoint.clone(), [18; 32]),
+                Err(ManagedContentCheckpointError::Changed)
+            ));
+            drop(tree);
+            assert_eq!(snapshot(&root, &checkpoint.record.private_name), witness);
+            assert_eq!(
+                std::fs::read_to_string(container.path().join("checkpoint")).unwrap(),
+                encoded
+            );
+        }
+    }
+
+    #[test]
     fn staging_checkpoint_prefix_reopens_with_reserved_slots_and_preserves_foreign_files() {
         for completed in [0, 512] {
             let temporary = test_tempdir().unwrap();

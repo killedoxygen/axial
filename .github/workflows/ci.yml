@@ -73,11 +73,11 @@ jobs:
           node scripts/cargo-target.mjs run -- cargo run -p axial-app --example export_contracts -- --check > "$RUNNER_TEMP/wire-contracts.log" 2>&1 || status=$?
           tail -n 70 "$RUNNER_TEMP/wire-contracts.log"
           exit "$status"
-      - name: Test application and local API
+      - name: Test launcher core and local API
         shell: bash
         run: |
           status=0
-          node scripts/cargo-target.mjs run -- cargo test -p axial-app -p axial-api --lib > "$RUNNER_TEMP/application-tests.log" 2>&1 || status=$?
+          node scripts/cargo-target.mjs run -- cargo test -p axial-app -p axial-api -p axial-fs -p axial-minecraft -p axial-performance -p axial-resource --lib > "$RUNNER_TEMP/application-tests.log" 2>&1 || status=$?
           tail -n 70 "$RUNNER_TEMP/application-tests.log"
           exit "$status"
       - name: Typecheck and test retained interface
