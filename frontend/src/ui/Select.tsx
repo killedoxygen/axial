@@ -167,9 +167,12 @@ export function SelectField<T extends string>({
     });
   }, [open, options.length]);
 
+  useLayoutEffect(() => {
+    if (open && placement) listRef.current?.focus();
+  }, [open, placement]);
+
   useEffect(() => {
     if (!open) return;
-    listRef.current?.focus();
     const onPointerDown = (e: PointerEvent): void => {
       const target = e.target as Node;
       if (listRef.current?.contains(target) || triggerRef.current?.contains(target)) return;
