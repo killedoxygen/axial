@@ -891,6 +891,14 @@ impl ManagedContentTransactionRoot {
         {
             return Err(ManagedContentCheckpointError::Invalid);
         }
+        if checkpoint
+            .record
+            .published
+            .iter()
+            .any(|published| published.backup.is_some())
+        {
+            return Err(ManagedContentCheckpointError::Unsupported);
+        }
         let root = self.directory.directory;
         if directory_incarnation(&root)? != checkpoint.record.root {
             return Err(ManagedContentCheckpointError::Changed);
@@ -2923,7 +2931,7 @@ impl ManagedContentReadyTransaction {
         drive_commit(self.state, |_| true)
     }
 
-    /// Offers optional create-only recovery evidence before publishing the manifest.
+    /// Offers optional complete publication evidence before publishing the manifest.
     /// Returning false stops publication and retains ownership through rollback.
     pub fn commit_with_checkpoint(
         self,
@@ -3034,6 +3042,8 @@ struct PublishedPayload {
     path: String,
     payload_index: usize,
     proof: StagingFileProof,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup: Option<StagingFileProof>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -3244,7 +3254,6 @@ impl ManagedContentStagingCheckpoint {
                     .get(published.payload_index)
                     .ok_or(invalid)?;
                 if published.path != before.path
-                    || before.proof.is_some()
                     || !payloads.insert(published.payload_index)
                     || published.proof.size != payload.proof.size
                     || published.proof.sha512 != payload.proof.sha512
@@ -3252,6 +3261,15 @@ impl ManagedContentStagingCheckpoint {
                     return Err(invalid);
                 }
                 validate_ready_file(&published.proof, MAX_CONTENT_FILE_BYTES)?;
+                match (&before.proof, &published.backup) {
+                    (None, None) => {}
+                    (Some(before), Some(backup))
+                        if backup.size == before.size && backup.sha512 == before.sha512 =>
+                    {
+                        validate_ready_file(backup, MAX_CONTENT_FILE_BYTES)?;
+                    }
+                    _ => return Err(invalid),
+                }
             }
         }
         if bytes > policy.transaction_byte_limit() {
@@ -3637,10 +3655,10 @@ fn published_checkpoint(
         return Err(ManagedContentCheckpointError::Invalid);
     }
     if state.mutations.is_empty()
-        || state.mutations.iter().any(|mutation| {
-            !matches!(mutation.observed, ManagedContentObservedState::Absent)
-                || !matches!(mutation.result, ManagedContentPathResult::Download(_))
-        })
+        || state
+            .mutations
+            .iter()
+            .any(|mutation| !matches!(mutation.result, ManagedContentPathResult::Download(_)))
     {
         return Ok(None);
     }
@@ -3657,7 +3675,7 @@ fn published_checkpoint(
     state.root.settle().map_err(checkpoint_loader)?;
     let mut remaining = cache.remaining;
     for (index, mutation) in state.mutations.iter().enumerate() {
-        if mutation.claimed || mutation.old_guard.is_some() || !mutation.installed {
+        if !mutation.installed {
             return Err(changed);
         }
         let ManagedContentPathResult::Download(id) = &mutation.result else {
@@ -3669,15 +3687,20 @@ fn published_checkpoint(
             .payloads
             .get(payload_index)
             .ok_or(changed)?;
+        let before = checkpoint.record.files.get(index + 1).ok_or(changed)?;
+        let backup = match (&before.proof, &mutation.old_guard, mutation.claimed) {
+            (None, None, false) => None,
+            (Some(original), Some(guard), true) => Some(checkpoint_file(
+                &state.backup,
+                mutation.backup_name.as_str(),
+                guard,
+                original.sha512.clone(),
+            )?),
+            _ => return Err(changed),
+        };
         let guard = mutation.installed_guard.as_ref().ok_or(changed)?;
         let published = PublishedPayload {
-            path: checkpoint
-                .record
-                .files
-                .get(index + 1)
-                .ok_or(changed)?
-                .path
-                .clone(),
+            path: before.path.clone(),
             payload_index,
             proof: checkpoint_file(
                 mutation.parent.resolved(),
@@ -3685,6 +3708,7 @@ fn published_checkpoint(
                 guard,
                 payload.proof.sha512.clone(),
             )?,
+            backup,
         };
         charge_checkpoint(&mut remaining, &published)?;
         checkpoint.record.published.push(published);
@@ -3786,7 +3810,7 @@ fn staging_public_bindings(
             (Some(proof), None) => {
                 admit_checkpoint_file(parent, name, proof)?;
             }
-            (None, Some(proof)) => {
+            (_, Some(proof)) if file.proof.is_none() || complete => {
                 if parent
                     .has_portably_exact_child_name(name)
                     .map_err(|_| changed)?
@@ -3923,12 +3947,28 @@ fn inspect_staging_checkpoint(
     if complete && (stage.is_none() || backup.is_none()) {
         return Err(changed);
     }
-    if backup.as_ref().is_some_and(|directory| {
-        directory
-            .entries_bounded(1)
-            .map_or(true, |entries| !entries.is_empty())
-    }) {
-        return Err(changed);
+    if let Some(backup) = &backup {
+        let expected = record
+            .published
+            .iter()
+            .enumerate()
+            .filter_map(|(index, published)| {
+                published
+                    .backup
+                    .as_ref()
+                    .map(|proof| (format!("old-{index}"), proof))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let names = backup
+            .entries_bounded(expected.len().max(1))
+            .map_err(|_| changed)?;
+        if names.len() != expected.len() {
+            return Err(changed);
+        }
+        for name in names {
+            let name = name.to_str().ok_or(changed)?;
+            admit_checkpoint_file(backup, name, expected.get(name).ok_or(changed)?)?;
+        }
     }
     let mut files = Vec::new();
     if let Some(stage) = &stage {
@@ -6553,38 +6593,42 @@ mod tests {
         );
     }
 
+    fn published_file_tree(
+        root: &std::path::Path,
+        private: &str,
+    ) -> BTreeMap<String, Option<Vec<u8>>> {
+        let mut entries = BTreeMap::new();
+        let mut pending = vec![
+            "mods".to_string(),
+            "config".to_string(),
+            private.to_string(),
+            MANIFEST_NAME.to_string(),
+        ];
+        while let Some(relative) = pending.pop() {
+            assert!(entries.len() < 16);
+            let path = root.join(&relative);
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            let bytes = if metadata.is_dir() {
+                for child in std::fs::read_dir(&path).unwrap() {
+                    assert!(pending.len() < 16);
+                    pending.push(format!(
+                        "{relative}/{}",
+                        child.unwrap().file_name().to_str().unwrap()
+                    ));
+                }
+                None
+            } else {
+                assert!(metadata.is_file() && metadata.len() <= 64);
+                Some(std::fs::read(path).unwrap())
+            };
+            assert!(entries.insert(relative, bytes).is_none());
+        }
+        entries
+    }
+
     #[test]
     fn staging_checkpoint_preserves_post_move_pre_manifest_process_exit() {
         const FIXTURE: &str = "AXIAL_CONTENT_PUBLIC_MOVE_FIXTURE";
-        fn snapshot(root: &std::path::Path, private: &str) -> BTreeMap<String, Option<Vec<u8>>> {
-            let mut entries = BTreeMap::new();
-            let mut pending = vec![
-                "mods".to_string(),
-                "config".to_string(),
-                private.to_string(),
-                MANIFEST_NAME.to_string(),
-            ];
-            while let Some(relative) = pending.pop() {
-                assert!(entries.len() < 16);
-                let path = root.join(&relative);
-                let metadata = std::fs::symlink_metadata(&path).unwrap();
-                let bytes = if metadata.is_dir() {
-                    for child in std::fs::read_dir(&path).unwrap() {
-                        assert!(pending.len() < 16);
-                        pending.push(format!(
-                            "{relative}/{}",
-                            child.unwrap().file_name().to_str().unwrap()
-                        ));
-                    }
-                    None
-                } else {
-                    assert!(metadata.is_file() && metadata.len() <= 64);
-                    Some(std::fs::read(path).unwrap())
-                };
-                assert!(entries.insert(relative, bytes).is_none());
-            }
-            entries
-        }
 
         if let Some(container) = std::env::var_os(FIXTURE) {
             let container = std::path::PathBuf::from(container);
@@ -6664,7 +6708,7 @@ mod tests {
                     format!("{private}/backup/{}", backup_name.as_str()),
                     Some(b"original".to_vec()),
                 );
-                let observed = snapshot(&root, &private);
+                let observed = published_file_tree(&root, &private);
                 assert_eq!(observed, expected);
                 std::fs::write(
                     container.join("publication-witness"),
@@ -6673,9 +6717,7 @@ mod tests {
                 .unwrap();
                 std::process::exit(42);
             }));
-            let _outcome = ready.commit_with_checkpoint([18; 32], |_| {
-                panic!("replacement transactions have no create-only proof")
-            });
+            let _outcome = ready.commit_with_checkpoint([18; 32], |_| true);
             panic!("production commit must reach the pre-manifest hard exit");
         }
 
@@ -6710,7 +6752,10 @@ mod tests {
             &std::fs::read(container.path().join("publication-witness")).unwrap(),
         )
         .unwrap();
-        assert_eq!(snapshot(&root, &checkpoint.record.private_name), witness);
+        assert_eq!(
+            published_file_tree(&root, &checkpoint.record.private_name),
+            witness
+        );
         for _ in 0..2 {
             let (tree, admitted) = reopen_content_root(&root);
             assert!(matches!(
@@ -6720,7 +6765,10 @@ mod tests {
                 Err(ManagedContentCheckpointError::Changed)
             ));
             drop(tree);
-            assert_eq!(snapshot(&root, &checkpoint.record.private_name), witness);
+            assert_eq!(
+                published_file_tree(&root, &checkpoint.record.private_name),
+                witness
+            );
             assert_eq!(
                 std::fs::read_to_string(container.path().join("checkpoint")).unwrap(),
                 encoded
@@ -6754,7 +6802,9 @@ mod tests {
                 panic!("cleanup must exit after an actual guarded public file removal");
             }
             let temporary = tempfile::tempdir_in(&container).unwrap();
-            let (_tree, ready) = checkpoint_fixture(&temporary, false);
+            let replace_existing =
+                std::env::var_os("AXIAL_CONTENT_PUBLICATION_REPLACE_EXISTING").is_some();
+            let (_tree, ready) = checkpoint_fixture(&temporary, replace_existing);
             std::fs::write(temporary.path().join("mods/keep.jar"), b"keep original").unwrap();
             let ManagedContentStageOutcome::Ready(mut ready) = ready.prepare_publication(BINDING)
             else {
@@ -6805,10 +6855,10 @@ mod tests {
         }
         for cleanup in ["complete", "public_file_removed", "private_removed"] {
             let container = test_tempdir().unwrap();
-            let (root, checkpoint) = published_checkpoint_fixture(&container);
+            let (root, checkpoint) = published_checkpoint_fixture(&container, false);
             match cleanup {
                 "public_file_removed" => {
-                    run_published_checkpoint_child(container.path(), true);
+                    run_published_checkpoint_child(container.path(), true, false);
                     assert_eq!(
                         checkpoint
                             .record
@@ -6861,11 +6911,16 @@ mod tests {
         }
     }
 
-    fn run_published_checkpoint_child(container: &std::path::Path, cleanup: bool) {
+    fn run_published_checkpoint_child(
+        container: &std::path::Path,
+        cleanup: bool,
+        replace_existing: bool,
+    ) {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "managed_fs::content_transaction::tests::published_checkpoint_compensates_create_only_process_exit", "--nocapture"])
             .env("AXIAL_CONTENT_ADDITIONS_FIXTURE", container)
             .envs(cleanup.then_some(("AXIAL_CONTENT_ADDITIONS_CLEANUP", "1")))
+            .envs(replace_existing.then_some(("AXIAL_CONTENT_PUBLICATION_REPLACE_EXISTING", "1")))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn().unwrap();
@@ -6888,8 +6943,9 @@ mod tests {
 
     fn published_checkpoint_fixture(
         container: &tempfile::TempDir,
+        replace_existing: bool,
     ) -> (std::path::PathBuf, ManagedContentStagingCheckpoint) {
-        run_published_checkpoint_child(container.path(), false);
+        run_published_checkpoint_child(container.path(), false, replace_existing);
         let root = std::path::PathBuf::from(
             std::fs::read_to_string(container.path().join("root-path")).unwrap(),
         );
@@ -6905,6 +6961,162 @@ mod tests {
             assert_eq!(before[field], after[field], "{field}");
         }
         (root, checkpoint)
+    }
+
+    #[test]
+    fn published_checkpoint_preserves_replacements_when_cold_recovery_is_unsupported() {
+        let container = test_tempdir().unwrap();
+        let (root, checkpoint) = published_checkpoint_fixture(&container, true);
+        let encoded = std::fs::read_to_string(container.path().join("checkpoint")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let original_index = record["published"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|file| file["path"] == "mods/first.jar")
+            .unwrap();
+        assert!(!record["published"][original_index]["backup"].is_null());
+        let private = record["private_name"].as_str().unwrap();
+        let mut expected = BTreeMap::new();
+        for directory in [
+            "mods".to_string(),
+            "config".to_string(),
+            "config/nested".to_string(),
+            private.to_string(),
+            format!("{private}/stage"),
+            format!("{private}/backup"),
+        ] {
+            expected.insert(directory, None);
+        }
+        for path in [
+            "mods/first.jar",
+            "mods/second.jar",
+            "config/nested/options.txt",
+        ] {
+            expected.insert(path.to_string(), Some(b"staged replacement".to_vec()));
+        }
+        expected.insert("mods/keep.jar".into(), Some(b"keep original".to_vec()));
+        expected.insert(MANIFEST_NAME.into(), Some(b"original manifest".to_vec()));
+        expected.insert(
+            format!("{private}/backup/old-{original_index}"),
+            Some(b"original".to_vec()),
+        );
+        assert_eq!(published_file_tree(&root, private), expected);
+        for _ in 0..2 {
+            let (tree, admitted) = reopen_content_root(&root);
+            assert!(matches!(
+                admitted
+                    .for_pack()
+                    .restore_staging_checkpoint(checkpoint.clone(), [19; 32]),
+                Err(ManagedContentCheckpointError::Unsupported)
+            ));
+            drop(tree);
+            assert_eq!(published_file_tree(&root, private), expected);
+            assert_eq!(
+                std::fs::read_to_string(container.path().join("checkpoint")).unwrap(),
+                encoded
+            );
+        }
+    }
+
+    #[test]
+    fn published_checkpoint_covers_complete_mixed_replacement_batch() {
+        const BINDING: [u8; 32] = [24; 32];
+        const PATHS: [&str; 3] = [
+            "mods/first.jar",
+            "mods/second.jar",
+            "config/nested/options.txt",
+        ];
+        let temporary = test_tempdir().unwrap();
+        let (_tree, ready) = checkpoint_fixture(&temporary, true);
+        let ManagedContentStageOutcome::Ready(mut ready) = ready.prepare_publication(BINDING)
+        else {
+            panic!("fixture must prepare publication");
+        };
+        let before: serde_json::Value = serde_json::from_str(
+            &ready
+                .checkpoint(BINDING)
+                .unwrap()
+                .encode(MAX_STAGING_CHECKPOINT_BYTES)
+                .unwrap(),
+        )
+        .unwrap();
+        for (path, present) in PATHS.into_iter().zip([true, false, false]) {
+            let original = before["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|file| file["path"] == path)
+                .unwrap();
+            assert_eq!(!original["proof"].is_null(), present);
+        }
+        assert_eq!(before["payloads"].as_array().unwrap().len(), 3);
+        let private = temporary
+            .path()
+            .join(before["private_name"].as_str().unwrap());
+        let mut publication = None;
+        let outcome = ready.commit_with_checkpoint(BINDING, |checkpoint| {
+            let encoded = checkpoint.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
+            let public = PATHS.map(|path| std::fs::read(temporary.path().join(path)).unwrap());
+            let manifest = std::fs::read(temporary.path().join(MANIFEST_NAME)).unwrap();
+            let staged = std::fs::read_dir(private.join(PRIVATE_STAGE_NAME))
+                .unwrap()
+                .count();
+            let backups = std::fs::read_dir(private.join(PRIVATE_BACKUP_NAME))
+                .unwrap()
+                .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+                .collect::<Vec<_>>();
+            publication = Some((encoded, public, manifest, staged, backups));
+            true
+        });
+        assert!(
+            matches!(outcome, ManagedContentTransactionOutcome::Committed(_)),
+            "{outcome:?}"
+        );
+        let (encoded, public, manifest, staged, backups) =
+            publication.expect("complete mixed replacement publication must offer a checkpoint");
+        for bytes in public {
+            assert_eq!(bytes, b"staged replacement");
+        }
+        assert_eq!(manifest, b"original manifest");
+        assert_eq!(staged, 0);
+        assert_eq!(backups, vec![b"original".to_vec()]);
+        ManagedContentStagingCheckpoint::decode(&encoded).unwrap();
+        let published: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        for field in ["files", "payloads", "directories", "created_parents"] {
+            assert_eq!(before[field], published[field], "{field}");
+        }
+        let published = published["published"].as_array().unwrap();
+        assert_eq!(published.len(), 3);
+        assert_eq!(
+            published
+                .iter()
+                .map(|file| file["path"].as_str().unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(PATHS)
+        );
+        assert_eq!(
+            published
+                .iter()
+                .map(|file| file["payload_index"].as_u64().unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1, 2])
+        );
+        for (index, file) in published.iter().enumerate() {
+            let original = &before["files"][index + 1]["proof"];
+            if original.is_null() {
+                assert!(file.get("backup").is_none());
+            } else {
+                assert_eq!(file["backup"]["size"], original["size"]);
+                assert_eq!(file["backup"]["sha512"], original["sha512"]);
+                assert_eq!(file["backup"]["revision"].as_array().unwrap().len(), 32);
+            }
+        }
+        assert!(!private.exists());
+        assert_eq!(
+            std::fs::read(temporary.path().join(MANIFEST_NAME)).unwrap(),
+            b"replacement manifest"
+        );
     }
 
     #[test]
@@ -6983,7 +7195,7 @@ mod tests {
             "private_absent_foreign",
         ] {
             let container = test_tempdir().unwrap();
-            let (root, checkpoint) = published_checkpoint_fixture(&container);
+            let (root, checkpoint) = published_checkpoint_fixture(&container, false);
             let private = root.join(&checkpoint.record.private_name);
             let mut paths = [
                 "mods/first.jar",
@@ -7077,9 +7289,57 @@ mod tests {
     }
 
     #[test]
+    fn published_checkpoint_codec_requires_exact_original_backups() {
+        let container = test_tempdir().unwrap();
+        let (_root, checkpoint) = published_checkpoint_fixture(&container, true);
+        let encoded = checkpoint.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let published = record["published"].as_array().unwrap();
+        let original = published
+            .iter()
+            .position(|file| file["path"] == "mods/first.jar")
+            .unwrap();
+        let created = published
+            .iter()
+            .position(|file| file["path"] == "mods/second.jar")
+            .unwrap();
+        for change in ["missing", "extra", "size", "hash"] {
+            let mut changed = record.clone();
+            match change {
+                "missing" => {
+                    changed["published"][original]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("backup");
+                }
+                "extra" => {
+                    changed["published"][created]["backup"] =
+                        record["published"][original]["backup"].clone();
+                }
+                "size" => {
+                    changed["published"][original]["backup"]["size"] =
+                        serde_json::json!(b"original".len() + 1);
+                }
+                "hash" => {
+                    changed["published"][original]["backup"]["sha512"] =
+                        serde_json::json!("0".repeat(128));
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    ManagedContentStagingCheckpoint::decode(&changed.to_string()),
+                    Err(ManagedContentCheckpointError::Invalid)
+                ),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
     fn published_checkpoint_codec_requires_complete_distinct_mutation_mapping() {
         let container = test_tempdir().unwrap();
-        let (_root, checkpoint) = published_checkpoint_fixture(&container);
+        let (_root, checkpoint) = published_checkpoint_fixture(&container, false);
         let encoded = checkpoint.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
         for change in ["missing", "duplicate", "read_precondition"] {
             let mut value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
