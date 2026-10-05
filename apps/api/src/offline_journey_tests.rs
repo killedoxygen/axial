@@ -2010,11 +2010,24 @@ async fn real_benchmark_driver_automatically_resumes_remaining_run_once() {
 #[ignore = "subprocess helper that exits only between fully settled benchmark runs"]
 async fn benchmark_pending_boundary_crash_helper() {
     use futures_util::FutureExt;
+    use tracing_subscriber::prelude::*;
 
     let profile =
         PathBuf::from(std::env::var_os(DRIVER_CHILD_PROFILE).expect("isolated driver profile"));
     assert_eq!(std::fs::canonicalize(&profile).unwrap(), profile);
     let instance = std::env::var(DRIVER_CHILD_INSTANCE).unwrap();
+    tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_ansi(false)
+        .without_time()
+        .finish()
+        .with(
+            tracing_subscriber::filter::Targets::new()
+                .with_target("axial_app::launch::session", tracing::Level::WARN)
+                .with_target("axial_app::launch::prepare", tracing::Level::WARN),
+        )
+        .try_init()
+        .unwrap();
     let services = start_in_profile(profile, None).await.unwrap();
     let api = Api::new(&services);
     let boundary = std::panic::AssertUnwindSafe(async {
