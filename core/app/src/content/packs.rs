@@ -841,7 +841,9 @@ fn inspect_overrides<R: Read + std::io::Seek>(
             }
             let path = entry.name()[prefix.len()..].to_string();
             if entry.is_dir() {
-                validate_pack_path(path.trim_end_matches('/'))?;
+                if !path.is_empty() {
+                    validate_pack_path(path.trim_end_matches('/'))?;
+                }
                 continue;
             }
             if !regular_entry(&entry) {
@@ -1164,6 +1166,14 @@ mod tests {
     use std::io::Write;
 
     fn archive(index: serde_json::Value, extras: &[(&str, &[u8])]) -> PackResult<PackArchive> {
+        archive_with_directories(index, &[], extras)
+    }
+
+    fn archive_with_directories(
+        index: serde_json::Value,
+        directories: &[&str],
+        extras: &[(&str, &[u8])],
+    ) -> PackResult<PackArchive> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         writer
             .start_file(INDEX_FILE, zip::write::SimpleFileOptions::default())
@@ -1171,6 +1181,11 @@ mod tests {
         writer
             .write_all(&serde_json::to_vec(&index).unwrap())
             .unwrap();
+        for name in directories {
+            writer
+                .add_directory(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+        }
         for (name, bytes) in extras {
             writer
                 .start_file(*name, zip::write::SimpleFileOptions::default())
@@ -1178,6 +1193,70 @@ mod tests {
             writer.write_all(bytes).unwrap();
         }
         PackArchive::read(writer.finish().unwrap().into_inner())
+    }
+
+    #[test]
+    fn explicit_override_root_directories_preserve_payload_selection() {
+        let archive = archive_with_directories(
+            serde_json::json!({"formatVersion":1,"game":"minecraft","name":"Directory fixture",
+                "versionId":"1","dependencies":{"minecraft":"1.21.4"},"files":[]}),
+            &[
+                "overrides/",
+                "overrides/config/",
+                "client-overrides/",
+                "client-overrides/config/",
+                "server-overrides/",
+                "server-overrides/config/",
+            ],
+            &[
+                ("overrides/config/settings.txt", b"common"),
+                ("client-overrides/config/settings.txt", b"client"),
+                ("server-overrides/config/server.txt", b"server"),
+            ],
+        )
+        .expect("explicit ZIP directory entries are not pack payloads");
+        let plan = archive.plan_all(true).unwrap();
+        assert_eq!(plan.destinations(), vec!["config/settings.txt"]);
+        assert_eq!(
+            archive.override_bytes(&plan.overrides[0]).unwrap(),
+            b"client"
+        );
+        assert!(archive.plan_all(false).unwrap().destinations().is_empty());
+    }
+
+    #[test]
+    fn override_directories_do_not_waive_unsafe_paths_or_conflicting_payloads() {
+        let index = serde_json::json!({"dependencies":{"minecraft":"1.21.4"}});
+        for directory in ["overrides/../", "overrides//", "client-overrides/../../"] {
+            assert!(matches!(
+                archive_with_directories(index.clone(), &[directory], &[]),
+                Err(PackError::Invalid(_))
+            ));
+        }
+        for path in [
+            "overrides/../escape.txt",
+            "client-overrides/config//bad.txt",
+        ] {
+            assert!(matches!(
+                archive(index.clone(), &[(path, b"unsafe")]),
+                Err(PackError::Invalid(_))
+            ));
+        }
+        for extras in [
+            [
+                ("overrides/config/A.txt", b"a".as_slice()),
+                ("overrides/config/a.txt", b"b"),
+            ],
+            [
+                ("overrides/config", b"a".as_slice()),
+                ("overrides/config/settings.txt", b"b"),
+            ],
+        ] {
+            assert!(matches!(
+                archive(index.clone(), &extras),
+                Err(PackError::Conflict(_))
+            ));
+        }
     }
 
     #[test]

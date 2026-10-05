@@ -104,6 +104,7 @@ function harness() {
   let nextTimer = 0;
   const timers = new Map<number, () => void>();
   const calls: [string, string][] = [];
+  const profileSaves: { path: string; body: string }[] = [];
   const notices: string[] = [];
   const preferences = new Map<string, string>();
   let accountRefreshes = 0;
@@ -113,13 +114,16 @@ function harness() {
   let cancelRead: (() => Promise<unknown>) | null = null;
   let confirm: () => Promise<boolean> = async () => true;
   const transport = {
-    async api(method: string, path: string) {
+    async api(method: string, path: string, body?: unknown) {
       calls.push([method, path]);
       const url = new URL(path, 'http://skin-fixture.invalid');
       if (method === 'GET' && url.pathname === '/skins')
         return skinsRead ? skinsRead() : { skins: [skin], pending_apply_texture_key: status?.texture_key ?? null };
       if (method === 'GET' && url.pathname === '/skins/pending') return statusRead ? statusRead() : status;
-      if (method === 'POST' && url.pathname === '/skins/from-profile') return skin;
+      if (method === 'POST' && url.pathname === '/skins/from-profile') {
+        profileSaves.push({ path, body: JSON.stringify(body) });
+        return skin;
+      }
       if (method !== 'GET') {
         assert.ok(url.searchParams.get('expected_account_id'));
         assert.ok(url.searchParams.get('expected_selection_revision'));
@@ -231,6 +235,7 @@ function harness() {
     api,
     timers,
     calls,
+    profileSaves,
     notices,
     setStatus(value: PendingSkinStatus | null) {
       status = value;
@@ -622,6 +627,111 @@ test('profile reset commands bind the confirmed account and selection', async ()
     assert.equal(h.machine.wardrobeNotice.value, null);
   }
 });
+
+test('manual profile save serializes its displayed account and selection with the profile options', async () => {
+  const h = harness();
+  h.machine.setWardrobeContext(profileContext());
+  await settle();
+  h.profileSaves.length = 0;
+  await h.machine.saveProfileSkinLocally();
+  assert.equal(h.profileSaves.length, 1);
+  const { path, body } = h.profileSaves[0];
+  const url = new URL(path, 'http://skin-fixture.invalid');
+  assert.equal(url.pathname, '/skins/from-profile');
+  assert.equal(url.searchParams.get('expected_account_id'), accountA);
+  assert.equal(url.searchParams.get('expected_selection_revision'), '7');
+  assert.deepEqual(JSON.parse(body), { variant: 'classic', mark_current: true });
+});
+
+test('automatic profile seeding serializes its displayed account and selection with the profile options', async () => {
+  const h = harness();
+  h.machine.setWardrobeContext(profileContext());
+  await settle();
+  assert.equal(h.profileSaves.length, 1);
+  const { path, body } = h.profileSaves[0];
+  const url = new URL(path, 'http://skin-fixture.invalid');
+  assert.equal(url.pathname, '/skins/from-profile');
+  assert.equal(url.searchParams.get('expected_account_id'), accountA);
+  assert.equal(url.searchParams.get('expected_selection_revision'), '7');
+  assert.deepEqual(JSON.parse(body), { variant: 'classic', mark_current: true });
+});
+
+for (const missingTarget of [false, true]) {
+  test(`onboarding profile seed ${missingTarget ? 'skips a missing target and completes' : 'keeps its pre-save selection while config is pending'}`, async () => {
+    const savedConfig = deferred<void>();
+    const calls: { method: string; path: string; body: string }[] = [];
+    const notices: string[] = [];
+    const accountsSnapshot = { value: {
+      state: 'ready',
+      accounts: missingTarget ? [] : [{ account_id: accountA, kind: 'microsoft', active: true }],
+      selection_revision: missingTarget ? null : Number.MAX_SAFE_INTEGER,
+      status: { online_action: { state_id: 'online_ready' } },
+    } };
+    const config = { value: { revision: 7, telemetry_enabled: false, discord_rpc_enabled: false, onboarding_done: false } };
+    const showOnboardingOverlay = { value: true };
+    let stateIndex = 0;
+    const initialStates: unknown[] = ['discord', 5, 'Player', 4, false];
+    const { Onboarding } = source<typeof import('../../src/views/onboarding/Onboarding')>(
+      'views/onboarding/Onboarding.tsx',
+      {
+        'preact/hooks': {
+          useState: <V>(value: V) => [stateIndex < initialStates.length ? initialStates[stateIndex++] : value, () => {}],
+          useRef: <V>(value: V) => ({ current: value }),
+          useEffect() {},
+        },
+        'preact/jsx-runtime': {
+          jsx: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
+          jsxs: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
+        },
+        '../../ui/Atoms': { Input: 'Input' }, '../../ui/Slider': { Slider: 'Slider' },
+        '../../ui/Icons': { Icon: 'Icon' }, '../../ui/MicrosoftMark': { MicrosoftMark: 'MicrosoftMark' },
+        '../settings/AccentEditor': {}, '../../shell/WindowControls': { WindowControls: 'WindowControls' },
+        '../../state': { local: { lightness: 50 } },
+        '../../music': { Music: { applyConfig() {} } }, '../../sound': { Sound: { ui() {} } },
+        '../../api': { api: async (method: string, path: string, body: unknown) => {
+          calls.push({ method, path, body: JSON.stringify(body) });
+          if (path.startsWith('/skins/from-profile')) throw new Error('Stale fixture selection');
+          if (method === 'POST' && path === '/onboarding/complete') { config.value.onboarding_done = true; return {}; }
+          if (method === 'GET' && path === '/config') return config.value;
+          throw new Error(`Unexpected onboarding request: ${method} ${path}`);
+        } },
+        '../../dto-core': { configResponse: (value: unknown) => value },
+        '../../dto-contract': { dtoError: () => null },
+        '../../store': { config, systemInfo: { value: null } },
+        '../../ui-state': { showOnboardingOverlay },
+        '../../toast': { toast: (message: string) => notices.push(message) },
+        '../../player-name': {}, '../../player-skin': { refreshAccountSkin() {} }, '../../format': {},
+        '../../utils': { getMemoryRecommendation: () => ({ rec: 4 }), validateUsername: () => null, errMessage: String },
+        '../../native': { hasNativeDesktopRuntime: () => false },
+        '../accounts/useMicrosoftSignIn': { useMicrosoftSignIn: () => ({ busy: false }) },
+        '../../hooks/use-autosave': { saveConfigPatch: () => savedConfig.promise },
+        '../../machines/accounts': { accountsSnapshot },
+      },
+      { console: { warn() {} }, window: { setTimeout: (callback: () => void) => callback() } },
+    );
+    const finish = nodes(Onboarding()).find((node) => node.props['aria-label'] === 'Finish (Enter)');
+    assert.ok(finish);
+    (finish.props.onClick as () => void)();
+    assert.equal(calls.length, 0);
+    accountsSnapshot.value = {
+      ...accountsSnapshot.value,
+      accounts: [{ account_id: accountB, kind: 'microsoft', active: true }], selection_revision: 3,
+    };
+    savedConfig.resolve();
+    await settle();
+    const seeds = calls.filter((call) => call.path.startsWith('/skins/from-profile'));
+    assert.equal(seeds.length, missingTarget ? 0 : 1);
+    if (!missingTarget) {
+      const url = new URL(seeds[0].path, 'http://skin-fixture.invalid');
+      assert.equal(url.searchParams.get('expected_account_id'), accountA);
+      assert.equal(url.searchParams.get('expected_selection_revision'), String(Number.MAX_SAFE_INTEGER));
+      assert.deepEqual(JSON.parse(seeds[0].body), { mark_current: true });
+    }
+    assert.equal(calls.filter((call) => call.method === 'POST' && call.path === '/onboarding/complete').length, 1);
+    assert.equal(showOnboardingOverlay.value, false);
+    assert.deepEqual(notices, []);
+  });
+}
 
 test('cancelled or stale profile reset confirmations never send a reset', async () => {
   for (const action of ['resetProfileSkin', 'resetProfileCape'] as const) {

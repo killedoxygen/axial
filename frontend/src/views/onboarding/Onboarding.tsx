@@ -239,8 +239,17 @@ export function Onboarding(): JSX.Element | null {
         discord_rpc_enabled: discordRpcEnabled,
         discord_rpc_onboarding_seen: true,
       };
+      let profileSeedQuery: URLSearchParams | null = null;
       if (onlineAfterOnboarding) {
         patch.launch_auth_mode = 'online';
+        const snapshot = accountsSnapshot.value;
+        const account = snapshot.accounts.find((candidate) => candidate.active && candidate.kind === 'microsoft');
+        if (snapshot.state === 'ready' && account && snapshot.selection_revision !== null) {
+          profileSeedQuery = new URLSearchParams({
+            expected_account_id: account.account_id,
+            expected_selection_revision: String(snapshot.selection_revision),
+          });
+        }
       } else {
         await refreshAccountsData();
         const snapshot = accountsSnapshot.value;
@@ -260,9 +269,9 @@ export function Onboarding(): JSX.Element | null {
         patch.launch_auth_mode = 'offline';
       }
       await saveConfigPatch(patch);
-      if (patch.launch_auth_mode === 'online') {
+      if (profileSeedQuery) {
         try {
-          await api('POST', '/skins/from-profile', { mark_current: true });
+          await api('POST', `/skins/from-profile?${profileSeedQuery.toString()}`, { mark_current: true });
         } catch (err: unknown) {
           console.warn('Could not seed profile skin after onboarding Microsoft sign-in.', err);
         }

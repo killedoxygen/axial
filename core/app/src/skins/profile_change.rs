@@ -135,12 +135,7 @@ impl ProfileMedia {
 
     fn selected_online(&self) -> Result<CapturedAccount, ProfileMediaError> {
         let capture = self.selected()?;
-        if capture.kind() != AccountKind::Microsoft || capture.profile().is_none() {
-            return Err(ProfileMediaError::AccountRequired);
-        }
-        if !capture.owns_minecraft_java() {
-            return Err(ProfileMediaError::OwnershipMissing);
-        }
+        require_online_account(&capture)?;
         Ok(capture)
     }
 
@@ -390,8 +385,20 @@ impl ProfileMedia {
         name: Option<String>,
         variant: Option<SkinVariant>,
         mark_current: bool,
+        expected_account_id: &str,
+        expected_selection_revision: u64,
     ) -> Result<SavedSkinRecord, SkinError> {
-        let capture = self.selected_online()?;
+        let capture = self
+            .accounts
+            .with_selected_account(
+                expected_account_id,
+                expected_selection_revision,
+                |capture| -> Result<_, ProfileMediaError> {
+                    require_online_account(capture)?;
+                    Ok(capture.clone())
+                },
+            )
+            .map_err(account_error)??;
         self.mutate(move |service| async move {
             service
                 .save_profile_inner(name, variant, mark_current, capture)
@@ -504,15 +511,8 @@ impl ProfileMedia {
                         .with_selected_account(
                             expected_account_id,
                             expected_selection_revision,
-                            |capture| {
-                                if capture.kind() != AccountKind::Microsoft
-                                    || capture.profile().is_none()
-                                {
-                                    return Err(ProfileMediaError::AccountRequired);
-                                }
-                                if !capture.owns_minecraft_java() {
-                                    return Err(ProfileMediaError::OwnershipMissing);
-                                }
+                            |capture| -> Result<_, ProfileMediaError> {
+                                require_online_account(capture)?;
                                 Ok(self.pending.queue(
                                     capture,
                                     snapshot.record.texture_key,
@@ -1112,13 +1112,8 @@ impl ProfileMedia {
                 .with_selected_account(
                     expected_account_id,
                     expected_selection_revision,
-                    |capture| {
-                        if capture.kind() != AccountKind::Microsoft || capture.profile().is_none() {
-                            return Err(ProfileMediaError::AccountRequired);
-                        }
-                        if !capture.owns_minecraft_java() {
-                            return Err(ProfileMediaError::OwnershipMissing);
-                        }
+                    |capture| -> Result<_, ProfileMediaError> {
+                        require_online_account(capture)?;
                         self.pending.cancel_account(capture.account_id())?;
                         Ok(capture.clone())
                     },
@@ -1187,6 +1182,16 @@ impl ProfileMedia {
         };
         service.commit(&capture, final_profile, None).await
     }
+}
+
+fn require_online_account(capture: &CapturedAccount) -> Result<(), ProfileMediaError> {
+    if capture.kind() != AccountKind::Microsoft || capture.profile().is_none() {
+        return Err(ProfileMediaError::AccountRequired);
+    }
+    if !capture.owns_minecraft_java() {
+        return Err(ProfileMediaError::OwnershipMissing);
+    }
+    Ok(())
 }
 
 fn profile_variant(profile: &MinecraftProfile) -> SkinVariant {
@@ -1289,6 +1294,22 @@ mod tests {
         String,
         String,
     ) {
+        let (directory, service, capture, first, second, _) =
+            fixture_with_credentials(base, initial).await;
+        (directory, service, capture, first, second)
+    }
+
+    async fn fixture_with_credentials(
+        base: &str,
+        initial: MinecraftProfile,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ProfileMedia>,
+        CapturedAccount,
+        String,
+        String,
+        Arc<CredentialStore>,
+    ) {
         assert!(crate::accounts::microsoft::validate_profile(&initial).is_ok());
         let directory = tempfile::tempdir().unwrap();
         let roots = match LibraryLifecycle::open(&directory.path().canonicalize().unwrap()) {
@@ -1332,7 +1353,7 @@ mod tests {
         let tasks = TaskOwner::new(32).unwrap();
         let auth = Arc::new(AuthService::new(
             accounts.clone(),
-            credentials,
+            credentials.clone(),
             tasks.clone(),
         ));
         let library = Arc::new(SavedSkinLibrary::new(
@@ -1380,7 +1401,194 @@ mod tests {
             capture,
             first.texture_key,
             second.texture_key,
+            credentials,
         )
+    }
+
+    async fn assert_stale_profile_save_preserves_publication(reselected: bool) {
+        let (_directory, service, confirmed, first, second, credentials) =
+            fixture_with_credentials("http://127.0.0.1:9", profile(Some(FIRST_URL), false)).await;
+        let mut other_profile = profile(Some(SECOND_URL), false);
+        other_profile.id = "22345678123442348234123456789abc".into();
+        other_profile.name = "PlayerTwo".into();
+        other_profile.skins[0].variant = "SLIM".into();
+        let other_id = microsoft_account_id(&other_profile.id).unwrap();
+        let fence = credentials.begin_change(&other_id, 0).await.unwrap();
+        let receipt = credentials
+            .save(
+                &fence,
+                Credentials::new(
+                    "fixture-second-microsoft".into(),
+                    Some("fixture-second-refresh".into()),
+                    u64::MAX / 2,
+                    "fixture-second-minecraft".into(),
+                    u64::MAX / 2,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let other = service
+            .accounts
+            .commit_microsoft(
+                service.accounts.selection_revision().unwrap(),
+                MicrosoftIdentity {
+                    login_id: uuid::Uuid::new_v4().to_string(),
+                    profile_id: other_profile.id.clone(),
+                    display_name: other_profile.name.clone(),
+                    credential_revision: receipt.revision(),
+                    owns_minecraft_java: true,
+                    profile: other_profile,
+                },
+            )
+            .unwrap();
+        if reselected {
+            service.accounts.select(confirmed.account_id()).unwrap();
+            let mut changed = profile(Some(FIRST_URL), false);
+            changed.skins[0].variant = "SLIM".into();
+            service
+                .auth
+                .commit_profile(&confirmed, changed)
+                .await
+                .unwrap();
+        }
+        for key in std::iter::once(&second).chain(reselected.then_some(&first)) {
+            service
+                .library
+                .update_metadata(
+                    key,
+                    UpdateSavedSkinRequest {
+                        variant: Some("slim".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .unwrap();
+        }
+        service
+            .library
+            .mark_applied(confirmed.account_id(), &first)
+            .unwrap();
+        service
+            .library
+            .mark_applied(other.account_id(), &second)
+            .unwrap();
+        let current = service.selected().unwrap();
+        assert_eq!(
+            current.account_id(),
+            if reselected {
+                confirmed.account_id()
+            } else {
+                other.account_id()
+            }
+        );
+        assert!(service.auth.credentials(&current).await.is_ok());
+        let before = [
+            service.library.get(&first).unwrap(),
+            service.library.get(&second).unwrap(),
+        ];
+        let pngs = [
+            service.library.read_png(&first).unwrap(),
+            service.library.read_png(&second).unwrap(),
+        ];
+        let markers = [
+            service
+                .library
+                .list_for_account(confirmed.account_id())
+                .unwrap(),
+            service
+                .library
+                .list_for_account(other.account_id())
+                .unwrap(),
+        ];
+
+        // The delayed caller derived Classic and mark_current from the original A profile.
+        let result = service
+            .save_profile(
+                None,
+                Some(SkinVariant::Classic),
+                true,
+                confirmed.account_id(),
+                confirmed.selection_revision(),
+            )
+            .await;
+        let after = [
+            service.library.get(&first).unwrap(),
+            service.library.get(&second).unwrap(),
+        ];
+        let after_pngs = [
+            service.library.read_png(&first).unwrap(),
+            service.library.read_png(&second).unwrap(),
+        ];
+        let after_markers = [
+            service
+                .library
+                .list_for_account(confirmed.account_id())
+                .unwrap(),
+            service
+                .library
+                .list_for_account(other.account_id())
+                .unwrap(),
+        ];
+        service.shutdown().await.unwrap();
+        assert_eq!(
+            after, before,
+            "stale profile save must preserve exact saved metadata and revisions"
+        );
+        assert_eq!(after_pngs, pngs);
+        assert_eq!(after_markers, markers);
+        assert!(matches!(
+            result,
+            Err(SkinError::Profile(ProfileMediaError::StaleIdentity))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_profile_save_cannot_publish_another_accounts_texture_or_clear_its_marker() {
+        assert_stale_profile_save_preserves_publication(false).await;
+    }
+
+    #[tokio::test]
+    async fn stale_profile_save_cannot_publish_after_reselection() {
+        assert_stale_profile_save_preserves_publication(true).await;
+    }
+
+    #[tokio::test]
+    async fn current_profile_save_publishes_its_texture_and_account_marker() {
+        let (_directory, service, capture, first, second) =
+            fixture("http://127.0.0.1:9", profile(Some(FIRST_URL), false)).await;
+        let png = service.library.read_png(&first).unwrap();
+        let untouched = service.library.get(&second).unwrap();
+        let saved = service
+            .save_profile(
+                None,
+                Some(SkinVariant::Classic),
+                true,
+                capture.account_id(),
+                capture.selection_revision(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.texture_key, first);
+        assert_eq!(saved.variant, SkinVariant::Classic);
+        assert_eq!(service.library.read_png(&first).unwrap(), png);
+        assert_eq!(service.library.get(&second).unwrap(), untouched);
+        let marked = service
+            .library
+            .list_for_account(capture.account_id())
+            .unwrap();
+        assert!(
+            marked
+                .iter()
+                .any(|skin| skin.texture_key == first && skin.applied_at.is_some())
+        );
+        assert!(
+            marked
+                .iter()
+                .filter(|skin| skin.texture_key != first)
+                .all(|skin| skin.applied_at.is_none())
+        );
+        service.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1464,7 +1672,15 @@ mod tests {
             Err(ProfileMediaError::OwnershipMissing)
         ));
         assert!(matches!(
-            service.save_profile(None, None, false).await,
+            service
+                .save_profile(
+                    None,
+                    None,
+                    false,
+                    unowned.account_id(),
+                    unowned.selection_revision()
+                )
+                .await,
             Err(SkinError::Profile(ProfileMediaError::OwnershipMissing))
         ));
         assert_eq!(

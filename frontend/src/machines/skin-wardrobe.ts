@@ -526,7 +526,8 @@ export async function saveProfileSkinLocally(): Promise<void> {
   await wardrobeAction({ kind: 'save-profile' }, 'Could not save Minecraft profile skin.', async () => {
     const request: { variant?: SkinVariant; mark_current: true } = { mark_current: true };
     if (profileSkin) request.variant = skinVariantValue(profileSkin.variant);
-    const saved = savedSkinRecord(await api('POST', '/skins/from-profile', request));
+    const query = skinCommandQuery(capture);
+    const saved = savedSkinRecord(await api('POST', `/skins/from-profile?${query.toString()}`, request));
     if (!saved) throw new Error('Profile skin save returned an invalid response.');
     if (!isWardrobeContextCurrent(capture)) return null;
     profileSavedKey.value = saved.texture_key;
@@ -635,7 +636,11 @@ export function seedProfileSkin(): void {
   profileSeedKey = seed.key;
   profileSavedKey.value = null;
 
-  void api('POST', '/skins/from-profile', { variant: seed.variant, mark_current: true })
+  const capture = captureWardrobeContext();
+  void (async () => {
+    const query = skinCommandQuery(capture);
+    return api('POST', `/skins/from-profile?${query.toString()}`, { variant: seed.variant, mark_current: true });
+  })()
     .then((payload) => {
       if (
         profileSeedRequestId !== requestId ||

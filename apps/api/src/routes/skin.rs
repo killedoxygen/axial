@@ -113,7 +113,7 @@ struct PendingCommandQuery {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResetQuery {
+struct SelectionQuery {
     expected_account_id: String,
     expected_selection_revision: u64,
 }
@@ -339,7 +339,12 @@ async fn save(
     Ok(Json(record).into_response())
 }
 
-async fn save_profile(State(service): State<SkinState>, body: Body) -> ApiResult {
+async fn save_profile(
+    State(service): State<SkinState>,
+    parameters: Result<Query<SelectionQuery>, QueryRejection>,
+    body: Body,
+) -> ApiResult {
+    let parameters = query(parameters)?;
     let request: FromProfile = json_body(body).await?;
     let variant = request
         .variant
@@ -349,7 +354,13 @@ async fn save_profile(State(service): State<SkinState>, body: Body) -> ApiResult
         .map_err(library_error)?;
     Ok(Json(
         service
-            .save_profile(request.name, variant, request.mark_current.unwrap_or(false))
+            .save_profile(
+                request.name,
+                variant,
+                request.mark_current.unwrap_or(false),
+                &parameters.expected_account_id,
+                parameters.expected_selection_revision,
+            )
             .await
             .map_err(skin_error)?,
     )
@@ -502,7 +513,7 @@ async fn cancel(
 
 async fn reset_skin(
     State(service): State<SkinState>,
-    parameters: Result<Query<ResetQuery>, QueryRejection>,
+    parameters: Result<Query<SelectionQuery>, QueryRejection>,
 ) -> ApiResult {
     let parameters = query(parameters)?;
     service
@@ -518,7 +529,7 @@ async fn reset_skin(
 
 async fn reset_cape(
     State(service): State<SkinState>,
-    parameters: Result<Query<ResetQuery>, QueryRejection>,
+    parameters: Result<Query<SelectionQuery>, QueryRejection>,
 ) -> ApiResult {
     let parameters = query(parameters)?;
     service
@@ -710,6 +721,15 @@ mod tests {
         }
 
         async fn request(&self, method: Method, path: &str) -> (StatusCode, Value) {
+            self.request_body(method, path, Body::empty()).await
+        }
+
+        async fn request_body(
+            &self,
+            method: Method,
+            path: &str,
+            body: Body,
+        ) -> (StatusCode, Value) {
             let response = self
                 .app
                 .clone()
@@ -717,7 +737,7 @@ mod tests {
                     Request::builder()
                         .method(method)
                         .uri(path)
-                        .body(Body::empty())
+                        .body(body)
                         .unwrap(),
                 )
                 .await
@@ -921,6 +941,65 @@ mod tests {
             assert_eq!(after.1["phase"], "idle");
             assert_eq!(other_after, other);
         }
+    }
+
+    #[tokio::test]
+    async fn profile_save_rejects_stale_selection_before_profile_access() {
+        let fixture = Fixture::new();
+        let confirmed = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
+        fixture.add_account("22345678123442348234123456789abc", "PlayerTwo");
+        let path = format!("/api/v1/skins/from-profile?{}", selection_query(&confirmed));
+        for reselected in [false, true] {
+            if reselected {
+                fixture.accounts.select(confirmed.account_id()).unwrap();
+            }
+            let before = fixture.request(Method::GET, "/api/v1/skins").await;
+            let (status, body) = fixture
+                .request_body(
+                    Method::POST,
+                    &path,
+                    Body::from(json!({"variant":"classic","mark_current":true}).to_string()),
+                )
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["error"], ProfileMediaError::StaleIdentity.to_string());
+            assert_eq!(fixture.request(Method::GET, "/api/v1/skins").await, before);
+        }
+        fixture.finish().await;
+    }
+
+    #[tokio::test]
+    async fn profile_save_requires_a_complete_valid_selection_fence() {
+        let fixture = Fixture::new();
+        let capture = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
+        let before = fixture.request(Method::GET, "/api/v1/skins").await;
+        for suffix in [
+            String::new(),
+            format!("?expected_account_id={}", capture.account_id()),
+            format!(
+                "?expected_selection_revision={}",
+                capture.selection_revision()
+            ),
+            format!(
+                "?expected_account_id={}&expected_selection_revision=invalid",
+                capture.account_id()
+            ),
+            format!(
+                "?expected_account_id={}&expected_selection_revision=18446744073709551616",
+                capture.account_id()
+            ),
+        ] {
+            let (status, _) = fixture
+                .request_body(
+                    Method::POST,
+                    &format!("/api/v1/skins/from-profile{suffix}"),
+                    Body::from(json!({"variant":"classic","mark_current":true}).to_string()),
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(fixture.request(Method::GET, "/api/v1/skins").await, before);
+        }
+        fixture.finish().await;
     }
 
     #[tokio::test]
