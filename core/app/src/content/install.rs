@@ -37,7 +37,7 @@ use axial_minecraft::{
     managed_path::*,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io,
@@ -298,6 +298,26 @@ struct Receipt {
     pack: Option<CanonicalId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     local_mod: Option<LocalModIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ready_checkpoint: Option<String>,
+}
+
+fn encoded_receipt(receipt: &Receipt) -> Result<String, MutationError> {
+    let encoded = serde_json::to_string(receipt).map_err(|_| MutationError::Capacity)?;
+    if encoded.len() > MAX_RECEIPT_BYTES {
+        return Err(MutationError::Capacity);
+    }
+    Ok(encoded)
+}
+
+fn checkpoint_binding(receipt: &Receipt) -> Result<[u8; 32], MutationError> {
+    let mut intent = receipt.clone();
+    intent.native_settled = false;
+    intent.ready_checkpoint = None;
+    let mut digest = Sha256::new();
+    digest.update(b"axial.content.ready-checkpoint.v1\0");
+    digest.update(encoded_receipt(&intent)?.as_bytes());
+    Ok(digest.finalize().into())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -641,6 +661,7 @@ impl ContentMutations {
             native_settled: false,
             pack: Some(canonical_id),
             local_mod: None,
+            ready_checkpoint: None,
         };
         validate_receipt(&receipt)?;
         if cancel.is_cancelled() {
@@ -1173,6 +1194,7 @@ impl ContentMutations {
             native_settled: false,
             pack: None,
             local_mod: Some(intent),
+            ready_checkpoint: None,
         };
         validate_receipt(&receipt)?;
         Ok(Some(receipt))
@@ -1241,6 +1263,7 @@ impl ContentMutations {
             native_settled: false,
             pack: None,
             local_mod: None,
+            ready_checkpoint: None,
         };
         Ok(receipt)
     }
@@ -1269,10 +1292,7 @@ impl ContentMutations {
     }
 
     fn persist_receipt(&self, receipt: &Receipt) -> Result<(), MutationError> {
-        let json = serde_json::to_string(&receipt).map_err(|_| MutationError::Capacity)?;
-        if json.len() > MAX_RECEIPT_BYTES {
-            return Err(MutationError::Capacity);
-        }
+        let json = encoded_receipt(receipt)?;
         self.directories.registry().storage().transaction(|tx| -> Result<(), MutationError> {
             let inserted = tx.execute("INSERT INTO content_batches(instance_id, operation_id, receipt_json) VALUES(?1, ?2, ?3)",
                 params![receipt.instance_id.as_str(), receipt.operation_id, json])?;
@@ -1280,14 +1300,69 @@ impl ContentMutations {
                 return Err(MutationError::Changed);
             }
             let persisted: Option<(String, String)> = tx.query_row(
-                "SELECT operation_id,receipt_json FROM content_batches WHERE instance_id=?1",
-                [receipt.instance_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT operation_id,receipt_json FROM content_batches WHERE instance_id=?1 AND length(CAST(receipt_json AS BLOB))<=?2",
+                params![receipt.instance_id.as_str(), MAX_RECEIPT_BYTES], |row| Ok((row.get(0)?, row.get(1)?)),
             ).optional()?;
             if persisted.as_ref().is_none_or(|(operation, payload)| operation != &receipt.operation_id || payload != &json) {
                 return Err(MutationError::Changed);
             }
             Ok(())
         })
+    }
+
+    fn replace_receipt(&self, receipt: &Receipt, previous: &str) -> Result<(), MutationError> {
+        let json = encoded_receipt(receipt)?;
+        self.directories.registry().storage().transaction(|tx| -> Result<(), MutationError> {
+            if tx.execute("UPDATE content_batches SET receipt_json=?1 WHERE instance_id=?2 AND operation_id=?3 AND receipt_json=?4",
+                params![json, receipt.instance_id.as_str(), receipt.operation_id, previous])? != 1 {
+                return Err(MutationError::Changed);
+            }
+            let stored: Option<String> = tx.query_row("SELECT receipt_json FROM content_batches WHERE instance_id=?1 AND operation_id=?2 AND length(CAST(receipt_json AS BLOB))<=?3",
+                params![receipt.instance_id.as_str(), receipt.operation_id, MAX_RECEIPT_BYTES], |row| row.get(0)).optional()?;
+            if stored.as_deref() != Some(json.as_str()) {
+                return Err(MutationError::Changed);
+            }
+            Ok(())
+        })
+    }
+
+    fn checkpoint_ready(
+        &self,
+        receipt: &mut Receipt,
+        ready: &ManagedContentReadyTransaction,
+    ) -> Result<(), MutationError> {
+        let previous = encoded_receipt(receipt)?;
+        let budget =
+            MAX_RECEIPT_BYTES.saturating_sub(previous.len() + ",\"ready_checkpoint\":\"\"".len());
+        if budget == 0 {
+            return Ok(());
+        }
+        let checkpoint = match ready.checkpoint(checkpoint_binding(receipt)?) {
+            Ok(checkpoint) => checkpoint,
+            Err(
+                ManagedContentCheckpointError::Unsupported
+                | ManagedContentCheckpointError::Capacity,
+            ) => return Ok(()),
+            Err(_) => return Err(MutationError::Changed),
+        };
+        let checkpoint = match checkpoint.encode(budget) {
+            Ok(checkpoint) => checkpoint,
+            Err(
+                ManagedContentCheckpointError::Unsupported
+                | ManagedContentCheckpointError::Capacity,
+            ) => return Ok(()),
+            Err(_) => return Err(MutationError::Changed),
+        };
+        let mut next = receipt.clone();
+        next.ready_checkpoint = Some(checkpoint);
+        match encoded_receipt(&next) {
+            Ok(_) => {}
+            Err(MutationError::Capacity) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        self.replace_receipt(&next, &previous)?;
+        *receipt = next;
+        Ok(())
     }
 
     pub fn resume(
@@ -1326,10 +1401,16 @@ impl ContentMutations {
             let effects = batch.map(|batch| batch.effects).unwrap_or_default();
             let mut remaining: Vec<_> = effects.into_iter().filter_map(Effect::settle).collect();
             if remaining.iter().any(|effect| matches!(effect, Effect::Recovery(_))) { return owner.retain(instance, remaining); }
-            let raw: String = owner.directories.registry().storage().read(|connection| -> Result<_, MutationError> {
-                connection.query_row("SELECT receipt_json FROM content_batches WHERE instance_id = ?1",
-                    [instance.record().instance.id.as_str()], |row| row.get(0)).optional()?.ok_or(MutationError::NotFound)
+            let raw: Option<String> = owner.directories.registry().storage().read(|connection| -> Result<_, MutationError> {
+                let id = instance.record().instance.id.as_str();
+                let raw = connection.query_row("SELECT receipt_json FROM content_batches WHERE instance_id=?1 AND length(CAST(receipt_json AS BLOB))<=?2",
+                    params![id, MAX_RECEIPT_BYTES], |row| row.get::<_, String>(0)).optional()?;
+                if raw.is_none() && !connection.query_row("SELECT EXISTS(SELECT 1 FROM content_batches WHERE instance_id=?1)", [id], |row| row.get::<_, bool>(0))? {
+                    return Err(MutationError::NotFound);
+                }
+                Ok(raw)
             })?;
+            let Some(raw) = raw else { return owner.retain_blocked(instance, remaining, restarting); };
             let mut receipt: Receipt = serde_json::from_str(&raw).map_err(|_| MutationError::Changed)?;
             validate_receipt(&receipt)?;
             validate_instance(&instance, &receipt)?;
@@ -1337,18 +1418,32 @@ impl ContentMutations {
                 && remaining.iter().all(|effect| matches!(effect, Effect::RolledBack))
                 && preflight(instance.game_directory(), &receipt, false).is_ok()
             {
-                owner.clear_receipt(&receipt)?;
+                if owner.clear_receipt(&receipt, &raw).is_err() { return owner.retain(instance, remaining); }
                 return Err(MutationError::Cancelled);
             }
             if remaining.iter().any(|effect| matches!(effect, Effect::Committed)) {
-                if owner.mark_native_settled(&mut receipt).is_err() { return owner.retain(instance, remaining); }
+                if owner.mark_native_settled(&mut receipt, &raw).is_err() { return owner.retain(instance, remaining); }
                 remaining.clear();
             }
-            // The retained leaf currently exposes in-process recovery only.
-            // After restart, only an entirely verified completed publication
-            // can retire the fence; private stage/backup names are never guessed.
-            if restarting {
-                if !receipt.native_settled { return owner.retain_blocked(instance, Vec::new(), true); }
+            if restarting && !receipt.native_settled {
+                let recovery = (|| {
+                    let checkpoint = receipt.ready_checkpoint.as_deref().ok_or(MutationError::Pending)?;
+                    let checkpoint = ManagedContentReadyCheckpoint::decode(checkpoint).map_err(|_| MutationError::Pending)?;
+                    transaction_root(&instance, receipt.pack.is_some())?
+                        .restore_ready_checkpoint(checkpoint, checkpoint_binding(&receipt)?)
+                        .map_err(|_| MutationError::Pending)
+                })();
+                let Ok(recovery) = recovery else { return owner.retain_blocked(instance, Vec::new(), true); };
+                match recovery.reconcile() {
+                    ManagedContentTransactionOutcome::Cancelled(_) => {
+                        if preflight(instance.game_directory(), &receipt, false).is_ok()
+                            && owner.clear_receipt(&receipt, &raw).is_ok()
+                        { return Err(MutationError::Cancelled); }
+                        return owner.retain_blocked(instance, Vec::new(), true);
+                    }
+                    ManagedContentTransactionOutcome::RecoveryRequired(effect) => return owner.retain(instance, vec![Effect::Recovery(effect)]),
+                    ManagedContentTransactionOutcome::Committed(_) | ManagedContentTransactionOutcome::Failed(_) => return owner.retain_blocked(instance, Vec::new(), true),
+                }
             }
             owner.apply(instance, receipt, HashMap::new(), &CancellationToken::new()).await
         }).map_err(|_| MutationError::Unavailable)
@@ -1379,8 +1474,9 @@ impl ContentMutations {
             preflight(instance.game_directory(), &receipt, true)?;
             if !receipt.native_settled {
                 apply_streamed(
+                    self,
                     &instance,
-                    &receipt,
+                    &mut receipt,
                     &mut payloads,
                     pack,
                     &mut effects,
@@ -1389,7 +1485,8 @@ impl ContentMutations {
                 )
                 .await?;
                 effects.push(Effect::Committed);
-                self.mark_native_settled(&mut receipt)?;
+                let previous = encoded_receipt(&receipt)?;
+                self.mark_native_settled(&mut receipt, &previous)?;
                 effects.clear();
             }
             // Verify the actual filesystem before discarding the settlement fence.
@@ -1403,18 +1500,7 @@ impl ContentMutations {
             {
                 return Err(MutationError::Changed);
             }
-            self.directories.registry().storage().transaction(
-                |tx| -> Result<(), MutationError> {
-                    let removed = tx.execute(
-                        "DELETE FROM content_batches WHERE instance_id = ?1 AND operation_id = ?2",
-                        params![receipt.instance_id.as_str(), receipt.operation_id],
-                    )?;
-                    if removed != 1 {
-                        return Err(MutationError::Changed);
-                    }
-                    Ok(())
-                },
-            )?;
+            self.clear_receipt(&receipt, &encoded_receipt(&receipt)?)?;
             report_progress(self.progress.as_deref(), "content_commit", 1, 1, None);
             Ok(MutationReceipt {
                 operation_id: receipt.operation_id.clone(),
@@ -1435,37 +1521,49 @@ impl ContentMutations {
                     })
                     && preflight(instance.game_directory(), &receipt, false).is_ok() =>
             {
-                self.clear_receipt(&receipt)?;
+                if self
+                    .clear_receipt(&receipt, &encoded_receipt(&receipt)?)
+                    .is_err()
+                {
+                    return self.retain(instance, effects);
+                }
                 Err(error)
             }
             Err(_) => self.retain(instance, effects),
         }
     }
 
-    fn clear_receipt(&self, receipt: &Receipt) -> Result<(), MutationError> {
+    fn clear_receipt(&self, receipt: &Receipt, previous: &str) -> Result<(), MutationError> {
         self.directories
             .registry()
             .storage()
             .transaction(|tx| -> Result<(), MutationError> {
                 if tx.execute(
-                    "DELETE FROM content_batches WHERE instance_id = ?1 AND operation_id = ?2",
-                    params![receipt.instance_id.as_str(), receipt.operation_id],
+                    "DELETE FROM content_batches WHERE instance_id = ?1 AND operation_id = ?2 AND receipt_json = ?3",
+                    params![receipt.instance_id.as_str(), receipt.operation_id, previous],
                 )? != 1
                 {
                     return Err(MutationError::Changed);
                 }
+                let remains: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM content_batches WHERE instance_id=?1)",
+                    [receipt.instance_id.as_str()], |row| row.get(0),
+                )?;
+                if remains { return Err(MutationError::Changed); }
                 Ok(())
             })
     }
 
-    fn mark_native_settled(&self, receipt: &mut Receipt) -> Result<(), MutationError> {
-        receipt.native_settled = true;
-        let json = serde_json::to_string(receipt).map_err(|_| MutationError::Changed)?;
-        self.directories.registry().storage().transaction(|tx| -> Result<(), MutationError> {
-            if tx.execute("UPDATE content_batches SET receipt_json = ?1 WHERE instance_id = ?2 AND operation_id = ?3",
-                params![json, receipt.instance_id.as_str(), receipt.operation_id])? != 1 { return Err(MutationError::Changed); }
-            Ok(())
-        })
+    fn mark_native_settled(
+        &self,
+        receipt: &mut Receipt,
+        previous: &str,
+    ) -> Result<(), MutationError> {
+        let mut next = receipt.clone();
+        next.native_settled = true;
+        self.replace_receipt(&next, previous)?;
+        *receipt = next;
+        Ok(())
     }
 
     fn retain(
@@ -2128,6 +2226,31 @@ struct ContentAuthority {
     tree: ManagedTreeRoot,
 }
 
+fn transaction_root(
+    instance: &RegisteredInstance,
+    pack: bool,
+) -> Result<ManagedContentTransactionRoot, MutationError> {
+    let directory = instance.game_directory().capability();
+    let effects = directory
+        .create_effect_owner()
+        .map_err(|_| MutationError::Files)?;
+    let tree = ManagedTreeRoot::from_directory(directory.clone(), effects)
+        .map_err(|_| MutationError::Files)?;
+    let authority = Arc::new(ContentAuthority {
+        _instance: instance.clone(),
+        tree,
+    });
+    let operation = authority
+        .tree
+        .try_acquire()
+        .map_err(|_| MutationError::Files)?;
+    let root = ManagedContentTransactionRoot::bind(
+        operation.directory().map_err(|_| MutationError::Files)?,
+        ManagedTransferAuthority::retain(authority),
+    );
+    Ok(if pack { root.for_pack() } else { root })
+}
+
 fn observed(proof: Option<&Proof>) -> ManagedContentObservedState {
     match proof {
         Some(proof) => ManagedContentObservedState::Exact {
@@ -2177,8 +2300,9 @@ fn unwind_outcome(
 /// displacement, compensation, and exact cleanup. This adapter only supplies
 /// the domain intent and keeps the registered instance alive with every leaf.
 async fn apply_streamed(
+    owner: &ContentMutations,
     instance: &RegisteredInstance,
-    receipt: &Receipt,
+    receipt: &mut Receipt,
     payloads: &mut HashMap<String, Vec<u8>>,
     pack: Option<&PackPlan>,
     effects: &mut Vec<Effect>,
@@ -2188,29 +2312,7 @@ async fn apply_streamed(
     // Before native preparation every refusal has no payload effects. Once
     // prepared, all exits below consume the native outcome or retain recovery.
     effects.push(Effect::RolledBack);
-    let directory = instance.game_directory().capability();
-    let native_effects = directory
-        .create_effect_owner()
-        .map_err(|_| MutationError::Files)?;
-    let tree = ManagedTreeRoot::from_directory(directory.clone(), native_effects)
-        .map_err(|_| MutationError::Files)?;
-    let authority = Arc::new(ContentAuthority {
-        _instance: instance.clone(),
-        tree,
-    });
-    let operation = authority
-        .tree
-        .try_acquire()
-        .map_err(|_| MutationError::Files)?;
-    let root = ManagedContentTransactionRoot::bind(
-        operation.directory().map_err(|_| MutationError::Files)?,
-        ManagedTransferAuthority::retain(authority),
-    );
-    let root = if receipt.pack.is_some() {
-        root.for_pack()
-    } else {
-        root
-    };
+    let root = transaction_root(instance, receipt.pack.is_some())?;
     let planning = root
         .observe_manifest()
         .map_err(|_| MutationError::Changed)?;
@@ -2455,15 +2557,19 @@ async fn apply_streamed(
             }
             ManagedContentTransferStep::Complete(complete) => {
                 return match complete.stage() {
-                    ManagedContentStageOutcome::Ready(ready) => transaction_outcome(
+                    ManagedContentStageOutcome::Ready(ready) => {
                         if cancel.is_cancelled() {
-                            ready.cancel()
-                        } else {
-                            report_progress(progress, "content_commit", 0, 1, None);
-                            ready.commit()
-                        },
-                        effects,
-                    ),
+                            return transaction_outcome(ready.cancel(), effects);
+                        }
+                        if let Err(error) = owner.checkpoint_ready(receipt, &ready) {
+                            return unwind_outcome(ready.cancel(), effects, error);
+                        }
+                        report_progress(progress, "content_commit", 0, 1, None);
+                        if cancel.is_cancelled() {
+                            return transaction_outcome(ready.cancel(), effects);
+                        }
+                        transaction_outcome(ready.commit(), effects)
+                    }
                     ManagedContentStageOutcome::Unwind(outcome) => {
                         unwind_outcome(outcome, effects, MutationError::Files)
                     }
@@ -2688,6 +2794,7 @@ mod tests {
             native_settled: false,
             pack: Some(pack.canonical_id.clone()),
             local_mod: None,
+            ready_checkpoint: None,
         };
         validate_receipt(&receipt).unwrap();
         receipt
@@ -2784,6 +2891,7 @@ mod tests {
             native_settled: false,
             pack: None,
             local_mod: None,
+            ready_checkpoint: None,
             changes: vec![Change {
                 path,
                 before: before
@@ -3039,8 +3147,9 @@ mod tests {
             owner.persist_receipt(&record).unwrap();
             if phase != "prepared" {
                 apply_streamed(
+                    &owner,
                     &instance,
-                    &record,
+                    &mut record,
                     &mut HashMap::new(),
                     None,
                     &mut Vec::new(),
@@ -3050,7 +3159,8 @@ mod tests {
                 .await
                 .unwrap();
                 if phase == "acknowledged" {
-                    owner.mark_native_settled(&mut record).unwrap();
+                    let raw = encoded_receipt(&record).unwrap();
+                    owner.mark_native_settled(&mut record, &raw).unwrap();
                 }
             }
             drop(instance);
@@ -4049,7 +4159,8 @@ mod tests {
             std::fs::write(directory.join("config/settings.txt"), b"override").unwrap();
             std::fs::write(directory.join(MANIFEST_FILE), &receipt.after_manifest).unwrap();
             if native_settled {
-                owner.mark_native_settled(&mut receipt).unwrap();
+                let raw = encoded_receipt(&receipt).unwrap();
+                owner.mark_native_settled(&mut receipt, &raw).unwrap();
             }
             drop(instance);
             let result = owner.resume(&id).unwrap().join().await.unwrap();
@@ -4084,13 +4195,184 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hard_exit_after_content_staging_preserves_restart_fence() {
-        content_crash_restart(false).await;
+    async fn hard_exit_after_content_staging_rolls_back_without_publication() {
+        content_crash_restart(false, None).await;
     }
 
     #[tokio::test]
     async fn hard_exit_after_content_metadata_commit_preserves_publication() {
-        content_crash_restart(true).await;
+        content_crash_restart(true, None).await;
+    }
+
+    #[tokio::test]
+    async fn hard_exit_ready_checkpoint_binding_mismatch_preserves_fence() {
+        content_crash_restart(false, Some("binding")).await;
+    }
+
+    #[tokio::test]
+    async fn hard_exit_ready_checkpoint_missing_preserves_fence() {
+        content_crash_restart(false, Some("missing")).await;
+    }
+
+    #[tokio::test]
+    async fn hard_exit_ready_checkpoint_foreign_public_file_allows_preserved_exit() {
+        content_crash_restart(false, Some("foreign")).await;
+    }
+
+    #[tokio::test]
+    async fn hard_exit_ready_rollback_delete_refusal_retries_after_reopen() {
+        content_crash_restart(false, Some("delete")).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_update_requires_affected_row_and_exact_readback_before_commit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for rewrite in ["ignore", "old", "oversized"] {
+            let (root, owner, id) = fixture().await;
+            let game = root.path().join("instances").join(id.as_str());
+            let original = std::fs::read(game.join(MANIFEST_FILE)).ok();
+            let storage = owner.directories.registry().storage();
+            storage.transaction(|db| db.execute_batch(match rewrite {
+                "old" =>
+                "CREATE TRIGGER refuse_checkpoint AFTER UPDATE ON content_batches
+                 WHEN json_extract(NEW.receipt_json,'$.ready_checkpoint') IS NOT NULL
+                 BEGIN UPDATE content_batches SET receipt_json=OLD.receipt_json WHERE instance_id=NEW.instance_id; END;",
+                "oversized" =>
+                "CREATE TRIGGER refuse_checkpoint AFTER UPDATE ON content_batches
+                 WHEN json_extract(NEW.receipt_json,'$.ready_checkpoint') IS NOT NULL
+                 BEGIN UPDATE content_batches SET receipt_json=replace(hex(zeroblob(8388609)),'00','é') WHERE instance_id=NEW.instance_id; END;",
+                _ =>
+                "CREATE TRIGGER refuse_checkpoint BEFORE UPDATE ON content_batches
+                 WHEN json_extract(NEW.receipt_json,'$.ready_checkpoint') IS NOT NULL
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            }).map_err(StorageError::from)).unwrap();
+            let committing = Arc::new(AtomicBool::new(false));
+            let observed = committing.clone();
+            let reporting = owner.clone().with_progress(Arc::new(move |event| {
+                if event.phase == "content_commit" {
+                    observed.store(true, Ordering::SeqCst);
+                }
+            }));
+            let result = reporting
+                .install_pack(
+                    &catalog(&owner),
+                    &id,
+                    pack(
+                        &[],
+                        &[("overrides/config/checkpoint.txt", b"not published")],
+                    ),
+                    true,
+                )
+                .unwrap()
+                .join()
+                .await
+                .unwrap();
+            owner
+                .tasks
+                .shutdown(std::time::Duration::from_secs(2))
+                .await
+                .unwrap();
+            owner.directories.library().try_preserve().unwrap();
+            assert!(matches!(result, Err(MutationError::Changed)), "{result:?}");
+            assert!(!committing.load(Ordering::SeqCst));
+            assert!(!has_pending(storage, &id).unwrap());
+            assert!(owner.pending.lock().unwrap().is_empty());
+            assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).ok(), original);
+            assert!(!game.join("config/checkpoint.txt").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_completion_cancellation_unwinds_before_publication() {
+        let (root, owner, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        let original = std::fs::read(game.join(MANIFEST_FILE)).ok();
+        let cancel = CancellationToken::new();
+        let captured_cancel = cancel.clone();
+        let registry = owner.directories.registry().clone();
+        let captured_id = id.clone();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = events.clone();
+        let owner = owner.with_progress(Arc::new(move |event| {
+            if event.phase == "content_commit" {
+                assert_eq!(event.current, 0);
+                let recorded: String = registry
+                    .storage()
+                    .read(|db| {
+                        db.query_row(
+                            "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
+                            [captured_id.as_str()],
+                            |row| row.get(0),
+                        )
+                        .map_err(StorageError::from)
+                    })
+                    .unwrap();
+                let receipt: Receipt = serde_json::from_str(&recorded).unwrap();
+                assert!(receipt.ready_checkpoint.is_some() && !receipt.native_settled);
+                captured_events.lock().unwrap().push(event.current);
+                captured_cancel.cancel();
+            }
+        }));
+        let instance = owner.directories.admit(&id).unwrap();
+        let pack = pack(&[], &[("overrides/config/cancelled.txt", b"not published")]);
+        let record = pack_record(&instance, &pack);
+        owner.persist_receipt(&record).unwrap();
+        let plan = pack.archive.plan_all(true).unwrap();
+        let result = owner
+            .apply_pack(instance, record, HashMap::new(), Some(&plan), &cancel)
+            .await;
+        owner
+            .tasks
+            .shutdown(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        owner.directories.library().try_preserve().unwrap();
+        assert!(
+            matches!(result, Err(MutationError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(*events.lock().unwrap(), [0]);
+        assert!(!owner.has_unsettled_effects());
+        assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).ok(), original);
+        assert!(!game.join("config/cancelled.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn oversized_utf8_receipt_remains_fenced_without_decoding() {
+        let (_root, owner, id) = fixture().await;
+        let instance = owner.directories.admit(&id).unwrap();
+        let record = receipt(&owner, &instance, b"not published");
+        drop(instance);
+        let storage = owner.directories.registry().storage();
+        storage.transaction(|db| db.execute(
+            "UPDATE content_batches SET receipt_json=replace(hex(zeroblob(?1)),'00','é') WHERE instance_id=?2",
+            params![MAX_RECEIPT_BYTES / 2 + 1, id.as_str()],
+        ).map_err(StorageError::from)).unwrap();
+        let result = owner.resume(&id).unwrap().join().await.unwrap();
+        owner
+            .tasks
+            .shutdown(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        owner
+            .release_shutdown_admissions(&owner.tasks.shutdown_receipt().unwrap())
+            .unwrap();
+        owner.directories.library().try_preserve().unwrap();
+        assert!(matches!(result, Err(MutationError::Pending)), "{result:?}");
+        let persisted: (String, usize, usize) = storage.read(|db| db.query_row(
+            "SELECT operation_id,length(receipt_json),length(CAST(receipt_json AS BLOB)) FROM content_batches WHERE instance_id=?1",
+            [id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(StorageError::from)).unwrap();
+        assert_eq!(
+            persisted,
+            (
+                record.operation_id,
+                MAX_RECEIPT_BYTES / 2 + 1,
+                MAX_RECEIPT_BYTES + 2
+            )
+        );
+        assert!(owner.has_unsettled_effects());
+        assert!(owner.directories.admit(&id).is_err());
     }
 
     #[tokio::test]
@@ -4098,10 +4380,15 @@ mod tests {
         for acknowledgement in ["UPDATE", "DELETE"] {
             let (root, owner, id) = fixture().await;
             let storage = owner.directories.registry().storage();
+            let predicate = if acknowledgement == "UPDATE" {
+                "WHEN json_extract(NEW.receipt_json, '$.native_settled') = 1"
+            } else {
+                ""
+            };
             storage
                 .transaction(|db| {
                     db.execute_batch(&format!(
-                        "CREATE TRIGGER refuse_content_acknowledgement BEFORE {acknowledgement} ON content_batches BEGIN SELECT RAISE(ABORT, 'injected content acknowledgement refusal'); END;"
+                        "CREATE TRIGGER refuse_content_acknowledgement BEFORE {acknowledgement} ON content_batches {predicate} BEGIN SELECT RAISE(ABORT, 'injected content acknowledgement refusal'); END;"
                     ))
                     .map_err(StorageError::from)
                 })
@@ -4191,7 +4478,7 @@ mod tests {
         }
     }
 
-    async fn content_crash_restart(committed: bool) {
+    async fn content_crash_restart(committed: bool, checkpoint_fault: Option<&str>) {
         use crate::library::LibraryId;
         use std::{io::Read, path::Path, process::Command, time::Duration};
 
@@ -4315,6 +4602,11 @@ mod tests {
             let game = root.join("instances").join(instance.id.as_str());
             std::fs::write(game.join(MANIFEST_FILE), ORIGINAL).unwrap();
             std::fs::write(game.join("config/user.txt"), b"unrelated payload").unwrap();
+            if !committed {
+                let witness = serde_json::to_vec(&files(&game)).unwrap();
+                assert!(witness.len() <= WITNESS_BYTES);
+                std::fs::write(root.join(WITNESS), witness).unwrap();
+            }
             let observer = owner.clone();
             let id = instance.id.clone();
             let reporting = owner.clone().with_progress(Arc::new(move |event| {
@@ -4334,6 +4626,7 @@ mod tests {
                         serde_json::from_str(&pending(&observer, &id).unwrap()).unwrap();
                     validate_receipt(&receipt).unwrap();
                     assert!(!receipt.native_settled);
+                    assert!(receipt.ready_checkpoint.is_some());
                     assert_eq!(receipt.before_manifest.as_deref(), Some(ORIGINAL));
                     assert_eq!(receipt.changes.len(), 1);
                     assert_eq!(receipt.changes[0].path, "config/staged.txt");
@@ -4379,10 +4672,26 @@ mod tests {
 
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let library_id = LibraryId::new();
-        let selector = if committed {
-            "content::install::tests::hard_exit_after_content_metadata_commit_preserves_publication"
-        } else {
-            "content::install::tests::hard_exit_after_content_staging_preserves_restart_fence"
+        let selector = match (committed, checkpoint_fault) {
+            (true, None) => {
+                "content::install::tests::hard_exit_after_content_metadata_commit_preserves_publication"
+            }
+            (false, None) => {
+                "content::install::tests::hard_exit_after_content_staging_rolls_back_without_publication"
+            }
+            (false, Some("binding")) => {
+                "content::install::tests::hard_exit_ready_checkpoint_binding_mismatch_preserves_fence"
+            }
+            (false, Some("missing")) => {
+                "content::install::tests::hard_exit_ready_checkpoint_missing_preserves_fence"
+            }
+            (false, Some("delete")) => {
+                "content::install::tests::hard_exit_ready_rollback_delete_refusal_retries_after_reopen"
+            }
+            (false, Some("foreign")) => {
+                "content::install::tests::hard_exit_ready_checkpoint_foreign_public_file_allows_preserved_exit"
+            }
+            _ => unreachable!(),
         };
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", selector, "--nocapture"])
@@ -4409,7 +4718,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let mut before = if committed {
+        let original_tree = {
             let mut witness = Vec::new();
             std::fs::File::open(root.path().join(WITNESS))
                 .unwrap()
@@ -4417,9 +4726,8 @@ mod tests {
                 .read_to_end(&mut witness)
                 .unwrap();
             assert!(witness.len() <= WITNESS_BYTES);
-            Some((None, serde_json::from_slice(&witness).unwrap()))
-        } else {
-            None
+            serde_json::from_slice::<BTreeMap<std::path::PathBuf, Option<Vec<u8>>>>(&witness)
+                .unwrap()
         };
         if !committed {
             let owner = open(root.path(), library_id);
@@ -4439,7 +4747,75 @@ mod tests {
             assert_eq!(pending(&owner, id).as_deref(), Some(receipt.as_str()));
             assert_eq!(files(&game), snapshot);
         }
-        for _ in 0..2 {
+        if let Some(fault) = checkpoint_fault {
+            let owner = open(root.path(), library_id);
+            let records = owner.directories.registry().list().unwrap();
+            let id = &records[0].instance.id;
+            let game = root.path().join("instances").join(id.as_str());
+            let mut snapshot = files(&game);
+            let raw = pending(&owner, id).unwrap();
+            let mut changed: Receipt = serde_json::from_str(&raw).unwrap();
+            let storage = owner.directories.registry().storage();
+            if fault == "foreign" {
+                std::fs::write(game.join("config/staged.txt"), b"foreign user payload").unwrap();
+                snapshot = files(&game);
+            } else if fault == "delete" {
+                storage.transaction(|db| db.execute_batch(
+                    "CREATE TRIGGER refuse_rollback_ack BEFORE DELETE ON content_batches BEGIN SELECT RAISE(IGNORE); END;"
+                ).map_err(StorageError::from)).unwrap();
+            } else {
+                if fault == "binding" {
+                    changed.operation_id = uuid::Uuid::new_v4().to_string();
+                } else {
+                    changed.ready_checkpoint = None;
+                }
+                validate_receipt(&changed).unwrap();
+                storage.transaction(|db| db.execute(
+                    "UPDATE content_batches SET operation_id=?1,receipt_json=?2 WHERE instance_id=?3 AND receipt_json=?4",
+                    params![changed.operation_id, encoded_receipt(&changed).unwrap(), id.as_str(), raw],
+                ).map_err(StorageError::from)).unwrap();
+            }
+            let expected = pending(&owner, id).unwrap();
+            let result = owner.resume(id).unwrap().join().await.unwrap();
+            owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
+            owner
+                .release_shutdown_admissions(&owner.tasks.shutdown_receipt().unwrap())
+                .unwrap();
+            owner.directories.library().try_preserve().unwrap();
+            assert!(matches!(result, Err(MutationError::Pending)), "{result:?}");
+            assert_eq!(pending(&owner, id).as_deref(), Some(expected.as_str()));
+            assert!(owner.has_unsettled_effects());
+            assert!(owner.directories.admit(id).is_err());
+            assert_eq!(
+                files(&game),
+                if fault == "delete" {
+                    original_tree.clone()
+                } else {
+                    snapshot
+                }
+            );
+            if fault == "foreign" {
+                assert_eq!(pending(&owner, id).as_deref(), Some(raw.as_str()));
+                assert_eq!(
+                    std::fs::read(game.join("config/staged.txt")).unwrap(),
+                    b"foreign user payload"
+                );
+                return;
+            }
+            storage.transaction(|db| {
+                if fault == "delete" {
+                    db.execute_batch("DROP TRIGGER refuse_rollback_ack")?;
+                } else {
+                    let original: Receipt = serde_json::from_str(&raw).unwrap();
+                    assert_eq!(db.execute(
+                        "UPDATE content_batches SET operation_id=?1,receipt_json=?2 WHERE instance_id=?3 AND receipt_json=?4",
+                        params![original.operation_id, raw, id.as_str(), expected],
+                    )?, 1);
+                }
+                Ok::<_, StorageError>(())
+            }).unwrap();
+        }
+        for attempt in 0..2 {
             let owner = open(root.path(), library_id);
             let records = owner.directories.registry().list().unwrap();
             assert_eq!(records.len(), 1);
@@ -4447,15 +4823,15 @@ mod tests {
             let game = root.path().join("instances").join(id.as_str());
             let receipt = pending(&owner, id);
             let snapshot = files(&game);
-            if let Some((record, tree)) = &before {
-                assert_eq!((&receipt, &snapshot), (record, tree));
-            } else {
-                before = Some((receipt.clone(), snapshot.clone()));
+            if committed || attempt > 0 {
+                assert!(receipt.is_none());
+                assert_eq!(snapshot, original_tree);
             }
             assert_eq!(
                 std::fs::read(game.join("config/user.txt")).unwrap(),
                 b"unrelated payload"
             );
+            let mut rollback = None;
             if committed {
                 assert!(receipt.is_none());
                 assert!(!owner.has_unsettled_effects());
@@ -4505,7 +4881,7 @@ mod tests {
                         )
                         .unwrap()
                 );
-            } else {
+            } else if attempt == 0 {
                 assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), ORIGINAL);
                 assert!(!game.join("config/staged.txt").exists());
                 assert!(matches!(
@@ -4529,34 +4905,68 @@ mod tests {
                 validate_instance(&admitted, &record).unwrap();
                 assert!(!record.native_settled);
                 drop(admitted);
-                assert!(matches!(
-                    owner.resume(id).unwrap().join().await.unwrap(),
-                    Err(MutationError::Pending)
-                ));
-                assert!(owner.has_unsettled_effects());
-                assert!(owner.directories.admit(id).is_err());
                 let foreign = TaskOwner::new(1).unwrap();
                 foreign.try_close_idle().unwrap();
                 assert!(matches!(
                     owner.release_shutdown_admissions(&foreign.shutdown_receipt().unwrap()),
                     Err(MutationError::Unavailable)
                 ));
-                assert_eq!(owner.pending.lock().unwrap().len(), 1);
-                assert!(owner.directories.admit_content_settlement(id).is_err());
+                rollback = Some(owner.resume(id).unwrap().join().await.unwrap());
+            } else {
+                assert!(!owner.has_unsettled_effects());
+                owner
+                    .directories
+                    .admit(id)
+                    .unwrap()
+                    .validate_current()
+                    .unwrap();
             }
             owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
             owner
                 .release_shutdown_admissions(&owner.tasks.shutdown_receipt().unwrap())
                 .unwrap();
             assert!(owner.pending.lock().unwrap().is_empty());
-            if !committed {
-                assert!(owner.has_unsettled_effects());
-                assert!(owner.directories.admit(id).is_err());
-                owner.directories.admit_content_settlement(id).unwrap();
-            }
             owner.directories.library().try_preserve().unwrap();
-            assert_eq!(pending(&owner, id), receipt);
-            assert_eq!(files(&game), snapshot);
+            if let Some(result) = rollback {
+                assert!(
+                    matches!(result, Err(MutationError::Cancelled)),
+                    "Ready-stage recovery must prove rollback, not publication: {result:?}"
+                );
+            }
+            assert!(pending(&owner, id).is_none());
+            assert_eq!(files(&game), original_tree);
+        }
+        if !committed {
+            let owner = open(root.path(), library_id);
+            let records = owner.directories.registry().list().unwrap();
+            assert_eq!(records.len(), 1);
+            let id = &records[0].instance.id;
+            let installed = owner
+                .install_pack(
+                    &catalog(&owner),
+                    id,
+                    pack(&[], &[("overrides/config/staged.txt", b"new payload")]),
+                    true,
+                )
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&installed.instance_id, id);
+            assert_eq!(installed.status, "complete");
+            assert!(!owner.has_unsettled_effects());
+            let game = root.path().join("instances").join(id.as_str());
+            assert_eq!(
+                std::fs::read(game.join("config/user.txt")).unwrap(),
+                b"unrelated payload"
+            );
+            assert_eq!(
+                std::fs::read(game.join("config/staged.txt")).unwrap(),
+                b"new payload"
+            );
+            owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
+            owner.directories.library().try_preserve().unwrap();
         }
     }
 
@@ -4829,8 +5239,9 @@ mod tests {
         let mut effects = Vec::new();
         assert!(
             apply_streamed(
+                &owner,
                 &instance,
-                &receipt,
+                &mut receipt,
                 &mut HashMap::from([("resourcepacks/known.zip".into(), b"known".to_vec())]),
                 None,
                 &mut effects,

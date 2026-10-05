@@ -27,7 +27,8 @@ pub mod managed_path {
     #[cfg(feature = "test-support")]
     pub use crate::managed_fs::ManagedLibraryTestAuthority;
     pub use crate::managed_fs::{
-        ManagedContentCancelReceipt, ManagedContentCommitReceipt, ManagedContentCompleteTransfers,
+        ManagedContentCancelReceipt, ManagedContentCheckpointError, ManagedContentCommitReceipt,
+        ManagedContentCompleteTransfers,
         ManagedContentDeferredManifest, ManagedContentEncodedManifest,
         ManagedContentIssuedTransfer, ManagedContentManifestBindOutcome,
         ManagedContentManifestObservationFailure, ManagedContentMutationPlan,
@@ -36,7 +37,8 @@ pub mod managed_path {
         ManagedContentPayloadPlan, ManagedContentPlanError, ManagedContentPlanningBinding,
         ManagedContentPlanningObservationFailure, ManagedContentPlanningSession,
         ManagedContentPreparationError, ManagedContentPreparationOutcome,
-        ManagedContentPreparedTransaction, ManagedContentReadyTransaction, ManagedContentRecovery,
+        ManagedContentPreparedTransaction, ManagedContentReadyCheckpoint,
+        ManagedContentReadyTransaction, ManagedContentRecovery,
         ManagedContentStageOutcome, ManagedContentTransactionFailure,
         ManagedContentTransactionOutcome, ManagedContentTransactionRoot,
         ManagedContentTransactionSession, ManagedContentTransferAdvance,

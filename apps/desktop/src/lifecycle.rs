@@ -1460,7 +1460,7 @@ mod tests {
         };
         let storage = services.instances.registry().storage();
         storage.transaction(|db| -> Result<(), StorageError> {
-            db.execute_batch("CREATE TRIGGER refuse_content_acknowledgement BEFORE UPDATE ON content_batches BEGIN SELECT RAISE(ABORT, 'injected content acknowledgement refusal'); END;")?;
+            db.execute_batch("CREATE TRIGGER refuse_content_acknowledgement BEFORE UPDATE ON content_batches WHEN json_extract(NEW.receipt_json,'$.native_settled')=1 BEGIN SELECT RAISE(ABORT, 'injected content acknowledgement refusal'); END;")?;
             Ok(())
         }).unwrap();
         let provider =

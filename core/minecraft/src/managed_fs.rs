@@ -26,7 +26,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 mod content_transaction;
 
 pub use content_transaction::{
-    ManagedContentCancelReceipt, ManagedContentCommitReceipt, ManagedContentCompleteTransfers,
+    ManagedContentCancelReceipt, ManagedContentCheckpointError, ManagedContentCommitReceipt,
+    ManagedContentCompleteTransfers,
     ManagedContentDeferredManifest, ManagedContentEncodedManifest, ManagedContentIssuedTransfer,
     ManagedContentManifestBindOutcome, ManagedContentManifestObservationFailure,
     ManagedContentMutationPlan, ManagedContentObservationError, ManagedContentObservedState,
@@ -35,7 +36,8 @@ pub use content_transaction::{
     ManagedContentPlanningBinding, ManagedContentPlanningObservationFailure,
     ManagedContentPlanningSession, ManagedContentPreparationError,
     ManagedContentPreparationOutcome, ManagedContentPreparedTransaction,
-    ManagedContentReadyTransaction, ManagedContentRecovery, ManagedContentStageOutcome,
+    ManagedContentReadyCheckpoint, ManagedContentReadyTransaction, ManagedContentRecovery,
+    ManagedContentStageOutcome,
     ManagedContentTransactionFailure, ManagedContentTransactionOutcome,
     ManagedContentTransactionRoot, ManagedContentTransactionSession, ManagedContentTransferAdvance,
     ManagedContentTransferBatch, ManagedContentTransferSettlement, ManagedContentTransferStep,

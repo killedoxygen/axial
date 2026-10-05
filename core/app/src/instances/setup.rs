@@ -11,7 +11,7 @@ use super::{
 use super::{directory::RegisteredInstance, model::InstanceId};
 use crate::content::{
     catalog::ContentService,
-    install::{ContentMutations, PlannedFile},
+    install::{ContentMutations, MutationError, PlannedFile},
     resolve::{ContentResolution, ResolutionSelection, ResolutionTarget},
     view::{ResolutionPlan, TargetRef, into_plan, preview_draft},
 };
@@ -455,13 +455,22 @@ impl SetupService {
             .as_ref()
             .ok_or(InstanceError::SetupUnavailable)?;
         if crate::content::install::has_pending(self.instances.registry().storage(), id)? {
-            mutations
+            match mutations
                 .resume(id)
                 .map_err(|_| InstanceError::SettlementRequired)?
                 .join()
                 .await
                 .map_err(|_| InstanceError::SettlementRequired)?
-                .map_err(|_| InstanceError::SettlementRequired)?;
+            {
+                Ok(_) => {}
+                Err(MutationError::Cancelled)
+                    if !crate::content::install::has_pending(
+                        self.instances.registry().storage(),
+                        id,
+                    )
+                    .map_err(|_| InstanceError::SettlementRequired)? => {}
+                Err(_) => return Err(InstanceError::SettlementRequired),
+            }
         }
         let retained = self
             .pending

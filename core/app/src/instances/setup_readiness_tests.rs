@@ -23,11 +23,30 @@ fn fixture() -> (tempfile::TempDir, SetupService, Arc<AccountDirectory>) {
     let root = tempfile::Builder::new()
         .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
         .unwrap();
-    let library = match crate::library::LibraryLifecycle::open(root.path()) {
+    let (service, accounts) = open_fixture(root.path(), crate::library::LibraryId::new());
+    service
+        .settings
+        .update(
+            serde_json::from_value(serde_json::json!({
+                "expected_revision": 0, "performance_mode": "vanilla",
+                "java_path_override": root.path().join("no-java-here").to_str().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    seed_catalog(&service);
+    (root, service, accounts)
+}
+
+fn open_fixture(
+    root: &std::path::Path,
+    library_id: crate::library::LibraryId,
+) -> (SetupService, Arc<AccountDirectory>) {
+    let library = match crate::library::LibraryLifecycle::open_with_id(root, library_id) {
         crate::library::LibraryOpenOutcome::Ready(library) => library,
         other => panic!("isolated test library did not open: {other:?}"),
     };
-    let storage = Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
+    let storage = Arc::new(MetadataStore::open(root.join("metadata.sqlite")).unwrap());
     storage
         .migrate(&[
             super::super::directory::MIGRATION,
@@ -66,15 +85,6 @@ fn fixture() -> (tempfile::TempDir, SetupService, Arc<AccountDirectory>) {
     let client = ProviderClient::new(ClientConfig::default()).unwrap();
     let content = Arc::new(ContentService::new(client.clone()).unwrap());
     let settings = Arc::new(SettingsStore::new(storage.clone()).unwrap());
-    settings
-        .update(
-            serde_json::from_value(serde_json::json!({
-                "expected_revision": 0, "performance_mode": "vanilla",
-                "java_path_override": root.path().join("no-java-here").to_str().unwrap(),
-            }))
-            .unwrap(),
-        )
-        .unwrap();
     let accounts = Arc::new(AccountDirectory::new(storage.clone()).unwrap());
     let auth = Arc::new(AuthService::new(
         accounts.clone(),
@@ -120,8 +130,7 @@ fn fixture() -> (tempfile::TempDir, SetupService, Arc<AccountDirectory>) {
         settings,
         launch,
     );
-    seed_catalog(&service);
-    (root, service, accounts)
+    (service, accounts)
 }
 
 fn seed_catalog(service: &SetupService) {
@@ -802,6 +811,382 @@ async fn resumed_setup_response_is_ready_after_accepted_admission_releases() {
         response.instance.status_detail
     );
     assert_eq!(response.instance.launch_action.primary_action, "launch");
+}
+
+#[tokio::test]
+async fn detached_setup_resumes_same_intent_after_ready_content_rollback() {
+    detached_setup_ready_resume(false).await;
+}
+
+#[tokio::test]
+async fn detached_setup_retains_intent_when_content_rollback_acknowledgement_is_refused() {
+    detached_setup_ready_resume(true).await;
+}
+
+async fn detached_setup_ready_resume(refuse_acknowledgement: bool) {
+    use crate::{
+        content::{model::CanonicalId, packs::PackArchive, provenance::MANIFEST_FILE},
+        instances::from_pack::PreparedPackCreation,
+        library::LibraryId,
+    };
+    use std::{io::Write, path::Path, process::Command, time::Duration};
+
+    const ROOT: &str = "AXIAL_SETUP_READY_CRASH_ROOT";
+    const LIBRARY: &str = "AXIAL_SETUP_READY_CRASH_LIBRARY";
+    const ORIGINAL: &[u8] = b"{\"schema_version\":3,\"entries\":[]}\n";
+
+    fn open(root: &Path, library_id: LibraryId) -> Arc<SetupService> {
+        let (mut service, _) = open_fixture(root, library_id);
+        let client = ProviderClient::new(ClientConfig::default()).unwrap();
+        let content = Arc::new(ContentService::new(client.clone()).unwrap());
+        let mutations = Arc::new(ContentMutations::new(
+            service.instances.directories().clone(),
+            client,
+            service.instances.tasks.clone(),
+        ));
+        service.installs = Arc::new(
+            service
+                .installs
+                .as_ref()
+                .clone()
+                .with_content(content.clone(), mutations.clone()),
+        );
+        Arc::new(service.with_content(content, mutations))
+    }
+
+    fn intent(service: &SetupService, id: &InstanceId) -> (String, String, String) {
+        service
+            .instances
+            .registry()
+            .storage()
+            .read(|db| {
+                db.query_row(
+                    "SELECT plan_id,request_json,phase FROM instance_setups WHERE instance_id=?1",
+                    [id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(StorageError::from)
+            })
+            .unwrap()
+    }
+
+    fn content_receipt(service: &SetupService, id: &InstanceId) -> Option<String> {
+        service.instances.registry().storage().read(|db| {
+            db.query_row(
+                "SELECT receipt_json FROM content_batches WHERE instance_id=?1 AND length(CAST(receipt_json AS BLOB))<=65536",
+                [id.as_str()], |row| row.get(0),
+            ).optional().map_err(StorageError::from)
+        }).unwrap()
+    }
+
+    fn public_before(game: &Path) {
+        assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), ORIGINAL);
+        assert_eq!(
+            std::fs::read(game.join("config/user.txt")).unwrap(),
+            b"unrelated"
+        );
+        assert!(!game.join("config/accepted.txt").exists());
+    }
+
+    if let Some(root) = std::env::var_os(ROOT) {
+        let root = std::path::PathBuf::from(root);
+        assert_eq!(root.canonicalize().unwrap(), root);
+        let service = open(
+            &root,
+            LibraryId::parse(&std::env::var(LIBRARY).unwrap()).unwrap(),
+        );
+        crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (path, bytes) in [
+            ("modrinth.index.json", br#"{"formatVersion":1,"game":"minecraft","versionId":"fixture-v1","name":"Accepted fixture","dependencies":{"minecraft":"1.21.4"},"files":[]}"#.as_slice()),
+            ("overrides/config/accepted.txt", b"accepted payload".as_slice()),
+        ] {
+            zip.start_file(path, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        let prepared = PreparedPackCreation::new(
+            CanonicalId("modrinth:accepted-fixture".into()),
+            "fixture-v1".into(),
+            PackArchive::read(zip.finish().unwrap().into_inner()).unwrap(),
+            "vanilla|1.21.4",
+        )
+        .unwrap();
+        let stored: StoredSetupIntent = serde_json::from_value(serde_json::json!({
+            "kind":"modpack", "canonical_id":"modrinth:accepted-fixture", "version_id":"fixture-v1",
+            "selection_id":"vanilla|1.21.4", "installed_version_id":"1.21.4",
+            "minecraft_version":"1.21.4", "loader_key":"vanilla",
+            "archive_fingerprint":prepared.plan().fingerprint(),
+            "install":{"kind":"vanilla", "version_id":"1.21.4"}
+        }))
+        .unwrap();
+        let request_json = serde_json::to_string(&stored).unwrap();
+        let admitted = service
+            .instances
+            .create_admitted(
+                CreateInstanceRequest {
+                    name: "Detached setup rollback".into(),
+                    selection_id: "vanilla|1.21.4".into(),
+                    ..Default::default()
+                },
+                CreateTarget {
+                    selection_id: "vanilla|1.21.4".into(),
+                    version_id: "1.21.4".into(),
+                    minecraft_version: "1.21.4".into(),
+                    loader_key: "vanilla".into(),
+                },
+                SetupIntent {
+                    plan_id: uuid::Uuid::new_v4().to_string(),
+                    request_json: request_json.clone(),
+                },
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        let id = admitted.record().instance.id.clone();
+        let game = root.join("instances").join(id.as_str());
+        std::fs::write(game.join(MANIFEST_FILE), ORIGINAL).unwrap();
+        std::fs::write(game.join("config/user.txt"), b"unrelated").unwrap();
+        let accepted = intent(&service, &id);
+        let (content, mutations) = service.content.as_ref().unwrap();
+        let work = SetupWork {
+            instances: service.instances.clone(),
+            content: content.clone(),
+            mutations: mutations.clone(),
+            admitted,
+            stored,
+            request_json,
+            prepared_pack: Some(prepared),
+        };
+        let observer = service.clone();
+        let progress = Arc::new(move |event: axial_minecraft::DownloadProgress| {
+            if event.phase != "content_commit" || event.current != 0 {
+                return;
+            }
+            assert_eq!(event.total, 1);
+            assert!(!event.done);
+            assert_eq!(intent(&observer, &id), accepted);
+            public_before(&game);
+            let raw = content_receipt(&observer, &id).unwrap();
+            let receipt: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(receipt["native_settled"], false);
+            assert!(
+                receipt["ready_checkpoint"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
+            assert!(observer.content.as_ref().unwrap().1.has_unsettled_effects());
+            std::process::exit(42);
+        });
+        let result = service
+            .instances
+            .tasks
+            .try_spawn(work.clone(), move |cancel| async move {
+                work.execute(&cancel, progress).await
+            })
+            .unwrap()
+            .join()
+            .await;
+        panic!("accepted setup did not reach its Content Ready boundary: {result:?}");
+    }
+
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let library_id = LibraryId::new();
+    let selector = if refuse_acknowledgement {
+        "instances::setup::readiness_tests::detached_setup_retains_intent_when_content_rollback_acknowledgement_is_refused"
+    } else {
+        "instances::setup::readiness_tests::detached_setup_resumes_same_intent_after_ready_content_rollback"
+    };
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", selector, "--nocapture"])
+        .env(ROOT, root.path())
+        .env(LIBRARY, library_id.to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let timed_out = child.try_wait().unwrap().is_none();
+    if timed_out {
+        child.kill().unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !timed_out && output.status.code() == Some(42),
+        "Ready boundary not reached: {:?}; {} {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let service = open(root.path(), library_id);
+    let records = service.instances.registry().list().unwrap();
+    assert_eq!(records.len(), 1);
+    let original = &records[0];
+    let id = &original.instance.id;
+    let game = root.path().join("instances").join(id.as_str());
+    let accepted = intent(&service, id);
+    assert_eq!(accepted.2, "pending");
+    public_before(&game);
+    assert!(!service.installs.has_setup_work(id));
+    assert!(
+        crate::content::install::has_pending(service.instances.registry().storage(), id).unwrap()
+    );
+    let original_receipt = content_receipt(&service, id).unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(&original_receipt).unwrap();
+    let checkpoint = receipt["ready_checkpoint"].as_str().unwrap();
+    axial_minecraft::managed_path::ManagedContentReadyCheckpoint::decode(checkpoint).unwrap();
+    let checkpoint: serde_json::Value = serde_json::from_str(checkpoint).unwrap();
+    let private = game.join(checkpoint["private_name"].as_str().unwrap());
+    assert!(
+        std::fs::symlink_metadata(&private)
+            .unwrap()
+            .file_type()
+            .is_dir()
+    );
+    if refuse_acknowledgement {
+        let operation = uuid::Uuid::parse_str(receipt["operation_id"].as_str().unwrap()).unwrap();
+        service.instances.registry().storage().transaction(|db| {
+            db.execute_batch(&format!(
+                "CREATE TRIGGER refuse_setup_content_acknowledgement BEFORE DELETE ON content_batches WHEN OLD.instance_id='{id}' AND OLD.operation_id='{operation}' BEGIN SELECT RAISE(ABORT, 'injected Content acknowledgement refusal'); END;"
+            )).map_err(StorageError::from)
+        }).unwrap();
+    }
+    let stored: StoredSetupIntent = serde_json::from_str(&accepted.1).unwrap();
+    let expected = stored.queue_request(&original.instance);
+    let writer = service
+        .instances
+        .directories()
+        .exclusions()
+        .try_acquire(
+            std::iter::empty::<String>(),
+            [crate::install::queue::library_artifact(
+                &library_id.to_string(),
+            )],
+        )
+        .unwrap();
+    let blocker = service
+        .installs
+        .enqueue(InstallQueueRequest::Vanilla {
+            version_id: "1.20.1".into(),
+        })
+        .await
+        .unwrap()
+        .started_install
+        .unwrap()
+        .install_id;
+    let response = tokio::time::timeout(Duration::from_secs(5), service.resume_setup(id)).await;
+    let private_removed = matches!(
+        std::fs::symlink_metadata(&private),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    let after = intent(&service, id);
+    let content_pending =
+        crate::content::install::has_pending(service.instances.registry().storage(), id).unwrap();
+    let content_unsettled = service.content.as_ref().unwrap().1.has_unsettled_effects();
+    let after_receipt = content_receipt(&service, id);
+    let content_queue_rows: i64 = service
+        .instances
+        .registry()
+        .storage()
+        .read(|db| {
+            db.query_row(
+                "SELECT COUNT(*) FROM install_queue WHERE request_json=?1",
+                [serde_json::to_string(&expected).unwrap()],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
+        })
+        .unwrap();
+    let attached = service.installs.has_setup_work(id);
+    let queued = service.installs.snapshot();
+    service.installs.close_admission();
+    service
+        .instances
+        .tasks
+        .shutdown(Duration::from_secs(2))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), service.installs.join_observers())
+        .await
+        .unwrap()
+        .unwrap();
+    let shutdown = service.instances.tasks.shutdown_receipt().unwrap();
+    service
+        .content
+        .as_ref()
+        .unwrap()
+        .1
+        .release_shutdown_admissions(&shutdown)
+        .unwrap();
+    service.release_shutdown_admissions(&shutdown).unwrap();
+    service.installs.shutdown_queued().unwrap();
+    drop(writer);
+    service
+        .instances
+        .directories()
+        .library()
+        .try_preserve()
+        .unwrap();
+
+    assert_eq!(after, accepted);
+    assert_eq!(
+        service.instances.registry().get_record(id).unwrap(),
+        *original
+    );
+    public_before(&game);
+    assert!(
+        private_removed,
+        "Ready rollback must remove its exact private directory before Content acknowledgement"
+    );
+    assert_eq!(content_receipt(&service, id), after_receipt);
+    if refuse_acknowledgement {
+        assert!(matches!(
+            response.expect("bounded setup resume"),
+            Err(InstanceError::SettlementRequired)
+        ));
+        assert!(content_pending && content_unsettled);
+        assert_eq!(after_receipt.as_deref(), Some(original_receipt.as_str()));
+        assert!(!attached && queued.active.is_none());
+        assert_eq!(content_queue_rows, 0);
+        assert_eq!(queued.items.len(), 1);
+        assert_eq!(queued.items[0].queue_id, blocker);
+        return;
+    }
+    assert!(
+        !content_pending && !content_unsettled,
+        "rollback must retire only the Content receipt"
+    );
+    assert_eq!(content_queue_rows, 1);
+    let response = response
+        .expect("setup resume must finish within its bound")
+        .expect("proven Content rollback must requeue the same accepted setup");
+    assert_eq!(response.instance.instance.id, *id);
+    assert_eq!(response.view_model.state_id, "setup_queued");
+    assert!(attached && queued.active.is_none());
+    let started = response.install_queue.unwrap().started_install.unwrap();
+    assert_ne!(started.install_id, blocker);
+    let item = queued
+        .items
+        .iter()
+        .find(|item| item.queue_id == started.install_id)
+        .unwrap();
+    let content = item.install_item.content.as_ref().unwrap();
+    assert_eq!(
+        InstallQueueRequest::Content {
+            instance_id: content.instance_id.clone(),
+            label: content.label.clone(),
+            action: content.action.clone(),
+        },
+        expected
+    );
+    let status = service.installs.status(&started.install_id).unwrap();
+    assert!(!status.done && status.outcome.is_none());
+    assert_eq!(status.view_model.phase_id, "queued");
 }
 
 #[cfg(unix)]
