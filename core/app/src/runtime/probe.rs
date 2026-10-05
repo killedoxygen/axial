@@ -183,6 +183,7 @@ async fn run_probe(
                 {
                     let now = std::time::Instant::now();
                     let gap = largest_gap.max(now.duration_since(last_observation));
+                    let leader_pid = process.pid();
                     let leader_before_termination = match process.try_wait() {
                         Ok(Some(status)) if status.success() => "success",
                         Ok(Some(_)) => "failure",
@@ -190,7 +191,7 @@ async fn run_probe(
                         Err(_) => "error",
                     };
                     eprintln!(
-                        "Java probe timeout observation: elapsed_ms={} largest_gap_ms={} iterations={} stdout_bytes={} stdout_eof={} stderr_bytes={} stderr_eof={} last_leader={} last_tree={} leader_before_termination={}",
+                        "Java probe timeout observation: pid={leader_pid:?} elapsed_ms={} largest_gap_ms={} iterations={} stdout_bytes={} stdout_eof={} stderr_bytes={} stderr_eof={} last_leader={} last_tree={} leader_before_termination={}",
                         now.duration_since(started).as_millis(), gap.as_millis(), iterations,
                         stdout_bytes.len(), stdout_done, stderr_bytes.len(), stderr_done,
                         last_leader, last_tree, leader_before_termination,
