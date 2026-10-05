@@ -257,7 +257,10 @@ impl DesktopLifecycle {
                 state.prepared = false;
             }
             if intent == TerminalIntent::Close
-                && state.intent == Some(TerminalIntent::Reset)
+                && matches!(
+                    state.intent,
+                    Some(TerminalIntent::Reset | TerminalIntent::Update)
+                )
                 && state.admitted
                 && !state.prepared
                 && state.active.is_none()
@@ -315,6 +318,8 @@ impl DesktopLifecycle {
         if !admitted {
             if intent == TerminalIntent::Reset {
                 services.server.ensure_reset_allowed()?;
+            } else if intent == TerminalIntent::Update {
+                services.server.ensure_update_allowed()?;
             } else if intent != TerminalIntent::Close {
                 services.server.ensure_no_interrupted_launch()?;
             }
@@ -350,7 +355,9 @@ impl DesktopLifecycle {
         self.settle(&services, intent != TerminalIntent::Update)
             .await?;
         if intent == TerminalIntent::Reset {
-            services.server.ensure_reset_allowed()?;
+            services.server.ensure_reset_settled()?;
+        } else if intent == TerminalIntent::Update {
+            services.server.ensure_update_allowed()?;
         }
         Ok(())
     }
@@ -1243,6 +1250,275 @@ mod tests {
             std::fs::read(stage.join("keep.txt")).unwrap(),
             b"pending creation payload"
         );
+    }
+
+    const PENDING_CONTENT_PROFILE: &str = "AXIAL_TEST_LIFECYCLE_CONTENT_PROFILE";
+    const PENDING_CONTENT_EXIT: i32 = 42;
+    const CONTENT_OVERRIDE: &[u8] = b"preserved lifecycle content\n";
+
+    fn content_snapshot(services: &axial_api::DesktopServices) -> (String, Vec<u8>, Vec<u8>) {
+        use axial_app::{content::provenance::MANIFEST_FILE, storage::StorageError};
+
+        let records = services.instances.registry().list().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        let receipt = services
+            .instances
+            .registry()
+            .storage()
+            .read(|db| -> Result<String, StorageError> {
+                Ok(db.query_row(
+                    "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
+                    [record.instance.id.as_str()],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        let payload = services
+            .library
+            .admit()
+            .unwrap()
+            .read_projection()
+            .unwrap()
+            .join("instances")
+            .join(&record.directory_name);
+        (
+            receipt,
+            std::fs::read(payload.join(MANIFEST_FILE)).unwrap(),
+            std::fs::read(payload.join("config/preserved.txt")).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn update_rechecks_content_after_preferences_and_preserves_it_on_close() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let temporary =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let root = temporary.path().join("rewrite");
+        std::fs::create_dir(&root).unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lifecycle::tests::pending_content_update_exit_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(PENDING_CONTENT_PROFILE, &root)
+            .stdout(output.try_clone().unwrap())
+            .stderr(output.try_clone().unwrap())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(60), child.wait()).await;
+        if result.is_err() {
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+        }
+        output
+            .seek(SeekFrom::Start(
+                output.metadata().unwrap().len().saturating_sub(4096),
+            ))
+            .unwrap();
+        let mut tail = String::new();
+        output.read_to_string(&mut tail).unwrap();
+        assert_eq!(
+            result.expect(&tail).unwrap().code(),
+            Some(PENDING_CONTENT_EXIT),
+            "{tail}"
+        );
+
+        let services = axial_api::start_in_profile(root.clone(), None)
+            .await
+            .unwrap();
+        let before = content_snapshot(&services);
+        let record = services.instances.registry().list().unwrap().remove(0);
+        assert!(matches!(
+            services
+                .content_mutations
+                .resume(&record.instance.id)
+                .unwrap()
+                .join()
+                .await
+                .unwrap(),
+            Err(axial_app::content::install::MutationError::Pending)
+        ));
+        assert!(services.content_mutations.has_unsettled_effects());
+        let lifecycle = DesktopLifecycle::new(
+            services.tasks.clone(),
+            services.server.clone(),
+            PresenceObserver::disabled_for_test(),
+            NativeSkinFiles::new(services.library.clone(), services.tasks.clone()),
+            services.skins.clone(),
+        )
+        .without_interface_preferences_for_test();
+        assert!(lifecycle.prepare_update().await.is_err());
+        assert!(!services.tasks.status().closing);
+        assert!(!lifecycle.terminal.lock().unwrap().admitted);
+        assert!(lifecycle.finish_update_settled().is_err());
+        assert!(lifecycle.prepare_update_process_exit().await.is_err());
+        lifecycle.prepare_exit(TerminalIntent::Close).await.unwrap();
+        assert!(services.server.is_shutdown_settled());
+        assert!(services.tasks.shutdown_receipt().is_some());
+        assert!(services.content_mutations.has_unsettled_effects());
+        // Shutdown closes admission, so the final proof uses the already known exact payload.
+        let payload = root.join("instances").join(&record.directory_name);
+        let receipt: String = services
+            .instances
+            .registry()
+            .storage()
+            .read(|db| -> Result<_, axial_app::storage::StorageError> {
+                Ok(db.query_row(
+                    "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
+                    [record.instance.id.as_str()],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(receipt, before.0);
+        assert_eq!(
+            std::fs::read(payload.join(axial_app::content::provenance::MANIFEST_FILE)).unwrap(),
+            before.1
+        );
+        assert_eq!(
+            std::fs::read(payload.join("config/preserved.txt")).unwrap(),
+            before.2
+        );
+        assert!(!root.join(".axial-reset-intent").exists());
+        lifecycle.shutdown_after_event_loop().await;
+        lifecycle.release_services_after_exit().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper exiting after real Content commit acknowledgement refusal"]
+    async fn pending_content_update_exit_helper() {
+        use axial_app::{
+            content::{
+                catalog::ContentService,
+                install::MutationError,
+                model::{CanonicalId, ProviderId},
+                packs::{PackArchive, ResolvedPack},
+            },
+            instances::create::{CreateInstanceRequest, CreateTarget},
+            network::{ClientConfig, ProviderClient},
+            storage::StorageError,
+        };
+        use std::io::Write;
+
+        let root = std::path::PathBuf::from(std::env::var_os(PENDING_CONTENT_PROFILE).unwrap());
+        assert_eq!(std::fs::canonicalize(&root).unwrap(), root);
+        let services = axial_api::start_in_profile(root, None).await.unwrap();
+        let lifecycle = DesktopLifecycle::new(
+            services.tasks.clone(),
+            services.server.clone(),
+            PresenceObserver::disabled_for_test(),
+            NativeSkinFiles::new(services.library.clone(), services.tasks.clone()),
+            services.skins.clone(),
+        );
+        let mut events = lifecycle.interface_preferences_events();
+        let update = start_terminal(&lifecycle, TerminalIntent::Update);
+        let request = preference_event(&mut events).await;
+        assert_eq!(request.phase, InterfacePreferencesPhase::Flush);
+        assert!(!services.tasks.status().closing);
+        let target = CreateTarget::loader_for_tests(
+            axial_minecraft::LoaderComponentId::Fabric,
+            "1.21.1",
+            "0.16.9",
+        )
+        .unwrap();
+        let instance = services
+            .instances
+            .create(
+                CreateInstanceRequest {
+                    name: "Late content fixture".into(),
+                    selection_id: target.selection_id().to_owned(),
+                    ..Default::default()
+                },
+                target,
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (path, bytes) in [
+            ("modrinth.index.json", serde_json::to_vec(&serde_json::json!({
+                "name":"Late content fixture", "dependencies":{"minecraft":"1.21.1","fabric-loader":"0.16.9"}, "files":[],
+            })).unwrap()),
+            ("overrides/config/preserved.txt", CONTENT_OVERRIDE.to_vec()),
+        ] {
+            archive.start_file(path, zip::write::SimpleFileOptions::default()).unwrap();
+            archive.write_all(&bytes).unwrap();
+        }
+        let pack = ResolvedPack {
+            canonical_id: CanonicalId::for_project(ProviderId::Modrinth, "fixture-pack"),
+            version_id: "fixture-v1".into(),
+            name: "Late content fixture".into(),
+            archive: PackArchive::read(archive.finish().unwrap().into_inner()).unwrap(),
+        };
+        let storage = services.instances.registry().storage();
+        storage.transaction(|db| -> Result<(), StorageError> {
+            db.execute_batch("CREATE TRIGGER refuse_content_acknowledgement BEFORE UPDATE ON content_batches BEGIN SELECT RAISE(ABORT, 'injected content acknowledgement refusal'); END;")?;
+            Ok(())
+        }).unwrap();
+        let provider =
+            ContentService::new(ProviderClient::new(ClientConfig::default()).unwrap()).unwrap();
+        assert!(matches!(
+            services
+                .content_mutations
+                .install_pack(&provider, &instance.id, pack, true)
+                .unwrap()
+                .join()
+                .await
+                .unwrap(),
+            Err(MutationError::Pending)
+        ));
+        let before = content_snapshot(&services);
+        let recorded: serde_json::Value = serde_json::from_str(&before.0).unwrap();
+        assert_eq!(recorded["native_settled"], false);
+        assert_eq!(
+            before.1,
+            serde_json::from_value::<Vec<u8>>(recorded["after_manifest"].clone()).unwrap()
+        );
+        assert_eq!(before.2, CONTENT_OVERRIDE);
+        storage
+            .transaction(|db| -> Result<(), StorageError> {
+                db.execute_batch("DROP TRIGGER refuse_content_acknowledgement;")?;
+                Ok(())
+            })
+            .unwrap();
+        lifecycle
+            .complete_interface_preferences(&request.request_id, true)
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), update)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "late content must refuse installation before preparation succeeds"
+        );
+        assert!(services.tasks.shutdown_receipt().is_some());
+        assert!(lifecycle.terminal.lock().unwrap().admitted);
+        assert!(!lifecycle.terminal.lock().unwrap().prepared);
+        assert!(lifecycle.finish_update_settled().is_err());
+        assert!(lifecycle.prepare_update_process_exit().await.is_err());
+        let close = lifecycle.prepare_exit(TerminalIntent::Close).await;
+        assert!(
+            close.is_err(),
+            "live native effects still require settlement"
+        );
+        assert_ne!(
+            close,
+            Err(TERMINAL_CONFLICT.into()),
+            "pre-installer refusal permits preserve-only Close"
+        );
+        assert!(!services.server.is_shutdown_settled());
+        assert!(!lifecycle.exit_allowed());
+        // The controlled exit loses the retained native owner, not a fabricated durable row.
+        std::process::exit(PENDING_CONTENT_EXIT);
     }
 
     #[tokio::test]

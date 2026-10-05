@@ -772,6 +772,31 @@ impl ContentMutations {
             .unwrap_or(true)
     }
 
+    /// Preserve durable restart fences across exit without releasing native effects.
+    /// Only the exact, permanently joined task owner may release inert admissions.
+    pub fn release_shutdown_admissions(
+        &self,
+        receipt: &crate::tasks::ShutdownReceipt,
+    ) -> Result<(), MutationError> {
+        if !receipt.belongs_to(&self.tasks) {
+            return Err(MutationError::Unavailable);
+        }
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| MutationError::Unavailable)?;
+        if pending
+            .values()
+            .any(|batch| !batch.restart_blocked || !batch.effects.is_empty())
+        {
+            return Err(MutationError::Pending);
+        }
+        let released = std::mem::take(&mut *pending);
+        drop(pending);
+        drop(released);
+        Ok(())
+    }
+
     pub fn instance_context(
         &self,
         id: &InstanceId,
@@ -4060,13 +4085,122 @@ mod tests {
 
     #[tokio::test]
     async fn hard_exit_after_content_staging_preserves_restart_fence() {
+        content_crash_restart(false).await;
+    }
+
+    #[tokio::test]
+    async fn hard_exit_after_content_metadata_commit_preserves_publication() {
+        content_crash_restart(true).await;
+    }
+
+    #[tokio::test]
+    async fn preserve_shutdown_refuses_retained_native_or_unacknowledged_batches() {
+        for acknowledgement in ["UPDATE", "DELETE"] {
+            let (root, owner, id) = fixture().await;
+            let storage = owner.directories.registry().storage();
+            storage
+                .transaction(|db| {
+                    db.execute_batch(&format!(
+                        "CREATE TRIGGER refuse_content_acknowledgement BEFORE {acknowledgement} ON content_batches BEGIN SELECT RAISE(ABORT, 'injected content acknowledgement refusal'); END;"
+                    ))
+                    .map_err(StorageError::from)
+                })
+                .unwrap();
+            assert!(matches!(
+                owner
+                    .install_pack(
+                        &catalog(&owner),
+                        &id,
+                        pack(&[], &[("overrides/config/preserved.txt", b"published")]),
+                        true,
+                    )
+                    .unwrap()
+                    .join()
+                    .await
+                    .unwrap(),
+                Err(MutationError::Pending)
+            ));
+            let recorded = || {
+                storage
+                    .read(|db| {
+                        db.query_row(
+                            "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
+                            [id.as_str()],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .map_err(StorageError::from)
+                    })
+                    .unwrap()
+            };
+            let before = recorded();
+            let receipt: Receipt = serde_json::from_str(&before).unwrap();
+            validate_receipt(&receipt).unwrap();
+            let game = root.path().join("instances").join(id.as_str());
+            assert_eq!(
+                std::fs::read(game.join("config/preserved.txt")).unwrap(),
+                b"published"
+            );
+            assert_eq!(
+                std::fs::read(game.join(MANIFEST_FILE)).unwrap(),
+                receipt.after_manifest
+            );
+            {
+                let pending = owner.pending.lock().unwrap();
+                let batch = pending.get(&id).unwrap();
+                assert!(!batch.restart_blocked);
+                if acknowledgement == "UPDATE" {
+                    assert!(
+                        batch
+                            .effects
+                            .iter()
+                            .any(|effect| matches!(effect, Effect::Committed))
+                    );
+                    assert!(
+                        !batch
+                            .effects
+                            .iter()
+                            .any(|effect| matches!(effect, Effect::Recovery(_)))
+                    );
+                    assert!(!receipt.native_settled);
+                } else {
+                    assert!(batch.effects.is_empty());
+                    assert!(receipt.native_settled);
+                }
+            }
+            owner
+                .tasks
+                .shutdown(std::time::Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert!(matches!(
+                owner.release_shutdown_admissions(&owner.tasks.shutdown_receipt().unwrap()),
+                Err(MutationError::Pending)
+            ));
+            assert!(owner.has_unsettled_effects());
+            assert_eq!(owner.pending.lock().unwrap().len(), 1);
+            assert!(owner.directories.admit_content_settlement(&id).is_err());
+            assert_eq!(recorded(), before);
+            assert_eq!(
+                std::fs::read(game.join("config/preserved.txt")).unwrap(),
+                b"published"
+            );
+            assert_eq!(
+                std::fs::read(game.join(MANIFEST_FILE)).unwrap(),
+                receipt.after_manifest
+            );
+        }
+    }
+
+    async fn content_crash_restart(committed: bool) {
         use crate::library::LibraryId;
-        use std::{path::Path, process::Command, time::Duration};
+        use std::{io::Read, path::Path, process::Command, time::Duration};
 
         const ROOT: &str = "AXIAL_CONTENT_STAGED_CRASH_ROOT";
         const LIBRARY: &str = "AXIAL_CONTENT_STAGED_CRASH_LIBRARY";
         const EXIT: i32 = 42;
         const ORIGINAL: &[u8] = b"{\"schema_version\":3,\"entries\":[]}\n";
+        const WITNESS: &str = "committed-tree.json";
+        const WITNESS_BYTES: usize = 512 * 1024;
 
         fn open(root: &Path, library_id: LibraryId) -> ContentMutations {
             let library = match LibraryLifecycle::open_with_id(root, library_id) {
@@ -4102,7 +4236,7 @@ mod tests {
             ContentMutations::new(directories, client, tasks).with_performance(performance)
         }
 
-        fn pending(owner: &ContentMutations, id: &InstanceId) -> String {
+        fn pending(owner: &ContentMutations, id: &InstanceId) -> Option<String> {
             owner
                 .directories
                 .registry()
@@ -4114,6 +4248,7 @@ mod tests {
                             [id.as_str()],
                             |row| row.get(0),
                         )
+                        .optional()
                         .map_err(StorageError::from)
                 })
                 .unwrap()
@@ -4183,25 +4318,50 @@ mod tests {
             let observer = owner.clone();
             let id = instance.id.clone();
             let reporting = owner.clone().with_progress(Arc::new(move |event| {
-                if event.phase != "content_commit" || event.current != 0 {
+                if event.phase != "content_commit"
+                    || !(0..=i32::from(committed)).contains(&event.current)
+                {
                     return;
                 }
                 assert_eq!(event.total, 1);
                 assert!(!event.done);
-                let receipt: Receipt = serde_json::from_str(&pending(&observer, &id)).unwrap();
-                validate_receipt(&receipt).unwrap();
-                assert!(!receipt.native_settled);
-                assert_eq!(receipt.before_manifest.as_deref(), Some(ORIGINAL));
-                assert_eq!(receipt.changes.len(), 1);
-                assert_eq!(receipt.changes[0].path, "config/staged.txt");
-                assert_eq!(receipt.changes[0].after, Some(Proof::bytes(b"new payload")));
-                assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), ORIGINAL);
                 assert_eq!(
                     std::fs::read(game.join("config/user.txt")).unwrap(),
                     b"unrelated payload"
                 );
-                assert!(!game.join("config/staged.txt").exists());
-                // This production callback follows native stage(), before commit().
+                if event.current == 0 {
+                    let receipt: Receipt =
+                        serde_json::from_str(&pending(&observer, &id).unwrap()).unwrap();
+                    validate_receipt(&receipt).unwrap();
+                    assert!(!receipt.native_settled);
+                    assert_eq!(receipt.before_manifest.as_deref(), Some(ORIGINAL));
+                    assert_eq!(receipt.changes.len(), 1);
+                    assert_eq!(receipt.changes[0].path, "config/staged.txt");
+                    assert_eq!(receipt.changes[0].after, Some(Proof::bytes(b"new payload")));
+                    assert!(matches!(
+                        receipt.changes[0].source,
+                        Some(Source::PackOverride)
+                    ));
+                    assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), ORIGINAL);
+                    assert!(!game.join("config/staged.txt").exists());
+                    // The zero callback follows native stage(), before commit().
+                    if committed {
+                        return;
+                    }
+                } else {
+                    // The one callback follows receipt deletion, before worker return.
+                    assert!(pending(&observer, &id).is_none());
+                    assert!(!observer.has_unsettled_effects());
+                    assert!(matches!(
+                        observer.directories.admit(&id),
+                        Err(crate::instances::model::InstanceError::Busy)
+                    ));
+                    let mut witness = vec![0; WITNESS_BYTES];
+                    let mut output = io::Cursor::new(witness.as_mut_slice());
+                    serde_json::to_writer(&mut output, &files(&game)).unwrap();
+                    let written = output.position() as usize;
+                    std::fs::write(root.join(WITNESS), &witness[..written]).unwrap();
+                }
                 std::process::exit(EXIT);
             }));
             let result = reporting
@@ -4214,17 +4374,18 @@ mod tests {
                 .unwrap()
                 .join()
                 .await;
-            panic!("content did not reach the staged crash boundary: {result:?}");
+            panic!("content did not reach crash boundary (committed={committed}): {result:?}");
         }
 
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let library_id = LibraryId::new();
+        let selector = if committed {
+            "content::install::tests::hard_exit_after_content_metadata_commit_preserves_publication"
+        } else {
+            "content::install::tests::hard_exit_after_content_staging_preserves_restart_fence"
+        };
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "content::install::tests::hard_exit_after_content_staging_preserves_restart_fence",
-                "--nocapture",
-            ])
+            .args(["--exact", selector, "--nocapture"])
             .env(ROOT, root.path())
             .env(LIBRARY, library_id.to_string())
             .stdout(std::process::Stdio::piped())
@@ -4242,13 +4403,42 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(
             !timed_out && output.status.code() == Some(EXIT),
-            "staged crash boundary not reached: {:?}; {} {}",
+            "crash boundary not reached (committed={committed}): {:?}; {} {}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let mut before = None;
+        let mut before = if committed {
+            let mut witness = Vec::new();
+            std::fs::File::open(root.path().join(WITNESS))
+                .unwrap()
+                .take(WITNESS_BYTES as u64 + 1)
+                .read_to_end(&mut witness)
+                .unwrap();
+            assert!(witness.len() <= WITNESS_BYTES);
+            Some((None, serde_json::from_slice(&witness).unwrap()))
+        } else {
+            None
+        };
+        if !committed {
+            let owner = open(root.path(), library_id);
+            let records = owner.directories.registry().list().unwrap();
+            assert_eq!(records.len(), 1);
+            let id = &records[0].instance.id;
+            let receipt = pending(&owner, id).unwrap();
+            let game = root.path().join("instances").join(id.as_str());
+            let snapshot = files(&game);
+            owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
+            owner
+                .release_shutdown_admissions(&owner.tasks.shutdown_receipt().unwrap())
+                .unwrap();
+            assert!(owner.has_unsettled_effects());
+            assert!(owner.directories.admit(id).is_err());
+            owner.directories.library().try_preserve().unwrap();
+            assert_eq!(pending(&owner, id).as_deref(), Some(receipt.as_str()));
+            assert_eq!(files(&game), snapshot);
+        }
         for _ in 0..2 {
             let owner = open(root.path(), library_id);
             let records = owner.directories.registry().list().unwrap();
@@ -4262,40 +4452,108 @@ mod tests {
             } else {
                 before = Some((receipt.clone(), snapshot.clone()));
             }
-            assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), ORIGINAL);
             assert_eq!(
                 std::fs::read(game.join("config/user.txt")).unwrap(),
                 b"unrelated payload"
             );
-            assert!(!game.join("config/staged.txt").exists());
-            assert!(matches!(
-                owner.installed(id),
-                Err(MutationError::Unavailable)
-            ));
-            assert!(matches!(
-                owner.directories.admit_read(id),
-                Err(crate::instances::model::InstanceError::Busy)
-            ));
-            assert!(matches!(
-                owner.directories.admit(id),
-                Err(crate::instances::model::InstanceError::Busy)
-            ));
-            let admitted = owner
-                .directories
-                .admit_content_settlement(id)
-                .expect("only settlement admission may bypass the content fence");
-            let record: Receipt = serde_json::from_str(&receipt).unwrap();
-            validate_receipt(&record).unwrap();
-            validate_instance(&admitted, &record).unwrap();
-            assert!(!record.native_settled);
-            drop(admitted);
-            assert!(matches!(
-                owner.resume(id).unwrap().join().await.unwrap(),
-                Err(MutationError::Pending)
-            ));
-            assert!(owner.has_unsettled_effects());
-            assert!(owner.directories.admit(id).is_err());
+            if committed {
+                assert!(receipt.is_none());
+                assert!(!owner.has_unsettled_effects());
+                assert_eq!(
+                    std::fs::read(game.join("config/staged.txt")).unwrap(),
+                    b"new payload"
+                );
+                let expected = pack(&[], &[("overrides/config/staged.txt", b"new payload")]);
+                let installed = owner.installed(id).unwrap();
+                assert_eq!(installed.entries().len(), 1);
+                let entry = installed.find(&expected.canonical_id).unwrap();
+                assert_eq!(entry.provider(), ProviderId::Modrinth);
+                assert_eq!(entry.project_id(), "fixture-pack");
+                assert_eq!(entry.version_id(), expected.version_id);
+                assert_eq!(entry.kind(), ContentKind::Modpack);
+                assert!(entry.enabled());
+                assert_eq!(entry.title(), Some("Pack fixture"));
+                assert_eq!(
+                    entry.pack_installation(),
+                    Some(&PackInstallation {
+                        fingerprint: expected.archive.fingerprint().into(),
+                        files: vec![PackInstalledFile {
+                            path: "config/staged.txt".into(),
+                            size: b"new payload".len() as u64,
+                            sha512: Proof::bytes(b"new payload").sha512,
+                        }],
+                    })
+                );
+                assert_eq!(
+                    installed.encode_managed().unwrap(),
+                    std::fs::read(game.join(MANIFEST_FILE)).unwrap()
+                );
+                owner
+                    .directories
+                    .admit_read(id)
+                    .unwrap()
+                    .validate_current()
+                    .unwrap();
+                let admitted = owner.directories.admit(id).unwrap();
+                assert!(
+                    owner
+                        .installed_pack_admitted(
+                            &admitted,
+                            &expected.canonical_id,
+                            &expected.version_id,
+                            expected.archive.fingerprint()
+                        )
+                        .unwrap()
+                );
+            } else {
+                assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), ORIGINAL);
+                assert!(!game.join("config/staged.txt").exists());
+                assert!(matches!(
+                    owner.installed(id),
+                    Err(MutationError::Unavailable)
+                ));
+                assert!(matches!(
+                    owner.directories.admit_read(id),
+                    Err(crate::instances::model::InstanceError::Busy)
+                ));
+                assert!(matches!(
+                    owner.directories.admit(id),
+                    Err(crate::instances::model::InstanceError::Busy)
+                ));
+                let admitted = owner
+                    .directories
+                    .admit_content_settlement(id)
+                    .expect("only settlement admission may bypass the content fence");
+                let record: Receipt = serde_json::from_str(receipt.as_deref().unwrap()).unwrap();
+                validate_receipt(&record).unwrap();
+                validate_instance(&admitted, &record).unwrap();
+                assert!(!record.native_settled);
+                drop(admitted);
+                assert!(matches!(
+                    owner.resume(id).unwrap().join().await.unwrap(),
+                    Err(MutationError::Pending)
+                ));
+                assert!(owner.has_unsettled_effects());
+                assert!(owner.directories.admit(id).is_err());
+                let foreign = TaskOwner::new(1).unwrap();
+                foreign.try_close_idle().unwrap();
+                assert!(matches!(
+                    owner.release_shutdown_admissions(&foreign.shutdown_receipt().unwrap()),
+                    Err(MutationError::Unavailable)
+                ));
+                assert_eq!(owner.pending.lock().unwrap().len(), 1);
+                assert!(owner.directories.admit_content_settlement(id).is_err());
+            }
             owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
+            owner
+                .release_shutdown_admissions(&owner.tasks.shutdown_receipt().unwrap())
+                .unwrap();
+            assert!(owner.pending.lock().unwrap().is_empty());
+            if !committed {
+                assert!(owner.has_unsettled_effects());
+                assert!(owner.directories.admit(id).is_err());
+                owner.directories.admit_content_settlement(id).unwrap();
+            }
             owner.directories.library().try_preserve().unwrap();
             assert_eq!(pending(&owner, id), receipt);
             assert_eq!(files(&game), snapshot);

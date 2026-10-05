@@ -26,6 +26,9 @@ objc2-app-kit.workspace = true
 tauri-build.workspace = true
 
 [dev-dependencies]
+axial-app = { workspace = true, features = ["test-support"] }
+axial-minecraft = { workspace = true, features = ["test-support"] }
 tauri = { workspace = true, features = ["test"] }
 tempfile.workspace = true
 png.workspace = true
+zip.workspace = true

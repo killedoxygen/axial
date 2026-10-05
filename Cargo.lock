@@ -356,6 +356,7 @@ dependencies = [
  "axial-api",
  "axial-app",
  "axial-fs",
+ "axial-minecraft",
  "objc2",
  "objc2-app-kit",
  "png 0.17.16",
@@ -370,6 +371,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zip 2.4.2",
 ]
 
 [[package]]

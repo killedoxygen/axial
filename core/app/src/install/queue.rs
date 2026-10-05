@@ -20,7 +20,10 @@ use crate::{
         MetadataStore, Migration, StorageError,
         rusqlite::{self, OptionalExtension, params},
     },
-    tasks::{ArtifactKey, CancellationToken, ExclusionLease, Exclusions, TaskHandle, TaskOwner},
+    tasks::{
+        ArtifactKey, CancellationToken, ExclusionLease, Exclusions, ShutdownReceipt, TaskHandle,
+        TaskOwner,
+    },
     telemetry::{Telemetry, TelemetryErrorKind, TelemetryEvent},
 };
 #[cfg(feature = "test-support")]
@@ -399,6 +402,55 @@ impl InstallQueue {
         publish(&self.inner, &mut state);
         drop(state);
         drop(retained);
+        Ok(())
+    }
+
+    /// Preserve an interrupted Content queue item without acknowledging its
+    /// receipt or changing its status. Native installation recovery stays owned.
+    pub fn preserve_shutdown(&self, receipt: &ShutdownReceipt) -> Result<(), InstallError> {
+        if !receipt.belongs_to(&self.inner.owner) {
+            return Err(InstallError::Busy);
+        }
+        let active = {
+            let state = self.inner.state.lock().expect("install queue lock");
+            let observers = self.inner.observers.lock().expect("install observers lock");
+            if !state.closed || !observers.closed || !observers.tasks.is_empty() {
+                return Err(InstallError::Busy);
+            }
+            preserved_content_instance(&state)?
+        };
+        let Some(instance) = active else {
+            return self.shutdown_queued();
+        };
+        let (_, mutations) = self
+            .content
+            .as_ref()
+            .ok_or(InstallError::ContentUnavailable)?;
+        if !crate::content::install::has_pending(&self.inner.storage, &instance)?
+            || crate::performance::mutation::has_pending(&self.inner.storage, &instance)?
+        {
+            return Err(InstallError::SettlementRequired);
+        }
+        mutations
+            .release_shutdown_admissions(receipt)
+            .map_err(|_| InstallError::SettlementRequired)?;
+        let mut state = self.inner.state.lock().expect("install queue lock");
+        if preserved_content_instance(&state)?.as_ref() != Some(&instance) {
+            return Err(InstallError::SettlementRequired);
+        }
+        let admissions = state
+            .entries
+            .values_mut()
+            .map(|entry| {
+                (
+                    entry.pin.take(),
+                    entry.setup.take(),
+                    entry.recovery_lease.take(),
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(state);
+        drop(admissions);
         Ok(())
     }
     pub fn snapshot(&self) -> InstallQueueStateResponse {
@@ -2568,6 +2620,34 @@ impl InstallQueue {
     }
 }
 
+fn preserved_content_instance(state: &State) -> Result<Option<InstanceId>, InstallError> {
+    let Some(active) = state.active.as_ref() else {
+        return Ok(None);
+    };
+    let entry = state
+        .entries
+        .get(active)
+        .ok_or(InstallError::SettlementRequired)?;
+    if entry.status.done
+        || entry.status.outcome.is_some()
+        || entry.status.view_model.phase_id != "settlement_required"
+        || !matches!(entry.retained, None | Some(RetainedInstall::Content(None)))
+        || state.entries.iter().any(|(id, entry)| {
+            entry.recovery_running
+                || (id != active && (entry.retained.is_some() || entry.recovery_lease.is_some()))
+        })
+    {
+        return Err(InstallError::SettlementRequired);
+    }
+    match &entry.request {
+        InstallQueueRequest::Content { instance_id, .. } => instance_id
+            .parse()
+            .map(Some)
+            .map_err(|_| InstallError::InvalidRequest),
+        _ => Err(InstallError::SettlementRequired),
+    }
+}
+
 enum WorkFailure {
     Failed(InstallError),
     Unsettled(RetainedInstall),
@@ -3347,6 +3427,14 @@ pub(crate) mod tests {
                 .shutdown(std::time::Duration::from_secs(1))
                 .await
                 .unwrap();
+            let receipt = owner.shutdown_receipt().unwrap();
+            let foreign = TaskOwner::new(1).unwrap();
+            foreign.try_close_idle().unwrap();
+            assert_eq!(
+                queue.preserve_shutdown(&foreign.shutdown_receipt().unwrap()),
+                Err(InstallError::Busy)
+            );
+            assert_eq!(queue.preserve_shutdown(&receipt), Err(InstallError::Busy));
             assert!(owner.status().is_idle());
             assert_eq!(
                 queue.inner.scheduling.load(Ordering::Acquire),
@@ -3364,6 +3452,8 @@ pub(crate) mod tests {
             }
             assert!(matches!(queue.observers(), Err(InstallError::Closed)));
             assert!(queue.inner.observers.lock().unwrap().tasks.is_empty());
+            queue.preserve_shutdown(&receipt).unwrap();
+            queue.preserve_shutdown(&receipt).unwrap();
             drop(blocker);
             drop(pin);
             queue.shutdown_queued().unwrap();

@@ -252,6 +252,38 @@ impl ServerHandle {
         if self.instances.has_pending_intents() {
             return Err("Reset is blocked while instance changes still require recovery.".into());
         }
+        if self.tasks.status().is_idle() && self.content_mutations.has_unsettled_effects() {
+            return Err("Reset is blocked while content changes still require recovery.".into());
+        }
+        Ok(())
+    }
+
+    pub fn ensure_reset_settled(&self) -> Result<(), String> {
+        self.ensure_reset_allowed()?;
+        if self.tasks.shutdown_receipt().is_none()
+            || self.content_mutations.has_unsettled_effects()
+            || self.installs.has_unsettled_effects()
+        {
+            return Err("Reset is blocked while file changes still require recovery.".into());
+        }
+        Ok(())
+    }
+
+    pub fn ensure_update_allowed(&self) -> Result<(), String> {
+        self.ensure_no_interrupted_launch()?;
+        if self.instances.has_pending_intents()
+            || self.instances.has_unsettled_effects()
+            || self.performance.has_unsettled_effects()
+            || self
+                .performance
+                .pending_count()
+                .map_or(true, |count| count != 0)
+            || self.content_mutations.has_unsettled_effects()
+            || self.resources.has_unsettled_effects()
+            || self.installs.has_unsettled_effects()
+        {
+            return Err("Update is blocked while file changes still require recovery.".into());
+        }
         Ok(())
     }
 
@@ -343,13 +375,8 @@ impl ServerHandle {
             let music = self.music.clone();
             let library = self.library.clone();
             *pending = Some(tokio::task::spawn_blocking(move || {
-                setup.release_shutdown_admissions(&receipt).map_err(|_| {
-                    "Instance setup effects have not settled. The local API remains available."
-                        .to_string()
-                })?;
                 if instances.has_unsettled_effects()
                     || performance.has_unsettled_effects()
-                    || content.has_unsettled_effects()
                     || resources.has_unsettled_effects()
                 {
                     return Err(
@@ -357,7 +384,15 @@ impl ServerHandle {
                             .into(),
                     );
                 }
-                installs.shutdown_queued().map_err(|_| {
+                content.release_shutdown_admissions(&receipt).map_err(|_| {
+                    "Content file effects have not settled. The local API remains available."
+                        .to_string()
+                })?;
+                setup.release_shutdown_admissions(&receipt).map_err(|_| {
+                    "Instance setup effects have not settled. The local API remains available."
+                        .to_string()
+                })?;
+                installs.preserve_shutdown(&receipt).map_err(|_| {
                     "Installation publication has not settled. The local API remains available."
                         .to_string()
                 })?;
