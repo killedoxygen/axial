@@ -84,6 +84,12 @@ impl MicrosoftAuthError {
         }
     }
 
+    fn request(error: reqwest::Error, step: MicrosoftAuthStep) -> Self {
+        let category = request_error_category(&error);
+        tracing::warn!(?step, category, "Microsoft sign-in transport failed");
+        Self::new(MicrosoftAuthErrorKind::Request, step)
+    }
+
     pub fn kind(&self) -> MicrosoftAuthErrorKind {
         self.kind
     }
@@ -138,6 +144,22 @@ impl fmt::Display for MicrosoftAuthError {
 }
 
 impl std::error::Error for MicrosoftAuthError {}
+
+fn request_error_category(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_builder() {
+        "builder"
+    } else if error.is_body() || error.is_decode() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "other"
+    }
+}
 
 pub struct MicrosoftLoginFlow {
     verifier: String,
@@ -600,12 +622,7 @@ async fn oauth_token(code: &str, verifier: &str) -> Result<OAuthToken, Microsoft
         ])
         .send()
         .await
-        .map_err(|_| {
-            MicrosoftAuthError::new(
-                MicrosoftAuthErrorKind::Request,
-                MicrosoftAuthStep::OAuthToken,
-            )
-        })?;
+        .map_err(|error| MicrosoftAuthError::request(error, MicrosoftAuthStep::OAuthToken))?;
 
     let current_date = get_date_header(response.headers());
     let body: OAuthTokenResponse = parse_response(response, MicrosoftAuthStep::OAuthToken).await?;
@@ -635,12 +652,7 @@ async fn oauth_refresh(refresh_token: &str) -> Result<OAuthToken, MicrosoftAuthE
         ])
         .send()
         .await
-        .map_err(|_| {
-            MicrosoftAuthError::new(
-                MicrosoftAuthErrorKind::Request,
-                MicrosoftAuthStep::OAuthRefresh,
-            )
-        })?;
+        .map_err(|error| MicrosoftAuthError::request(error, MicrosoftAuthStep::OAuthRefresh))?;
 
     let current_date = get_date_header(response.headers());
     let body: OAuthTokenResponse =
@@ -792,12 +804,7 @@ async fn minecraft_token(
         }))
         .send()
         .await
-        .map_err(|_| {
-            MicrosoftAuthError::new(
-                MicrosoftAuthErrorKind::Request,
-                MicrosoftAuthStep::MinecraftToken,
-            )
-        })?;
+        .map_err(|error| MicrosoftAuthError::request(error, MicrosoftAuthStep::MinecraftToken))?;
 
     parse_response(response, MicrosoftAuthStep::MinecraftToken).await
 }
@@ -812,11 +819,8 @@ async fn minecraft_entitlements(token: &str, endpoint: &str) -> Result<bool, Mic
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|_| {
-            MicrosoftAuthError::new(
-                MicrosoftAuthErrorKind::Request,
-                MicrosoftAuthStep::MinecraftEntitlements,
-            )
+        .map_err(|error| {
+            MicrosoftAuthError::request(error, MicrosoftAuthStep::MinecraftEntitlements)
         })?;
 
     let entitlements: MinecraftEntitlementsResponse =
@@ -839,12 +843,7 @@ async fn minecraft_profile(
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|_| {
-            MicrosoftAuthError::new(
-                MicrosoftAuthErrorKind::Request,
-                MicrosoftAuthStep::MinecraftProfile,
-            )
-        })?;
+        .map_err(|error| MicrosoftAuthError::request(error, MicrosoftAuthStep::MinecraftProfile))?;
 
     let profile: MinecraftProfile =
         parse_response(response, MicrosoftAuthStep::MinecraftProfile).await?;
@@ -917,7 +916,7 @@ async fn send_signed_request<T: DeserializeOwned>(
         .body(body)
         .send()
         .await
-        .map_err(|_| MicrosoftAuthError::new(MicrosoftAuthErrorKind::Request, step))?;
+        .map_err(|error| MicrosoftAuthError::request(error, step))?;
 
     let headers = response.headers().clone();
     let current_date = get_date_header(&headers);
@@ -959,7 +958,7 @@ async fn bounded_response_body(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| MicrosoftAuthError::new(MicrosoftAuthErrorKind::Request, step))?
+        .map_err(|error| MicrosoftAuthError::request(error, step))?
     {
         if body.len().saturating_add(chunk.len()) > MAX_MICROSOFT_AUTH_RESPONSE_BYTES {
             return Err(MicrosoftAuthError::new(MicrosoftAuthErrorKind::Parse, step));
@@ -1071,6 +1070,129 @@ pub fn validate_profile(profile: &MinecraftProfile) -> Result<(), MicrosoftAuthE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_safe_request_error(error: MicrosoftAuthError, step: MicrosoftAuthStep) {
+        assert_eq!(error.kind(), MicrosoftAuthErrorKind::Request);
+        assert_eq!(error.step(), step);
+        assert_eq!(error.provider_status(), None);
+        assert_eq!(
+            error.to_string(),
+            "failed to reach Microsoft sign-in services"
+        );
+        assert_eq!(error.user_message(), error.to_string());
+        assert!(!format!("{error:?}").contains("private-"));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[tokio::test]
+    async fn transport_diagnostics_classify_builder_and_timeout_without_private_details() {
+        let client = Client::builder().no_proxy().build().unwrap();
+        let error = client
+            .get("http://127.0.0.1/private-url-sentinel")
+            .bearer_auth("private-header-sentinel\n")
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(request_error_category(&error), "builder");
+        assert_safe_request_error(
+            MicrosoftAuthError::request(error, MicrosoftAuthStep::OAuthToken),
+            MicrosoftAuthStep::OAuthToken,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let request = client
+            .get(format!(
+                "http://{}/private-url-sentinel?code=private-code-sentinel",
+                listener.local_addr().unwrap()
+            ))
+            .bearer_auth("private-header-sentinel")
+            .timeout(Duration::from_millis(50))
+            .send();
+        let accepted = tokio::time::timeout(Duration::from_secs(2), listener.accept());
+        let (response, accepted) = tokio::join!(request, accepted);
+        let (_stream, _) = accepted
+            .expect("timeout fixture did not accept a connection")
+            .unwrap();
+        let error = response.unwrap_err();
+        assert_eq!(request_error_category(&error), "timeout");
+        assert_safe_request_error(
+            MicrosoftAuthError::request(error, MicrosoftAuthStep::OAuthRefresh),
+            MicrosoftAuthStep::OAuthRefresh,
+        );
+    }
+
+    async fn truncated_auth_response() -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/private-url-sentinel",
+            listener.local_addr().unwrap()
+        );
+        let (close, received_headers) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0; 1024];
+                let read = stream.read(&mut bytes).await.unwrap();
+                assert!(read > 0 && request.len() + read <= 8192);
+                request.extend_from_slice(&bytes[..read]);
+                if request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 128\r\nConnection: close\r\n\r\nprivate-body-sentinel")
+                .await
+                .unwrap();
+            received_headers.await.unwrap();
+        });
+        let response = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(endpoint)
+            .bearer_auth("private-header-sentinel")
+            .send()
+            .await
+            .unwrap();
+        close.send(()).unwrap();
+        server.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn transport_diagnostics_cover_truncated_entitlement_and_profile_bodies() {
+        let mut response = truncated_auth_response().await;
+        let error = loop {
+            match response.chunk().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("truncated body was accepted"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(request_error_category(&error), "body");
+        assert_safe_request_error(
+            MicrosoftAuthError::request(error, MicrosoftAuthStep::MinecraftEntitlements),
+            MicrosoftAuthStep::MinecraftEntitlements,
+        );
+
+        let error = parse_response::<MinecraftEntitlementsResponse>(
+            truncated_auth_response().await,
+            MicrosoftAuthStep::MinecraftEntitlements,
+        )
+        .await
+        .unwrap_err();
+        assert_safe_request_error(error, MicrosoftAuthStep::MinecraftEntitlements);
+        let error = parse_response::<MinecraftProfile>(
+            truncated_auth_response().await,
+            MicrosoftAuthStep::MinecraftProfile,
+        )
+        .await
+        .unwrap_err();
+        assert_safe_request_error(error, MicrosoftAuthStep::MinecraftProfile);
+    }
 
     #[tokio::test]
     async fn login_and_refresh_profile_admission_requires_positive_entitlements() {
