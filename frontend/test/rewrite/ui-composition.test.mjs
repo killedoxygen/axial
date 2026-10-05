@@ -370,6 +370,13 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
   const calls = [];
   /** @type {Array<Parameters<typeof import('../../src/toast').toast>>} */
   const toasts = [];
+  /** @type {string[]} */
+  const errors = [];
+  const utils = {
+    showError: /** @param {string} message */ (message) => {
+      errors.push(message);
+    },
+  };
   /** @param {string} id @param {boolean} launchable @returns {import('../../src/types-instance').EnrichedInstance} */
   function instance(id, launchable) {
     return {
@@ -474,7 +481,7 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
       './api': { api },
       './dto-core': core,
       './store': store,
-      './utils': { showError() {} },
+      './utils': utils,
     },
     { window: { setTimeout } },
   );
@@ -502,6 +509,7 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
       '../views/accounts/auth': auth,
       '../dto-core': core,
       '../instance-readiness': readiness,
+      '../utils': utils,
     },
     { console: { warn() {} } },
   );
@@ -510,6 +518,7 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
     machine,
     calls,
     toasts,
+    errors,
     store,
     readiness,
     instance,
@@ -565,6 +574,50 @@ test('an account change refreshes backend launch availability for every retained
   assert.equal(calls[calls.length - 1]?.[1], '/instances');
 });
 
+test('acknowledged account changes settle with a permanent instance refusal', async () => {
+  const h = accountRenameHarness();
+  await h.machine.refreshAccountsData();
+  h.store.instances.value = Array.from({ length: 7 }, (_, index) => h.instance(`retained-${index}`, false));
+  h.read(async (path, response) =>
+    path === '/instances'
+      ? {
+          instances: h.store.instances.value.map((row, index) => h.instance(row.id, index !== 3)),
+          last_instance_id: null,
+        }
+      : response,
+  );
+
+  assert.equal(await h.machine.saveOfflineIdentityName(activeAccount(h.machine), 'Renamed'), true);
+  assert.equal(h.machine.accountsOp.value, null);
+  assert.equal(h.machine.accountsNotice.value, null);
+  assert.equal(h.toasts.length, 1);
+  assert.deepEqual(
+    h.store.instances.value.map((row) => row.launch_action.launchable),
+    [true, true, true, false, true, true, true],
+  );
+  assert.equal(h.calls.filter(([, path]) => path === '/instances').length, 1);
+});
+
+test('an acknowledged account change stays successful when readiness is unavailable', async () => {
+  const h = accountRenameHarness();
+  await h.machine.refreshAccountsData();
+  const previous = h.store.instances.value;
+  h.read(async (path, response) => {
+    if (path === '/instances') throw new Error('private transport detail');
+    return response;
+  });
+  assert.equal(await h.machine.saveOfflineIdentityName(activeAccount(h.machine), 'Renamed'), true);
+  assert.equal(activeAccount(h.machine).display_name, 'Renamed');
+  assert.equal(h.machine.accountsNotice.value, null);
+  assert.equal(h.machine.accountsOp.value, null);
+  assert.equal(h.store.instances.value, previous);
+  assert.equal(h.toasts.length, 1);
+  assert.deepEqual(h.errors, ['Could not refresh launch availability. Refresh the launcher to check again.']);
+  assert.equal(h.calls.filter(([, path]) => path === '/instances').length, 1);
+  assert.equal(h.calls.filter(([, path]) => path === '/config').length, 1);
+  assert.equal(h.calls.filter(([method]) => method === 'PATCH').length, 1);
+});
+
 test('invalid rename confirmation reconciles accounts without publishing success or replaying mutation', async () => {
   const { machine, calls, toasts } = accountRenameHarness({ invalidReply: true });
   await machine.refreshAccountsData();
@@ -585,6 +638,22 @@ test('a lost committed account reply still refreshes readiness without replay or
   assert.equal(calls.filter(([, path]) => path === '/instances').length, 1);
   assert.match(machine.accountsNotice.value ?? '', /Account response lost/);
   assert.deepEqual(toasts, []);
+});
+
+test('a lost account reply retains bounded reconciliation for unavailable instances', async () => {
+  const h = accountRenameHarness({ lostReply: true });
+  await h.machine.refreshAccountsData();
+  h.read(async (path, response) =>
+    path === '/instances'
+      ? { instances: [h.instance('first', true), h.instance('second', false)], last_instance_id: null }
+      : response,
+  );
+  assert.equal(await h.machine.saveOfflineIdentityName(activeAccount(h.machine), 'Renamed'), false);
+  assert.equal(h.calls.filter(([method]) => method === 'PATCH').length, 1);
+  assert.equal(h.calls.filter(([, path]) => path === '/instances').length, 2);
+  assert.equal(h.store.instances.value[1].launch_action.launchable, false);
+  assert.match(h.machine.accountsNotice.value ?? '', /Account response lost/);
+  assert.deepEqual(h.toasts, []);
 });
 
 for (const accountless of [false, true]) {

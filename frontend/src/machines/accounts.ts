@@ -22,6 +22,7 @@ import {
 import type { AccountActionState, AuthStatusRecord, LauncherAccount } from '../views/accounts/types';
 import { configResponse } from '../dto-core';
 import { refreshInstanceReadiness } from '../instance-readiness';
+import { showError } from '../utils';
 import { config } from '../store';
 import type { Config } from '../types-settings';
 import { accountsSnapshot, activeAccount, type AccountsSnapshot } from './accounts-state';
@@ -111,7 +112,10 @@ function parseAuthStatus(value: unknown): AuthStatusRecord | null {
   return authStatusResponse(value);
 }
 
-async function afterAccountsChange(cancelled?: { config: Config | null; accounts: AccountsSnapshot }): Promise<void> {
+async function afterAccountsChange(
+  cancelled?: { config: Config | null; accounts: AccountsSnapshot },
+  acknowledged = false,
+): Promise<void> {
   let refreshedConfig: Config | null = null;
   try {
     refreshedConfig = configResponse(await api('GET', '/config'));
@@ -153,7 +157,12 @@ async function afterAccountsChange(cancelled?: { config: Config | null; accounts
       sameOnlineAction(previousAccount?.online_action, currentAccount?.online_action))
   )
     return;
-  await refreshInstanceReadiness();
+  if (!acknowledged) return refreshInstanceReadiness();
+  try {
+    await refreshInstanceReadiness(undefined, { retry: false });
+  } catch {
+    showError('Could not refresh launch availability. Refresh the launcher to check again.');
+  }
 }
 
 function sameOnlineAction(left: AccountActionState | undefined, right: AccountActionState | undefined): boolean {
@@ -222,7 +231,7 @@ async function runAccountsOp(
   try {
     const summary = await task();
     invalidateAccountsRead();
-    await afterAccountsChange(summary === null ? before : undefined);
+    await afterAccountsChange(summary === null ? before : undefined, summary !== null);
     if (summary && (accountsSnapshot.value.state !== 'ready' || (verify && !verify(accountsSnapshot.value)))) {
       throw new Error('The account request finished, but its current state could not be read. Refresh accounts.');
     }
