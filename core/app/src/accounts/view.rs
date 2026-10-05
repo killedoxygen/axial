@@ -1,11 +1,14 @@
 //! Public account projections contain identity and readiness, never secrets.
 
 use super::{
+    credential_store::CredentialError,
     credentials::Credentials,
     model::{AccountId, AccountKind, AccountRecord, LaunchAuthMode},
     session::{AuthError, AuthService, now_seconds},
 };
 use serde::Serialize;
+
+const STORAGE_UNAVAILABLE: &str = "Secure credential storage is unavailable.";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AccountActionState {
@@ -86,22 +89,26 @@ impl AuthService {
         let snapshot = self.directory().snapshot()?;
         let mut accounts = Vec::with_capacity(snapshot.accounts.len());
         for account in &snapshot.accounts {
+            let mut storage_unavailable = false;
             let credentials = if account.kind == AccountKind::Microsoft {
                 let capture =
                     super::selection::CapturedAccount::new(&snapshot, account.account_id.as_str())?;
                 match self.credentials(&capture).await {
                     Ok(credentials) => Some(credentials),
                     Err(AuthError::Account(error)) => return Err(error.into()),
-                    // A keyring outage cannot turn into a fabricated online
-                    // session. Preserve the identity with disabled actions.
+                    Err(AuthError::Credentials(CredentialError::Unavailable)) => {
+                        storage_unavailable = true;
+                        None
+                    }
                     Err(_) => None,
                 }
             } else {
                 None
             };
-            let readiness = readiness(Some(account), credentials.as_ref());
+            let readiness = readiness(Some(account), credentials.as_ref(), storage_unavailable);
             let detail = match account.kind {
                 AccountKind::Offline => "Offline identity",
+                AccountKind::Microsoft if storage_unavailable => STORAGE_UNAVAILABLE,
                 AccountKind::Microsoft if readiness.online_mode_ready => {
                     "Microsoft account ready for online play"
                 }
@@ -138,7 +145,7 @@ impl AuthService {
         let readiness = active
             .as_ref()
             .map(|account| account.readiness.clone())
-            .unwrap_or_else(|| readiness(None, None));
+            .unwrap_or_else(|| readiness(None, None, false));
         let microsoft = active
             .as_ref()
             .is_some_and(|account| account.identity.kind == AccountKind::Microsoft);
@@ -150,7 +157,9 @@ impl AuthService {
             "online_profile_ready",
             "Online profile ready",
             readiness.online_mode_ready,
-            if microsoft && !online {
+            if readiness.online_action.state_id == "online_credentials_unavailable" {
+                STORAGE_UNAVAILABLE
+            } else if microsoft && !online {
                 "The selected Microsoft account has not verified Minecraft Java ownership."
             } else {
                 "A verified Microsoft account is required for online profile actions."
@@ -193,6 +202,7 @@ impl AuthService {
 fn readiness(
     account: Option<&AccountRecord>,
     credentials: Option<&Credentials>,
+    storage_unavailable: bool,
 ) -> AccountReadiness {
     let microsoft = account.is_some_and(|a| a.kind == AccountKind::Microsoft);
     let now = now_seconds();
@@ -217,6 +227,14 @@ fn readiness(
             "",
             "Microsoft sign-in can be refreshed for Online mode.",
         )
+    } else if storage_unavailable {
+        action(
+            "online_credentials_unavailable",
+            "Credentials unavailable",
+            false,
+            STORAGE_UNAVAILABLE,
+            "",
+        )
     } else {
         action(
             "online_sign_in_required",
@@ -230,7 +248,7 @@ fn readiness(
             "",
         )
     };
-    if microsoft && !owned {
+    if microsoft && !owned && !storage_unavailable {
         online_action.detail =
             Some("The selected Microsoft account has not verified Minecraft Java ownership.");
     }
@@ -247,14 +265,22 @@ fn readiness(
             "refresh_available",
             "Refresh sign-in",
             refresh,
-            "Sign in with Microsoft again to refresh this account.",
+            if storage_unavailable {
+                STORAGE_UNAVAILABLE
+            } else {
+                "Sign in with Microsoft again to refresh this account."
+            },
             "Microsoft sign-in refreshed.",
         ),
         profile_sync_action: action(
             "profile_sync_available",
             "Sync profile",
             microsoft && game_expiry.is_some_and(|expiry| expiry > 0),
-            "Refresh Microsoft sign-in before syncing this profile.",
+            if storage_unavailable {
+                STORAGE_UNAVAILABLE
+            } else {
+                "Refresh Microsoft sign-in before syncing this profile."
+            },
             "Minecraft profile synced.",
         ),
     }
@@ -387,6 +413,10 @@ mod tests {
         assert_eq!(directory.snapshot().unwrap(), before);
         assert_eq!(list.accounts.len(), 1);
         assert_eq!(list.accounts[0].identity, before.accounts[0]);
+        assert_eq!(
+            serde_json::to_value(&list).unwrap()["accounts"][0]["view_model"]["detail"],
+            "Secure credential storage is unavailable."
+        );
         assert!(list.accounts[0].active);
         assert_eq!(list.active_account_id, before.active_account_id);
         assert_eq!(list.selection_revision, status.selection_revision);
@@ -397,6 +427,25 @@ mod tests {
         assert_eq!(status.minecraft_profile, Some(profile));
         assert!(status.login_available);
         assert!(!status.verified && !status.skin_action.enabled);
+        for response in [
+            serde_json::to_value(&list).unwrap()["accounts"][0].clone(),
+            serde_json::to_value(&status).unwrap(),
+        ] {
+            assert_eq!(
+                response["online_action"]["state_id"],
+                "online_credentials_unavailable"
+            );
+            for field in ["online_action", "refresh_action", "profile_sync_action"] {
+                assert_eq!(
+                    response[field]["disabled_reason"],
+                    "Secure credential storage is unavailable."
+                );
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["skin_action"]["disabled_reason"],
+            "Secure credential storage is unavailable."
+        );
         for readiness in [&list.accounts[0].readiness, &status.readiness] {
             assert!(readiness.minecraft_profile_ready);
             assert!(!readiness.msa_authenticated);
