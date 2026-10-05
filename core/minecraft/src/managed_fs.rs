@@ -166,6 +166,8 @@ struct ManagedRoot {
     file_identities: Mutex<Vec<Weak<ManagedFileProof>>>,
     #[cfg(test)]
     file_identity_comparisons: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    directory_revalidations: std::sync::atomic::AtomicUsize,
     publication_locks: Mutex<HashMap<PublicationLockKey, Weak<PublicationLock>>>,
     publication_mutex: Arc<tokio::sync::Mutex<()>>,
     install_flights: Mutex<HashMap<PortablePathKey, Weak<tokio::sync::Mutex<()>>>>,
@@ -1593,6 +1595,8 @@ impl ManagedDir {
             file_identities: Mutex::new(Vec::new()),
             #[cfg(test)]
             file_identity_comparisons: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            directory_revalidations: std::sync::atomic::AtomicUsize::new(0),
             publication_locks: Mutex::new(HashMap::new()),
             publication_mutex: Arc::new(tokio::sync::Mutex::new(())),
             install_flights: Mutex::new(HashMap::new()),
@@ -1643,6 +1647,8 @@ impl ManagedDir {
             file_identities: Mutex::new(Vec::new()),
             #[cfg(test)]
             file_identity_comparisons: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            directory_revalidations: std::sync::atomic::AtomicUsize::new(0),
             publication_locks: Mutex::new(HashMap::new()),
             publication_mutex: Arc::new(tokio::sync::Mutex::new(())),
             install_flights: Mutex::new(HashMap::new()),
@@ -1733,6 +1739,11 @@ impl ManagedDir {
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
+        #[cfg(test)]
+        self.inner
+            .root
+            .directory_revalidations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         verify_operation_admission(&self.inner.operation_pin)?;
         self.inner.root.require_settled()?;
         self.revalidate_locked_root()?;
@@ -5416,7 +5427,7 @@ impl FileBatchParent {
         if let Some(guard) = guard
             && !self
                 .directory
-                .file_guard_matches(name, guard)
+                .file_guard_matches_after_revalidation(name, guard)
                 .map_err(loader_io)?
         {
             return Err(io::Error::other(
@@ -5526,7 +5537,7 @@ impl ManagedLibraryFileBatch {
         let revision = parent.directory.passive_revision().map_err(loader_io)?;
         let guard = parent
             .directory
-            .inspect_regular_file(name)
+            .inspect_regular_file_after_revalidation(name)
             .map_err(loader_io)?;
         parent.finish_observation(name, &revision, guard.as_ref())?;
         self.operation.revalidate()?;
@@ -6914,6 +6925,38 @@ mod library_lifecycle_tests {
                 .is_none()
         );
         assert_eq!(batch.parent_walks, 2);
+    }
+
+    #[test]
+    fn file_batch_does_not_repeat_validated_leaf_checks() {
+        use std::sync::atomic::Ordering;
+
+        let (temporary, root, operation) = file_batch_fixture();
+        for index in 0..32 {
+            std::fs::write(
+                temporary
+                    .path()
+                    .join(format!("assets/objects/aa/asset-{index}")),
+                b"asset",
+            )
+            .unwrap();
+        }
+        let mut batch = operation.file_batch();
+        batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        let validations = &root.authority.root.inner.root.directory_revalidations;
+        validations.store(0, Ordering::Relaxed);
+        let mut last = None;
+        for index in 0..32 {
+            let file = batch
+                .observe_file(&batch_path(&format!("asset-{index}")))
+                .unwrap()
+                .unwrap();
+            assert_eq!(file.size(), 5);
+            last = Some(file);
+        }
+        let observed = validations.load(Ordering::Relaxed);
+        assert_eq!(last.unwrap().read_bounded(5).unwrap(), b"asset");
+        assert!(observed <= 32 * 28, "Repeated leaf validation: {observed}");
     }
 
     #[test]
