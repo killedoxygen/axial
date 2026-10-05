@@ -504,6 +504,31 @@ fn extend_preallocated_key(key: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn birth_time_ns(seconds: i64, nanos: i64) -> io::Result<u64> {
+    if seconds == 0 && nanos == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "filesystem birth time is unavailable",
+        ));
+    }
+    let seconds = u64::try_from(seconds).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "birth time precedes the Unix epoch",
+        )
+    })?;
+    let nanos = u64::try_from(nanos)
+        .ok()
+        .filter(|nanos| *nanos < 1_000_000_000)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "birth time nanos are invalid")
+        })?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(nanos))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "birth time overflowed"))
+}
+
 #[cfg(unix)]
 mod native {
     use super::*;
@@ -2179,6 +2204,43 @@ mod native {
             changed_seconds: stat.st_ctime,
             changed_nanos,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn directory_created_at_ns(handle: &DirectoryHandle) -> io::Result<u64> {
+        directory_identity(handle)?;
+        let stat = match rfs::statx(handle, "", AtFlags::EMPTY_PATH, rfs::StatxFlags::BTIME) {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOSYS | rustix::io::Errno::OPNOTSUPP) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "filesystem birth time is unavailable",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if stat.stx_mask & rfs::StatxFlags::BTIME.bits() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "filesystem birth time is unavailable",
+            ));
+        }
+        birth_time_ns(stat.stx_btime.tv_sec, i64::from(stat.stx_btime.tv_nsec))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn directory_created_at_ns(handle: &DirectoryHandle) -> io::Result<u64> {
+        directory_identity(handle)?;
+        let stat = rfs::fstat(handle)?;
+        birth_time_ns(stat.st_birthtime, stat.st_birthtime_nsec)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn directory_created_at_ns(_handle: &DirectoryHandle) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "filesystem birth time is unavailable",
+        ))
     }
 
     #[cfg(target_os = "linux")]
@@ -5962,6 +6024,30 @@ mod native {
             modified: basic.LastWriteTime,
             changed: basic.ChangeTime,
         })
+    }
+
+    pub(crate) fn directory_created_at_ns(handle: &DirectoryHandle) -> io::Result<u64> {
+        require_directory(handle)?;
+        let created = query_basic(handle)?.CreationTime;
+        if created == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "filesystem birth time is unavailable",
+            ));
+        }
+        let ticks = u64::try_from(created)
+            .ok()
+            .and_then(|created| created.checked_sub(WINDOWS_TO_UNIX_EPOCH_TICKS))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "birth time precedes the Unix epoch",
+                )
+            })?;
+        birth_time_ns(
+            (ticks / 10_000_000) as i64,
+            ((ticks % 10_000_000) * 100) as i64,
+        )
     }
 
     pub(crate) fn open_directory(

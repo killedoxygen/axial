@@ -10560,6 +10560,27 @@ impl Directory {
         Ok(self.inner.identity)
     }
 
+    /// Comparison evidence from physical identity and birth time, not authority.
+    /// Child edits preserve it; unavailable birth metadata refuses the proof.
+    /// Filesystems may reuse or permit changes to these values.
+    pub fn incarnation_witness(&self) -> io::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        let created_at_ns = platform::directory_created_at_ns(&self.inner.handle)?;
+        let mut digest = Sha256::new();
+        digest.update(b"axial-fs-directory-incarnation-v1");
+        digest.update(platform::identity_witness(self.inner.identity.physical));
+        digest.update(created_at_ns.to_le_bytes());
+        if platform::directory_created_at_ns(&self.inner.handle)? != created_at_ns {
+            return Err(identity_changed("directory birth time changed"));
+        }
+        self.validate(&operation)?;
+        Ok(digest.finalize().into())
+    }
+
     pub fn open_directory(&self, name: &LeafName) -> io::Result<Self> {
         let authority = self.authority()?;
         let operation = authority.enter()?;
@@ -11821,6 +11842,32 @@ impl FileCapability {
             size,
             stamp,
         })
+    }
+
+    /// Comparison evidence for a freshly admitted file, never filesystem authority.
+    /// Includes physical identity, size and revision, but not the root session.
+    pub fn revision_witness(&self) -> io::Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+
+        let authority = self.parent.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        let (size, stamp) = platform::file_receipt_fields(&self.handle)?;
+        let mut digest = Sha256::new();
+        digest.update(b"axial-fs-file-revision-v1");
+        digest.update(platform::identity_witness(self.identity));
+        digest.update(size.to_le_bytes());
+        let modified_at_ns = platform::file_modified_at_ns(stamp)
+            .map_err(|_| io::Error::from(io::ErrorKind::Unsupported))?;
+        let changed_at_ns = platform::file_changed_at_ns(stamp)
+            .map_err(|_| io::Error::from(io::ErrorKind::Unsupported))?;
+        digest.update(modified_at_ns.to_le_bytes());
+        digest.update(changed_at_ns.to_le_bytes());
+        if platform::file_receipt_fields(&self.handle)? != (size, stamp) {
+            return Err(identity_changed("file revision changed"));
+        }
+        self.validate(&operation)?;
+        Ok(digest.finalize().into())
     }
 
     pub fn park_request(self, expected: ExpectedFileContent) -> FileParkRequest {
@@ -19934,6 +19981,259 @@ mod tests {
     }
 
     #[test]
+    fn file_revision_witness_survives_root_reopen_and_fixed_width_encoding() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("record.bin"), b"payload").expect("file");
+        let leaf = LeafName::new("record.bin").expect("leaf");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let file = root.open_file(&leaf).expect("file capability");
+        let witness = file.revision_witness().expect("revision witness");
+        let encoded = hex::encode(witness);
+        assert_eq!(encoded.len(), 64);
+        let mut decoded = [0; 32];
+        hex::decode_to_slice(&encoded, &mut decoded).expect("fixed-width witness");
+        assert_eq!(decoded, witness);
+        assert!(hex::decode_to_slice(&encoded[..62], &mut decoded).is_err());
+        drop((file, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+
+        let reopened = acquire_test_root(temporary.path());
+        let root = reopened.root().expect("reopened root");
+        let file = root.open_file(&leaf).expect("reopened file");
+        assert_eq!(file.revision_witness().expect("reopened witness"), witness);
+        drop((file, root));
+        assert!(matches!(reopened.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn file_revision_witness_refuses_same_bytes_replacement_and_stale_binding() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        let path = temporary.path().join("record.bin");
+        std::fs::write(&path, b"payload").expect("file");
+        let leaf = LeafName::new("record.bin").expect("leaf");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let file = root.open_file(&leaf).expect("file capability");
+        let witness = file.revision_witness().expect("revision witness");
+        #[cfg(windows)]
+        drop(file);
+
+        std::fs::rename(&path, temporary.path().join("original.bin"))
+            .expect("retain original inode");
+        std::fs::write(&path, b"payload").expect("same bytes replacement");
+        #[cfg(unix)]
+        assert!(file.revision_witness().is_err());
+        let replacement = root.open_file(&leaf).expect("replacement capability");
+        assert_ne!(
+            replacement.revision_witness().expect("replacement witness"),
+            witness
+        );
+        #[cfg(unix)]
+        drop(file);
+        drop((replacement, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn file_revision_witness_refuses_in_place_size_and_equal_bytes_revision_changes() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        let path = temporary.path().join("record.bin");
+        std::fs::write(&path, b"payload").expect("file");
+        let writer = File::options().write(true).open(&path).expect("writer");
+        let original_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400);
+        writer
+            .set_times(std::fs::FileTimes::new().set_modified(original_time))
+            .expect("initial revision timestamp");
+        drop(writer);
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let leaf = LeafName::new("record.bin").expect("leaf");
+        let file = root.open_file(&leaf).expect("file capability");
+        let witness = file.revision_witness().expect("revision witness");
+        let identity = file.identity;
+        drop(file);
+
+        std::fs::write(&path, b"payload").expect("equal bytes in-place write");
+        let writer = File::options().write(true).open(&path).expect("writer");
+        writer
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(original_time + std::time::Duration::from_secs(86_400)),
+            )
+            .expect("distinct revision timestamp");
+        drop(writer);
+        let readmitted = root.open_file(&leaf).expect("same physical file");
+        assert!(readmitted.identity == identity);
+        let changed = readmitted.revision_witness().expect("changed witness");
+        assert_ne!(changed, witness);
+        drop(readmitted);
+
+        let writer = File::options().write(true).open(&path).expect("writer");
+        writer.set_len(1).expect("in-place size change");
+        drop(writer);
+        let file = root.open_file(&leaf).expect("resized file");
+        assert_ne!(file.revision_witness().expect("resized witness"), changed);
+        drop((file, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn file_revision_witness_refuses_unrepresentable_metadata() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        let path = temporary.path().join("record.bin");
+        std::fs::write(&path, b"payload").expect("file");
+        let writer = File::options().write(true).open(&path).expect("writer");
+        writer
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)),
+            )
+            .expect("pre-epoch timestamp");
+        drop(writer);
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let file = root
+            .open_file(&LeafName::new("record.bin").expect("leaf"))
+            .expect("file capability");
+        assert!(file.revision().expect("revision").modified_at_ns().is_err());
+        assert_eq!(
+            file.revision_witness()
+                .expect_err("unsupported timestamp must not lose revision evidence")
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        drop((file, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn file_revision_witness_refuses_revoked_authority() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("record.bin"), b"payload").expect("file");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let file = root
+            .open_file(&LeafName::new("record.bin").expect("leaf"))
+            .expect("file capability");
+        file.revision_witness().expect("live witness");
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(
+            file.revision_witness()
+                .expect_err("revoked authority must refuse")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn directory_incarnation_witness_survives_child_cleanup_and_root_reopen() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        let path = temporary.path().join("staged");
+        std::fs::create_dir(&path).expect("staged directory");
+        std::fs::write(path.join("payload.bin"), b"payload").expect("staged payload");
+        let leaf = LeafName::new("staged").expect("leaf");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let directory = root.open_directory(&leaf).expect("directory capability");
+        let witness = match directory.incarnation_witness() {
+            Ok(witness) => witness,
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                eprintln!(
+                    "filesystem birth time unavailable; no cleanup-stability proof exercised"
+                );
+                drop((directory, root));
+                assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+                return;
+            }
+        };
+        std::fs::remove_file(path.join("payload.bin")).expect("remove staged payload");
+        assert_eq!(
+            directory.incarnation_witness().expect("cleaned witness"),
+            witness
+        );
+        drop((directory, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+
+        let reopened = acquire_test_root(temporary.path());
+        let root = reopened.root().expect("reopened root");
+        let directory = root.open_directory(&leaf).expect("reopened directory");
+        assert_eq!(
+            directory.incarnation_witness().expect("reopened witness"),
+            witness
+        );
+        drop((directory, root));
+        assert!(matches!(reopened.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn directory_incarnation_witness_refuses_replacement_and_stale_binding() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        let path = temporary.path().join("staged");
+        std::fs::create_dir(&path).expect("staged directory");
+        let leaf = LeafName::new("staged").expect("leaf");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let directory = root.open_directory(&leaf).expect("directory capability");
+        let witness = match directory.incarnation_witness() {
+            Ok(witness) => witness,
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+                eprintln!("filesystem birth time unavailable; no replacement proof exercised");
+                drop((directory, root));
+                assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+                return;
+            }
+        };
+        std::fs::rename(&path, temporary.path().join("original"))
+            .expect("retain original directory");
+        std::fs::create_dir(&path).expect("replacement directory");
+        assert!(directory.incarnation_witness().is_err());
+        let replacement = root.open_directory(&leaf).expect("replacement capability");
+        assert_ne!(
+            replacement
+                .incarnation_witness()
+                .expect("replacement witness"),
+            witness
+        );
+        drop((replacement, directory, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn directory_incarnation_witness_refuses_unavailable_birth_metadata() {
+        for (seconds, nanos) in [(0, 0), (-1, 0), (1, -1), (1, 1_000_000_000), (i64::MAX, 0)] {
+            assert_eq!(
+                platform::birth_time_ns(seconds, nanos)
+                    .expect_err(
+                        "unrepresentable birth metadata must not become an identity-only proof"
+                    )
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+        assert_eq!(
+            platform::birth_time_ns(1, 23).expect("exact timestamp"),
+            1_000_000_023
+        );
+    }
+
+    #[test]
+    fn directory_incarnation_witness_refuses_revoked_authority() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(
+            root.incarnation_witness()
+                .expect_err("revoked authority must refuse before metadata inspection")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn move_topology_never_reclassifies_reported_success_as_no_effect() {
         assert_eq!(
             classify_move_topology(
@@ -20286,16 +20586,17 @@ mod tests {
         );
         assert_eq!(platform::lease_name_class_scan_count(), 1);
 
-        #[cfg(windows)]
         let root = session.root().expect("root revision capability");
-        #[cfg(windows)]
-        let cached_revision = root.revision().expect("cached root revision");
+        let cached_revision =
+            platform::directory_revision(&root.inner.handle).expect("direct cached root revision");
         std::fs::remove_file(sibling).expect("remove cooperative sibling");
-        #[cfg(windows)]
         let revision_witnesses = {
             let mut witnesses = Vec::new();
             for attempt in 0..32 {
-                if root.revision().expect("changed root revision") != cached_revision {
+                if platform::directory_revision(&root.inner.handle)
+                    .expect("direct changed root revision")
+                    != cached_revision
+                {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -20303,10 +20604,11 @@ mod tests {
                 std::fs::write(&witness, b"owned").expect("create root revision witness");
                 witnesses.push(witness);
             }
-            assert_ne!(
-                root.revision().expect("observed changed root revision"),
-                cached_revision,
-                "Windows must expose a real root revision change before cache invalidation",
+            assert!(
+                platform::directory_revision(&root.inner.handle)
+                    .expect("direct observed root revision")
+                    != cached_revision,
+                "must observe a real root revision change before cache invalidation",
             );
             witnesses
         };
@@ -20317,12 +20619,9 @@ mod tests {
                 .expect("second changed-root validation"),
         );
         assert_eq!(platform::lease_name_class_scan_count(), 2);
-        #[cfg(windows)]
-        {
-            drop(root);
-            for witness in revision_witnesses {
-                std::fs::remove_file(witness).expect("remove root revision witness");
-            }
+        drop(root);
+        for witness in revision_witnesses {
+            std::fs::remove_file(witness).expect("remove root revision witness");
         }
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
