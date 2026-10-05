@@ -9,6 +9,13 @@ const CRASH_COLLECTION_LIMIT: usize = 2;
 const HEAVY_IO_LIMIT: usize = 1;
 const SCRATCH_UNIT_BYTES: u64 = 1 << 20;
 const SCRATCH_LIMIT_BYTES: u64 = 512 << 20;
+const PROCESS_LIMITS: PhysicalWorkLimits = PhysicalWorkLimits {
+    workers: PROCESS_WORKER_LIMIT,
+    background: BACKGROUND_WORKER_LIMIT,
+    crash: CRASH_COLLECTION_LIMIT,
+    heavy: HEAVY_IO_LIMIT,
+    scratch_bytes: SCRATCH_LIMIT_BYTES,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PhysicalWorkClass {
@@ -190,19 +197,16 @@ enum PhysicalWorkOutput<T> {
 pub fn process_physical_work() -> PhysicalWorkOwner {
     static OWNER: OnceLock<PhysicalWorkOwner> = OnceLock::new();
     OWNER
-        .get_or_init(|| {
-            PhysicalWorkOwner::new(PhysicalWorkLimits {
-                workers: PROCESS_WORKER_LIMIT,
-                background: BACKGROUND_WORKER_LIMIT,
-                crash: CRASH_COLLECTION_LIMIT,
-                heavy: HEAVY_IO_LIMIT,
-                scratch_bytes: SCRATCH_LIMIT_BYTES,
-            })
-        })
+        .get_or_init(|| PhysicalWorkOwner::new(PROCESS_LIMITS))
         .clone()
 }
 
 impl PhysicalWorkOwner {
+    #[cfg(feature = "test-support")]
+    pub fn isolated_for_test() -> Self {
+        Self::new(PROCESS_LIMITS)
+    }
+
     fn new(limits: PhysicalWorkLimits) -> Self {
         let scratch_units = limits.scratch_bytes.div_ceil(SCRATCH_UNIT_BYTES);
         let scratch_units = usize::try_from(scratch_units).expect("scratch unit count fits usize");

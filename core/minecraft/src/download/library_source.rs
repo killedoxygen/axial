@@ -33,7 +33,7 @@ use crate::managed_component_table::ManagedComponentArtifactKind;
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedPublicationLifetimeGuard;
 use crate::portable_path::{PortablePathKey, PortableRelativePath};
-use axial_resource::{PhysicalScratchPermit, process_physical_work};
+use axial_resource::{PhysicalScratchPermit, PhysicalWorkOwner, process_physical_work};
 use futures_util::StreamExt as _;
 use sha1::{Digest as _, Sha1};
 use std::collections::BTreeMap;
@@ -65,6 +65,7 @@ const ZIP_MAX_COMMENT_BYTES: usize = u16::MAX as usize;
 #[derive(Clone)]
 pub(super) struct LibrarySourcePool {
     acquisition_permits: Arc<Semaphore>,
+    physical: PhysicalWorkOwner,
     spool: Arc<RetainedComponentSourceSpool>,
     workers: ManagedBlockingWorkers,
 }
@@ -85,6 +86,7 @@ impl LibrarySourcePool {
     ) -> Result<Self, DownloadError> {
         Ok(Self {
             acquisition_permits: Arc::new(Semaphore::new(LIBRARY_SOURCE_BUDGET_UNITS as usize)),
+            physical: process_physical_work(),
             spool: RetainedComponentSourceSpool::new(retained_bytes)
                 .map_err(retained_spool_download_error)?,
             workers,
@@ -107,7 +109,8 @@ impl LibrarySourcePool {
             .acquire_many_owned(units)
             .await
             .map_err(|_| source_integrity_error("scratch budget is closed"))?;
-        let global = process_physical_work()
+        let global = self
+            .physical
             .reserve_scratch(hard_limit)
             .await
             .map_err(|_| source_integrity_error("process scratch budget is closed"))?
@@ -1687,8 +1690,9 @@ mod tests {
     ) {
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let pool = LibrarySourcePool::with_retained_limit(retained_bytes, workers.clone())
+        let mut pool = LibrarySourcePool::with_retained_limit(retained_bytes, workers.clone())
             .expect("test component source pool");
+        pool.physical = PhysicalWorkOwner::isolated_for_test();
         (pool, workers, attempt)
     }
 
@@ -3131,6 +3135,36 @@ mod tests {
         assert_eq!(hook_exited.load(Ordering::Acquire), 1);
         assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
         assert_eq!(pool.retained_available_bytes(), MAX_TIER2_AGGREGATE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn fixture_scratch_does_not_wait_behind_unrelated_process_reservations() {
+        let physical = process_physical_work();
+        let foreign_permit = physical
+            .reserve_scratch(33 << 20)
+            .await
+            .expect("foreign scratch reservation")
+            .expect("positive foreign scratch reservation");
+        let (pool, _workers, _attempt) = source_pool_for_test();
+        let first = pool.reserve(33 << 20).await.expect("first fixture source");
+        let mut foreign_full = Box::pin(physical.reserve_scratch(LIBRARY_SOURCE_MAX_BYTES));
+        let foreign_pending = tokio::time::timeout(Duration::from_millis(25), &mut foreign_full)
+            .await
+            .is_err();
+        let second_admitted = tokio::time::timeout(Duration::from_secs(1), pool.reserve(33 << 20))
+            .await
+            .is_ok_and(|result| result.is_ok());
+        drop(foreign_full);
+        drop(first);
+        drop(foreign_permit);
+        assert!(
+            foreign_pending,
+            "foreign full-budget request must be queued"
+        );
+        assert!(
+            second_admitted,
+            "an unrelated process reservation must not block the fixture's aggregate budget"
+        );
     }
 
     #[tokio::test]
