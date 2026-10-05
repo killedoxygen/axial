@@ -4059,6 +4059,250 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_exit_after_content_staging_preserves_restart_fence() {
+        use crate::library::LibraryId;
+        use std::{path::Path, process::Command, time::Duration};
+
+        const ROOT: &str = "AXIAL_CONTENT_STAGED_CRASH_ROOT";
+        const LIBRARY: &str = "AXIAL_CONTENT_STAGED_CRASH_LIBRARY";
+        const EXIT: i32 = 42;
+        const ORIGINAL: &[u8] = b"{\"schema_version\":3,\"entries\":[]}\n";
+
+        fn open(root: &Path, library_id: LibraryId) -> ContentMutations {
+            let library = match LibraryLifecycle::open_with_id(root, library_id) {
+                LibraryOpenOutcome::Ready(library) => library,
+                other => panic!("content crash fixture root: {other:?}"),
+            };
+            let storage = Arc::new(MetadataStore::open(root.join("metadata.sqlite")).unwrap());
+            storage
+                .migrate(&[
+                    crate::instances::directory::MIGRATION,
+                    crate::instances::create::MIGRATION,
+                    crate::instances::delete::MIGRATION,
+                    MIGRATION,
+                    crate::performance::mutation::MIGRATION,
+                    crate::performance::rules::MIGRATION,
+                ])
+                .unwrap();
+            let directories = InstanceDirectories::new(
+                Registry::new(storage.clone()),
+                library,
+                Exclusions::new(),
+            );
+            let tasks = TaskOwner::new(8).unwrap();
+            let client = ProviderClient::new(ClientConfig::default()).unwrap();
+            let performance = crate::performance::PerformanceService::new(
+                storage,
+                directories.clone(),
+                tasks.clone(),
+                Arc::new(ContentService::new(client.clone()).unwrap()),
+                crate::performance::public_transfer_resolver(),
+            )
+            .unwrap();
+            ContentMutations::new(directories, client, tasks).with_performance(performance)
+        }
+
+        fn pending(owner: &ContentMutations, id: &InstanceId) -> String {
+            owner
+                .directories
+                .registry()
+                .storage()
+                .read(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
+                            [id.as_str()],
+                            |row| row.get(0),
+                        )
+                        .map_err(StorageError::from)
+                })
+                .unwrap()
+        }
+
+        fn files(root: &Path) -> BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+            use std::io::Read;
+            let mut pending = vec![root.to_path_buf()];
+            let mut files = BTreeMap::new();
+            let mut bytes = 0;
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let path = entry.unwrap().path();
+                    let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                    assert!(files.len() < 32 && relative.components().count() <= 4);
+                    let metadata = std::fs::symlink_metadata(&path).unwrap();
+                    let value = if metadata.is_dir() {
+                        pending.push(path);
+                        None
+                    } else {
+                        assert!(metadata.is_file() && metadata.len() <= 16 * 1024);
+                        let mut body = Vec::new();
+                        std::fs::File::open(&path)
+                            .unwrap()
+                            .take(16 * 1024 + 1)
+                            .read_to_end(&mut body)
+                            .unwrap();
+                        assert_eq!(body.len() as u64, metadata.len());
+                        bytes += body.len();
+                        assert!(bytes <= 64 * 1024);
+                        Some(body)
+                    };
+                    files.insert(relative, value);
+                }
+            }
+            files
+        }
+
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = std::path::PathBuf::from(root);
+            assert_eq!(root.canonicalize().unwrap(), root);
+            let library_id = LibraryId::parse(&std::env::var(LIBRARY).unwrap()).unwrap();
+            let owner = open(&root, library_id);
+            let instances = InstanceService::new(owner.directories.clone(), owner.tasks.clone());
+            let instance = instances
+                .create(
+                    CreateInstanceRequest {
+                        name: "Content crash fixture".into(),
+                        selection_id: "vanilla|1.21.4".into(),
+                        ..Default::default()
+                    },
+                    CreateTarget {
+                        selection_id: "vanilla|1.21.4".into(),
+                        version_id: "1.21.4".into(),
+                        minecraft_version: "1.21.4".into(),
+                        loader_key: "vanilla".into(),
+                    },
+                )
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap();
+            let game = root.join("instances").join(instance.id.as_str());
+            std::fs::write(game.join(MANIFEST_FILE), ORIGINAL).unwrap();
+            std::fs::write(game.join("config/user.txt"), b"unrelated payload").unwrap();
+            let observer = owner.clone();
+            let id = instance.id.clone();
+            let reporting = owner.clone().with_progress(Arc::new(move |event| {
+                if event.phase != "content_commit" || event.current != 0 {
+                    return;
+                }
+                assert_eq!(event.total, 1);
+                assert!(!event.done);
+                let receipt: Receipt = serde_json::from_str(&pending(&observer, &id)).unwrap();
+                validate_receipt(&receipt).unwrap();
+                assert!(!receipt.native_settled);
+                assert_eq!(receipt.before_manifest.as_deref(), Some(ORIGINAL));
+                assert_eq!(receipt.changes.len(), 1);
+                assert_eq!(receipt.changes[0].path, "config/staged.txt");
+                assert_eq!(receipt.changes[0].after, Some(Proof::bytes(b"new payload")));
+                assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), ORIGINAL);
+                assert_eq!(
+                    std::fs::read(game.join("config/user.txt")).unwrap(),
+                    b"unrelated payload"
+                );
+                assert!(!game.join("config/staged.txt").exists());
+                // This production callback follows native stage(), before commit().
+                std::process::exit(EXIT);
+            }));
+            let result = reporting
+                .install_pack(
+                    &catalog(&owner),
+                    &instance.id,
+                    pack(&[], &[("overrides/config/staged.txt", b"new payload")]),
+                    true,
+                )
+                .unwrap()
+                .join()
+                .await;
+            panic!("content did not reach the staged crash boundary: {result:?}");
+        }
+
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let library_id = LibraryId::new();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "content::install::tests::hard_exit_after_content_staging_preserves_restart_fence",
+                "--nocapture",
+            ])
+            .env(ROOT, root.path())
+            .env(LIBRARY, library_id.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let timed_out = child.try_wait().unwrap().is_none();
+        if timed_out {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !timed_out && output.status.code() == Some(EXIT),
+            "staged crash boundary not reached: {:?}; {} {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut before = None;
+        for _ in 0..2 {
+            let owner = open(root.path(), library_id);
+            let records = owner.directories.registry().list().unwrap();
+            assert_eq!(records.len(), 1);
+            let id = &records[0].instance.id;
+            let game = root.path().join("instances").join(id.as_str());
+            let receipt = pending(&owner, id);
+            let snapshot = files(&game);
+            if let Some((record, tree)) = &before {
+                assert_eq!((&receipt, &snapshot), (record, tree));
+            } else {
+                before = Some((receipt.clone(), snapshot.clone()));
+            }
+            assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), ORIGINAL);
+            assert_eq!(
+                std::fs::read(game.join("config/user.txt")).unwrap(),
+                b"unrelated payload"
+            );
+            assert!(!game.join("config/staged.txt").exists());
+            assert!(matches!(
+                owner.installed(id),
+                Err(MutationError::Unavailable)
+            ));
+            assert!(matches!(
+                owner.directories.admit_read(id),
+                Err(crate::instances::model::InstanceError::Busy)
+            ));
+            assert!(matches!(
+                owner.directories.admit(id),
+                Err(crate::instances::model::InstanceError::Busy)
+            ));
+            let admitted = owner
+                .directories
+                .admit_content_settlement(id)
+                .expect("only settlement admission may bypass the content fence");
+            let record: Receipt = serde_json::from_str(&receipt).unwrap();
+            validate_receipt(&record).unwrap();
+            validate_instance(&admitted, &record).unwrap();
+            assert!(!record.native_settled);
+            drop(admitted);
+            assert!(matches!(
+                owner.resume(id).unwrap().join().await.unwrap(),
+                Err(MutationError::Pending)
+            ));
+            assert!(owner.has_unsettled_effects());
+            assert!(owner.directories.admit(id).is_err());
+            owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
+            owner.directories.library().try_preserve().unwrap();
+            assert_eq!(pending(&owner, id), receipt);
+            assert_eq!(files(&game), snapshot);
+        }
+    }
+
+    #[tokio::test]
     async fn identified_pack_member_remains_manageable_when_display_metadata_fails() {
         let (root, owner, id) = fixture().await;
         let instance = owner.directories.admit(&id).unwrap();
