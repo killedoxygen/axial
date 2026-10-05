@@ -2491,13 +2491,15 @@ if [ ! -e {processor_state} ]; then
   printf '%s\n' "$$" > {cancelled_leader}
   printf '%s\n' "$PWD" > {cancelled_workspace}
   sleep 30 &
-  printf '%s\n' "$!" > {cancelled_descendant}
+  printf '%s\n' "$!" > {cancelled_descendant}.tmp || exit 1
+  mv {cancelled_descendant}.tmp {cancelled_descendant} || exit 1
   wait
   exit 1
 fi
 printf '%s\n' "$PWD" > {successful_workspace}
 sleep 30 &
-printf '%s\n' "$!" > {successful_descendant}
+printf '%s\n' "$!" > {successful_descendant}.tmp || exit 1
+mv {successful_descendant}.tmp {successful_descendant} || exit 1
 printf '%s' 'processor-terminal' > "$last"
 "#,
             processor_state = shell_quote_path(&processor_state),
