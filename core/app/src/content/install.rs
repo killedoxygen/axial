@@ -1326,25 +1326,28 @@ impl ContentMutations {
         })
     }
 
-    fn checkpoint_ready(
+    fn persist_checkpoint(
         &self,
         receipt: &mut Receipt,
-        ready: &ManagedContentReadyTransaction,
+        checkpoint: Result<Option<&ManagedContentStagingCheckpoint>, ManagedContentCheckpointError>,
     ) -> Result<(), MutationError> {
-        let previous = encoded_receipt(receipt)?;
-        let budget =
-            MAX_RECEIPT_BYTES.saturating_sub(previous.len() + ",\"ready_checkpoint\":\"\"".len());
-        if budget == 0 {
-            return Ok(());
-        }
-        let checkpoint = match ready.checkpoint(checkpoint_binding(receipt)?) {
-            Ok(checkpoint) => checkpoint,
+        let checkpoint = match checkpoint {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => return Ok(()),
             Err(
                 ManagedContentCheckpointError::Unsupported
                 | ManagedContentCheckpointError::Capacity,
             ) => return Ok(()),
             Err(_) => return Err(MutationError::Changed),
         };
+        let previous = encoded_receipt(receipt)?;
+        let mut next = receipt.clone();
+        next.ready_checkpoint = None;
+        let budget = MAX_RECEIPT_BYTES
+            .saturating_sub(encoded_receipt(&next)?.len() + ",\"ready_checkpoint\":\"\"".len());
+        if budget == 0 {
+            return Ok(());
+        }
         let checkpoint = match checkpoint.encode(budget) {
             Ok(checkpoint) => checkpoint,
             Err(
@@ -1353,7 +1356,6 @@ impl ContentMutations {
             ) => return Ok(()),
             Err(_) => return Err(MutationError::Changed),
         };
-        let mut next = receipt.clone();
         next.ready_checkpoint = Some(checkpoint);
         match encoded_receipt(&next) {
             Ok(_) => {}
@@ -1428,9 +1430,9 @@ impl ContentMutations {
             if restarting && !receipt.native_settled {
                 let recovery = (|| {
                     let checkpoint = receipt.ready_checkpoint.as_deref().ok_or(MutationError::Pending)?;
-                    let checkpoint = ManagedContentReadyCheckpoint::decode(checkpoint).map_err(|_| MutationError::Pending)?;
+                    let checkpoint = ManagedContentStagingCheckpoint::decode(checkpoint).map_err(|_| MutationError::Pending)?;
                     transaction_root(&instance, receipt.pack.is_some())?
-                        .restore_ready_checkpoint(checkpoint, checkpoint_binding(&receipt)?)
+                        .restore_staging_checkpoint(checkpoint, checkpoint_binding(&receipt)?)
                         .map_err(|_| MutationError::Pending)
                 })();
                 let Ok(recovery) = recovery else { return owner.retain_blocked(instance, Vec::new(), true); };
@@ -2312,6 +2314,7 @@ async fn apply_streamed(
     // Before native preparation every refusal has no payload effects. Once
     // prepared, all exits below consume the native outcome or retain recovery.
     effects.push(Effect::RolledBack);
+    let checkpoint_binding = checkpoint_binding(receipt)?;
     let root = transaction_root(instance, receipt.pack.is_some())?;
     let planning = root
         .observe_manifest()
@@ -2446,6 +2449,20 @@ async fn apply_streamed(
         }
     };
     loop {
+        if let Err(error) =
+            owner.persist_checkpoint(receipt, transfers.checkpoint(checkpoint_binding))
+        {
+            return unwind_outcome(transfers.cancel(), effects, error);
+        }
+        if completed > 0 {
+            report_progress(
+                progress,
+                "content_download",
+                completed,
+                payload_count,
+                Some((bytes_done, bytes_total)),
+            );
+        }
         match transfers.next() {
             ManagedContentTransferStep::Issued(issued) => {
                 if cancel.is_cancelled() {
@@ -2547,21 +2564,17 @@ async fn apply_streamed(
                 };
                 completed += 1;
                 bytes_done += size;
-                report_progress(
-                    progress,
-                    "content_download",
-                    completed,
-                    payload_count,
-                    Some((bytes_done, bytes_total)),
-                );
             }
             ManagedContentTransferStep::Complete(complete) => {
                 return match complete.stage() {
-                    ManagedContentStageOutcome::Ready(ready) => {
+                    ManagedContentStageOutcome::Ready(mut ready) => {
                         if cancel.is_cancelled() {
                             return transaction_outcome(ready.cancel(), effects);
                         }
-                        if let Err(error) = owner.checkpoint_ready(receipt, &ready) {
+                        if let Err(error) = owner.persist_checkpoint(
+                            receipt,
+                            ready.checkpoint(checkpoint_binding).map(Some),
+                        ) {
                             return unwind_outcome(ready.cancel(), effects, error);
                         }
                         report_progress(progress, "content_commit", 0, 1, None);
@@ -2688,6 +2701,17 @@ mod tests {
             }),
             overrides,
         )
+    }
+
+    fn prefix_pack() -> ResolvedPack {
+        let paths = (0..513)
+            .map(|index| format!("overrides/config/prefix-{index:04}.txt"))
+            .collect::<Vec<_>>();
+        let overrides = paths
+            .iter()
+            .map(|path| (path.as_str(), b"new payload".as_slice()))
+            .collect::<Vec<_>>();
+        pack(&[], &overrides)
     }
 
     fn pack_with_index(index: serde_json::Value, overrides: &[(&str, &[u8])]) -> ResolvedPack {
@@ -4200,6 +4224,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_exit_after_512_content_payloads_rolls_back_recorded_prefix() {
+        content_crash_restart(false, Some("prefix")).await;
+    }
+
+    #[tokio::test]
     async fn hard_exit_after_content_metadata_commit_preserves_publication() {
         content_crash_restart(true, None).await;
     }
@@ -4335,6 +4364,67 @@ mod tests {
         assert!(!owner.has_unsettled_effects());
         assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).ok(), original);
         assert!(!game.join("config/cancelled.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn staged_prefix_checkpoint_refusal_cancels_before_reporting_completion() {
+        for rewrite in [false, true] {
+            let (root, owner, id) = fixture().await;
+            let game = root.path().join("instances").join(id.as_str());
+            let original = std::fs::read(game.join(MANIFEST_FILE)).ok();
+            let original_children = std::fs::read_dir(&game)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<HashSet<_>>();
+            let registry = owner.directories.registry().clone();
+            let captured_id = id.clone();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let received = events.clone();
+            let reporting = owner.clone().with_progress(Arc::new(move |event| {
+                assert_ne!(event.phase, "content_commit");
+                if event.phase != "content_download" { return; }
+                received.lock().unwrap().push(event.current);
+                if event.current != 511 { return; }
+                let recorded: String = registry.storage().read(|db| db.query_row(
+                    "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
+                    [captured_id.as_str()], |row| row.get(0),
+                ).map_err(StorageError::from)).unwrap();
+                let receipt: Receipt = serde_json::from_str(&recorded).unwrap();
+                assert!(!receipt.native_settled && receipt.ready_checkpoint.is_some());
+                registry.storage().transaction(|db| db.execute_batch(if rewrite {
+                    "CREATE TRIGGER refuse_prefix AFTER UPDATE ON content_batches
+                     BEGIN UPDATE content_batches SET receipt_json=OLD.receipt_json WHERE instance_id=NEW.instance_id; END;"
+                } else {
+                    "CREATE TRIGGER refuse_prefix BEFORE UPDATE ON content_batches BEGIN SELECT RAISE(IGNORE); END;"
+                }).map_err(StorageError::from)).unwrap();
+            }));
+            let result = reporting
+                .install_pack(&catalog(&owner), &id, prefix_pack(), true)
+                .unwrap()
+                .join()
+                .await
+                .unwrap();
+            owner
+                .tasks
+                .shutdown(std::time::Duration::from_secs(2))
+                .await
+                .unwrap();
+            owner.directories.library().try_preserve().unwrap();
+            assert!(matches!(result, Err(MutationError::Changed)), "{result:?}");
+            assert_eq!(events.lock().unwrap().last(), Some(&511));
+            assert!(!owner.has_unsettled_effects());
+            assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).ok(), original);
+            assert_eq!(
+                std::fs::read_dir(&game)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<HashSet<_>>(),
+                original_children
+            );
+            for index in 0..513 {
+                assert!(!game.join(format!("config/prefix-{index:04}.txt")).exists());
+            }
+        }
     }
 
     #[tokio::test]
@@ -4488,6 +4578,7 @@ mod tests {
         const ORIGINAL: &[u8] = b"{\"schema_version\":3,\"entries\":[]}\n";
         const WITNESS: &str = "committed-tree.json";
         const WITNESS_BYTES: usize = 512 * 1024;
+        let prefix = checkpoint_fault == Some("prefix");
 
         fn open(root: &Path, library_id: LibraryId) -> ContentMutations {
             let library = match LibraryLifecycle::open_with_id(root, library_id) {
@@ -4550,22 +4641,22 @@ mod tests {
                 for entry in std::fs::read_dir(directory).unwrap() {
                     let path = entry.unwrap().path();
                     let relative = path.strip_prefix(root).unwrap().to_path_buf();
-                    assert!(files.len() < 32 && relative.components().count() <= 4);
+                    assert!(files.len() < 1024 && relative.components().count() <= 4);
                     let metadata = std::fs::symlink_metadata(&path).unwrap();
                     let value = if metadata.is_dir() {
                         pending.push(path);
                         None
                     } else {
-                        assert!(metadata.is_file() && metadata.len() <= 16 * 1024);
+                        assert!(metadata.is_file() && metadata.len() <= 512 * 1024);
                         let mut body = Vec::new();
                         std::fs::File::open(&path)
                             .unwrap()
-                            .take(16 * 1024 + 1)
+                            .take(512 * 1024 + 1)
                             .read_to_end(&mut body)
                             .unwrap();
                         assert_eq!(body.len() as u64, metadata.len());
                         bytes += body.len();
-                        assert!(bytes <= 64 * 1024);
+                        assert!(bytes <= 1024 * 1024);
                         Some(body)
                     };
                     files.insert(relative, value);
@@ -4610,6 +4701,29 @@ mod tests {
             let observer = owner.clone();
             let id = instance.id.clone();
             let reporting = owner.clone().with_progress(Arc::new(move |event| {
+                if prefix {
+                    if event.phase == "content_download" && event.current == 512 {
+                        assert_eq!(event.total, 513);
+                        let receipt: Receipt =
+                            serde_json::from_str(&pending(&observer, &id).unwrap()).unwrap();
+                        validate_receipt(&receipt).unwrap();
+                        assert!(!receipt.native_settled && receipt.ready_checkpoint.is_some());
+                        assert_eq!(receipt.before_manifest.as_deref(), Some(ORIGINAL));
+                        assert_eq!(receipt.changes.len(), 513);
+                        assert!(receipt.changes.iter().all(|change| matches!(
+                            change.source,
+                            Some(Source::PackOverride)
+                        )
+                            && !game.join(&change.path).exists()));
+                        assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), ORIGINAL);
+                        assert_eq!(
+                            std::fs::read(game.join("config/user.txt")).unwrap(),
+                            b"unrelated payload"
+                        );
+                        std::process::exit(EXIT);
+                    }
+                    return;
+                }
                 if event.phase != "content_commit"
                     || !(0..=i32::from(committed)).contains(&event.current)
                 {
@@ -4661,7 +4775,11 @@ mod tests {
                 .install_pack(
                     &catalog(&owner),
                     &instance.id,
-                    pack(&[], &[("overrides/config/staged.txt", b"new payload")]),
+                    if prefix {
+                        prefix_pack()
+                    } else {
+                        pack(&[], &[("overrides/config/staged.txt", b"new payload")])
+                    },
                     true,
                 )
                 .unwrap()
@@ -4691,6 +4809,9 @@ mod tests {
             (false, Some("foreign")) => {
                 "content::install::tests::hard_exit_ready_checkpoint_foreign_public_file_allows_preserved_exit"
             }
+            (false, Some("prefix")) => {
+                "content::install::tests::hard_exit_after_512_content_payloads_rolls_back_recorded_prefix"
+            }
             _ => unreachable!(),
         };
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -4701,7 +4822,8 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let child_deadline_secs = if prefix { 60 } else { 20 };
+        let deadline = std::time::Instant::now() + Duration::from_secs(child_deadline_secs);
         while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -4712,7 +4834,7 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(
             !timed_out && output.status.code() == Some(EXIT),
-            "crash boundary not reached (committed={committed}): {:?}; {} {}",
+            "crash boundary not reached (committed={committed}, prefix={prefix}, timed_out={timed_out}, deadline={child_deadline_secs}s): {:?}; {} {}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -4747,7 +4869,7 @@ mod tests {
             assert_eq!(pending(&owner, id).as_deref(), Some(receipt.as_str()));
             assert_eq!(files(&game), snapshot);
         }
-        if let Some(fault) = checkpoint_fault {
+        if let Some(fault) = checkpoint_fault.filter(|_| !prefix) {
             let owner = open(root.path(), library_id);
             let records = owner.directories.registry().list().unwrap();
             let id = &records[0].instance.id;
@@ -4945,7 +5067,11 @@ mod tests {
                 .install_pack(
                     &catalog(&owner),
                     id,
-                    pack(&[], &[("overrides/config/staged.txt", b"new payload")]),
+                    if prefix {
+                        prefix_pack()
+                    } else {
+                        pack(&[], &[("overrides/config/staged.txt", b"new payload")])
+                    },
                     true,
                 )
                 .unwrap()
@@ -4961,10 +5087,19 @@ mod tests {
                 std::fs::read(game.join("config/user.txt")).unwrap(),
                 b"unrelated payload"
             );
-            assert_eq!(
-                std::fs::read(game.join("config/staged.txt")).unwrap(),
-                b"new payload"
-            );
+            if prefix {
+                for index in 0..513 {
+                    assert_eq!(
+                        std::fs::read(game.join(format!("config/prefix-{index:04}.txt"))).unwrap(),
+                        b"new payload"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    std::fs::read(game.join("config/staged.txt")).unwrap(),
+                    b"new payload"
+                );
+            }
             owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
             owner.directories.library().try_preserve().unwrap();
         }

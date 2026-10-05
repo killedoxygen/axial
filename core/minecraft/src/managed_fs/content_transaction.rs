@@ -47,7 +47,7 @@ const MAX_TRANSIENT_STAGE_MEMBERS: usize = 256;
 const MAX_CONTENT_PRIVATE_DIRECTORIES: usize = 16;
 const PRIVATE_STAGE_NAME: &str = "stage";
 const PRIVATE_BACKUP_NAME: &str = "backup";
-const MAX_READY_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STAGING_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedContentPathPolicy {
@@ -840,9 +840,9 @@ impl ManagedContentTransactionRoot {
         observe_transaction_manifest(self)
     }
 
-    pub fn restore_ready_checkpoint(
+    pub fn restore_staging_checkpoint(
         self,
-        checkpoint: ManagedContentReadyCheckpoint,
+        checkpoint: ManagedContentStagingCheckpoint,
         binding: [u8; 32],
     ) -> Result<ManagedContentRecovery, ManagedContentCheckpointError> {
         checkpoint.validate()?;
@@ -855,9 +855,9 @@ impl ManagedContentTransactionRoot {
         if directory_incarnation(&root)? != checkpoint.record.root {
             return Err(ManagedContentCheckpointError::Changed);
         }
-        inspect_ready_checkpoint(&root, &checkpoint, false)?;
+        inspect_staging_checkpoint(&root, &checkpoint, false)?;
         Ok(ManagedContentRecovery {
-            state: Some(RecoveryState::ReadyRollback {
+            state: Some(RecoveryState::StagingRollback {
                 root,
                 authority: self.authority,
                 checkpoint,
@@ -1574,6 +1574,25 @@ impl ManagedContentTransferBatch {
         self.payload_count
     }
 
+    /// Emits only initial or geometrically advancing quiescent staged prefixes.
+    pub fn checkpoint(
+        &mut self,
+        binding: [u8; 32],
+    ) -> Result<Option<&ManagedContentStagingCheckpoint>, ManagedContentCheckpointError> {
+        if self
+            .state
+            .checkpoint
+            .as_ref()
+            .is_some_and(|cache| cache.binding != binding)
+        {
+            return Err(ManagedContentCheckpointError::Invalid);
+        }
+        if !self.verified.is_empty() {
+            return Ok(None);
+        }
+        staging_checkpoint(&mut self.state, binding, false)
+    }
+
     pub fn next(mut self) -> ManagedContentTransferStep {
         match self.remaining.pop_front() {
             Some(slot) => ManagedContentTransferStep::Issued(ManagedContentIssuedTransfer {
@@ -1929,6 +1948,7 @@ struct TransactionState {
     planned_payloads: Vec<PlannedPayload>,
     staged_by_id: BTreeMap<ManagedContentPayloadId, usize>,
     payloads: Vec<StagedPayload>,
+    checkpoint: Option<StagingCheckpointCache>,
     manifest_claimed: bool,
     manifest_installed: Option<ManagedFileGuard>,
     manifest_publication_started: bool,
@@ -2163,6 +2183,7 @@ fn prepare_transaction(
             planned_payloads,
             staged_by_id: BTreeMap::new(),
             payloads: Vec::new(),
+            checkpoint: None,
             manifest_claimed: false,
             manifest_installed: None,
             manifest_publication_started: false,
@@ -2827,10 +2848,11 @@ impl fmt::Debug for ManagedContentReadyTransaction {
 
 impl ManagedContentReadyTransaction {
     pub fn checkpoint(
-        &self,
+        &mut self,
         binding: [u8; 32],
-    ) -> Result<ManagedContentReadyCheckpoint, ManagedContentCheckpointError> {
-        ready_checkpoint(&self.state, binding)
+    ) -> Result<&ManagedContentStagingCheckpoint, ManagedContentCheckpointError> {
+        staging_checkpoint(&mut self.state, binding, true)?
+            .ok_or(ManagedContentCheckpointError::Invalid)
     }
 
     pub fn commit(self) -> ManagedContentTransactionOutcome {
@@ -2852,21 +2874,27 @@ pub enum ManagedContentCheckpointError {
 
 /// Comparison evidence only. Restoring always requires a freshly admitted root.
 #[derive(Clone)]
-pub struct ManagedContentReadyCheckpoint {
-    record: ReadyCheckpoint,
+pub struct ManagedContentStagingCheckpoint {
+    record: StagingCheckpoint,
 }
 
-impl fmt::Debug for ManagedContentReadyCheckpoint {
+struct StagingCheckpointCache {
+    binding: [u8; 32],
+    checkpoint: Result<ManagedContentStagingCheckpoint, ManagedContentCheckpointError>,
+    remaining: usize,
+}
+
+impl fmt::Debug for ManagedContentStagingCheckpoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ManagedContentReadyCheckpoint")
+            .debug_struct("ManagedContentStagingCheckpoint")
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadyCheckpoint {
+struct StagingCheckpoint {
     schema: u32,
     binding: [u8; 32],
     pack: bool,
@@ -2876,35 +2904,35 @@ struct ReadyCheckpoint {
     stage: [u8; 32],
     backup: [u8; 32],
     mutation_count: usize,
-    #[serde(deserialize_with = "ready_directories")]
+    #[serde(deserialize_with = "staging_directories")]
     directories: BTreeMap<String, Option<[u8; 32]>>,
-    files: Vec<ReadyFile>,
-    payloads: Vec<ReadyPayload>,
+    files: Vec<StagingFile>,
+    payloads: Vec<StagingPayload>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadyFile {
+struct StagingFile {
     path: String,
-    proof: Option<ReadyFileProof>,
+    proof: Option<StagingFileProof>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadyPayload {
+struct StagingPayload {
     name: String,
-    proof: ReadyFileProof,
+    proof: StagingFileProof,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadyFileProof {
+struct StagingFileProof {
     revision: [u8; 32],
     size: u64,
     sha512: String,
 }
 
-fn ready_directories<'de, D: serde::Deserializer<'de>>(
+fn staging_directories<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<String, Option<[u8; 32]>>, D::Error> {
     struct Directories;
@@ -2920,7 +2948,7 @@ fn ready_directories<'de, D: serde::Deserializer<'de>>(
             let mut directories = BTreeMap::new();
             while let Some((path, witness)) = map.next_entry()? {
                 if directories.insert(path, witness).is_some()
-                    || directories.len() > MAX_READY_CHECKPOINT_BYTES / 4
+                    || directories.len() > MAX_STAGING_CHECKPOINT_BYTES / 4
                 {
                     return Err(serde::de::Error::custom("invalid content parent witnesses"));
                 }
@@ -2931,9 +2959,9 @@ fn ready_directories<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_map(Directories)
 }
 
-impl ManagedContentReadyCheckpoint {
+impl ManagedContentStagingCheckpoint {
     pub fn encode(&self, max_bytes: usize) -> Result<String, ManagedContentCheckpointError> {
-        if max_bytes == 0 || max_bytes > MAX_READY_CHECKPOINT_BYTES {
+        if max_bytes == 0 || max_bytes > MAX_STAGING_CHECKPOINT_BYTES {
             return Err(ManagedContentCheckpointError::Capacity);
         }
         self.validate()?;
@@ -2963,7 +2991,7 @@ impl ManagedContentReadyCheckpoint {
     }
 
     pub fn decode(encoded: &str) -> Result<Self, ManagedContentCheckpointError> {
-        if encoded.len() > MAX_READY_CHECKPOINT_BYTES {
+        if encoded.len() > MAX_STAGING_CHECKPOINT_BYTES {
             return Err(ManagedContentCheckpointError::Capacity);
         }
         let checkpoint = Self {
@@ -2995,7 +3023,7 @@ impl ManagedContentReadyCheckpoint {
             || record.files.is_empty()
             || record.files.len() > policy.planning_path_limit() + 1
             || record.payloads.len() > record.mutation_count
-            || record.directories.len() > MAX_READY_CHECKPOINT_BYTES / 4
+            || record.directories.len() > MAX_STAGING_CHECKPOINT_BYTES / 4
         {
             return Err(invalid);
         }
@@ -3056,7 +3084,7 @@ impl ManagedContentReadyCheckpoint {
 }
 
 fn validate_ready_file(
-    proof: &ReadyFileProof,
+    proof: &StagingFileProof,
     limit: u64,
 ) -> Result<(), ManagedContentCheckpointError> {
     if proof.size > limit
@@ -3108,7 +3136,7 @@ fn checkpoint_file(
     name: &str,
     guard: &ManagedFileGuard,
     sha512: String,
-) -> Result<ReadyFileProof, ManagedContentCheckpointError> {
+) -> Result<StagingFileProof, ManagedContentCheckpointError> {
     let changed = ManagedContentCheckpointError::Changed;
     if !directory
         .file_guard_matches(name, guard)
@@ -3126,7 +3154,7 @@ fn checkpoint_file(
     {
         return Err(changed);
     }
-    Ok(ReadyFileProof {
+    Ok(StagingFileProof {
         revision,
         size: guard.size(),
         sha512,
@@ -3146,25 +3174,91 @@ fn charge_checkpoint(
     Ok(())
 }
 
-fn ready_checkpoint(
+fn staging_checkpoint(
+    state: &mut TransactionState,
+    binding: [u8; 32],
+    final_ready: bool,
+) -> Result<Option<&ManagedContentStagingCheckpoint>, ManagedContentCheckpointError> {
+    if let Some(cache) = &state.checkpoint {
+        if cache.binding != binding {
+            return Err(ManagedContentCheckpointError::Invalid);
+        }
+        let checkpoint = cache.checkpoint.as_ref().map_err(|error| *error)?;
+        if !final_ready
+            && (state.payloads.len() == state.planned_payloads.len()
+                || state.payloads.len()
+                    < checkpoint
+                        .record
+                        .payloads
+                        .len()
+                        .saturating_mul(2)
+                        .max(MAX_TRANSIENT_STAGE_MEMBERS))
+        {
+            return Ok(None);
+        }
+    }
+    let initial = state.checkpoint.is_none();
+    let mut cache = state.checkpoint.take().unwrap_or_else(|| {
+        let (checkpoint, remaining) = match capture_staging_checkpoint(state, binding) {
+            Ok((checkpoint, remaining)) => (Ok(checkpoint), remaining),
+            Err(error) => (Err(error), 0),
+        };
+        StagingCheckpointCache {
+            binding,
+            checkpoint,
+            remaining,
+        }
+    });
+    let update = (|| {
+        let checkpoint = cache.checkpoint.as_mut().map_err(|error| *error)?;
+        append_staging_payloads(state, checkpoint, &mut cache.remaining)?;
+        if final_ready
+            && (!unpublished_before_bindings_match(state)
+                || state.payloads.len() != state.planned_payloads.len())
+        {
+            return Err(ManagedContentCheckpointError::Changed);
+        }
+        if initial || final_ready {
+            checkpoint.validate()?;
+            inspect_staging_checkpoint(&state.root, checkpoint, true)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = update {
+        cache.checkpoint = Err(error);
+    }
+    state.checkpoint = Some(cache);
+    state
+        .checkpoint
+        .as_ref()
+        .expect("checkpoint capture retains its proof or refusal")
+        .checkpoint
+        .as_ref()
+        .map(Some)
+        .map_err(|error| *error)
+}
+
+fn unpublished_before_bindings_match(state: &TransactionState) -> bool {
+    revalidate_all(state)
+        && !state.manifest_claimed
+        && !state.manifest_publication_started
+        && !state.manifest_committed
+        && state.manifest_installed.is_none()
+        && state.created_parents.is_empty()
+        && state.mutations.iter().all(|mutation| {
+            !mutation.claimed && !mutation.installed && mutation.installed_guard.is_none()
+        })
+}
+
+fn capture_staging_checkpoint(
     state: &TransactionState,
     binding: [u8; 32],
-) -> Result<ManagedContentReadyCheckpoint, ManagedContentCheckpointError> {
+) -> Result<(ManagedContentStagingCheckpoint, usize), ManagedContentCheckpointError> {
     let changed = ManagedContentCheckpointError::Changed;
-    if !revalidate_all(state)
-        || state.manifest_claimed
-        || state.manifest_publication_started
-        || state.manifest_committed
-        || state.manifest_installed.is_some()
-        || !state.created_parents.is_empty()
-        || state.mutations.iter().any(|mutation| {
-            mutation.claimed || mutation.installed || mutation.installed_guard.is_some()
-        })
-        || state.payloads.len() != state.planned_payloads.len()
-    {
+    if !unpublished_before_bindings_match(state) {
         return Err(changed);
     }
-    let mut remaining = MAX_READY_CHECKPOINT_BYTES - 1024;
+    let mut remaining = MAX_STAGING_CHECKPOINT_BYTES - 1024;
     let mut files = Vec::new();
     let mut capture = |path: String,
                        parent: Option<&ManagedDir>,
@@ -3184,7 +3278,7 @@ fn ready_checkpoint(
             (_, None, ManagedContentObservedState::Absent) => None,
             _ => return Err(changed),
         };
-        let file = ReadyFile { path, proof };
+        let file = StagingFile { path, proof };
         charge_checkpoint(&mut remaining, &file)?;
         files.push(file);
         Ok(())
@@ -3263,8 +3357,45 @@ fn ready_checkpoint(
             parent = child;
         }
     }
-    let mut payloads = Vec::new();
-    for payload in &state.payloads {
+    Ok((
+        ManagedContentStagingCheckpoint {
+            record: StagingCheckpoint {
+                schema: 1,
+                binding,
+                pack: state.path_policy == ManagedContentPathPolicy::Pack,
+                root: directory_incarnation(&state.root)?,
+                private_name: state.private_name.as_str().to_string(),
+                private: directory_incarnation(&state.private)?,
+                stage: directory_incarnation(&state.stage)?,
+                backup: directory_incarnation(&state.backup)?,
+                mutation_count: state.mutations.len(),
+                directories,
+                files,
+                payloads: Vec::new(),
+            },
+        },
+        remaining,
+    ))
+}
+
+fn append_staging_payloads(
+    state: &TransactionState,
+    checkpoint: &mut ManagedContentStagingCheckpoint,
+    remaining: &mut usize,
+) -> Result<(), ManagedContentCheckpointError> {
+    let changed = ManagedContentCheckpointError::Changed;
+    let record = &mut checkpoint.record;
+    if directory_incarnation(&state.root)? != record.root
+        || directory_incarnation(&state.private)? != record.private
+        || directory_incarnation(&state.stage)? != record.stage
+        || directory_incarnation(&state.backup)? != record.backup
+        || record.payloads.len() > state.payloads.len()
+    {
+        return Err(changed);
+    }
+    // Previously captured proofs stay unchanged even if an external writer drifts.
+    // Final publication and cold recovery still verify the complete exact tree.
+    for payload in &state.payloads[record.payloads.len()..] {
         let guard = payload.guard.as_ref().ok_or(changed)?;
         let sha512 = match payload.report.digests().sha512() {
             Some(hash) => hex_lower(hash),
@@ -3273,37 +3404,19 @@ fn ready_checkpoint(
                 .sha512_guarded_file(payload.name.as_str(), guard, MAX_CONTENT_FILE_BYTES)
                 .map_err(|_| changed)?,
         };
-        let payload = ReadyPayload {
+        let payload = StagingPayload {
             name: payload.name.as_str().to_string(),
             proof: checkpoint_file(&state.stage, payload.name.as_str(), guard, sha512)?,
         };
-        charge_checkpoint(&mut remaining, &payload)?;
-        payloads.push(payload);
+        charge_checkpoint(remaining, &payload)?;
+        record.payloads.push(payload);
     }
-    let checkpoint = ManagedContentReadyCheckpoint {
-        record: ReadyCheckpoint {
-            schema: 1,
-            binding,
-            pack: state.path_policy == ManagedContentPathPolicy::Pack,
-            root: directory_incarnation(&state.root)?,
-            private_name: state.private_name.as_str().to_string(),
-            private: directory_incarnation(&state.private)?,
-            stage: directory_incarnation(&state.stage)?,
-            backup: directory_incarnation(&state.backup)?,
-            mutation_count: state.mutations.len(),
-            directories,
-            files,
-            payloads,
-        },
-    };
-    checkpoint.validate()?;
-    inspect_ready_checkpoint(&state.root, &checkpoint, true)?;
-    Ok(checkpoint)
+    Ok(())
 }
 
-fn ready_public_bindings(
+fn staging_public_bindings(
     root: &ManagedDir,
-    checkpoint: &ManagedContentReadyCheckpoint,
+    checkpoint: &ManagedContentStagingCheckpoint,
 ) -> Result<(), ManagedContentCheckpointError> {
     let changed = ManagedContentCheckpointError::Changed;
     if directory_incarnation(root)? != checkpoint.record.root {
@@ -3364,7 +3477,7 @@ fn ready_public_bindings(
 fn admit_checkpoint_file(
     parent: &ManagedDir,
     name: &str,
-    proof: &ReadyFileProof,
+    proof: &StagingFileProof,
 ) -> Result<ManagedFileGuard, ManagedContentCheckpointError> {
     let changed = ManagedContentCheckpointError::Changed;
     let guard = parent
@@ -3408,26 +3521,26 @@ fn checkpoint_directory(
     Ok(directory)
 }
 
-struct ReadyCleanup {
+struct StagingCleanup {
     private: Option<ManagedDir>,
     stage: Option<ManagedDir>,
     backup: Option<ManagedDir>,
     files: Vec<(String, ManagedFileGuard)>,
 }
 
-fn inspect_ready_checkpoint(
+fn inspect_staging_checkpoint(
     root: &ManagedDir,
-    checkpoint: &ManagedContentReadyCheckpoint,
+    checkpoint: &ManagedContentStagingCheckpoint,
     complete: bool,
-) -> Result<ReadyCleanup, ManagedContentCheckpointError> {
+) -> Result<StagingCleanup, ManagedContentCheckpointError> {
     let changed = ManagedContentCheckpointError::Changed;
-    ready_public_bindings(root, checkpoint)?;
+    staging_public_bindings(root, checkpoint)?;
     let record = &checkpoint.record;
     let Some(private) = checkpoint_directory(root, &record.private_name, record.private)? else {
         if complete {
             return Err(changed);
         }
-        return Ok(ReadyCleanup {
+        return Ok(StagingCleanup {
             private: None,
             stage: None,
             backup: None,
@@ -3478,7 +3591,7 @@ fn inspect_ready_checkpoint(
             files.push((name.to_string(), admit_checkpoint_file(stage, name, proof)?));
         }
     }
-    Ok(ReadyCleanup {
+    Ok(StagingCleanup {
         private: Some(private),
         stage,
         backup,
@@ -3486,12 +3599,12 @@ fn inspect_ready_checkpoint(
     })
 }
 
-fn rollback_ready_checkpoint(
+fn rollback_staging_checkpoint(
     root: &ManagedDir,
-    checkpoint: &ManagedContentReadyCheckpoint,
+    checkpoint: &ManagedContentStagingCheckpoint,
 ) -> Result<(), ManagedContentCheckpointError> {
     let changed = ManagedContentCheckpointError::Changed;
-    let cleanup = inspect_ready_checkpoint(root, checkpoint, false)?;
+    let cleanup = inspect_staging_checkpoint(root, checkpoint, false)?;
     if let Some(private) = cleanup.private {
         if let Some(stage) = &cleanup.stage {
             for (name, guard) in cleanup.files {
@@ -3517,7 +3630,7 @@ fn rollback_ready_checkpoint(
             return Err(changed);
         }
     }
-    ready_public_bindings(root, checkpoint)?;
+    staging_public_bindings(root, checkpoint)?;
     if root
         .has_portably_exact_child_name(&checkpoint.record.private_name)
         .map_err(|_| changed)?
@@ -4424,10 +4537,10 @@ fn recovery(
 }
 
 enum RecoveryState {
-    ReadyRollback {
+    StagingRollback {
         root: ManagedDir,
         authority: ManagedTransferAuthority,
-        checkpoint: ManagedContentReadyCheckpoint,
+        checkpoint: ManagedContentStagingCheckpoint,
     },
     Preparation {
         session: ManagedContentTransactionSession,
@@ -4536,18 +4649,19 @@ impl ManagedContentRecovery {
             .take()
             .expect("content recovery retains one exact state")
         {
-            RecoveryState::ReadyRollback {
+            RecoveryState::StagingRollback {
                 root,
                 authority,
                 checkpoint,
             } => {
-                if root.settle().is_ok() && rollback_ready_checkpoint(&root, &checkpoint).is_ok() {
+                if root.settle().is_ok() && rollback_staging_checkpoint(&root, &checkpoint).is_ok()
+                {
                     ManagedContentTransactionOutcome::Cancelled(ManagedContentCancelReceipt {
                         path_count: checkpoint.record.mutation_count,
                     })
                 } else {
                     ManagedContentTransactionOutcome::RecoveryRequired(Self {
-                        state: Some(RecoveryState::ReadyRollback {
+                        state: Some(RecoveryState::StagingRollback {
                             root,
                             authority,
                             checkpoint,
@@ -5353,22 +5467,23 @@ mod tests {
         }
     }
 
-    fn checkpoint_fixture(
+    fn checkpoint_batch_fixture(
         temporary: &tempfile::TempDir,
-    ) -> (
-        super::super::ManagedTreeRoot,
-        ManagedContentReadyTransaction,
-    ) {
+        payload_count: usize,
+    ) -> (super::super::ManagedTreeRoot, ManagedContentTransferBatch) {
         let (tree, root) = content_root(temporary);
         std::fs::write(temporary.path().join("mods/first.jar"), b"original").unwrap();
         std::fs::write(temporary.path().join(MANIFEST_NAME), b"original manifest").unwrap();
-        let paths = [
+        let mut paths = [
             "mods/first.jar",
             "mods/second.jar",
             "config/nested/options.txt",
         ]
         .map(|path| PortableRelativePath::new_exact(path).unwrap())
         .to_vec();
+        paths.extend((3..payload_count).map(|index| {
+            PortableRelativePath::new_exact(&format!("mods/member-{index}.jar")).unwrap()
+        }));
         let session = transaction_session(root.for_pack(), paths);
         let observations = session.observations();
         let bytes = b"staged replacement";
@@ -5395,40 +5510,259 @@ mod tests {
             .unwrap();
         let plan =
             ManagedContentMutationPlan::new(&observations, mutations, payloads, manifest).unwrap();
-        let mut batch = prepared(session, plan).into_transfer_batch();
-        loop {
-            batch = match batch.next() {
-                ManagedContentTransferStep::Issued(issued) => {
-                    let (_sender, cancellation) = crate::download::transfer_cancellation_channel();
-                    match issued
-                        .copy_external(std::io::Cursor::new(bytes), cancellation)
-                        .unwrap()
-                        .advance()
-                    {
-                        ManagedContentTransferAdvance::Continue(batch) => batch,
-                        _ => panic!("checkpoint payload must stage"),
-                    }
+        (tree, prepared(session, plan).into_transfer_batch())
+    }
+
+    fn advance_checkpoint_payload(
+        batch: ManagedContentTransferBatch,
+    ) -> ManagedContentTransferBatch {
+        let ManagedContentTransferStep::Issued(issued) = batch.next() else {
+            panic!("checkpoint fixture must retain a payload");
+        };
+        let (_sender, cancellation) = crate::download::transfer_cancellation_channel();
+        match issued
+            .copy_external(std::io::Cursor::new(b"staged replacement"), cancellation)
+            .unwrap()
+            .advance()
+        {
+            ManagedContentTransferAdvance::Continue(batch) => batch,
+            _ => panic!("checkpoint payload must stage"),
+        }
+    }
+
+    fn checkpoint_fixture(
+        temporary: &tempfile::TempDir,
+    ) -> (
+        super::super::ManagedTreeRoot,
+        ManagedContentReadyTransaction,
+    ) {
+        let (tree, mut batch) = checkpoint_batch_fixture(temporary, 3);
+        for _ in 0..3 {
+            batch = advance_checkpoint_payload(batch);
+        }
+        let ManagedContentTransferStep::Complete(complete) = batch.next() else {
+            panic!("checkpoint fixture must complete its transfers");
+        };
+        let ManagedContentStageOutcome::Ready(ready) = complete.stage() else {
+            panic!("checkpoint fixture must become Ready");
+        };
+        (tree, ready)
+    }
+
+    #[test]
+    fn staging_checkpoint_prefix_reopens_with_reserved_slots_and_preserves_foreign_files() {
+        for completed in [0, 512] {
+            let temporary = test_tempdir().unwrap();
+            let (tree, mut batch) = checkpoint_batch_fixture(&temporary, 513);
+            let mut encoded = batch
+                .checkpoint([6; 32])
+                .unwrap()
+                .unwrap()
+                .encode(MAX_STAGING_CHECKPOINT_BYTES)
+                .unwrap();
+            for _ in 0..completed {
+                batch = advance_checkpoint_payload(batch);
+                if let Some(checkpoint) = batch.checkpoint([6; 32]).unwrap() {
+                    encoded = checkpoint.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
                 }
-                ManagedContentTransferStep::Complete(complete) => {
-                    return (
-                        tree,
-                        match complete.stage() {
-                            ManagedContentStageOutcome::Ready(ready) => ready,
-                            _ => panic!("checkpoint fixture must become Ready"),
-                        },
+            }
+            assert!(batch.verified.is_empty());
+            assert_eq!(batch.state.payloads.len(), completed);
+            assert!(!batch.remaining.is_empty());
+            let private = batch.state.private.inner.path.clone();
+            let stage = private.join(PRIVATE_STAGE_NAME);
+            assert_eq!(std::fs::read_dir(&stage).unwrap().count(), completed);
+            let checkpoint = ManagedContentStagingCheckpoint::decode(&encoded).unwrap();
+            assert_eq!(checkpoint.record.mutation_count, 513);
+            assert_eq!(checkpoint.record.files.len(), 514);
+            assert_eq!(checkpoint.record.payloads.len(), completed);
+            if completed != 0 {
+                std::fs::write(stage.join("unowned"), b"keep").unwrap();
+            }
+            // This in-process reopen settles only unstarted reservations; the
+            // application subprocess fixture separately exercises hard exit.
+            for slot in batch.remaining.drain(..) {
+                assert!(matches!(
+                    advance_transfer_unwind(TransferUnwindMember::Unstarted(slot)),
+                    TransferUnwindAdvance::Settled
+                ));
+            }
+            assert_eq!(
+                std::fs::read_dir(&stage).unwrap().count(),
+                completed + usize::from(completed != 0)
+            );
+            drop((batch, tree));
+            if completed != 0 {
+                let (tree, root) = content_root(&temporary);
+                assert!(matches!(
+                    root.for_pack()
+                        .restore_staging_checkpoint(checkpoint.clone(), [6; 32]),
+                    Err(ManagedContentCheckpointError::Changed)
+                ));
+                assert_eq!(std::fs::read(stage.join("unowned")).unwrap(), b"keep");
+                for index in 0..completed {
+                    assert_eq!(
+                        std::fs::read(stage.join(format!("payload-{index}"))).unwrap(),
+                        b"staged replacement"
                     );
                 }
-            };
+                drop(tree);
+                // The external writer removes its own file; recovery must not do so.
+                std::fs::remove_file(stage.join("unowned")).unwrap();
+            }
+            for _ in 0..2 {
+                let (tree, root) = content_root(&temporary);
+                assert!(matches!(
+                    root.for_pack()
+                        .restore_staging_checkpoint(checkpoint.clone(), [6; 32])
+                        .unwrap()
+                        .reconcile(),
+                    ManagedContentTransactionOutcome::Cancelled(_)
+                ));
+                assert!(!private.exists());
+                assert!(!temporary.path().join("config").exists());
+                assert_eq!(
+                    std::fs::read_dir(temporary.path().join("mods"))
+                        .unwrap()
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    std::fs::read(temporary.path().join("mods/first.jar")).unwrap(),
+                    b"original"
+                );
+                assert_eq!(
+                    std::fs::read(temporary.path().join(MANIFEST_NAME)).unwrap(),
+                    b"original manifest"
+                );
+                drop(tree);
+            }
         }
     }
 
     #[test]
-    fn ready_checkpoint_reopens_and_repeats_exact_staged_rollback() {
+    fn staging_checkpoint_cadence_keeps_unrecorded_prefixes_unresolved_and_finishes_at_ready() {
+        let temporary = test_tempdir().unwrap();
+        let chunk = MAX_TRANSIENT_STAGE_MEMBERS;
+        let total = 3 * chunk + 1;
+        let (tree, mut batch) = checkpoint_batch_fixture(&temporary, total);
+        let initial = batch.checkpoint([5; 32]).unwrap().unwrap().clone();
+        let original = serde_json::to_value(&initial.record.files).unwrap();
+        let mut saved = initial;
+        let mut emitted = vec![0];
+        for completed in 1..=total {
+            batch = advance_checkpoint_payload(batch);
+            if let Some(checkpoint) = batch.checkpoint([5; 32]).unwrap() {
+                emitted.push(completed);
+                assert_eq!(
+                    serde_json::to_value(&checkpoint.record.files).unwrap(),
+                    original
+                );
+                saved = checkpoint.clone();
+            }
+            assert!(batch.checkpoint([5; 32]).unwrap().is_none());
+            if completed == 3 * chunk {
+                assert!(matches!(
+                    inspect_staging_checkpoint(&batch.state.root, &saved, false),
+                    Err(ManagedContentCheckpointError::Changed)
+                ));
+                assert_eq!(
+                    batch.state.stage.entries_bounded(total).unwrap().len(),
+                    completed
+                );
+            }
+        }
+        assert_eq!(emitted, vec![0, chunk, 2 * chunk]);
+        assert!(matches!(
+            batch.checkpoint([4; 32]),
+            Err(ManagedContentCheckpointError::Invalid)
+        ));
+        let ManagedContentTransferStep::Complete(complete) = batch.next() else {
+            panic!("all checkpoint payloads must complete");
+        };
+        let ManagedContentStageOutcome::Ready(mut ready) = complete.stage() else {
+            panic!("all checkpoint payloads must become Ready");
+        };
+        let checkpoint = ready.checkpoint([5; 32]).unwrap().clone();
+        assert_eq!(checkpoint.record.payloads.len(), total);
+        assert_eq!(
+            serde_json::to_value(&checkpoint.record.files).unwrap(),
+            original
+        );
+        let encoded = checkpoint.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap()["schema"],
+            1
+        );
+        drop((ready, tree));
+        let (tree, root) = content_root(&temporary);
+        assert!(matches!(
+            root.for_pack()
+                .restore_staging_checkpoint(
+                    ManagedContentStagingCheckpoint::decode(&encoded).unwrap(),
+                    [5; 32]
+                )
+                .unwrap()
+                .reconcile(),
+            ManagedContentTransactionOutcome::Cancelled(_)
+        ));
+        assert_eq!(
+            std::fs::read(temporary.path().join("mods/first.jar")).unwrap(),
+            b"original"
+        );
+        drop(tree);
+    }
+
+    #[test]
+    fn staging_checkpoint_cached_proofs_never_refresh_after_equal_byte_drift() {
+        for public in [true, false] {
+            let temporary = test_tempdir().unwrap();
+            let (tree, mut batch) = checkpoint_batch_fixture(&temporary, 3);
+            batch.checkpoint([3; 32]).unwrap().unwrap();
+            for _ in 0..3 {
+                batch = advance_checkpoint_payload(batch);
+                assert!(batch.checkpoint([3; 32]).unwrap().is_none());
+            }
+            let path = if public {
+                temporary.path().join("mods/first.jar")
+            } else {
+                batch.state.stage.inner.path.join("payload-0")
+            };
+            let bytes = std::fs::read(&path).unwrap();
+            let changed_time = std::fs::metadata(&path).unwrap().modified().unwrap()
+                + std::time::Duration::from_secs(86_400);
+            std::fs::write(&path, &bytes).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(changed_time))
+                .unwrap();
+            let ManagedContentTransferStep::Complete(complete) = batch.next() else {
+                panic!("drift fixture transfers must complete");
+            };
+            let ManagedContentStageOutcome::Ready(mut ready) = complete.stage() else {
+                panic!("drift fixture must become Ready");
+            };
+            for _ in 0..2 {
+                assert!(matches!(
+                    ready.checkpoint([3; 32]),
+                    Err(ManagedContentCheckpointError::Changed)
+                ));
+            }
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert!(!temporary.path().join("mods/second.jar").exists());
+            drop((ready, tree));
+        }
+    }
+
+    #[test]
+    fn staging_checkpoint_reopens_and_repeats_exact_staged_rollback() {
         for partial_cleanup in [false, true] {
             let temporary = test_tempdir().unwrap();
-            let (tree, ready) = checkpoint_fixture(&temporary);
+            let (tree, mut ready) = checkpoint_fixture(&temporary);
             let checkpoint = ready.checkpoint([7; 32]).unwrap();
-            let encoded = checkpoint.encode(MAX_READY_CHECKPOINT_BYTES).unwrap();
+            let encoded = checkpoint.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
             assert_eq!(
                 checkpoint.encode(1),
                 Err(ManagedContentCheckpointError::Capacity)
@@ -5445,10 +5779,10 @@ mod tests {
             drop((ready, tree));
             for _ in 0..2 {
                 let (tree, root) = content_root(&temporary);
-                let checkpoint = ManagedContentReadyCheckpoint::decode(&encoded).unwrap();
+                let checkpoint = ManagedContentStagingCheckpoint::decode(&encoded).unwrap();
                 let outcome = root
                     .for_pack()
-                    .restore_ready_checkpoint(checkpoint, [7; 32])
+                    .restore_staging_checkpoint(checkpoint, [7; 32])
                     .unwrap()
                     .reconcile();
                 assert!(matches!(
@@ -5472,7 +5806,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_checkpoint_preserves_unknown_replaced_and_partly_published_objects() {
+    fn staging_checkpoint_preserves_unknown_replaced_and_partly_published_objects() {
         for change in [
             "stage_extra",
             "stage_extra_after_admission",
@@ -5489,7 +5823,7 @@ mod tests {
         ] {
             let temporary = test_tempdir().unwrap();
             let (tree, mut ready) = checkpoint_fixture(&temporary);
-            let checkpoint = ready.checkpoint([8; 32]).unwrap();
+            let checkpoint = ready.checkpoint([8; 32]).unwrap().clone();
             let private = ready.state.private.inner.path.clone();
             let stage = private.join(PRIVATE_STAGE_NAME);
             match change {
@@ -5574,7 +5908,7 @@ mod tests {
             let (tree, root) = content_root(&temporary);
             let restored = root
                 .for_pack()
-                .restore_ready_checkpoint(checkpoint, [8; 32]);
+                .restore_staging_checkpoint(checkpoint, [8; 32]);
             let retained = if change == "stage_extra_after_admission" {
                 let recovery = restored.unwrap();
                 std::fs::write(stage.join("unowned"), b"keep").unwrap();
@@ -5651,22 +5985,23 @@ mod tests {
     }
 
     #[test]
-    fn ready_checkpoint_rejects_wrong_authority_codec_and_capture_drift() {
+    fn staging_checkpoint_rejects_wrong_authority_codec_and_capture_drift() {
         let temporary = test_tempdir().unwrap();
-        let (tree, ready) = checkpoint_fixture(&temporary);
-        let checkpoint = ready.checkpoint([9; 32]).unwrap();
-        let encoded = checkpoint.encode(MAX_READY_CHECKPOINT_BYTES).unwrap();
+        let (tree, mut ready) = checkpoint_fixture(&temporary);
+        let checkpoint = ready.checkpoint([9; 32]).unwrap().clone();
+        let encoded = checkpoint.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap();
         let duplicate_parent =
             encoded.replacen("\"directories\":{", "\"directories\":{\"mods\":null,", 1);
         assert!(matches!(
-            ManagedContentReadyCheckpoint::decode(&duplicate_parent),
+            ManagedContentStagingCheckpoint::decode(&duplicate_parent),
             Err(ManagedContentCheckpointError::Invalid)
         ));
         let mut record: serde_json::Value =
-            serde_json::from_str(&checkpoint.encode(MAX_READY_CHECKPOINT_BYTES).unwrap()).unwrap();
+            serde_json::from_str(&checkpoint.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap())
+                .unwrap();
         record["payloads"][0]["name"] = "../unowned".into();
         assert!(matches!(
-            ManagedContentReadyCheckpoint::decode(&record.to_string()),
+            ManagedContentStagingCheckpoint::decode(&record.to_string()),
             Err(ManagedContentCheckpointError::Invalid)
         ));
         let path = temporary.path().join("mods/first.jar");
@@ -5687,7 +6022,7 @@ mod tests {
         let (tree, root) = content_root(&temporary);
         assert!(matches!(
             root.for_pack()
-                .restore_ready_checkpoint(checkpoint.clone(), [10; 32]),
+                .restore_staging_checkpoint(checkpoint.clone(), [10; 32]),
             Err(ManagedContentCheckpointError::Invalid)
         ));
         drop(tree);
@@ -5695,7 +6030,7 @@ mod tests {
         let (tree, root) = content_root(&other);
         assert!(matches!(
             root.for_pack()
-                .restore_ready_checkpoint(checkpoint, [9; 32]),
+                .restore_staging_checkpoint(checkpoint, [9; 32]),
             Err(ManagedContentCheckpointError::Changed)
         ));
         drop(tree);

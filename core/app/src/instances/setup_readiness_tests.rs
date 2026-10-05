@@ -1039,7 +1039,7 @@ async fn detached_setup_ready_resume(refuse_acknowledgement: bool) {
     let original_receipt = content_receipt(&service, id).unwrap();
     let receipt: serde_json::Value = serde_json::from_str(&original_receipt).unwrap();
     let checkpoint = receipt["ready_checkpoint"].as_str().unwrap();
-    axial_minecraft::managed_path::ManagedContentReadyCheckpoint::decode(checkpoint).unwrap();
+    axial_minecraft::managed_path::ManagedContentStagingCheckpoint::decode(checkpoint).unwrap();
     let checkpoint: serde_json::Value = serde_json::from_str(checkpoint).unwrap();
     let private = game.join(checkpoint["private_name"].as_str().unwrap());
     assert!(
