@@ -4,8 +4,9 @@ import { createRequire } from 'node:module';
 import { basename, dirname, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import type { ModpackFilesPlan } from '../../src/types-content';
+import type { ContentSelection, ModpackFilesPlan } from '../../src/types-content';
 import type { InstallQueueStateResponse } from '../../src/types-install';
+import type { EnrichedInstance } from '../../src/types-instance';
 
 type ApiCall = Parameters<typeof import('../../src/api').api>;
 type PickerProps = Parameters<typeof import('../../src/views/discover/ModpackPicker').ModpackPicker>[0];
@@ -130,6 +131,9 @@ function harness() {
     },
     'loaders/api': { connectInstallQueueSSE: () => () => {} },
     toast: { toast: (...args: unknown[]) => notices.push(args) },
+    'ui/Dialog': { showChoice: async () => null },
+    'ui-state': { navigate: () => {} },
+    'views/instance/instance-actions': { openInstanceFolder: async () => {} },
     'ui/Atoms': { Button: 'Button' },
     'ui/Icons': { Icon: 'Icon' },
     'ui/Modal': { Modal: 'Modal', ModalContent: 'ModalContent' },
@@ -177,6 +181,7 @@ function harness() {
     client,
     downloads,
     activity,
+    load,
     render,
     closed: () => closed,
     async settle(): Promise<unknown> {
@@ -198,6 +203,103 @@ function harness() {
       downloads.disconnectInstallQueue();
     },
   };
+}
+
+for (const readFails of [false, true]) {
+  test(`lost mod update batch stops submissions and ${readFails ? 'retains uncertainty when the queue read fails' : 'observes accepted work through the queue'}`, async (t) => {
+    const h = harness();
+    t.after(h.dispose);
+    const mods = h.load<typeof import('../../src/views/instance/mod-actions')>('views/instance/mod-actions');
+    const bulk = h.load<typeof import('../../src/views/instance/bulk-actions')>('views/instance/bulk-actions');
+    const accepted = queue(1);
+    h.io.post = async ([method, path, body]) => {
+      assert.equal(method, 'POST');
+      assert.equal(path, '/content/install');
+      const request = body as { instance_id: string; selections: ContentSelection[]; allow_incompatible: boolean };
+      assert.equal(request.instance_id, 'instance-a');
+      assert.equal(request.allow_incompatible, false);
+      const index = accepted.items.length;
+      accepted.items.push({
+        queue_id: `accepted-${index}`,
+        state_id: 'queued',
+        kind: 'content',
+        title: 'Mod updates',
+        label: 'Mod updates',
+        summary: '',
+        detail: '',
+        position: index + 1,
+        total: index + 1,
+        install_item: {
+          version_id: 'fabric',
+          content: {
+            instance_id: 'instance-a',
+            label: 'Mod updates',
+            action: {
+              kind: 'install',
+              selections: structuredClone(request.selections),
+              allow_incompatible: false,
+            },
+          },
+        },
+        remove_action: { action: 'remove_from_queue', label: 'Remove', enabled: true },
+      });
+      for (const item of accepted.items) item.total = accepted.items.length;
+      accepted.view_model = {
+        ...accepted.view_model,
+        state_id: 'queued',
+        status_label: 'Queued',
+        queued_count: accepted.items.length,
+        queued_count_label: String(accepted.items.length),
+      };
+      accepted.revision++;
+      if (index === 1) throw new Error('Admission response lost');
+      return structuredClone(accepted);
+    };
+    h.io.queue = async () => {
+      if (readFails) throw new Error('Queue read unavailable');
+      return structuredClone(accepted);
+    };
+    await mods.applyModUpdates(
+      { id: 'instance-a' } as EnrichedInstance,
+      Array.from({ length: 85 }, (_, index) => ({
+        canonical_id: `modrinth:${index}`,
+        kind: 'mod',
+        current_version_id: 'old',
+        latest_version_id: `pinned-${index}`,
+        latest_version_number: 'new',
+      })),
+    );
+    const posts = h.calls.filter(([method]) => method === 'POST');
+    assert.deepEqual(
+      posts.map(([, , body]) => (body as { selections: unknown[] }).selections.length),
+      [40, 40],
+    );
+    assert.equal(h.calls.filter(([, path]) => path === '/install/queue').length, 1);
+    assert.deepEqual(
+      h.downloads.downloadQueue.value.items.map((item) => item.queue_id),
+      readFails ? ['accepted-0'] : ['accepted-0', 'accepted-1'],
+    );
+    assert.equal(h.downloads.downloadQueue.value.view_model.queued_count, readFails ? 1 : 2);
+    assert.equal(h.activity.contentRevision.value, 1);
+    for (const [batch, [, , body]] of posts.entries()) {
+      assert.deepEqual(
+        (body as { selections: unknown[] }).selections,
+        Array.from({ length: 40 }, (_, offset) => ({
+          canonical_id: `modrinth:${batch * 40 + offset}`,
+          kind: 'mod',
+          version_id: `pinned-${batch * 40 + offset}`,
+        })),
+      );
+    }
+    const state = bulk.resourceMutationState('instance-a');
+    assert.equal(state.status, 'error');
+    assert.ok(state.status === 'error');
+    assert.match(state.error, /Queued 40 of 85 updates.*Admission response lost/);
+    assert.equal(
+      h.notices.some(([message]) => /updates queued$/.test(String(message))),
+      false,
+    );
+  });
 }
 
 function nodes(value: unknown): ViewNode[] {
