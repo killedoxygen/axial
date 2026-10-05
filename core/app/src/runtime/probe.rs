@@ -144,6 +144,18 @@ async fn run_probe(
         }
     };
     let deadline = tokio::time::sleep(timeout);
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    #[cfg(test)]
+    let mut last_observation = started;
+    #[cfg(test)]
+    let mut largest_gap = Duration::ZERO;
+    #[cfg(test)]
+    let mut iterations = 0_u64;
+    #[cfg(test)]
+    let mut last_leader = "unobserved";
+    #[cfg(test)]
+    let mut last_tree = "unobserved";
     tokio::pin!(deadline);
     tokio::pin!(cancellation);
     let mut interval = tokio::time::interval(Duration::from_millis(10));
@@ -155,10 +167,36 @@ async fn run_probe(
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
     loop {
+        #[cfg(test)]
+        {
+            let now = std::time::Instant::now();
+            largest_gap = largest_gap.max(now.duration_since(last_observation));
+            last_observation = now;
+            iterations = iterations.saturating_add(1);
+        }
         tokio::select! {
             biased;
             _ = &mut cancellation, if failure.is_none() => failure = Some(JavaDiscoveryError::Cancelled),
-            _ = &mut deadline, if failure.is_none() => failure = Some(JavaDiscoveryError::TimedOut),
+            _ = &mut deadline, if failure.is_none() => {
+                failure = Some(JavaDiscoveryError::TimedOut);
+                #[cfg(test)]
+                {
+                    let now = std::time::Instant::now();
+                    let gap = largest_gap.max(now.duration_since(last_observation));
+                    let leader_before_termination = match process.try_wait() {
+                        Ok(Some(status)) if status.success() => "success",
+                        Ok(Some(_)) => "failure",
+                        Ok(None) => "running",
+                        Err(_) => "error",
+                    };
+                    eprintln!(
+                        "Java probe timeout observation: elapsed_ms={} largest_gap_ms={} iterations={} stdout_bytes={} stdout_eof={} stderr_bytes={} stderr_eof={} last_leader={} last_tree={} leader_before_termination={}",
+                        now.duration_since(started).as_millis(), gap.as_millis(), iterations,
+                        stdout_bytes.len(), stdout_done, stderr_bytes.len(), stderr_done,
+                        last_leader, last_tree, leader_before_termination,
+                    );
+                }
+            },
             result = output.stdout.read(&mut stdout), if !stdout_done => {
                 read_output(result, &stdout, &mut stdout_bytes, stderr_bytes.len(), &mut stdout_done, &mut failure);
             }
@@ -173,18 +211,46 @@ async fn run_probe(
         }
         match process.try_wait() {
             Ok(Some(status)) => {
+                #[cfg(test)]
+                {
+                    last_leader = if status.success() {
+                        "success"
+                    } else {
+                        "failure"
+                    };
+                }
                 if !status.success() && failure.is_none() {
                     failure = Some(JavaDiscoveryError::Failed);
                 }
                 // A diagnostic must not leave descendants behind, even if its
                 // leader exits successfully before the pipes reach EOF.
                 let _ = process.terminate();
-                if stdout_done && stderr_done && matches!(process.tree_settled(), Ok(true)) {
-                    break;
+                if stdout_done && stderr_done {
+                    let settled = process.tree_settled();
+                    #[cfg(test)]
+                    {
+                        last_tree = match &settled {
+                            Ok(true) => "settled",
+                            Ok(false) => "unsettled",
+                            Err(_) => "error",
+                        };
+                    }
+                    if matches!(settled, Ok(true)) {
+                        break;
+                    }
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                #[cfg(test)]
+                {
+                    last_leader = "running";
+                }
+            }
             Err(_) => {
+                #[cfg(test)]
+                {
+                    last_leader = "error";
+                }
                 failure.get_or_insert(JavaDiscoveryError::Failed);
             }
         }
