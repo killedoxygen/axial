@@ -249,11 +249,11 @@ impl DesktopLifecycle {
                 return Err(SHUTDOWN_INCOMPLETE.into());
             }
             if state.intent == Some(TerminalIntent::Update)
-                && intent == TerminalIntent::Restart
+                && matches!(intent, TerminalIntent::Close | TerminalIntent::Restart)
                 && state.update_settled
                 && state.active.is_none()
             {
-                state.intent = Some(TerminalIntent::Restart);
+                state.intent = Some(intent);
                 state.prepared = false;
             }
             if intent == TerminalIntent::Close
@@ -1354,6 +1354,71 @@ mod tests {
             .await
             .unwrap();
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+
+    async fn assert_settled_update_can_close(stop_api_before_settlement: bool) {
+        let (_directory, lifecycle, address) = preferences_fixture().await;
+        let mut events = lifecycle.interface_preferences_events();
+        assert!(lifecycle.finish_update_settled().is_err());
+        let update = start_terminal(&lifecycle, TerminalIntent::Update);
+        let request = preference_event(&mut events).await;
+        assert_eq!(
+            lifecycle.prepare_exit(TerminalIntent::Close).await,
+            Err(TERMINAL_CONFLICT.into())
+        );
+        lifecycle
+            .complete_interface_preferences(&request.request_id, true)
+            .unwrap();
+        update.await.unwrap().unwrap();
+        if stop_api_before_settlement {
+            lifecycle.prepare_update_process_exit().await.unwrap();
+        }
+        assert_eq!(
+            tokio::net::TcpStream::connect(address).await.is_err(),
+            stop_api_before_settlement
+        );
+        assert_eq!(
+            lifecycle.prepare_exit(TerminalIntent::Close).await,
+            Err(TERMINAL_CONFLICT.into())
+        );
+        // Exercise the native owner's explicit settlement boundary, not an installer.
+        lifecycle.finish_update_settled().unwrap();
+        let close = lifecycle.prepare_exit(TerminalIntent::Close).await;
+        let server_settled = lifecycle
+            .retained_services()
+            .unwrap()
+            .server
+            .is_shutdown_settled();
+        let http_stopped = tokio::net::TcpStream::connect(address).await.is_err();
+        if close.is_err() {
+            lifecycle
+                .prepare_exit(TerminalIntent::Restart)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            lifecycle.tasks.try_spawn((), |_| async {}),
+            Err(axial_app::tasks::SpawnError::Closed)
+        ));
+        assert!(!lifecycle.exit_allowed());
+        assert!(!lifecycle.restart_after_exit());
+        lifecycle.shutdown_after_event_loop().await;
+        lifecycle.release_services_after_exit().unwrap();
+        assert!(lifecycle.retained_services().is_err());
+        assert_eq!(close, Ok(()));
+        assert!(server_settled);
+        assert!(http_stopped);
+        assert_eq!(lifecycle.terminal.lock().unwrap().preference_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn settled_update_can_close_with_live_http() {
+        assert_settled_update_can_close(false).await;
+    }
+
+    #[tokio::test]
+    async fn settled_update_can_close_with_already_joined_http() {
+        assert_settled_update_can_close(true).await;
     }
 
     #[tokio::test]
