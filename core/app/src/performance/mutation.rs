@@ -2367,7 +2367,16 @@ mod tests {
         (root, library_id)
     }
 
-    async fn prepared_remove_restart(entry: &str, action: &str) {
+    async fn settled_prepared_fixture(
+        entry: &str,
+        action: &str,
+    ) -> (
+        tempfile::TempDir,
+        crate::library::LibraryId,
+        PerformanceService,
+        PerformanceOperationStatus,
+        std::path::PathBuf,
+    ) {
         let (root, library_id) = prepared_crash_fixture(entry, action, "prepared").await;
         let storage = MetadataStore::open(root.path().join("metadata.sqlite")).unwrap();
         let (pending_bytes, command) = storage
@@ -2478,6 +2487,12 @@ mod tests {
         assert_eq!(service.pending_count().unwrap(), 0);
         assert!(!service.has_unsettled_effects());
         service.instances.admit(&pending.instance_id).unwrap();
+        (root, library_id, service, command, path)
+    }
+
+    async fn prepared_remove_restart(entry: &str, action: &str) {
+        let (root, library_id, service, command, path) =
+            settled_prepared_fixture(entry, action).await;
         let files = payload_files(&path);
         service.instances.library().try_preserve().unwrap();
         let prior = service.instances.library().snapshot();
@@ -2516,6 +2531,175 @@ mod tests {
                 prepared_remove_restart(entry, action).await;
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_restart_releases_library_during_install_spawn() {
+        use std::os::unix::process::CommandExt;
+
+        // Isolate the paused fork from unrelated tests' live root leases.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "performance::mutation::tests::prepared_restart_during_install_spawn_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let waited = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break Ok(()),
+                Err(error) => break Err(error),
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    break Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        if waited.is_err() {
+            // Only this helper and its own descendants belong to this group.
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            waited.is_ok() && output.status.success(),
+            "isolated restart failed ({waited:?}): {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "isolated process fixture invoked by the concurrent install-spawn restart test"]
+    async fn prepared_restart_during_install_spawn_child() {
+        use crate::library::{LibraryLifecycle, LibraryOpenOutcome};
+        use std::{
+            io::{Read, Write},
+            os::{fd::AsRawFd, unix::net::UnixStream, unix::process::CommandExt},
+            time::{Duration, Instant},
+        };
+
+        let (root, library_id, service, command_status, path) =
+            settled_prepared_fixture("queued", "apply").await;
+        let files = payload_files(&path);
+        let pin = service.instances.library().admit().unwrap();
+        let (mut gate, child_gate) = UnixStream::pair().unwrap();
+        gate.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        gate.set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut command = crate::install::queue::tests::bounded_fd_child_command();
+        unsafe {
+            command.pre_exec(move || {
+                // Only async-signal-safe operations run between fork and exec.
+                let fd = child_gate.as_raw_fd();
+                let mut byte = 1_u8;
+                if libc::write(fd, (&byte as *const u8).cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut ready = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if libc::poll(&mut ready, 1, 30_000) != 1 {
+                    return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                }
+                if libc::read(fd, (&mut byte as *mut u8).cast(), 1) != 1 || byte != 1 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                }
+                Ok(())
+            });
+        }
+        let (observed, released, child) = std::thread::scope(|scope| {
+            let spawning = scope.spawn(move || -> std::io::Result<_> {
+                let mut child = command.spawn()?;
+                let deadline = Instant::now() + Duration::from_secs(45);
+                let waited = loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break Ok(status),
+                        Err(error) => break Err(error),
+                        Ok(None) if Instant::now() >= deadline => {
+                            break Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                        }
+                        Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                };
+                if waited.is_err() {
+                    let _ = child.kill();
+                }
+                let reaped = child.wait();
+                waited.and(reaped)
+            });
+            let observed = (|| -> std::io::Result<_> {
+                let mut entered = [0_u8];
+                gate.read_exact(&mut entered)?;
+                if entered != [1] {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                }
+                let preservation = service.instances.library().try_preserve();
+                let prior = service.instances.library().snapshot();
+                drop(service);
+                let pin_valid = pin.revalidate();
+                let pinned = LibraryLifecycle::open_with_id(root.path(), library_id);
+                drop(pin);
+                let reopened = LibraryLifecycle::open_with_id(root.path(), library_id);
+                Ok((preservation, prior, pin_valid, pinned, reopened))
+            })();
+            let released = gate.write_all(&[1]);
+            (observed, released, spawning.join())
+        });
+        // All verdicts, including the expected RED, follow release and reap.
+        let (preservation, prior, pin_valid, pinned, reopened) = observed.unwrap();
+        let pinned_busy = matches!(
+            &pinned,
+            LibraryOpenOutcome::NoEffect(axial_fs::RootSessionError::Busy)
+        );
+        let pinned_debug = format!("{pinned:?}");
+        let immediate = matches!(&reopened, LibraryOpenOutcome::Ready(_));
+        let immediate_debug = format!("{reopened:?}");
+        for outcome in [&pinned, &reopened] {
+            if let LibraryOpenOutcome::Ready(owner) = outcome {
+                owner.try_preserve().unwrap();
+            }
+        }
+        drop((pinned, reopened));
+        released.unwrap();
+        assert!(child.unwrap().unwrap().success());
+        preservation.unwrap();
+        pin_valid.unwrap();
+        assert!(
+            pinned_busy,
+            "live pin did not retain the library: {pinned_debug}"
+        );
+        let after_exec = restart_service(
+            root.path(),
+            library_id,
+            "after install child exit",
+            Some(&prior),
+        );
+        assert_eq!(after_exec.recover_pending().await.unwrap(), 0);
+        assert_eq!(
+            after_exec
+                .operation(&command_status.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "complete"
+        );
+        assert_eq!(payload_files(&path), files);
+        after_exec.instances.library().try_preserve().unwrap();
+        assert!(
+            immediate,
+            "settled library remained leased before child exec: {immediate_debug}"
+        );
     }
 
     #[tokio::test]

@@ -5493,35 +5493,43 @@ pub(crate) mod tests {
     }
 
     #[cfg(unix)]
+    const FD_FIXTURE_CHILD: &str = "AXIAL_INSTALL_FD_FIXTURE_CHILD";
+
+    #[cfg(unix)]
+    pub(crate) fn bounded_fd_child_command() -> std::process::Command {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "install::queue::tests::large_install_inventory_uses_bounded_file_descriptors",
+                "--nocapture",
+            ])
+            .env(FD_FIXTURE_CHILD, "1");
+        // Limit only the isolated child; parallel tests retain their own
+        // process limits. No installed/user directory enters this fixture.
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: 128,
+                    rlim_max: 128,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn large_install_inventory_uses_bounded_file_descriptors() {
         use sha1::Digest;
-        use std::os::unix::process::CommandExt;
-        const CHILD: &str = "AXIAL_INSTALL_FD_FIXTURE_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command
-                .args([
-                    "--exact",
-                    "install::queue::tests::large_install_inventory_uses_bounded_file_descriptors",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1");
-            // Limit only the isolated child; parallel tests retain their own
-            // process limits. No installed/user directory enters this fixture.
-            unsafe {
-                command.pre_exec(|| {
-                    let limit = libc::rlimit {
-                        rlim_cur: 128,
-                        rlim_max: 128,
-                    };
-                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            let result = command.output().unwrap();
+        if std::env::var_os(FD_FIXTURE_CHILD).is_none() {
+            let result = bounded_fd_child_command().output().unwrap();
             assert!(
                 result.status.success(),
                 "bounded-FD fixture failed: {} {}",

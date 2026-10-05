@@ -654,10 +654,20 @@ mod native {
 
     pub(crate) struct LeaseHandle {
         handle: File,
+        process: u32,
         identity: Identity,
         root: RootGuard,
         name: OsString,
         name_class_revision: RwLock<Option<DirectoryStamp>>,
+    }
+
+    impl Drop for LeaseHandle {
+        fn drop(&mut self) {
+            // A pre-exec duplicate must not retain this owner or unlock its parent.
+            if self.process == std::process::id() {
+                let _ = unsafe { libc::flock(self.handle.as_raw_fd(), libc::LOCK_UN) };
+            }
+        }
     }
 
     #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -3853,6 +3863,7 @@ mod native {
         };
         LeaseAcquisitionOutcome::Acquired(LeaseHandle {
             handle,
+            process: std::process::id(),
             identity,
             root: retained_root,
             name: name.to_os_string(),
@@ -4099,6 +4110,7 @@ mod native {
                 .handle
                 .take()
                 .expect("reconciled lease acquisition retains its file"),
+            process: std::process::id(),
             identity,
             root: retained_root,
             name: obligation.name.clone(),
