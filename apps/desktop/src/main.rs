@@ -27,6 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn app_context() -> tauri::Context<tauri::Wry> {
+    // Track the inline configuration read by the context macro.
+    let _ = option_env!("TAURI_CONFIG");
     // The macro embeds platform symbols, so keep a single expansion.
     tauri::generate_context!()
 }
