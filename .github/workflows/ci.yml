@@ -75,11 +75,22 @@ jobs:
           exit "$status"
       - name: Test launcher core and local API
         shell: bash
+        env:
+          RUST_TEST_NOCAPTURE: 1
+          RUST_BACKTRACE: 1
         run: |
           status=0
           node scripts/cargo-target.mjs run -- cargo test -p axial-app -p axial-api -p axial-fs -p axial-minecraft -p axial-performance -p axial-resource --lib > "$RUNNER_TEMP/application-tests.log" 2>&1 || status=$?
           tail -n 70 "$RUNNER_TEMP/application-tests.log"
           exit "$status"
+      - name: Preserve failed core test output
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: core-test-failure
+          path: ${{ runner.temp }}/application-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Typecheck and test retained interface
         shell: bash
         run: |
