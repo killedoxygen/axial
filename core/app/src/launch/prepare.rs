@@ -223,7 +223,47 @@ pub(super) mod tests {
         PreparedSession,
         crate::library::ApplicationRootPin,
     ) {
-        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        fixture_with_legacy_arguments(false).await
+    }
+
+    pub(in crate::launch) async fn legacy_fixture() -> (
+        tempfile::TempDir,
+        PreparedSession,
+        crate::library::ApplicationRootPin,
+    ) {
+        fixture_with_legacy_arguments(true).await
+    }
+
+    async fn fixture_with_legacy_arguments(
+        legacy: bool,
+    ) -> (
+        tempfile::TempDir,
+        PreparedSession,
+        crate::library::ApplicationRootPin,
+    ) {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let root = if legacy {
+            tempfile::Builder::new()
+                .prefix("legacy launch ")
+                .tempdir_in(parent)
+                .unwrap()
+        } else {
+            tempfile::tempdir_in(parent).unwrap()
+        };
+        let (version_id, metadata, java_version) = if legacy {
+            (
+                "1.4.7",
+                br#"{"id":"1.4.7","type":"release","mainClass":"net.minecraft.client.Minecraft","minecraftArguments":"${auth_player_name} ${auth_session} --gameDir ${game_directory}"}"#.as_slice(),
+                "1.8.0_312",
+            )
+        } else {
+            (
+                "1.20.1",
+                br#"{"id":"1.20.1","type":"release","mainClass":"net.minecraft.client.main.Main"}"#
+                    .as_slice(),
+                "17.0.10",
+            )
+        };
         let library = match LibraryLifecycle::open(root.path()) {
             LibraryOpenOutcome::Ready(library) => library,
             other => panic!("fixture library unavailable: {other:?}"),
@@ -249,13 +289,13 @@ pub(super) mod tests {
             .create(
                 CreateInstanceRequest {
                     name: "Launch proof".into(),
-                    selection_id: "1.20.1".into(),
+                    selection_id: version_id.into(),
                     ..Default::default()
                 },
                 CreateTarget {
-                    selection_id: "1.20.1".into(),
-                    version_id: "1.20.1".into(),
-                    minecraft_version: "1.20.1".into(),
+                    selection_id: version_id.into(),
+                    version_id: version_id.into(),
+                    minecraft_version: version_id.into(),
                     loader_key: "vanilla".into(),
                 },
             )
@@ -279,7 +319,7 @@ pub(super) mod tests {
             .prepare_for_launch(
                 &instance,
                 performance.resolution_request(
-                    "1.20.1".into(),
+                    version_id.into(),
                     "vanilla".into(),
                     axial_performance::PerformanceMode::Vanilla,
                 ),
@@ -288,24 +328,23 @@ pub(super) mod tests {
             .unwrap();
         let mut files = Vec::new();
         for (path, bytes) in [
+            (format!("versions/{version_id}/{version_id}.json"), metadata),
             (
-                "versions/1.20.1/1.20.1.json",
-                br#"{"id":"1.20.1","type":"release","mainClass":"net.minecraft.client.main.Main"}"#
-                    .as_slice(),
+                format!("versions/{version_id}/{version_id}.jar"),
+                b"verified client".as_slice(),
             ),
-            ("versions/1.20.1/1.20.1.jar", b"verified client".as_slice()),
         ] {
-            let target = root.path().join(path);
+            let target = root.path().join(&path);
             std::fs::create_dir_all(target.parent().unwrap()).unwrap();
             std::fs::write(target, bytes).unwrap();
             files.push(ActivatedFile {
-                path: path.into(),
+                path,
                 sha1: hex::encode(Sha1::digest(bytes)),
                 size: bytes.len() as u64,
             });
         }
         let installed = ActivatedVersion {
-            version_id: "1.20.1".into(),
+            version_id: version_id.into(),
             contract_id: format!("managed-install-activation-v1.{}", "A".repeat(43)),
             files,
         }
@@ -313,7 +352,7 @@ pub(super) mod tests {
         .unwrap();
         let java = root.path().join("java");
         std::fs::write(&java, format!(
-            "#!/bin/sh\nprintf 'java.version = 17.0.10\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
+            "#!/bin/sh\nprintf 'java.version = {java_version}\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
             std::env::consts::ARCH,
         )).unwrap();
         std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -328,7 +367,7 @@ pub(super) mod tests {
             version_guard: axial_minecraft::VersionBundleReadGuard::acquire(&operation).unwrap(),
             library_operation: operation,
             library_dir: instance.generation().read_projection().unwrap(),
-            target_version_id: "1.20.1".into(),
+            target_version_id: version_id.into(),
             game_dir: instance.game_directory().read_projection().unwrap(),
             auth: super::super::model::LaunchAuthContext::offline("Player"),
             runtime,
@@ -340,7 +379,7 @@ pub(super) mod tests {
         .unwrap();
         let prepared = PreparedSession {
             instance_id: instance.record().instance.id.clone(),
-            version_id: "1.20.1".into(),
+            version_id: version_id.into(),
             command,
             account: CapturedSelection::capture(&accounts).unwrap(),
             accounts,
@@ -350,7 +389,7 @@ pub(super) mod tests {
             instance,
             performance,
             scenario: super::super::reports::LaunchProofScenario {
-                version_id: Some("1.20.1".into()),
+                version_id: Some(version_id.into()),
                 ..Default::default()
             },
             resource_budget: super::super::resources::capture(

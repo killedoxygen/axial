@@ -1122,6 +1122,10 @@ fn resolve_legacy_args(arguments: &str, var_map: &HashMap<&str, String>) -> Vec<
 fn default_legacy_jvm_args(var_map: &HashMap<&str, String>) -> Vec<String> {
     vec![
         format!(
+            "-Dminecraft.applet.TargetDirectory={}",
+            var_map.get("game_directory").cloned().unwrap_or_default()
+        ),
+        format!(
             "-Djava.library.path={}",
             var_map
                 .get("natives_directory")

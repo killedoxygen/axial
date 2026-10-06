@@ -289,6 +289,7 @@ fn validate_extra_args(
                     "java.library.path",
                     "java.home",
                     "org.lwjgl.librarypath",
+                    "minecraft.applet.TargetDirectory",
                 ]
                 .contains(&property.split_once('=').map_or(property, |(key, _)| key))
             })
@@ -316,6 +317,46 @@ fn validate_extra_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_command_binds_applet_home_to_the_admitted_game_directory() {
+        let (_root, prepared, _application) = super::super::prepare::tests::legacy_fixture().await;
+        prepared.validate_before_spawn().unwrap();
+        let command = prepared.validated_command();
+        assert!(command.installed.version().is_legacy_version());
+        assert_eq!(command.runtime.info().major, 8);
+        let game = prepared
+            .instance()
+            .game_directory()
+            .read_projection()
+            .unwrap();
+        let game = game.to_str().unwrap();
+        assert!(game.contains(' '));
+        assert_eq!(command.cwd().to_str().unwrap(), game);
+        let main = command
+            .args()
+            .iter()
+            .position(|arg| arg == &command.installed.version().main_class)
+            .unwrap();
+        let properties = command.args()[..main]
+            .iter()
+            .filter(|arg| {
+                arg.as_str() == "-Dminecraft.applet.TargetDirectory"
+                    || arg.starts_with("-Dminecraft.applet.TargetDirectory=")
+            })
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            properties,
+            [format!("-Dminecraft.applet.TargetDirectory={game}")]
+        );
+        assert!(
+            command.args()[main + 1..]
+                .windows(2)
+                .any(|pair| pair == ["--gameDir", game])
+        );
+    }
 
     #[test]
     fn vanilla_1_20_1_keeps_verified_native_search_paths_out_of_runtime_scratch() {
@@ -429,10 +470,12 @@ mod tests {
             "-Xmx8G",
             "-Djava.library.path=elsewhere",
             "-Dorg.lwjgl.librarypath=elsewhere",
+            "-Dminecraft.applet.TargetDirectory=elsewhere",
             "-Djava.class.path",
             "-Djava.library.path",
             "-Djava.home",
             "-Dorg.lwjgl.librarypath",
+            "-Dminecraft.applet.TargetDirectory",
             "@args",
             "Main",
         ] {
