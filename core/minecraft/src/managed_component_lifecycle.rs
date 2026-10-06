@@ -61,6 +61,10 @@ pub(crate) trait RetainedComponentPublicationSource: Send + Sized {
     fn observed_size(&self) -> u64;
     fn observed_sha1(&self) -> [u8; 20];
 
+    fn requires_exact_prior(&self) -> bool {
+        false
+    }
+
     fn stage_create_new(
         self,
         staging_bucket: &ManagedDir,
@@ -1046,8 +1050,11 @@ where
                 counts.supplied_exact += 1;
             }
         } else {
-            if !sources.contains_key(&row.path) {
-                return Err(PrepareComponentIntentError::SourceSet);
+            let source = sources
+                .get(&row.path)
+                .ok_or(PrepareComponentIntentError::SourceSet)?;
+            if row.prior.is_some() && source.requires_exact_prior() {
+                return Err(PrepareComponentIntentError::CanonicalChanged);
             }
             counts.required += 1;
         }
@@ -1917,6 +1924,90 @@ mod tests {
             .unwrap_or_else(|_| panic!("durable Libraries intent"));
         assert!(lane.join(COMPONENT_INTENT_FILE).is_file());
         drop(prepared);
+    }
+
+    #[tokio::test]
+    async fn exact_prior_sources_refuse_late_conflicts_and_preserve_replay_policy() {
+        use crate::download::library_source::{
+            LibraryComponentSourceKind, RetainedLibraryComponentSource,
+        };
+
+        let payload = b"authenticated-library";
+        for (strict, prior) in [
+            (true, None),
+            (true, Some(payload.as_slice())),
+            (false, Some(b"foreign-library".as_slice())),
+            (true, Some(b"foreign-library".as_slice())),
+        ] {
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+            let path = PortableRelativePath::new("fml/library.jar").unwrap();
+            let sha1: [u8; 20] = Sha1::digest(payload).into();
+            let source = RetainedLibraryComponentSource::from_authenticated_local_bytes(
+                path.clone(),
+                LibraryComponentSourceKind::Library,
+                payload.to_vec(),
+                payload.len() as u64,
+                sha1,
+            )
+            .unwrap();
+            let source = if strict {
+                source.require_exact_prior()
+            } else {
+                source
+            };
+            let replay = source.retained_replay();
+            drop(source);
+            let authority = PendingKnownGoodInstallAuthority::component_for_test([(
+                KnownGoodRoot::Libraries,
+                path.as_str().to_owned(),
+                KnownGoodArtifactKind::Library,
+                sha1,
+                payload.len() as u64,
+            )]);
+            let lease = test_lease(&temporary).await;
+            assert!(matches!(
+                plan_component_canonical_path(lease.root(), ManagedComponentKind::Libraries, &path)
+                    .unwrap()
+                    .observe()
+                    .unwrap(),
+                ComponentCanonicalObservation::Absent
+            ));
+            let canonical = path.join_under(&temporary.path().join("libraries"));
+            if let Some(bytes) = prior {
+                fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+                fs::write(&canonical, bytes).unwrap();
+            }
+            let result = publish_managed_component_effect(
+                lease,
+                authority
+                    .component_projection(ManagedKnownGoodComponent::Libraries)
+                    .unwrap(),
+                ManagedComponentKind::Libraries,
+                vec![replay],
+            )
+            .await;
+            let refused = matches!(
+                &result,
+                Err(ComponentLifecycleError::Prepare(
+                    PrepareComponentIntentError::CanonicalChanged
+                ))
+            );
+            let committed = matches!(&result, Ok(ManagedComponentLifecycleOutcome::Committed(_)));
+            drop(result);
+            if strict && prior.is_some_and(|bytes| bytes != payload) {
+                assert!(refused, "strict source accepted a differing late arrival");
+                assert_eq!(fs::read(&canonical).unwrap(), prior.unwrap());
+                assert_component_lane_absent(&temporary, ManagedComponentKind::Libraries);
+            } else {
+                assert!(committed, "permitted source publication did not commit");
+                assert_eq!(fs::read(&canonical).unwrap(), payload);
+                if prior == Some(payload.as_slice()) {
+                    assert_component_lane_absent(&temporary, ManagedComponentKind::Libraries);
+                } else {
+                    assert_component_lane_settled(&temporary, ManagedComponentKind::Libraries);
+                }
+            }
+        }
     }
 
     #[tokio::test]

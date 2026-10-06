@@ -1,11 +1,17 @@
-use crate::download::library_source::RetainedLibrarySourceSet;
+use crate::download::library_source::{
+    LibraryComponentSourceKind, LibrarySourcePool, LibrarySourceRequest,
+    RetainedLibraryComponentSource, RetainedLibrarySourceSet,
+    acquire_retained_library_component_source,
+};
 use crate::download::{
-    AuthenticatedSelectedArtifactSource, DownloadProgress, Downloader, ExactLibraryDownloadProof,
-    ManagedReconstructionContext, PreparedManagedInstall,
+    AuthenticatedSelectedArtifactSource, DownloadJob, DownloadProgress, Downloader,
+    ExactLibraryCacheAdmission, ExactLibraryDownloadProof, ExpectedIntegrity,
+    ManagedInstallActivationContractId, ManagedReconstructionContext, PreparedManagedInstall,
     download_installer_libraries_with_declarations_and_facts,
     download_profile_retained_libraries_with_declarations_and_facts, prepare_local_managed_install,
-    publish_prepared_managed_install, reconstruct_installer_library_declarations,
-    reconstruct_profile_library_declarations,
+    publish_prepared_managed_install, reconstruct_game_library_sources,
+    reconstruct_installer_library_declarations, reconstruct_profile_library_declarations,
+    standard_minecraft_download_client,
 };
 use crate::known_good::{
     KnownGoodInstallReceipt, KnownGoodLoaderBaseDerivation, KnownGoodReconstructionReceipt,
@@ -29,6 +35,7 @@ use crate::loaders::forge_installer::{
     PendingForgeNetworkInstall, VerifiedInstallerClientBytes, bind_authenticated_installer_plan,
     plan_authenticated_installer,
 };
+use crate::loaders::game_libraries::{self, Requirements};
 #[cfg(not(test))]
 use crate::loaders::http::fetch_bytes;
 #[cfg(test)]
@@ -40,7 +47,9 @@ use crate::loaders::types::{
     LoaderInstallContinuation, LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy,
 };
 use crate::loaders::{validate_provider_version_id, validate_version_id};
-use crate::managed_fs::ManagedLibraryOperation;
+use crate::managed_blocking::ManagedBlockingWorkers;
+use crate::managed_fs::{ManagedLibraryFile, ManagedLibraryOperation};
+use crate::portable_path::PortableRelativePath;
 use crate::runtime::{ManagedRuntimeCache, acquire_preferred_runtime_source};
 use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use sha1::{Digest as _, Sha1};
@@ -299,9 +308,10 @@ async fn reconstruct_profile_after_sources(
 
 pub(super) async fn reconstruct_from_legacy_archive(
     plan: &LoaderInstallPlan,
+    expected: &ManagedInstallActivationContractId,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
     let context = ManagedReconstructionContext::proof_only();
-    reconstruct_component_from_legacy_archive(plan, &context)
+    reconstruct_component_from_legacy_archive(plan, &context, Some(expected))
         .await
         .map(RetainedKnownGoodReconstruction::discard_sources)
 }
@@ -309,18 +319,20 @@ pub(super) async fn reconstruct_from_legacy_archive(
 pub(super) async fn reconstruct_component_from_legacy_archive(
     plan: &LoaderInstallPlan,
     context: &ManagedReconstructionContext,
+    expected: Option<&ManagedInstallActivationContractId>,
 ) -> Result<RetainedKnownGoodReconstruction, LoaderError> {
     let downloader = Downloader::source_only();
-    reconstruct_legacy_authority_with_downloader(plan, &downloader, context).await
+    reconstruct_legacy_authority_with_downloader(plan, &downloader, context, expected).await
 }
 
 async fn reconstruct_legacy_authority_with_downloader(
     plan: &LoaderInstallPlan,
     downloader: &Downloader,
     context: &ManagedReconstructionContext,
+    expected: Option<&ManagedInstallActivationContractId>,
 ) -> Result<RetainedKnownGoodReconstruction, LoaderError> {
     Box::pin(reconstruct_legacy_with_downloader_inner(
-        plan, downloader, context,
+        plan, downloader, context, expected,
     ))
     .await
 }
@@ -331,7 +343,7 @@ async fn reconstruct_legacy_with_downloader(
     downloader: &Downloader,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
     let context = ManagedReconstructionContext::proof_only();
-    reconstruct_legacy_authority_with_downloader(plan, downloader, &context)
+    reconstruct_legacy_authority_with_downloader(plan, downloader, &context, None)
         .await
         .map(RetainedKnownGoodReconstruction::discard_sources)
 }
@@ -340,6 +352,7 @@ async fn reconstruct_legacy_with_downloader_inner(
     plan: &LoaderInstallPlan,
     downloader: &Downloader,
     context: &ManagedReconstructionContext,
+    expected: Option<&ManagedInstallActivationContractId>,
 ) -> Result<RetainedKnownGoodReconstruction, LoaderError> {
     let LoaderInstallSource::LegacyArchive { url } = &plan.record.install_source else {
         return Err(LoaderError::InvalidProfile(
@@ -365,16 +378,60 @@ async fn reconstruct_legacy_with_downloader_inner(
         archive_source.shared_bytes(),
     )
     .await?;
-    seal_reconstructed_legacy_archive_source(AuthenticatedLegacyOverlayAuthority {
-        base,
-        base_client_source,
-        archive_source,
-        record: plan.record.clone(),
-        resolved_version,
-        version_bytes,
-        child_client_bytes,
-    })
-    .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))
+    let archive_bytes = archive_source.shared_bytes();
+    let mut reconstructed =
+        seal_reconstructed_legacy_archive_source(AuthenticatedLegacyOverlayAuthority {
+            base,
+            base_client_source,
+            archive_source,
+            record: plan.record.clone(),
+            resolved_version,
+            version_bytes,
+            child_client_bytes,
+        })
+        .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
+    if let Some(expected) = expected
+        && reconstructed
+            .receipt()
+            .activation_contract_id()
+            .map_err(|_| LoaderError::Verify("invalid reconstructed loader contract".into()))?
+            == *expected
+    {
+        return Ok(reconstructed);
+    }
+    if let Some(requirements) =
+        recognize_game_libraries(&plan.record.version_id, archive_bytes).await?
+    {
+        reconstructed = reconstructed
+            .require_game_libraries(&requirements)
+            .map_err(|error| LoaderError::Verify(format!("derive game libraries: {error:?}")))?;
+        if let Some(expected) = expected
+            && reconstructed
+                .receipt()
+                .activation_contract_id()
+                .map_err(|_| LoaderError::Verify("invalid reconstructed loader contract".into()))?
+                != *expected
+        {
+            return Err(LoaderError::Verify(
+                "reconstructed loader contract differs from checkpoint".into(),
+            ));
+        }
+        let sources = reconstruct_game_library_sources(&requirements, context)
+            .await
+            .map_err(|_| LoaderError::Verify("game library reconstruction failed".into()))?;
+        let (receipt, mut retained, version_bundle) = reconstructed.into_parts();
+        for source in sources {
+            retained.insert(source).map_err(|_| {
+                LoaderError::Verify("conflicting reconstructed game library".into())
+            })?;
+        }
+        reconstructed = RetainedKnownGoodReconstruction::new(receipt, retained, version_bundle);
+    } else if expected.is_some() {
+        return Err(LoaderError::Verify(
+            "reconstructed loader contract differs from checkpoint".into(),
+        ));
+    }
+    Ok(reconstructed)
 }
 
 async fn derive_legacy_archive_inputs(
@@ -1104,6 +1161,12 @@ where
     let base_client_bytes = read_installed_base_client(library_root, &base_derivation)?;
     let archive_bytes =
         archive_source.into_shared_bytes_for(archive_url, &plan.record.version_id)?;
+    let requirements =
+        recognize_game_libraries(&plan.record.version_id, archive_bytes.clone()).await?;
+    let sources = match &requirements {
+        Some(requirements) => acquire_game_libraries(library_root, requirements, send).await?,
+        None => Vec::new(),
+    };
     let (version, version_bytes, child_client_bytes) = derive_legacy_archive_inputs(
         base_derivation.effective_version(),
         &plan.record,
@@ -1112,7 +1175,7 @@ where
     )
     .await?;
     let log_config_bytes = read_inherited_log_config(library_root, &base_derivation, &version)?;
-    let authority = base_derivation
+    let mut authority = base_derivation
         .derive_verified_legacy_archive_source(
             &plan.record,
             version,
@@ -1120,12 +1183,17 @@ where
             &child_client_bytes,
         )
         .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
+    if let Some(requirements) = &requirements {
+        authority = authority
+            .require_game_libraries(requirements)
+            .map_err(|error| LoaderError::Verify(format!("derive game libraries: {error:?}")))?;
+    }
     let prepared = prepare_local_managed_install(
         authority,
         version_bytes,
         child_client_bytes,
         log_config_bytes,
-        Vec::new(),
+        sources,
     )
     .map_err(loader_managed_install_error)?;
     send(progress("loader_overlay", 1, 1, None));
@@ -1134,6 +1202,167 @@ where
     send(progress("loader_publish", 1, 1, None));
     send(done());
     Ok(receipt)
+}
+
+async fn recognize_game_libraries(
+    version_id: &str,
+    archive: Arc<[u8]>,
+) -> Result<Option<Requirements>, LoaderError> {
+    let version_id = version_id.to_owned();
+    process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(
+            PhysicalIoClass::Read,
+            game_libraries::scratch_bytes(archive.len() as u64)?,
+        ))
+        .await
+        .map_err(|_| LoaderError::InstallExecutionFailed("game library inspection stopped".into()))?
+        .run(move |_| game_libraries::recognize(&version_id, &archive))
+        .await
+        .map_err(|_| {
+            LoaderError::InstallExecutionFailed("game library inspection stopped".into())
+        })?
+}
+
+async fn acquire_game_libraries<F>(
+    library_root: &ManagedLibraryOperation,
+    requirements: &Requirements,
+    send: &mut F,
+) -> Result<Vec<RetainedLibraryComponentSource>, LoaderError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let workers = ManagedBlockingWorkers::new();
+    let attempt = workers.attempt_guard();
+    let (fact_tx, mut facts_rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = async {
+        let root = library_root.clone();
+        let declared = requirements.clone();
+        let guards = workers
+            .run(move |cancellation| {
+                let mut batch = root.file_batch();
+                let mut guards: Vec<ManagedLibraryFile> = Vec::new();
+                for requirement in declared.entries() {
+                    cancellation.check_io().map_err(LoaderError::Io)?;
+                    let path = PortableRelativePath::new_exact(&format!(
+                        "libraries/{}",
+                        requirement.path()
+                    ))
+                    .map_err(|_| LoaderError::Verify("invalid game library path".into()))?;
+                    if let Some(file) = batch.observe_file(&path).map_err(LoaderError::Io)? {
+                        if file.size() != requirement.size()
+                            || format!(
+                                "{:x}",
+                                sha1::digest::Output::<Sha1>::from(
+                                    file.sha1_bounded(requirement.size())
+                                        .map_err(LoaderError::Io)?
+                                )
+                            ) != requirement.sha1()
+                        {
+                            return Err(LoaderError::Verify(
+                                "required game library conflicts with existing file".into(),
+                            ));
+                        }
+                        guards.push(file);
+                    }
+                }
+                Ok(guards)
+            })
+            .await
+            .map_err(|_| {
+                LoaderError::InstallExecutionFailed("game library inspection stopped".into())
+            })??;
+        let total_bytes = requirements
+            .entries()
+            .iter()
+            .map(|entry| entry.size())
+            .sum();
+        let pool = LibrarySourcePool::with_retained_limit(total_bytes, workers.clone())
+            .map_err(|_| LoaderError::Verify("game library source budget unavailable".into()))?;
+        let cache = ExactLibraryCacheAdmission::bind_with_workers(library_root, workers.clone())
+            .await
+            .map_err(|_| LoaderError::Verify("game library cache unavailable".into()))?;
+        let client = standard_minecraft_download_client();
+        let mut sources = Vec::new();
+        send(progress(
+            "game_libraries",
+            0,
+            requirements.entries().len() as i32,
+            None,
+        ));
+        for (index, requirement) in requirements.entries().iter().enumerate() {
+            let job = DownloadJob {
+                relative_path: PortableRelativePath::new_exact(requirement.path())
+                    .map_err(|_| LoaderError::Verify("invalid game library path".into()))?,
+                url: requirement.provider_url().to_owned(),
+                name: requirement.file_name().to_owned(),
+                expected: ExpectedIntegrity {
+                    size: Some(requirement.size()),
+                    sha1: Some(requirement.sha1().to_owned()),
+                },
+                is_native: false,
+            };
+            let source = match cache
+                .retain_installer_source(&job, &pool, LibraryComponentSourceKind::Library)
+                .await
+            {
+                Ok(Some(source)) => Ok(source),
+                Ok(None) => {
+                    acquire_retained_library_component_source(
+                        LibrarySourceRequest {
+                            client: &client,
+                            url: &job.url,
+                            expected: &job.expected,
+                            relative_path: &job.relative_path,
+                            max_bytes: requirement.size(),
+                            target: requirement.path(),
+                            pool: &pool,
+                            fact_tx: Some(&fact_tx),
+                        },
+                        LibraryComponentSourceKind::Library,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+            .map_err(|error| {
+                log_library_download_failure("game_libraries", &error);
+                LoaderError::ArtifactDownloadFailed { facts: Vec::new() }
+            })?;
+            sources.push(source.require_exact_prior());
+            send(progress(
+                "game_libraries",
+                index as i32 + 1,
+                requirements.entries().len() as i32,
+                Some(job.name),
+            ));
+        }
+        workers
+            .run(move |_| {
+                for file in guards {
+                    file.revalidate().map_err(LoaderError::Io)?;
+                }
+                Ok::<(), LoaderError>(())
+            })
+            .await
+            .map_err(|_| {
+                LoaderError::InstallExecutionFailed("game library inspection stopped".into())
+            })??;
+        Ok(sources)
+    }
+    .await;
+    if result.is_err() {
+        workers.cancel();
+    }
+    workers.drain().await;
+    attempt.disarm();
+    let mut facts = Vec::new();
+    while let Ok(fact) = facts_rx.try_recv() {
+        facts.push(fact);
+    }
+    result.map_err(|error| match error {
+        LoaderError::ArtifactDownloadFailed { .. } => LoaderError::ArtifactDownloadFailed { facts },
+        error => error,
+    })
 }
 
 async fn ensure_base_version<F>(
@@ -3114,6 +3343,7 @@ printf '%s' 'processor-terminal' > "$last"
                 &plan,
                 &reconstruction_downloader,
                 &ManagedReconstructionContext::version_bundle(),
+                None,
             )
             .await
             .expect("retain exact earliest-archive VersionBundle sources");
@@ -3124,6 +3354,202 @@ printf '%s' 'processor-terminal' > "$last"
                 server.stop();
             }
             let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_fml_reconstruction_preserves_recorded_contract_before_enhancement() {
+        use crate::download::{
+            ManagedInstallAcknowledgementOutcome, ManagedInstallDurableOutcome,
+            classify_managed_install_publication,
+        };
+        use base64::Engine as _;
+
+        for unknown_declaration in [false, true] {
+            let root = temp_dir("fml-recorded-reconstruction");
+            let mut record = legacy_archive_record();
+            record.minecraft_version = "1.4.7".into();
+            record.loader_version = "6.6.2.534".into();
+            canonicalize_record_identity(&mut record);
+            let mut class = base64::engine::general_purpose::STANDARD
+                .decode(include_str!("../../../tests/fixtures/fml-libraries.base64").trim())
+                .unwrap();
+            if unknown_declaration {
+                class[0] ^= 1;
+            }
+            let base_client = zip_entries(&[("net/minecraft/client/Minecraft.class", b"base")]);
+            let archive =
+                zip_entries(&[("cpw/mods/fml/relauncher/CoreFMLLibraries.class", &class)]);
+            let child = overlay_legacy_archive_bytes(&base_client, &archive).unwrap();
+            let client_server = TestByteServer::start(base_client.clone());
+            let version_bytes = vanilla_version_bytes("1.4.7", &client_server.url, &base_client);
+            let version_server = TestByteServer::start(version_bytes.clone());
+            let manifest = test_install_manifest("1.4.7", &version_server.url, &version_bytes);
+            let archive_server = TestByteServer::start_with_sha1(archive);
+            record.install_source = LoaderInstallSource::LegacyArchive {
+                url: archive_server.url.clone(),
+            };
+            let plan = LoaderInstallPlan {
+                record: record.clone(),
+            };
+            let library = test_library_operation(&root);
+            let downloader = test_downloader(library.operation(), manifest);
+            let base = downloader.install_version("1.4.7", |_| {}).await.unwrap();
+            let wrong_contract = base.activation_contract_id().unwrap();
+            checkpoint_and_ack_version_bundle(library.operation(), "1.4.7").await;
+            let historical = super::publish_loader_managed_install(
+                &library,
+                prepared_test_legacy_bundle_from_base(&base, &record, &child),
+            )
+            .await
+            .unwrap();
+            let expected = historical.activation_contract_id().unwrap();
+            let before = snapshot_tree(&root);
+            let counts = (
+                version_server.request_count(),
+                client_server.request_count(),
+                archive_server.request_count(),
+            );
+            let original = super::reconstruct_legacy_authority_with_downloader(
+                &plan,
+                &downloader,
+                &ManagedReconstructionContext::version_bundle(),
+                Some(&expected),
+            )
+            .await;
+            let retained_sources = original
+                .as_ref()
+                .is_ok_and(|receipt| receipt.retained_version_bundle_sources_match_projection());
+            let mut verified = false;
+            let acknowledgement = match classify_managed_install_publication(
+                library.operation().clone(),
+                record.version_id.clone(),
+            )
+            .await
+            {
+                ManagedInstallDurableOutcome::Committed(evidence) => {
+                    match original {
+                        Ok(original) => match evidence
+                            .verify_reconstruction_receipt(original.discard_sources())
+                        {
+                            Ok(receipt) => {
+                                verified = true;
+                                receipt.activate_with(|_| async { Ok(()) }).await.unwrap()
+                            }
+                            Err(refusal) => refusal
+                                .into_parts()
+                                .0
+                                .verify_install_receipt(historical)
+                                .unwrap()
+                                .activate_with(|_| async { Ok(()) })
+                                .await
+                                .unwrap(),
+                        },
+                        Err(_) => evidence
+                            .verify_install_receipt(historical)
+                            .unwrap()
+                            .activate_with(|_| async { Ok(()) })
+                            .await
+                            .unwrap(),
+                    }
+                    .acknowledge()
+                    .await
+                }
+                _ => panic!("historical child must retain its actual committed native publication"),
+            };
+            let acknowledgement = tokio::time::timeout(Duration::from_secs(60), async {
+                let mut acknowledgement = acknowledgement;
+                while let ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) =
+                    acknowledgement
+                {
+                    acknowledgement = recovery.retry().await;
+                }
+                acknowledgement
+            })
+            .await
+            .expect("historical publication acknowledgement must settle");
+            assert!(matches!(
+                acknowledgement,
+                ManagedInstallAcknowledgementOutcome::Acknowledged
+            ));
+            assert!(
+                verified,
+                "recorded contract must verify against the native publication before enhancement"
+            );
+            assert!(retained_sources);
+            assert_eq!(version_server.request_count(), counts.0 + 1);
+            assert_eq!(client_server.request_count(), counts.1 + 1);
+            assert_eq!(archive_server.request_count(), counts.2 + 2);
+            let settled = snapshot_tree(&root);
+            assert!(
+                before
+                    .iter()
+                    .filter(|(path, _)| !path.starts_with(".axial-publication"))
+                    .all(|(path, value)| settled.get(path) == Some(value))
+            );
+
+            let enhanced = super::reconstruct_legacy_authority_with_downloader(
+                &plan,
+                &downloader,
+                &ManagedReconstructionContext::version_bundle(),
+                None,
+            )
+            .await;
+            if unknown_declaration {
+                assert!(
+                    enhanced.is_err(),
+                    "new enhancement must reject an unknown FML recipe"
+                );
+            } else {
+                let enhanced = enhanced.unwrap();
+                assert!(enhanced.retained_version_bundle_sources_match_projection());
+                let enhanced_contract = enhanced.receipt().activation_contract_id().unwrap();
+                assert_ne!(enhanced_contract, expected);
+                let inventory = enhanced
+                    .discard_sources()
+                    .into_activation_source()
+                    .into_parts()
+                    .1;
+                assert_eq!(
+                    inventory
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.root() == &KnownGoodRoot::Libraries
+                            && entry.path().as_str().starts_with("fml/"))
+                        .count(),
+                    4
+                );
+                let matched = super::reconstruct_legacy_authority_with_downloader(
+                    &plan,
+                    &downloader,
+                    &ManagedReconstructionContext::version_bundle(),
+                    Some(&enhanced_contract),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    matched.receipt().activation_contract_id().unwrap(),
+                    enhanced_contract
+                );
+                assert!(matched.retained_version_bundle_sources_match_projection());
+            }
+            assert!(
+                super::reconstruct_legacy_authority_with_downloader(
+                    &plan,
+                    &downloader,
+                    &ManagedReconstructionContext::proof_only(),
+                    Some(&wrong_contract),
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(snapshot_tree(&root), settled);
+            for server in [client_server, version_server, archive_server] {
+                server.stop();
+            }
+            drop(downloader);
+            drop(library);
+            fs::remove_dir_all(root).unwrap();
         }
     }
 
@@ -3493,13 +3919,16 @@ printf '%s' 'processor-terminal' > "$last"
             )) < 4096,
             "archive reconstruction future should stay small"
         );
+        let expected = crate::download::ManagedInstallActivationContractId::from_digest([0; 32]);
         assert!(
-            std::mem::size_of_val(&super::super::reconstruct_build(&profile_plan)) < 4096,
+            std::mem::size_of_val(&super::super::reconstruct_build(&profile_plan, &expected))
+                < 4096,
             "loader reconstruction dispatcher future should stay small"
         );
         assert!(
             std::mem::size_of_val(&crate::loaders::reconstruct_build(
-                &profile_plan.record.version_id
+                &profile_plan.record.version_id,
+                &expected,
             )) < 4096,
             "public loader reconstruction future should stay small"
         );
@@ -4646,6 +5075,89 @@ printf '%s' 'processor-terminal' > "$last"
         assert_eq!(installer_server.request_count(), 2);
         installer_server.stop();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_fml_refuses_conflicting_prerequisite_before_publication() {
+        use base64::Engine as _;
+
+        let declaration = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("../../../tests/fixtures/fml-libraries.base64").trim())
+            .expect("authentic FML declaration fixture");
+        assert_eq!(declaration.len(), 1172);
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&declaration)),
+            "dbccc9ce173f5db2f24cbb566d39fd9b784be8710d6bc791087efe22bf967b4a"
+        );
+        let root = temp_dir("legacy-fml-prerequisite-conflict");
+        write_base_version(&root, "1.4.7");
+        let base_dir = versions_dir(&root).join("1.4.7");
+        fs::write(
+            base_dir.join("1.4.7.jar"),
+            zip_entries(&[("net/minecraft/client/Minecraft.class", b"base")]),
+        )
+        .expect("base client archive");
+        let base_before = snapshot_tree(&base_dir);
+        let collision =
+            root.join("libraries/fml/98308890597acb64047f7e896638e0d98753ae82-asm-all-4.0.jar");
+        fs::create_dir_all(collision.parent().expect("FML library directory"))
+            .expect("FML library directory");
+        fs::write(&collision, b"different library bytes").expect("conflicting FML library");
+        let archive = zip_entries(&[(
+            "cpw/mods/fml/relauncher/CoreFMLLibraries.class",
+            declaration.as_slice(),
+        )]);
+        let server = TestByteServer::start_with_sha1(archive);
+        let mut record = legacy_archive_record();
+        record.minecraft_version = "1.4.7".to_string();
+        record.loader_version = "6.6.2.534".to_string();
+        canonicalize_record_identity(&mut record);
+        record.install_source = LoaderInstallSource::LegacyArchive {
+            url: server.url.clone(),
+        };
+        let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
+        let library_root = test_library_operation(&root);
+        let mut events = Vec::new();
+        let result = continue_legacy_install_after_base(
+            &library_root,
+            LoaderInstallPlan {
+                record: record.clone(),
+            },
+            test_loader_base_derivation(base_receipt),
+            &mut |event| events.push(event),
+        )
+        .await;
+        let published = result.is_ok();
+        if published {
+            checkpoint_and_ack_version_bundle(&library_root, &record.version_id).await;
+        }
+        let base_after = snapshot_tree(&base_dir);
+        let collision_after = fs::read(&collision).expect("retained conflicting library");
+        let child_exists = versions_dir(&root).join(&record.version_id).exists();
+        let requests = server.request_count();
+        server.stop();
+        drop(result);
+        drop(library_root);
+        fs::remove_dir_all(&root).expect("remove settled fixture");
+
+        assert_eq!(requests, 2, "archive and checksum must be authenticated");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.phase == "artifacts" && event.current == 1)
+        );
+        assert_eq!(base_after, base_before);
+        assert_eq!(collision_after, b"different library bytes");
+        assert!(
+            !published,
+            "authenticated FML child published with a conflicting required library"
+        );
+        assert!(!child_exists, "refused FML child must not be published");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.phase == "loader_publish" || event.done)
+        );
     }
 
     #[tokio::test]

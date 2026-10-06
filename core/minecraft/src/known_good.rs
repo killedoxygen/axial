@@ -1263,6 +1263,16 @@ pub(crate) struct ManagedAssetsReconstruction {
 }
 
 impl RetainedKnownGoodReconstruction {
+    pub(crate) fn require_game_libraries(
+        mut self,
+        requirements: &crate::loaders::game_libraries::Requirements,
+    ) -> Result<Self, KnownGoodInventoryError> {
+        self.receipt
+            .authenticated
+            .require_game_libraries(requirements)?;
+        Ok(self)
+    }
+
     pub(crate) fn new(
         receipt: KnownGoodReconstructionReceipt,
         library_sources: RetainedLibrarySourceSet,
@@ -1823,10 +1833,20 @@ type ManagedVersionBundleFixtureParts = (
 pub(crate) fn managed_version_bundle_fixture_parts_for_test(
     version_id: &str,
 ) -> Result<ManagedVersionBundleFixtureParts, DownloadError> {
-    const CLIENT_BYTES: &[u8] = b"axial managed VersionBundle client fixture";
+    managed_version_bundle_client_fixture_parts_for_test(
+        version_id,
+        b"axial managed VersionBundle client fixture",
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn managed_version_bundle_client_fixture_parts_for_test(
+    version_id: &str,
+    client_bytes: &[u8],
+) -> Result<ManagedVersionBundleFixtureParts, DownloadError> {
     const LOG_ID: &str = "guardian-version-bundle.xml";
     const LOG_BYTES: &[u8] = b"<Configuration/>";
-    let client_sha1 = format!("{:x}", Sha1::digest(CLIENT_BYTES));
+    let client_sha1 = format!("{:x}", Sha1::digest(client_bytes));
     let mut version_json = serde_json::json!({
         "id": version_id,
         "type": "release",
@@ -1834,7 +1854,7 @@ pub(crate) fn managed_version_bundle_fixture_parts_for_test(
         "downloads": {
             "client": {
                 "sha1": client_sha1,
-                "size": CLIENT_BYTES.len(),
+                "size": client_bytes.len(),
                 "url": "https://example.invalid/managed-version-bundle-client"
             }
         }
@@ -1850,7 +1870,7 @@ pub(crate) fn managed_version_bundle_fixture_parts_for_test(
     let inventory = KnownGoodInventory::version_bundle_for_test(
         version_id.as_str(),
         &version_json,
-        CLIENT_BYTES,
+        client_bytes,
         Some((LOG_ID, LOG_BYTES)),
     );
     let effective_version = serde_json::from_slice::<VersionJson>(&version_json)?;
@@ -1864,7 +1884,7 @@ pub(crate) fn managed_version_bundle_fixture_parts_for_test(
             },
         },
         version_json,
-        CLIENT_BYTES.to_vec(),
+        client_bytes.to_vec(),
         Some(LOG_BYTES.to_vec()),
     ))
 }
@@ -1993,6 +2013,39 @@ impl KnownGoodActivationContractHasher {
 }
 
 impl AuthenticatedKnownGoodReceipt {
+    fn require_game_libraries(
+        &mut self,
+        requirements: &crate::loaders::game_libraries::Requirements,
+    ) -> Result<(), KnownGoodInventoryError> {
+        if requirements.version_id() != self.version_id.as_str() {
+            return Err(KnownGoodInventoryError::VersionIdentityMismatch);
+        }
+        let mut builder = InventoryBuilder::default();
+        for (ordinal, entry) in self.inventory.entries.iter().enumerate() {
+            builder.insert_preserving_standalone_leaf_repair_source(
+                &self.inventory,
+                ordinal,
+                entry.clone(),
+            )?;
+        }
+        for requirement in requirements.entries() {
+            builder.insert_with_standalone_leaf_repair_source(
+                KnownGoodEntry {
+                    root: KnownGoodRoot::Libraries,
+                    path: KnownGoodRelativePath::new(requirement.path())?,
+                    kind: KnownGoodArtifactKind::Library,
+                    integrity: KnownGoodIntegrity::Sha1 {
+                        digest: Sha1Digest::from_metadata(requirement.sha1())?,
+                        size: requirement.size(),
+                    },
+                },
+                Some(requirement.provider_url()),
+            )?;
+        }
+        self.inventory = Arc::new(builder.finish());
+        Ok(())
+    }
+
     fn activation_contract_id(
         &self,
     ) -> Result<ManagedInstallActivationContractId, KnownGoodActivationContractError> {
@@ -3314,6 +3367,14 @@ fn authenticate_vanilla_authority(
 }
 
 impl PendingKnownGoodInstallAuthority {
+    pub(crate) fn require_game_libraries(
+        mut self,
+        requirements: &crate::loaders::game_libraries::Requirements,
+    ) -> Result<Self, KnownGoodInventoryError> {
+        self.authenticated.require_game_libraries(requirements)?;
+        Ok(self)
+    }
+
     #[cfg(test)]
     pub(crate) fn component_for_test(
         entries: impl IntoIterator<Item = (KnownGoodRoot, String, KnownGoodArtifactKind, [u8; 20], u64)>,
@@ -4370,6 +4431,99 @@ mod tests {
         authority.authenticated
     }
 
+    #[test]
+    fn game_libraries_extend_only_the_bound_inventory_and_contract() {
+        use base64::Engine as _;
+        use std::io::{Cursor, Write as _};
+
+        let version_id = installed_version_id_for(
+            crate::loaders::LoaderComponentId::Forge,
+            "1.4.7",
+            "6.6.2.534",
+        )
+        .unwrap();
+        let declaration = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("../tests/fixtures/fml-libraries.base64").trim())
+            .unwrap();
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "cpw/mods/fml/relauncher/CoreFMLLibraries.class",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(&declaration).unwrap();
+        let archive = archive.finish().unwrap().into_inner();
+        let requirements = crate::loaders::game_libraries::recognize(&version_id, &archive)
+            .unwrap()
+            .unwrap();
+        let mut receipt = activation_contract_fixture(&version_id);
+        let retained_entry = KnownGoodEntry {
+            root: KnownGoodRoot::Libraries,
+            path: KnownGoodRelativePath::new("org/example/retained.jar").unwrap(),
+            kind: KnownGoodArtifactKind::Library,
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: sha1_digest(b"retained"),
+                size: 8,
+            },
+        };
+        receipt.inventory = Arc::new(copy_inventory(
+            &receipt.inventory,
+            Some((
+                retained_entry.clone(),
+                Some("https://example.invalid/retained.jar"),
+            )),
+        ));
+        let original_inventory = Arc::clone(&receipt.inventory);
+        let original_version = receipt.effective_version.clone();
+        let original_contract = receipt.activation_contract_id().unwrap();
+        receipt.require_game_libraries(&requirements).unwrap();
+        assert_ne!(receipt.activation_contract_id().unwrap(), original_contract);
+        assert_eq!(receipt.effective_version, original_version);
+        assert_eq!(
+            receipt.inventory.entries.len(),
+            original_inventory.entries.len() + 4
+        );
+        for entry in &original_inventory.entries {
+            assert!(receipt.inventory.entries.contains(entry));
+        }
+        let ordinal = receipt
+            .inventory
+            .entries
+            .iter()
+            .position(|entry| entry == &retained_entry)
+            .unwrap();
+        assert_eq!(
+            receipt.inventory.standalone_leaf_repair_sources[&ordinal].provider_url,
+            "https://example.invalid/retained.jar"
+        );
+        let enhanced_contract = receipt.activation_contract_id().unwrap();
+        receipt.require_game_libraries(&requirements).unwrap();
+        assert_eq!(receipt.activation_contract_id().unwrap(), enhanced_contract);
+        for requirement in requirements.entries() {
+            let (ordinal, entry) = receipt
+                .inventory
+                .entries
+                .iter()
+                .enumerate()
+                .find(|(_, entry)| entry.path.as_str() == requirement.path())
+                .unwrap();
+            assert_eq!(entry.root, KnownGoodRoot::Libraries);
+            assert_eq!(entry.kind, KnownGoodArtifactKind::Library);
+            assert_eq!(
+                receipt.inventory.standalone_leaf_repair_sources[&ordinal].provider_url,
+                requirement.provider_url()
+            );
+        }
+        let mut other = activation_contract_fixture("unrelated-version");
+        let original = Arc::clone(&other.inventory);
+        assert_eq!(
+            other.require_game_libraries(&requirements),
+            Err(KnownGoodInventoryError::VersionIdentityMismatch)
+        );
+        assert_eq!(other.inventory, original);
+    }
+
     fn copy_inventory(
         source: &KnownGoodInventory,
         extra: Option<(KnownGoodEntry, Option<&str>)>,
@@ -5268,7 +5422,8 @@ mod tests {
 
     #[test]
     fn physical_mapping_covers_library_and_managed_runtime_roots() {
-        let fixture = tempfile::tempdir_in(crate::test_temp_root()).expect("physical mapping fixture");
+        let fixture =
+            tempfile::tempdir_in(crate::test_temp_root()).expect("physical mapping fixture");
         let runtime_cache = crate::runtime::ManagedRuntimeCache::isolated_for_test()
             .expect("isolated runtime cache");
         let library_root = &fixture.path().join("library-root");

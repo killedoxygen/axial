@@ -83,7 +83,7 @@ use crate::manifest::{
     ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest,
     fetch_registered_repair_version_manifest,
 };
-use crate::portable_path::PortableFileName;
+use crate::portable_path::{PortableFileName, PortableRelativePath};
 use crate::rules::{Environment, default_environment};
 use crate::runtime::{ManagedRuntimeCache, RuntimeSourceReceipt, acquire_preferred_runtime_source};
 #[cfg(test)]
@@ -2973,6 +2973,57 @@ impl Downloader {
     }
 }
 
+pub(crate) async fn reconstruct_game_library_sources(
+    requirements: &crate::loaders::game_libraries::Requirements,
+    context: &ManagedReconstructionContext,
+) -> Result<Vec<RetainedLibraryComponentSource>, DownloadError> {
+    if !context.retains_library_sources() {
+        return Ok(Vec::new());
+    }
+    let attempt = context.blocking_attempt().await;
+    let result = async {
+        let client = standard_minecraft_download_client();
+        let pool = context.phase_library_source_pool()?;
+        let mut sources = Vec::new();
+        for requirement in requirements.entries() {
+            let job = super::libraries::DownloadJob {
+                relative_path: PortableRelativePath::new(requirement.path())
+                    .map_err(|_| DownloadError::Integrity("invalid game library path".into()))?,
+                url: requirement.provider_url().to_owned(),
+                name: requirement.file_name().to_owned(),
+                expected: ExpectedIntegrity {
+                    sha1: Some(requirement.sha1().to_owned()),
+                    size: Some(requirement.size()),
+                },
+                is_native: false,
+            };
+            if !context.requires_retained_exact_source(&job).await? {
+                continue;
+            }
+            sources.push(
+                acquire_retained_library_component_source(
+                    LibrarySourceRequest {
+                        client: &client,
+                        url: &job.url,
+                        expected: &job.expected,
+                        relative_path: &job.relative_path,
+                        max_bytes: requirement.size(),
+                        target: requirement.file_name(),
+                        pool: &pool,
+                        fact_tx: None,
+                    },
+                    LibraryComponentSourceKind::Library,
+                )
+                .await?
+                .require_exact_prior(),
+            );
+        }
+        Ok(sources)
+    }
+    .await;
+    context.settle_blocking_attempt(attempt, result).await
+}
+
 pub(crate) async fn reconstruct_profile_library_declarations(
     declarations: PendingExactLibraryDeclarations,
     context: &ManagedReconstructionContext,
@@ -3821,6 +3872,22 @@ pub async fn publish_managed_install_fixture_for_test(
 ) -> Result<KnownGoodInstallReceipt, DownloadError> {
     let (authority, version_json, client_jar, log_config) =
         crate::known_good::managed_version_bundle_fixture_parts_for_test(version_id)?;
+    let prepared =
+        prepare_local_managed_install(authority, version_json, client_jar, log_config, Vec::new())?;
+    publish_prepared_managed_install(managed_root, prepared).await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn publish_managed_install_fixture_with_client_for_test(
+    managed_root: ManagedLibraryOperation,
+    version_id: &str,
+    client_bytes: Vec<u8>,
+) -> Result<KnownGoodInstallReceipt, DownloadError> {
+    let (authority, version_json, client_jar, log_config) =
+        crate::known_good::managed_version_bundle_client_fixture_parts_for_test(
+            version_id,
+            &client_bytes,
+        )?;
     let prepared =
         prepare_local_managed_install(authority, version_json, client_jar, log_config, Vec::new())?;
     publish_prepared_managed_install(managed_root, prepared).await

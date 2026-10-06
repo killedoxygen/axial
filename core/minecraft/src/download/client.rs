@@ -25,7 +25,7 @@ pub(super) fn build_http_client(read_timeout: Duration) -> reqwest::Client {
         .expect("download HTTP client configuration should be valid")
 }
 
-pub(super) fn standard_minecraft_download_client() -> reqwest::Client {
+pub(crate) fn standard_minecraft_download_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
         .get_or_init(|| build_http_client(Duration::from_secs(DOWNLOAD_CLIENT_READ_TIMEOUT_SECS)))

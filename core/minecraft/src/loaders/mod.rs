@@ -2,6 +2,7 @@ pub mod api;
 mod bound_processors;
 mod compose;
 mod forge_installer;
+pub mod game_libraries;
 mod http;
 pub mod index;
 mod install_flight;
@@ -160,17 +161,19 @@ where
 
 pub(crate) async fn reconstruct_build(
     installed_version_id: &str,
+    expected: &crate::download::ManagedInstallActivationContractId,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
     let plan = api::loader_reconstruction_plan(installed_version_id)?;
-    strategies::reconstruct_build(&plan).await
+    strategies::reconstruct_build(&plan, expected).await
 }
 
 pub(crate) async fn reconstruct_managed_component(
     installed_version_id: &str,
     context: &crate::download::ManagedReconstructionContext,
+    expected: Option<&crate::download::ManagedInstallActivationContractId>,
 ) -> Result<crate::known_good::RetainedKnownGoodReconstruction, LoaderError> {
     let plan = api::loader_reconstruction_plan(installed_version_id)?;
-    strategies::reconstruct_managed_component(&plan, context).await
+    strategies::reconstruct_managed_component(&plan, context, expected).await
 }
 
 fn require_exact_live_build_record(

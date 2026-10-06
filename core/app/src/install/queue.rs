@@ -35,7 +35,8 @@ use axial_minecraft::loaders::{
 };
 use axial_minecraft::{
     DownloadError, DownloadProgress, KnownGoodActivationRejected, LoaderComponentId,
-    ManagedInstallAcknowledgementOutcome, ManagedInstallDurableOutcome, ManagedRuntimeCache,
+    ManagedInstallAcknowledgementOutcome, ManagedInstallActivationContractId,
+    ManagedInstallDurableOutcome, ManagedRuntimeCache,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1063,8 +1064,8 @@ impl InstallQueue {
         let queue = self.clone();
         self.recover_interrupted_with(
             id,
-            |version| async move {
-                axial_minecraft::reconstruct_known_good(&version)
+            |version, expected| async move {
+                axial_minecraft::reconstruct_known_good(&version, &expected)
                     .await
                     .map_err(|_| InstallError::SettlementRequired)
             },
@@ -1085,7 +1086,8 @@ impl InstallQueue {
         continue_loader: Continue,
     ) -> Result<(), InstallError>
     where
-        Reconstruct: FnOnce(String) -> Reconstruction + Send + 'static,
+        Reconstruct:
+            FnOnce(String, ManagedInstallActivationContractId) -> Reconstruction + Send + 'static,
         Reconstruction: std::future::Future<
                 Output = Result<axial_minecraft::KnownGoodReconstructionReceipt, InstallError>,
             > + Send,
@@ -1313,28 +1315,40 @@ impl InstallQueue {
         reconstruct: Reconstruct,
     ) -> Result<RecoveryAction, WorkFailure>
     where
-        Reconstruct: FnOnce(String) -> Reconstruction,
+        Reconstruct: FnOnce(String, ManagedInstallActivationContractId) -> Reconstruction,
         Reconstruction: std::future::Future<
                 Output = Result<axial_minecraft::KnownGoodReconstructionReceipt, InstallError>,
             >,
     {
-        let checkpoint: Option<String> = self.inner.storage.read(|db| {
-            db.query_row(
-                "SELECT checkpoint_json FROM install_queue WHERE id=?1",
-                [id],
-                |row| row.get(0),
-            )
-            .map_err(InstallError::from)
-        })?;
-        let checkpoint: Option<PublicationCheckpoint> = checkpoint
-            .as_deref()
-            .map(|encoded| {
-                serde_json::from_str(encoded).map_err(|_| InstallError::SettlementRequired)
-            })
-            .transpose()?;
-        if let Some(checkpoint) = &checkpoint {
-            checkpoint.verify(operation, item)?;
-        }
+        let checkpoint = (|| -> Result<Option<PublicationCheckpoint>, InstallError> {
+            let encoded: Option<String> = self.inner.storage.read(|db| {
+                db.query_row(
+                    "SELECT checkpoint_json FROM install_queue WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(InstallError::from)
+            })?;
+            let checkpoint: Option<PublicationCheckpoint> = encoded
+                .as_deref()
+                .map(|encoded| {
+                    serde_json::from_str(encoded).map_err(|_| InstallError::SettlementRequired)
+                })
+                .transpose()?;
+            if let Some(checkpoint) = &checkpoint {
+                checkpoint.verify(operation, item)?;
+            }
+            Ok(checkpoint)
+        })();
+        let checkpoint = match checkpoint {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                tracing::warn!(?error, "Installation settlement requires retry.");
+                return Err(WorkFailure::Unsettled(
+                    retained.unwrap_or(RetainedInstall::Retry),
+                ));
+            }
+        };
         let outcome = match retained {
             Some(RetainedInstall::Publication(recovery)) => match recovery.retry().await {
                 Ok(receipt) => {
@@ -1460,7 +1474,12 @@ impl InstallQueue {
                         .committed_activation_contract_id()
                         .map(|contract| contract.as_str().to_owned()),
                 };
-                observed.verify(operation, item)?;
+                if let Err(error) = observed.verify(operation, item) {
+                    tracing::warn!(?error, "Installation settlement requires retry.");
+                    return Err(WorkFailure::Unsettled(RetainedInstall::Outcome(
+                        ManagedInstallDurableOutcome::Committed(evidence),
+                    )));
+                }
                 if checkpoint.as_ref().is_some_and(|previous| {
                     !(previous.kind == CheckpointKind::Base
                         && observed.kind == CheckpointKind::Final)
@@ -1516,7 +1535,20 @@ impl InstallQueue {
             }
             outcome => return Err(WorkFailure::Unsettled(RetainedInstall::Outcome(outcome))),
         };
-        let receipt = match reconstruct(checkpoint.version_id.clone()).await {
+        let contract = checkpoint
+            .contract_id
+            .as_deref()
+            .and_then(|value| ManagedInstallActivationContractId::parse(value).ok());
+        let Some(contract) = contract else {
+            tracing::warn!(error = ?InstallError::SettlementRequired, "Installation settlement requires retry.");
+            return Err(WorkFailure::Unsettled(match evidence {
+                Some(evidence) => {
+                    RetainedInstall::Outcome(ManagedInstallDurableOutcome::Committed(evidence))
+                }
+                None => RetainedInstall::Retry,
+            }));
+        };
+        let receipt = match reconstruct(checkpoint.version_id.clone(), contract.clone()).await {
             Ok(receipt) => receipt,
             Err(_) => {
                 return Err(WorkFailure::Unsettled(match evidence {
@@ -1527,13 +1559,6 @@ impl InstallQueue {
                 }));
             }
         };
-        let contract = axial_minecraft::ManagedInstallActivationContractId::parse(
-            checkpoint
-                .contract_id
-                .as_deref()
-                .ok_or(InstallError::SettlementRequired)?,
-        )
-        .map_err(|_| InstallError::SettlementRequired)?;
         let storage = self.inner.storage.clone();
         let install_id = id.to_owned();
         let activation_pin = pin.clone();
@@ -1548,11 +1573,21 @@ impl InstallQueue {
             )
         };
         let (continuation, acknowledgement) = if checkpoint.kind == CheckpointKind::Base {
-            let commit = axial_minecraft::loaders::resume_install_build_after_base(
+            let commit = match axial_minecraft::loaders::resume_install_build_after_base(
                 &item.version_id,
                 receipt,
-            )
-            .map_err(|_| InstallError::SettlementRequired)?;
+            ) {
+                Ok(commit) => commit,
+                Err(_) => {
+                    tracing::warn!(error = ?InstallError::SettlementRequired, "Installation settlement requires retry.");
+                    return Err(WorkFailure::Unsettled(match evidence {
+                        Some(evidence) => RetainedInstall::Outcome(
+                            ManagedInstallDurableOutcome::Committed(evidence),
+                        ),
+                        None => RetainedInstall::Retry,
+                    }));
+                }
+            };
             match evidence {
                 Some(evidence) => {
                     let verified =
@@ -3660,6 +3695,37 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn install_ready_fixture(queue: &InstallQueue, version: &str) {
+        install_ready_fixture_using(queue, version, |operation| async move {
+            axial_minecraft::download::publish_managed_install_fixture_for_test(operation, version)
+                .await
+        })
+        .await;
+    }
+
+    pub(crate) async fn install_ready_fixture_with_client(
+        queue: &InstallQueue,
+        version: &str,
+        client: Vec<u8>,
+    ) {
+        install_ready_fixture_using(queue, version, |operation| async move {
+            axial_minecraft::download::publish_managed_install_fixture_with_client_for_test(
+                operation, version, client,
+            )
+            .await
+        })
+        .await;
+    }
+
+    async fn install_ready_fixture_using<Publish, Publication>(
+        queue: &InstallQueue,
+        version: &str,
+        publish: Publish,
+    ) where
+        Publish: FnOnce(axial_minecraft::managed_path::ManagedLibraryOperation) -> Publication,
+        Publication: std::future::Future<
+                Output = Result<axial_minecraft::KnownGoodInstallReceipt, DownloadError>,
+            >,
+    {
         assert!(queue.snapshot().active.is_none());
         assert!(queue.snapshot().items.is_empty());
         let pin = queue.inner.library.admit().unwrap();
@@ -3684,12 +3750,7 @@ pub(crate) mod tests {
             state.active = Some(id.clone());
         }
         let operation = pin.managed_library().unwrap();
-        let receipt = axial_minecraft::download::publish_managed_install_fixture_for_test(
-            operation.clone(),
-            version,
-        )
-        .await
-        .unwrap();
+        let receipt = publish(operation.clone()).await.unwrap();
         assert!(
             queue
                 .settle_receipt(&id, &pin, operation, receipt)
@@ -4051,7 +4112,7 @@ pub(crate) mod tests {
             queue
                 .recover_interrupted_with(
                     &old,
-                    |_| async { panic!("stale target must not reconstruct") },
+                    |_, _| async { panic!("stale target must not reconstruct") },
                     |_, _, _| async { panic!("stale target must not continue") }
                 )
                 .await
@@ -4475,6 +4536,7 @@ pub(crate) mod tests {
 
     fn reconstruct_fixture(
         version: String,
+        _expected: ManagedInstallActivationContractId,
     ) -> impl std::future::Future<
         Output = Result<axial_minecraft::KnownGoodReconstructionReceipt, InstallError>,
     > {
@@ -4666,6 +4728,7 @@ pub(crate) mod tests {
     async fn mismatched_reconstruction_stays_fenced_and_can_retry_the_retained_publication() {
         let (_root, storage, library, exclusions, owner, queue) = fixture();
         let pin = library.admit().unwrap();
+        let operation = pin.managed_library().unwrap();
         let writer = exclusions
             .try_acquire(
                 std::iter::empty::<String>(),
@@ -4698,34 +4761,171 @@ pub(crate) mod tests {
             storage,
             library,
             exclusions.clone(),
-            owner,
+            owner.clone(),
             queue.runtime_cache().clone(),
         )
         .unwrap();
         let result = restarted
             .recover_interrupted_with(
                 &id,
-                |_| reconstruct_fixture("other-version".into()),
+                |_, expected| reconstruct_fixture("other-version".into(), expected),
                 |_, _, _| async { panic!("no loader") },
             )
             .await;
-        assert_eq!(result, Err(InstallError::SettlementRequired));
-        assert!(restarted.has_unsettled_effects());
-        assert!(
-            exclusions
-                .try_acquire(
-                    std::iter::empty::<String>(),
-                    [library_artifact(&pin.library_id().to_string())]
-                )
-                .is_err()
-        );
-        assert!(restarted.ready_version(&pin, version).await.is_err());
+        let retained_guard = axial_minecraft::VersionBundleReadGuard::acquire(&operation)
+            .err()
+            .map(|error| error.kind());
+        let unsettled = restarted.has_unsettled_effects();
+        let excluded = exclusions
+            .try_acquire(
+                std::iter::empty::<String>(),
+                [library_artifact(&pin.library_id().to_string())],
+            )
+            .is_err();
+        let not_ready = restarted.ready_version(&pin, version).await.is_err();
         recover_fixture(&restarted).await.unwrap();
+        restarted.close_admission();
+        owner
+            .shutdown(std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        restarted.join_observers().await.unwrap();
+        queue.join_observers().await.unwrap();
+        restarted.shutdown_queued().unwrap();
+
+        assert_eq!(result, Err(InstallError::SettlementRequired));
+        assert_eq!(retained_guard, Some(std::io::ErrorKind::WouldBlock));
+        assert!(unsettled && excluded && not_ready);
         assert_eq!(
             restarted.status(&id).unwrap().outcome,
             Some(InstallOutcome::Succeeded)
         );
         assert!(!restarted.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn invalid_checkpoint_contract_retains_classified_publication_until_recovery() {
+        for invalid in [None, Some("invalid-contract")] {
+            let (_root, storage, library, exclusions, owner, queue) = fixture();
+            let pin = library.admit().unwrap();
+            let operation = pin.managed_library().unwrap();
+            let writer = exclusions
+                .try_acquire(
+                    std::iter::empty::<String>(),
+                    [library_artifact(&pin.library_id().to_string())],
+                )
+                .unwrap();
+            let version = "retained-checkpoint-contract";
+            let id = queue
+                .enqueue(InstallQueueRequest::Vanilla {
+                    version_id: version.into(),
+                })
+                .await
+                .unwrap()
+                .started_install
+                .unwrap()
+                .install_id;
+            interrupt_intent(&storage, &id);
+            publish_before_crash(
+                &queue,
+                &pin,
+                &id,
+                version,
+                CheckpointKind::Final,
+                CrashPoint::BeforeAcknowledgement,
+            )
+            .await;
+            let (original, inventory): (String, String) = storage
+                .read(|db| {
+                    db.query_row(
+                        "SELECT q.checkpoint_json,v.inventory_json FROM install_queue q JOIN installed_versions v ON v.install_id=q.id WHERE q.id=?1",
+                        [&id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(InstallError::from)
+                })
+                .unwrap();
+            queue.shutdown_queued().unwrap();
+            drop(writer);
+            let restarted = InstallQueue::new(
+                storage.clone(),
+                library,
+                exclusions,
+                owner.clone(),
+                queue.runtime_cache().clone(),
+            )
+            .unwrap();
+            let initially_readable =
+                axial_minecraft::VersionBundleReadGuard::acquire(&operation).is_ok();
+            let classified = restarted
+                .recover_interrupted_with(
+                    &id,
+                    |_, _| async { Err(InstallError::NotReady) },
+                    |_, _, _| async { panic!("vanilla recovery must not continue a loader") },
+                )
+                .await;
+            let classified_guard = axial_minecraft::VersionBundleReadGuard::acquire(&operation)
+                .err()
+                .map(|error| error.kind());
+            let original_checkpoint: PublicationCheckpoint =
+                serde_json::from_str(&original).unwrap();
+            let mut invalid_checkpoint = original_checkpoint.clone();
+            invalid_checkpoint.contract_id = invalid.map(str::to_owned);
+            restarted
+                .persist_checkpoint(&id, &invalid_checkpoint)
+                .unwrap();
+            let refused = restarted
+                .recover_interrupted_with(
+                    &id,
+                    |_, _| async { panic!("invalid recorded contract must not reconstruct") },
+                    |_, _, _| async { panic!("invalid recorded contract must not continue") },
+                )
+                .await;
+            let refused_guard = axial_minecraft::VersionBundleReadGuard::acquire(&operation)
+                .err()
+                .map(|error| error.kind());
+            let pending = restarted.status(&id).unwrap().outcome;
+
+            restarted
+                .persist_checkpoint(&id, &original_checkpoint)
+                .unwrap();
+            recover_fixture(&restarted).await.unwrap();
+            let recovered = restarted.status(&id).unwrap().outcome;
+            let restored: (String, String) = storage
+                .read(|db| {
+                    db.query_row(
+                        "SELECT q.checkpoint_json,v.inventory_json FROM install_queue q JOIN installed_versions v ON v.install_id=q.id WHERE q.id=?1",
+                        [&id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(InstallError::from)
+                })
+                .unwrap();
+            let settled_readable =
+                axial_minecraft::VersionBundleReadGuard::acquire(&operation).is_ok();
+            restarted.close_admission();
+            owner
+                .shutdown(std::time::Duration::from_secs(3))
+                .await
+                .unwrap();
+            restarted.join_observers().await.unwrap();
+            queue.join_observers().await.unwrap();
+            restarted.shutdown_queued().unwrap();
+
+            assert!(initially_readable);
+            assert_eq!(classified, Err(InstallError::SettlementRequired));
+            assert_eq!(classified_guard, Some(std::io::ErrorKind::WouldBlock));
+            assert_eq!(refused, Err(InstallError::SettlementRequired));
+            assert_eq!(pending, None);
+            assert_eq!(recovered, Some(InstallOutcome::Succeeded));
+            assert_eq!(restored, (original, inventory));
+            assert!(settled_readable);
+            assert_eq!(
+                refused_guard,
+                Some(std::io::ErrorKind::WouldBlock),
+                "recorded contract {invalid:?} released classified publication authority"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4892,13 +5092,13 @@ pub(crate) mod tests {
                 recovering
                     .recover_interrupted_with(
                         &recovery_id,
-                        move |version| async move {
+                        move |version, expected| async move {
                             let _ = entered.send(());
                             released.await.unwrap();
                             if reconstruction_fails {
                                 Err(InstallError::NotReady)
                             } else {
-                                reconstruct_fixture(version).await
+                                reconstruct_fixture(version, expected).await
                             }
                         },
                         |_, _, _| async { panic!("no loader") },

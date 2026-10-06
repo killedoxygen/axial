@@ -24,8 +24,7 @@ pub use assets::repair_virtual_assets_from_index_retained;
 pub(crate) use assets::{ASSET_OBJECT_BASE_URL, parse_asset_index};
 #[cfg(feature = "test-support")]
 pub use assets::{VirtualAssetRepairTestGate, arm_virtual_asset_repair_test_pause};
-#[cfg(any(test, feature = "test-support"))]
-pub use install::publish_managed_install_fixture_for_test;
+pub(crate) use client::standard_minecraft_download_client;
 pub(crate) use install::{
     AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleMemberSource,
     AuthenticatedVersionBundleSource, ManagedReconstructionContext, PreparedManagedInstall,
@@ -43,13 +42,17 @@ pub use install::{
 pub(crate) use install::{
     ManagedInstallSettlementForTest, checkpoint_and_ack_managed_install_for_test,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use install::{
+    publish_managed_install_fixture_for_test, publish_managed_install_fixture_with_client_for_test,
+};
 pub(crate) use install::{
-    reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,
-    reconstruct_profile_library_declarations,
+    reconstruct_game_library_sources, reconstruct_installer_library_declarations,
+    reconstruct_installer_processor_sources, reconstruct_profile_library_declarations,
 };
 pub use integrity::LauncherManagedArtifactReadiness;
-pub(crate) use libraries::DownloadJob;
 pub(crate) use libraries::download_installer_libraries_with_declarations_and_facts;
+pub(crate) use libraries::{DownloadJob, ExactLibraryCacheAdmission};
 pub(crate) use libraries::{
     LibraryArtifactPlan, download_profile_retained_libraries_with_declarations_and_facts,
     library_artifact_plans_for,

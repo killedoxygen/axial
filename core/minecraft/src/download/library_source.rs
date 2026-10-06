@@ -63,7 +63,7 @@ const ZIP_END_OF_CENTRAL_DIRECTORY_BYTES: usize = 22;
 const ZIP_MAX_COMMENT_BYTES: usize = u16::MAX as usize;
 
 #[derive(Clone)]
-pub(super) struct LibrarySourcePool {
+pub(crate) struct LibrarySourcePool {
     acquisition_permits: Arc<Semaphore>,
     physical: PhysicalWorkOwner,
     spool: Arc<RetainedComponentSourceSpool>,
@@ -76,11 +76,11 @@ struct LibrarySourceScratchPermit {
 }
 
 impl LibrarySourcePool {
-    pub(super) fn new_with_workers(workers: ManagedBlockingWorkers) -> Result<Self, DownloadError> {
+    pub(crate) fn new_with_workers(workers: ManagedBlockingWorkers) -> Result<Self, DownloadError> {
         Self::with_retained_limit(MAX_TIER2_AGGREGATE_BYTES, workers)
     }
 
-    pub(super) fn with_retained_limit(
+    pub(crate) fn with_retained_limit(
         retained_bytes: u64,
         workers: ManagedBlockingWorkers,
     ) -> Result<Self, DownloadError> {
@@ -355,6 +355,7 @@ pub(crate) struct RetainedLibraryComponentSource {
     observed_sha1: [u8; 20],
     origin: RetainedLibraryComponentOrigin,
     kind: LibraryComponentSourceKind,
+    requires_exact_prior: bool,
 }
 
 pub(crate) struct AuthenticatedLocalLibraryBytes {
@@ -732,6 +733,11 @@ impl RetainedLibraryComponentStorage {
 }
 
 impl RetainedLibraryComponentSource {
+    pub(crate) fn require_exact_prior(mut self) -> Self {
+        self.requires_exact_prior = true;
+        self
+    }
+
     pub(crate) fn retained_replay(&self) -> Self {
         Self {
             storage: self.storage.retained_replay(),
@@ -740,6 +746,7 @@ impl RetainedLibraryComponentSource {
             observed_sha1: self.observed_sha1,
             origin: self.origin.clone(),
             kind: self.kind,
+            requires_exact_prior: self.requires_exact_prior,
         }
     }
 
@@ -762,6 +769,7 @@ impl RetainedLibraryComponentSource {
                 provider_url,
             },
             kind,
+            requires_exact_prior: false,
         }
     }
 
@@ -789,6 +797,7 @@ impl RetainedLibraryComponentSource {
             observed_sha1,
             origin: RetainedLibraryComponentOrigin::Local,
             kind,
+            requires_exact_prior: false,
         })
     }
 
@@ -806,6 +815,7 @@ impl RetainedLibraryComponentSource {
             observed_sha1,
             origin: RetainedLibraryComponentOrigin::Local,
             kind,
+            requires_exact_prior: false,
         }
     }
 
@@ -834,6 +844,7 @@ impl RetainedLibraryComponentSource {
             } else {
                 LibraryComponentSourceKind::Library
             },
+            requires_exact_prior: false,
         }
     }
 
@@ -904,6 +915,7 @@ impl RetainedLibraryComponentSource {
             observed_sha1,
             origin: _,
             kind,
+            requires_exact_prior: _,
         } = self;
         let reader = storage.into_reader()?;
         let file = staging_bucket
@@ -945,6 +957,10 @@ impl RetainedComponentPublicationSource for RetainedLibraryComponentSource {
         self.observed_sha1
     }
 
+    fn requires_exact_prior(&self) -> bool {
+        self.requires_exact_prior
+    }
+
     async fn stage_create_new(
         self,
         staging_bucket: &ManagedDir,
@@ -958,6 +974,7 @@ impl RetainedComponentPublicationSource for RetainedLibraryComponentSource {
             observed_sha1,
             origin: _,
             kind,
+            requires_exact_prior: _,
         } = self;
         let reader = storage.into_reader()?;
         let file = staging_bucket
@@ -988,15 +1005,15 @@ fn component_source_kind(kind: LibraryComponentSourceKind) -> ManagedComponentAr
     }
 }
 
-pub(super) struct LibrarySourceRequest<'a> {
-    pub(super) client: &'a reqwest::Client,
-    pub(super) url: &'a str,
-    pub(super) expected: &'a ExpectedIntegrity,
-    pub(super) relative_path: &'a PortableRelativePath,
-    pub(super) max_bytes: u64,
-    pub(super) target: &'a str,
-    pub(super) pool: &'a LibrarySourcePool,
-    pub(super) fact_tx: Option<&'a mpsc::UnboundedSender<ExecutionDownloadFact>>,
+pub(crate) struct LibrarySourceRequest<'a> {
+    pub(crate) client: &'a reqwest::Client,
+    pub(crate) url: &'a str,
+    pub(crate) expected: &'a ExpectedIntegrity,
+    pub(crate) relative_path: &'a PortableRelativePath,
+    pub(crate) max_bytes: u64,
+    pub(crate) target: &'a str,
+    pub(crate) pool: &'a LibrarySourcePool,
+    pub(crate) fact_tx: Option<&'a mpsc::UnboundedSender<ExecutionDownloadFact>>,
 }
 
 async fn acquire_library_source(
@@ -1005,7 +1022,7 @@ async fn acquire_library_source(
     acquire_library_source_with_retry_delays(request, &LIBRARY_SOURCE_RETRY_DELAYS).await
 }
 
-pub(super) async fn acquire_retained_library_component_source(
+pub(crate) async fn acquire_retained_library_component_source(
     request: LibrarySourceRequest<'_>,
     kind: LibraryComponentSourceKind,
 ) -> Result<RetainedLibraryComponentSource, DownloadError> {
@@ -1020,6 +1037,7 @@ pub(super) async fn acquire_retained_library_component_source(
             provider_url: source.provider_url,
         },
         kind,
+        requires_exact_prior: false,
     })
 }
 
@@ -2563,7 +2581,8 @@ mod tests {
         assert_eq!(pool.retained_available_bytes(), retained_budget);
         drop(replay);
 
-        let temp = tempfile::tempdir_in(crate::test_temp_root()).expect("final component staging root");
+        let temp =
+            tempfile::tempdir_in(crate::test_temp_root()).expect("final component staging root");
         let root = ManagedDir::open_root(temp.path()).expect("managed staging root");
         let lease = ManagedRootPublicationLease::acquire(root.clone())
             .await

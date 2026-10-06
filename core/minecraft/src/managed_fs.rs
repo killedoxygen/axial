@@ -5704,6 +5704,37 @@ impl ManagedNativeDirectory {
 }
 
 impl ManagedLibraryFile {
+    pub fn copy_create_only(
+        &self,
+        target: crate::download::CreateOnlyTransferTarget,
+        contract: crate::download::TransferContract,
+        cancellation: crate::download::TransferCancellation,
+    ) -> crate::download::TransferOutcome<crate::download::VerifiedCreateOnly> {
+        let limit = match contract.bytes() {
+            crate::download::TransferByteContract::Exact(limit)
+            | crate::download::TransferByteContract::AtMost(limit)
+            | crate::download::TransferByteContract::Below(limit) => limit.get(),
+        };
+        let reader = self
+            .revalidate()
+            .and_then(|()| self.guard.bounded_reader(limit).map_err(loader_io));
+        match reader {
+            Ok(reader) => crate::download::copy_create_only_transfer(
+                target,
+                Box::new(LibraryCopyReader {
+                    reader,
+                    source: self,
+                }),
+                contract,
+                cancellation,
+            ),
+            Err(error) => crate::download::fail_create_only_transfer(
+                target,
+                crate::download::TransferFailureKind::SourceRead(error.kind()),
+            ),
+        }
+    }
+
     pub fn revision_observation(&self) -> axial_fs::FileRevisionObservation {
         self.guard.revision.observation()
     }
@@ -5744,6 +5775,33 @@ impl ManagedLibraryFile {
             .map_err(loader_io)?;
         self.operation.revalidate()?;
         Ok(digest)
+    }
+}
+
+struct LibraryCopyReader<'a> {
+    reader: ManagedBoundedFileReader,
+    source: &'a ManagedLibraryFile,
+}
+
+impl Read for LibraryCopyReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(bytes)
+    }
+}
+
+impl LocalTransferReader for LibraryCopyReader<'_> {
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        let Self { reader, source } = *self;
+        if let Err(error) = source.revalidate() {
+            reader.cancel();
+            return Err(error);
+        }
+        LocalTransferReader::finish(Box::new(reader))?;
+        source.revalidate()
+    }
+
+    fn cancel(self: Box<Self>) {
+        self.reader.cancel();
     }
 }
 
