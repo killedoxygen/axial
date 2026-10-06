@@ -502,6 +502,9 @@ impl SessionEntry {
                 });
                 report.scenario = self.scenario.clone();
                 report.resource_budget = self.resource_budget.clone();
+                if let Some(budget) = &report.resource_budget {
+                    report.device = super::reports::LaunchProofDevice::from_budget(budget);
+                }
                 state.report = Some(report);
             }
             (

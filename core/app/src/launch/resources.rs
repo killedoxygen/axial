@@ -51,12 +51,10 @@ pub(super) fn capture(
     });
     #[cfg(unix)]
     let loads = {
-        let load = System::load_average();
-        [
-            load_x100(load.one),
-            load_x100(load.five),
-            load_x100(load.fifteen),
-        ]
+        let mut values = [0.0; 3];
+        // The native function writes at most the supplied three elements.
+        let observed = unsafe { libc::getloadavg(values.as_mut_ptr(), 3) };
+        observed_loads(values, observed)
     };
     #[cfg(not(unix))]
     let loads = [None; 3];
@@ -122,6 +120,15 @@ fn cpu_pressure(threads: Option<usize>, sessions: usize, loads: [Option<u64>; 3]
 }
 
 #[cfg(any(unix, test))]
+fn observed_loads(values: [f64; 3], count: i32) -> [Option<u64>; 3] {
+    std::array::from_fn(|index| {
+        ((0..=3).contains(&count) && index < count as usize)
+            .then(|| load_x100(values[index]))
+            .flatten()
+    })
+}
+
+#[cfg(any(unix, test))]
 fn load_x100(value: f64) -> Option<u64> {
     (value.is_finite() && value >= 0.0)
         .then(|| (value * 100.0).round().clamp(0.0, u64::MAX as f64) as u64)
@@ -130,6 +137,111 @@ fn load_x100(value: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_exhaustion_retains_native_load_availability() {
+        const CHILD: &str = "AXIAL_LOAD_DENIAL_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "launch::resources::tests::descriptor_exhaustion_retains_native_load_availability",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        child.wait().expect("load-denial child must be reaped");
+                        panic!("load-denial child timed out or could not be observed");
+                    }
+                }
+            };
+            assert!(status.success(), "load-denial child failed: {status}");
+            return;
+        }
+
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let host = capture_host();
+        let loads = |budget: &LaunchProofResourceBudget| {
+            [
+                budget.host_cpu_load_1m_x100,
+                budget.host_cpu_load_5m_x100,
+                budget.host_cpu_load_15m_x100,
+            ]
+        };
+        let before = capture(&host, (0, 0), 0, 2048, [root.path(), root.path()]);
+        assert!(loads(&before).into_iter().all(|load| load.is_some()));
+        assert!(!std::fs::read_to_string("/proc/loadavg").unwrap().is_empty());
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0
+        );
+        let denied = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: original.rlim_max,
+        };
+        // Only this isolated child's soft limit changes, after sampler initialization.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &denied) }, 0);
+        let observation = std::panic::catch_unwind(|| {
+            let open_error = std::fs::File::open("/proc/loadavg")
+                .err()
+                .and_then(|error| error.raw_os_error());
+            let mut values = [0.0; 3];
+            let observed = unsafe { libc::getloadavg(values.as_mut_ptr(), 3) };
+            let budget = (open_error == Some(libc::EMFILE))
+                .then(|| capture(&host, (0, 0), 0, 2048, [root.path(), root.path()]));
+            (open_error, observed, budget)
+        });
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) },
+            0
+        );
+        let (open_error, observed, budget) =
+            observation.expect("resource capture panicked during denial");
+        assert_eq!(open_error, Some(libc::EMFILE));
+        let budget = budget.expect("capture requires the confirmed load-read denial");
+        assert_eq!(
+            loads(&budget).map(|load| load.is_some()),
+            std::array::from_fn(|index| index < observed.max(0) as usize),
+            "file-read failure alone does not establish native sampler unavailability"
+        );
+        let after = capture(&host, (0, 0), 0, 2048, [root.path(), root.path()]);
+        assert!(loads(&after).into_iter().all(|load| load.is_some()));
+    }
+
+    #[test]
+    fn native_load_count_preserves_zero_and_omits_unobserved_slots() {
+        for (count, expected) in [
+            (-1, [None; 3]),
+            (0, [None; 3]),
+            (1, [Some(0), None, None]),
+            (2, [Some(0), Some(123), None]),
+            (3, [Some(0), Some(123), Some(250)]),
+            (4, [None; 3]),
+        ] {
+            assert_eq!(observed_loads([0.0, 1.234, 2.5], count), expected);
+        }
+        assert_eq!(
+            observed_loads([f64::NAN, f64::INFINITY, -1.0], 3),
+            [None; 3]
+        );
+    }
 
     #[test]
     fn resource_snapshot_preserves_overcommit_and_unknown_observations() {
@@ -161,7 +273,7 @@ mod tests {
             used_memory_mb: 0,
             cpu_threads: None,
         };
-        let budget = capture(&host, (0, 0), 0, 0, [&missing, &missing]);
+        let mut budget = capture(&host, (0, 0), 0, 0, [&missing, &missing]);
         assert_eq!(budget.host_total_memory_mb, None);
         assert_eq!(budget.host_available_memory_mb, None);
         assert_eq!(budget.host_used_memory_mb, None);
@@ -174,6 +286,15 @@ mod tests {
                 && !budget.install_pressure
                 && !budget.disk_pressure
         );
+        [
+            budget.host_cpu_load_1m_x100,
+            budget.host_cpu_load_5m_x100,
+            budget.host_cpu_load_15m_x100,
+        ] = observed_loads([0.0, 1.0, 2.0], 1);
+        let payload = serde_json::to_value(budget).unwrap();
+        assert_eq!(payload["host_cpu_load_1m_x100"], 0);
+        assert!(payload.get("host_cpu_load_5m_x100").is_none());
+        assert!(payload.get("host_cpu_load_15m_x100").is_none());
     }
 
     #[test]

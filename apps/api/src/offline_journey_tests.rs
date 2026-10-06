@@ -2395,6 +2395,17 @@ async fn offline_vanilla_journey(existing: bool) {
     assert_eq!(budget["active_memory_allocation_mb"], 0);
     assert_eq!(budget["memory_headroom_mb"], 2048);
     assert_eq!(budget["launch_disk_headroom_mb"], 2048);
+    let device = &first_report["device"];
+    assert_eq!(device["total_memory_mb"], budget["host_total_memory_mb"]);
+    assert_eq!(device["cpu_threads"], budget["host_cpu_threads"]);
+    if !budget["host_total_memory_mb"].is_null() || !budget["host_cpu_threads"].is_null() {
+        assert!(matches!(
+            device["tier"].as_str(),
+            Some("low" | "mid" | "high")
+        ));
+    } else {
+        assert_eq!(device["tier"], "unknown");
+    }
     let removed = api
         .request(
             reqwest::Method::DELETE,

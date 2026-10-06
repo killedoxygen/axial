@@ -597,6 +597,33 @@ impl Default for LaunchProofDevice {
     }
 }
 
+impl LaunchProofDevice {
+    pub(super) fn from_budget(budget: &LaunchProofResourceBudget) -> Self {
+        let cpu_threads = budget.host_cpu_threads.filter(|threads| *threads > 0);
+        let total_memory_mb = budget.host_total_memory_mb.filter(|memory| *memory > 0);
+        let cpu_tier = cpu_threads.map(|threads| match threads {
+            0..=4 => 0,
+            8.. => 2,
+            _ => 1,
+        });
+        let memory_tier = total_memory_mb.map(|memory| match memory {
+            0..=8192 => 0,
+            32768.. => 2,
+            _ => 1,
+        });
+        let tier = cpu_tier
+            .into_iter()
+            .chain(memory_tier)
+            .min()
+            .map_or("unknown", |tier| ["low", "mid", "high"][tier]);
+        Self {
+            tier: tier.into(),
+            total_memory_mb,
+            cpu_threads,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchProofComparison {
@@ -794,10 +821,17 @@ fn comparison_dimensions_match(current: &LaunchProofRecord, candidate: &LaunchPr
         && required_version_targets_match(current, candidate)
         && current.scenario.requested_memory_mb == candidate.scenario.requested_memory_mb
         && required_dimensions_match(&current.device.tier, &candidate.device.tier)
-        && optional_benchmark_dimensions_match(
+        && (optional_benchmark_dimensions_match(
             current.scenario.benchmark_profile.as_deref(),
             candidate.scenario.benchmark_profile.as_deref(),
-        )
+        ) || (known_launch_mode(current) == Some("managed")
+            && known_launch_mode(candidate) == Some("vanilla")
+            && current.scenario.benchmark_profile.as_deref() == Some("managed_default")
+            && candidate.scenario.benchmark_profile.as_deref() == Some("vanilla_baseline")
+            && matches!(
+                current.scenario.benchmark_mode.as_deref(),
+                Some("qualification" | "release_validation")
+            )))
         && optional_benchmark_dimensions_match(
             current.scenario.benchmark_run_type.as_deref(),
             candidate.scenario.benchmark_run_type.as_deref(),
@@ -1614,6 +1648,47 @@ mod tests {
     }
 
     #[test]
+    fn device_uses_the_lower_observed_tier_without_fallbacks() {
+        let mut budget: LaunchProofResourceBudget = serde_json::from_value(serde_json::json!({
+            "active_session_count":0, "active_install_count":0, "active_memory_allocation_mb":0,
+            "memory_headroom_mb":2048, "memory_pressure":false, "cpu_pressure":false,
+            "install_pressure":false, "launch_disk_headroom_mb":2048, "disk_pressure":false
+        }))
+        .unwrap();
+        for (threads, memory, tier) in [
+            (None, None, "unknown"),
+            (Some(0), Some(0), "unknown"),
+            (Some(4), None, "low"),
+            (Some(5), None, "mid"),
+            (Some(7), None, "mid"),
+            (Some(8), None, "high"),
+            (None, Some(8192), "low"),
+            (None, Some(8193), "mid"),
+            (None, Some(32767), "mid"),
+            (None, Some(32768), "high"),
+            (Some(8), Some(8192), "low"),
+            (Some(4), Some(32768), "low"),
+            (Some(8), Some(18432), "mid"),
+        ] {
+            budget.host_cpu_threads = threads;
+            budget.host_total_memory_mb = memory;
+            let device = LaunchProofDevice::from_budget(&budget);
+            assert_eq!(device.tier, tier);
+            assert_eq!(device.cpu_threads, threads.filter(|value| *value > 0));
+            assert_eq!(device.total_memory_mb, memory.filter(|value| *value > 0));
+            let wire = serde_json::to_value(&device).unwrap();
+            assert_eq!(
+                wire.get("cpu_threads").is_some(),
+                device.cpu_threads.is_some()
+            );
+            assert_eq!(
+                wire.get("total_memory_mb").is_some(),
+                device.total_memory_mb.is_some()
+            );
+        }
+    }
+
+    #[test]
     fn canonical_loader_versions_survive_reports_but_not_unstructured_logs() {
         use axial_minecraft::loaders::{LoaderComponentId, installed_version_id_for};
         for component in [
@@ -1768,6 +1843,165 @@ mod tests {
             Err(ReportError::ConflictingSession)
         ));
         assert_eq!(store.get(&report.session_id).unwrap(), Some(saved));
+    }
+
+    #[test]
+    fn release_managed_report_compares_to_planned_vanilla_baseline_after_reopen() {
+        use crate::performance::benchmarks::{
+            benchmark_suite_manifest_run_inputs, benchmark_suite_plan,
+        };
+
+        let temporary_parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = tempfile::tempdir_in(temporary_parent).unwrap();
+        let path = root.path().join("metadata.sqlite");
+        let metadata = Arc::new(MetadataStore::open(&path).unwrap());
+        let store = LaunchReportStore::new(metadata.clone()).unwrap();
+        let redactor = Redactor::new(vec![]);
+        let mode = "release_validation";
+        let plan = benchmark_suite_plan(mode).unwrap();
+        let runs = benchmark_suite_manifest_run_inputs(mode, &plan);
+        assert_eq!(runs[0].profile, "vanilla_baseline");
+        assert_eq!(runs[1].profile, "managed_default");
+        let version = axial_minecraft::loaders::installed_version_id_for(
+            axial_minecraft::loaders::LoaderComponentId::Forge,
+            "1.12.2",
+            "14.23.5.2860",
+        )
+        .unwrap();
+        let instance_id = crate::instances::model::InstanceId::new().to_string();
+        let mut reports = Vec::new();
+        for (index, (performance_mode, launched_at, recorded_at, boot_ms)) in [
+            (
+                "vanilla",
+                "2026-01-01T00:00:00.000Z",
+                "2026-01-01T00:00:02.000Z",
+                1000,
+            ),
+            (
+                "managed",
+                "2026-01-01T00:00:03.000Z",
+                "2026-01-01T00:00:04.000Z",
+                500,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(runs[index].run_type, "coldish");
+            let mut report = session_report();
+            report.instance_id = instance_id.clone();
+            report.version_id = version.clone();
+            report.launched_at = launched_at.into();
+            report.recorded_at = recorded_at.into();
+            report.boot_duration_ms = Some(boot_ms);
+            report.comparison = None;
+            report.scenario.version_id = Some(version.clone());
+            report.scenario.performance_mode = performance_mode.into();
+            report.scenario.requested_memory_mb = Some(2048);
+            report.scenario.benchmark_profile = Some(runs[index].profile.clone());
+            report.scenario.benchmark_run_type = Some(runs[index].run_type.clone());
+            report.scenario.benchmark_mode = Some(mode.into());
+            report.scenario.benchmark_id = Some(runs[index].benchmark_id.clone());
+            report.device.tier = "mid".into();
+            store.record(report.clone(), &redactor).unwrap();
+            reports.push(report);
+        }
+        let baseline = store.get(&reports[0].session_id).unwrap().unwrap();
+        let managed = store.get(&reports[1].session_id).unwrap().unwrap();
+        assert!(baseline.comparison.is_none());
+        assert_eq!(baseline.outcome, "exited");
+        assert_eq!(managed.outcome, "exited");
+        let comparison = managed
+            .comparison
+            .as_ref()
+            .expect("the planned Managed run must bind its Vanilla baseline");
+        assert_eq!(comparison.baseline_session_id, baseline.session_id);
+        assert_eq!(comparison.baseline_recorded_at, baseline.recorded_at);
+        assert_eq!(comparison.baseline.performance_mode, "vanilla");
+        assert_eq!(
+            comparison.baseline.benchmark_profile.as_deref(),
+            Some("vanilla_baseline")
+        );
+        assert_eq!(comparison.matched_sample_count, 1);
+        assert_eq!(comparison.current_value_ms, 500);
+        assert_eq!(comparison.baseline_value_ms, 1000);
+        for dimension in [
+            "profile",
+            "baseline_profile",
+            "mode",
+            "suite",
+            "no_suite",
+            "run_type",
+            "version",
+            "memory",
+            "tier",
+            "outcome",
+            "baseline_outcome",
+            "order",
+        ] {
+            let mut current = managed.clone();
+            let mut prior = baseline.clone();
+            match dimension {
+                "profile" => current.scenario.benchmark_profile = Some("custom_profile".into()),
+                "baseline_profile" => {
+                    prior.scenario.benchmark_profile = Some("other_baseline".into())
+                }
+                "mode" => current.scenario.performance_mode = "custom".into(),
+                "suite" | "no_suite" => {
+                    let mode = (dimension == "suite").then(|| "development".into());
+                    current.scenario.benchmark_mode = mode.clone();
+                    prior.scenario.benchmark_mode = mode;
+                }
+                "run_type" => current.scenario.benchmark_run_type = Some("repeat".into()),
+                "version" => {
+                    current.version_id = "1.21.1".into();
+                    current.scenario.version_id = Some("1.21.1".into());
+                }
+                "memory" => current.scenario.requested_memory_mb = Some(4096),
+                "tier" => current.device.tier = "unknown".into(),
+                "outcome" | "baseline_outcome" => {
+                    let outcome = if dimension == "outcome" {
+                        &mut current.session_outcome
+                    } else {
+                        &mut prior.session_outcome
+                    };
+                    outcome.kind = SessionOutcomeKind::Stopped;
+                    outcome.reason = super::super::outcome::SessionExitReason::LauncherStopped;
+                }
+                "order" => {
+                    current.launched_at = prior.launched_at.clone();
+                    current.recorded_at = prior.recorded_at.clone();
+                }
+                _ => unreachable!(),
+            }
+            if dimension == "order" {
+                current.session_id = "a".into();
+                prior.session_id = "b".into();
+            }
+            let isolated =
+                LaunchReportStore::new(Arc::new(MetadataStore::in_memory().unwrap())).unwrap();
+            isolated.record(prior, &redactor).unwrap();
+            isolated.record(current.clone(), &redactor).unwrap();
+            assert!(
+                isolated
+                    .get(&current.session_id)
+                    .unwrap()
+                    .unwrap()
+                    .comparison
+                    .is_none(),
+                "{dimension}"
+            );
+        }
+        drop(store);
+        drop(metadata);
+
+        let store = LaunchReportStore::new(Arc::new(MetadataStore::open(&path).unwrap())).unwrap();
+        store.record(reports[1].clone(), &redactor).unwrap();
+        assert_eq!(
+            store.get(&managed.session_id).unwrap(),
+            Some(managed.clone())
+        );
+        assert_eq!(store.list_recent(25).unwrap(), vec![managed, baseline]);
     }
 
     #[test]
