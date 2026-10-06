@@ -181,6 +181,7 @@ if "net.minecraft.client.main.Main" in sys.argv[1:]:
     assert "net.minecraft.client.main.Main" in args
     heap_mb = int(next(arg[4:-1] for arg in args if arg.startswith("-Xmx") and arg.endswith("M")))
     print("Fixture heap MiB " + str(heap_mb), flush=True)
+    print("Fixture command elements " + str(len(sys.argv)), flush=True)
     print("Fixture command validated", flush=True)
 "#,
         config_literal = serde_json::to_string(&config.to_string()).unwrap(),
@@ -2397,6 +2398,10 @@ async fn offline_vanilla_journey(existing: bool) {
     );
     assert!(runtime.join(".axial-runtime-manifest.json").is_file());
     let first = launch_and_stop(&api, &instance).await;
+    #[cfg(debug_assertions)]
+    let first_command = api.get(&format!("/api/v1/launch/{first}/command")).await;
+    #[cfg(debug_assertions)]
+    let first_logs = api.get(&format!("/api/v1/launch/{first}/logs")).await;
     let first_report = api.get(&format!("/api/v1/launch/reports/{first}")).await;
     let budget = &first_report["resource_budget"];
     assert!(
@@ -2482,6 +2487,40 @@ async fn offline_vanilla_journey(existing: bool) {
         assert_eq!(
             std::fs::read(root.join("user-canary.bin")).unwrap(),
             EXTERNAL_CANARY
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        // The child observes the executable-equivalent argv[0] plus passed arguments.
+        // Assert after shutdown so a diagnostic-contract failure cannot strand work.
+        let observed_count = first_logs["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["source"] == "stdout")
+            .find_map(|entry| {
+                entry["text"]
+                    .as_str()?
+                    .strip_prefix("Fixture command elements ")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .expect("the real fixture child must report its command element count");
+        assert!((1..=16_385).contains(&observed_count));
+        assert_eq!(first_command["command_redacted"], true);
+        assert_eq!(first_command["command_arg_count"], observed_count);
+        assert!(
+            first_command
+                == json!({
+                    "session_id":first,
+                    "command":vec!["<redacted>"; observed_count],
+                    "command_redacted":true,
+                    "command_arg_count":observed_count,
+                    "java_path_present":true,
+                }),
+            "command inspection must contain only the retained redacted contract"
         );
     }
 }

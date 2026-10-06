@@ -173,6 +173,8 @@ async fn command(
         .ok_or_else(|| error(LaunchError::InstanceNotFound))?;
     Ok(Json(
         json!({"session_id": command.session_id,"command_arg_count": command.command_arg_count,
+        "command":vec!["<redacted>"; command.command_arg_count],
+        "command_redacted":command.command_arg_count > 0,
         "java_path_present": command.java_path_present}),
     ))
 }

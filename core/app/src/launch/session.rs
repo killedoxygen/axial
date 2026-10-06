@@ -673,7 +673,7 @@ impl SessionManager {
             preparation: Arc::downgrade(&prepared),
             command_inspection: SessionCommandInspection {
                 session_id: snapshot.session_id.clone(),
-                command_arg_count: prepared.validated_command().args().len(),
+                command_arg_count: prepared.validated_command().args().len() + 1,
                 java_path_present: !prepared
                     .validated_command()
                     .program()
