@@ -1799,16 +1799,31 @@ pub fn driver_payload(driver: BenchmarkSuiteDriverStatus) -> serde_json::Value {
 }
 
 pub fn qualification_preview() -> serde_json::Value {
+    let mode = super::qualification::FAMILY_C_QUALIFICATION_MODE;
+    let plan = benchmark_suite_plan(mode).expect("qualification mode has a suite plan");
     let now = now();
     let manifest = BenchmarkSuiteManifest {
         schema: "axial.launch.benchmark.suite".into(),
         schema_version: 2,
         suite_id: "preview".into(),
         instance_id: String::new(),
-        mode: "release_validation".into(),
+        mode: mode.into(),
         created_at: now.clone(),
         updated_at: now,
-        runs: Vec::new(),
+        runs: benchmark_suite_manifest_run_inputs(mode, &plan)
+            .into_iter()
+            .map(|run| BenchmarkSuiteManifestRun {
+                run_index: run.run_index,
+                profile: run.profile,
+                run_type: run.run_type,
+                target_id: run.target_id.unwrap_or_default(),
+                benchmark_id: run.benchmark_id,
+                session_id: None,
+                launched_at: None,
+                state: "pending".into(),
+                launch_intent: None,
+            })
+            .collect(),
     };
     super::qualification::qualification_payload(&manifest, &[], None, false)
 }

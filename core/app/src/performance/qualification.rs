@@ -37,7 +37,15 @@ pub fn qualification_payload(
     } else {
         vec!["suite_manifest_missing"]
     };
-    let (baseline_extra_missing, managed_extra_missing) = (&extra_missing, &extra_missing);
+    let mut managed_extra_missing = extra_missing.clone();
+    if !suite_present {
+        managed_extra_missing.push("managed_comparison_missing");
+    }
+    let preview_install = (!suite_present).then(|| {
+        let mut evidence = unobserved_managed_install_evidence(managed_target);
+        evidence.missing.clear();
+        evidence
+    });
     let baseline_proof = family_c_qualification_target_proof(baseline_target, manifest, proofs);
     let baseline = family_c_qualification_target_payload(
         baseline_target,
@@ -45,14 +53,14 @@ pub fn qualification_payload(
         proofs,
         baseline_proof,
         managed_install,
-        &baseline_extra_missing,
+        &extra_missing,
     );
     let managed = family_c_qualification_target_payload(
         managed_target,
         manifest,
         proofs,
         baseline_proof,
-        managed_install,
+        managed_install.or(preview_install.as_ref()),
         &managed_extra_missing,
     );
     let status = if family_c_qualification_target_ready(&baseline)
@@ -68,11 +76,15 @@ pub fn qualification_payload(
         "schema_version": FAMILY_C_QUALIFICATION_SCHEMA_VERSION,
         "status": status,
         "view_model": family_c_qualification_view_model(status, suite_present, manifest, [&baseline, &managed]),
-        "suite": {
+        "suite": if suite_present { json!({
             "suite_id": bounded_descriptor_token(&manifest.suite_id, "suite"),
             "mode": bounded_descriptor_token(&manifest.mode, "mode"),
             "run_count": manifest.runs.len(),
-        },
+        }) } else { json!({
+            "present": false,
+            "mode": bounded_descriptor_token(&manifest.mode, "mode"),
+            "run_count": manifest.runs.len(),
+        }) },
         "target": {
             "family": "C",
             "loader": FAMILY_C_QUALIFICATION_LOADER,
