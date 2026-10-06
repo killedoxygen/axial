@@ -5397,7 +5397,6 @@ struct FileBatchParent {
 
 impl FileBatchParent {
     fn revalidate(&mut self) -> io::Result<()> {
-        self.directory.revalidate().map_err(loader_io)?;
         for (index, name) in self
             .relative
             .split('/')
@@ -5436,9 +5435,8 @@ impl FileBatchParent {
         }
         // Unlike cached ancestor proofs, the leaf namespace is fenced for
         // this observation only, including absence and newly added aliases.
-        self.directory
-            .validate_passive_revision(revision)
-            .map_err(loader_io)
+        self.directory.inner.directory.validate_revision(revision)?;
+        self.directory.revalidate().map_err(loader_io)
     }
 }
 
@@ -5452,7 +5450,9 @@ fn revalidate_batch_child(
     // exact portable name while retaining the original child capability.
     for _ in 0..3 {
         child.revalidate().map_err(loader_io)?;
-        let before = directory.passive_revision().map_err(loader_io)?;
+        // Native revision reads already validate the retained ancestor chain;
+        // child revalidation supplies managed admission and settlement checks.
+        let before = directory.inner.directory.revision()?;
         if before == *revision {
             return Ok(());
         }
@@ -5464,7 +5464,7 @@ fn revalidate_batch_child(
             return Err(io::Error::other("managed batch ancestor changed"));
         }
         child.revalidate().map_err(loader_io)?;
-        let after = directory.passive_revision().map_err(loader_io)?;
+        let after = directory.inner.directory.revision()?;
         if before == after {
             *revision = after;
             return Ok(());
@@ -5534,7 +5534,7 @@ impl ManagedLibraryFileBatch {
         }
         let parent = self.parent.as_mut().expect("observed parent chain");
         parent.revalidate()?;
-        let revision = parent.directory.passive_revision().map_err(loader_io)?;
+        let revision = parent.directory.inner.directory.revision()?;
         let guard = parent
             .directory
             .inspect_regular_file_after_revalidation(name)
