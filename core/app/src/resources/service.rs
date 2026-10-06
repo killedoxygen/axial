@@ -138,28 +138,64 @@ impl ResourceService {
     }
 
     pub fn resources(&self, id: &InstanceId) -> Result<InstanceResourcesResponse, ResourceError> {
+        self.read_list(id, |game| {
+            let worlds = worlds::list_worlds(game).map_err(|_| ResourceError::Files)?;
+            let mods = mods::list_mods(game).map_err(|_| ResourceError::Files)?;
+            let screenshots =
+                screenshots::list_screenshots(game).map_err(|_| ResourceError::Files)?;
+            let logs = list_logs(game)?;
+            Ok(InstanceResourcesResponse {
+                worlds_count: worlds.len(),
+                mods_count: mods.len(),
+                screenshots_count: screenshots.len(),
+                logs_count: logs.len(),
+                worlds,
+                mods,
+                screenshots,
+                logs,
+            })
+        })
+    }
+
+    pub fn mods(&self, id: &InstanceId) -> Result<Vec<mods::InstanceModInfo>, ResourceError> {
+        self.read_list(id, |game| {
+            mods::list_mods(game).map_err(|_| ResourceError::Files)
+        })
+    }
+
+    pub fn worlds(&self, id: &InstanceId) -> Result<Vec<worlds::InstanceWorldInfo>, ResourceError> {
+        self.read_list(id, |game| {
+            worlds::list_worlds(game).map_err(|_| ResourceError::Files)
+        })
+    }
+
+    pub fn screenshots(
+        &self,
+        id: &InstanceId,
+    ) -> Result<Vec<screenshots::InstanceScreenshotInfo>, ResourceError> {
+        self.read_list(id, |game| {
+            screenshots::list_screenshots(game).map_err(|_| ResourceError::Files)
+        })
+    }
+
+    pub fn logs(&self, id: &InstanceId) -> Result<Vec<InstanceLogInfo>, ResourceError> {
+        self.read_list(id, list_logs)
+    }
+
+    fn read_list<T>(
+        &self,
+        id: &InstanceId,
+        scan: impl FnOnce(&ScopedDirectory) -> Result<T, ResourceError>,
+    ) -> Result<T, ResourceError> {
         let instance = self
             .directories
             .admit_read(id)
             .map_err(|_| ResourceError::Busy)?;
-        let game = instance.game_directory();
-        let worlds = worlds::list_worlds(game).map_err(|_| ResourceError::Files)?;
-        let mods = mods::list_mods(game).map_err(|_| ResourceError::Files)?;
-        let screenshots = screenshots::list_screenshots(game).map_err(|_| ResourceError::Files)?;
-        let logs = list_logs(game)?;
+        let result = scan(instance.game_directory())?;
         instance
             .validate_current()
             .map_err(|_| ResourceError::Busy)?;
-        Ok(InstanceResourcesResponse {
-            worlds_count: worlds.len(),
-            mods_count: mods.len(),
-            screenshots_count: screenshots.len(),
-            logs_count: logs.len(),
-            worlds,
-            mods,
-            screenshots,
-            logs,
-        })
+        Ok(result)
     }
 
     pub fn screenshot(

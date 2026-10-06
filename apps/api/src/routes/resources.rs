@@ -3,11 +3,11 @@
 use axial_app::{
     instances::model::InstanceId,
     resources::{
-        ResourceCommand, ResourceError, ResourceService,
+        InstanceLogInfo, ResourceCommand, ResourceError, ResourceService,
         folders::{FolderError, FolderService},
-        mods::UpdateModRequest,
-        screenshots::RenameScreenshotRequest,
-        worlds::RenameWorldRequest,
+        mods::{InstanceModInfo, UpdateModRequest},
+        screenshots::{InstanceScreenshotInfo, RenameScreenshotRequest},
+        worlds::{InstanceWorldInfo, RenameWorldRequest},
     },
     tasks::TaskHandle,
 };
@@ -131,28 +131,48 @@ async fn resources(
         .map_err(error)
 }
 async fn mods(
-    state: State<Arc<ResourceService>>,
-    path: Path<String>,
-) -> Result<Json<Value>, Error> {
-    Ok(Json(json!(resources(state, path).await?.0.mods)))
+    State(state): State<Arc<ResourceService>>,
+    Path(raw): Path<String>,
+) -> Result<Json<Vec<InstanceModInfo>>, Error> {
+    let id = id(&raw)?;
+    tokio::task::spawn_blocking(move || state.mods(&id))
+        .await
+        .map_err(|_| error(ResourceError::Files))?
+        .map(Json)
+        .map_err(error)
 }
 async fn worlds(
-    state: State<Arc<ResourceService>>,
-    path: Path<String>,
-) -> Result<Json<Value>, Error> {
-    Ok(Json(json!(resources(state, path).await?.0.worlds)))
+    State(state): State<Arc<ResourceService>>,
+    Path(raw): Path<String>,
+) -> Result<Json<Vec<InstanceWorldInfo>>, Error> {
+    let id = id(&raw)?;
+    tokio::task::spawn_blocking(move || state.worlds(&id))
+        .await
+        .map_err(|_| error(ResourceError::Files))?
+        .map(Json)
+        .map_err(error)
 }
 async fn screenshots(
-    state: State<Arc<ResourceService>>,
-    path: Path<String>,
-) -> Result<Json<Value>, Error> {
-    Ok(Json(json!(resources(state, path).await?.0.screenshots)))
+    State(state): State<Arc<ResourceService>>,
+    Path(raw): Path<String>,
+) -> Result<Json<Vec<InstanceScreenshotInfo>>, Error> {
+    let id = id(&raw)?;
+    tokio::task::spawn_blocking(move || state.screenshots(&id))
+        .await
+        .map_err(|_| error(ResourceError::Files))?
+        .map(Json)
+        .map_err(error)
 }
 async fn logs(
-    state: State<Arc<ResourceService>>,
-    path: Path<String>,
-) -> Result<Json<Value>, Error> {
-    Ok(Json(json!(resources(state, path).await?.0.logs)))
+    State(state): State<Arc<ResourceService>>,
+    Path(raw): Path<String>,
+) -> Result<Json<Vec<InstanceLogInfo>>, Error> {
+    let id = id(&raw)?;
+    tokio::task::spawn_blocking(move || state.logs(&id))
+        .await
+        .map_err(|_| error(ResourceError::Files))?
+        .map(Json)
+        .map_err(error)
 }
 
 async fn log(
@@ -254,12 +274,14 @@ async fn backup_world(
 mod tests {
     use super::*;
     use axial_app::{
+        content::install::ContentMutations,
         instances::{
             create::InstanceService,
             directory::{InstanceDirectories, Registry},
             model::Instance,
         },
         library::{LibraryId, LibraryLifecycle},
+        network::{ClientConfig, ProviderClient},
         resources::folders::{AdmittedFolder, FolderOpener, FolderProcess},
         settings::InstanceSettings,
         storage::MetadataStore,
@@ -376,12 +398,23 @@ mod tests {
                 InstanceDirectories::new(registry, library, Exclusions::new()),
                 tasks.clone(),
             ));
+            let directories = instances.directories().clone();
+            let content = ContentMutations::new(
+                directories.clone(),
+                ProviderClient::new(ClientConfig::default()).unwrap(),
+                tasks.clone(),
+            );
             let opener = Arc::new(RecordingOpener::default());
             let app = folders_router(Arc::new(FolderService::new(
                 instances,
                 tasks.clone(),
                 opener.clone(),
-            )));
+            )))
+            .merge(router(Arc::new(ResourceService::new(
+                directories,
+                content,
+                tasks.clone(),
+            ))));
             Self {
                 _root: root,
                 id,
@@ -417,6 +450,79 @@ mod tests {
             .expect("fake folder process settles");
             (status, serde_json::from_slice(&body).unwrap())
         }
+
+        async fn resource(&self, name: &str) -> (StatusCode, Value) {
+            let response = self
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/instances/{}/{name}", self.id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&body).unwrap())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn targeted_resource_lists_ignore_an_unrelated_screenshot_symlink() {
+        let fixture = FolderFixture::new();
+        std::fs::create_dir(fixture.game.join("mods")).unwrap();
+        std::fs::write(fixture.game.join("mods/local.jar"), b"regular mod").unwrap();
+        std::fs::create_dir(fixture.game.join("logs")).unwrap();
+        std::fs::write(fixture.game.join("logs/latest.log"), b"fixture log\n").unwrap();
+        let mods_before = fixture.resource("mods").await;
+        assert_eq!(mods_before.0, StatusCode::OK);
+        assert_eq!(mods_before.1.as_array().unwrap().len(), 1);
+        assert_eq!(mods_before.1[0]["name"], "local.jar");
+        assert_eq!(mods_before.1[0]["size"], 11);
+        assert_eq!(mods_before.1[0]["enabled"], true);
+        let logs_before = fixture.resource("logs").await;
+        assert_eq!(logs_before.0, StatusCode::OK);
+        assert_eq!(logs_before.1.as_array().unwrap().len(), 1);
+        assert_eq!(logs_before.1[0]["name"], "latest.log");
+        assert_eq!(logs_before.1[0]["size"], 12);
+
+        let outside = fixture._root.path().join("outside-screenshots");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("canary.png"), b"untouched screenshot").unwrap();
+        let link = fixture.game.join("screenshots");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let mods_after = fixture.resource("mods").await;
+        let logs_after = fixture.resource("logs").await;
+        let screenshots = fixture.resource("screenshots").await;
+        let resources = fixture.resource("resources").await;
+        fixture
+            .tasks
+            .shutdown(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let refused = (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error":"resource files could not be read or updated"}),
+        );
+        assert_eq!(screenshots, refused);
+        assert_eq!(resources, refused);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), outside);
+        assert_eq!(
+            std::fs::read(outside.join("canary.png")).unwrap(),
+            b"untouched screenshot"
+        );
+        assert_eq!(mods_after, mods_before);
+        assert_eq!(logs_after, logs_before);
     }
 
     #[tokio::test]
