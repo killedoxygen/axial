@@ -68,11 +68,20 @@ pub(super) fn capture(
                 .iter()
                 .filter_map(|disk| {
                     let mount = disk.mount_point().canonicalize().ok()?;
-                    path.starts_with(&mount)
-                        .then_some((mount.components().count(), disk.available_space() / MIB))
+                    path.starts_with(&mount).then_some((mount, disk))
                 })
-                .max_by_key(|(depth, _)| *depth)
-                .map(|(_, available)| available)
+                .max_by_key(|(mount, _)| mount.components().count())
+                .and_then(|selected| {
+                    #[cfg(target_os = "linux")]
+                    {
+                        available_disk_bytes(&selected.0)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Some(selected.1.available_space())
+                    }
+                })
+                .map(|available| available / MIB)
         })
         .min();
     LaunchProofResourceBudget {
@@ -98,6 +107,12 @@ pub(super) fn capture(
         disk_pressure: launch_disk_available_mb
             .is_some_and(|available| available < DISK_HEADROOM_MB),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    let disk = rustix::fs::statvfs(path).ok()?;
+    disk.f_bavail.checked_mul(disk.f_frsize)
 }
 
 fn cpu_pressure(threads: Option<usize>, sessions: usize, loads: [Option<u64>; 3]) -> bool {
@@ -139,36 +154,145 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
+    fn run_observation_child(test: &str, marker: &str) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(marker, "1")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => {
+                    let _ = child.kill();
+                    child.wait().expect("observation child must be reaped");
+                    panic!("{test} child timed out or could not be observed");
+                }
+            }
+        };
+        assert!(status.success(), "{test} child failed: {status}");
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn disk_observation_failure_is_not_reported_as_available_capacity() {
+        use std::os::unix::ffi::OsStrExt;
+
+        const CHILD: &str = "AXIAL_DISK_DENIAL_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            run_observation_child(
+                "launch::resources::tests::disk_observation_failure_is_not_reported_as_available_capacity",
+                CHILD,
+            );
+            return;
+        }
+
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let path = std::ffi::CString::new(root.path().as_os_str().as_bytes()).unwrap();
+        let native_sample = || {
+            let mut observation = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            // The canonical fixture path and output storage outlive this native call.
+            let result = unsafe { libc::statvfs(path.as_ptr(), observation.as_mut_ptr()) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error().raw_os_error())
+            }
+        };
+        native_sample().expect("fixture filesystem must be observable before denial");
+        let host = capture_host();
+        let before = capture(&host, (0, 0), 0, 2048, [root.path(), root.path()]);
+        assert!(
+            before.launch_disk_available_mb.is_some(),
+            "fixture filesystem must have a reported disk sample before denial"
+        );
+
+        let instruction = |code: u32, jt, jf, k| libc::sock_filter {
+            code: code as u16,
+            jt,
+            jf,
+            k,
+        };
+        let mut filter = [
+            instruction(
+                libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+                0,
+                0,
+                std::mem::offset_of!(libc::seccomp_data, nr) as u32,
+            ),
+            instruction(
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                2,
+                0,
+                libc::SYS_statfs as u32,
+            ),
+            instruction(
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                1,
+                0,
+                libc::SYS_fstatfs as u32,
+            ),
+            instruction(libc::BPF_RET | libc::BPF_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+            instruction(
+                libc::BPF_RET | libc::BPF_K,
+                0,
+                0,
+                libc::SECCOMP_RET_ERRNO | libc::EIO as u32,
+            ),
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        // No TSYNC: only this isolated helper thread is restricted until it exits.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+            0,
+            "disk-denial fixture could not disable privilege gains"
+        );
+        assert_eq!(
+            unsafe {
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &program as *const libc::sock_fprog,
+                    0,
+                    0,
+                )
+            },
+            0,
+            "disk-denial fixture requires an available seccomp filter"
+        );
+        let denied_before = native_sample();
+        let budget = capture(&host, (0, 0), 0, 2048, [root.path(), root.path()]);
+        let denied_after = native_sample();
+        root.close().unwrap();
+        assert_eq!(denied_before, Err(Some(libc::EIO)));
+        assert_eq!(denied_after, Err(Some(libc::EIO)));
+        assert_eq!(
+            budget.launch_disk_available_mb, None,
+            "confirmed native disk-observation failure must not become a capacity sample"
+        );
+        assert!(!budget.disk_pressure);
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn descriptor_exhaustion_retains_native_load_availability() {
         const CHILD: &str = "AXIAL_LOAD_DENIAL_FIXTURE_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "launch::resources::tests::descriptor_exhaustion_retains_native_load_availability",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .stdin(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break status,
-                    Ok(None) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    _ => {
-                        let _ = child.kill();
-                        child.wait().expect("load-denial child must be reaped");
-                        panic!("load-denial child timed out or could not be observed");
-                    }
-                }
-            };
-            assert!(status.success(), "load-denial child failed: {status}");
+            run_observation_child(
+                "launch::resources::tests::descriptor_exhaustion_retains_native_load_availability",
+                CHILD,
+            );
             return;
         }
 
