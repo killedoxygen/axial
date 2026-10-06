@@ -4449,15 +4449,45 @@ mod tests {
     async fn hard_exit_after_content_replacement_restores_original_installation() {
         use crate::library::LibraryId;
         use axial_minecraft::download::{TransferClient, TransferClientConfig};
-        use std::{io::Read, path::Path, process::Command, time::Duration};
+        use std::{io::Read, path::Path, process::Command, sync::mpsc, time::Duration};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         const ROOT: &str = "AXIAL_CONTENT_REPLACEMENT_CRASH_ROOT";
         const LIBRARY: &str = "AXIAL_CONTENT_REPLACEMENT_CRASH_LIBRARY";
+        const UNSAVED: &str = "AXIAL_CONTENT_REPLACEMENT_CRASH_UNSAVED";
         const ORIGINAL: &[u8] = b"original content payload";
         const REPLACEMENT: &[u8] = b"replacement content payload";
         const PAYLOAD: &str = "resourcepacks/replacement.zip";
         const WITNESS: &str = "original-tree.json";
+        const UNSAVED_RECEIPT: &str = "unsaved-receipt.json";
+        const UNSAVED_TREE: &str = "unsaved-tree.json";
+
+        fn publication_checkpoint(raw: &str, saved: bool) -> serde_json::Value {
+            assert!(raw.len() <= MAX_RECEIPT_BYTES);
+            let receipt: Receipt = serde_json::from_str(raw).unwrap();
+            validate_receipt(&receipt).unwrap();
+            assert!(!receipt.native_settled);
+            assert_eq!(receipt.changes.len(), 1);
+            assert_eq!(receipt.changes[0].path, PAYLOAD);
+            assert_eq!(receipt.changes[0].before, Some(Proof::bytes(ORIGINAL)));
+            assert_eq!(receipt.changes[0].after, Some(Proof::bytes(REPLACEMENT)));
+            let checkpoint = ManagedContentStagingCheckpoint::decode(
+                receipt.ready_checkpoint.as_deref().unwrap(),
+            )
+            .unwrap();
+            let checkpoint: serde_json::Value =
+                serde_json::from_str(&checkpoint.encode(MAX_RECEIPT_BYTES).unwrap()).unwrap();
+            if saved {
+                let published = checkpoint["published"].as_array().unwrap();
+                assert_eq!(published.len(), 1);
+                assert_eq!(published[0]["path"], PAYLOAD);
+                assert!(published[0]["backup"].is_object());
+            } else {
+                assert!(checkpoint.get("published").is_none());
+            }
+            assert!(checkpoint.get("restored").is_none());
+            checkpoint
+        }
 
         fn files(root: &Path) -> BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
             let mut pending = vec![root.to_path_buf()];
@@ -4526,6 +4556,7 @@ mod tests {
         }
 
         if let Some(root) = std::env::var_os(ROOT) {
+            let unsaved = std::env::var(UNSAVED).unwrap() == "1";
             let root = std::path::PathBuf::from(root);
             assert_eq!(root.canonicalize().unwrap(), root);
             let library_id = LibraryId::parse(&std::env::var(LIBRARY).unwrap()).unwrap();
@@ -4610,30 +4641,298 @@ mod tests {
             assert!(witness.len() <= 128 * 1024);
             std::fs::write(root.join(WITNESS), witness).unwrap();
             let replacement = plan(&owner, &instance.id, &url, "v2", REPLACEMENT).await;
-            let observer = owner.clone();
+            let registry = owner.directories.registry().clone();
             let id = instance.id.clone();
             let observed_game = game.clone();
-            ManagedContentTransactionRoot::before_manifest_revalidation_for_test(
-                &game.canonicalize().unwrap(),
-                move || {
-                    let raw: String = observer
-                        .directories
-                        .registry()
+            let receipt_path = root.join(UNSAVED_RECEIPT);
+            let verify_exit = move |raw: &str| -> ! {
+                let checkpoint = publication_checkpoint(raw, !unsaved);
+                let receipt: Receipt = serde_json::from_str(raw).unwrap();
+                assert_eq!(
+                    receipt.before_manifest.as_deref(),
+                    Some(original_manifest.as_slice())
+                );
+                assert_eq!(
+                    std::fs::read(observed_game.join(PAYLOAD)).unwrap(),
+                    REPLACEMENT
+                );
+                assert_eq!(
+                    std::fs::read(observed_game.join(MANIFEST_FILE)).unwrap(),
+                    original_manifest
+                );
+                let private = observed_game.join(checkpoint["private_name"].as_str().unwrap());
+                assert_eq!(std::fs::read_dir(private.join("stage")).unwrap().count(), 0);
+                let backup = std::fs::read_dir(private.join("backup"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                assert_eq!(backup.len(), 1);
+                assert_eq!(
+                    std::fs::metadata(&backup[0]).unwrap().len(),
+                    ORIGINAL.len() as u64
+                );
+                assert_eq!(std::fs::read(&backup[0]).unwrap(), ORIGINAL);
+                if unsaved {
+                    let witness = serde_json::to_vec(&files(&observed_game)).unwrap();
+                    assert!(witness.len() <= 128 * 1024);
+                    std::fs::write(root.join(UNSAVED_TREE), witness).unwrap();
+                }
+                std::process::exit(42);
+            };
+            let observer = if unsaved {
+                let (begin, started) = mpsc::sync_channel(1);
+                let (locked, admitted) = mpsc::sync_channel(1);
+                let admitted = Mutex::new(admitted);
+                let observer = std::thread::spawn(move || {
+                    started.recv_timeout(Duration::from_secs(10)).unwrap();
+                    registry
                         .storage()
+                        .transaction(|db| -> Result<(), StorageError> {
+                            let raw: String = db.query_row(
+                                "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
+                                [id.as_str()],
+                                |row| row.get(0),
+                            )?;
+                            let checkpoint = publication_checkpoint(&raw, false);
+                            assert_eq!(std::fs::read(game.join(PAYLOAD)).unwrap(), ORIGINAL);
+                            let private = game.join(checkpoint["private_name"].as_str().unwrap());
+                            assert_eq!(
+                                std::fs::read_dir(private.join("backup")).unwrap().count(),
+                                0
+                            );
+                            let payloads = checkpoint["payloads"].as_array().unwrap();
+                            assert_eq!(payloads.len(), 1);
+                            assert_eq!(
+                                std::fs::read(
+                                    private
+                                        .join("stage")
+                                        .join(payloads[0]["name"].as_str().unwrap())
+                                )
+                                .unwrap(),
+                                REPLACEMENT
+                            );
+                            std::fs::write(receipt_path, &raw).unwrap();
+                            locked.send(()).unwrap();
+                            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                            while std::fs::read(game.join(PAYLOAD)).ok().as_deref()
+                                != Some(REPLACEMENT)
+                                && std::time::Instant::now() < deadline
+                            {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            let unchanged: String = db.query_row(
+                                "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
+                                [id.as_str()],
+                                |row| row.get(0),
+                            )?;
+                            assert!(unchanged == raw, "publication proof must remain unsaved");
+                            verify_exit(&raw)
+                        })
+                        .unwrap();
+                });
+                owner = owner.with_progress(Arc::new(move |event| {
+                    if event.phase == "content_commit" && event.current == 0 {
+                        begin.send(()).unwrap();
+                        admitted
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
+                    }
+                }));
+                Some(observer)
+            } else {
+                ManagedContentTransactionRoot::before_manifest_revalidation_for_test(
+                    &game.canonicalize().unwrap(),
+                    move || {
+                        let raw: String = registry
+                            .storage()
+                            .read(|db| {
+                                db.query_row(
+                                    "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
+                                    [id.as_str()],
+                                    |row| row.get(0),
+                                )
+                                .map_err(StorageError::from)
+                            })
+                            .unwrap();
+                        verify_exit(&raw);
+                    },
+                )
+                .unwrap();
+                None
+            };
+            let result = owner.install(replacement, false).unwrap().join().await;
+            transport.await.unwrap();
+            if let Some(observer) = observer {
+                observer.join().unwrap();
+            }
+            panic!(
+                "replacement did not reach its publication boundary (unsaved={unsaved}): {result:?}"
+            );
+        }
+
+        for unsaved in [false, true] {
+            let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let library_id = LibraryId::new();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "content::install::tests::hard_exit_after_content_replacement_restores_original_installation", "--nocapture"])
+            .env(ROOT, root.path())
+            .env(LIBRARY, library_id.to_string())
+            .env(UNSAVED, if unsaved { "1" } else { "0" })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let timed_out = child.try_wait().unwrap().is_none();
+            if timed_out {
+                child.kill().unwrap();
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !timed_out && output.status.code() == Some(42),
+                "replacement crash boundary not reached: unsaved={unsaved}, timed_out={timed_out}, status={:?}; {} {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut witness = Vec::new();
+            std::fs::File::open(
+                root.path()
+                    .join(if unsaved { UNSAVED_TREE } else { WITNESS }),
+            )
+            .unwrap()
+            .take(128 * 1024 + 1)
+            .read_to_end(&mut witness)
+            .unwrap();
+            assert!(witness.len() <= 128 * 1024);
+            let expected_tree: BTreeMap<std::path::PathBuf, Option<Vec<u8>>> =
+                serde_json::from_slice(&witness).unwrap();
+            let mut restored_receipt = if unsaved {
+                let mut raw = String::new();
+                std::fs::File::open(root.path().join(UNSAVED_RECEIPT))
+                    .unwrap()
+                    .take(MAX_RECEIPT_BYTES as u64 + 1)
+                    .read_to_string(&mut raw)
+                    .unwrap();
+                publication_checkpoint(&raw, false);
+                Some(raw)
+            } else {
+                None
+            };
+            for attempt in 0..if unsaved { 2 } else { 3 } {
+                let owner = open_crash_fixture(root.path(), library_id);
+                let records = owner.directories.registry().list().unwrap();
+                assert_eq!(records.len(), 1);
+                let id = &records[0].instance.id;
+                let game = root.path().join("instances").join(id.as_str());
+                let storage = owner.directories.registry().storage();
+                let pending = || {
+                    storage
                         .read(|db| {
                             db.query_row(
                                 "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
                                 [id.as_str()],
-                                |row| row.get(0),
+                                |row| row.get::<_, String>(0),
                             )
+                            .optional()
                             .map_err(StorageError::from)
                         })
-                        .unwrap();
-                    let receipt: Receipt = serde_json::from_str(&raw).unwrap();
+                        .unwrap()
+                };
+                let before = pending();
+                if unsaved {
+                    assert!(
+                        before == restored_receipt,
+                        "restart must retain the saved receipt"
+                    );
+                    assert_eq!(files(&game), expected_tree);
+                    assert!(matches!(
+                        owner.installed(id),
+                        Err(MutationError::Unavailable)
+                    ));
+                    assert!(matches!(
+                        owner.directories.admit_read(id),
+                        Err(crate::instances::model::InstanceError::Busy)
+                    ));
+                    assert!(matches!(
+                        owner.directories.admit(id),
+                        Err(crate::instances::model::InstanceError::Busy)
+                    ));
+                } else if attempt == 0 {
+                    assert!(before.is_some());
+                    storage.transaction(|db| db.execute_batch(
+                    "CREATE TRIGGER refuse_replacement_rollback_ack BEFORE DELETE ON content_batches BEGIN SELECT RAISE(IGNORE); END;"
+                ).map_err(StorageError::from)).unwrap();
+                } else {
+                    assert_eq!(before, restored_receipt);
+                }
+                let result = if unsaved || attempt < 2 {
+                    Some(owner.resume(id).unwrap().join().await.unwrap())
+                } else {
+                    None
+                };
+                let restored = files(&game);
+                let installed = owner.installed(id);
+                let after = pending();
+                if unsaved || attempt == 0 {
+                    assert!(owner.has_unsettled_effects());
+                    assert!(matches!(
+                        owner.directories.admit(id),
+                        Err(crate::instances::model::InstanceError::Busy)
+                    ));
+                }
+                if unsaved {
+                    assert!(matches!(
+                        owner.directories.admit_read(id),
+                        Err(crate::instances::model::InstanceError::Busy)
+                    ));
+                }
+                owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
+                owner
+                    .release_shutdown_admissions(&owner.tasks.shutdown_receipt().unwrap())
+                    .unwrap();
+                owner.directories.library().try_preserve().unwrap();
+                if let Some(result) = result {
+                    assert!(
+                        if unsaved || attempt == 0 {
+                            matches!(result, Err(MutationError::Pending))
+                        } else {
+                            matches!(result, Err(MutationError::Cancelled))
+                        },
+                        "replacement recovery must respect its durable proof (unsaved={unsaved}, attempt={attempt}): {result:?}"
+                    );
+                }
+                assert_eq!(restored, expected_tree);
+                if unsaved || attempt == 0 {
+                    assert!(matches!(installed, Err(MutationError::Unavailable)));
+                } else {
+                    assert_eq!(
+                        installed
+                            .unwrap()
+                            .find(&CanonicalId("modrinth:replacement".into()))
+                            .unwrap()
+                            .version_id(),
+                        "v1"
+                    );
+                }
+                assert_eq!(pending(), after);
+                if unsaved {
+                    assert!(after == before, "Resume must preserve the unsaved receipt");
+                    assert_eq!(files(&game), expected_tree);
+                    assert!(owner.tasks.status().is_idle());
+                    assert!(owner.has_unsettled_effects());
+                    continue;
+                }
+                if attempt == 0 {
+                    let before: Receipt = serde_json::from_str(before.as_deref().unwrap()).unwrap();
+                    let receipt: Receipt = serde_json::from_str(after.as_deref().unwrap()).unwrap();
                     assert!(!receipt.native_settled);
-                    assert_eq!(receipt.changes.len(), 1);
-                    assert_eq!(receipt.changes[0].before, Some(Proof::bytes(ORIGINAL)));
-                    assert_eq!(receipt.changes[0].after, Some(Proof::bytes(REPLACEMENT)));
+                    assert_eq!(receipt.operation_id, before.operation_id);
+                    assert_ne!(receipt.ready_checkpoint, before.ready_checkpoint);
                     let checkpoint = ManagedContentStagingCheckpoint::decode(
                         receipt.ready_checkpoint.as_deref().unwrap(),
                     )
@@ -4641,190 +4940,38 @@ mod tests {
                     let checkpoint: serde_json::Value =
                         serde_json::from_str(&checkpoint.encode(MAX_RECEIPT_BYTES).unwrap())
                             .unwrap();
-                    let published = checkpoint["published"].as_array().unwrap();
-                    assert_eq!(published.len(), 1);
-                    assert_eq!(published[0]["path"], PAYLOAD);
-                    assert!(published[0]["backup"].is_object());
-                    assert_eq!(
-                        std::fs::read(observed_game.join(PAYLOAD)).unwrap(),
-                        REPLACEMENT
-                    );
-                    assert_eq!(
-                        std::fs::read(observed_game.join(MANIFEST_FILE)).unwrap(),
-                        original_manifest
-                    );
-                    let private = observed_game.join(checkpoint["private_name"].as_str().unwrap());
-                    assert_eq!(std::fs::read_dir(private.join("stage")).unwrap().count(), 0);
-                    let backup = std::fs::read_dir(private.join("backup"))
-                        .unwrap()
-                        .map(|entry| entry.unwrap().path())
-                        .collect::<Vec<_>>();
-                    assert_eq!(backup.len(), 1);
-                    assert_eq!(
-                        std::fs::metadata(&backup[0]).unwrap().len(),
-                        ORIGINAL.len() as u64
-                    );
-                    assert_eq!(std::fs::read(&backup[0]).unwrap(), ORIGINAL);
-                    std::process::exit(42);
-                },
-            )
-            .unwrap();
-            let result = owner.install(replacement, false).unwrap().join().await;
-            transport.await.unwrap();
-            panic!("replacement did not reach the saved publication boundary: {result:?}");
-        }
-
-        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-        let library_id = LibraryId::new();
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "content::install::tests::hard_exit_after_content_replacement_restores_original_installation", "--nocapture"])
-            .env(ROOT, root.path())
-            .env(LIBRARY, library_id.to_string())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let timed_out = child.try_wait().unwrap().is_none();
-        if timed_out {
-            child.kill().unwrap();
-        }
-        let output = child.wait_with_output().unwrap();
-        assert!(
-            !timed_out && output.status.code() == Some(42),
-            "replacement crash boundary not reached: timed_out={timed_out}, status={:?}; {} {}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let mut witness = Vec::new();
-        std::fs::File::open(root.path().join(WITNESS))
-            .unwrap()
-            .take(128 * 1024 + 1)
-            .read_to_end(&mut witness)
-            .unwrap();
-        assert!(witness.len() <= 128 * 1024);
-        let original_tree: BTreeMap<std::path::PathBuf, Option<Vec<u8>>> =
-            serde_json::from_slice(&witness).unwrap();
-        let mut restored_receipt = None;
-        for attempt in 0..3 {
-            let owner = open_crash_fixture(root.path(), library_id);
-            let records = owner.directories.registry().list().unwrap();
-            assert_eq!(records.len(), 1);
-            let id = &records[0].instance.id;
-            let game = root.path().join("instances").join(id.as_str());
-            let storage = owner.directories.registry().storage();
-            let pending = || {
-                storage
-                    .read(|db| {
-                        db.query_row(
-                            "SELECT receipt_json FROM content_batches WHERE instance_id=?1",
-                            [id.as_str()],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .map_err(StorageError::from)
-                    })
-                    .unwrap()
-            };
-            let before = pending();
-            if attempt == 0 {
-                assert!(before.is_some());
-                storage.transaction(|db| db.execute_batch(
-                    "CREATE TRIGGER refuse_replacement_rollback_ack BEFORE DELETE ON content_batches BEGIN SELECT RAISE(IGNORE); END;"
-                ).map_err(StorageError::from)).unwrap();
-            } else {
-                assert_eq!(before, restored_receipt);
-            }
-            let result = if attempt < 2 {
-                Some(owner.resume(id).unwrap().join().await.unwrap())
-            } else {
-                None
-            };
-            let restored = files(&game);
-            let installed = owner.installed(id);
-            let after = pending();
-            if attempt == 0 {
-                assert!(owner.has_unsettled_effects());
-                assert!(matches!(
-                    owner.directories.admit(id),
-                    Err(crate::instances::model::InstanceError::Busy)
-                ));
-            }
-            owner.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
-            owner
-                .release_shutdown_admissions(&owner.tasks.shutdown_receipt().unwrap())
-                .unwrap();
-            owner.directories.library().try_preserve().unwrap();
-            if let Some(result) = result {
-                assert!(
-                    if attempt == 0 {
-                        matches!(result, Err(MutationError::Pending))
-                    } else {
-                        matches!(result, Err(MutationError::Cancelled))
-                    },
-                    "recorded replacement recovery must retain a refused acknowledgement and restore after reopen (attempt={attempt}): {result:?}"
-                );
-            }
-            assert_eq!(restored, original_tree);
-            if attempt == 0 {
-                assert!(matches!(installed, Err(MutationError::Unavailable)));
-            } else {
-                assert_eq!(
-                    installed
-                        .unwrap()
-                        .find(&CanonicalId("modrinth:replacement".into()))
-                        .unwrap()
-                        .version_id(),
-                    "v1"
-                );
-            }
-            assert_eq!(pending(), after);
-            if attempt == 0 {
-                let before: Receipt = serde_json::from_str(before.as_deref().unwrap()).unwrap();
-                let receipt: Receipt = serde_json::from_str(after.as_deref().unwrap()).unwrap();
-                assert!(!receipt.native_settled);
-                assert_eq!(receipt.operation_id, before.operation_id);
-                assert_ne!(receipt.ready_checkpoint, before.ready_checkpoint);
-                let checkpoint = ManagedContentStagingCheckpoint::decode(
-                    receipt.ready_checkpoint.as_deref().unwrap(),
-                )
-                .unwrap();
-                let checkpoint: serde_json::Value =
-                    serde_json::from_str(&checkpoint.encode(MAX_RECEIPT_BYTES).unwrap()).unwrap();
-                let before = ManagedContentStagingCheckpoint::decode(
-                    before.ready_checkpoint.as_deref().unwrap(),
-                )
-                .unwrap();
-                let before: serde_json::Value =
-                    serde_json::from_str(&before.encode(MAX_RECEIPT_BYTES).unwrap()).unwrap();
-                assert!(before.get("restored").is_none());
-                for field in ["files", "payloads", "published"] {
-                    assert_eq!(checkpoint[field], before[field]);
+                    let before = ManagedContentStagingCheckpoint::decode(
+                        before.ready_checkpoint.as_deref().unwrap(),
+                    )
+                    .unwrap();
+                    let before: serde_json::Value =
+                        serde_json::from_str(&before.encode(MAX_RECEIPT_BYTES).unwrap()).unwrap();
+                    assert!(before.get("restored").is_none());
+                    for field in ["files", "payloads", "published"] {
+                        assert_eq!(checkpoint[field], before[field]);
+                    }
+                    let files = checkpoint["files"].as_array().unwrap();
+                    let restored = checkpoint["restored"].as_array().unwrap();
+                    assert_eq!(restored.len(), files.len());
+                    let payload = files
+                        .iter()
+                        .position(|file| file["path"] == PAYLOAD)
+                        .unwrap();
+                    assert_eq!(restored[payload]["size"], ORIGINAL.len());
+                    assert_eq!(restored[payload]["sha512"], Proof::bytes(ORIGINAL).sha512);
+                    restored_receipt = after;
+                    storage
+                        .transaction(|db| {
+                            db.execute_batch("DROP TRIGGER refuse_replacement_rollback_ack")
+                                .map_err(StorageError::from)
+                        })
+                        .unwrap();
+                    assert_eq!(pending(), restored_receipt);
+                } else {
+                    assert!(after.is_none());
+                    assert!(!owner.has_unsettled_effects());
+                    restored_receipt = None;
                 }
-                let files = checkpoint["files"].as_array().unwrap();
-                let restored = checkpoint["restored"].as_array().unwrap();
-                assert_eq!(restored.len(), files.len());
-                let payload = files
-                    .iter()
-                    .position(|file| file["path"] == PAYLOAD)
-                    .unwrap();
-                assert_eq!(restored[payload]["size"], ORIGINAL.len());
-                assert_eq!(restored[payload]["sha512"], Proof::bytes(ORIGINAL).sha512);
-                restored_receipt = after;
-                storage
-                    .transaction(|db| {
-                        db.execute_batch("DROP TRIGGER refuse_replacement_rollback_ack")
-                            .map_err(StorageError::from)
-                    })
-                    .unwrap();
-                assert_eq!(pending(), restored_receipt);
-            } else {
-                assert!(after.is_none());
-                assert!(!owner.has_unsettled_effects());
-                restored_receipt = None;
             }
         }
     }
