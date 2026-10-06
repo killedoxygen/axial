@@ -4447,6 +4447,15 @@ mod tests {
 
     #[tokio::test]
     async fn hard_exit_after_content_replacement_restores_original_installation() {
+        file_change_crash(false).await;
+    }
+
+    #[tokio::test]
+    async fn hard_exit_after_content_removal_restores_original_installation() {
+        file_change_crash(true).await;
+    }
+
+    async fn file_change_crash(removal: bool) {
         use crate::library::LibraryId;
         use axial_minecraft::download::{TransferClient, TransferClientConfig};
         use std::{io::Read, path::Path, process::Command, sync::mpsc, time::Duration};
@@ -4461,8 +4470,9 @@ mod tests {
         const WITNESS: &str = "original-tree.json";
         const UNSAVED_RECEIPT: &str = "unsaved-receipt.json";
         const UNSAVED_TREE: &str = "unsaved-tree.json";
+        const REMOVAL_RECEIPT: &str = "removal-receipt.json";
 
-        fn publication_checkpoint(raw: &str, saved: bool) -> serde_json::Value {
+        fn publication_checkpoint(raw: &str, saved: bool, removal: bool) -> serde_json::Value {
             assert!(raw.len() <= MAX_RECEIPT_BYTES);
             let receipt: Receipt = serde_json::from_str(raw).unwrap();
             validate_receipt(&receipt).unwrap();
@@ -4470,19 +4480,22 @@ mod tests {
             assert_eq!(receipt.changes.len(), 1);
             assert_eq!(receipt.changes[0].path, PAYLOAD);
             assert_eq!(receipt.changes[0].before, Some(Proof::bytes(ORIGINAL)));
-            assert_eq!(receipt.changes[0].after, Some(Proof::bytes(REPLACEMENT)));
+            assert_eq!(
+                receipt.changes[0].after,
+                (!removal).then(|| Proof::bytes(REPLACEMENT))
+            );
             let checkpoint = ManagedContentStagingCheckpoint::decode(
                 receipt.ready_checkpoint.as_deref().unwrap(),
             )
             .unwrap();
             let checkpoint: serde_json::Value =
                 serde_json::from_str(&checkpoint.encode(MAX_RECEIPT_BYTES).unwrap()).unwrap();
-            if saved {
+            if saved && !removal {
                 let published = checkpoint["published"].as_array().unwrap();
                 assert_eq!(published.len(), 1);
                 assert_eq!(published[0]["path"], PAYLOAD);
                 assert!(published[0]["backup"].is_object());
-            } else {
+            } else if !saved {
                 assert!(checkpoint.get("published").is_none());
             }
             assert!(checkpoint.get("restored").is_none());
@@ -4590,7 +4603,12 @@ mod tests {
             ))
             .unwrap();
             let transport = tokio::spawn(async move {
-                for bytes in [ORIGINAL, REPLACEMENT] {
+                let payloads: &[&[u8]] = if removal {
+                    &[ORIGINAL]
+                } else {
+                    &[ORIGINAL, REPLACEMENT]
+                };
+                for bytes in payloads {
                     let (mut socket, _) = listener.accept().await.unwrap();
                     let mut request = Vec::new();
                     while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
@@ -4640,22 +4658,37 @@ mod tests {
             let witness = serde_json::to_vec(&files(&game)).unwrap();
             assert!(witness.len() <= 128 * 1024);
             std::fs::write(root.join(WITNESS), witness).unwrap();
-            let replacement = plan(&owner, &instance.id, &url, "v2", REPLACEMENT).await;
+            let replacement = if removal {
+                None
+            } else {
+                Some(plan(&owner, &instance.id, &url, "v2", REPLACEMENT).await)
+            };
             let registry = owner.directories.registry().clone();
             let id = instance.id.clone();
             let observed_game = game.clone();
             let receipt_path = root.join(UNSAVED_RECEIPT);
+            let removal_receipt = root.join(REMOVAL_RECEIPT);
             let verify_exit = move |raw: &str| -> ! {
-                let checkpoint = publication_checkpoint(raw, !unsaved);
+                let checkpoint = publication_checkpoint(raw, !unsaved, removal);
                 let receipt: Receipt = serde_json::from_str(raw).unwrap();
                 assert_eq!(
                     receipt.before_manifest.as_deref(),
                     Some(original_manifest.as_slice())
                 );
-                assert_eq!(
-                    std::fs::read(observed_game.join(PAYLOAD)).unwrap(),
-                    REPLACEMENT
-                );
+                if removal {
+                    assert_eq!(
+                        std::fs::symlink_metadata(observed_game.join(PAYLOAD))
+                            .unwrap_err()
+                            .kind(),
+                        std::io::ErrorKind::NotFound
+                    );
+                    std::fs::write(removal_receipt, raw).unwrap();
+                } else {
+                    assert_eq!(
+                        std::fs::read(observed_game.join(PAYLOAD)).unwrap(),
+                        REPLACEMENT
+                    );
+                }
                 assert_eq!(
                     std::fs::read(observed_game.join(MANIFEST_FILE)).unwrap(),
                     original_manifest
@@ -4693,7 +4726,7 @@ mod tests {
                                 [id.as_str()],
                                 |row| row.get(0),
                             )?;
-                            let checkpoint = publication_checkpoint(&raw, false);
+                            let checkpoint = publication_checkpoint(&raw, false, false);
                             assert_eq!(std::fs::read(game.join(PAYLOAD)).unwrap(), ORIGINAL);
                             let private = game.join(checkpoint["private_name"].as_str().unwrap());
                             assert_eq!(
@@ -4762,27 +4795,40 @@ mod tests {
                 .unwrap();
                 None
             };
-            let result = owner.install(replacement, false).unwrap().join().await;
+            let result = match replacement {
+                Some(plan) => owner.install(plan, false),
+                None => owner.remove(&instance.id, &CanonicalId("modrinth:replacement".into())),
+            }
+            .unwrap()
+            .join()
+            .await;
             transport.await.unwrap();
             if let Some(observer) = observer {
                 observer.join().unwrap();
             }
             panic!(
-                "replacement did not reach its publication boundary (unsaved={unsaved}): {result:?}"
+                "content change did not reach its publication boundary (removal={removal}, unsaved={unsaved}): {result:?}"
             );
         }
 
-        for unsaved in [false, true] {
+        let phases: &[bool] = if removal { &[false] } else { &[false, true] };
+        for &unsaved in phases {
             let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
             let library_id = LibraryId::new();
+            let selector = if removal {
+                "content::install::tests::hard_exit_after_content_removal_restores_original_installation"
+            } else {
+                "content::install::tests::hard_exit_after_content_replacement_restores_original_installation"
+            };
             let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "content::install::tests::hard_exit_after_content_replacement_restores_original_installation", "--nocapture"])
-            .env(ROOT, root.path())
-            .env(LIBRARY, library_id.to_string())
-            .env(UNSAVED, if unsaved { "1" } else { "0" })
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn().unwrap();
+                .args(["--exact", selector, "--nocapture"])
+                .env(ROOT, root.path())
+                .env(LIBRARY, library_id.to_string())
+                .env(UNSAVED, if unsaved { "1" } else { "0" })
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4794,7 +4840,7 @@ mod tests {
             let output = child.wait_with_output().unwrap();
             assert!(
                 !timed_out && output.status.code() == Some(42),
-                "replacement crash boundary not reached: unsaved={unsaved}, timed_out={timed_out}, status={:?}; {} {}",
+                "content crash boundary not reached: removal={removal}, unsaved={unsaved}, timed_out={timed_out}, status={:?}; {} {}",
                 output.status,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
@@ -4818,12 +4864,25 @@ mod tests {
                     .take(MAX_RECEIPT_BYTES as u64 + 1)
                     .read_to_string(&mut raw)
                     .unwrap();
-                publication_checkpoint(&raw, false);
+                publication_checkpoint(&raw, false, false);
                 Some(raw)
             } else {
                 None
             };
-            for attempt in 0..if unsaved { 2 } else { 3 } {
+            let removal_receipt = if removal {
+                let mut raw = String::new();
+                std::fs::File::open(root.path().join(REMOVAL_RECEIPT))
+                    .unwrap()
+                    .take(MAX_RECEIPT_BYTES as u64 + 1)
+                    .read_to_string(&mut raw)
+                    .unwrap();
+                publication_checkpoint(&raw, true, true);
+                Some(raw)
+            } else {
+                None
+            };
+            for attempt in 0..if unsaved || removal { 2 } else { 3 } {
+                let refuse_ack = !removal && !unsaved && attempt == 0;
                 let owner = open_crash_fixture(root.path(), library_id);
                 let records = owner.directories.registry().list().unwrap();
                 assert_eq!(records.len(), 1);
@@ -4862,15 +4921,17 @@ mod tests {
                         owner.directories.admit(id),
                         Err(crate::instances::model::InstanceError::Busy)
                     ));
-                } else if attempt == 0 {
+                } else if refuse_ack {
                     assert!(before.is_some());
                     storage.transaction(|db| db.execute_batch(
                     "CREATE TRIGGER refuse_replacement_rollback_ack BEFORE DELETE ON content_batches BEGIN SELECT RAISE(IGNORE); END;"
                 ).map_err(StorageError::from)).unwrap();
+                } else if removal && attempt == 0 {
+                    assert_eq!(before, removal_receipt);
                 } else {
                     assert_eq!(before, restored_receipt);
                 }
-                let result = if unsaved || attempt < 2 {
+                let result = if unsaved || attempt < if removal { 1 } else { 2 } {
                     Some(owner.resume(id).unwrap().join().await.unwrap())
                 } else {
                     None
@@ -4878,7 +4939,7 @@ mod tests {
                 let restored = files(&game);
                 let installed = owner.installed(id);
                 let after = pending();
-                if unsaved || attempt == 0 {
+                if unsaved || refuse_ack {
                     assert!(owner.has_unsettled_effects());
                     assert!(matches!(
                         owner.directories.admit(id),
@@ -4898,16 +4959,16 @@ mod tests {
                 owner.directories.library().try_preserve().unwrap();
                 if let Some(result) = result {
                     assert!(
-                        if unsaved || attempt == 0 {
+                        if unsaved || refuse_ack {
                             matches!(result, Err(MutationError::Pending))
                         } else {
                             matches!(result, Err(MutationError::Cancelled))
                         },
-                        "replacement recovery must respect its durable proof (unsaved={unsaved}, attempt={attempt}): {result:?}"
+                        "content recovery must respect its durable proof (removal={removal}, unsaved={unsaved}, attempt={attempt}): {result:?}"
                     );
                 }
                 assert_eq!(restored, expected_tree);
-                if unsaved || attempt == 0 {
+                if unsaved || refuse_ack {
                     assert!(matches!(installed, Err(MutationError::Unavailable)));
                 } else {
                     assert_eq!(
@@ -4927,7 +4988,18 @@ mod tests {
                     assert!(owner.has_unsettled_effects());
                     continue;
                 }
-                if attempt == 0 {
+                if removal && attempt == 0 {
+                    let checkpoint = publication_checkpoint(before.as_deref().unwrap(), true, true);
+                    let published = checkpoint["published"].as_array().unwrap();
+                    assert_eq!(published.len(), 1);
+                    assert_eq!(published[0]["path"], PAYLOAD);
+                    assert!(checkpoint["payloads"].as_array().unwrap().is_empty());
+                    let backup = &published[0]["backup"];
+                    assert!(backup.is_object());
+                    assert_eq!(backup["size"], ORIGINAL.len());
+                    assert_eq!(backup["sha512"], Proof::bytes(ORIGINAL).sha512);
+                }
+                if refuse_ack {
                     let before: Receipt = serde_json::from_str(before.as_deref().unwrap()).unwrap();
                     let receipt: Receipt = serde_json::from_str(after.as_deref().unwrap()).unwrap();
                     assert!(!receipt.native_settled);
