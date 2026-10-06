@@ -276,6 +276,34 @@ fn modernfix_uses_exact_supported_roots_once_without_parent_fallback() {
 }
 
 #[test]
+fn fabric_1_20_1_extended_includes_cloth_config_for_moreculling() {
+    let manifest = builtin_manifest().expect("manifest");
+    for (game_version, cloth_count) in [("1.20", 0), ("1.20.1", 1)] {
+        let plan = resolve_plan(
+            Some(&manifest),
+            ResolutionRequest {
+                game_version: game_version.to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            },
+        );
+
+        assert_eq!(plan.composition_id, "family-e-fabric-extended");
+        assert_eq!(count_mods_with_slug(&plan.mods, "moreculling"), 1);
+        assert_eq!(
+            plan.mods
+                .iter()
+                .filter(|managed_mod| managed_mod.project_id == "9s6osm5g")
+                .count(),
+            cloth_count,
+            "{game_version}"
+        );
+    }
+}
+
+#[test]
 fn builtin_manifest_binds_all_managed_artifacts_to_immutable_provider_identities() {
     let manifest = builtin_manifest().expect("manifest");
     let expected_project_ids = [
@@ -288,6 +316,7 @@ fn builtin_manifest_binds_all_managed_artifacts_to_immutable_provider_identities
         ("entityculling", "NNAgCjsB"),
         ("c2me-fabric", "VSNURh3q"),
         ("moreculling", "51shyZVL"),
+        ("cloth-config", "9s6osm5g"),
         ("krypton", "fQEb0iXm"),
         ("enhancedblockentities", "OVuFYfre"),
         ("memoryleakfix", "NRjRiSSD"),
