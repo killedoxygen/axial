@@ -1,7 +1,7 @@
 use crate::paths::{libraries_dir, versions_dir};
 use crate::rules::{Environment, Rule, evaluate_rules, is_native_library};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -176,7 +176,7 @@ pub struct Library {
     pub url: String,
     #[serde(default)]
     pub rules: Vec<Rule>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub natives: HashMap<String, String>,
     #[serde(default)]
     pub extract: Option<ExtractRule>,
@@ -194,8 +194,19 @@ pub struct Library {
 pub struct LibraryDownload {
     #[serde(default)]
     pub artifact: Option<LibraryArtifact>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_sorted_map")]
     pub classifiers: HashMap<String, LibraryArtifact>,
+}
+
+fn serialize_sorted_map<S, T>(values: &HashMap<String, T>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    T: Serialize,
+{
+    values
+        .iter()
+        .collect::<BTreeMap<_, _>>()
+        .serialize(serializer)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

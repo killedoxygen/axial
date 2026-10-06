@@ -3246,6 +3246,69 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[tokio::test]
+    async fn legacy_archive_materialization_is_reproducible_across_fresh_parses() {
+        let mut record = legacy_archive_record();
+        record.minecraft_version = "1.4.7".into();
+        record.loader_version = "6.6.2.534".into();
+        canonicalize_record_identity(&mut record);
+        let base_client: Arc<[u8]> = zip_entries(&[
+            ("net/minecraft/client/Minecraft.class", b"base"),
+            ("META-INF/MANIFEST.MF", b"manifest"),
+        ])
+        .into();
+        let archive: Arc<[u8]> =
+            zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]).into();
+        let base_json = format!(
+            r#"{{
+                "id":"1.4.7",
+                "type":"release",
+                "mainClass":"net.minecraft.client.Minecraft",
+                "downloads":{{"client":{{
+                    "url":"https://example.invalid/client.jar",
+                    "sha1":"{}","size":{}
+                }}}},
+                "libraries":[{{
+                    "name":"org.lwjgl.lwjgl:lwjgl-platform:2.9.0",
+                    "natives":{{
+                        "linux":"natives-linux",
+                        "osx":"natives-osx",
+                        "windows":"natives-windows"
+                    }},
+                    "downloads":{{"classifiers":{{
+                        "natives-linux":{{"path":"native/linux.jar","url":"https://example.invalid/linux.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}},
+                        "natives-osx":{{"path":"native/osx.jar","url":"https://example.invalid/osx.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}},
+                        "natives-windows":{{"path":"native/windows.jar","url":"https://example.invalid/windows.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}}
+                    }}}}
+                }}]
+            }}"#,
+            sha1_hex(&base_client),
+            base_client.len(),
+        );
+        let mut baseline = None;
+        for attempt in 0..32 {
+            let base: crate::launch::VersionJson = serde_json::from_str(&base_json).unwrap();
+            let (version, metadata, child) = super::derive_legacy_archive_inputs(
+                &base,
+                &record,
+                super::LegacyOverlayBaseBytes::Shared(Arc::clone(&base_client)),
+                Arc::clone(&archive),
+            )
+            .await
+            .unwrap();
+            if let Some((expected_version, expected_metadata, expected_child)) = &baseline {
+                assert_eq!(&version, expected_version, "semantic drift at {attempt}");
+                assert_eq!(&child, expected_child, "client drift at {attempt}");
+                assert!(
+                    &metadata == expected_metadata,
+                    "identical fresh inputs changed materialized JSON contract bytes at {attempt}"
+                );
+            } else {
+                baseline = Some((version, metadata, child));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn earliest_archive_reconstruction_matches_install_uses_fresh_sources_once_and_is_effect_free()
      {
         for (minecraft_version, loader_version, label) in [
