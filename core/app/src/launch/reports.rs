@@ -2005,6 +2005,68 @@ mod tests {
     }
 
     #[test]
+    fn comparison_reports_with_fractional_percentages_survive_reopen() {
+        let temporary_parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = tempfile::tempdir_in(temporary_parent).unwrap();
+        let redactor = Redactor::new(vec![]);
+        for (baseline_ms, current_ms, delta_ms) in [(101, 99, -2), (99, 101, 2), (101, 101, 0)] {
+            let path = root
+                .path()
+                .join(format!("{baseline_ms}-{current_ms}.sqlite"));
+            let store =
+                LaunchReportStore::new(Arc::new(MetadataStore::open(&path).unwrap())).unwrap();
+            let mut baseline = session_report();
+            baseline.comparison = None;
+            baseline.boot_duration_ms = Some(baseline_ms);
+            baseline.scenario.requested_memory_mb = Some(2048);
+            baseline.scenario.benchmark_profile = Some("vanilla_baseline".into());
+            baseline.scenario.benchmark_run_type = Some("coldish".into());
+            baseline.scenario.benchmark_mode = Some("release_validation".into());
+            store.record(baseline.clone(), &redactor).unwrap();
+            assert_eq!(
+                store.get(&baseline.session_id).unwrap(),
+                Some(baseline.clone())
+            );
+
+            let mut managed = baseline.clone();
+            managed.session_id = uuid::Uuid::new_v4().to_string();
+            managed.launched_at = "2026-01-01T00:00:03.000Z".into();
+            managed.recorded_at = "2026-01-01T00:00:04.000Z".into();
+            managed.boot_duration_ms = Some(current_ms);
+            managed.scenario.performance_mode = "managed".into();
+            managed.scenario.scenario_id = "managed_launch".into();
+            managed.scenario.benchmark_profile = Some("managed_default".into());
+            let result = store.record(managed.clone(), &redactor);
+            assert!(
+                result.is_ok(),
+                "baseline={baseline_ms}ms current={current_ms}ms: {result:?}"
+            );
+            let saved = store.get(&managed.session_id).unwrap().unwrap();
+            let comparison = saved.comparison.as_ref().unwrap();
+            assert_eq!(comparison.baseline_session_id, baseline.session_id);
+            assert_eq!(comparison.baseline_value_ms, baseline_ms);
+            assert_eq!(comparison.current_value_ms, current_ms);
+            assert_eq!(comparison.delta_ms, delta_ms);
+            assert_eq!(comparison.matched_sample_count, 1);
+            assert!(comparison.delta_percent.is_finite());
+            assert_eq!(
+                store.get(&baseline.session_id).unwrap(),
+                Some(baseline.clone())
+            );
+            drop(store);
+
+            let reopened =
+                LaunchReportStore::new(Arc::new(MetadataStore::open(&path).unwrap())).unwrap();
+            assert_eq!(
+                reopened.get(&managed.session_id).unwrap(),
+                Some(saved.clone())
+            );
+            reopened.record(managed, &redactor).unwrap();
+            assert_eq!(reopened.list_recent(25).unwrap(), vec![saved, baseline]);
+        }
+    }
+
+    #[test]
     fn session_report_retry_rejects_misindexed_or_noncanonical_storage() {
         for corruption in ["instance", "recorded_at", "payload"] {
             let metadata = Arc::new(MetadataStore::in_memory().unwrap());
