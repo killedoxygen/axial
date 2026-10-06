@@ -159,24 +159,28 @@ async fn logs(
     Err(error(LaunchError::InstanceNotFound))
 }
 
+#[cfg(debug_assertions)]
 async fn command(
     State(state): State<LaunchState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    if !cfg!(debug_assertions) {
-        return Err(error(LaunchError::InstanceNotFound));
-    }
     session_id(&id)?;
     let command = state
         .sessions
         .command_inspection(&id)
         .ok_or_else(|| error(LaunchError::InstanceNotFound))?;
-    Ok(Json(
-        json!({"session_id": command.session_id,"command_arg_count": command.command_arg_count,
-        "command":vec!["<redacted>"; command.command_arg_count],
-        "command_redacted":command.command_arg_count > 0,
-        "java_path_present": command.java_path_present}),
-    ))
+    Ok(Json(json!(
+        axial_app::developer::command::inspect_launch_command(
+            &command.session_id,
+            command.command_arg_count,
+            command.java_path_present,
+        )
+    )))
+}
+
+#[cfg(not(debug_assertions))]
+async fn command(_state: State<LaunchState>, _id: Path<String>) -> Result<Json<Value>, ApiError> {
+    Err(error(LaunchError::InstanceNotFound))
 }
 
 struct EventState {
