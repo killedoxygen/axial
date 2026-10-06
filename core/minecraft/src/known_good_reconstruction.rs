@@ -956,20 +956,18 @@ pub async fn rebuild_managed_version_bundle(
                 .await?
         }
         ReconstructionKind::Loader => {
-            let reconstruction = prepare_loader_managed_version_bundle_reconstruction(
-                managed_root,
-                &version_id,
-                authority.activation_contract_id(),
-            )
-            .await
-            .map_err(|error| match error {
-                KnownGoodReconstructionError::ManagedRoot => {
-                    ManagedVersionBundleRebuildError::LocalPreparation
-                }
-                KnownGoodReconstructionError::Vanilla | KnownGoodReconstructionError::Loader => {
-                    ManagedVersionBundleRebuildError::Reconstruction(error)
-                }
-            })?;
+            let reconstruction =
+                prepare_loader_managed_version_bundle_reconstruction(managed_root, authority)
+                    .await
+                    .map_err(|error| match error {
+                        KnownGoodReconstructionError::ManagedRoot => {
+                            ManagedVersionBundleRebuildError::LocalPreparation
+                        }
+                        KnownGoodReconstructionError::Vanilla
+                        | KnownGoodReconstructionError::Loader => {
+                            ManagedVersionBundleRebuildError::Reconstruction(error)
+                        }
+                    })?;
             require_loader_version_bundle_projection(reconstruction, authority)?
         }
     };
@@ -1389,16 +1387,25 @@ fn classify_version_bundle_settlement_error(
 pub async fn reconstruct_known_good(
     version_id: &str,
     expected: &ManagedInstallActivationContractId,
+    recorded: Option<crate::download::RecordedVersionMetadata>,
 ) -> Result<KnownGoodReconstructionReceipt, KnownGoodReconstructionError> {
     let kind = reconstruction_kind(version_id);
+    if recorded
+        .as_ref()
+        .is_some_and(|metadata| !metadata.matches(version_id, expected))
+    {
+        return Err(reconstruction_error_for(kind));
+    }
     let receipt = match kind {
         ReconstructionKind::Vanilla => Downloader::source_only()
             .reconstruct_version(version_id)
             .await
             .map_err(|_| KnownGoodReconstructionError::Vanilla),
-        ReconstructionKind::Loader => crate::loaders::reconstruct_build(version_id, expected)
-            .await
-            .map_err(|_| KnownGoodReconstructionError::Loader),
+        ReconstructionKind::Loader => {
+            crate::loaders::reconstruct_build(version_id, expected, recorded)
+                .await
+                .map_err(|_| KnownGoodReconstructionError::Loader)
+        }
     }?;
     if receipt.activation_contract_id().ok().as_ref() != Some(expected) {
         return Err(reconstruction_error_for(kind));
@@ -1467,16 +1474,24 @@ async fn prepare_registered_managed_version_bundle_reconstruction(
 
 async fn prepare_loader_managed_version_bundle_reconstruction(
     managed_root: ManagedLibraryOperation,
-    version_id: &str,
-    expected: &ManagedInstallActivationContractId,
+    authority: &crate::known_good::KnownGoodActivationSource,
 ) -> Result<ManagedVersionBundleReconstruction, KnownGoodReconstructionError> {
     let kind = ReconstructionKind::Loader;
+    let recorded =
+        crate::download::RecordedVersionMetadata::read_activation(managed_root.clone(), authority)
+            .await
+            .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?;
     let guarded_root = managed_root
         .managed_directory()
         .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?;
-    let context = ManagedReconstructionContext::version_bundle();
-    let reconstruction =
-        reconstruct_managed_authority(version_id, &context, kind, Some(expected)).await?;
+    let context = ManagedReconstructionContext::version_bundle().with_recorded_metadata(recorded);
+    let reconstruction = reconstruct_managed_authority(
+        authority.version_id(),
+        &context,
+        kind,
+        Some(authority.activation_contract_id()),
+    )
+    .await?;
     reconstruction
         .bind_managed_version_bundle(guarded_root)
         .map_err(|_| reconstruction_error_for(kind))
@@ -2328,7 +2343,7 @@ mod tests {
 
         for invalid in ["loader-v2-", "loader-v2-not-base64!", "loader-v2-_w=="] {
             assert!(matches!(
-                reconstruct_known_good(invalid, &expected).await,
+                reconstruct_known_good(invalid, &expected, None).await,
                 Err(KnownGoodReconstructionError::Loader)
             ));
             assert_sentinel_untouched(root.path(), &sentinel);
@@ -2336,7 +2351,7 @@ mod tests {
 
         for invalid in ["../escape", " vanilla "] {
             assert!(matches!(
-                reconstruct_known_good(invalid, &expected).await,
+                reconstruct_known_good(invalid, &expected, None).await,
                 Err(KnownGoodReconstructionError::Vanilla)
             ));
             assert_sentinel_untouched(root.path(), &sentinel);

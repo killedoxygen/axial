@@ -79,13 +79,17 @@ where
 pub(crate) async fn reconstruct_build(
     plan: &LoaderInstallPlan,
     expected: &crate::download::ManagedInstallActivationContractId,
+    recorded: Option<crate::download::RecordedVersionMetadata>,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
     match plan.record.strategy {
         LoaderInstallStrategy::FabricProfile | LoaderInstallStrategy::QuiltProfile => {
             Box::pin(common::reconstruct_from_profile_source(plan)).await
         }
         LoaderInstallStrategy::ForgeEarliestLegacy => {
-            Box::pin(common::reconstruct_from_legacy_archive(plan, expected)).await
+            Box::pin(common::reconstruct_from_legacy_archive(
+                plan, expected, recorded,
+            ))
+            .await
         }
         LoaderInstallStrategy::ForgeModern
         | LoaderInstallStrategy::ForgeLegacyInstaller

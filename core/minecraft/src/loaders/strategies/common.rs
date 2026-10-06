@@ -309,8 +309,9 @@ async fn reconstruct_profile_after_sources(
 pub(super) async fn reconstruct_from_legacy_archive(
     plan: &LoaderInstallPlan,
     expected: &ManagedInstallActivationContractId,
+    recorded: Option<crate::download::RecordedVersionMetadata>,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
-    let context = ManagedReconstructionContext::proof_only();
+    let context = ManagedReconstructionContext::proof_only().with_recorded_metadata(recorded);
     reconstruct_component_from_legacy_archive(plan, &context, Some(expected))
         .await
         .map(RetainedKnownGoodReconstruction::discard_sources)
@@ -378,6 +379,10 @@ async fn reconstruct_legacy_with_downloader_inner(
         archive_source.shared_bytes(),
     )
     .await?;
+    let version_bytes = context
+        .recorded_version_bytes(&plan.record.version_id, expected)
+        .map_err(|_| LoaderError::Verify("recorded loader metadata contract differs".into()))?
+        .map_or(version_bytes, <[u8]>::to_vec);
     let archive_bytes = archive_source.shared_bytes();
     let mut reconstructed =
         seal_reconstructed_legacy_archive_source(AuthenticatedLegacyOverlayAuthority {
@@ -3421,6 +3426,263 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[tokio::test]
+    async fn legacy_recorded_metadata_order_recovers_without_rewriting_publication() {
+        use crate::download::{
+            ManagedInstallAcknowledgementOutcome, ManagedInstallDurableOutcome,
+            classify_managed_install_publication,
+        };
+
+        let root = temp_dir("legacy-recorded-metadata-order");
+        let record = legacy_archive_record();
+        let base_client = zip_entries(&[("net/minecraft/client/Minecraft.class", b"base")]);
+        let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]);
+        let client_server = TestByteServer::start(base_client.clone());
+        let mut base_metadata: serde_json::Value = serde_json::from_slice(&vanilla_version_bytes(
+            &record.minecraft_version,
+            &client_server.url,
+            &base_client,
+        ))
+        .unwrap();
+        let classifier = serde_json::json!({
+            "url": client_server.url,
+            "sha1": sha1_hex(&base_client),
+            "size": base_client.len()
+        });
+        base_metadata["libraries"] = serde_json::json!([{
+            "name": "org.lwjgl.lwjgl:lwjgl-platform:2.9.0",
+            "rules": [{"action": "disallow"}],
+            "natives": {
+                "linux": "natives-linux",
+                "osx": "natives-osx",
+                "windows": "natives-windows"
+            },
+            "downloads": {"classifiers": {
+                "natives-linux": classifier.clone(),
+                "natives-osx": classifier.clone(),
+                "natives-windows": classifier
+            }}
+        }]);
+        let base_metadata = serde_json::to_vec(&base_metadata).unwrap();
+        let version_server = TestByteServer::start(base_metadata.clone());
+        let manifest = test_install_manifest(
+            &record.minecraft_version,
+            &version_server.url,
+            &base_metadata,
+        );
+        let archive_server = TestByteServer::start_with_sha1(archive);
+        let mut record = record;
+        record.install_source = LoaderInstallSource::LegacyArchive {
+            url: archive_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+        let library = test_library_operation(&root);
+        let downloader = test_downloader(library.operation(), manifest);
+        let base = downloader
+            .install_version(&record.minecraft_version, |_| {})
+            .await
+            .unwrap();
+        checkpoint_and_ack_version_bundle(library.operation(), &record.minecraft_version).await;
+        let archive = verified_test_source_for(
+            &archive_server.url,
+            "legacy Forge archive",
+            &record.version_id,
+        )
+        .await
+        .into_shared_bytes_for(&archive_server.url, &record.version_id)
+        .unwrap();
+        let (version, canonical_metadata, child) = super::derive_legacy_archive_inputs(
+            base.effective_version(),
+            &record,
+            super::LegacyOverlayBaseBytes::Owned(base_client),
+            archive,
+        )
+        .await
+        .unwrap();
+        let canonical_metadata = String::from_utf8(canonical_metadata).unwrap();
+        let sorted = "\"linux\": \"natives-linux\",\n        \"osx\": \"natives-osx\"";
+        let prior_order = "\"osx\": \"natives-osx\",\n        \"linux\": \"natives-linux\"";
+        assert_eq!(canonical_metadata.matches(sorted).count(), 1);
+        let recorded_metadata = canonical_metadata
+            .replacen(sorted, prior_order, 1)
+            .into_bytes();
+        assert_ne!(recorded_metadata, canonical_metadata.as_bytes());
+        assert_eq!(
+            serde_json::from_slice::<crate::launch::VersionJson>(&recorded_metadata).unwrap(),
+            version
+        );
+        let authority = test_loader_base_derivation(base)
+            .derive_verified_legacy_archive_source(&record, version, &recorded_metadata, &child)
+            .unwrap();
+        let prepared = super::prepare_local_managed_install(
+            authority,
+            recorded_metadata.clone(),
+            child,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let historical = super::publish_loader_managed_install(&library, prepared)
+            .await
+            .unwrap();
+        let expected = historical.activation_contract_id().unwrap();
+        let before = snapshot_tree(&root.join("versions"));
+        let evidence = match classify_managed_install_publication(
+            library.operation().clone(),
+            record.version_id.clone(),
+        )
+        .await
+        {
+            ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+            _ => panic!("recorded publication must retain its committed native evidence"),
+        };
+        assert_eq!(evidence.committed_activation_contract_id(), Some(&expected));
+        let recorded = evidence.read_recorded_metadata().await.unwrap();
+        let reconstructed = super::reconstruct_legacy_authority_with_downloader(
+            &plan,
+            &downloader,
+            &ManagedReconstructionContext::version_bundle().with_recorded_metadata(Some(recorded)),
+            Some(&expected),
+        )
+        .await;
+        let contract_mismatch = matches!(
+            &reconstructed,
+            Err(LoaderError::Verify(message))
+                if message == "reconstructed loader contract differs from checkpoint"
+        );
+        let retained_sources = reconstructed
+            .as_ref()
+            .is_ok_and(|receipt| receipt.retained_version_bundle_sources_match_projection());
+        let mut activation = None;
+        let activate = |source| {
+            activation = Some(source);
+            std::future::ready(Ok(()))
+        };
+        let (verified, acknowledgement) = match reconstructed {
+            Ok(receipt) => {
+                match evidence.verify_reconstruction_receipt(receipt.discard_sources()) {
+                    Ok(receipt) => (true, receipt.activate_with(activate).await.unwrap()),
+                    Err(refusal) => (
+                        false,
+                        refusal
+                            .into_parts()
+                            .0
+                            .verify_install_receipt(historical)
+                            .unwrap()
+                            .activate_with(activate)
+                            .await
+                            .unwrap(),
+                    ),
+                }
+            }
+            Err(_) => (
+                false,
+                evidence
+                    .verify_install_receipt(historical)
+                    .unwrap()
+                    .activate_with(activate)
+                    .await
+                    .unwrap(),
+            ),
+        };
+        let acknowledged = tokio::time::timeout(Duration::from_secs(60), async {
+            let mut outcome = acknowledgement.acknowledge().await;
+            while let ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) = outcome {
+                outcome = recovery.retry().await;
+            }
+            matches!(outcome, ManagedInstallAcknowledgementOutcome::Acknowledged)
+        })
+        .await
+        .unwrap();
+        let activation = activation.unwrap();
+        let registered = crate::download::RecordedVersionMetadata::read_activation(
+            library.operation().clone(),
+            &activation,
+        )
+        .await
+        .unwrap()
+        .expect("acknowledged metadata matches its recorded inventory");
+        let registered = super::reconstruct_legacy_authority_with_downloader(
+            &plan,
+            &downloader,
+            &ManagedReconstructionContext::version_bundle()
+                .with_recorded_metadata(Some(registered)),
+            Some(&expected),
+        )
+        .await
+        .unwrap()
+        .bind_managed_version_bundle(library.managed_directory().unwrap())
+        .unwrap();
+        let registered_exact = registered.matches_known_good_inventory(activation.inventory())
+            && registered.activation_contract_id().unwrap() == expected;
+        let (registered_root, registered_projection, registered_sources) =
+            registered.into_effect_parts();
+        let registered_bytes = registered_sources.into_sources().into_iter().any(|source| {
+            source.kind() == crate::known_good::KnownGoodArtifactKind::VersionMetadata
+                && source.logical_identity() == record.version_id
+                && source.bytes() == recorded_metadata
+        });
+        drop((registered_root, registered_projection));
+        let wrong_contract =
+            crate::download::ManagedInstallActivationContractId::from_digest([0; 32]);
+        assert_ne!(wrong_contract, expected);
+        let wrong = crate::download::RecordedVersionMetadata::read_registered(
+            library.operation().clone(),
+            &record.version_id,
+            &wrong_contract,
+            &sha1_hex(&recorded_metadata),
+            recorded_metadata.len() as u64,
+        )
+        .await
+        .unwrap()
+        .expect("registered bytes alone do not authorize a contract");
+        let wrong = super::reconstruct_legacy_authority_with_downloader(
+            &plan,
+            &downloader,
+            &ManagedReconstructionContext::version_bundle().with_recorded_metadata(Some(wrong)),
+            Some(&wrong_contract),
+        )
+        .await;
+        let wrong_contract_refused = matches!(wrong, Err(LoaderError::Verify(message))
+            if message == "reconstructed loader contract differs from checkpoint");
+        let unchanged = snapshot_tree(&root.join("versions")) == before;
+        let cleared = matches!(
+            classify_managed_install_publication(library.operation().clone(), record.version_id)
+                .await,
+            ManagedInstallDurableOutcome::NoEffect
+        );
+        for server in [client_server, version_server, archive_server] {
+            server.stop();
+        }
+        drop(downloader);
+        drop(library);
+        fs::remove_dir_all(root).unwrap();
+
+        assert!(
+            acknowledged && cleared && unchanged,
+            "fixture settlement or preservation failed"
+        );
+        assert!(
+            verified || contract_mismatch,
+            "reconstruction failed before the exact contract check"
+        );
+        assert!(
+            verified,
+            "unchanged recorded JSON must reconstruct its exact committed contract"
+        );
+        assert!(retained_sources);
+        assert!(
+            registered_exact && registered_bytes,
+            "registered reconstruction lost the recorded raw source"
+        );
+        assert!(
+            wrong_contract_refused,
+            "recorded bytes waived the full activation contract"
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_fml_reconstruction_preserves_recorded_contract_before_enhancement() {
         use crate::download::{
             ManagedInstallAcknowledgementOutcome, ManagedInstallDurableOutcome,
@@ -3984,14 +4246,18 @@ printf '%s' 'processor-terminal' > "$last"
         );
         let expected = crate::download::ManagedInstallActivationContractId::from_digest([0; 32]);
         assert!(
-            std::mem::size_of_val(&super::super::reconstruct_build(&profile_plan, &expected))
-                < 4096,
+            std::mem::size_of_val(&super::super::reconstruct_build(
+                &profile_plan,
+                &expected,
+                None
+            )) < 4096,
             "loader reconstruction dispatcher future should stay small"
         );
         assert!(
             std::mem::size_of_val(&crate::loaders::reconstruct_build(
                 &profile_plan.record.version_id,
                 &expected,
+                None,
             )) < 4096,
             "public loader reconstruction future should stay small"
         );

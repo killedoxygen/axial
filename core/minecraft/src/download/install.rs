@@ -95,8 +95,8 @@ use crate::version_bundle_publication::{
     DurableVersionBundleOutcome, VersionBundlePublicationPurpose, VersionBundleTransactionError,
     VersionBundleTransactionRecovery, VersionBundleTransactionSettledOutcome,
     acknowledge_durable_version_bundle, classify_durable_version_bundle_candidates,
-    durable_version_bundle_root_binding, publish_version_bundle, revalidate_settled_version_bundle,
-    settle_version_bundle_publication,
+    durable_version_bundle_root_binding, publish_version_bundle, read_committed_version_metadata,
+    revalidate_settled_version_bundle, settle_version_bundle_publication,
 };
 use futures_util::{FutureExt, StreamExt};
 use sha1::{Digest as _, Sha1};
@@ -252,6 +252,88 @@ pub(crate) struct RetainedVersionBundleReconstructionSources {
     version_json: Arc<[u8]>,
     client_jar: Arc<[u8]>,
     log_config: Option<Arc<[u8]>>,
+}
+
+/// Exact recorded bytes are reconstruction inputs, never publication authority.
+#[derive(Clone)]
+pub struct RecordedVersionMetadata {
+    version_id: String,
+    expected: super::model::ManagedInstallActivationContractId,
+    bytes: Arc<[u8]>,
+}
+
+impl RecordedVersionMetadata {
+    pub async fn read_registered(
+        root: ManagedLibraryOperation,
+        version_id: &str,
+        expected: &super::model::ManagedInstallActivationContractId,
+        sha1: &str,
+        size: u64,
+    ) -> Result<Option<Self>, DownloadError> {
+        validate_install_version_id(version_id)?;
+        if size == 0
+            || size > MAX_KNOWN_GOOD_VERSION_JSON_BYTES as u64
+            || !crate::managed_publication::valid_publication_sha1(sha1)
+        {
+            return Err(version_bundle_install_error(
+                "invalid recorded metadata descriptor",
+            ));
+        }
+        let contract = VersionBundleMemberContract {
+            kind: KnownGoodArtifactKind::VersionMetadata,
+            root_name: "versions",
+            relative_path: format!("{version_id}/{version_id}.json"),
+            logical_identity: version_id.to_owned(),
+            digest: sha1.to_owned(),
+            size,
+        };
+        let source = run_publication_blocking(move || {
+            let managed_root = root.managed_directory().map_err(|_| {
+                version_bundle_install_error("recorded metadata root is unavailable")
+            })?;
+            let source = read_exact_local_version_bundle_member(&managed_root, &contract)?;
+            managed_root
+                .revalidate()
+                .map_err(|_| version_bundle_install_error("recorded metadata root changed"))?;
+            Ok::<_, DownloadError>(source)
+        })
+        .await
+        .map_err(|_| version_bundle_install_error("recorded metadata read did not settle"))??;
+        Ok(source.map(|source| Self {
+            version_id: version_id.to_owned(),
+            expected: expected.clone(),
+            bytes: source.bytes,
+        }))
+    }
+
+    pub(crate) async fn read_activation(
+        root: ManagedLibraryOperation,
+        authority: &KnownGoodActivationSource,
+    ) -> Result<Option<Self>, DownloadError> {
+        let projection = authority
+            .inventory()
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .map_err(|_| {
+                version_bundle_install_error("invalid recorded VersionBundle inventory")
+            })?;
+        let contract = version_bundle_contract(authority.version_id(), &projection)?;
+        Self::read_registered(
+            root,
+            authority.version_id(),
+            authority.activation_contract_id(),
+            &contract.version_json.digest,
+            contract.version_json.size,
+        )
+        .await
+    }
+
+    pub(crate) fn matches(
+        &self,
+        version_id: &str,
+        expected: &super::model::ManagedInstallActivationContractId,
+    ) -> bool {
+        self.version_id == version_id && self.expected == *expected
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -671,6 +753,7 @@ pub(crate) struct ReconstructedVanillaClientAuthority {
 #[derive(Clone)]
 pub(crate) struct ManagedReconstructionContext {
     mode: ManagedReconstructionMode,
+    recorded_metadata: Option<RecordedVersionMetadata>,
     workers: ManagedBlockingWorkers,
     blocking_operation: Arc<tokio::sync::Mutex<()>>,
 }
@@ -714,6 +797,7 @@ impl ManagedReconstructionContext {
         let workers = ManagedBlockingWorkers::new();
         Self {
             mode: ManagedReconstructionMode::ProofOnly,
+            recorded_metadata: None,
             workers,
             blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -735,6 +819,7 @@ impl ManagedReconstructionContext {
                         AuthenticatedLibraryCacheProofSet::default(),
                     )),
                 }),
+                recorded_metadata: None,
                 workers: workers.clone(),
                 blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
             })
@@ -759,6 +844,7 @@ impl ManagedReconstructionContext {
                     .map_err(asset_cache_error)?,
                     authority: Arc::new(std::sync::Mutex::new(None)),
                 }),
+                recorded_metadata: None,
                 workers: workers.clone(),
                 blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
             })
@@ -771,6 +857,7 @@ impl ManagedReconstructionContext {
         let workers = ManagedBlockingWorkers::new();
         Self {
             mode: ManagedReconstructionMode::VersionBundle,
+            recorded_metadata: None,
             workers,
             blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -778,6 +865,32 @@ impl ManagedReconstructionContext {
 
     fn retains_version_bundle_sources(&self) -> bool {
         matches!(self.mode, ManagedReconstructionMode::VersionBundle)
+    }
+
+    pub(crate) fn with_recorded_metadata(
+        mut self,
+        recorded: Option<RecordedVersionMetadata>,
+    ) -> Self {
+        self.recorded_metadata = recorded;
+        self
+    }
+
+    pub(crate) fn recorded_version_bytes(
+        &self,
+        version_id: &str,
+        expected: Option<&super::model::ManagedInstallActivationContractId>,
+    ) -> Result<Option<&[u8]>, DownloadError> {
+        self.recorded_metadata
+            .as_ref()
+            .map(|metadata| {
+                if !expected.is_some_and(|expected| metadata.matches(version_id, expected)) {
+                    return Err(version_bundle_install_error(
+                        "recorded metadata contract differs",
+                    ));
+                }
+                Ok(metadata.bytes.as_ref())
+            })
+            .transpose()
     }
 
     async fn blocking_attempt(&self) -> ManagedReconstructionAttempt {
@@ -4228,6 +4341,23 @@ fn managed_install_rollback_effect(
 }
 
 impl ManagedInstallCommittedEvidence {
+    pub async fn read_recorded_metadata(&self) -> Result<RecordedVersionMetadata, DownloadError> {
+        let expected = self
+            .committed_activation_contract_id()
+            .cloned()
+            .ok_or_else(|| {
+                version_bundle_install_error("committed metadata contract is unavailable")
+            })?;
+        let bytes = read_committed_version_metadata(&self.state.lease, &self.state.evidence)
+            .await
+            .map_err(|_| version_bundle_install_error("committed metadata proof is unavailable"))?;
+        Ok(RecordedVersionMetadata {
+            version_id: self.version_id().to_owned(),
+            expected,
+            bytes: bytes.into(),
+        })
+    }
+
     pub fn version_id(&self) -> &str {
         self.state.evidence.version_id()
     }
@@ -5620,6 +5750,7 @@ mod tests {
                     AuthenticatedLibraryCacheProofSet::default(),
                 )),
             }),
+            recorded_metadata: None,
             workers: workers.clone(),
             blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
         };

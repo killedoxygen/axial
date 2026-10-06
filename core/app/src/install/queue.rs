@@ -1064,8 +1064,8 @@ impl InstallQueue {
         let queue = self.clone();
         self.recover_interrupted_with(
             id,
-            |version, expected| async move {
-                axial_minecraft::reconstruct_known_good(&version, &expected)
+            |version, expected, recorded| async move {
+                axial_minecraft::reconstruct_known_good(&version, &expected, recorded)
                     .await
                     .map_err(|_| InstallError::SettlementRequired)
             },
@@ -1086,8 +1086,13 @@ impl InstallQueue {
         continue_loader: Continue,
     ) -> Result<(), InstallError>
     where
-        Reconstruct:
-            FnOnce(String, ManagedInstallActivationContractId) -> Reconstruction + Send + 'static,
+        Reconstruct: FnOnce(
+                String,
+                ManagedInstallActivationContractId,
+                Option<axial_minecraft::RecordedVersionMetadata>,
+            ) -> Reconstruction
+            + Send
+            + 'static,
         Reconstruction: std::future::Future<
                 Output = Result<axial_minecraft::KnownGoodReconstructionReceipt, InstallError>,
             > + Send,
@@ -1315,7 +1320,11 @@ impl InstallQueue {
         reconstruct: Reconstruct,
     ) -> Result<RecoveryAction, WorkFailure>
     where
-        Reconstruct: FnOnce(String, ManagedInstallActivationContractId) -> Reconstruction,
+        Reconstruct: FnOnce(
+            String,
+            ManagedInstallActivationContractId,
+            Option<axial_minecraft::RecordedVersionMetadata>,
+        ) -> Reconstruction,
         Reconstruction: std::future::Future<
                 Output = Result<axial_minecraft::KnownGoodReconstructionReceipt, InstallError>,
             >,
@@ -1548,17 +1557,82 @@ impl InstallQueue {
                 None => RetainedInstall::Retry,
             }));
         };
-        let receipt = match reconstruct(checkpoint.version_id.clone(), contract.clone()).await {
-            Ok(receipt) => receipt,
-            Err(_) => {
-                return Err(WorkFailure::Unsettled(match evidence {
-                    Some(evidence) => {
-                        RetainedInstall::Outcome(ManagedInstallDurableOutcome::Committed(evidence))
+        let recorded = if let Some(committed) = &evidence {
+            match committed.read_recorded_metadata().await {
+                Ok(recorded) => Some(recorded),
+                Err(_) => {
+                    return Err(WorkFailure::Unsettled(match evidence {
+                        Some(evidence) => RetainedInstall::Outcome(
+                            ManagedInstallDurableOutcome::Committed(evidence),
+                        ),
+                        None => RetainedInstall::Retry,
+                    }));
+                }
+            }
+        } else {
+            let metadata = (|| -> Result<Option<super::artifacts::ActivatedFile>, InstallError> {
+                let encoded: Option<Option<String>> = self.inner.storage.read(|db| {
+                    db.query_row(
+                        "SELECT CASE WHEN length(CAST(inventory_json AS BLOB))<=134217728 THEN inventory_json END FROM installed_versions WHERE library_id=?1 AND version_id=?2 AND contract_id=?3 AND install_id=?4 AND state IN ('activating','ready')",
+                        params![pin.library_id().to_string(), checkpoint.version_id, contract.as_str(), id],
+                        |row| row.get(0),
+                    ).optional().map_err(InstallError::from)
+                })?;
+                let Some(encoded) = encoded else {
+                    return Ok(None);
+                };
+                let registered: ActivatedVersion =
+                    serde_json::from_str(&encoded.ok_or(InstallError::SettlementRequired)?)
+                        .map_err(|_| InstallError::SettlementRequired)?;
+                if registered.version_id != checkpoint.version_id
+                    || registered.contract_id != contract.as_str()
+                    || registered.files.is_empty()
+                    || registered.files.len() > 1_000_000
+                {
+                    return Err(InstallError::SettlementRequired);
+                }
+                let path = format!("versions/{0}/{0}.json", checkpoint.version_id);
+                let mut matching = registered
+                    .files
+                    .into_iter()
+                    .filter(|file| file.path == path);
+                let metadata = matching.next().ok_or(InstallError::SettlementRequired)?;
+                if matching.next().is_some() {
+                    return Err(InstallError::SettlementRequired);
+                }
+                Ok(Some(metadata))
+            })();
+            match metadata {
+                Ok(Some(metadata)) => {
+                    match axial_minecraft::RecordedVersionMetadata::read_registered(
+                        operation.clone(),
+                        &checkpoint.version_id,
+                        &contract,
+                        &metadata.sha1,
+                        metadata.size,
+                    )
+                    .await
+                    {
+                        Ok(recorded) => recorded,
+                        Err(_) => return Err(WorkFailure::Unsettled(RetainedInstall::Retry)),
                     }
-                    None => RetainedInstall::Retry,
-                }));
+                }
+                Ok(None) => None,
+                Err(_) => return Err(WorkFailure::Unsettled(RetainedInstall::Retry)),
             }
         };
+        let receipt =
+            match reconstruct(checkpoint.version_id.clone(), contract.clone(), recorded).await {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    return Err(WorkFailure::Unsettled(match evidence {
+                        Some(evidence) => RetainedInstall::Outcome(
+                            ManagedInstallDurableOutcome::Committed(evidence),
+                        ),
+                        None => RetainedInstall::Retry,
+                    }));
+                }
+            };
         let storage = self.inner.storage.clone();
         let install_id = id.to_owned();
         let activation_pin = pin.clone();
@@ -4112,7 +4186,7 @@ pub(crate) mod tests {
             queue
                 .recover_interrupted_with(
                     &old,
-                    |_, _| async { panic!("stale target must not reconstruct") },
+                    |_, _, _| async { panic!("stale target must not reconstruct") },
                     |_, _, _| async { panic!("stale target must not continue") }
                 )
                 .await
@@ -4537,6 +4611,7 @@ pub(crate) mod tests {
     fn reconstruct_fixture(
         version: String,
         _expected: ManagedInstallActivationContractId,
+        _recorded: Option<axial_minecraft::RecordedVersionMetadata>,
     ) -> impl std::future::Future<
         Output = Result<axial_minecraft::KnownGoodReconstructionReceipt, InstallError>,
     > {
@@ -4725,6 +4800,264 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn acknowledged_activation_supplies_recorded_metadata_before_ready() {
+        let (_root, storage, library, exclusions, owner, queue) = fixture();
+        let pin = library.admit().unwrap();
+        let operation = pin.managed_library().unwrap();
+        let writer = exclusions
+            .try_acquire(
+                std::iter::empty::<String>(),
+                [library_artifact(&pin.library_id().to_string())],
+            )
+            .unwrap();
+        let version = "recorded-before-ready";
+        let id = queue
+            .enqueue(InstallQueueRequest::Vanilla {
+                version_id: version.into(),
+            })
+            .await
+            .unwrap()
+            .items[0]
+            .queue_id
+            .clone();
+        interrupt_intent(&storage, &id);
+        publish_before_crash(
+            &queue,
+            &pin,
+            &id,
+            version,
+            CheckpointKind::Final,
+            CrashPoint::BeforeReady,
+        )
+        .await;
+        let original: (String, String, String) = storage
+            .read(|db| {
+                db.query_row(
+                    "SELECT q.checkpoint_json,v.inventory_json,v.state FROM install_queue q JOIN installed_versions v ON v.install_id=q.id WHERE q.id=?1",
+                    [&id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(InstallError::from)
+            })
+            .unwrap();
+        queue.shutdown_queued().unwrap();
+        drop(writer);
+        let restarted = InstallQueue::new(
+            storage.clone(),
+            library,
+            exclusions.clone(),
+            owner.clone(),
+            queue.runtime_cache().clone(),
+        )
+        .unwrap();
+        let (supplied, mut received) = tokio::sync::oneshot::channel();
+        let recovered = restarted
+            .recover_interrupted_with(
+                &id,
+                move |version, expected, recorded| {
+                    let _ = supplied.send(recorded.is_some());
+                    reconstruct_fixture(version, expected, recorded)
+                },
+                |_, _, _| async { panic!("vanilla recovery must not continue a loader") },
+            )
+            .await;
+        let restored: (String, String, String) = storage
+            .read(|db| {
+                db.query_row(
+                    "SELECT q.checkpoint_json,v.inventory_json,v.state FROM install_queue q JOIN installed_versions v ON v.install_id=q.id WHERE q.id=?1",
+                    [&id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(InstallError::from)
+            })
+            .unwrap();
+        let ready = restarted.ready_version(&pin, version).await.is_ok();
+        restarted.close_admission();
+        owner
+            .shutdown(std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        restarted.join_observers().await.unwrap();
+        queue.join_observers().await.unwrap();
+        restarted.shutdown_queued().unwrap();
+
+        assert_eq!(original.2, "activating");
+        assert_eq!(recovered, Ok(()));
+        assert!(
+            received.try_recv().unwrap(),
+            "ACK-before-Ready must authenticate stored metadata"
+        );
+        assert_eq!(restored, (original.0, original.1, "ready".into()));
+        assert!(ready && !restarted.has_unsettled_effects());
+        assert_eq!(
+            restarted.status(&id).unwrap().outcome,
+            Some(InstallOutcome::Succeeded)
+        );
+        assert!(axial_minecraft::VersionBundleReadGuard::acquire(&operation).is_ok());
+        assert!(
+            exclusions
+                .try_acquire(
+                    std::iter::empty::<String>(),
+                    [library_artifact(&pin.library_id().to_string())],
+                )
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_committed_metadata_refuses_reconstruction_without_releasing_evidence() {
+        let (root, storage, library, exclusions, owner, queue) = fixture();
+        let pin = library.admit().unwrap();
+        let operation = pin.managed_library().unwrap();
+        let writer = exclusions
+            .try_acquire(
+                std::iter::empty::<String>(),
+                [library_artifact(&pin.library_id().to_string())],
+            )
+            .unwrap();
+        let version = "missing-recorded-metadata";
+        let id = queue
+            .enqueue(InstallQueueRequest::Vanilla {
+                version_id: version.into(),
+            })
+            .await
+            .unwrap()
+            .items[0]
+            .queue_id
+            .clone();
+        interrupt_intent(&storage, &id);
+        publish_before_crash(
+            &queue,
+            &pin,
+            &id,
+            version,
+            CheckpointKind::Final,
+            CrashPoint::BeforeAcknowledgement,
+        )
+        .await;
+        let original: (String, String) = storage.read(|db| {
+            db.query_row(
+                "SELECT q.checkpoint_json,v.inventory_json FROM install_queue q JOIN installed_versions v ON v.install_id=q.id WHERE q.id=?1",
+                [&id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).map_err(InstallError::from)
+        }).unwrap();
+        let checkpoint: PublicationCheckpoint = serde_json::from_str(&original.0).unwrap();
+        let metadata = root
+            .path()
+            .join(format!("versions/{version}/{version}.json"));
+        let aside = root.path().join("preserved-version.json");
+        let original_bytes = std::fs::read(&metadata).unwrap();
+        queue.shutdown_queued().unwrap();
+        drop(writer);
+        let restarted = InstallQueue::new(
+            storage.clone(),
+            library,
+            exclusions.clone(),
+            owner.clone(),
+            queue.runtime_cache().clone(),
+        )
+        .unwrap();
+        let (supplied, mut received) = tokio::sync::oneshot::channel();
+        let classified = restarted
+            .recover_interrupted_with(
+                &id,
+                move |_, _, recorded| async move {
+                    let _ = supplied.send(recorded.is_some());
+                    Err(InstallError::NotReady)
+                },
+                |_, _, _| async { panic!("vanilla recovery must not continue a loader") },
+            )
+            .await;
+        let retained = || {
+            let state = restarted.inner.state.lock().unwrap();
+            let entry = &state.entries[&id];
+            let evidence = match &entry.retained {
+                Some(RetainedInstall::Outcome(ManagedInstallDurableOutcome::Committed(value))) => {
+                    Some(value.id().as_str().to_owned())
+                }
+                _ => None,
+            };
+            (evidence, entry.recovery_lease.is_some())
+        };
+        let classified_authority = retained();
+        std::fs::rename(&metadata, &aside).unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let callback = called.clone();
+        let refused = restarted
+            .recover_interrupted_with(
+                &id,
+                move |_, _, _| async move {
+                    callback.store(true, Ordering::SeqCst);
+                    Err(InstallError::NotReady)
+                },
+                |_, _, _| async { panic!("vanilla recovery must not continue a loader") },
+            )
+            .await;
+        let refused_authority = retained();
+        let retained_guard = axial_minecraft::VersionBundleReadGuard::acquire(&operation)
+            .err()
+            .map(|error| error.kind());
+        let excluded = exclusions
+            .try_acquire(
+                std::iter::empty::<String>(),
+                [library_artifact(&pin.library_id().to_string())],
+            )
+            .is_err();
+        let pending = restarted.status(&id).unwrap().outcome;
+        let unsettled = restarted.has_unsettled_effects();
+        std::fs::rename(&aside, &metadata).unwrap();
+        let recovered = recover_fixture(&restarted).await;
+        let restored: (String, String) = storage.read(|db| {
+            db.query_row(
+                "SELECT q.checkpoint_json,v.inventory_json FROM install_queue q JOIN installed_versions v ON v.install_id=q.id WHERE q.id=?1",
+                [&id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).map_err(InstallError::from)
+        }).unwrap();
+        let ready = restarted.ready_version(&pin, version).await.is_ok();
+        restarted.close_admission();
+        owner
+            .shutdown(std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        restarted.join_observers().await.unwrap();
+        queue.join_observers().await.unwrap();
+        restarted.shutdown_queued().unwrap();
+
+        assert_eq!(classified, Err(InstallError::SettlementRequired));
+        assert!(
+            received.try_recv().unwrap(),
+            "real committed metadata must reach reconstruction"
+        );
+        assert_eq!(classified_authority, (Some(checkpoint.evidence_id), true));
+        assert_eq!(refused_authority, classified_authority);
+        assert_eq!(refused, Err(InstallError::SettlementRequired));
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "missing exact metadata must refuse before reconstruction"
+        );
+        assert_eq!(retained_guard, Some(std::io::ErrorKind::WouldBlock));
+        assert!(excluded && unsettled);
+        assert_eq!(pending, None);
+        assert_eq!(recovered, Ok(()));
+        assert_eq!(restored, original);
+        assert_eq!(std::fs::read(&metadata).unwrap(), original_bytes);
+        assert!(ready && !restarted.has_unsettled_effects());
+        assert_eq!(
+            restarted.status(&id).unwrap().outcome,
+            Some(InstallOutcome::Succeeded)
+        );
+        assert!(axial_minecraft::VersionBundleReadGuard::acquire(&operation).is_ok());
+        assert!(
+            exclusions
+                .try_acquire(
+                    std::iter::empty::<String>(),
+                    [library_artifact(&pin.library_id().to_string())],
+                )
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn mismatched_reconstruction_stays_fenced_and_can_retry_the_retained_publication() {
         let (_root, storage, library, exclusions, owner, queue) = fixture();
         let pin = library.admit().unwrap();
@@ -4768,7 +5101,9 @@ pub(crate) mod tests {
         let result = restarted
             .recover_interrupted_with(
                 &id,
-                |_, expected| reconstruct_fixture("other-version".into(), expected),
+                |_, expected, recorded| {
+                    reconstruct_fixture("other-version".into(), expected, recorded)
+                },
                 |_, _, _| async { panic!("no loader") },
             )
             .await;
@@ -4860,7 +5195,7 @@ pub(crate) mod tests {
             let classified = restarted
                 .recover_interrupted_with(
                     &id,
-                    |_, _| async { Err(InstallError::NotReady) },
+                    |_, _, _| async { Err(InstallError::NotReady) },
                     |_, _, _| async { panic!("vanilla recovery must not continue a loader") },
                 )
                 .await;
@@ -4877,7 +5212,7 @@ pub(crate) mod tests {
             let refused = restarted
                 .recover_interrupted_with(
                     &id,
-                    |_, _| async { panic!("invalid recorded contract must not reconstruct") },
+                    |_, _, _| async { panic!("invalid recorded contract must not reconstruct") },
                     |_, _, _| async { panic!("invalid recorded contract must not continue") },
                 )
                 .await;
@@ -5092,13 +5427,13 @@ pub(crate) mod tests {
                 recovering
                     .recover_interrupted_with(
                         &recovery_id,
-                        move |version, expected| async move {
+                        move |version, expected, recorded| async move {
                             let _ = entered.send(());
                             released.await.unwrap();
                             if reconstruction_fails {
                                 Err(InstallError::NotReady)
                             } else {
-                                reconstruct_fixture(version, expected).await
+                                reconstruct_fixture(version, expected, recorded).await
                             }
                         },
                         |_, _, _| async { panic!("no loader") },

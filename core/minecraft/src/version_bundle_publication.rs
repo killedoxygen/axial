@@ -5,8 +5,8 @@ use crate::download::{
 };
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRelativePath, KnownGoodRoot,
-    MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, ManagedComponentProjection,
-    ManagedKnownGoodComponent,
+    MAX_KNOWN_GOOD_VERSION_JSON_BYTES, MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES,
+    ManagedComponentProjection, ManagedKnownGoodComponent,
 };
 use crate::loaders::LoaderError;
 #[cfg(test)]
@@ -3701,6 +3701,85 @@ pub(crate) async fn revalidate_settled_version_bundle(
     matches!(exact, Ok(Ok(true))) && lease.revalidate().is_ok()
 }
 
+pub(crate) async fn read_committed_version_metadata(
+    lease: &ManagedRootPublicationLease,
+    evidence: &DurableVersionBundleEvidence,
+) -> Result<Vec<u8>, VersionBundleTransactionError> {
+    lease
+        .revalidate()
+        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+    let retained = lease.retain_recovery();
+    let evidence = evidence.clone();
+    let bytes = run_publication_blocking(move || {
+        let lease = retained.restore();
+        lease
+            .revalidate()
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        let lane = lease
+            .publication_directory()
+            .open_child(LANE_NAME)
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        let (settlement, marker) =
+            read_settlement(&lane)?.ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
+        validate_settlement(&settlement)?;
+        let binding = durable_version_bundle_root_binding(
+            lease.root(),
+            &settlement.intent.transaction_nonce,
+            &settlement.generation_nonce,
+        )
+        .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
+        if settlement != evidence.settlement
+            || !evidence.is_committed()
+            || marker.identity() != evidence.settlement_identity
+            || binding != evidence.root_binding
+            || settlement_fingerprint(&binding, &settlement)? != evidence.fingerprint
+            || !lane
+                .file_guard_matches(SETTLEMENT_NAME, &marker)
+                .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
+        {
+            return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+        }
+        let fingerprint = validate_persisted_intent(&settlement.intent)?
+            .into_iter()
+            .find(|entry| entry.kind == KnownGoodArtifactKind::VersionMetadata)
+            .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
+        if fingerprint.size > MAX_KNOWN_GOOD_VERSION_JSON_BYTES as u64 {
+            return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+        }
+        let (parent, name) = open_canonical_parent_loader(lease.root(), &fingerprint)
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
+            .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
+        let file = parent
+            .inspect_regular_file(&name)
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
+            .ok_or(VersionBundleTransactionError::RecoveryAmbiguous)?;
+        let bytes = parent
+            .read_guarded_file_bounded(&name, &file, fingerprint.size)
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        if bytes.len() as u64 != fingerprint.size
+            || format!("{:x}", sha1::Sha1::digest(&bytes)) != fingerprint.digest
+            || !parent
+                .file_guard_matches(&name, &file)
+                .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
+            || !lane
+                .file_guard_matches(SETTLEMENT_NAME, &marker)
+                .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?
+        {
+            return Err(VersionBundleTransactionError::RecoveryAmbiguous);
+        }
+        lease
+            .revalidate()
+            .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)??;
+    lease
+        .revalidate()
+        .map_err(|_| VersionBundleTransactionError::RecoveryAmbiguous)?;
+    Ok(bytes)
+}
+
 fn settle_context(
     context: &mut TransactionContext,
     expectation: &mut SettlementExpectation,
@@ -4789,6 +4868,123 @@ mod settlement_tests {
             acknowledge_durable_version_bundle(lease, evidence).await,
             DurableVersionBundleAcknowledgementOutcome::Acknowledged(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn recorded_metadata_refuses_drift_without_releasing_evidence() {
+        const VERSION: &str = "recorded-metadata-refusal";
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let reconstruction =
+            crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
+                root, VERSION,
+            )
+            .unwrap();
+        let (root, projection, source) = reconstruction.into_effect_parts();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let contract = projection.activation_contract_id().unwrap();
+        let publication = publish_version_bundle(
+            lease,
+            source,
+            contract.clone(),
+            VersionBundlePublicationPurpose::GuardianRebuild,
+            projection.component_projection().unwrap(),
+        )
+        .await;
+        let (lease, evidence) = match settle_version_bundle_publication(publication)
+            .await
+            .unwrap()
+        {
+            VersionBundleTransactionSettledOutcome::Committed { lease, evidence } => {
+                (lease, evidence)
+            }
+            _ => panic!("fixture must commit its real publication"),
+        };
+        let read = || {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_committed_version_metadata(&lease, &evidence),
+            )
+        };
+        let original = read().await.unwrap().unwrap();
+        let identity = evidence.evidence_id();
+        let parent = lease
+            .root()
+            .open_child("versions")
+            .unwrap()
+            .open_child(VERSION)
+            .unwrap();
+        let name = format!("{VERSION}.json");
+        let mut file = parent.inspect_regular_file(&name).unwrap().unwrap();
+        parent
+            .rename_guarded_file_no_replace(&name, &mut file, lease.root(), "held-metadata")
+            .unwrap();
+        let missing_member = read().await.is_ok_and(|result| result.is_err());
+        let mut foreign = original.clone();
+        *foreign.last_mut().unwrap() ^= 1;
+        let replacement = parent.write_new_exact_guarded(&name, &foreign).unwrap();
+        let changed_member = read().await.is_ok_and(|result| result.is_err());
+        let foreign_preserved = parent
+            .read_guarded_file_bounded(&name, &replacement, foreign.len() as u64)
+            .unwrap()
+            == foreign;
+        parent.remove_guarded_file(&name, &replacement).unwrap();
+        lease
+            .root()
+            .rename_guarded_file_no_replace("held-metadata", &mut file, &parent, &name)
+            .unwrap();
+
+        let lane = lease.publication_directory().open_child(LANE_NAME).unwrap();
+        let mut marker = lane.inspect_regular_file(SETTLEMENT_NAME).unwrap().unwrap();
+        let marker_bytes = lane
+            .read_guarded_file_bounded(SETTLEMENT_NAME, &marker, MAX_MARKER_BYTES as u64)
+            .unwrap();
+        lane.rename_guarded_file_no_replace(
+            SETTLEMENT_NAME,
+            &mut marker,
+            lease.root(),
+            "held-settlement",
+        )
+        .unwrap();
+        let missing_marker = read().await.is_ok_and(|result| result.is_err());
+        let replacement = lane
+            .write_new_exact_guarded(SETTLEMENT_NAME, &marker_bytes)
+            .unwrap();
+        let replaced_marker = read().await.is_ok_and(|result| result.is_err());
+        let marker_preserved = lane
+            .read_guarded_file_bounded(SETTLEMENT_NAME, &replacement, MAX_MARKER_BYTES as u64)
+            .unwrap()
+            == marker_bytes;
+        let lease_retained = ManagedRootPublicationLease::try_acquire(lease.root().clone())
+            .await
+            .unwrap()
+            .is_none();
+        lane.remove_guarded_file(SETTLEMENT_NAME, &replacement)
+            .unwrap();
+        lease
+            .root()
+            .rename_guarded_file_no_replace("held-settlement", &mut marker, &lane, SETTLEMENT_NAME)
+            .unwrap();
+        let restored = read().await.unwrap().unwrap() == original;
+        let same_evidence = evidence.evidence_id() == identity
+            && evidence.committed_activation_contract_id() == Some(&contract);
+        let acknowledged = matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                acknowledge_durable_version_bundle(lease, evidence)
+            )
+            .await
+            .unwrap(),
+            DurableVersionBundleAcknowledgementOutcome::Acknowledged(_)
+        );
+        let marker_cleared = read_settlement(&lane).unwrap().is_none();
+        assert!(
+            acknowledged && marker_cleared && restored,
+            "fixture did not settle its original publication"
+        );
+        assert!(missing_member && changed_member && foreign_preserved);
+        assert!(missing_marker && replaced_marker && marker_preserved);
+        assert!(lease_retained && same_evidence);
     }
 
     #[tokio::test]

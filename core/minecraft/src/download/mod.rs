@@ -33,7 +33,7 @@ pub(crate) use install::{
     prepare_local_managed_install, publish_prepared_managed_install,
 };
 pub use install::{
-    Downloader, classify_managed_install_publication,
+    Downloader, RecordedVersionMetadata, classify_managed_install_publication,
     classify_managed_install_publication_candidates, verify_managed_install_loader_base_checkpoint,
     verify_managed_install_publication_evidence_root,
     verify_managed_install_reconstruction_checkpoint, verify_registered_known_good_bootstrap,

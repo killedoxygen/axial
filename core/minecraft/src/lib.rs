@@ -72,7 +72,7 @@ pub use download::{
     ManagedInstallPostActivationAcknowledgement, ManagedInstallPublicationCandidates,
     ManagedInstallPublicationCandidatesError, ManagedInstallPublicationEvidenceId,
     ManagedInstallPublicationEvidenceIdError, ManagedInstallReceiptVerificationFailure,
-    ManagedInstallRollbackEffect, ManagedInstallRolledBackEvidence,
+    ManagedInstallRollbackEffect, ManagedInstallRolledBackEvidence, RecordedVersionMetadata,
     RegisteredKnownGoodBootstrapVerificationFailure,
     RegisteredKnownGoodBootstrapVerificationFailureKind,
     RegisteredKnownGoodBootstrapVerificationRecovery, VerifiedManagedInstallCheckpointReceipt,

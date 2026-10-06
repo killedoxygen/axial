@@ -162,9 +162,10 @@ where
 pub(crate) async fn reconstruct_build(
     installed_version_id: &str,
     expected: &crate::download::ManagedInstallActivationContractId,
+    recorded: Option<crate::download::RecordedVersionMetadata>,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
     let plan = api::loader_reconstruction_plan(installed_version_id)?;
-    strategies::reconstruct_build(&plan, expected).await
+    strategies::reconstruct_build(&plan, expected, recorded).await
 }
 
 pub(crate) async fn reconstruct_managed_component(
