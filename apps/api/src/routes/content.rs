@@ -114,13 +114,9 @@ async fn search(
     let installed = query
         .instance_id
         .as_deref()
-        .map(|value| {
-            state
-                .mutations
-                .instance_context(&id(value)?)
-                .map_err(mutation_error)
-        })
-        .transpose()?;
+        .map(id)
+        .transpose()?
+        .and_then(|instance| state.mutations.instance_context(&instance).ok());
     let response = state
         .service
         .search(&ContentQuery {
@@ -561,6 +557,12 @@ mod tests {
                     async move {
                         paths.lock().unwrap().push(uri.path().to_owned());
                         match uri.path() {
+                            "/v2/search" => Json(json!({
+                                "hits":[{"project_id":"owned", "title":"Fixture resource pack",
+                                    "project_type":"resourcepack"}],
+                                "offset":0, "limit":1, "total_hits":1
+                            }))
+                            .into_response(),
                             "/v2/project/owned/version" => Json(json!([])).into_response(),
                             "/v2/project/updateable/version" => Json(json!([{
                                 "project_id":"updateable", "id":"v2", "name":"Release",
@@ -770,6 +772,84 @@ mod tests {
             self.queue.shutdown_queued().unwrap();
             self.provider.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_survives_unreadable_content_without_waiving_mutation_refusal() {
+        let fixture = Fixture::new().await;
+        let mut malformed = fixture.write_managed_resource_packs(&["owned"]);
+        let search = "/api/v1/content/search?kind=resource_pack&limit=1";
+        let targeted_search = format!("{search}&instance_id={}", fixture.id);
+        let (provider_status, provider_page) = fixture.get(search).await;
+        let (installed_status, installed_page) = fixture.get(&targeted_search).await;
+        malformed.push(b'!');
+        std::fs::write(fixture.game.join(MANIFEST_FILE), &malformed).unwrap();
+
+        let (search_status, search_page) = fixture.get(&targeted_search).await;
+        let (missing_status, missing_page) = fixture
+            .get(&format!("{search}&instance_id={}", InstanceId::new()))
+            .await;
+        let (invalid_status, invalid_response) =
+            fixture.get(&format!("{search}&instance_id=invalid")).await;
+        let (read_status, read_response) = fixture
+            .get(&format!("/api/v1/instances/{}/content", fixture.id))
+            .await;
+        let selections = json!([{"canonical_id":"modrinth:owned", "kind":"resource_pack"}]);
+        let (plan_status, plan_response) = fixture
+            .post(
+                "/api/v1/content/plan",
+                json!({"target":{"kind":"instance", "instance_id":fixture.id},
+                    "selections":selections}),
+            )
+            .await;
+        let (install_status, install_response) = fixture
+            .post(
+                "/api/v1/content/install",
+                json!({"instance_id":fixture.id, "selections":selections}),
+            )
+            .await;
+        let accepted: InstallQueueStateResponse =
+            serde_json::from_value(install_response.clone()).unwrap();
+        let install_id = accepted.started_install.unwrap().install_id;
+        let outcome = fixture.terminal(&install_id).await;
+        fixture.queue.close_admission();
+        fixture
+            .tasks
+            .shutdown(Duration::from_secs(3))
+            .await
+            .unwrap();
+        fixture.queue.join_observers().await.unwrap();
+        let manifest_after = std::fs::read(fixture.game.join(MANIFEST_FILE)).unwrap();
+        let owned_after = std::fs::read(fixture.game.join("resourcepacks/owned.zip")).unwrap();
+        let user_after = std::fs::read(fixture.game.join("resourcepacks/user.zip")).unwrap();
+        let unsettled = fixture.queue.has_unsettled_effects();
+        fixture.close().await;
+
+        assert_eq!(provider_status, StatusCode::OK, "{provider_page}");
+        assert_eq!(provider_page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(provider_page["items"][0]["canonical_id"], "modrinth:owned");
+        assert_eq!(provider_page["items"][0]["title"], "Fixture resource pack");
+        assert_eq!(provider_page["total"], 1);
+        assert!(provider_page["items"][0].get("install_state").is_none());
+        assert_eq!(installed_status, StatusCode::OK, "{installed_page}");
+        assert_eq!(installed_page["items"][0]["install_state"], "installed");
+        assert_eq!(read_status, StatusCode::BAD_REQUEST, "{read_response}");
+        assert_eq!(plan_status, StatusCode::BAD_REQUEST, "{plan_response}");
+        assert_eq!(install_status, StatusCode::OK, "{install_response}");
+        assert_eq!(outcome, InstallOutcome::Failed);
+        assert!(!unsettled);
+        assert_eq!(manifest_after, malformed);
+        assert_eq!(owned_after, b"abc");
+        assert_eq!(user_after, b"untouched");
+        assert_eq!(
+            invalid_status,
+            StatusCode::BAD_REQUEST,
+            "{invalid_response}"
+        );
+        assert_eq!(search_status, StatusCode::OK, "{search_page}");
+        assert_eq!(search_page, provider_page);
+        assert_eq!(missing_status, StatusCode::OK, "{missing_page}");
+        assert_eq!(missing_page, provider_page);
     }
 
     #[tokio::test]
