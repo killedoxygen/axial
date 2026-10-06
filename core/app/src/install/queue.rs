@@ -456,6 +456,14 @@ impl InstallQueue {
     pub fn snapshot(&self) -> InstallQueueStateResponse {
         project(&self.inner.state.lock().expect("install queue lock"))
     }
+    pub(crate) fn active_count(&self) -> usize {
+        let state = self.inner.state.lock().expect("install queue lock");
+        state
+            .entries
+            .iter()
+            .filter(|(id, entry)| !entry.status.done && !state.queued.contains(id))
+            .count()
+    }
     pub(crate) fn invalidate_registry(&self) {
         let mut state = self.inner.state.lock().expect("install queue lock");
         state.registry_revision = state.registry_revision.saturating_add(1);
@@ -3387,6 +3395,103 @@ pub(crate) mod tests {
         )
         .unwrap();
         (root, storage, library, exclusions, owner, queue)
+    }
+
+    #[tokio::test]
+    async fn active_count_excludes_queued_and_terminal_and_counts_all_restored_content() {
+        use crate::{
+            instances::{
+                create::{InstanceService, tests::create},
+                directory::{InstanceDirectories, Registry},
+            },
+            network::{ClientConfig, ProviderClient},
+        };
+
+        let (_root, storage, library, exclusions, owner, queue) = fixture();
+        storage
+            .migrate(&[
+                crate::instances::directory::MIGRATION,
+                crate::instances::create::MIGRATION,
+                crate::instances::delete::MIGRATION,
+                crate::content::install::MIGRATION,
+                crate::performance::mutation::MIGRATION,
+            ])
+            .unwrap();
+        let directories = InstanceDirectories::new(
+            Registry::new(storage.clone()),
+            library.clone(),
+            exclusions.clone(),
+        );
+        let instances = InstanceService::new(directories.clone(), owner.clone());
+        let first = create(&instances, "First census target").await;
+        let second = create(&instances, "Second census target").await;
+        let client = ProviderClient::new(ClientConfig::default()).unwrap();
+        let queue = queue.with_content(
+            Arc::new(ContentService::new(client.clone()).unwrap()),
+            Arc::new(ContentMutations::new(directories, client, owner.clone())),
+        );
+        let mut ids = Vec::new();
+        for (index, instance) in [&first, &first, &first, &second].into_iter().enumerate() {
+            let request = InstallQueueRequest::Content {
+                instance_id: instance.id.to_string(),
+                label: format!("Remove census fixture {index}"),
+                action: InstallQueueContentActionRequest::Uninstall {
+                    canonical_ids: vec![format!("modrinth:fixture{index}")],
+                },
+            };
+            let item = queue.resolve_target(&request).await.unwrap();
+            ids.push(
+                queue
+                    .admit_locked(
+                        &mut queue.inner.state.lock().unwrap(),
+                        request,
+                        item,
+                        library.admit().unwrap(),
+                        None,
+                        false,
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(queue.snapshot().items.len(), 4);
+        assert_eq!(queue.active_count(), 0);
+        queue.remove(&ids[0]).await.unwrap();
+        assert_eq!(
+            queue.status(&ids[0]).unwrap().outcome,
+            Some(InstallOutcome::Removed)
+        );
+        assert_eq!(queue.snapshot().items.len(), 3);
+        assert_eq!(queue.active_count(), 0);
+
+        for id in &ids[2..] {
+            persist_status(&storage, &queue.status(id).unwrap(), "running").unwrap();
+        }
+        let runtime = queue.inner.runtime.clone();
+        queue.close_admission();
+        queue.shutdown_queued().unwrap();
+        drop(queue);
+        let restored =
+            InstallQueue::new(storage, library.clone(), exclusions, owner.clone(), runtime)
+                .unwrap();
+        let snapshot = restored.snapshot();
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].queue_id, ids[1]);
+        assert!(ids[2..].contains(&snapshot.active.unwrap().queue_id));
+        for id in &ids[2..] {
+            let status = restored.status(id).unwrap();
+            assert!(!status.done);
+            assert_eq!(status.view_model.phase_id, "settlement_required");
+        }
+        assert!(restored.status(&ids[0]).unwrap().done);
+        assert_eq!(restored.active_count(), 2);
+        restored.close_admission();
+        owner
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        restored.join_observers().await.unwrap();
+        drop(restored);
+        library.try_preserve().unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

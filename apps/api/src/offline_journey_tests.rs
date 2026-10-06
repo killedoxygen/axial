@@ -2356,7 +2356,7 @@ async fn offline_vanilla_journey(existing: bool) {
     let created = api
         .post(
             "/api/v1/instances",
-            json!({"name":"Offline journey","selection_id":format!("vanilla|{VERSION}")}),
+            json!({"name":"Offline journey","selection_id":format!("vanilla|{VERSION}"),"max_memory_mb":2048}),
         )
         .await;
     let instance = created["id"].as_str().unwrap().to_owned();
@@ -2383,6 +2383,18 @@ async fn offline_vanilla_journey(existing: bool) {
     );
     assert!(runtime.join(".axial-runtime-manifest.json").is_file());
     let first = launch_and_stop(&api, &instance).await;
+    let first_report = api.get(&format!("/api/v1/launch/reports/{first}")).await;
+    let budget = &first_report["resource_budget"];
+    assert!(
+        budget.is_object(),
+        "launch must retain its resource snapshot"
+    );
+    assert_eq!(budget["requested_memory_mb"], 2048);
+    assert_eq!(budget["active_session_count"], 0);
+    assert_eq!(budget["active_install_count"], 0);
+    assert_eq!(budget["active_memory_allocation_mb"], 0);
+    assert_eq!(budget["memory_headroom_mb"], 2048);
+    assert_eq!(budget["launch_disk_headroom_mb"], 2048);
     let removed = api
         .request(
             reqwest::Method::DELETE,
@@ -2419,6 +2431,12 @@ async fn offline_vanilla_journey(existing: bool) {
     }
     let restarted_api = Api::new(&reopened);
     assert_ne!(api.capability, restarted_api.capability);
+    assert_eq!(
+        restarted_api
+            .get(&format!("/api/v1/launch/reports/{first}"))
+            .await,
+        first_report
+    );
     assert_installed(&restarted_api, true).await;
     assert_eq!(restarted_api.get("/api/v1/accounts").await, empty_accounts);
     assert_eq!(

@@ -521,7 +521,8 @@ impl LaunchCoordinator {
                             .map_err(LaunchError::RuntimeFailure)?;
                         let contribution =
                             axial_performance::effective_performance_plan(performance.plan());
-                        let options = launch_options(&settings, target, &contribution)?;
+                        let host = super::resources::capture_host();
+                        let options = launch_options(&settings, target, &contribution, &host)?;
                         super::plan::validate_options(
                             &options,
                             &target.minecraft_version,
@@ -735,7 +736,15 @@ impl LaunchCoordinator {
             .game_directory()
             .read_projection()
             .map_err(|_| LaunchError::InstanceChanged)?;
-        let options = launch_options(&effective, &instance, &contribution)?;
+        let host = super::resources::capture_host();
+        let options = launch_options(&effective, &instance, &contribution, &host)?;
+        let resource_budget = super::resources::capture(
+            &host,
+            self.sessions.resource_use(),
+            self.installs.active_count(),
+            effective.max_memory_mb,
+            [&library_dir, &game_dir],
+        );
         let prepared_natives = installed
             .prepare_natives(&library_operation, &library_dir, &environment)
             .await
@@ -790,6 +799,7 @@ impl LaunchCoordinator {
                 admitted,
                 performance,
                 scenario,
+                resource_budget,
                 credential_expires_at,
                 telemetry,
             )
@@ -880,14 +890,13 @@ fn launch_options(
     effective: &EffectiveLaunchSettings,
     instance: &crate::instances::model::Instance,
     contribution: &axial_performance::EffectivePerformancePlan,
+    host: &super::resources::HostResources,
 ) -> Result<LaunchOptions, LaunchError> {
     let resolution = match (effective.window_width, effective.window_height) {
         (0, 0) => None,
         (width, height) if width > 0 && height > 0 => Some((width as u32, height as u32)),
         _ => return Err(LaunchError::PlanRejected),
     };
-    let mut host = sysinfo::System::new();
-    host.refresh_memory();
     Ok(LaunchOptions {
         min_memory_mb: Some(effective.min_memory_mb),
         max_memory_mb: Some(effective.max_memory_mb),
@@ -905,10 +914,8 @@ fn launch_options(
         },
         low_impact_startup: contribution.launch_smoothing.policy
             != axial_performance::EffectiveLaunchSmoothingPolicy::UserControlled,
-        logical_cores: std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(4),
-        total_memory_mb: Some(host.total_memory() / (1024 * 1024)),
+        logical_cores: host.cpu_threads.unwrap_or(4),
+        total_memory_mb: Some(host.total_memory_mb),
         loader: instance.loader_key.clone(),
         is_modded: !matches!(instance.loader_key.as_str(), "" | "vanilla"),
         ..Default::default()

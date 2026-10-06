@@ -276,6 +276,7 @@ struct SessionEntry {
     reports: Option<LaunchReportStore>,
     version_id: String,
     scenario: LaunchProofScenario,
+    resource_budget: Option<super::reports::LaunchProofResourceBudget>,
     telemetry: Arc<LaunchAttemptTelemetry>,
     acceptance: Option<super::coordinator::AcceptedIntent>,
     preparation: Weak<PreparedSession>,
@@ -500,6 +501,7 @@ impl SessionEntry {
                     logs_dropped: state.logs.dropped_entries(),
                 });
                 report.scenario = self.scenario.clone();
+                report.resource_budget = self.resource_budget.clone();
                 state.report = Some(report);
             }
             (
@@ -662,6 +664,7 @@ impl SessionManager {
             reports: self.reports.clone(),
             version_id: prepared.version_id().to_owned(),
             scenario: prepared.scenario().clone(),
+            resource_budget: Some(prepared.resource_budget().clone()),
             telemetry: prepared.telemetry(),
             acceptance: Some(acceptance),
             preparation: Arc::downgrade(&prepared),
@@ -781,6 +784,25 @@ impl SessionManager {
 
     pub fn sessions(&self) -> Vec<SessionSnapshot> {
         self.snapshots()
+    }
+
+    pub(super) fn resource_use(&self) -> (usize, u64) {
+        let registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        registry
+            .sessions
+            .values()
+            .filter(|entry| entry.current().phase != SessionPhase::Exited)
+            .fold((0, 0), |(count, memory), entry| {
+                let requested = entry
+                    .scenario
+                    .requested_memory_mb
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or(0);
+                (count + 1, memory.saturating_add(requested))
+            })
     }
 
     pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
@@ -1347,6 +1369,7 @@ fn entry_for_instance(
             performance_mode: "vanilla".into(),
             ..Default::default()
         },
+        resource_budget: None,
         telemetry: LaunchAttemptTelemetry::started(telemetry, "vanilla"),
         acceptance: None,
         preparation: Weak::new(),
@@ -1396,6 +1419,52 @@ fn exit_signal(_status: std::process::ExitStatus) -> Option<i32> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_use_counts_nonterminal_sessions_and_their_known_allocations() {
+        let storage = Arc::new(crate::storage::MetadataStore::in_memory().unwrap());
+        storage
+            .migrate(&[super::super::reports::REPORT_MIGRATION])
+            .unwrap();
+        let reports = LaunchReportStore::new(storage).unwrap();
+        let sessions = SessionManager::new(TaskOwner::new(2).unwrap());
+        let mut first = entry(reports.clone());
+        Arc::get_mut(&mut first)
+            .unwrap()
+            .scenario
+            .requested_memory_mb = Some(2048);
+        let mut second = entry(reports);
+        Arc::get_mut(&mut second)
+            .unwrap()
+            .scenario
+            .requested_memory_mb = Some(4096);
+        {
+            let mut registry = sessions.registry.lock().unwrap();
+            for entry in [&first, &second] {
+                registry
+                    .sessions
+                    .insert(entry.current().session_id.clone(), entry.clone());
+            }
+            registry.retired.insert("retired".into(), second.current());
+        }
+        for phase in [
+            SessionPhase::Starting,
+            SessionPhase::Running,
+            SessionPhase::Stopping,
+            SessionPhase::Settling,
+            SessionPhase::Unresolved,
+        ] {
+            first.publish(|snapshot| {
+                snapshot.phase = phase;
+                snapshot.process_alive = false;
+            });
+            assert_eq!(sessions.resource_use(), (2, 6144), "{phase:?}");
+        }
+        first.publish(|snapshot| snapshot.phase = SessionPhase::Exited);
+        assert_eq!(sessions.resource_use(), (1, 4096));
+        second.publish(|snapshot| snapshot.phase = SessionPhase::Exited);
+        assert_eq!(sessions.resource_use(), (0, 0));
+    }
 
     #[tokio::test]
     async fn metadata_loan_requires_current_live_running_preparation_and_open_owners() {

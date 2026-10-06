@@ -162,6 +162,164 @@ mod tests {
     const DRIVERS: &str = "/api/v1/launch/benchmark/suite/drivers";
 
     #[tokio::test]
+    async fn qualification_preview_is_descriptor_only_and_creates_no_work() {
+        const PREVIEW: &str = "/api/v1/launch/benchmark/qualification/family-c-1-12-2/preview";
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let services = crate::start_in_profile(root.path().join("replacement"), None)
+            .await
+            .unwrap();
+        let bootstrap = services.server.bootstrap();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let get = |path: &str| {
+            client
+                .get(format!("{}{path}", bootstrap.base_url))
+                .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
+        };
+        let unauthorized = client
+            .get(format!("{}{PREVIEW}", bootstrap.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        let response = get(PREVIEW).send().await.unwrap();
+        let status = response.status();
+        let data = response.text().await.unwrap();
+        let drivers: Value = get(DRIVERS)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let sessions: Value = get("/api/v1/launch/sessions")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        services.server.shutdown().await.unwrap();
+        services.server.wait().await.unwrap();
+        let durable_counts = services
+            .settings
+            .metadata()
+            .read::<_, StorageError>(|connection| {
+                connection
+                    .query_row(
+                        "SELECT (SELECT count(*) FROM benchmark_suites),
+                                (SELECT count(*) FROM launch_intents),
+                                (SELECT count(*) FROM launch_reports)",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, u64>(0)?,
+                                row.get::<_, u64>(1)?,
+                                row.get::<_, u64>(2)?,
+                            ))
+                        },
+                    )
+                    .map_err(StorageError::from)
+            })
+            .unwrap();
+        assert!(services.tasks.shutdown_receipt().is_some());
+        assert_eq!(unauthorized, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(drivers, json!({"status":"ok", "drivers":[]}));
+        assert_eq!(sessions, json!({"sessions":[]}));
+        assert_eq!(durable_counts, (0, 0, 0));
+        assert!(data.len() < 4096);
+        assert!(!data.contains('/') && !data.contains('\\'));
+        assert!(!data.contains(&bootstrap.capability));
+        let lower = data.to_ascii_lowercase();
+        for forbidden in [
+            "java_path",
+            "command",
+            "java-args",
+            "account",
+            "token",
+            "runtime",
+            "launch_intent",
+        ] {
+            assert!(!lower.contains(forbidden), "preview exposed {forbidden}");
+        }
+        let payload: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            payload["schema"],
+            "axial.launch.benchmark.qualification.family_c_1_12_2"
+        );
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["status"], "incomplete");
+        assert_eq!(
+            payload["suite"],
+            json!({
+                "present":false, "mode":"release_validation", "run_count":8,
+            })
+        );
+        assert_eq!(
+            payload["target"],
+            json!({
+                "family":"C", "loader":"Forge", "version":"1.12.2", "mode":"release_validation",
+            })
+        );
+        assert_eq!(
+            payload["view_model"],
+            json!({
+                "status_label":"Incomplete", "status_tone":"warn",
+                "target_label":"Family C, Forge, 1.12.2, Release Validation",
+                "suite_label":"Suite missing", "schema_label":"v1",
+                "missing_summary":"7 missing: Proof Missing, Suite Manifest Missing, +5",
+                "suite_summary":"Suite missing",
+                "evidence_summary":"Baseline: Pending, run #1, Proof missing | Managed: Pending, run #2, Proof missing",
+            })
+        );
+        let targets = payload["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets[0]["suite_run"],
+            json!({
+                "present":true, "run_index":0, "profile":"vanilla_baseline", "run_type":"coldish",
+                "target_id":"family_c_forge_1_12_2_vanilla_baseline",
+                "benchmark_id":"benchmark-cb555607e50285e6", "session_id":null, "state":"pending",
+            })
+        );
+        assert_eq!(
+            targets[1]["suite_run"],
+            json!({
+                "present":true, "run_index":1, "profile":"managed_default", "run_type":"coldish",
+                "target_id":"family_c_forge_1_12_2_family_c_forge_core",
+                "benchmark_id":"benchmark-83e6d2fae9587b9c", "session_id":null, "state":"pending",
+            })
+        );
+        assert_eq!(
+            targets[0]["missing"],
+            json!([
+                "proof_missing",
+                "suite_manifest_missing",
+                "suite_run_session_missing",
+            ])
+        );
+        assert_eq!(
+            targets[1]["missing"],
+            json!([
+                "managed_comparison_missing",
+                "proof_missing",
+                "suite_manifest_missing",
+                "suite_run_session_missing",
+            ])
+        );
+        for target in targets {
+            assert_eq!(target["proof"], json!({"present":false}));
+        }
+    }
+
+    #[tokio::test]
     async fn current_driver_routes_resume_the_same_driver_and_project_actions() {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let services = crate::start_in_profile(root.path().join("replacement"), None)

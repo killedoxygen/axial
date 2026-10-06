@@ -25,6 +25,7 @@ pub(super) struct PreparedSession {
     instance: RegisteredInstance,
     performance: crate::performance::PreparedPerformance,
     scenario: super::reports::LaunchProofScenario,
+    resource_budget: super::reports::LaunchProofResourceBudget,
     credential_expires_at: Option<u64>,
     telemetry: Arc<super::session::LaunchAttemptTelemetry>,
 }
@@ -45,6 +46,7 @@ impl PreparedSession {
         instance: RegisteredInstance,
         performance: crate::performance::PreparedPerformance,
         scenario: super::reports::LaunchProofScenario,
+        resource_budget: super::reports::LaunchProofResourceBudget,
         credential_expires_at: Option<u64>,
         telemetry: Arc<super::session::LaunchAttemptTelemetry>,
     ) -> Result<Self, PrepareError> {
@@ -60,6 +62,7 @@ impl PreparedSession {
             instance,
             performance,
             scenario,
+            resource_budget,
             credential_expires_at,
             telemetry,
         };
@@ -90,6 +93,10 @@ impl PreparedSession {
     }
     pub(super) fn scenario(&self) -> &super::reports::LaunchProofScenario {
         &self.scenario
+    }
+
+    pub(super) fn resource_budget(&self) -> &super::reports::LaunchProofResourceBudget {
+        &self.resource_budget
     }
 
     pub(super) fn validated_command(&self) -> &ValidatedLaunchCommand {
@@ -336,6 +343,13 @@ pub(super) mod tests {
             instance,
             performance,
             scenario: Default::default(),
+            resource_budget: super::super::resources::capture(
+                &super::super::resources::capture_host(),
+                (0, 0),
+                0,
+                4096,
+                [root.path(), root.path()],
+            ),
             credential_expires_at: None,
             telemetry: super::super::session::LaunchAttemptTelemetry::started(None, "vanilla"),
         };
@@ -355,6 +369,7 @@ pub(super) mod tests {
             prepared.instance,
             prepared.performance,
             prepared.scenario,
+            prepared.resource_budget,
             prepared.credential_expires_at,
             prepared.telemetry,
         )
