@@ -173,9 +173,7 @@ fn configure_native_paths(args: &mut Vec<String>, natives: &str) {
     // use ordinary JVM/library defaults, never this exact-cleanup directory.
     args.retain(|arg| !sets_runtime_temp_directory(arg));
     if !natives.is_empty() {
-        for property in ["java.library.path", "org.lwjgl.librarypath"] {
-            args.push(format!("-D{property}={natives}"));
-        }
+        args.push(format!("-Djava.library.path={natives}"));
     }
 }
 
@@ -284,14 +282,15 @@ fn validate_extra_args(
             ]
             .iter()
             .any(|reserved| arg == reserved || arg.starts_with(&format!("{reserved}=")))
-            || [
-                "java.class.path",
-                "java.library.path",
-                "java.home",
-                "org.lwjgl.librarypath",
-            ]
-            .iter()
-            .any(|key| arg.starts_with(&format!("-D{key}=")))
+            || arg.strip_prefix("-D").is_some_and(|property| {
+                [
+                    "java.class.path",
+                    "java.library.path",
+                    "java.home",
+                    "org.lwjgl.librarypath",
+                ]
+                .contains(&property.split_once('=').map_or(property, |(key, _)| key))
+            })
         {
             return Err(LaunchPlanError::ReservedJvmArgument);
         }
@@ -346,6 +345,12 @@ mod tests {
             game_assets: String::new(),
         };
         let (mut args, game) = resolve_arguments(&version, &default_environment(), &vars);
+        assert!(args.contains(&"-Djava.library.path=/verified/natives".into()));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("-Dorg.lwjgl.librarypath="))
+        );
         assert_eq!(
             args.iter()
                 .filter(|arg| sets_runtime_temp_directory(arg))
@@ -354,9 +359,13 @@ mod tests {
         );
         configure_native_paths(&mut args, &vars.natives_directory);
         assert!(!args.iter().any(|arg| sets_runtime_temp_directory(arg)));
-        for property in ["java.library.path", "org.lwjgl.librarypath"] {
-            assert!(args.contains(&format!("-D{property}=/verified/natives")));
-        }
+        assert!(args.contains(&"-Djava.library.path=/verified/natives".into()));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("-Dorg.lwjgl.librarypath=")),
+            "the launcher must preserve standard JNI lookup for legacy native filenames"
+        );
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["-cp", "verified-client.jar"])
@@ -418,6 +427,11 @@ mod tests {
             "-javaagent:agent.jar",
             "-Xmx8G",
             "-Djava.library.path=elsewhere",
+            "-Dorg.lwjgl.librarypath=elsewhere",
+            "-Djava.class.path",
+            "-Djava.library.path",
+            "-Djava.home",
+            "-Dorg.lwjgl.librarypath",
             "@args",
             "Main",
         ] {
