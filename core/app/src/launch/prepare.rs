@@ -211,6 +211,13 @@ pub(super) mod tests {
     use sha1::{Digest, Sha1};
     use std::os::unix::fs::PermissionsExt;
 
+    pub(in crate::launch) fn attach_game_libraries(
+        prepared: &mut PreparedSession,
+        libraries: super::super::libraries::Prepared,
+    ) {
+        prepared.command.game_libraries = Some(libraries);
+    }
+
     pub(in crate::launch) async fn fixture() -> (
         tempfile::TempDir,
         PreparedSession,
@@ -342,7 +349,10 @@ pub(super) mod tests {
             secrets: vec![],
             instance,
             performance,
-            scenario: Default::default(),
+            scenario: super::super::reports::LaunchProofScenario {
+                version_id: Some("1.20.1".into()),
+                ..Default::default()
+            },
             resource_budget: super::super::resources::capture(
                 &super::super::resources::capture_host(),
                 (0, 0),

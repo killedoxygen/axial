@@ -3355,6 +3355,123 @@ mod tests {
         LaunchIntents::with_storage(storage, reports, 8).unwrap()
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaced_game_library_settles_accepted_session_without_spawning() {
+        use super::super::{
+            libraries,
+            outcome::SessionExitReason,
+            prepare::tests::{attach_game_libraries, fixture},
+            session::SessionPhase,
+        };
+        use axial_minecraft::portable_path::PortableRelativePath;
+        use std::time::Duration;
+
+        let (root, mut prepared, application) = fixture().await;
+        let source_path = root.path().join("libraries/fml/source.jar");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, b"abc").unwrap();
+        let source = prepared
+            .instance()
+            .generation()
+            .managed_library()
+            .unwrap()
+            .observe_file(&PortableRelativePath::new_exact("libraries/fml/source.jar").unwrap())
+            .unwrap()
+            .unwrap();
+        let game = prepared.instance().game_directory().clone();
+        let game_path = game.read_projection().unwrap();
+        attach_game_libraries(
+            &mut prepared,
+            libraries::tests::prepare_abc_copy(game, source),
+        );
+        prepared.validate_before_spawn().unwrap();
+
+        let storage = Arc::new(MetadataStore::in_memory().unwrap());
+        let intents = durable_intents(storage.clone());
+        let mut request = request();
+        request.instance_id = prepared.instance_id().clone();
+        request.username = None;
+        let ReservedIntent::New {
+            key, session_id, ..
+        } = intents.reserve(&request).unwrap()
+        else {
+            panic!("fresh launch intent");
+        };
+        let acceptance = intents
+            .accept(&key, prepared.intent_binding(&application).unwrap())
+            .unwrap();
+        let target = game_path.join("lib/required.jar");
+        let preserved = game_path.join("lib/preserved.jar");
+        std::fs::rename(&target, &preserved).unwrap();
+        std::fs::write(&target, b"abc").unwrap();
+        assert!(matches!(
+            prepared.validated_command().revalidate(),
+            Err(super::super::model::LaunchPlanError::ArtifactChanged)
+        ));
+
+        let tasks = TaskOwner::new(2).unwrap();
+        let sessions =
+            SessionManager::with_reports(tasks.clone(), intents.reports.clone().unwrap());
+        let started = sessions.start_reserved(prepared, session_id.clone(), acceptance.clone());
+        if let Ok(snapshot) = &started {
+            intents.settle(&key, Ok(snapshot.clone()));
+        }
+        let terminal = if let Some(mut changes) = sessions.subscribe_by_session_id(&session_id) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let snapshot = changes.borrow_and_update().clone();
+                    if snapshot.phase == SessionPhase::Exited {
+                        return Some(snapshot);
+                    }
+                    if changes.changed().await.is_err() {
+                        return None;
+                    }
+                }
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let session_shutdown = sessions.shutdown(Duration::from_secs(5)).await;
+        let task_shutdown = tasks.shutdown(Duration::from_secs(5)).await;
+
+        session_shutdown.unwrap();
+        task_shutdown.unwrap();
+        assert_eq!(started.unwrap().phase, SessionPhase::Starting);
+        let terminal = terminal.expect("input refusal settles before shutdown requests Stop");
+        assert_eq!(
+            terminal.outcome.unwrap().reason,
+            SessionExitReason::SpawnFailed
+        );
+        assert_eq!(terminal.exit_code, None);
+        assert_eq!(terminal.pid, None);
+        assert!(!terminal.boot_observed && !terminal.process_alive && !terminal.stop_allowed);
+        assert!(terminal.tree_settled && terminal.output_drained);
+        assert!(sessions.logs_by_session_id(&session_id).unwrap().is_empty());
+        let bytes: Vec<u8> = storage
+            .read(|db| -> Result<_, StorageError> {
+                Ok(db.query_row(
+                    "SELECT settlement FROM launch_intents WHERE intent_key=?1",
+                    [&key],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        let observation =
+            decode_settlement(&acceptance.record, &acceptance.payload, &bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(observation).unwrap()["process"],
+            serde_json::json!({"kind":"no_child","stopped":false})
+        );
+        assert!(terminal_ack(&storage, &key));
+        for path in [&source_path, &target, &preserved] {
+            assert_eq!(std::fs::read(path).unwrap(), b"abc");
+        }
+    }
+
     fn refuse_reports(storage: &MetadataStore) {
         storage.transaction(|tx| -> Result<(), StorageError> {
             tx.execute_batch("CREATE TRIGGER refuse_report BEFORE INSERT ON launch_reports BEGIN SELECT RAISE(ABORT,'unavailable'); END;")?;

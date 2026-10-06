@@ -452,7 +452,7 @@ impl Effect {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::library::{LibraryLifecycle, LibraryOpenOutcome};
     use axial_minecraft::portable_path::PortableRelativePath;
@@ -461,6 +461,31 @@ mod tests {
         0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50, 0xc2,
         0x6c, 0x9c, 0xd0, 0xd8, 0x9d,
     ];
+
+    pub(in crate::launch) fn prepare_abc_copy(
+        game: ScopedDirectory,
+        source: ManagedLibraryFile,
+    ) -> Prepared {
+        let retention = Retention::new(game);
+        let directory = prepare_directory(&retention).unwrap();
+        let (_sender, cancellation) = transfer_cancellation_channel();
+        let file = prepare_file(
+            &source,
+            &directory,
+            LeafName::new("required.jar").unwrap(),
+            3,
+            DIGEST,
+            &retention,
+            cancellation,
+        )
+        .unwrap();
+        assert!(!retention.has_pending());
+        Prepared {
+            directory,
+            sources: vec![source],
+            files: vec![file],
+        }
+    }
 
     struct Fixture {
         _library: LibraryLifecycle,
