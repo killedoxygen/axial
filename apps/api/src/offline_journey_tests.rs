@@ -116,7 +116,7 @@ fn native_name() -> &'static str {
     }
 }
 
-fn fake_java() -> (Vec<u8>, Vec<u8>) {
+fn fake_java(natural_exit: bool) -> (Vec<u8>, Vec<u8>) {
     let python = std::process::Command::new("python3")
         .args(["-c", "import sys; print(sys.executable)"])
         .output()
@@ -129,7 +129,7 @@ fn fake_java() -> (Vec<u8>, Vec<u8>) {
     let python = python.trim().replace('\'', "'\\''");
     let launcher =
         format!("#!/bin/sh\nexec '{python}' \"$(dirname \"$0\")/fake_java.py\" \"$@\"\n");
-    let config = json!({
+    let mut config = json!({
         "java_version":"17.0.12", "arch":std::env::consts::ARCH,
         "events":[
             {"stream":"stdout","text":"LWJGL Version: fixture\n"},
@@ -138,6 +138,12 @@ fn fake_java() -> (Vec<u8>, Vec<u8>) {
         "stall_ms":30000, "descendant_depth":1, "descendant_stall_ms":30000,
         "descendants_ignore_sigterm":true, "report_lifecycle":true
     });
+    if natural_exit {
+        config["events"][0]["delay_ms"] = json!(50);
+        config["stall_ms"] = json!(100);
+        config["descendant_depth"] = json!(0);
+        config["exit_code"] = json!(0);
+    }
     // Instrument only this downloaded fixture, never process-global test env.
     // Command checks execute inside the actual owned child after Java probing.
     let prelude = format!(
@@ -270,7 +276,11 @@ fn fake_java_launcher_version_options_remain_probes() {
     }
 }
 
-fn provider_routes(base: &str, corrupt_client: bool) -> BTreeMap<String, Vec<u8>> {
+fn provider_routes(
+    base: &str,
+    corrupt_client: bool,
+    natural_exit: bool,
+) -> BTreeMap<String, Vec<u8>> {
     let mut routes = BTreeMap::new();
     let mut source = |path: &str, bytes: Vec<u8>| {
         let descriptor =
@@ -303,7 +313,7 @@ fn provider_routes(base: &str, corrupt_client: bool) -> BTreeMap<String, Vec<u8>
         }))
         .unwrap(),
     );
-    let (java, helper) = fake_java();
+    let (java, helper) = fake_java(natural_exit);
     let java = source("/java-runtime/java", java);
     let helper = source("/java-runtime/fake_java.py", helper);
     let helper_path = java_relative_path().replace("/java", "/fake_java.py");
@@ -391,12 +401,16 @@ struct Provider {
 
 impl Provider {
     async fn start(corrupt_client: bool) -> Self {
+        Self::start_with_java_exit(corrupt_client, false).await
+    }
+
+    async fn start_with_java_exit(corrupt_client: bool, natural_exit: bool) -> Self {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let state = ProviderState {
-            routes: Arc::new(provider_routes(&base, corrupt_client)),
+            routes: Arc::new(provider_routes(&base, corrupt_client, natural_exit)),
             requests: Arc::new(Mutex::new(Vec::new())),
         };
         let router = Router::new()
@@ -2470,6 +2484,165 @@ async fn offline_vanilla_journey(existing: bool) {
             EXTERNAL_CANARY
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_clean_benchmarks_compare_configured_modes_after_reopen() {
+    let temporary =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let profile = temporary.path().join("profile");
+    let provider = Provider::start_with_java_exit(false, true).await;
+    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+        .await
+        .unwrap();
+    let api = Api::new(&services);
+    api.post(
+        "/api/v1/accounts/offline",
+        json!({"username":PLAYER,"expected_selection_revision":0}),
+    )
+    .await;
+    api.request(
+        reqwest::Method::PUT,
+        "/api/v1/config",
+        Some(json!({
+            "expected_revision":0,"performance_mode":"managed","java_path_override":""
+        })),
+    )
+    .await;
+    let start = api
+        .post(
+            "/api/v1/install/queue",
+            json!({"kind":"vanilla","version_id":VERSION}),
+        )
+        .await;
+    assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
+    let created = api
+        .post(
+            "/api/v1/instances",
+            json!({
+                "name":"Clean benchmark comparison","selection_id":format!("vanilla|{VERSION}"),
+                "max_memory_mb":2048,"min_memory_mb":512
+            }),
+        )
+        .await;
+    let instance = created["id"].as_str().unwrap();
+    let instance_path = format!("/api/v1/instances/{instance}");
+    let mut reports = Vec::new();
+    for (mode, benchmark_profile) in [
+        ("vanilla", "vanilla_baseline"),
+        ("managed", "managed_default"),
+    ] {
+        let current = api.get(&instance_path).await;
+        let configured = api
+            .request(
+                reqwest::Method::PUT,
+                &instance_path,
+                Some(json!({
+                    "expected_revision":current["revision"],"performance_mode":mode
+                })),
+            )
+            .await;
+        assert_eq!(configured["performance_mode"], mode);
+        wait_launchable(&api, instance).await;
+        let launched = api
+            .post(
+                "/api/v1/launch/benchmark",
+                json!({
+                    "instance_id":instance,"profile":benchmark_profile,
+                    "run_type":"coldish","benchmark_mode":"release_validation"
+                }),
+            )
+            .await;
+        let session = launched["session_id"].as_str().unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let status = api.get(&format!("/api/v1/launch/{session}/status")).await;
+                if status["phase"] == "exited" {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("fixture Java must exit naturally and publish its settled report");
+        assert_eq!(terminal["instance_id"], instance);
+        assert_eq!(terminal["tree_settled"], true);
+        assert_eq!(terminal["output_drained"], true);
+        assert_eq!(terminal["process_alive"], false);
+        assert_eq!(terminal["boot_observed"], true);
+        assert_eq!(terminal["exit_code"], 0);
+        assert_eq!(terminal["outcome"]["kind"], "clean", "{terminal}");
+        assert_fixture_processes_gone(&BTreeSet::from([terminal["pid"].as_u64().unwrap()])).await;
+        let report = api.get(&format!("/api/v1/launch/reports/{session}")).await;
+        assert_eq!(report["session_id"], session);
+        assert_eq!(report["instance_id"], instance);
+        assert_eq!(report["outcome"], "exited");
+        assert_eq!(report["session_outcome"]["kind"], "clean");
+        assert_eq!(report["exit_code"], 0);
+        assert!(report["boot_duration_ms"].as_u64().unwrap() > 0);
+        let scenario = &report["scenario"];
+        assert_eq!(scenario["performance_mode"], mode);
+        assert_eq!(scenario["version_id"], VERSION);
+        assert_eq!(scenario["requested_memory_mb"], 2048);
+        assert_eq!(scenario["benchmark_profile"], benchmark_profile);
+        assert_eq!(scenario["benchmark_run_type"], "coldish");
+        assert_eq!(scenario["benchmark_mode"], "release_validation");
+        assert!(matches!(
+            report["device"]["tier"].as_str(),
+            Some("low" | "mid" | "high")
+        ));
+        let logs = report["logs"].as_array().unwrap();
+        assert!(
+            logs.iter()
+                .any(|line| line["text"] == "Fixture command validated")
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line["text"] == "Fixture heap MiB 2048")
+        );
+        reports.push(report);
+    }
+    let baseline = &reports[0];
+    let managed = &reports[1];
+    assert_ne!(managed["session_id"], baseline["session_id"]);
+    assert!(baseline["comparison"].is_null());
+    assert_eq!(managed["device"]["tier"], baseline["device"]["tier"]);
+    let comparison = &managed["comparison"];
+    assert_eq!(comparison["baseline_session_id"], baseline["session_id"]);
+    assert_eq!(comparison["baseline_recorded_at"], baseline["recorded_at"]);
+    assert_eq!(comparison["matched_sample_count"], 1);
+    assert_eq!(comparison["metric_name"], "boot_duration_ms");
+    assert_eq!(
+        comparison["baseline_value_ms"],
+        baseline["boot_duration_ms"]
+    );
+    assert_eq!(comparison["current_value_ms"], managed["boot_duration_ms"]);
+    assert_eq!(
+        comparison["baseline"],
+        json!({
+            "performance_mode":"vanilla","version_id":VERSION,"requested_memory_mb":2048,
+            "device_tier":baseline["device"]["tier"],"benchmark_profile":"vanilla_baseline",
+            "benchmark_run_type":"coldish","benchmark_mode":"release_validation"
+        })
+    );
+    provider.assert_requests(true);
+    services.server.shutdown().await.unwrap();
+    assert!(services.server.is_shutdown_settled());
+    drop(services);
+    provider.shutdown().await;
+
+    let reopened = start_in_profile(profile, None).await.unwrap();
+    let api = Api::new(&reopened);
+    assert_eq!(api.get(&instance_path).await["performance_mode"], "managed");
+    for report in reports {
+        let session = report["session_id"].as_str().unwrap();
+        assert_eq!(
+            api.get(&format!("/api/v1/launch/reports/{session}")).await,
+            report
+        );
+    }
+    reopened.server.shutdown().await.unwrap();
+    assert!(reopened.server.is_shutdown_settled());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
