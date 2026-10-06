@@ -1,5 +1,6 @@
 pub mod coordinator;
 pub(crate) mod jvm;
+mod libraries;
 pub mod logs;
 pub(crate) mod model;
 pub mod outcome;

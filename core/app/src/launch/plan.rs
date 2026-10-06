@@ -161,6 +161,7 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
         version_guard: request.version_guard,
         installed: request.installed,
         prepared_natives: request.prepared_natives,
+        game_libraries: None,
         runtime: request.runtime,
         managed_launch: request.managed_launch,
     };

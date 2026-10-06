@@ -214,6 +214,17 @@ pub struct InstalledVersionReceipt {
     client_jar: PathBuf,
 }
 
+#[derive(Debug)]
+pub(crate) enum GameLibrariesError {
+    Install(super::queue::InstallError),
+    Physical(axial_resource::PhysicalWorkError),
+}
+
+pub(crate) struct GameLibraries {
+    pub requirements: axial_minecraft::loaders::game_libraries::Requirements,
+    pub sources: Vec<axial_minecraft::managed_path::ManagedLibraryFile>,
+}
+
 impl std::fmt::Debug for InstalledVersionReceipt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstalledVersionReceipt")
@@ -248,6 +259,95 @@ impl InstalledVersionReceipt {
             }
         }
         Ok(())
+    }
+
+    pub(crate) async fn prepare_game_libraries(
+        self,
+    ) -> Result<(Self, Option<GameLibraries>), GameLibrariesError> {
+        use super::queue::InstallError;
+        use axial_minecraft::loaders::game_libraries;
+        use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
+
+        if !game_libraries::applies_to(&self.version.id) {
+            return Ok((self, None));
+        }
+        let client_path = format!("versions/{0}/{0}.jar", self.version.id);
+        let size = self
+            .exact
+            .get(&client_path)
+            .map(|(_, size)| *size)
+            .ok_or(GameLibrariesError::Install(InstallError::NotReady))?;
+        let scratch = game_libraries::scratch_bytes(size)
+            .map_err(|_| GameLibrariesError::Install(InstallError::NotReady))?;
+        process_physical_work()
+            .admit(PhysicalWorkRequest::foreground(
+                PhysicalIoClass::Read,
+                scratch,
+            ))
+            .await
+            .map_err(GameLibrariesError::Physical)?
+            .run(move |_| {
+                let path = PortableRelativePath::new_exact(&client_path)
+                    .map_err(|_| InstallError::NotReady)?;
+                let expected = self
+                    .guards
+                    .iter()
+                    .find(|(recorded, _)| recorded == &path)
+                    .map(|(_, revision)| revision)
+                    .ok_or(InstallError::NotReady)?;
+                let client = self
+                    .operation
+                    .observe_file(&path)
+                    .map_err(|_| InstallError::NotReady)?
+                    .ok_or(InstallError::NotReady)?;
+                if client.revision_observation() != *expected {
+                    return Err(InstallError::NotReady);
+                }
+                let bytes = client
+                    .read_bounded(size)
+                    .map_err(|_| InstallError::NotReady)?;
+                let requirements = game_libraries::recognize(&self.version.id, &bytes)
+                    .map_err(|_| InstallError::NotReady)?;
+                let mut sources = Vec::new();
+                if let Some(requirements) = &requirements {
+                    for entry in requirements.entries() {
+                        let path = format!("libraries/{}", entry.path());
+                        if !self.exact.get(&path).is_some_and(|(sha1, size)| {
+                            sha1 == entry.sha1() && *size == entry.size()
+                        }) {
+                            return Err(InstallError::NotReady);
+                        }
+                        let path = PortableRelativePath::new_exact(&path)
+                            .map_err(|_| InstallError::NotReady)?;
+                        let expected = self
+                            .guards
+                            .iter()
+                            .find(|(recorded, _)| recorded == &path)
+                            .map(|(_, revision)| revision)
+                            .ok_or(InstallError::NotReady)?;
+                        let source = self
+                            .operation
+                            .observe_file(&path)
+                            .map_err(|_| InstallError::NotReady)?
+                            .ok_or(InstallError::NotReady)?;
+                        if source.revision_observation() != *expected {
+                            return Err(InstallError::NotReady);
+                        }
+                        sources.push(source);
+                    }
+                }
+                self.revalidate()?;
+                Ok((
+                    self,
+                    requirements.map(|requirements| GameLibraries {
+                        requirements,
+                        sources,
+                    }),
+                ))
+            })
+            .await
+            .map_err(GameLibrariesError::Physical)?
+            .map_err(GameLibrariesError::Install)
     }
 
     pub(crate) async fn prepare_natives(

@@ -117,6 +117,7 @@ pub(crate) struct ValidatedLaunchCommand {
     pub(super) version_guard: VersionBundleReadGuard,
     pub(super) installed: InstalledVersionReceipt,
     pub(super) prepared_natives: Option<Arc<PreparedNatives>>,
+    pub(super) game_libraries: Option<super::libraries::Prepared>,
     pub(super) runtime: JavaProbeReceipt,
     pub(super) managed_launch: Option<ManagedRuntimeLaunchReceipt>,
 }
@@ -158,6 +159,12 @@ impl ValidatedLaunchCommand {
             natives
                 .revalidate()
                 .map_err(|_| LaunchPlanError::ArtifactChanged)?;
+        }
+        if let Some(libraries) = &self.game_libraries {
+            libraries.revalidate().map_err(|error| match error.kind() {
+                std::io::ErrorKind::WouldBlock => LaunchPlanError::InspectionLimit,
+                _ => LaunchPlanError::ArtifactChanged,
+            })?;
         }
         Ok(())
     }

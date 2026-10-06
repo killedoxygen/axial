@@ -290,7 +290,14 @@ impl LaunchCoordinator {
                 // The task owner keeps the exact extraction even if a later
                 // preparation step panics before handing it to the session.
                 let native_retention = Arc::new(Mutex::new(None));
-                let retained = (admitted.clone(), native_retention.clone());
+                let library_retention = Arc::new(super::libraries::Retention::new(
+                    admitted.game_directory().clone(),
+                ));
+                let retained = (
+                    admitted.clone(),
+                    native_retention.clone(),
+                    library_retention.clone(),
+                );
                 let coordinator = self.clone();
                 let failure_key = key.clone();
                 if let Err(error) = self.tasks.try_spawn(retained, move |cancel| async move {
@@ -311,6 +318,7 @@ impl LaunchCoordinator {
                             &cancel,
                             context,
                             &native_retention,
+                            library_retention.clone(),
                             telemetry.clone(),
                         )
                         .await
@@ -340,6 +348,7 @@ impl LaunchCoordinator {
                         }
                         Err(error) => Err(error),
                     };
+                    super::libraries::settle(library_retention).await;
                     if result.is_err() {
                         telemetry.failure(None);
                     }
@@ -470,6 +479,10 @@ impl LaunchCoordinator {
                             .ready_version(&pin, &admitted.record().instance.version_id)
                             .await
                             .map_err(install_read_error)?;
+                        let (installed, _) = installed
+                            .prepare_game_libraries()
+                            .await
+                            .map_err(game_libraries_error)?;
                         let proof = Arc::new(PreflightArtifacts {
                             pin,
                             _lease: artifacts,
@@ -628,6 +641,7 @@ impl LaunchCoordinator {
         cancellation: &CancellationToken,
         context: Option<super::reports::LaunchProofScenario>,
         native_retention: &Mutex<Option<Arc<crate::install::vanilla::PreparedNatives>>>,
+        library_retention: Arc<super::libraries::Retention>,
         telemetry: Arc<super::session::LaunchAttemptTelemetry>,
     ) -> Result<PreparedSession, LaunchError> {
         let (selection, mut effective, player_name) =
@@ -646,7 +660,6 @@ impl LaunchCoordinator {
         {
             return Err(LaunchError::InstanceChanged);
         }
-        let mode = crate::performance::plan::configured_mode(effective.performance_mode);
         let library_operation = admitted
             .generation()
             .managed_library()
@@ -662,6 +675,11 @@ impl LaunchCoordinator {
             .ready_version(admitted.generation(), &instance.version_id)
             .await
             .map_err(|_| LaunchError::InstallUnavailable)?;
+        let (installed, game_libraries) = installed
+            .prepare_game_libraries()
+            .await
+            .map_err(game_libraries_error)?;
+        let mode = crate::performance::plan::configured_mode(effective.performance_mode);
         let version = installed.version();
         let required = axial_minecraft::effective_java_version_for(
             &instance.minecraft_version,
@@ -745,6 +763,12 @@ impl LaunchCoordinator {
             effective.max_memory_mb,
             [&library_dir, &game_dir],
         );
+        let game_libraries = match game_libraries {
+            Some(inputs) => {
+                Some(super::libraries::prepare(inputs, library_retention, cancellation).await?)
+            }
+            None => None,
+        };
         let prepared_natives = installed
             .prepare_natives(&library_operation, &library_dir, &environment)
             .await
@@ -758,7 +782,7 @@ impl LaunchCoordinator {
             if cancellation.is_cancelled() {
                 return Err(LaunchError::Cancelled);
             }
-            let command = super::plan::build(LaunchPlanRequest {
+            let mut command = super::plan::build(LaunchPlanRequest {
                 library_operation,
                 library_dir,
                 target_version_id: instance.minecraft_version.clone(),
@@ -775,6 +799,7 @@ impl LaunchCoordinator {
                 tracing::warn!(?error, stage = "build", "Launch plan rejected.");
                 LaunchError::PlanRejected
             })?;
+            command.game_libraries = game_libraries;
             if cancellation.is_cancelled() {
                 return Err(LaunchError::Cancelled);
             }
@@ -937,6 +962,29 @@ fn install_read_error(error: InstallError) -> LaunchError {
         InstallError::AtCapacity => LaunchError::AtCapacity,
         InstallError::Closed => LaunchError::Closed,
         _ => LaunchError::LibraryUnavailable,
+    }
+}
+
+fn game_libraries_error(error: crate::install::artifacts::GameLibrariesError) -> LaunchError {
+    use crate::install::artifacts::GameLibrariesError;
+
+    match error {
+        GameLibrariesError::Install(error) => install_read_error(error),
+        GameLibrariesError::Physical(error) => physical_work_error(error),
+    }
+}
+
+pub(super) fn physical_work_error(error: axial_resource::PhysicalWorkError) -> LaunchError {
+    use axial_resource::PhysicalWorkError;
+    match error {
+        PhysicalWorkError::Closed => LaunchError::Closed,
+        PhysicalWorkError::Cancelled => LaunchError::Cancelled,
+        PhysicalWorkError::ScratchLimit
+        | PhysicalWorkError::WorkerLimit
+        | PhysicalWorkError::Unavailable => LaunchError::AtCapacity,
+        PhysicalWorkError::Deadline | PhysicalWorkError::TaskStopped => {
+            LaunchError::PreparationFailed
+        }
     }
 }
 
@@ -2452,6 +2500,188 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn historical_fml_client_requires_install_before_launch() {
+        use crate::instances::create::{CreateInstanceRequest, CreateTarget, InstanceService};
+        use base64::Engine;
+        use std::io::{Cursor, Write};
+        use std::time::Duration;
+
+        let (root, mut coordinator, _) = preflight_fixture().await;
+        let storage = Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
+        let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
+        coordinator.sessions =
+            SessionManager::with_reports(coordinator.tasks.clone(), reports.clone());
+        let coordinator = coordinator.with_storage(storage, reports.clone()).unwrap();
+        let target = CreateTarget::loader_for_tests(
+            axial_minecraft::LoaderComponentId::Forge,
+            "1.4.7",
+            "6.6.2.534",
+        )
+        .unwrap();
+        let version_id = target.version_id().to_owned();
+        let instance =
+            InstanceService::new(coordinator.instances.clone(), coordinator.tasks.clone())
+                .create(
+                    CreateInstanceRequest {
+                        name: "Historical FML".into(),
+                        selection_id: target.selection_id().into(),
+                        ..Default::default()
+                    },
+                    target,
+                )
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap();
+        let declaration = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("../../../minecraft/tests/fixtures/fml-libraries.base64").trim())
+            .unwrap();
+        assert_eq!(declaration.len(), 1172);
+        assert_eq!(
+            hex::encode(Sha256::digest(&declaration)),
+            "dbccc9ce173f5db2f24cbb566d39fd9b784be8710d6bc791087efe22bf967b4a"
+        );
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "cpw/mods/fml/relauncher/CoreFMLLibraries.class",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(&declaration).unwrap();
+        let client = archive.finish().unwrap().into_inner();
+        crate::install::queue::tests::install_ready_fixture_with_client(
+            &coordinator.installs,
+            &version_id,
+            client.clone(),
+        )
+        .await;
+
+        let pin = coordinator.instances.library().admit().unwrap();
+        let installed = coordinator
+            .installs
+            .ready_version(&pin, &version_id)
+            .await
+            .unwrap();
+        installed.revalidate().unwrap();
+        assert!(installed.version().libraries.is_empty());
+        let operation = pin.managed_library().unwrap();
+        assert!(
+            installed
+                .prepare_natives(
+                    &operation,
+                    root.path(),
+                    &axial_minecraft::default_environment(),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let java = root.path().join("probe-java");
+        std::fs::write(
+            &java,
+            format!(
+                "#!/bin/sh\nprobe_dir=${{0%/*}}\nif [ \"$#\" -eq 2 ] && [ \"$1\" = '-XshowSettings:properties' ] && [ \"$2\" = '-version' ]; then\n  printf 'java.version = 21.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\nelse\n  printf 'unexpected game invocation' > \"$probe_dir/game-started\"\n  exit 1\nfi\n",
+                std::env::consts::ARCH,
+            ),
+        )
+        .unwrap();
+        assert_eq!(installed.version().java_version.major_version, 21);
+        coordinator
+            .runtimes
+            .select(
+                &installed.version().java_version,
+                java.to_str().unwrap(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let admitted = coordinator.instances.admit(&instance.id).unwrap();
+        admitted.validate_current().unwrap();
+        let game = admitted.game_directory().read_projection().unwrap();
+        drop(admitted);
+        let canary = game.join("lib/user.jar");
+        std::fs::create_dir_all(canary.parent().unwrap()).unwrap();
+        std::fs::write(&canary, b"unrelated instance library").unwrap();
+        let maven = root
+            .path()
+            .join("libraries/org/ow2/asm/asm-all/4.0/asm-all-4.0.jar");
+        std::fs::create_dir_all(maven.parent().unwrap()).unwrap();
+        std::fs::write(&maven, b"unrelated Maven artifact").unwrap();
+        let names = || {
+            let mut names = std::fs::read_dir(&game)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let before = names();
+        let record = coordinator
+            .instances
+            .registry()
+            .get_live(&instance.id)
+            .unwrap();
+        let request = LaunchRequest {
+            instance_id: instance.id.clone(),
+            username: None,
+            ..request()
+        };
+        let key = request.intent_key.clone().unwrap();
+        let preflight = coordinator.preflight(instance.id.clone()).await;
+        let launched =
+            tokio::time::timeout(Duration::from_secs(5), coordinator.launch(request)).await;
+        coordinator
+            .sessions
+            .shutdown(Duration::from_secs(3))
+            .await
+            .unwrap();
+        coordinator
+            .tasks
+            .shutdown(Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            launched.expect("the launch request must settle"),
+            Err(LaunchError::InstallUnavailable),
+            "historical FML input receipts require ordinary Install before game launch"
+        );
+        assert!(!preflight.launchable);
+        assert_eq!(
+            preflight.error.unwrap().code,
+            LaunchError::InstallUnavailable
+        );
+        assert!(matches!(
+            coordinator.intent(&key).unwrap(),
+            Some(LaunchIntentStatus::Rejected { error }) if error.code == LaunchError::InstallUnavailable
+        ));
+        assert!(coordinator.sessions.snapshots().is_empty());
+        assert!(reports.list_recent(10).unwrap().is_empty());
+        assert!(!root.path().join("game-started").exists());
+        assert!(!root.path().join("libraries/fml").exists());
+        assert_eq!(names(), before);
+        assert_eq!(std::fs::read_dir(game.join("lib")).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read(canary).unwrap(),
+            b"unrelated instance library"
+        );
+        assert_eq!(std::fs::read(maven).unwrap(), b"unrelated Maven artifact");
+        assert_eq!(std::fs::read(installed.client_jar()).unwrap(), client);
+        assert_eq!(
+            coordinator
+                .instances
+                .registry()
+                .get_live(&instance.id)
+                .unwrap(),
+            record
+        );
+        installed.revalidate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn preflight_projection_reuses_verified_install_but_ordinary_reads_stay_fresh() {
         let (root, coordinator, id) = preflight_fixture().await;
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
@@ -2654,6 +2884,87 @@ mod tests {
             3
         );
         assert_eq!(projection.current.as_ref().unwrap().pin.generation(), after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn account_change_during_install_readiness_rejects_the_captured_launch() {
+        use std::future::Future;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (root, coordinator, id) = preflight_fixture().await;
+            std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+            let admitted = coordinator.admit(&id).unwrap();
+            let native_retention = Mutex::new(None);
+            let library_retention = Arc::new(super::super::libraries::Retention::new(
+                admitted.game_directory().clone(),
+            ));
+            let cancellation = CancellationToken::new();
+            let mut request = request();
+            request.instance_id = id;
+            request.username = None;
+            let telemetry = super::super::session::LaunchAttemptTelemetry::started(None, "vanilla");
+
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = entered.send(());
+                released.recv_timeout(Duration::from_secs(5))
+            });
+            let started = started.await;
+            let preparation = coordinator.prepare(
+                admitted,
+                &request,
+                &cancellation,
+                None,
+                &native_retention,
+                library_retention.clone(),
+                telemetry,
+            );
+            tokio::pin!(preparation);
+            // Poll the actual owner once: ready_version cannot finish while
+            // its only blocking worker is held. No timing sleep selects this window.
+            let first =
+                std::future::poll_fn(|context| Poll::Ready(preparation.as_mut().poll(context)))
+                    .await;
+            let was_pending = first.is_pending();
+            let changed = coordinator.accounts.create_offline_account("Elsewhere");
+            let released = release.send(());
+            let blocker = blocker.await;
+            let result = match first {
+                Poll::Pending => preparation.await,
+                Poll::Ready(result) => result,
+            };
+            let result = match result {
+                Ok(prepared) => {
+                    super::super::prepare::settle_natives(prepared.natives()).await;
+                    drop(prepared);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            };
+            super::super::libraries::settle(library_retention).await;
+            let sessions = coordinator.sessions.shutdown(Duration::from_secs(3)).await;
+            let tasks = coordinator.tasks.shutdown(Duration::from_secs(3)).await;
+
+            assert!(
+                started.is_ok() && was_pending,
+                "preparation did not await installation readiness"
+            );
+            changed.unwrap();
+            released.unwrap();
+            blocker.unwrap().unwrap();
+            sessions.unwrap();
+            tasks.unwrap();
+            assert_eq!(result, Err(LaunchError::AccountChanged));
+        });
     }
 
     #[cfg(unix)]
