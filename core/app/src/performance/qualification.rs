@@ -8,6 +8,7 @@ use super::proofs::{
     LaunchProofComparison, LaunchProofRecord, LaunchProofResourceBudget,
     comparison_baseline_matches_report,
 };
+use axial_minecraft::loaders::{LoaderComponentId, api::decode_installed_version_id};
 use serde_json::{Value, json};
 
 pub const FAMILY_C_QUALIFICATION_PROOF_SCAN_LIMIT: usize = 100;
@@ -442,7 +443,7 @@ fn family_c_qualification_target_payload(
             if proof.scenario.benchmark_mode.as_deref() != Some(FAMILY_C_QUALIFICATION_MODE) {
                 missing.push("proof_mode_mismatch");
             }
-            if family_c_proof_version(proof) != Some(FAMILY_C_QUALIFICATION_VERSION) {
+            if family_c_proof_version(proof).as_deref() != Some(FAMILY_C_QUALIFICATION_VERSION) {
                 missing.push("proof_version_mismatch");
             }
             if proof.scenario.performance_mode.trim() != target.performance_mode {
@@ -778,6 +779,7 @@ fn family_c_qualification_proof_payload(
             .map(|value| bounded_descriptor_token(value, "mode")),
         "performance_mode": bounded_descriptor_token(&proof.scenario.performance_mode, "mode"),
         "version": family_c_proof_version(proof)
+            .as_deref()
             .map(|value| bounded_descriptor_token(value, "version")),
         "outcome": bounded_descriptor_token(&proof.outcome, "outcome"),
         "comparison": comparison.unwrap_or_else(|| json!({ "present": false })),
@@ -845,8 +847,8 @@ fn family_c_qualification_target_ready(target: &Value) -> bool {
         .is_some_and(Vec::is_empty)
 }
 
-fn family_c_proof_version(proof: &LaunchProofRecord) -> Option<&str> {
-    proof
+fn family_c_proof_version(proof: &LaunchProofRecord) -> Option<String> {
+    let version = proof
         .scenario
         .version_id
         .as_deref()
@@ -855,7 +857,13 @@ fn family_c_proof_version(proof: &LaunchProofRecord) -> Option<&str> {
         .or_else(|| {
             let value = proof.version_id.trim();
             (!value.is_empty() && value != "unknown").then_some(value)
-        })
+        })?;
+    Some(match decode_installed_version_id(version) {
+        Ok(identity) if identity.component_id() == LoaderComponentId::Forge => {
+            identity.minecraft_version().to_owned()
+        }
+        _ => version.to_owned(),
+    })
 }
 
 fn family_c_qualification_outcome_is_acceptable(outcome: &str) -> bool {
@@ -890,4 +898,155 @@ struct FamilyCManagedComparisonEvidence {
     metric_valid: bool,
     samples_present: bool,
     values_present: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::launch::{
+        outcome::{SessionExitReason, SessionOutcome, SessionOutcomeKind},
+        reports::{SessionReportInput, decode_report, encode_report},
+    };
+    use crate::performance::benchmarks::{
+        benchmark_suite_manifest_run_inputs, benchmark_suite_plan,
+    };
+    use axial_minecraft::loaders::{LoaderComponentId, installed_version_id_for};
+
+    fn baseline_payload(version: &str, scenario_version: Option<&str>) -> Value {
+        let plan = benchmark_suite_plan(FAMILY_C_QUALIFICATION_MODE).unwrap();
+        let mut runs = benchmark_suite_manifest_run_inputs(FAMILY_C_QUALIFICATION_MODE, &plan)
+            .into_iter()
+            .map(|run| BenchmarkSuiteManifestRun {
+                run_index: run.run_index,
+                profile: run.profile,
+                run_type: run.run_type,
+                target_id: run.target_id.unwrap(),
+                benchmark_id: run.benchmark_id,
+                session_id: None,
+                launched_at: None,
+                state: "pending".into(),
+                launch_intent: Some(uuid::Uuid::new_v4().to_string()),
+            })
+            .collect::<Vec<_>>();
+        let mut report = LaunchProofRecord::from_session(SessionReportInput {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: crate::instances::model::InstanceId::new().to_string(),
+            version_id: version.into(),
+            launched_at: "2026-01-01T00:00:00.000Z".into(),
+            ended_at: "2026-01-01T00:00:02.000Z".into(),
+            outcome: SessionOutcome {
+                kind: SessionOutcomeKind::Clean,
+                reason: SessionExitReason::CleanExit,
+                failure_class: None,
+                summary: String::new(),
+            },
+            entries: Vec::new(),
+            exit_code: Some(0),
+            boot_duration_ms: Some(1000),
+            logs_dropped: 0,
+        });
+        let baseline = &mut runs[0];
+        assert_eq!(baseline.target_id, FAMILY_C_BASELINE_TARGET_ID);
+        baseline.session_id = Some(report.session_id.clone());
+        baseline.launched_at = Some(report.launched_at.clone());
+        baseline.state = "exited".into();
+        report.scenario.performance_mode = "vanilla".into();
+        report.scenario.version_id = scenario_version.map(str::to_owned);
+        report.scenario.benchmark_profile = Some(baseline.profile.clone());
+        report.scenario.benchmark_run_type = Some(baseline.run_type.clone());
+        report.scenario.benchmark_mode = Some(FAMILY_C_QUALIFICATION_MODE.into());
+        report.scenario.benchmark_id = Some(baseline.benchmark_id.clone());
+        let report = decode_report(&encode_report(&report).unwrap()).unwrap();
+        super::super::proofs::validate_proof(&report).unwrap();
+        assert_eq!(report.version_id, version);
+        assert_eq!(
+            report.scenario.version_id.as_deref(),
+            scenario_version.filter(|value| !value.is_empty())
+        );
+        let manifest = BenchmarkSuiteManifest {
+            schema: "axial.launch.benchmark.suite".into(),
+            schema_version: 2,
+            suite_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: report.instance_id.clone(),
+            mode: FAMILY_C_QUALIFICATION_MODE.into(),
+            created_at: report.launched_at.clone(),
+            updated_at: report.recorded_at.clone(),
+            runs,
+        };
+        let payload = qualification_payload(&manifest, &[report], None, true);
+        assert_eq!(payload["status"], "incomplete");
+        let baseline = &payload["targets"][0];
+        assert_eq!(baseline["role"], "baseline");
+        assert_eq!(baseline["proof"]["present"], true);
+        assert_eq!(baseline["proof"]["outcome"], "exited");
+        let other_missing = baseline["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .filter(|value| *value != "proof_version_mismatch")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            other_missing,
+            [
+                "proof_resource_budget_missing",
+                "proof_resource_cpu_evidence_missing",
+                "proof_resource_disk_evidence_missing",
+                "proof_resource_install_evidence_missing",
+                "proof_resource_memory_evidence_missing",
+            ]
+        );
+        baseline.clone()
+    }
+
+    fn version_matches(baseline: &Value) -> bool {
+        !baseline["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "proof_version_mismatch")
+    }
+
+    #[test]
+    fn canonical_forge_report_matches_family_c_version() {
+        for build in ["14.23.5.2860", "14.23.5.2859"] {
+            let version =
+                installed_version_id_for(LoaderComponentId::Forge, "1.12.2", build).unwrap();
+            let baseline = baseline_payload(&version, Some(&version));
+            assert!(version_matches(&baseline), "Forge {build}");
+            assert_eq!(baseline["proof"]["version"], "1.12.2");
+        }
+    }
+
+    #[test]
+    fn scenario_version_precedes_report_version_with_absent_or_unknown_fallback() {
+        let current =
+            installed_version_id_for(LoaderComponentId::Forge, "1.12.2", "14.23.5.2860").unwrap();
+        let other =
+            installed_version_id_for(LoaderComponentId::Forge, "1.7.10", "10.13.4.1614").unwrap();
+        let baseline = baseline_payload(&other, Some(&current));
+        assert!(version_matches(&baseline));
+        assert_eq!(baseline["proof"]["version"], "1.12.2");
+        assert!(!version_matches(&baseline_payload(&current, Some(&other))));
+        let fabric =
+            installed_version_id_for(LoaderComponentId::Fabric, "1.12.2", "0.19.5").unwrap();
+        assert!(!version_matches(&baseline_payload(&current, Some(&fabric))));
+        for scenario in [None, Some(""), Some("unknown")] {
+            let baseline = baseline_payload(&current, scenario);
+            assert!(version_matches(&baseline));
+            assert_eq!(baseline["proof"]["version"], "1.12.2");
+        }
+    }
+
+    #[test]
+    fn different_minecraft_or_loader_does_not_qualify_as_family_c_forge() {
+        for (loader, minecraft, build) in [
+            (LoaderComponentId::Forge, "1.7.10", "10.13.4.1614"),
+            (LoaderComponentId::Fabric, "1.12.2", "0.19.5"),
+        ] {
+            let version = installed_version_id_for(loader, minecraft, build).unwrap();
+            let baseline = baseline_payload(&version, Some(&version));
+            assert!(!version_matches(&baseline));
+        }
+    }
 }
