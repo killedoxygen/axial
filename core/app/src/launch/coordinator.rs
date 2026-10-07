@@ -3053,21 +3053,23 @@ mod tests {
         )
         .unwrap();
         let version_id = target.version_id().to_owned();
-        let instance =
-            InstanceService::new(coordinator.instances.clone(), coordinator.tasks.clone())
-                .create(
-                    CreateInstanceRequest {
-                        name: "Historical FML".into(),
-                        selection_id: target.selection_id().into(),
-                        ..Default::default()
-                    },
-                    target,
-                )
-                .unwrap()
-                .join()
-                .await
-                .unwrap()
-                .unwrap();
+        let instances =
+            InstanceService::new(coordinator.instances.clone(), coordinator.tasks.clone());
+        let instance = instances
+            .create(
+                CreateInstanceRequest {
+                    name: "Historical FML".into(),
+                    selection_id: target.selection_id().into(),
+                    ..Default::default()
+                },
+                target,
+                instances.creation_admission_for_tests().await.unwrap(),
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
         let declaration = base64::engine::general_purpose::STANDARD
             .decode(include_str!("../../../minecraft/tests/fixtures/fml-libraries.base64").trim())
             .unwrap();
@@ -5019,7 +5021,8 @@ mod tests {
         let directories =
             InstanceDirectories::new(Registry::new(storage.clone()), library, Exclusions::new());
         let tasks = TaskOwner::new(4).unwrap();
-        let instance = InstanceService::new(directories.clone(), tasks)
+        let instances = InstanceService::new(directories.clone(), tasks);
+        let instance = instances
             .create(
                 CreateInstanceRequest {
                     name: "Restart binding".into(),
@@ -5032,6 +5035,7 @@ mod tests {
                     minecraft_version: "1.20.1".into(),
                     loader_key: "vanilla".into(),
                 },
+                instances.creation_admission_for_tests().await.unwrap(),
             )
             .unwrap()
             .join()

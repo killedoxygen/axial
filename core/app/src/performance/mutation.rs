@@ -1606,7 +1606,8 @@ mod tests {
         use crate::instances::create::{CreateTarget, InstanceService, tests::request};
         let mut request = request(&format!("Pending budget {}", uuid::Uuid::new_v4()));
         request.selection_id = "fixture-fabric".into();
-        let instance = InstanceService::new(service.instances.clone(), service.tasks.clone())
+        let instances = InstanceService::new(service.instances.clone(), service.tasks.clone());
+        let instance = instances
             .create(
                 request,
                 CreateTarget {
@@ -1615,6 +1616,7 @@ mod tests {
                     minecraft_version: "1.21.4".into(),
                     loader_key: "fabric".into(),
                 },
+                instances.creation_admission_for_tests().await.unwrap(),
             )
             .unwrap()
             .join()
@@ -2250,6 +2252,7 @@ mod tests {
                     minecraft_version: "1.21.4".into(),
                     loader_key: "fabric".into(),
                 },
+                instances.creation_admission_for_tests().await.unwrap(),
             )
             .unwrap()
             .join()
@@ -3301,6 +3304,7 @@ mod tests {
                     minecraft_version: "1.21.4".into(),
                     loader_key: "fabric".into(),
                 },
+                instances.creation_admission_for_tests().await.unwrap(),
             )
             .unwrap()
             .join()

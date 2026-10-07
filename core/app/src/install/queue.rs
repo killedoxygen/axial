@@ -577,6 +577,32 @@ impl InstallQueue {
         self.enqueue_with_placement(request, None, false).await
     }
 
+    pub(crate) async fn enqueue_creation(
+        &self,
+        request: InstallQueueRequest,
+        version_id: &str,
+        admission: &crate::instances::create::Admission,
+    ) -> Result<InstallQueueStateResponse, InstallError> {
+        let item = self.resolve_target(&request).await?;
+        if item.version_id != version_id {
+            return Err(InstallError::InvalidRequest);
+        }
+        let pin = admission.generation().clone();
+        let operation = pin
+            .managed_library()
+            .map_err(|_| InstallError::LibraryUnavailable)?;
+        let guard = axial_minecraft::VersionBundleReadGuard::acquire(&operation)
+            .map_err(|_| InstallError::LibraryUnavailable)?;
+        admission
+            .validate()
+            .map_err(|_| InstallError::LibraryUnavailable)?;
+        let result = self.enqueue_resolved(request, item, pin, None, false);
+        drop(guard);
+        drop(operation);
+        self.resume_queued();
+        result
+    }
+
     pub async fn retry(
         &self,
         request: InstallQueueRequest,
@@ -825,22 +851,31 @@ impl InstallQueue {
                 .admit()
                 .map_err(|_| InstallError::LibraryUnavailable)?,
         };
-        let result = {
-            let mut state = self.inner.state.lock().expect("install queue lock");
-            let result = self.admit_locked(&mut state, request, item, pin, setup, front);
-            publish(&self.inner, &mut state);
-            result.map(|id| {
-                project_with_started(
-                    &state,
-                    state
-                        .entries
-                        .get(&id)
-                        .map(|entry| start_response(&entry.status)),
-                )
-            })
-        };
+        let result = self.enqueue_resolved(request, item, pin, setup, front);
         self.resume_queued();
         result
+    }
+
+    fn enqueue_resolved(
+        &self,
+        request: InstallQueueRequest,
+        item: InstallQueueInstallItemViewModel,
+        pin: GenerationPin,
+        setup: Option<SetupWork>,
+        front: bool,
+    ) -> Result<InstallQueueStateResponse, InstallError> {
+        let mut state = self.inner.state.lock().expect("install queue lock");
+        let result = self.admit_locked(&mut state, request, item, pin, setup, front);
+        publish(&self.inner, &mut state);
+        result.map(|id| {
+            project_with_started(
+                &state,
+                state
+                    .entries
+                    .get(&id)
+                    .map(|entry| start_response(&entry.status)),
+            )
+        })
     }
 
     fn admit_locked(
@@ -882,6 +917,15 @@ impl InstallQueue {
             .find(|(_, entry)| !entry.status.done && entry.request == request)
             .map(|(id, _)| id.clone())
         {
+            let existing = state.entries.get(&existing_id).expect("existing install");
+            if existing.item != item
+                || !existing.pin.as_ref().is_some_and(|existing| {
+                    existing.library_id() == pin.library_id()
+                        && existing.generation() == pin.generation()
+                })
+            {
+                return Err(InstallError::LibraryUnavailable);
+            }
             if front && state.queued.iter().any(|id| id == &existing_id) {
                 self.inner.storage.transaction(|db| {
                     db.execute("UPDATE install_queue SET accepted_at=(SELECT MIN(accepted_at)-1 FROM install_queue WHERE phase='queued') WHERE id=?1", [&existing_id])?;

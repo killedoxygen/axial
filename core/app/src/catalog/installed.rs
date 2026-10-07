@@ -13,6 +13,10 @@ pub(crate) struct InstalledSnapshot {
 }
 
 impl InstalledSnapshot {
+    pub(crate) fn versions(&self) -> &[VersionEntry] {
+        &self.snapshot.report.versions
+    }
+
     pub(crate) fn is_degraded(&self) -> bool {
         self.snapshot.report.state == VersionScanState::Degraded
     }

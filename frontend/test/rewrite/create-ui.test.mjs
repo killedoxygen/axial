@@ -347,6 +347,27 @@ test('create options retain every loader, backend labels, disabled reasons, defa
   assert.equal(parsed.versions[0].display_name, 'Backend version label');
 });
 
+test('create notices preserve omitted detail and backend guidance', () => {
+  const response = {
+    ...view(),
+    notices: [
+      { state_id: 'catalog_unavailable', tone: 'warn', message: 'Catalog unavailable' },
+      {
+        state_id: 'library_scan_degraded',
+        tone: 'warn',
+        message: 'Installed versions are unavailable',
+        detail: 'Could not verify installed versions. Check the library folder and try again.',
+      },
+    ],
+  };
+  const parsed = ui.createBackendViewResponse(response);
+  assert.equal(parsed.notices[0].detail, undefined);
+  assert.equal(
+    parsed.notices[1].detail,
+    'Could not verify installed versions. Check the library folder and try again.',
+  );
+});
+
 function lifecycleView() {
   // Current SetupService::create_view wire values, including the five lifecycle
   // channels, stable default and no legacy-only tags/build attachment fields.

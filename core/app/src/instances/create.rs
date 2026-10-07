@@ -81,6 +81,51 @@ pub struct CreateTarget {
     pub(crate) loader_key: String,
 }
 
+#[derive(Clone)]
+pub struct Admission {
+    pin: GenerationPin,
+    scan: Arc<crate::catalog::InstalledSnapshot>,
+}
+
+impl Admission {
+    pub(super) async fn capture(pin: GenerationPin) -> InstanceResult<Self> {
+        let scan = crate::catalog::installed_snapshot(&pin)
+            .await
+            .map_err(|_| InstanceError::VersionUnavailable)?;
+        Ok(Self {
+            pin,
+            scan: Arc::new(scan),
+        })
+    }
+
+    pub(crate) fn generation(&self) -> &GenerationPin {
+        &self.pin
+    }
+
+    pub(super) fn scan(&self) -> &crate::catalog::InstalledSnapshot {
+        &self.scan
+    }
+
+    pub(crate) fn validate(&self) -> InstanceResult<()> {
+        self.scan
+            .revalidate_for(&self.pin)
+            .map_err(|_| InstanceError::VersionUnavailable)?;
+        if self.scan.is_degraded() {
+            return Err(InstanceError::InstalledVersionsDegraded);
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for Admission {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output
+            .debug_struct("Admission")
+            .field("pin", &self.pin)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CreateTarget {
     #[cfg(any(test, feature = "test-support"))]
     pub fn loader_for_tests(
@@ -753,13 +798,10 @@ impl InstanceService {
         &self,
         request: CreateInstanceRequest,
         target: CreateTarget,
+        admission: Admission,
     ) -> InstanceResult<TaskHandle<InstanceResult<Instance>>> {
         let instance = build_instance(request, &target)?;
-        let pin = self
-            .directories
-            .library()
-            .admit()
-            .map_err(|_| InstanceError::LibraryUnavailable)?;
+        let pin = admission.generation().clone();
         let lease = self
             .directories
             .exclusions()
@@ -767,9 +809,18 @@ impl InstanceService {
             .map_err(|_| InstanceError::Busy)?;
         let service = self.for_operation(instance.id.clone());
         self.tasks
-            .try_spawn((pin.clone(), lease.clone()), move |cancel| async move {
-                service.publish_instance(instance, pin, lease, None, None, cancel)
-            })
+            .try_spawn(
+                (admission.clone(), lease.clone()),
+                move |cancel| async move {
+                    let operation = pin
+                        .managed_library()
+                        .map_err(|_| InstanceError::LibraryUnavailable)?;
+                    let _guard = axial_minecraft::VersionBundleReadGuard::acquire(&operation)
+                        .map_err(|_| InstanceError::VersionUnavailable)?;
+                    admission.validate()?;
+                    service.publish_instance(instance, pin, lease, None, None, cancel)
+                },
+            )
             .map_err(|_| InstanceError::Closed)
     }
 
@@ -777,14 +828,11 @@ impl InstanceService {
         &self,
         request: CreateInstanceRequest,
         target: CreateTarget,
+        admission: Admission,
         setup: SetupIntent,
     ) -> InstanceResult<TaskHandle<InstanceResult<super::directory::RegisteredInstance>>> {
         let instance = build_instance(request, &target)?;
-        let pin = self
-            .directories
-            .library()
-            .admit()
-            .map_err(|_| InstanceError::LibraryUnavailable)?;
+        let pin = admission.generation().clone();
         let lease = self
             .directories
             .exclusions()
@@ -792,23 +840,49 @@ impl InstanceService {
             .map_err(|_| InstanceError::Busy)?;
         let service = self.for_operation(instance.id.clone());
         self.tasks
-            .try_spawn((pin.clone(), lease.clone()), move |cancel| async move {
-                let instance = service.publish_instance(
-                    instance,
-                    pin.clone(),
-                    lease.clone(),
-                    None,
-                    Some(setup),
-                    cancel,
-                )?;
-                super::directory::InstanceDirectories::admit_record(
-                    service.registry().clone(),
-                    service.registry().get_live(&instance.id)?,
-                    pin,
-                    lease,
-                )
-            })
+            .try_spawn(
+                (admission.clone(), lease.clone()),
+                move |cancel| async move {
+                    let operation = pin
+                        .managed_library()
+                        .map_err(|_| InstanceError::LibraryUnavailable)?;
+                    let _guard = axial_minecraft::VersionBundleReadGuard::acquire(&operation)
+                        .map_err(|_| InstanceError::VersionUnavailable)?;
+                    admission.validate()?;
+                    let instance = service.publish_instance(
+                        instance,
+                        pin.clone(),
+                        lease.clone(),
+                        None,
+                        Some(setup),
+                        cancel,
+                    )?;
+                    super::directory::InstanceDirectories::admit_record(
+                        service.registry().clone(),
+                        service.registry().get_live(&instance.id)?,
+                        pin,
+                        lease,
+                    )
+                },
+            )
             .map_err(|_| InstanceError::Closed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn creation_admission_for_tests(&self) -> InstanceResult<Admission> {
+        let pin = self
+            .directories
+            .library()
+            .admit()
+            .map_err(|_| InstanceError::LibraryUnavailable)?;
+        self.tasks
+            .try_spawn(pin.clone(), move |_cancel| async move {
+                Admission::capture(pin).await
+            })
+            .map_err(|_| InstanceError::Closed)?
+            .join()
+            .await
+            .map_err(|_| InstanceError::Closed)?
     }
 
     pub fn update(
@@ -1253,7 +1327,11 @@ pub(crate) mod tests {
 
     pub(crate) async fn create(service: &InstanceService, name: &str) -> Instance {
         service
-            .create(request(name), target())
+            .create(
+                request(name),
+                target(),
+                service.creation_admission_for_tests().await.unwrap(),
+            )
             .unwrap()
             .join()
             .await
@@ -1284,7 +1362,11 @@ pub(crate) mod tests {
         assert!(service.pending().unwrap().is_empty());
         assert!(matches!(
             service
-                .create(request("Weekend / friends"), target())
+                .create(
+                    request("Weekend / friends"),
+                    target(),
+                    service.creation_admission_for_tests().await.unwrap()
+                )
                 .unwrap()
                 .join()
                 .await
@@ -1314,7 +1396,11 @@ pub(crate) mod tests {
         );
         assert!(
             service
-                .create(request(&instance.name), target())
+                .create(
+                    request(&instance.name),
+                    target(),
+                    service.creation_admission_for_tests().await.unwrap()
+                )
                 .unwrap()
                 .join()
                 .await
@@ -1697,7 +1783,12 @@ pub(crate) mod tests {
             request_json: "{}".into(),
         };
         let admitted = service
-            .create_admitted(request("Content pending"), target(), setup)
+            .create_admitted(
+                request("Content pending"),
+                target(),
+                service.creation_admission_for_tests().await.unwrap(),
+                setup,
+            )
             .unwrap()
             .join()
             .await
@@ -1723,6 +1814,7 @@ pub(crate) mod tests {
             .create_admitted(
                 request("Pending at exit"),
                 target(),
+                service.creation_admission_for_tests().await.unwrap(),
                 SetupIntent {
                     plan_id: uuid::Uuid::new_v4().to_string(),
                     request_json: "{}".into(),
@@ -1813,7 +1905,15 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn dropped_http_waiter_does_not_cancel_accepted_create() {
         let (_root, service) = fixture();
-        drop(service.create(request("Accepted"), target()).unwrap());
+        drop(
+            service
+                .create(
+                    request("Accepted"),
+                    target(),
+                    service.creation_admission_for_tests().await.unwrap(),
+                )
+                .unwrap(),
+        );
         for _ in 0..100 {
             if !service.registry().list().unwrap().is_empty() {
                 break;

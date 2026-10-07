@@ -307,6 +307,7 @@ pub(super) mod tests {
                     minecraft_version: version_id.into(),
                     loader_key: "vanilla".into(),
                 },
+                instances.creation_admission_for_tests().await.unwrap(),
             )
             .unwrap()
             .join()

@@ -847,6 +847,7 @@ mod tests {
                     minecraft_version: "1.21.4".into(),
                     loader_key: "vanilla".into(),
                 },
+                service.creation_admission_for_tests().await.unwrap(),
             )
             .unwrap()
             .join()
@@ -1093,6 +1094,7 @@ mod tests {
             .create_admitted(
                 creation::request("Queued setup"),
                 creation::target(),
+                service.creation_admission_for_tests().await.unwrap(),
                 super::super::create::SetupIntent {
                     plan_id: uuid::Uuid::new_v4().to_string(),
                     request_json: "{}".into(),

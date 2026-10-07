@@ -89,6 +89,11 @@ async fn external_selection_precedes_instance_composition_and_survives_reopen() 
                 ..Default::default()
             },
             target,
+            services
+                .instances
+                .creation_admission_for_tests()
+                .await
+                .unwrap(),
         )
         .unwrap()
         .join()
@@ -485,6 +490,11 @@ async fn pending_external_instance_exit_helper() {
                 ..Default::default()
             },
             target,
+            services
+                .instances
+                .creation_admission_for_tests()
+                .await
+                .unwrap(),
         )
         .unwrap()
         .join()
@@ -1076,6 +1086,11 @@ async fn pending_content_exit_helper() {
                 ..Default::default()
             },
             target,
+            services
+                .instances
+                .creation_admission_for_tests()
+                .await
+                .unwrap(),
         )
         .unwrap()
         .join()

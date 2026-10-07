@@ -128,7 +128,8 @@ async fn instance_service(
 ) -> (BenchmarkService, InstanceId) {
     use crate::instances::create::{CreateInstanceRequest, CreateTarget, InstanceService};
     let (service, directories) = service_with_directories(root, storage);
-    let instance = InstanceService::new(directories, service.tasks.clone())
+    let instances = InstanceService::new(directories, service.tasks.clone());
+    let instance = instances
         .create(
             CreateInstanceRequest {
                 name: "Benchmark fixture".into(),
@@ -141,6 +142,7 @@ async fn instance_service(
                 minecraft_version: "1.21.1".into(),
                 loader_key: "vanilla".into(),
             },
+            instances.creation_admission_for_tests().await.unwrap(),
         )
         .unwrap()
         .join()

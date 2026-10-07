@@ -279,7 +279,7 @@ impl SetupService {
             &request.create.selection_id,
         )
         .map_err(pack_error)?;
-        let (target, install) = self.resolve(&prepared.target().selection_id).await?;
+        let (target, install, admission) = self.resolve(&prepared.target().selection_id).await?;
         let stored = StoredPackSetup::new(&prepared, &target, install)?;
         let setup = SetupIntent {
             plan_id: uuid::Uuid::new_v4().to_string(),
@@ -290,10 +290,10 @@ impl SetupService {
         let work = self
             .instances
             .tasks
-            .try_spawn((), move |_cancel| async move {
+            .try_spawn(admission.clone(), move |_cancel| async move {
                 let admitted = service
                     .instances
-                    .create_admitted(request.create, target, setup)?
+                    .create_admitted(request.create, target, admission, setup)?
                     .join()
                     .await
                     .map_err(|_| InstanceError::SettlementRequired)??;
@@ -557,6 +557,7 @@ mod tests {
                     ..Default::default()
                 },
                 target(),
+                service.creation_admission_for_tests().await.unwrap(),
                 SetupIntent {
                     plan_id: "03b50763-6b11-4b43-9a17-4a2bd61a006b".into(),
                     request_json: serde_json::to_string(&stored).unwrap(),

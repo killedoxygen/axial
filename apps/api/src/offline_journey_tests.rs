@@ -1020,6 +1020,11 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
                 ..Default::default()
             },
             target,
+            services
+                .instances
+                .creation_admission_for_tests()
+                .await
+                .unwrap(),
         )
         .unwrap()
         .join()
@@ -2154,186 +2159,242 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
     persisted.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_benchmark_driver_automatically_resumes_remaining_run_once() {
+#[test]
+fn real_benchmark_driver_automatically_resumes_remaining_run_once() {
+    let (runtime, _diagnostics) = benchmark_diagnostic_runtime();
+    runtime.block_on(benchmark_driver_automatically_resumes_remaining_run_once());
+}
+
+async fn benchmark_driver_automatically_resumes_remaining_run_once() {
     use axial_app::storage::StorageError;
+    use futures_util::FutureExt;
     use std::process::Stdio;
 
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
-    let provider = Provider::start(false).await;
-    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
-        .await
-        .unwrap();
-    let api = Api::new(&services);
-    api.post(
-        "/api/v1/accounts/offline",
-        json!({"username":PLAYER,"expected_selection_revision":0}),
-    )
-    .await;
-    api.request(
-        reqwest::Method::PUT,
-        "/api/v1/config",
-        Some(json!({
-            "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
-        })),
-    )
-    .await;
-    let install = api
-        .post(
-            "/api/v1/install/queue",
-            json!({"kind":"vanilla","version_id":VERSION}),
-        )
-        .await;
-    let terminal = install_terminal(&api, &install).await;
-    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
-    let created = api
-        .post(
-            "/api/v1/instances",
-            json!({
-                "name":"Automatic driver restart","selection_id":format!("vanilla|{VERSION}")
-            }),
-        )
-        .await;
-    let instance = created["id"].as_str().unwrap().to_owned();
-    assert!(created["install_queue"].is_null(), "{created}");
-    services.server.shutdown().await.unwrap();
-    drop(services);
-    provider.shutdown().await;
-
-    let mut output = std::fs::OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(temporary.path().join("driver-child.log"))
-        .unwrap();
-    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "offline_journey_tests::benchmark_pending_boundary_crash_helper",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env(DRIVER_CHILD_PROFILE, &profile)
-        .env(DRIVER_CHILD_INSTANCE, &instance)
-        .stdout(Stdio::from(output.try_clone().unwrap()))
-        .stderr(Stdio::from(output.try_clone().unwrap()))
-        .kill_on_drop(false)
-        .spawn()
-        .unwrap();
-    let helper_pid = child.id();
-    let exit = tokio::time::timeout(Duration::from_secs(60), child.wait()).await;
-    if !matches!(&exit, Ok(Ok(status)) if status.code() == Some(DRIVER_CHILD_EXIT)) {
-        let tail = fixture_child_log_tail(&mut output);
-        let preserved = temporary.keep();
-        panic!(
-            "driver boundary helper did not settle safely: {exit:?}; helper {helper_pid:?}; retained {}\n{tail}",
-            preserved.display()
+    let mut provider = None;
+    let mut services = None;
+    let journey = std::panic::AssertUnwindSafe(async {
+        provider = Some(Provider::start(false).await);
+        services = Some(
+            start_profile_with_test_endpoints(
+                profile.clone(),
+                provider.as_ref().unwrap().endpoints(),
+            )
+            .await
+            .unwrap(),
         );
-    }
-    let (driver_bytes, request, suite_bytes, first_intent_bytes, first_report_bytes) = {
-        let storage =
-            axial_app::storage::MetadataStore::open(profile.join("metadata.sqlite")).unwrap();
-        storage.read(|db| -> Result<_, StorageError> {
-            let (driver, request): (Vec<u8>, Vec<u8>) = db.query_row("SELECT payload,request FROM benchmark_drivers", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            let suite: Vec<u8> = db.query_row("SELECT payload FROM benchmark_suites WHERE suite_id=?1", [RESTART_SUITE], |row| row.get(0))?;
-            let intent: Vec<u8> = db.query_row("SELECT payload FROM launch_intents WHERE state='accepted' AND terminal_ack=1 AND settlement IS NOT NULL", [], |row| row.get(0))?;
-            let report: Vec<u8> = db.query_row("SELECT payload FROM launch_reports", [], |row| row.get(0))?;
-            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get::<_, i64>(0))?, 1);
-            Ok((driver, request, suite, intent, report))
-        }).unwrap()
-    };
-    let driver: Value = serde_json::from_slice(&driver_bytes).unwrap();
-    let original_suite: Value = serde_json::from_slice(&suite_bytes).unwrap();
-    assert_eq!(driver["state"], "waiting");
-    assert_eq!(driver["launched_run_count"], 1);
-    assert_eq!(driver["pending_run_index"], 1);
-    assert_eq!(original_suite["runs"][1]["state"], "pending");
-    assert!(original_suite["runs"][1]["session_id"].is_null());
-    let driver_id = driver["id"].as_str().unwrap();
-    let driver_path = format!("/api/v1/launch/benchmark/suite/drivers/{driver_id}");
-    let first = original_suite["runs"][0]["session_id"].as_str().unwrap();
-    let first_intent = original_suite["runs"][0]["launch_intent"].as_str().unwrap();
+        let api = Api::new(services.as_ref().unwrap());
+        api.post(
+            "/api/v1/accounts/offline",
+            json!({"username":PLAYER,"expected_selection_revision":0}),
+        )
+        .await;
+        api.request(
+            reqwest::Method::PUT,
+            "/api/v1/config",
+            Some(json!({
+                "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
+            })),
+        )
+        .await;
+        let install = api
+            .post(
+                "/api/v1/install/queue",
+                json!({"kind":"vanilla","version_id":VERSION}),
+            )
+            .await;
+        let terminal = install_terminal(&api, &install).await;
+        assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+        let created = api
+            .post(
+                "/api/v1/instances",
+                json!({
+                    "name":"Automatic driver restart","selection_id":format!("vanilla|{VERSION}")
+                }),
+            )
+            .await;
+        let instance = created["id"].as_str().unwrap().to_owned();
+        assert!(created["install_queue"].is_null(), "{created}");
+        services.as_ref().unwrap().server.shutdown().await.unwrap();
+        assert!(services.as_ref().unwrap().server.is_shutdown_settled());
+        drop(services.take());
+        provider.take().unwrap().shutdown().await;
 
-    let reopened = start_in_profile(profile.clone(), None).await.unwrap();
-    let api = Api::new(&reopened);
-    // Startup itself owns this continuation; no Resume or Tick request follows.
-    let second = wait_benchmark_run(&api, RESTART_SUITE, 1).await;
-    let second_session = second["session_id"].as_str().unwrap();
-    assert_ne!(second_session, first);
-    assert_ne!(second["launch_intent"], first_intent);
-    let processes = observe_and_stop_session(&api, second_session).await;
-    assert_fixture_processes_gone(&processes).await;
-    let complete_driver = tokio::time::timeout(Duration::from_secs(40), async {
-        loop {
-            let status = api.get(&driver_path).await;
-            if status["driver"]["state"] == "complete" {
-                break status;
-            }
-            assert!(
-                matches!(
-                    status["driver"]["state"].as_str(),
-                    Some("running" | "waiting")
-                ),
-                "{status}"
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(temporary.path().join("driver-child.log"))
+            .unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "offline_journey_tests::benchmark_pending_boundary_crash_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(DRIVER_CHILD_PROFILE, &profile)
+            .env(DRIVER_CHILD_INSTANCE, &instance)
+            .stdout(Stdio::from(output.try_clone().unwrap()))
+            .stderr(Stdio::from(output.try_clone().unwrap()))
+            .kill_on_drop(false)
+            .spawn()
+            .unwrap();
+        let helper_pid = child.id();
+        let exit = tokio::time::timeout(Duration::from_secs(60), child.wait()).await;
+        if !matches!(&exit, Ok(Ok(status)) if status.code() == Some(DRIVER_CHILD_EXIT)) {
+            let tail = fixture_child_log_tail(&mut output);
+            panic!(
+                "driver boundary helper did not settle safely: {exit:?}; helper {helper_pid:?}; retained {}\n{tail}",
+                temporary.path().display()
             );
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    })
-    .await
-    .expect("automatic driver must complete after the remaining real run");
-    assert_eq!(complete_driver["driver"]["launched_run_count"], 2);
-    assert!(complete_driver["driver"]["pending_run_index"].is_null());
-    let complete_suite = api
-        .get(&format!("/api/v1/launch/benchmark/suites/{RESTART_SUITE}"))
-        .await;
-    assert_eq!(complete_suite["runs"][0]["session_id"], first);
-    assert_eq!(complete_suite["runs"][0]["launch_intent"], first_intent);
-    assert_eq!(complete_suite["runs"][1]["session_id"], second_session);
-    assert!(
-        complete_suite["runs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|run| run["state"] == "stopped")
-    );
-    for (index, session) in [first, second_session].into_iter().enumerate() {
-        let report = api.get(&format!("/api/v1/launch/reports/{session}")).await;
-        assert_eq!(
-            report["scenario"]["benchmark_id"],
-            complete_suite["runs"][index]["benchmark_id"]
-        );
-        assert_eq!(report["session_outcome"]["kind"], "stopped");
-    }
-    reopened.server.shutdown().await.unwrap();
-    assert!(reopened.server.is_shutdown_settled());
-    drop(reopened);
+        let (driver_bytes, request, suite_bytes, first_intent_bytes, first_report_bytes) = {
+            let storage =
+                axial_app::storage::MetadataStore::open(profile.join("metadata.sqlite")).unwrap();
+            storage.read(|db| -> Result<_, StorageError> {
+                let (driver, request): (Vec<u8>, Vec<u8>) = db.query_row("SELECT payload,request FROM benchmark_drivers", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let suite: Vec<u8> = db.query_row("SELECT payload FROM benchmark_suites WHERE suite_id=?1", [RESTART_SUITE], |row| row.get(0))?;
+                let intent: Vec<u8> = db.query_row("SELECT payload FROM launch_intents WHERE state='accepted' AND terminal_ack=1 AND settlement IS NOT NULL", [], |row| row.get(0))?;
+                let report: Vec<u8> = db.query_row("SELECT payload FROM launch_reports", [], |row| row.get(0))?;
+                assert_eq!(db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get::<_, i64>(0))?, 1);
+                Ok((driver, request, suite, intent, report))
+            }).unwrap()
+        };
+        let driver: Value = serde_json::from_slice(&driver_bytes).unwrap();
+        let original_suite: Value = serde_json::from_slice(&suite_bytes).unwrap();
+        assert_eq!(driver["state"], "waiting");
+        assert_eq!(driver["launched_run_count"], 1);
+        assert_eq!(driver["pending_run_index"], 1);
+        assert_eq!(original_suite["runs"][1]["state"], "pending");
+        assert!(original_suite["runs"][1]["session_id"].is_null());
+        let driver_id = driver["id"].as_str().unwrap();
+        let driver_path = format!("/api/v1/launch/benchmark/suite/drivers/{driver_id}");
+        let first = original_suite["runs"][0]["session_id"].as_str().unwrap();
+        let first_intent = original_suite["runs"][0]["launch_intent"].as_str().unwrap();
 
-    let reopened = start_in_profile(profile, None).await.unwrap();
-    let api = Api::new(&reopened);
-    assert_eq!(api.get(&driver_path).await, complete_driver);
-    assert_eq!(
-        api.get(&format!("/api/v1/launch/benchmark/suites/{RESTART_SUITE}"))
-            .await,
-        complete_suite
-    );
-    assert_eq!(
-        api.get("/api/v1/launch/sessions").await,
-        json!({"sessions":[]})
-    );
-    reopened.instances.registry().storage().read(|db| -> Result<(), StorageError> {
-        assert_eq!(db.query_row("SELECT count(*) FROM benchmark_drivers", [], |row| row.get::<_, i64>(0))?, 1);
-        assert_eq!(db.query_row("SELECT request FROM benchmark_drivers WHERE driver_id=?1", [driver_id], |row| row.get::<_, Vec<u8>>(0))?, request);
-        assert_eq!(db.query_row("SELECT count(*) FROM launch_intents WHERE state='accepted' AND terminal_ack=1 AND settlement IS NOT NULL", [], |row| row.get::<_, i64>(0))?, 2);
-        assert_eq!(db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get::<_, i64>(0))?, 2);
-        assert_eq!(db.query_row("SELECT count(*) FROM launch_reports", [], |row| row.get::<_, i64>(0))?, 2);
-        assert_eq!(db.query_row("SELECT payload FROM launch_intents WHERE intent_key=?1", [first_intent], |row| row.get::<_, Vec<u8>>(0))?, first_intent_bytes);
-        assert_eq!(db.query_row("SELECT payload FROM launch_reports WHERE session_id=?1", [first], |row| row.get::<_, Vec<u8>>(0))?, first_report_bytes);
-        Ok(())
-    }).unwrap();
-    reopened.server.shutdown().await.unwrap();
-    assert!(reopened.server.is_shutdown_settled());
+        services = Some(start_in_profile(profile.clone(), None).await.unwrap());
+        let reopened = services.as_ref().unwrap();
+        let api = Api::new(reopened);
+        // Startup itself owns this continuation; no Resume or Tick request follows.
+        let second = wait_benchmark_run(&api, RESTART_SUITE, 1).await;
+        let second_session = second["session_id"].as_str().unwrap();
+        assert_ne!(second_session, first);
+        assert_ne!(second["launch_intent"], first_intent);
+        let processes = observe_and_stop_session(&api, second_session).await;
+        assert_fixture_processes_gone(&processes).await;
+        let complete_driver = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let status = api.get(&driver_path).await;
+                if status["driver"]["state"] == "complete" {
+                    break status;
+                }
+                assert!(
+                    matches!(
+                        status["driver"]["state"].as_str(),
+                        Some("running" | "waiting")
+                    ),
+                    "{status}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("automatic driver must complete after the remaining real run");
+        assert_eq!(complete_driver["driver"]["launched_run_count"], 2);
+        assert!(complete_driver["driver"]["pending_run_index"].is_null());
+        let complete_suite = api
+            .get(&format!("/api/v1/launch/benchmark/suites/{RESTART_SUITE}"))
+            .await;
+        assert_eq!(complete_suite["runs"][0]["session_id"], first);
+        assert_eq!(complete_suite["runs"][0]["launch_intent"], first_intent);
+        assert_eq!(complete_suite["runs"][1]["session_id"], second_session);
+        assert!(
+            complete_suite["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|run| run["state"] == "stopped")
+        );
+        for (index, session) in [first, second_session].into_iter().enumerate() {
+            let report = api.get(&format!("/api/v1/launch/reports/{session}")).await;
+            assert_eq!(
+                report["scenario"]["benchmark_id"],
+                complete_suite["runs"][index]["benchmark_id"]
+            );
+            assert_eq!(report["session_outcome"]["kind"], "stopped");
+        }
+        reopened.server.shutdown().await.unwrap();
+        assert!(reopened.server.is_shutdown_settled());
+        drop(services.take());
+
+        services = Some(start_in_profile(profile.clone(), None).await.unwrap());
+        let reopened = services.as_ref().unwrap();
+        let api = Api::new(reopened);
+        assert_eq!(api.get(&driver_path).await, complete_driver);
+        assert_eq!(
+            api.get(&format!("/api/v1/launch/benchmark/suites/{RESTART_SUITE}"))
+                .await,
+            complete_suite
+        );
+        assert_eq!(
+            api.get("/api/v1/launch/sessions").await,
+            json!({"sessions":[]})
+        );
+        reopened.instances.registry().storage().read(|db| -> Result<(), StorageError> {
+            assert_eq!(db.query_row("SELECT count(*) FROM benchmark_drivers", [], |row| row.get::<_, i64>(0))?, 1);
+            assert_eq!(db.query_row("SELECT request FROM benchmark_drivers WHERE driver_id=?1", [driver_id], |row| row.get::<_, Vec<u8>>(0))?, request);
+            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents WHERE state='accepted' AND terminal_ack=1 AND settlement IS NOT NULL", [], |row| row.get::<_, i64>(0))?, 2);
+            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get::<_, i64>(0))?, 2);
+            assert_eq!(db.query_row("SELECT count(*) FROM launch_reports", [], |row| row.get::<_, i64>(0))?, 2);
+            assert_eq!(db.query_row("SELECT payload FROM launch_intents WHERE intent_key=?1", [first_intent], |row| row.get::<_, Vec<u8>>(0))?, first_intent_bytes);
+            assert_eq!(db.query_row("SELECT payload FROM launch_reports WHERE session_id=?1", [first], |row| row.get::<_, Vec<u8>>(0))?, first_report_bytes);
+            Ok(())
+        }).unwrap();
+        reopened.server.shutdown().await.unwrap();
+        assert!(reopened.server.is_shutdown_settled());
+        drop(services.take());
+    })
+    .catch_unwind()
+    .await;
+    let shutdown = match services.as_ref() {
+        Some(services) => {
+            std::panic::AssertUnwindSafe(services.server.shutdown())
+                .catch_unwind()
+                .await
+        }
+        None => Ok(Ok(())),
+    };
+    let settled = services
+        .as_ref()
+        .is_none_or(|services| services.server.is_shutdown_settled());
+    drop(services);
+    let provider_shutdown = match provider {
+        Some(provider) => {
+            std::panic::AssertUnwindSafe(provider.shutdown())
+                .catch_unwind()
+                .await
+        }
+        None => Ok(()),
+    };
+    if journey.is_err()
+        || !matches!(&shutdown, Ok(Ok(())))
+        || !settled
+        || provider_shutdown.is_err()
+    {
+        eprintln!(
+            "Retained automatic benchmark fixture after failure: {}",
+            temporary.keep().display()
+        );
+    }
+    shutdown
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        .unwrap();
+    assert!(settled);
+    provider_shutdown.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3229,6 +3290,282 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
     if let Err(panic) = verification {
         eprintln!(
             "Retained degraded-scan preflight fixture: {}",
+            temporary.keep().display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degraded_versions_block_create_view_and_create_without_mutation() {
+    use futures_util::FutureExt;
+
+    let temporary =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let profile = temporary.path().join("profile");
+    let provider = Provider::start(false).await;
+    let services = start_profile_with_test_endpoints(profile, provider.endpoints())
+        .await
+        .unwrap();
+    let api = Api::new(&services);
+    let journey = std::panic::AssertUnwindSafe(async {
+        api.post(
+            "/api/v1/accounts/offline",
+            json!({"username":PLAYER,"expected_selection_revision":0}),
+        )
+        .await;
+        api.request(
+            reqwest::Method::PUT,
+            "/api/v1/config",
+            Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
+        )
+        .await;
+        let pin = services.library.admit().unwrap();
+        let operation = pin.managed_library().unwrap();
+        let root = pin.read_projection().unwrap();
+        // Catalog has its own source; install endpoints do not redirect it.
+        let manifest = serde_json::to_vec(&json!({
+            "latest":{"release":VERSION,"snapshot":VERSION},
+            "versions":[{
+                "id":VERSION,"type":"release",
+                "url":"https://piston-meta.mojang.com/axial-offline-fixture.json",
+                "sha1":sha1(&provider.state.routes["GET /versions/fixture.json"]),
+                "time":"2024-01-01T00:00:00Z","releaseTime":"2024-01-01T00:00:00Z"
+            }]
+        })).unwrap();
+        axial_minecraft::manifest::persist_version_manifest_cache_fixture_for_test(
+            &operation,
+            &manifest,
+        )
+        .unwrap();
+        let empty_cached =
+            axial_minecraft::manifest::read_cached_manifest_bytes(&operation).unwrap();
+        let empty_versions = api.get("/api/v1/versions").await;
+        let empty_catalog = api.get("/api/v1/versions/catalog").await;
+        let view_path = "/api/v1/instances/create-view?source=vanilla";
+        let empty_view = api.get(view_path).await;
+        let install = api
+            .post(
+                "/api/v1/install/queue",
+                json!({"kind":"vanilla","version_id":VERSION}),
+            )
+            .await;
+        let terminal = install_terminal(&api, &install).await;
+        axial_minecraft::manifest::persist_version_manifest_cache_fixture_for_test(
+            &operation,
+            &manifest,
+        )
+        .unwrap();
+        let cached = axial_minecraft::manifest::read_cached_manifest_bytes(&operation).unwrap();
+        let installed_catalog = api.get("/api/v1/versions/catalog").await;
+        let installed_versions = api.get("/api/v1/versions").await;
+        let installed_view = api.get(view_path).await;
+        let classifier = if cfg!(target_os = "macos") {
+            "natives-macos"
+        } else {
+            "natives-linux"
+        };
+        let asset_hash = sha1(ASSET);
+        let protected: Vec<_> = [
+            format!("versions/{VERSION}/{VERSION}.json"),
+            format!("versions/{VERSION}/{VERSION}.jar"),
+            "libraries/org/axial/fixture/1.0/fixture-1.0.jar".to_owned(),
+            format!("libraries/org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-{classifier}.jar"),
+            "assets/log_configs/fixture-log.xml".to_owned(),
+            "assets/indexes/fixture-assets.json".to_owned(),
+            format!("assets/objects/{}/{asset_hash}", &asset_hash[..2]),
+            "cache/version_manifest_v2.json".to_owned(),
+        ]
+        .into_iter()
+        .map(|relative| {
+            let path = root.join(relative);
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+        let client_source = provider.state.routes["GET /artifacts/client.jar"].clone();
+        let instances_before = api.get("/api/v1/instances").await;
+        let pending_before = api.get("/api/v1/instances/pending").await;
+        let queue_before = api.get("/api/v1/install/queue").await;
+        let requests_before = provider.state.requests.lock().unwrap().clone();
+        let read_projection = |path: &str| {
+            let request = api.client.get(format!("{}{path}", api.base))
+                .header(transport::CAPABILITY_HEADER, &api.capability);
+            async move {
+                let response = request.send().await.unwrap();
+                (response.status(), response.json::<Value>().await.unwrap())
+            }
+        };
+        // An external malformed entry does not replace the managed target.
+        let unrelated = root.join("versions/external-degraded-entry");
+        let absent_before = std::fs::symlink_metadata(&unrelated)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        std::fs::create_dir(&unrelated).unwrap();
+        let metadata = unrelated.join("external-degraded-entry.json");
+        let malformed = b"{not valid external version metadata\n";
+        std::fs::write(&metadata, malformed).unwrap();
+        let degraded_versions = read_projection("/api/v1/versions").await;
+        let degraded_view = read_projection(view_path).await;
+        let response = api.client
+            .post(format!("{}/api/v1/instances", api.base))
+            .header(transport::CAPABILITY_HEADER, &api.capability)
+            .json(&json!({
+                "name":"Degraded scan create","selection_id":format!("vanilla|{VERSION}")
+            }))
+            .send()
+            .await
+            .unwrap();
+        let create_status = response.status();
+        let create_body: Value = response.json().await.unwrap();
+        let instances_after = read_projection("/api/v1/instances").await;
+        let pending_after = api.get("/api/v1/instances/pending").await;
+        let queue_after = api.get("/api/v1/install/queue").await;
+        let requests_after = provider.state.requests.lock().unwrap().clone();
+        let intact: Vec<_> = protected.iter()
+            .map(|(path, _)| std::fs::read(path).unwrap()).collect();
+        let malformed_after = std::fs::read(&metadata).unwrap();
+        let unexpected_cleanup = if create_status.is_success() {
+            let id = create_body["id"].as_str().unwrap().to_owned();
+            let operation = uuid::Uuid::new_v4().to_string();
+            let removed = api.request(
+                reqwest::Method::DELETE,
+                &format!("/api/v1/instances/{id}?keep_files=true&operation_id={operation}"),
+                None,
+            ).await;
+            let absent = read_projection(&format!("/api/v1/instances/{id}")).await;
+            Some((id, operation, removed, absent))
+        } else {
+            None
+        };
+        std::fs::remove_file(&metadata).unwrap();
+        std::fs::remove_dir(&unrelated).unwrap();
+        let restored_versions = api.get("/api/v1/versions").await;
+        let restored_view = api.get(view_path).await;
+        let created = api.post(
+            "/api/v1/instances",
+            json!({"name":"Restored scan create","selection_id":format!("vanilla|{VERSION}")}),
+        ).await;
+        let created_id = created["id"].as_str().unwrap().to_owned();
+        let detail = api.get(&format!("/api/v1/instances/{created_id}")).await;
+        let restored_instances = api.get("/api/v1/instances").await;
+        let restored_pending = api.get("/api/v1/instances/pending").await;
+        let final_queue = api.get("/api/v1/install/queue").await;
+        let final_requests = provider.state.requests.lock().unwrap().clone();
+        let sessions = api.get("/api/v1/launch/sessions").await;
+        let reports = api.get("/api/v1/launch/reports").await;
+        drop(operation);
+        drop(pin);
+        move || {
+            assert!(absent_before);
+            assert_eq!(malformed_after, malformed);
+            assert!(std::fs::symlink_metadata(unrelated)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
+            assert_eq!(protected[1].1, client_source);
+            for ((path, before), observed) in protected.iter().zip(intact) {
+                assert_eq!(&observed, before);
+                assert_eq!(&std::fs::read(path).unwrap(), before);
+            }
+            if let Some((id, operation, removed, absent)) = unexpected_cleanup {
+                assert_eq!(removed, json!({"status":"removed","deletion":{
+                    "operation_id":operation,"instance_id":id,"intent":"keep_files","status":"removed"
+                }}));
+                assert_eq!(absent.0, StatusCode::NOT_FOUND);
+            }
+            assert_eq!(empty_versions["scan_state"]["state_id"], "empty");
+            assert_eq!(empty_versions["scan_state"]["degraded"], false);
+            assert_eq!(empty_versions["versions"], json!([]));
+            for cache in [empty_cached, cached] {
+                assert_eq!(cache, (manifest.clone(), true));
+            }
+            for catalog in [empty_catalog, installed_catalog] {
+                assert_eq!(catalog["catalog_state"]["fresh"], true, "{catalog}");
+                assert_eq!(catalog["catalog_state"]["cache_hit"], true);
+                assert_eq!(catalog["catalog_state"]["stale"], false);
+            }
+            assert_eq!(terminal["outcome"], "succeeded");
+            assert!(requests_before.contains(&"GET /artifacts/client.jar".to_owned()));
+            for versions in [&installed_versions, &degraded_versions.1, &restored_versions] {
+                let target = versions["versions"].as_array().unwrap().iter()
+                    .find(|version| version["id"] == VERSION).unwrap();
+                assert_eq!(target["installed"], true);
+                assert_eq!(target["launchable"], true);
+            }
+            assert_eq!(degraded_versions.0, StatusCode::OK);
+            assert_eq!(degraded_versions.1["scan_state"]["degraded"], true);
+            assert_eq!(restored_versions["scan_state"]["degraded"], false);
+            for (view, download) in [
+                (&empty_view, "none"),
+                (&installed_view, "full"),
+                (&restored_view, "full"),
+            ] {
+                assert_eq!(view["defaults"]["source_id"], "vanilla");
+                assert_eq!(view["notices"], json!([]));
+                let rows = view["versions"].as_array().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["selection_id"], format!("vanilla|{VERSION}"));
+                assert_eq!(rows[0]["create_enabled"], true);
+                assert_eq!(rows[0]["download_state"], download);
+            }
+            assert_eq!(created["view_model"]["state_id"], "created");
+            assert!(created.get("install_queue").is_none());
+            assert_eq!(detail["id"], created_id);
+            assert_eq!(detail["version_id"], VERSION);
+            assert_eq!(detail["launch_action"]["primary_action"], "launch");
+            assert_eq!(restored_instances["instances"].as_array().unwrap().len(), 1);
+            assert_eq!(restored_instances["instances"][0]["id"], created_id);
+            assert_eq!(restored_pending, json!({"creations":[],"deletions":[]}));
+            assert_eq!(instances_before["instances"], json!([]));
+            assert_eq!(pending_before, json!({"creations":[],"deletions":[]}));
+            assert_eq!(degraded_view.0, StatusCode::OK, "{:?}", degraded_view.1);
+            assert_eq!(degraded_view.1["defaults"]["source_id"], "vanilla");
+            assert_eq!(degraded_view.1["notices"], json!([{
+                "state_id":"library_scan_degraded","tone":"warn",
+                "message":"Installed versions are unavailable",
+                "detail":"Could not verify installed versions. Check the library folder and try again."
+            }]));
+            assert_eq!(degraded_view.1["versions"], json!([]));
+            assert_eq!(create_status, StatusCode::PRECONDITION_FAILED, "{create_body}");
+            assert_eq!(create_body, json!({
+                "error":"Could not verify installed versions. Check the library folder and try again."
+            }));
+            assert_eq!(instances_after.0, StatusCode::OK);
+            assert_eq!(instances_after.1, instances_before);
+            assert_eq!(pending_after, pending_before);
+            assert_eq!(queue_after, queue_before);
+            assert_eq!(final_queue, queue_before);
+            assert_eq!(requests_after, requests_before);
+            assert_eq!(final_requests, requests_before);
+            assert_eq!(sessions, json!({"sessions":[]}));
+            assert_eq!(reports, json!({"reports":[]}));
+        }
+    })
+    .catch_unwind()
+    .await;
+    let shutdown = std::panic::AssertUnwindSafe(services.server.shutdown())
+        .catch_unwind()
+        .await;
+    let settled = services.server.is_shutdown_settled();
+    drop(services);
+    let provider_join = std::panic::AssertUnwindSafe(provider.shutdown())
+        .catch_unwind()
+        .await;
+    let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match shutdown {
+            Ok(result) => assert!(result.is_ok(), "{result:?}"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+        assert!(settled);
+        if let Err(panic) = provider_join {
+            std::panic::resume_unwind(panic);
+        }
+        match journey {
+            Ok(verify) => verify(),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }));
+    if let Err(panic) = verification {
+        eprintln!(
+            "Retained degraded-scan create fixture: {}",
             temporary.keep().display()
         );
         std::panic::resume_unwind(panic);
@@ -4824,6 +5161,11 @@ async fn real_playing_instance_edits_preserve_active_command_and_next_launch_set
 
 #[test]
 fn real_benchmark_mapping_survives_response_loss_and_restart() {
+    let (runtime, _diagnostics) = benchmark_diagnostic_runtime();
+    runtime.block_on(benchmark_mapping_survives_response_loss_and_restart());
+}
+
+fn benchmark_diagnostic_runtime() -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
     use tracing_subscriber::prelude::*;
 
     thread_local! {
@@ -4835,6 +5177,14 @@ fn real_benchmark_mapping_survives_response_loss_and_restart() {
             .with_test_writer()
             .with_ansi(false)
             .without_time()
+            .fmt_fields(tracing_subscriber::fmt::format::debug_fn(
+                |writer, field, value| match field.name() {
+                    "message" | "stage" | "error_kind" | "os_error_code" => {
+                        write!(writer, "{}={value:?} ", field.name())
+                    }
+                    _ => Ok(()),
+                },
+            ))
             .finish()
             .with(
                 tracing_subscriber::filter::Targets::new()
@@ -4842,7 +5192,7 @@ fn real_benchmark_mapping_survives_response_loss_and_restart() {
                     .with_target("axial_app::launch::prepare", tracing::Level::WARN),
             ),
     );
-    let _diagnostics = tracing::dispatcher::set_default(&diagnostics);
+    let current_thread = tracing::dispatcher::set_default(&diagnostics);
     // HTTP and retained launch tasks run on this test's runtime threads.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -4857,7 +5207,7 @@ fn real_benchmark_mapping_survives_response_loss_and_restart() {
         })
         .build()
         .unwrap();
-    runtime.block_on(benchmark_mapping_survives_response_loss_and_restart());
+    (runtime, current_thread)
 }
 
 async fn benchmark_mapping_survives_response_loss_and_restart() {

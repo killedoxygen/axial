@@ -2,7 +2,7 @@
 //! registry publication and installation keep their separate authorities.
 
 use super::{
-    create::{CreateInstanceRequest, CreateTarget, InstanceService, SetupIntent},
+    create::{Admission, CreateInstanceRequest, CreateTarget, InstanceService, SetupIntent},
     model::{
         EnrichedInstance, Instance, InstanceError, InstanceLaunchAction, InstanceResult,
         InstanceVersionDisplay,
@@ -212,7 +212,7 @@ impl SetupService {
     }
 
     pub async fn plan_setup(
-        &self,
+        self: &Arc<Self>,
         request: InstanceSetupPlanRequest,
     ) -> InstanceResult<InstanceSetupPlanResponse> {
         if request.selections.is_empty() || request.selections.len() > 40 {
@@ -222,7 +222,7 @@ impl SetupService {
             .content
             .as_ref()
             .ok_or(InstanceError::SetupUnavailable)?;
-        let (target, install) = self.resolve(&request.selection_id).await?;
+        let (target, install, admission) = self.resolve(&request.selection_id).await?;
         let resolution_target = ResolutionTarget {
             loader: target.loader_key.clone(),
             game_version: target.minecraft_version.clone(),
@@ -240,6 +240,7 @@ impl SetupService {
         let resolution = preview_draft(content, &resolution_target, &request.selections)
             .await
             .map_err(|_| InstanceError::SetupUnavailable)?;
+        admission.validate()?;
         let plan = into_plan(&resolution, None, &resolution_target);
         let plan_id = if resolution.conflicts.is_empty() {
             let mut plans = self.plans.lock().expect("setup plans lock poisoned");
@@ -319,13 +320,14 @@ impl SetupService {
             .content
             .as_ref()
             .ok_or(InstanceError::SetupUnavailable)?;
-        let (target, install) = self.resolve(&stored.selection_id).await?;
+        let (target, install, admission) = self.resolve(&stored.selection_id).await?;
         if target.version_id != stored.version_id || install != stored.install {
             return Err(InstanceError::Conflict);
         }
         let current = preview_draft(content, &stored.target, &stored.selections)
             .await
             .map_err(|_| InstanceError::SetupUnavailable)?;
+        admission.validate()?;
         if content_fingerprint(&current)? != stored.fingerprint {
             return Err(InstanceError::Conflict);
         }
@@ -348,10 +350,10 @@ impl SetupService {
         let work = self
             .instances
             .tasks
-            .try_spawn((), move |_cancel| async move {
+            .try_spawn(admission.clone(), move |_cancel| async move {
                 let admitted = service
                     .instances
-                    .create_admitted(request.create, target, setup)?
+                    .create_admitted(request.create, target, admission, setup)?
                     .join()
                     .await
                     .map_err(|_| InstanceError::SettlementRequired)??;
@@ -652,37 +654,59 @@ impl SetupService {
     }
 
     pub async fn resolve(
-        &self,
+        self: &Arc<Self>,
         selection_id: &str,
-    ) -> InstanceResult<(CreateTarget, InstallQueueRequest)> {
+    ) -> InstanceResult<(CreateTarget, InstallQueueRequest, Admission)> {
         let selection_id = selection_id.trim();
         if selection_id.len() > 2048 {
             return Err(InstanceError::InvalidInput);
         }
-        let parts: Vec<_> = selection_id.split('|').collect();
         let pin = self
             .instances
             .directories()
             .library()
             .admit()
             .map_err(|_| InstanceError::LibraryUnavailable)?;
+        let service = Arc::clone(self);
+        let selection_id = selection_id.to_owned();
+        self.instances
+            .tasks
+            .try_spawn(pin.clone(), move |cancel| async move {
+                service.resolve_admitted(&selection_id, pin, cancel).await
+            })
+            .map_err(|_| InstanceError::Closed)?
+            .join()
+            .await
+            .map_err(|_| InstanceError::VersionUnavailable)?
+    }
+
+    async fn resolve_admitted(
+        &self,
+        selection_id: &str,
+        pin: crate::library::GenerationPin,
+        cancel: CancellationToken,
+    ) -> InstanceResult<(CreateTarget, InstallQueueRequest, Admission)> {
+        let parts: Vec<_> = selection_id.split('|').collect();
         let library = pin
             .managed_library()
             .map_err(|_| InstanceError::LibraryUnavailable)?;
+        let admission = Admission::capture(pin).await?;
+        admission.validate()?;
         let mut verified_target = None;
         let request = match parts.as_slice() {
             ["vanilla", version] if !version.is_empty() => {
                 // Existing verified installations remain selectable offline.
-                let installed = installed_versions(&library, None)
-                    .await
-                    .map_err(|_| InstanceError::VersionUnavailable)?;
-                let present = installed.versions.iter().any(|entry| {
+                let present = admission.scan().versions().iter().any(|entry| {
                     entry.id == *version
                         && entry.installed
                         && entry.launchable
                         && entry.loader.is_none()
                 }) && !loaders::is_canonical_installed_loader_id(version)
-                    && self.installs.ready_version(&pin, version).await.is_ok();
+                    && self
+                        .installs
+                        .ready_version(admission.generation(), version)
+                        .await
+                        .is_ok();
                 if present {
                     verified_target = Some(InstallQueueInstallItemViewModel {
                         version_id: (*version).to_owned(),
@@ -691,9 +715,10 @@ impl SetupService {
                     });
                 } else {
                     self.catalog
-                        .resolve_install(&library, version, &CancellationToken::new())
+                        .resolve_install(&library, version, &cancel)
                         .await
                         .map_err(|_| InstanceError::VersionUnavailable)?;
+                    admission.validate()?;
                 }
                 InstallQueueRequest::Vanilla {
                     version_id: (*version).to_owned(),
@@ -705,7 +730,7 @@ impl SetupService {
                 let target = loader_install_target(component_id, build_id)?;
                 if self
                     .installs
-                    .ready_version(&pin, &target.version_id)
+                    .ready_version(admission.generation(), &target.version_id)
                     .await
                     .is_ok()
                 {
@@ -723,6 +748,7 @@ impl SetupService {
                     .loader_build_catalog(&library, component_id, minecraft)
                     .await
                     .map_err(|_| InstanceError::VersionUnavailable)?;
+                admission.validate()?;
                 let build = preferred_build(builds).ok_or(InstanceError::VersionUnavailable)?;
                 let target = loader_install_target(component_id, &build.build_id)?;
                 if target.version_id != build.version_id {
@@ -730,7 +756,7 @@ impl SetupService {
                 }
                 if self
                     .installs
-                    .ready_version(&pin, &target.version_id)
+                    .ready_version(admission.generation(), &target.version_id)
                     .await
                     .is_ok()
                 {
@@ -753,6 +779,7 @@ impl SetupService {
                 .await
                 .map_err(|_| InstanceError::VersionUnavailable)?,
         };
+        admission.validate()?;
         let (minecraft_version, loader_key) = match resolved.loader {
             Some(loader) => (
                 loader.minecraft_version,
@@ -771,6 +798,7 @@ impl SetupService {
                 loader_key,
             },
             request,
+            admission,
         ))
     }
 
@@ -779,21 +807,16 @@ impl SetupService {
         self: &Arc<Self>,
         request: CreateInstanceRequest,
     ) -> InstanceResult<CreateInstanceResponse> {
-        let (target, install) = self.resolve(&request.selection_id).await?;
+        let (target, install, admission) = self.resolve(&request.selection_id).await?;
         let service = Arc::clone(self);
-        let pin = self
-            .instances
-            .directories()
-            .library()
-            .admit()
-            .map_err(|_| InstanceError::LibraryUnavailable)?;
+        let pin = admission.generation().clone();
         let work = self
             .instances
             .tasks
-            .try_spawn(pin.clone(), move |_cancel| async move {
+            .try_spawn(admission.clone(), move |_cancel| async move {
                 let instance = service
                     .instances
-                    .create(request, target)?
+                    .create(request, target, admission.clone())?
                     .join()
                     .await
                     .map_err(|_| InstanceError::SettlementRequired)??;
@@ -814,7 +837,11 @@ impl SetupService {
                         },
                     )
                 } else {
-                    match service.installs.enqueue(install).await {
+                    match service
+                        .installs
+                        .enqueue_creation(install, &instance.version_id, &admission)
+                        .await
+                    {
                         Ok(queue) => (
                             Some(queue),
                             CreateResultView {
@@ -1083,7 +1110,7 @@ impl SetupService {
         }
     }
 
-    pub async fn create_view(&self, source: Option<&str>) -> InstanceResult<CreateView> {
+    pub async fn create_view(self: &Arc<Self>, source: Option<&str>) -> InstanceResult<CreateView> {
         let source = source
             .filter(|value| !value.is_empty())
             .unwrap_or("vanilla");
@@ -1098,16 +1125,44 @@ impl SetupService {
             .library()
             .admit()
             .map_err(|_| InstanceError::LibraryUnavailable)?;
+        let source = source.to_owned();
+        let service = Arc::clone(self);
+        self.instances
+            .tasks
+            .try_spawn(pin.clone(), move |cancel| async move {
+                service
+                    .create_view_admitted(&source, component, pin, cancel)
+                    .await
+            })
+            .map_err(|_| InstanceError::Closed)?
+            .join()
+            .await
+            .map_err(|_| InstanceError::VersionUnavailable)?
+    }
+
+    async fn create_view_admitted(
+        &self,
+        source: &str,
+        component: Option<LoaderComponentId>,
+        pin: crate::library::GenerationPin,
+        cancel: CancellationToken,
+    ) -> InstanceResult<CreateView> {
         let library = pin
             .managed_library()
             .map_err(|_| InstanceError::LibraryUnavailable)?;
-        let cancel = CancellationToken::new();
-        let installed = installed_versions(&library, None)
+        let installed = crate::catalog::installed_snapshot(&pin)
             .await
             .map_err(|_| InstanceError::VersionUnavailable)?;
-        let displayed_installed = self.display_installed_ids(&pin, &installed.versions)?;
+        let displayed_installed = if installed.is_degraded() {
+            BTreeSet::new()
+        } else {
+            self.display_installed_ids(&pin, installed.versions())?
+        };
         let mut notices = Vec::new();
-        let versions = if let Some(component) = component {
+        let versions = if installed.is_degraded() {
+            notices.push(CreateNotice::library_scan_degraded());
+            Vec::new()
+        } else if let Some(component) = component {
             let (mut versions, state) = self
                 .loader_version_catalog(&library, component)
                 .await
@@ -1122,7 +1177,7 @@ impl SetupService {
             versions
                 .into_iter()
                 .map(|entry| {
-                    let full = installed.versions.iter().any(|installed| {
+                    let full = installed.versions().iter().any(|installed| {
                         displayed_installed.contains(&installed.id)
                             && installed_loader_matches(installed, component, &entry.id)
                     });
@@ -1152,7 +1207,7 @@ impl SetupService {
                 notices.push(CreateNotice::catalog_unavailable());
             }
             let mut entries = snapshot.versions;
-            for entry in &installed.versions {
+            for entry in installed.versions() {
                 if entry.loader.is_none()
                     && !entries.iter().any(|candidate| candidate.id == entry.id)
                 {
@@ -1179,6 +1234,18 @@ impl SetupService {
                 })
                 .collect()
         };
+        installed
+            .revalidate_for(&pin)
+            .map_err(|_| InstanceError::VersionUnavailable)?;
+        let current = self
+            .instances
+            .directories()
+            .library()
+            .admit()
+            .map_err(|_| InstanceError::LibraryUnavailable)?;
+        if !installed.generation_matches(&current) {
+            return Err(InstanceError::LibraryUnavailable);
+        }
         let config = self
             .settings
             .current()
@@ -1505,11 +1572,14 @@ pub struct CreateOption {
     pub label: String,
     pub enabled: bool,
 }
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
 pub struct CreateNotice {
     pub state_id: &'static str,
     pub tone: &'static str,
     pub message: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub detail: Option<&'static str>,
 }
 impl CreateNotice {
     fn catalog_unavailable() -> Self {
@@ -1517,6 +1587,18 @@ impl CreateNotice {
             state_id: "catalog_unavailable",
             tone: "warn",
             message: "The catalog could not be refreshed. Previously installed versions remain available.",
+            detail: None,
+        }
+    }
+
+    fn library_scan_degraded() -> Self {
+        Self {
+            state_id: "library_scan_degraded",
+            tone: "warn",
+            message: "Installed versions are unavailable",
+            detail: Some(
+                "Could not verify installed versions. Check the library folder and try again.",
+            ),
         }
     }
 }
@@ -2102,6 +2184,7 @@ pub(crate) mod tests {
             .create_admitted(
                 super::super::create::tests::request("Queued content fixture"),
                 super::super::create::tests::target(),
+                instances.creation_admission_for_tests().await.unwrap(),
                 SetupIntent {
                     plan_id: uuid::Uuid::new_v4().to_string(),
                     request_json: request_json.clone(),

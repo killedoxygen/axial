@@ -328,6 +328,7 @@ pub(super) fn error(failure: InstanceError) -> ApiError {
         | InstanceError::InvalidInput
         | InstanceError::InvalidSettings => StatusCode::BAD_REQUEST,
         InstanceError::NotFound => StatusCode::NOT_FOUND,
+        InstanceError::InstalledVersionsDegraded => StatusCode::PRECONDITION_FAILED,
         InstanceError::Conflict
         | InstanceError::NameConflict
         | InstanceError::Busy

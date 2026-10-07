@@ -1,7 +1,10 @@
 //! Export only reviewed public DTOs, never runtime commands or credentials.
 
 use axial_app::{
-    instances::{delete::DeletionSnapshot, setup::CreateLoaderBuildsView},
+    instances::{
+        delete::DeletionSnapshot,
+        setup::{CreateLoaderBuildsView, CreateNotice},
+    },
     launch::coordinator::PreflightDiagnostics,
     public::{ErrorResponse, OperationId},
     resources::{InstanceLogTailResponse, InstanceResourcesResponse},
@@ -66,6 +69,7 @@ fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     PendingSkinStatus::export_all(&config)?;
     DeletionSnapshot::export_all(&config)?;
     CreateLoaderBuildsView::export_all(&config)?;
+    CreateNotice::export_all(&config)?;
     PreflightDiagnostics::export_all(&config)?;
     Ok(())
 }

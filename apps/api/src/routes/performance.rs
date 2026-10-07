@@ -333,6 +333,11 @@ mod tests {
                         ..Default::default()
                     },
                     target,
+                    services
+                        .instances
+                        .creation_admission_for_tests()
+                        .await
+                        .unwrap(),
                 )
                 .unwrap()
                 .join()

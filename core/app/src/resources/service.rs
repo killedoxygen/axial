@@ -833,7 +833,8 @@ mod tests {
     }
 
     async fn create_fixture_instance(service: &ResourceService) -> InstanceId {
-        InstanceService::new(service.directories.clone(), service.tasks.clone())
+        let instances = InstanceService::new(service.directories.clone(), service.tasks.clone());
+        instances
             .create(
                 CreateInstanceRequest {
                     name: "Resources".into(),
@@ -846,6 +847,7 @@ mod tests {
                     minecraft_version: "1.21.4".into(),
                     loader_key: "vanilla".into(),
                 },
+                instances.creation_admission_for_tests().await.unwrap(),
             )
             .unwrap()
             .join()

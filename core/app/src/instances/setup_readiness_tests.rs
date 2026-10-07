@@ -332,6 +332,7 @@ async fn incompatible_quilt_build_is_disabled_and_rejected_even_when_installed()
         assert!(view.builds[1].installed && view.builds[1].enabled && view.builds[1].recommended);
         assert_eq!(view.builds[1].channel_label, "Beta");
     }
+    let mut service = Arc::new(service);
     let automatic = format!("loader_auto|{}|{minecraft}", component.as_str());
     assert_eq!(
         service.resolve(&automatic).await.unwrap().0.version_id(),
@@ -351,7 +352,12 @@ async fn incompatible_quilt_build_is_disabled_and_rejected_even_when_installed()
             .version_id(),
         compatible.version_id
     );
-    service.loader_catalog_fixture.as_mut().unwrap().builds = vec![incompatible.clone()];
+    Arc::get_mut(&mut service)
+        .unwrap()
+        .loader_catalog_fixture
+        .as_mut()
+        .unwrap()
+        .builds = vec![incompatible.clone()];
     let unavailable = service
         .loader_builds(component.as_str(), minecraft)
         .await
@@ -362,7 +368,6 @@ async fn incompatible_quilt_build_is_disabled_and_rejected_even_when_installed()
         Err(InstanceError::VersionUnavailable)
     ));
     let before = service.installs.snapshot();
-    let service = Arc::new(service);
     let result = service
         .create(CreateInstanceRequest {
             name: "Incompatible installed Quilt".into(),
@@ -934,6 +939,11 @@ async fn detached_setup_ready_resume(refuse_acknowledgement: bool) {
                     minecraft_version: "1.21.4".into(),
                     loader_key: "vanilla".into(),
                 },
+                service
+                    .instances
+                    .creation_admission_for_tests()
+                    .await
+                    .unwrap(),
                 SetupIntent {
                     plan_id: uuid::Uuid::new_v4().to_string(),
                     request_json: request_json.clone(),
@@ -1405,6 +1415,11 @@ async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
                 minecraft_version: "1.20.1".into(),
                 loader_key: "vanilla".into(),
             },
+            service
+                .instances
+                .creation_admission_for_tests()
+                .await
+                .unwrap(),
         )
         .unwrap()
         .join()
@@ -1641,6 +1656,7 @@ async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
 async fn create_view_download_indicators_use_settled_install_and_scanner_status() {
     let (root, mut service, _) = fixture();
     service.loader_catalog_fixture = Some(stale_loader_catalog());
+    let service = Arc::new(service);
     let initial = service.create_view(None).await.unwrap();
     assert!(
         initial
@@ -1700,6 +1716,7 @@ async fn offline_loader_creation_reuses_only_the_exact_preferred_verified_build(
     let catalog = stale_loader_catalog();
     let installed = catalog.builds[0].clone();
     service.loader_catalog_fixture = Some(catalog);
+    let mut service = Arc::new(service);
     let selection = "loader_auto|net.fabricmc.fabric-loader|1.21.4";
     assert!(matches!(
         service.resolve(selection).await,
@@ -1738,7 +1755,7 @@ async fn offline_loader_creation_reuses_only_the_exact_preferred_verified_build(
     assert!(available.auto.disabled_reason.is_none());
     assert!(available.builds[0].enabled && available.builds[0].installed);
     let before = service.installs.snapshot();
-    let (target, request) = service.resolve(selection).await.unwrap();
+    let (target, request, _) = service.resolve(selection).await.unwrap();
     assert_eq!(target.version_id(), installed.version_id);
     assert_eq!(
         request,
@@ -1761,7 +1778,12 @@ async fn offline_loader_creation_reuses_only_the_exact_preferred_verified_build(
     newer.build_id = loaders::build_id_for(newer.component_id, "1.21.4", "0.16.15");
     newer.version_id =
         loaders::installed_version_id_for(newer.component_id, "1.21.4", "0.16.15").unwrap();
-    service.loader_catalog_fixture.as_mut().unwrap().builds = vec![newer, installed.clone()];
+    Arc::get_mut(&mut service)
+        .unwrap()
+        .loader_catalog_fixture
+        .as_mut()
+        .unwrap()
+        .builds = vec![newer, installed.clone()];
     assert!(
         matches!(
             service.resolve(selection).await,
@@ -1782,14 +1804,16 @@ async fn offline_loader_creation_reuses_only_the_exact_preferred_verified_build(
         installed.version_id,
         "the older explicit installed choice remains usable"
     );
-    service
+    Arc::get_mut(&mut service)
+        .unwrap()
         .loader_catalog_fixture
         .as_mut()
         .unwrap()
         .state
         .availability
         .fresh = true;
-    service
+    Arc::get_mut(&mut service)
+        .unwrap()
         .loader_catalog_fixture
         .as_mut()
         .unwrap()
@@ -1801,7 +1825,8 @@ async fn offline_loader_creation_reuses_only_the_exact_preferred_verified_build(
         .await
         .unwrap();
     assert!(fresh.auto.enabled && fresh.builds[0].enabled);
-    service
+    Arc::get_mut(&mut service)
+        .unwrap()
         .loader_catalog_fixture
         .as_mut()
         .unwrap()
@@ -1812,8 +1837,7 @@ async fn offline_loader_creation_reuses_only_the_exact_preferred_verified_build(
         .await
         .unwrap();
     assert!(!empty.auto.enabled && empty.auto.disabled_reason.is_some());
-    service.loader_catalog_fixture = Some(stale_loader_catalog());
-    let service = Arc::new(service);
+    Arc::get_mut(&mut service).unwrap().loader_catalog_fixture = Some(stale_loader_catalog());
     let created = service
         .create(CreateInstanceRequest {
             name: "Offline Fabric".into(),

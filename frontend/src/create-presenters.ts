@@ -1,12 +1,8 @@
 import type { ToastKind } from './types-ui';
 import type { IconName } from './ui/Icons';
 
-export interface CreateNotice {
-  state_id: string;
-  tone: string;
-  message: string;
-  detail?: string | null;
-}
+import type { CreateNotice } from './generated/CreateNotice';
+export type { CreateNotice } from './generated/CreateNotice';
 
 export interface CreateResultPresentationSource {
   view_model?: {

@@ -257,6 +257,8 @@ pub enum InstanceError {
     Cancelled,
     #[error("The selected version is unavailable. Refresh the version list and try again.")]
     VersionUnavailable,
+    #[error("Could not verify installed versions. Check the library folder and try again.")]
+    InstalledVersionsDegraded,
     #[error(
         "Managed Performance state could not be verified for duplication. The source was preserved."
     )]

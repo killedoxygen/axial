@@ -142,7 +142,7 @@ export function createBackendViewResponse(value: unknown): CreateBackendViewResp
         state_id: dtoString(entry.state_id, 'Create notice state'),
         tone: dtoString(entry.tone, 'Create notice tone'),
         message: dtoString(entry.message, 'Create notice message'),
-        detail: entry.detail == null ? null : dtoString(entry.detail, 'Create notice detail'),
+        detail: entry.detail == null ? undefined : dtoString(entry.detail, 'Create notice detail'),
       };
     }),
     defaults: {

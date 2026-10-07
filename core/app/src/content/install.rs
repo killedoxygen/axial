@@ -3045,6 +3045,7 @@ mod tests {
                     minecraft_version: "1.21.4".into(),
                     loader_key: "vanilla".into(),
                 },
+                instances.creation_admission_for_tests().await.unwrap(),
             )
             .unwrap()
             .join()
@@ -4588,6 +4589,7 @@ mod tests {
                         minecraft_version: "1.21.4".into(),
                         loader_key: "vanilla".into(),
                     },
+                    instances.creation_admission_for_tests().await.unwrap(),
                 )
                 .unwrap()
                 .join()
@@ -6099,6 +6101,7 @@ mod tests {
                         minecraft_version: "1.21.4".into(),
                         loader_key: "vanilla".into(),
                     },
+                    instances.creation_admission_for_tests().await.unwrap(),
                 )
                 .unwrap()
                 .join()
