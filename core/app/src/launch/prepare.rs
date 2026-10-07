@@ -17,6 +17,7 @@ pub(super) struct PreparedSession {
     instance_id: InstanceId,
     version_id: String,
     command: ValidatedLaunchCommand,
+    installed_versions: crate::catalog::InstalledSnapshot,
     accounts: Arc<AccountDirectory>,
     account: CapturedSelection,
     settings: Arc<SettingsStore>,
@@ -38,6 +39,7 @@ impl PreparedSession {
         instance_id: InstanceId,
         version_id: String,
         command: ValidatedLaunchCommand,
+        installed_versions: crate::catalog::InstalledSnapshot,
         accounts: Arc<AccountDirectory>,
         account: CapturedSelection,
         settings: Arc<SettingsStore>,
@@ -54,6 +56,7 @@ impl PreparedSession {
             instance_id,
             version_id,
             command,
+            installed_versions,
             accounts,
             account,
             settings,
@@ -131,6 +134,12 @@ impl PreparedSession {
     }
 
     fn validate_context(&self) -> Result<(), PrepareError> {
+        self.installed_versions
+            .revalidate_for(self.instance.generation())
+            .map_err(|_| LaunchError::PlanRejected)?;
+        if self.installed_versions.is_degraded() {
+            return Err(LaunchError::InstalledVersionsDegraded);
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| LaunchError::OnlineAccountUnavailable)?
@@ -377,10 +386,14 @@ pub(super) mod tests {
             prepared_natives: None,
         })
         .unwrap();
+        let installed_versions = crate::catalog::installed_snapshot(instance.generation())
+            .await
+            .unwrap();
         let prepared = PreparedSession {
             instance_id: instance.record().instance.id.clone(),
             version_id: version_id.into(),
             command,
+            installed_versions,
             account: CapturedSelection::capture(&accounts).unwrap(),
             accounts,
             settings_revision: settings.current().unwrap().revision,
@@ -410,6 +423,7 @@ pub(super) mod tests {
             prepared.instance_id,
             prepared.version_id,
             prepared.command,
+            prepared.installed_versions,
             prepared.accounts,
             prepared.account,
             prepared.settings,

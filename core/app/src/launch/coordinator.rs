@@ -1193,6 +1193,12 @@ impl LaunchCoordinator {
             .ready_version(admitted.generation(), &instance.version_id)
             .await
             .map_err(|_| LaunchError::InstallUnavailable)?;
+        let installed_versions = crate::catalog::installed_snapshot(admitted.generation())
+            .await
+            .map_err(|_| LaunchError::LibraryUnavailable)?;
+        if installed_versions.is_degraded() {
+            return Err(LaunchError::InstalledVersionsDegraded);
+        }
         let (installed, game_libraries) = installed
             .prepare_game_libraries()
             .await
@@ -1334,6 +1340,7 @@ impl LaunchCoordinator {
                 instance.id,
                 instance.version_id,
                 command,
+                installed_versions,
                 self.accounts.clone(),
                 selection,
                 self.settings.clone(),
@@ -3426,6 +3433,194 @@ mod tests {
             3
         );
         assert_eq!(projection.current.as_ref().unwrap().pin.generation(), after);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_launch_does_not_refresh_a_changed_library_scan() {
+        use futures_util::FutureExt;
+        use std::time::Duration;
+
+        let (root, coordinator, id) = preflight_fixture().await;
+        let native_retention = Mutex::new(None);
+        let mut library_retention = None;
+        let mut admitted_retention = None;
+        let journey = std::panic::AssertUnwindSafe(async {
+            std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+            let admitted = coordinator.admit(&id).unwrap();
+            admitted_retention = Some(admitted.clone());
+            let libraries = Arc::new(super::super::libraries::Retention::new(
+                admitted.game_directory().clone(),
+            ));
+            library_retention = Some(libraries.clone());
+            let versions = admitted
+                .generation()
+                .directory()
+                .unwrap()
+                .open_directory(&axial_fs::LeafName::new("versions").unwrap())
+                .unwrap();
+            let cancellation = CancellationToken::new();
+            let mut request = request();
+            request.instance_id = id.clone();
+            request.username = None;
+            let prepared = coordinator
+                .prepare(
+                    admitted,
+                    &request,
+                    &cancellation,
+                    None,
+                    &native_retention,
+                    libraries.clone(),
+                    super::super::session::LaunchAttemptTelemetry::started(None, "vanilla"),
+                )
+                .await
+                .unwrap();
+            let initial = prepared.validate_before_spawn();
+            let revision_before = versions.revision().unwrap();
+            let observe_changed_revision = || async {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let revision = versions.revision().unwrap();
+                        if revision != revision_before {
+                            break revision;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+            };
+            let target_files = ["json", "jar"].map(|extension| {
+                root.path()
+                    .join(format!("versions/1.20.1/1.20.1.{extension}"))
+            });
+            let read_target = || {
+                target_files
+                    .iter()
+                    .map(|path| std::fs::read(path).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            let target_before = read_target();
+            // This is an external library entry, not another managed installation.
+            let external = root.path().join("versions/external-degraded-entry");
+            let absent_before = std::fs::symlink_metadata(&external)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            std::fs::create_dir(&external).unwrap();
+            let metadata = external.join("external-degraded-entry.json");
+            std::fs::write(&metadata, b"{not valid external version metadata\n").unwrap();
+            let revision_changed = observe_changed_revision().await;
+            let target_changed = read_target();
+            let command_changed = prepared.validated_command().revalidate();
+            let changed = prepared.validate_before_spawn();
+
+            std::fs::remove_file(&metadata).unwrap();
+            std::fs::remove_dir(&external).unwrap();
+            let revision_restored = observe_changed_revision().await;
+            let target_restored = read_target();
+            let command_restored = prepared.validated_command().revalidate();
+            let restored_old = prepared.validate_before_spawn();
+            let natives = native_retention.lock().unwrap().clone();
+            if !super::super::prepare::try_settle_natives(natives).await {
+                return Err("original native preparation did not settle");
+            }
+            super::super::libraries::settle(libraries.clone()).await;
+            drop(prepared);
+            drop(admitted_retention.take());
+
+            let admitted = coordinator.admit(&id).unwrap();
+            admitted_retention = Some(admitted.clone());
+            let fresh = coordinator
+                .prepare(
+                    admitted,
+                    &request,
+                    &cancellation,
+                    None,
+                    &native_retention,
+                    libraries,
+                    super::super::session::LaunchAttemptTelemetry::started(None, "vanilla"),
+                )
+                .await
+                .unwrap();
+            let restored_fresh = fresh.validate_before_spawn();
+            let target_fresh = read_target();
+            drop(fresh);
+            Ok(move || {
+                assert!(absent_before);
+                assert!(
+                    std::fs::symlink_metadata(external)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                );
+                assert_ne!(revision_changed.unwrap(), revision_before);
+                assert_ne!(revision_restored.unwrap(), revision_before);
+                for observed in [target_changed, target_restored, target_fresh] {
+                    assert_eq!(observed, target_before);
+                }
+                for (path, bytes) in target_files.into_iter().zip(target_before) {
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                }
+                assert_eq!(initial, Ok(()));
+                assert!(
+                    command_changed.is_ok(),
+                    "target command changed with external entry"
+                );
+                assert!(
+                    command_restored.is_ok(),
+                    "target command changed after restoration"
+                );
+                assert_eq!(changed, Err(LaunchError::PlanRejected));
+                assert_eq!(restored_old, Err(LaunchError::PlanRejected));
+                assert_eq!(restored_fresh, Ok(()));
+            })
+        })
+        .catch_unwind()
+        .await;
+        let released = std::fs::write(root.path().join("probe-release"), b"release");
+        let natives = native_retention
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let native_cleanup =
+            std::panic::AssertUnwindSafe(super::super::prepare::try_settle_natives(natives))
+                .catch_unwind()
+                .await;
+        let library_cleanup = std::panic::AssertUnwindSafe(async {
+            if let Some(retained) = library_retention {
+                super::super::libraries::settle(retained).await;
+            }
+        })
+        .catch_unwind()
+        .await;
+        drop(admitted_retention);
+        let sessions =
+            std::panic::AssertUnwindSafe(coordinator.sessions.shutdown(Duration::from_secs(3)))
+                .catch_unwind()
+                .await;
+        let tasks =
+            std::panic::AssertUnwindSafe(coordinator.tasks.shutdown(Duration::from_secs(3)))
+                .catch_unwind()
+                .await;
+        let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(released.is_ok());
+            assert!(
+                matches!(native_cleanup, Ok(true)),
+                "native effects did not settle"
+            );
+            assert!(
+                library_cleanup.is_ok(),
+                "game-library effects did not settle"
+            );
+            assert!(matches!(sessions, Ok(Ok(()))), "sessions did not join");
+            assert!(matches!(tasks, Ok(Ok(()))), "tasks did not join");
+            assert!(coordinator.tasks.status().is_idle());
+            match journey {
+                Ok(Ok(verify)) => verify(),
+                Ok(Err(message)) => panic!("{message}"),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }));
+        if let Err(panic) = verification {
+            eprintln!("Retained prepared scan fixture: {}", root.keep().display());
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[cfg(unix)]

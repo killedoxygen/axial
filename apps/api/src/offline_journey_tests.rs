@@ -2970,7 +2970,7 @@ async fn preflight_reports_publication_contention_without_waiting_or_launching()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn preflight_reports_unrelated_degraded_versions_without_repairing() {
+async fn degraded_versions_block_preflight_and_play_without_repairing() {
     use futures_util::FutureExt;
 
     let temporary =
@@ -2981,6 +2981,7 @@ async fn preflight_reports_unrelated_degraded_versions_without_repairing() {
         .await
         .unwrap();
     let api = Api::new(&services);
+    let mut processes = BTreeSet::new();
     let journey = std::panic::AssertUnwindSafe(async {
         api.post(
             "/api/v1/accounts/offline",
@@ -3072,6 +3073,21 @@ async fn preflight_reports_unrelated_degraded_versions_without_repairing() {
         let intact: Vec<_> = protected.iter()
             .map(|(path, _)| std::fs::read(path).unwrap()).collect();
         let malformed_after = std::fs::read(&metadata).unwrap();
+        let response = api.client
+            .post(format!("{}/api/v1/launch", api.base))
+            .header(transport::CAPABILITY_HEADER, &api.capability)
+            .json(&json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()}))
+            .send()
+            .await
+            .unwrap();
+        let play_status = response.status();
+        let play_body: Value = response.json().await.unwrap();
+        if play_status.is_success() {
+            let session = play_body["session_id"].as_str().unwrap();
+            processes.extend(observe_and_stop_session(&api, session).await);
+        }
+        let after_play: Vec<_> = protected.iter()
+            .map(|(path, _)| std::fs::read(path).unwrap()).collect();
 
         std::fs::remove_file(&client).unwrap();
         let missing_before = std::fs::symlink_metadata(&client)
@@ -3099,14 +3115,11 @@ async fn preflight_reports_unrelated_degraded_versions_without_repairing() {
         let sessions = api.get("/api/v1/launch/sessions").await;
         let reports = api.get("/api/v1/launch/reports").await;
         move || {
-            assert_eq!(requests_after, requests_before);
-            assert_eq!(queue_after, queue_before);
-            assert_eq!(sessions, json!({"sessions":[]}));
-            assert_eq!(reports, json!({"reports":[]}));
-            for (((_, before), intact), restored) in
-                protected.into_iter().zip(intact).zip(restored_bytes)
+            for ((((_, before), intact), after_play), restored) in
+                protected.into_iter().zip(intact).zip(after_play).zip(restored_bytes)
             {
                 assert_eq!(intact, before);
+                assert_eq!(after_play, before);
                 assert_eq!(restored, before);
             }
             assert_eq!(malformed_after, malformed);
@@ -3172,6 +3185,15 @@ async fn preflight_reports_unrelated_degraded_versions_without_repairing() {
                     assert_eq!(observed["needs_install"], "");
                 }
             }
+            assert_eq!(play_status, StatusCode::CONFLICT, "{play_body}");
+            assert_eq!(play_body, json!({
+                "code":"installed_versions_degraded",
+                "error":"Could not verify installed versions. Check the library folder and try again."
+            }));
+            assert_eq!(requests_after, requests_before);
+            assert_eq!(queue_after, queue_before);
+            assert_eq!(sessions, json!({"sessions":[]}));
+            assert_eq!(reports, json!({"reports":[]}));
         }
     })
     .catch_unwind()
@@ -3184,6 +3206,9 @@ async fn preflight_reports_unrelated_degraded_versions_without_repairing() {
     let provider_join = std::panic::AssertUnwindSafe(provider.shutdown())
         .catch_unwind()
         .await;
+    let absent = std::panic::AssertUnwindSafe(assert_fixture_processes_gone(&processes))
+        .catch_unwind()
+        .await;
     let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match shutdown {
             Ok(result) => assert!(result.is_ok(), "{result:?}"),
@@ -3191,6 +3216,9 @@ async fn preflight_reports_unrelated_degraded_versions_without_repairing() {
         }
         assert!(settled);
         if let Err(panic) = provider_join {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = absent {
             std::panic::resume_unwind(panic);
         }
         match journey {
