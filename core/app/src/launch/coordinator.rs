@@ -45,7 +45,7 @@ use crate::{
     },
     install::queue::{InstallError, InstallQueue, InstalledVersionReceipt},
     instances::{
-        directory::{InstanceDirectories, RegisteredInstance},
+        directory::{InstanceDirectories, ReadInstance, RegisteredInstance},
         model::InstanceError,
     },
     library::{ApplicationRootPin, GenerationPin},
@@ -104,7 +104,18 @@ pub struct LaunchPreflight {
     pub diagnostics: Option<PreflightDiagnostics>,
 }
 
-/// Safe facts from a completed successful diagnostic probe, not launch authority.
+impl LaunchPreflight {
+    fn refused(instance_id: InstanceId, error: LaunchError) -> Self {
+        Self {
+            instance_id,
+            launchable: false,
+            error: Some(error.into()),
+            diagnostics: None,
+        }
+    }
+}
+
+/// Safe facts from a completed diagnostic observation, not launch authority.
 #[derive(Clone, Debug, Serialize, TS)]
 pub struct PreflightDiagnostics {
     pub status: PreflightStatus,
@@ -154,7 +165,27 @@ impl From<Option<OverrideOrigin>> for PreflightOverride {
 #[derive(Clone, Debug, Serialize, TS)]
 pub struct PreflightReadiness {
     pub launchable: bool,
-    pub reasons: [(); 0],
+    pub reasons: Vec<PreflightReadinessReason>,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct PreflightReadinessReason {
+    pub id: PreflightReadinessReasonId,
+    pub severity: PreflightReadinessSeverity,
+    pub message: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightReadinessReasonId {
+    ClientJarMissing,
+    ClientJarCorrupt,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightReadinessSeverity {
+    Blocking,
 }
 
 #[derive(Clone, Debug, Serialize, TS)]
@@ -171,9 +202,10 @@ pub struct PreflightResourceBudget {
 }
 
 impl PreflightDiagnostics {
-    fn ready(
+    fn from_capture(
         settings: &EffectiveLaunchSettings,
         budget: super::reports::LaunchProofResourceBudget,
+        readiness: PreflightReadiness,
     ) -> Self {
         Self {
             status: PreflightStatus::Ready,
@@ -187,10 +219,7 @@ impl PreflightDiagnostics {
                 preset: settings.preset_override_origin.into(),
                 raw_jvm_args: settings.raw_jvm_args_origin.into(),
             },
-            readiness: PreflightReadiness {
-                launchable: true,
-                reasons: [],
-            },
+            readiness,
             resource_budget: PreflightResourceBudget {
                 active_session_count: budget.active_session_count,
                 active_install_count: budget.active_install_count,
@@ -510,25 +539,16 @@ impl LaunchCoordinator {
         id: InstanceId,
         projection: &mut PreflightProjection,
     ) -> LaunchPreflight {
-        let result = self.check_preflight(&id, projection).await;
-        let launchable = result.is_ok();
-        let (diagnostics, error) = match result {
-            Ok(diagnostics) => (diagnostics, None),
-            Err(error) => (None, Some(error.into())),
-        };
-        LaunchPreflight {
-            instance_id: id,
-            launchable,
-            error,
-            diagnostics,
-        }
+        self.check_preflight(&id, projection)
+            .await
+            .unwrap_or_else(|error| LaunchPreflight::refused(id, error))
     }
 
     async fn check_preflight(
         &self,
         id: &InstanceId,
         projection: &mut PreflightProjection,
-    ) -> Result<Option<PreflightDiagnostics>, LaunchError> {
+    ) -> Result<LaunchPreflight, LaunchError> {
         let admitted = Arc::new(self.instances.admit_read(id).map_err(instance_error)?);
         let pin = admitted.game_directory().pin().clone();
         if projection.current.as_ref().is_some_and(|proof| {
@@ -592,11 +612,62 @@ impl LaunchCoordinator {
                         coordinator
                             .fresh_install_checks
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let installed = coordinator
+                        let installed = match coordinator
                             .installs
                             .ready_version(&pin, &admitted.record().instance.version_id)
                             .await
-                            .map_err(install_read_error)?;
+                        {
+                            Ok(installed) => installed,
+                            Err(error) if diagnostics => {
+                                let (id, message) = match error {
+                                    InstallError::ClientJarMissing => (
+                                        PreflightReadinessReasonId::ClientJarMissing,
+                                        "Client game files are missing. Install this version before launching.",
+                                    ),
+                                    InstallError::ClientJarCorrupt => (
+                                        PreflightReadinessReasonId::ClientJarCorrupt,
+                                        "Client game files are corrupt. Repair this version before launching.",
+                                    ),
+                                    _ => return Err(install_read_error(error)),
+                                };
+                                let target = &admitted.record().instance;
+                                let mut refused = LaunchPreflight::refused(
+                                    target.id.clone(),
+                                    LaunchError::InstallUnavailable,
+                                );
+                                if let Ok((selection, settings, _)) = coordinator.capture(target, None)
+                                    && let Ok(facts) = coordinator.preflight_diagnostics(
+                                        &admitted,
+                                        &settings,
+                                        &host,
+                                        PreflightReadiness {
+                                            launchable: false,
+                                            reasons: vec![PreflightReadinessReason {
+                                                id,
+                                                severity: PreflightReadinessSeverity::Blocking,
+                                                message,
+                                            }],
+                                        },
+                                    )
+                                {
+                                    selection
+                                        .validate(&coordinator.accounts)
+                                        .map_err(|_| LaunchError::AccountChanged)?;
+                                    coordinator
+                                        .settings
+                                        .validate_revision(settings.global_config_revision)
+                                        .map_err(|_| LaunchError::SettingsChanged)?;
+                                    refused.diagnostics = Some(facts);
+                                }
+                                bundle_guard
+                                    .as_ref()
+                                    .unwrap()
+                                    .revalidate()
+                                    .map_err(bundle_read_error)?;
+                                return Ok(refused);
+                            }
+                            Err(error) => return Err(install_read_error(error)),
+                        };
                         let (installed, _) = installed
                             .prepare_game_libraries()
                             .await
@@ -667,26 +738,24 @@ impl LaunchCoordinator {
                             LaunchError::PlanRejected
                         })?;
                         let diagnostics = if diagnostics {
-                            let library_dir = proof
-                                .pin
-                                .read_projection()
-                                .map_err(|_| LaunchError::LibraryUnavailable)?;
-                            let game_dir = admitted
-                                .game_directory()
-                                .read_projection()
-                                .map_err(|_| LaunchError::InstanceChanged)?;
-                            let budget = super::resources::capture(
+                            Some(coordinator.preflight_diagnostics(
+                                &admitted,
+                                &settings,
                                 &host,
-                                coordinator.sessions.resource_use(),
-                                coordinator.installs.active_count(),
-                                settings.max_memory_mb,
-                                [&library_dir, &game_dir],
-                            );
-                            Some(PreflightDiagnostics::ready(&settings, budget))
+                                PreflightReadiness {
+                                    launchable: true,
+                                    reasons: Vec::new(),
+                                },
+                            )?)
                         } else {
                             None
                         };
-                        Ok::<_, LaunchError>(diagnostics)
+                        Ok::<_, LaunchError>(LaunchPreflight {
+                            instance_id: target.id.clone(),
+                            launchable: true,
+                            error: None,
+                            diagnostics,
+                        })
                     }
                     .await;
                     selection
@@ -725,6 +794,33 @@ impl LaunchCoordinator {
             .map_err(|_| LaunchError::PreparationFailed)?;
         projection.current = proof_slot.lock().unwrap().take();
         result
+    }
+
+    fn preflight_diagnostics(
+        &self,
+        admitted: &ReadInstance,
+        settings: &EffectiveLaunchSettings,
+        host: &super::resources::HostResources,
+        readiness: PreflightReadiness,
+    ) -> Result<PreflightDiagnostics, LaunchError> {
+        let game = admitted.game_directory();
+        let library_dir = game
+            .pin()
+            .read_projection()
+            .map_err(|_| LaunchError::LibraryUnavailable)?;
+        let game_dir = game
+            .read_projection()
+            .map_err(|_| LaunchError::InstanceChanged)?;
+        let budget = super::resources::capture(
+            host,
+            self.sessions.resource_use(),
+            self.installs.active_count(),
+            settings.max_memory_mb,
+            [&library_dir, &game_dir],
+        );
+        Ok(PreflightDiagnostics::from_capture(
+            settings, budget, readiness,
+        ))
     }
 
     fn capture(
@@ -1094,7 +1190,9 @@ fn bundle_read_error(error: std::io::Error) -> LaunchError {
 
 fn install_read_error(error: InstallError) -> LaunchError {
     match error {
-        InstallError::NotReady => LaunchError::InstallUnavailable,
+        InstallError::NotReady
+        | InstallError::ClientJarMissing
+        | InstallError::ClientJarCorrupt => LaunchError::InstallUnavailable,
         InstallError::Busy => LaunchError::InstanceBusy,
         InstallError::AtCapacity => LaunchError::AtCapacity,
         InstallError::Closed => LaunchError::Closed,

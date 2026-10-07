@@ -2483,6 +2483,192 @@ async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preflight_reports_installed_client_damage_without_launching_or_repairing() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temporary =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let profile = temporary.path().join("profile");
+    let provider = Provider::start(false).await;
+    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+        .await
+        .unwrap();
+    let api = Api::new(&services);
+    api.post(
+        "/api/v1/accounts/offline",
+        json!({"username":PLAYER,"expected_selection_revision":0}),
+    )
+    .await;
+    api.request(
+        reqwest::Method::PUT,
+        "/api/v1/config",
+        Some(json!({
+            "expected_revision":0,"performance_mode":"vanilla","jvm_preset":"",
+            "java_path_override":"","max_memory_mb":2048,"min_memory_mb":1024
+        })),
+    )
+    .await;
+    let start = api
+        .post(
+            "/api/v1/install/queue",
+            json!({"kind":"vanilla","version_id":VERSION}),
+        )
+        .await;
+    assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
+    let created = api
+        .post(
+            "/api/v1/instances",
+            json!({"name":"Missing client preflight","selection_id":format!("vanilla|{VERSION}")}),
+        )
+        .await;
+    let instance = created["id"].as_str().unwrap();
+    let current = api.get(&format!("/api/v1/instances/{instance}")).await;
+    let private_args = "-Dpreflight.private=missing-client-secret";
+    api.request(
+        reqwest::Method::PUT,
+        &format!("/api/v1/instances/{instance}"),
+        Some(json!({"expected_revision":current["revision"],"extra_jvm_args":private_args})),
+    )
+    .await;
+    let preflight = format!("/api/v1/launch/preflight/{instance}");
+    let ready = api.get(&preflight).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    assert_eq!(ready["launchable"], true, "{ready}");
+    assert_eq!(ready["readiness"], json!({"launchable":true,"reasons":[]}));
+    let reports_before = api.get("/api/v1/launch/reports").await;
+    let queue_before = api.get("/api/v1/install/queue").await;
+    let sessions_before = api.get("/api/v1/launch/sessions").await;
+    let library = services.library.admit().unwrap().read_projection().unwrap();
+    let client = library.join(format!("versions/{VERSION}/{VERSION}.jar"));
+    let original = std::fs::read(&client).unwrap();
+    let mut changed = original.clone();
+    changed[0] ^= 1;
+    std::fs::write(&client, &changed).unwrap();
+    let corrupt = api.get(&preflight).await;
+    let bytes_after_preflight = std::fs::read(&client).unwrap();
+    std::fs::remove_file(&client).unwrap();
+    let canary = temporary.path().join("outside-client-canary.jar");
+    assert!(!canary.starts_with(&profile) && !canary.starts_with(&library));
+    std::fs::write(&canary, &original).unwrap();
+    std::os::unix::fs::symlink(&canary, &client).unwrap();
+    let link_before = std::fs::symlink_metadata(&client).unwrap();
+    let inadmissible = api.get(&preflight).await;
+    let link_after = std::fs::symlink_metadata(&client).unwrap();
+    let link_target = std::fs::read_link(&client).unwrap();
+    std::fs::remove_file(&client).unwrap();
+    let missing = api.get(&preflight).await;
+    let canary_after = std::fs::read(&canary).unwrap();
+    let reports_after = api.get("/api/v1/launch/reports").await;
+    let queue_after = api.get("/api/v1/install/queue").await;
+    let sessions_after = api.get("/api/v1/launch/sessions").await;
+    services.server.shutdown().await.unwrap();
+    assert!(services.server.is_shutdown_settled());
+    drop(services);
+    provider.shutdown().await;
+
+    assert_eq!(reports_before, json!({"reports":[]}));
+    assert_eq!(reports_after, reports_before);
+    assert_eq!(queue_after, queue_before);
+    assert_eq!(sessions_before, json!({"sessions":[]}));
+    assert_eq!(sessions_after, sessions_before);
+    assert!(link_before.file_type().is_symlink());
+    assert!(link_after.file_type().is_symlink());
+    assert_eq!(
+        (link_after.dev(), link_after.ino()),
+        (link_before.dev(), link_before.ino())
+    );
+    assert_eq!(link_target, canary);
+    assert_eq!(canary_after, original);
+    assert_eq!(
+        inadmissible,
+        json!({
+            "instance_id":instance,"launchable":false,
+            "error":{
+                "code":"install_unavailable",
+                "error":"The installed version requires a completed installation before launch."
+            }
+        })
+    );
+    assert_eq!(changed.len(), original.len());
+    assert_ne!(changed, original);
+    assert_eq!(
+        bytes_after_preflight, changed,
+        "preflight must not repair files"
+    );
+    assert!(
+        !client.try_exists().unwrap(),
+        "preflight must not repair files"
+    );
+    for (response, reason, message) in [
+        (
+            missing,
+            "client_jar_missing",
+            "Client game files are missing. Install this version before launching.",
+        ),
+        (
+            corrupt,
+            "client_jar_corrupt",
+            "Client game files are corrupt. Repair this version before launching.",
+        ),
+    ] {
+        assert_eq!(response["instance_id"], instance);
+        assert_eq!(response["launchable"], false, "{response}");
+        assert_eq!(response["error"]["code"], "install_unavailable");
+        assert_eq!(response["status"], "ready", "{response}");
+        assert_eq!(
+            response["readiness"],
+            json!({"launchable":false,"reasons":[{
+                "id":reason,"severity":"blocking","message":message
+            }]})
+        );
+        assert_eq!(
+            response["memory"],
+            json!({"max_memory_mb":2048,"min_memory_mb":1024,"min_clamped":false})
+        );
+        assert_eq!(
+            response["overrides"],
+            json!({
+                "java":{"present":false},"preset":{"present":false},
+                "raw_jvm_args":{"present":true,"origin":"instance"}
+            })
+        );
+        assert_eq!(response.as_object().unwrap().len(), 8);
+        let budget = response["resource_budget"]
+            .as_object()
+            .expect("safe resource budget");
+        assert_eq!(budget.len(), 9);
+        assert_eq!(budget["active_session_count"], 0);
+        assert_eq!(budget["active_install_count"], 0);
+        assert_eq!(budget["active_memory_allocation_mb"], 0);
+        assert_eq!(budget["requested_memory_mb"], 2048);
+        let remaining = budget.get("estimated_remaining_memory_mb").unwrap();
+        assert!(remaining.is_null() || remaining.as_i64().is_some());
+        for pressure in [
+            "memory_pressure",
+            "cpu_pressure",
+            "install_pressure",
+            "disk_pressure",
+        ] {
+            assert!(budget[pressure].is_boolean(), "{pressure}: {budget:?}");
+        }
+        assert_eq!(budget["install_pressure"], false);
+        let encoded = response.to_string();
+        for private in [
+            profile.to_str().unwrap(),
+            client.to_str().unwrap(),
+            private_args,
+            "missing-client-secret",
+            &api.capability,
+        ] {
+            assert!(
+                !encoded.contains(private),
+                "preflight exposed private input"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_offline_vanilla_install_launch_stop_and_restart() {
     offline_vanilla_journey(false).await;
 }

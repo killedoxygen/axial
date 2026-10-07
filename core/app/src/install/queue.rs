@@ -112,6 +112,10 @@ pub enum InstallError {
         "The version is not fully installed or its files changed. Install it before launching."
     )]
     NotReady,
+    #[error("Client game files are missing. Install this version before launching.")]
+    ClientJarMissing,
+    #[error("Client game files are corrupt. Repair this version before launching.")]
+    ClientJarCorrupt,
     #[error("The selected loader build is unavailable.")]
     LoaderUnavailable,
     #[error("Content installation is unavailable.")]
@@ -3998,7 +4002,7 @@ pub(crate) mod tests {
         );
         assert!(matches!(
             queue.ready_version(&pin, &loader_id).await,
-            Err(InstallError::NotReady)
+            Err(InstallError::ClientJarCorrupt)
         ));
         queue.shutdown_queued().unwrap();
         other_queue.shutdown_queued().unwrap();
@@ -5915,6 +5919,46 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_recorded_client_digest_is_not_reported_as_corrupt_bytes() {
+        let (root, storage, library, _exclusions, owner, queue) = fixture();
+        let version = "recorded-digest-fixture";
+        install_ready_fixture(&queue, version).await;
+        let pin = library.admit().unwrap();
+        assert!(queue.ready_version(&pin, version).await.is_ok());
+        let relative = format!("versions/{version}/{version}.jar");
+        let client = root.path().join(&relative);
+        let before = std::fs::read(&client).unwrap();
+        storage.transaction(|db| {
+            let encoded: String = db.query_row(
+                "SELECT inventory_json FROM installed_versions WHERE library_id=?1 AND version_id=?2 AND state='ready'",
+                params![pin.library_id().to_string(), version], |row| row.get(0),
+            )?;
+            let mut inventory: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            let entry = inventory["files"].as_array_mut().unwrap().iter_mut()
+                .find(|entry| entry["path"] == relative).unwrap();
+            entry["sha1"] = serde_json::Value::String("z".repeat(40));
+            assert_eq!(db.execute(
+                "UPDATE installed_versions SET inventory_json=?1 WHERE library_id=?2 AND version_id=?3 AND state='ready'",
+                params![inventory.to_string(), pin.library_id().to_string(), version],
+            )?, 1);
+            Ok::<_, InstallError>(())
+        }).unwrap();
+        let observed = queue.ready_version(&pin, version).await;
+        let after = std::fs::read(&client).unwrap();
+        queue.shutdown_queued().unwrap();
+        owner
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(after, before);
+        assert!(
+            matches!(observed, Err(InstallError::NotReady)),
+            "{observed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn exact_publication_is_not_ready_before_activation_and_acknowledgement() {
         let (root, storage, library, exclusions, owner, queue) = fixture();
         let pin = library.admit().unwrap();
@@ -5976,7 +6020,7 @@ pub(crate) mod tests {
         assert!(ready.revalidate().is_err());
         assert!(matches!(
             restarted.ready_version(&pin, version_id).await,
-            Err(InstallError::NotReady)
+            Err(InstallError::ClientJarCorrupt)
         ));
     }
 

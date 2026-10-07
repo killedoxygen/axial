@@ -6,6 +6,6 @@ import type { PreflightResourceBudget } from "./PreflightResourceBudget";
 import type { PreflightStatus } from "./PreflightStatus";
 
 /**
- * Safe facts from a completed successful diagnostic probe, not launch authority.
+ * Safe facts from a completed diagnostic observation, not launch authority.
  */
 export type PreflightDiagnostics = { status: PreflightStatus, memory: PreflightMemory, overrides: PreflightOverrides, readiness: PreflightReadiness, resource_budget: PreflightResourceBudget, };

@@ -173,9 +173,11 @@ pub(crate) fn failure(error: InstallError) -> ApiError {
     let status = match error {
         InstallError::InvalidRequest => StatusCode::BAD_REQUEST,
         InstallError::NotFound => StatusCode::NOT_FOUND,
-        InstallError::Busy | InstallError::SettlementRequired | InstallError::NotReady => {
-            StatusCode::CONFLICT
-        }
+        InstallError::Busy
+        | InstallError::SettlementRequired
+        | InstallError::NotReady
+        | InstallError::ClientJarMissing
+        | InstallError::ClientJarCorrupt => StatusCode::CONFLICT,
         InstallError::AtCapacity => StatusCode::TOO_MANY_REQUESTS,
         InstallError::ContentUnavailable
         | InstallError::LoaderUnavailable

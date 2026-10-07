@@ -93,12 +93,21 @@ impl ActivatedVersion {
             .sort_unstable_by(|left, right| left.path.cmp(&right.path));
         let mut batch = operation.file_batch();
         let metadata_path = format!("versions/{0}/{0}.json", self.version_id);
+        let client = format!("versions/{0}/{0}.jar", self.version_id);
+        let client_path =
+            PortableRelativePath::new_exact(&client).map_err(|_| InstallError::NotReady)?;
         let mut guards = Vec::with_capacity(self.files.len());
         let mut version = None;
         let mut exact = BTreeMap::new();
         let mut asset_flags = BTreeMap::new();
         for expected in &self.files {
-            if expected.size > 2 * 1024 * 1024 * 1024 || expected.sha1.len() != 40 {
+            if expected.size > 2 * 1024 * 1024 * 1024 {
+                return Err(InstallError::NotReady);
+            }
+            let mut expected_digest = [0; 20];
+            hex::decode_to_slice(&expected.sha1, &mut expected_digest)
+                .map_err(|_| InstallError::NotReady)?;
+            if hex::encode(expected_digest) != expected.sha1 {
                 return Err(InstallError::NotReady);
             }
             let path = PortableRelativePath::new_exact(&expected.path)
@@ -118,14 +127,22 @@ impl ActivatedVersion {
             let file = batch
                 .observe_file(&path)
                 .map_err(|_| InstallError::NotReady)?
-                .ok_or(InstallError::NotReady)?;
+                .ok_or(if path == client_path {
+                    InstallError::ClientJarMissing
+                } else {
+                    InstallError::NotReady
+                })?;
             if file.size() != expected.size
-                || hex::encode(
-                    file.sha1_bounded(expected.size)
-                        .map_err(|_| InstallError::NotReady)?,
-                ) != expected.sha1
+                || file
+                    .sha1_bounded(expected.size)
+                    .map_err(|_| InstallError::NotReady)?
+                    != expected_digest
             {
-                return Err(InstallError::NotReady);
+                return Err(if path == client_path {
+                    InstallError::ClientJarCorrupt
+                } else {
+                    InstallError::NotReady
+                });
             }
             if expected.path == metadata_path {
                 let bytes = file
@@ -179,16 +196,13 @@ impl ActivatedVersion {
                 .get(&format!("assets/indexes/{}.json", version.asset_index.id))
                 .ok_or(InstallError::NotReady)?
         };
-        let client = format!("versions/{0}/{0}.jar", version.id);
         if !exact.contains_key(&client) {
             return Err(InstallError::NotReady);
         }
-        let client_jar = PortableRelativePath::new_exact(&client)
-            .map_err(|_| InstallError::NotReady)?
-            .join_under(
-                &pin.read_projection()
-                    .map_err(|_| InstallError::LibraryUnavailable)?,
-            );
+        let client_jar = client_path.join_under(
+            &pin.read_projection()
+                .map_err(|_| InstallError::LibraryUnavailable)?,
+        );
         let receipt = InstalledVersionReceipt {
             pin,
             operation,

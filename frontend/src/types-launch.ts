@@ -34,26 +34,9 @@ export type { PreflightOverrides as LaunchPreflightOverrides } from './generated
 export type { PreflightResourceBudget as LaunchPreflightResourceBudget } from './generated/PreflightResourceBudget';
 export type { PreflightReadiness as LaunchReadiness } from './generated/PreflightReadiness';
 
-export type LaunchReadinessReasonId =
-  | 'version_json_missing'
-  | 'client_jar_missing'
-  | 'client_jar_corrupt'
-  | 'parent_version_missing'
-  | 'incomplete_install'
-  | 'libraries_missing'
-  | 'libraries_corrupt'
-  | 'asset_index_missing'
-  | 'asset_index_corrupt'
-  | 'managed_runtime_missing'
-  | 'java_override_missing';
-
-export type LaunchReadinessSeverity = 'blocking' | 'recoverable';
-
-export interface LaunchReadinessReason {
-  id: LaunchReadinessReasonId;
-  severity: LaunchReadinessSeverity;
-  message: string;
-}
+export type { PreflightReadinessReasonId as LaunchReadinessReasonId } from './generated/PreflightReadinessReasonId';
+export type { PreflightReadinessSeverity as LaunchReadinessSeverity } from './generated/PreflightReadinessSeverity';
+export type { PreflightReadinessReason as LaunchReadinessReason } from './generated/PreflightReadinessReason';
 
 export interface InstanceLaunchDraft {
   javaPath: string;
