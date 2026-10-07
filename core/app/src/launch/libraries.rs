@@ -17,7 +17,9 @@ use axial_minecraft::{
     },
     managed_path::ManagedLibraryFile,
 };
-use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
+use axial_resource::{
+    PhysicalIoClass, PhysicalWorkOwner, PhysicalWorkRequest, process_physical_work,
+};
 use sha1::{Digest, Sha1};
 use std::{
     io::{self, Read},
@@ -33,11 +35,12 @@ pub(super) struct Prepared {
     directory: ScopedDirectory,
     sources: Vec<ManagedLibraryFile>,
     files: Vec<FileProof>,
+    work: PhysicalWorkOwner,
 }
 
 impl Prepared {
     pub(super) fn revalidate(&self) -> io::Result<()> {
-        process_physical_work()
+        self.work
             .try_run_inline(
                 PhysicalWorkRequest::foreground(PhysicalIoClass::Read, SCRATCH_BYTES),
                 || self.check(),
@@ -70,6 +73,7 @@ struct FileProof {
 pub(super) struct Retention {
     game: ScopedDirectory,
     pending: Mutex<Option<Effect>>,
+    work: PhysicalWorkOwner,
 }
 
 impl Retention {
@@ -77,6 +81,7 @@ impl Retention {
         Self {
             game,
             pending: Mutex::new(None),
+            work: process_physical_work(),
         }
     }
 
@@ -117,7 +122,8 @@ pub(super) async fn prepare(
     if cancellation.is_cancelled() {
         return Err(LaunchError::Cancelled);
     }
-    let admission = process_physical_work()
+    let admission = retention
+        .work
         .admit(PhysicalWorkRequest::foreground(
             PhysicalIoClass::Write,
             SCRATCH_BYTES,
@@ -155,6 +161,7 @@ pub(super) async fn prepare(
             directory,
             sources: inputs.sources,
             files,
+            work: retention.work.clone(),
         };
         prepared
             .check()
@@ -181,7 +188,8 @@ pub(super) async fn settle(retention: Arc<Retention>) {
         "Launch retains unresolved game-library file effects."
     );
     loop {
-        if let Ok(admission) = process_physical_work()
+        if let Ok(admission) = retention
+            .work
             .admit(PhysicalWorkRequest::foreground(
                 PhysicalIoClass::Write,
                 SCRATCH_BYTES,
@@ -466,7 +474,10 @@ pub(super) mod tests {
         game: ScopedDirectory,
         source: ManagedLibraryFile,
     ) -> Prepared {
-        let retention = Retention::new(game);
+        let retention = Retention {
+            work: PhysicalWorkOwner::isolated_for_test(),
+            ..Retention::new(game)
+        };
         let directory = prepare_directory(&retention).unwrap();
         let (_sender, cancellation) = transfer_cancellation_channel();
         let file = prepare_file(
@@ -484,6 +495,7 @@ pub(super) mod tests {
             directory,
             sources: vec![source],
             files: vec![file],
+            work: retention.work.clone(),
         }
     }
 
@@ -520,7 +532,10 @@ pub(super) mod tests {
             .unwrap();
         Fixture {
             _library: library,
-            retention: Retention::new(game),
+            retention: Retention {
+                work: PhysicalWorkOwner::isolated_for_test(),
+                ..Retention::new(game)
+            },
             source,
             temporary,
         }
@@ -703,6 +718,7 @@ pub(super) mod tests {
             directory,
             sources: vec![fixture.source],
             files: vec![file],
+            work: fixture.retention.work.clone(),
         };
         prepared.revalidate().unwrap();
         let target = fixture.temporary.path().join("game/lib/required.jar");
@@ -712,6 +728,59 @@ pub(super) mod tests {
         assert!(prepared.revalidate().is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"abc");
         assert_eq!(std::fs::read(&preserved).unwrap(), b"abc");
+        assert!(!fixture.retention.has_pending());
+    }
+
+    #[tokio::test]
+    async fn prepared_copy_refuses_its_exhausted_worker_pool_and_recovers() {
+        let fixture = fixture();
+        let directory = prepare_directory(&fixture.retention).unwrap();
+        let file = copy(&fixture, &directory).unwrap();
+        let prepared = Prepared {
+            directory,
+            sources: vec![fixture.source],
+            files: vec![file],
+            work: fixture.retention.work.clone(),
+        };
+        let initial = prepared.revalidate();
+        let held = fixture
+            .retention
+            .work
+            .admit(PhysicalWorkRequest::foreground_parallel(
+                PhysicalIoClass::Read,
+                0,
+                4,
+            ))
+            .await
+            .unwrap();
+        let exhausted = fixture
+            .retention
+            .work
+            .snapshot(axial_resource::PhysicalWorkClass::Foreground);
+        let refused = prepared.revalidate();
+        drop(held);
+        let recovered = prepared.revalidate();
+        let released = fixture
+            .retention
+            .work
+            .snapshot(axial_resource::PhysicalWorkClass::Foreground);
+
+        assert!(initial.is_ok());
+        assert_eq!(exhausted.available_workers, 0);
+        assert_eq!(exhausted.available_scratch_bytes, 512 << 20);
+        let error = refused.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<axial_resource::PhysicalWorkError>()),
+            Some(&axial_resource::PhysicalWorkError::Unavailable),
+        );
+        assert!(recovered.is_ok());
+        assert_eq!(released.available_workers, 4);
+        assert_eq!(released.active_admissions, 0);
+        assert_eq!(released.running_workers, 0);
+        assert_eq!(released.available_scratch_bytes, 512 << 20);
         assert!(!fixture.retention.has_pending());
     }
 }
