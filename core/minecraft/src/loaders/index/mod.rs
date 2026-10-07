@@ -13,5 +13,5 @@ pub use query::{
 pub use query::{
     fetch_fabric_builds_for_test, fetch_fabric_game_versions_for_test,
     persist_loader_build_cache_fixture_for_test,
-    persist_loader_supported_versions_cache_fixture_for_test,
+    persist_loader_supported_versions_cache_fixture_for_test, resolve_fabric_build_for_test,
 };

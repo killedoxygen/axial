@@ -770,12 +770,12 @@ impl SetupService {
                     .installs
                     .ready_version(admission.generation(), &target.version_id)
                     .await
-                    .is_ok()
+                    .is_err()
+                    && (!state.availability.fresh || state.availability.stale)
                 {
-                    verified_target = Some(target);
-                } else if !state.availability.fresh || state.availability.stale {
                     return Err(InstanceError::VersionUnavailable);
                 }
+                verified_target = Some(target);
                 InstallQueueRequest::Loader {
                     component_id,
                     build_id: build.build_id,

@@ -953,6 +953,386 @@ async fn dropped_resolution_caller_keeps_owned_fetch_until_shutdown() {
 }
 
 #[tokio::test]
+async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
+    use futures_util::FutureExt;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
+    let library = service.instances.directories().library().clone();
+    let owner = service.instances.tasks.clone();
+    let registry_revision = service.installs.snapshot().registry_revision;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    service.loader_build_url = Some(format!("{base}/v2/versions/loader/1.21.4").parse().unwrap());
+    service.installs = Arc::new(
+        (*service.installs)
+            .clone()
+            .with_loader_url(format!("{base}/unavailable-resolution").parse().unwrap()),
+    );
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match stopped.try_recv() {
+                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return requests,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "resolution fixture was not stopped"
+            );
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("resolution fixture accept failed: {error}"),
+            };
+            assert!(
+                requests.len() < 4,
+                "resolution fixture request bound exceeded"
+            );
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            let mut length = 0;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !request[..length]
+                .windows(4)
+                .any(|bytes| bytes == b"\r\n\r\n")
+            {
+                stream
+                    .set_read_timeout(Some(
+                        deadline.checked_duration_since(Instant::now()).unwrap(),
+                    ))
+                    .unwrap();
+                assert!(
+                    length < request.len(),
+                    "resolution request headers exceed their bound"
+                );
+                let read = stream.read(&mut request[length..]).unwrap();
+                assert!(read > 0, "resolution request ended before its headers");
+                length += read;
+            }
+            if request[..length].starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n") {
+                let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+                requests.push("catalog");
+            } else {
+                assert!(request[..length].starts_with(b"GET /unavailable-resolution HTTP/1.1\r\n"));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                requests.push("unavailable-resolution");
+            }
+        }
+    });
+    let service = Arc::new(service);
+    let mut caller = None;
+    let absent = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    };
+    let cache = root
+        .path()
+        .join("cache/loaders/catalog/component-fabric-builds-1.21.4.json");
+    let canary = root.path().join("unrelated-user-file.txt");
+    let version_id =
+        axial_minecraft::installed_version_id_for(LoaderComponentId::Fabric, "1.21.4", "0.16.14")
+            .unwrap();
+    let journey = std::panic::AssertUnwindSafe(async {
+        let pin = library.admit().unwrap();
+        let original_generation = pin.generation();
+        let original_library = pin.library_id();
+        let operation = pin.managed_library().unwrap();
+        operation.prepare_layout().unwrap();
+        let initially_absent = absent(&cache)
+            && absent(&root.path().join("versions").join(&version_id))
+            && loaders::fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.4")
+                .unwrap()
+                .is_none();
+        let not_ready = matches!(
+            service.installs.ready_version(&pin, &version_id).await,
+            Err(crate::install::queue::InstallError::NotReady)
+        );
+        drop(operation);
+        drop(pin);
+        std::fs::write(&canary, b"preserve unrelated user bytes\n").unwrap();
+        let instances_before = service.instances.registry().list().unwrap();
+        let pending_before = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+        let queue_before = service.installs.snapshot();
+        caller = Some(tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .resolve("loader_auto|net.fabricmc.fabric-loader|1.21.4")
+                    .await
+            }
+        }));
+        let joined = tokio::time::timeout(Duration::from_secs(5), caller.as_mut().unwrap())
+            .await
+            .expect("automatic resolution did not settle");
+        drop(caller.take());
+        let resolved = joined.unwrap().map(|(target, request, admission)| {
+            let original = admission.generation().generation() == original_generation
+                && admission.generation().library_id() == original_library;
+            let valid = admission.validate().is_ok();
+            (target, request, original, valid)
+        });
+        let cached_bytes = std::fs::read(&cache).unwrap();
+        let explicit = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.resolve(&format!(
+                "loader_build|net.fabricmc.fabric-loader|{}",
+                loaders::build_id_for(LoaderComponentId::Fabric, "1.21.4", "0.16.14")
+            )),
+        )
+        .await
+        .expect("explicit resolution did not settle")
+        .map(|_| ());
+        let created = if resolved.is_ok() {
+            Some(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    service.create(
+                        serde_json::from_value(serde_json::json!({
+                            "name": "ProviderRefusal",
+                            "selection_id": "loader_auto|net.fabricmc.fabric-loader|1.21.4"
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .expect("creation did not settle")
+                .map(|created| serde_json::to_value(created).unwrap()),
+            )
+        } else {
+            None
+        };
+        let records_after = service.instances.registry().list().unwrap();
+        let registered = records_after.first().is_some_and(|record| {
+            service
+                .instances
+                .directories()
+                .admit(&record.instance.id)
+                .is_ok_and(|admitted| admitted.revalidate().is_ok())
+        });
+        let queue_after = service.installs.snapshot();
+        move || {
+            assert!(
+                initially_absent && not_ready,
+                "fixture must require a real provider build, not a Ready target"
+            );
+            assert!(instances_before.is_empty());
+            assert_eq!(pending_before, serde_json::json!([]));
+            assert_eq!(queue_after, queue_before);
+            (
+                resolved,
+                explicit,
+                created,
+                records_after,
+                registered,
+                cached_bytes,
+            )
+        }
+    })
+    .catch_unwind()
+    .await;
+    let stopped = stop.send(());
+    service.installs.close_admission();
+    let shutdown = std::panic::AssertUnwindSafe(owner.shutdown(Duration::from_secs(15)))
+        .catch_unwind()
+        .await;
+    let remaining = match caller.take() {
+        Some(mut caller) => {
+            caller.abort();
+            Some(
+                tokio::time::timeout(Duration::from_secs(1), &mut caller)
+                    .await
+                    .is_ok_and(|joined| match joined {
+                        Ok(_) => true,
+                        Err(error) => error.is_cancelled(),
+                    }),
+            )
+        }
+        None => None,
+    };
+    let observers =
+        tokio::time::timeout(Duration::from_secs(5), service.installs.join_observers()).await;
+    let server = tokio::task::spawn_blocking(move || server.join());
+    let server = tokio::time::timeout(Duration::from_secs(18), server).await;
+    let final_state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let pin = library.admit().unwrap();
+        let operation = pin.managed_library().unwrap();
+        (
+            service.instances.registry().list().unwrap(),
+            service.instances.pending().unwrap(),
+            service.installs.snapshot(),
+            loaders::fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.4").unwrap(),
+        )
+    }));
+    let receipt = owner.shutdown_receipt();
+    let receipted = receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.belongs_to(&owner));
+    let idle = owner.status().is_idle();
+    let unsettled = service.installs.has_unsettled_effects();
+    let runtime_settled = service.installs.runtime_cache().settle();
+    drop(receipt);
+    drop(service);
+    drop(owner);
+    let pins = library.wait_for_pins(Duration::from_secs(2)).await;
+    let preserved = if matches!(&shutdown, Ok(Ok(())))
+        && matches!(&observers, Ok(Ok(())))
+        && matches!(&server, Ok(Ok(Ok(_))))
+        && receipted
+        && idle
+        && !unsettled
+        && runtime_settled.is_ok()
+        && pins.is_ok()
+    {
+        Some(library.try_preserve())
+    } else {
+        None
+    };
+    let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(stopped.is_ok(), "resolution fixture stopped before cleanup");
+        assert!(
+            matches!(shutdown, Ok(Ok(()))),
+            "resolution owner did not join"
+        );
+        assert!(
+            remaining.is_none_or(|joined| joined),
+            "disposable resolution caller did not join"
+        );
+        assert!(
+            matches!(observers, Ok(Ok(()))),
+            "queue observers did not join"
+        );
+        let requests = server
+            .expect("HTTP server join timed out")
+            .expect("HTTP server join task failed")
+            .expect("HTTP server failed");
+        assert!(receipted && idle && !unsettled && runtime_settled.is_ok());
+        assert!(
+            pins.is_ok(),
+            "profile capabilities remained after resolution joined"
+        );
+        assert!(
+            matches!(preserved, Some(Ok(()))),
+            "resolution fixture root did not preserve"
+        );
+        let (records, pending, queue, cached) = final_state.unwrap();
+        assert!(pending.is_empty());
+        assert!(queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none());
+        assert_eq!(queue.registry_revision, registry_revision);
+        assert!(absent(&root.path().join("cache/version_manifest_v2.json")));
+        assert!(
+            std::fs::read_dir(root.path().join("versions"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"preserve unrelated user bytes\n"
+        );
+        assert!(
+            cache.is_file(),
+            "the actual provider response was not persisted"
+        );
+        let (builds, state) = cached.expect("valid provider build was not cached");
+        assert!(
+            state.availability.fresh && state.availability.cache_hit && !state.availability.stale
+        );
+        assert_eq!(builds.len(), 1);
+        let build = &builds[0];
+        assert_eq!(
+            loaders::parse_build_id(&build.build_id),
+            Some((LoaderComponentId::Fabric, "1.21.4".into(), "0.16.14".into()))
+        );
+        assert_eq!(build.version_id, version_id);
+        assert!(
+            matches!(&build.install_source, loaders::LoaderInstallSource::ProfileJson { url } if url == "https://meta.fabricmc.net/v2/versions/loader/1.21.4/0.16.14/profile/json")
+        );
+        let (resolved, explicit, created, records_after, registered, cached_bytes) = match journey {
+            Ok(verify) => verify(),
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        let (target, request, original, valid) = resolved.unwrap_or_else(|error| {
+            panic!("fresh automatic selection was lost when a later provider lookup was unavailable: {error:?}; served routes: {requests:?}")
+        });
+        assert_eq!(
+            target.selection_id(),
+            "loader_auto|net.fabricmc.fabric-loader|1.21.4"
+        );
+        assert_eq!(target.version_id(), version_id);
+        assert_eq!(target.minecraft_version(), "1.21.4");
+        assert_eq!(target.loader_key(), "fabric");
+        assert_eq!(
+            request,
+            InstallQueueRequest::Loader {
+                component_id: LoaderComponentId::Fabric,
+                build_id: build.build_id.clone()
+            }
+        );
+        assert!(
+            original && valid,
+            "resolution did not retain its valid original Admission"
+        );
+        assert_eq!(
+            requests,
+            [
+                "catalog",
+                "unavailable-resolution",
+                "unavailable-resolution"
+            ]
+        );
+        assert!(matches!(explicit, Err(InstanceError::VersionUnavailable)));
+        let created = created.expect("creation control was not reached").unwrap();
+        assert_eq!(
+            created["view_model"],
+            serde_json::json!({
+                "state_id": "created_install_unavailable", "tone": "warn",
+                "title": "Instance created",
+                "summary": "Instance created. Installation could not be queued.",
+                "detail": "Use Install on this instance to try again."
+            })
+        );
+        assert!(created.get("install_queue").is_none());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records, records_after);
+        assert!(registered);
+        assert_eq!(created["id"], records[0].instance.id.as_str());
+        assert_eq!(records[0].instance.name, "ProviderRefusal");
+        assert_eq!(records[0].instance.version_id, version_id);
+        assert_eq!(std::fs::read(&cache).unwrap(), cached_bytes);
+    }));
+    if let Err(panic) = verification {
+        eprintln!(
+            "Retained automatic resolution fixture: {}",
+            root.keep().display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
     use futures_util::FutureExt;
     use std::io::{Read, Write};

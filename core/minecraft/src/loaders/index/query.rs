@@ -254,6 +254,22 @@ pub async fn resolve_build_record_for_install(
     .await
 }
 
+#[cfg(feature = "test-support")]
+pub async fn resolve_fabric_build_for_test(
+    build_id: &str,
+    url: &reqwest::Url,
+) -> Result<LoaderBuildRecord, LoaderError> {
+    crate::loaders::http::validate_loopback_url_for_test(url)?;
+    resolve_build_record_for_install_with(
+        LoaderComponentId::Fabric,
+        build_id,
+        |minecraft_version| async move {
+            providers::fetch_builds_from_loopback_for_test(&minecraft_version, url).await
+        },
+    )
+    .await
+}
+
 async fn resolve_build_record_for_install_with<F, Fut>(
     component_id: LoaderComponentId,
     build_id: &str,

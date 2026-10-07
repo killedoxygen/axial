@@ -163,6 +163,8 @@ pub struct InstallQueue {
     content: Option<(Arc<ContentService>, Arc<ContentMutations>)>,
     #[cfg(feature = "test-support")]
     test_endpoints: Option<InstallTestEndpoints>,
+    #[cfg(test)]
+    loader_url: Option<url::Url>,
 }
 struct Inner {
     storage: Arc<MetadataStore>,
@@ -306,6 +308,8 @@ impl InstallQueue {
             content: None,
             #[cfg(feature = "test-support")]
             test_endpoints: None,
+            #[cfg(test)]
+            loader_url: None,
         })
     }
 
@@ -335,6 +339,11 @@ impl InstallQueue {
 
     pub fn runtime_cache(&self) -> &ManagedRuntimeCache {
         &self.inner.runtime
+    }
+    #[cfg(test)]
+    pub(crate) fn with_loader_url(mut self, url: url::Url) -> Self {
+        self.loader_url = Some(url);
+        self
     }
     pub fn library(&self) -> &LibraryLifecycle {
         &self.inner.library
@@ -536,6 +545,18 @@ impl InstallQueue {
                 component_id,
                 build_id,
             } => {
+                #[cfg(test)]
+                let record = if let Some(url) = &self.loader_url {
+                    if *component_id != LoaderComponentId::Fabric {
+                        return Err(InstallError::InvalidRequest);
+                    }
+                    axial_minecraft::loaders::resolve_fabric_build_for_test(build_id, url)
+                        .await
+                        .map_err(|_| InstallError::LoaderUnavailable)?
+                } else {
+                    resolve_loader(*component_id, build_id).await?
+                };
+                #[cfg(not(test))]
                 let record = resolve_loader(*component_id, build_id).await?;
                 Ok(item_for_loader(&record))
             }
