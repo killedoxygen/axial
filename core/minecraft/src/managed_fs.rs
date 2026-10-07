@@ -5389,6 +5389,49 @@ pub struct ManagedLibraryFileBatch {
     parent_walks: usize,
 }
 
+/// An admitted observation, not permission to create or replace a file.
+pub enum FileObservation {
+    Present(ManagedLibraryFile),
+    Missing(FileAbsence),
+}
+
+/// Retains the original namespace observation at the first missing component.
+pub struct FileAbsence {
+    operation: ManagedLibraryOperation,
+    parent: FileBatchParent,
+    name: String,
+    revision: DirectoryRevision,
+}
+
+impl FileAbsence {
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.operation.revalidate()?;
+        // Cursor refreshes authenticate the retained children, never replace
+        // this proof's original revisions.
+        let mut parent = self.parent.clone();
+        parent.revalidate()?;
+        parent
+            .directory
+            .validate_passive_revision(&self.revision)
+            .map_err(loader_io)?;
+        if parent
+            .directory
+            .exact_entry_kind(&self.name)
+            .map_err(loader_io)?
+            .is_some()
+        {
+            return Err(io::Error::other("observed library absence changed"));
+        }
+        parent.revalidate()?;
+        parent
+            .directory
+            .validate_passive_revision(&self.revision)
+            .map_err(loader_io)?;
+        self.operation.revalidate()
+    }
+}
+
+#[derive(Clone)]
 struct FileBatchParent {
     relative: String,
     directory: ManagedDir,
@@ -5481,6 +5524,17 @@ impl ManagedLibraryFileBatch {
         &mut self,
         relative: &PortableRelativePath,
     ) -> io::Result<Option<ManagedLibraryFile>> {
+        self.observe_file_with_absence(relative)
+            .map(|observation| match observation {
+                FileObservation::Present(file) => Some(file),
+                FileObservation::Missing(_) => None,
+            })
+    }
+
+    pub fn observe_file_with_absence(
+        &mut self,
+        relative: &PortableRelativePath,
+    ) -> io::Result<FileObservation> {
         let result = self.observe(relative);
         if result.is_err() {
             self.parent = None;
@@ -5488,10 +5542,7 @@ impl ManagedLibraryFileBatch {
         result
     }
 
-    fn observe(
-        &mut self,
-        relative: &PortableRelativePath,
-    ) -> io::Result<Option<ManagedLibraryFile>> {
+    fn observe(&mut self, relative: &PortableRelativePath) -> io::Result<FileObservation> {
         self.operation.revalidate()?;
         let (parent_path, name) = relative
             .as_str()
@@ -5516,10 +5567,22 @@ impl ManagedLibraryFileBatch {
                     let mut revision = directory.passive_revision().map_err(loader_io)?;
                     let child = directory.open_child_if_exists(segment).map_err(loader_io)?;
                     let Some(child) = child else {
-                        directory
-                            .validate_passive_revision(&revision)
-                            .map_err(loader_io)?;
-                        return Ok(None);
+                        let absence = FileAbsence {
+                            operation: self.operation.clone(),
+                            parent: FileBatchParent {
+                                relative: parent_path
+                                    .split('/')
+                                    .take(revisions.len())
+                                    .collect::<Vec<_>>()
+                                    .join("/"),
+                                directory,
+                                revisions,
+                            },
+                            name: segment.to_owned(),
+                            revision,
+                        };
+                        absence.revalidate()?;
+                        return Ok(FileObservation::Missing(absence));
                     };
                     revalidate_batch_child(&directory, &child, segment, &mut revision)?;
                     revisions.push((directory, revision));
@@ -5541,12 +5604,24 @@ impl ManagedLibraryFileBatch {
             .map_err(loader_io)?;
         parent.finish_observation(name, &revision, guard.as_ref())?;
         self.operation.revalidate()?;
-        Ok(guard.map(|guard| ManagedLibraryFile {
-            operation: self.operation.clone(),
-            directory: parent.directory.clone(),
-            name: name.to_owned(),
-            guard,
-        }))
+        match guard {
+            Some(guard) => Ok(FileObservation::Present(ManagedLibraryFile {
+                operation: self.operation.clone(),
+                directory: parent.directory.clone(),
+                name: name.to_owned(),
+                guard,
+            })),
+            None => {
+                let absence = FileAbsence {
+                    operation: self.operation.clone(),
+                    parent: parent.clone(),
+                    name: name.to_owned(),
+                    revision,
+                };
+                absence.revalidate()?;
+                Ok(FileObservation::Missing(absence))
+            }
+        }
     }
 }
 
@@ -6852,6 +6927,145 @@ mod library_lifecycle_tests {
 
     fn batch_path(name: &str) -> PortableRelativePath {
         PortableRelativePath::new_exact(&format!("assets/objects/aa/{name}")).unwrap()
+    }
+
+    fn require_changed_directory_revision(
+        directory: &ManagedDir,
+        original: DirectoryRevision,
+        path: &Path,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while directory.passive_revision().unwrap() == original {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "directory revision did not advance"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+            let marker = path.join("revision-change");
+            std::fs::write(&marker, b"namespace change").unwrap();
+            std::fs::remove_file(marker).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_absence_refuses_invalid_ancestor_namespace() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        let path = batch_path("missing");
+        let FileObservation::Missing(absence) = operation
+            .file_batch()
+            .observe_file_with_absence(&path)
+            .unwrap()
+        else {
+            panic!("fixture file must be absent");
+        };
+        absence.revalidate().unwrap();
+        let ancestor = operation.managed_directory().unwrap();
+        let revision = ancestor.passive_revision().unwrap();
+        std::fs::create_dir(temporary.path().join("unsafe:name")).unwrap();
+        require_changed_directory_revision(&ancestor, revision, temporary.path());
+        assert!(operation.file_batch().observe_file(&path).is_err());
+        assert!(absence.revalidate().is_err());
+        assert_eq!(
+            std::fs::read(temporary.path().join("assets/objects/aa/first")).unwrap(),
+            b"first payload"
+        );
+    }
+
+    #[test]
+    fn file_absence_refuses_a_distinct_portable_ancestor_alias() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        let path = batch_path("missing");
+        let FileObservation::Missing(absence) = operation
+            .file_batch()
+            .observe_file_with_absence(&path)
+            .unwrap()
+        else {
+            panic!("fixture file must be absent");
+        };
+        let ancestor = operation.managed_directory().unwrap();
+        let revision = ancestor.passive_revision().unwrap();
+        match std::fs::create_dir(temporary.path().join("Assets")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                assert_eq!(
+                    std::fs::canonicalize(temporary.path().join("assets")).unwrap(),
+                    std::fs::canonicalize(temporary.path().join("Assets")).unwrap(),
+                );
+                return;
+            }
+            Err(error) => panic!("create distinct portable alias: {error}"),
+        }
+        require_changed_directory_revision(&ancestor, revision, temporary.path());
+        assert!(operation.file_batch().observe_file(&path).is_err());
+        assert!(absence.revalidate().is_err());
+    }
+
+    #[test]
+    fn file_absence_retains_missing_components_across_ancestor_churn() {
+        for relative in ["assets/objects/aa/missing", "assets/missing/leaf"] {
+            let (temporary, _root, operation) = file_batch_fixture();
+            let path = PortableRelativePath::new_exact(relative).unwrap();
+            let FileObservation::Missing(absence) = operation
+                .file_batch()
+                .observe_file_with_absence(&path)
+                .unwrap()
+            else {
+                panic!("fixture component must be absent");
+            };
+            let ancestor = operation.managed_directory().unwrap();
+            let revision = ancestor.passive_revision().unwrap();
+            std::fs::create_dir(temporary.path().join("unrelated")).unwrap();
+            require_changed_directory_revision(&ancestor, revision, temporary.path());
+            absence.revalidate().unwrap();
+            absence.revalidate().unwrap();
+            std::fs::create_dir_all(temporary.path().join(relative).parent().unwrap()).unwrap();
+            std::fs::write(temporary.path().join(relative), b"appeared").unwrap();
+            assert!(absence.revalidate().is_err());
+            assert_eq!(
+                std::fs::read(temporary.path().join(relative)).unwrap(),
+                b"appeared"
+            );
+        }
+    }
+
+    #[test]
+    fn file_absence_refuses_replaced_parent() {
+        let (temporary, _root, operation) = file_batch_fixture();
+        let path = batch_path("missing");
+        let FileObservation::Missing(absence) = operation
+            .file_batch()
+            .observe_file_with_absence(&path)
+            .unwrap()
+        else {
+            panic!("fixture file must be absent");
+        };
+        absence.revalidate().unwrap();
+        let parent = temporary.path().join("assets/objects/aa");
+        let previous = temporary.path().join("assets/objects/previous-aa");
+        std::fs::rename(&parent, &previous).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("replacement"), b"replacement payload").unwrap();
+
+        assert!(absence.revalidate().is_err());
+        let FileObservation::Missing(fresh) = operation
+            .file_batch()
+            .observe_file_with_absence(&path)
+            .unwrap()
+        else {
+            panic!("replacement parent must still lack the fixture file");
+        };
+        fresh.revalidate().unwrap();
+        for (name, bytes) in [
+            ("first", &b"first payload"[..]),
+            ("second", &b"second payload"[..]),
+        ] {
+            assert_eq!(std::fs::read(previous.join(name)).unwrap(), bytes);
+        }
+        assert_eq!(
+            std::fs::read(parent.join("replacement")).unwrap(),
+            b"replacement payload"
+        );
     }
 
     #[test]

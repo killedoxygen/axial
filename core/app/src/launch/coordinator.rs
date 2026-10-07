@@ -43,7 +43,10 @@ use crate::{
         selection::{CapturedAccount, CapturedSelection},
         session::AuthService,
     },
-    install::queue::{InstallError, InstallQueue, InstalledVersionReceipt},
+    install::{
+        artifacts::VersionInspection,
+        queue::{InstallError, InstallQueue, InstalledVersionReceipt},
+    },
     instances::{
         directory::{InstanceDirectories, ReadInstance, RegisteredInstance},
         model::InstanceError,
@@ -587,7 +590,8 @@ impl LaunchCoordinator {
             .try_spawn(retained, move |cancel| async move {
                 let mut bundle_guard = None;
                 let mut planned_performance = None;
-                let result = async {
+                let mut observed_damage = None;
+                let mut result = async {
                     // Installation can be repaired without selecting an account.
                     // Only the guarded install proof establishes that need;
                     // catalogue display flags and transient admission failures do not.
@@ -620,77 +624,16 @@ impl LaunchCoordinator {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let installed = match coordinator
                             .installs
-                            .ready_version(&pin, &admitted.record().instance.version_id)
+                            .inspect_version(&pin, &admitted.record().instance.version_id, diagnostics)
                             .await
                         {
-                            Ok(installed) => installed,
-                            Err(error) if diagnostics => {
-                                let (id, message) = match error {
-                                    InstallError::ClientJarMissing => (
-                                        PreflightReadinessReasonId::ClientJarMissing,
-                                        "Client game files are missing. Install this version before launching.",
-                                    ),
-                                    InstallError::ClientJarCorrupt => (
-                                        PreflightReadinessReasonId::ClientJarCorrupt,
-                                        "Client game files are corrupt. Repair this version before launching.",
-                                    ),
-                                    InstallError::VersionJsonMissing => (
-                                        PreflightReadinessReasonId::VersionJsonMissing,
-                                        "Installed version metadata is missing. Install this version before launching.",
-                                    ),
-                                    InstallError::LibrariesMissing => (
-                                        PreflightReadinessReasonId::LibrariesMissing,
-                                        "Required libraries are missing. Install this version before launching.",
-                                    ),
-                                    InstallError::LibrariesCorrupt => (
-                                        PreflightReadinessReasonId::LibrariesCorrupt,
-                                        "Required libraries are corrupt. Repair this version before launching.",
-                                    ),
-                                    InstallError::AssetIndexMissing => (
-                                        PreflightReadinessReasonId::AssetIndexMissing,
-                                        "Asset index is missing. Install this version before launching.",
-                                    ),
-                                    InstallError::AssetIndexCorrupt => (
-                                        PreflightReadinessReasonId::AssetIndexCorrupt,
-                                        "Asset index is corrupt. Repair this version before launching.",
-                                    ),
-                                    _ => return Err(install_read_error(error)),
-                                };
-                                let target = &admitted.record().instance;
-                                let mut refused = LaunchPreflight::refused(
-                                    target.id.clone(),
+                            Ok(VersionInspection::Ready(installed)) => installed,
+                            Ok(VersionInspection::Damaged(damage)) => {
+                                observed_damage = Some(damage);
+                                return Ok(LaunchPreflight::refused(
+                                    admitted.record().instance.id.clone(),
                                     LaunchError::InstallUnavailable,
-                                );
-                                if let Ok((selection, settings, _)) = coordinator.capture(target, None)
-                                    && let Ok(facts) = coordinator.preflight_diagnostics(
-                                        &admitted,
-                                        &settings,
-                                        &host,
-                                        PreflightReadiness {
-                                            launchable: false,
-                                            reasons: vec![PreflightReadinessReason {
-                                                id,
-                                                severity: PreflightReadinessSeverity::Blocking,
-                                                message,
-                                            }],
-                                        },
-                                    )
-                                {
-                                    selection
-                                        .validate(&coordinator.accounts)
-                                        .map_err(|_| LaunchError::AccountChanged)?;
-                                    coordinator
-                                        .settings
-                                        .validate_revision(settings.global_config_revision)
-                                        .map_err(|_| LaunchError::SettingsChanged)?;
-                                    refused.diagnostics = Some(facts);
-                                }
-                                bundle_guard
-                                    .as_ref()
-                                    .unwrap()
-                                    .revalidate()
-                                    .map_err(bundle_read_error)?;
-                                return Ok(refused);
+                                ));
                             }
                             Err(error) => return Err(install_read_error(error)),
                         };
@@ -822,6 +765,25 @@ impl LaunchCoordinator {
                     result
                 }
                 .await;
+                let observed_damage = match observed_damage {
+                    Some(damage) => {
+                        let checked = tokio::task::spawn_blocking(move || {
+                            damage.revalidate()?;
+                            Ok::<_, InstallError>(damage)
+                        })
+                        .await
+                        .map_err(|_| LaunchError::PreparationFailed)
+                        .and_then(|result| result.map_err(install_read_error));
+                        match checked {
+                            Ok(damage) => Some(damage),
+                            Err(error) => {
+                                result = Err(error);
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 // Nonblocking and synchronous: preserve the busy projection
                 // and fence both successful and failed readiness observations.
                 let _target = coordinator
@@ -837,6 +799,67 @@ impl LaunchCoordinator {
                     .map_err(instance_error)?;
                 if current.instance.settings != admitted.record().instance.settings {
                     return Err(LaunchError::InstanceChanged);
+                }
+                if let Some(damage) = observed_damage {
+                    bundle_guard
+                        .as_ref()
+                        .unwrap()
+                        .revalidate()
+                        .map_err(bundle_read_error)?;
+                    let reasons = damage.reasons().iter().map(|&error| {
+                        let (id, message) = match error {
+                            InstallError::ClientJarMissing => (
+                                PreflightReadinessReasonId::ClientJarMissing,
+                                "Client game files are missing. Install this version before launching.",
+                            ),
+                            InstallError::ClientJarCorrupt => (
+                                PreflightReadinessReasonId::ClientJarCorrupt,
+                                "Client game files are corrupt. Repair this version before launching.",
+                            ),
+                            InstallError::VersionJsonMissing => (
+                                PreflightReadinessReasonId::VersionJsonMissing,
+                                "Installed version metadata is missing. Install this version before launching.",
+                            ),
+                            InstallError::LibrariesMissing => (
+                                PreflightReadinessReasonId::LibrariesMissing,
+                                "Required libraries are missing. Install this version before launching.",
+                            ),
+                            InstallError::LibrariesCorrupt => (
+                                PreflightReadinessReasonId::LibrariesCorrupt,
+                                "Required libraries are corrupt. Repair this version before launching.",
+                            ),
+                            InstallError::AssetIndexMissing => (
+                                PreflightReadinessReasonId::AssetIndexMissing,
+                                "Asset index is missing. Install this version before launching.",
+                            ),
+                            InstallError::AssetIndexCorrupt => (
+                                PreflightReadinessReasonId::AssetIndexCorrupt,
+                                "Asset index is corrupt. Repair this version before launching.",
+                            ),
+                            _ => return Err(install_read_error(error)),
+                        };
+                        Ok(PreflightReadinessReason {
+                            id,
+                            severity: PreflightReadinessSeverity::Blocking,
+                            message,
+                        })
+                    }).collect::<Result<Vec<_>, _>>()?;
+                    let target = &admitted.record().instance;
+                    if let Ok(ref mut refused) = result
+                        && let Ok((selection, settings, _)) = coordinator.capture(target, None)
+                        && let Ok(facts) = coordinator.preflight_diagnostics(
+                            &admitted,
+                            &settings,
+                            &host,
+                            PreflightReadiness { launchable: false, reasons },
+                        )
+                    {
+                        selection.validate(&coordinator.accounts)
+                            .map_err(|_| LaunchError::AccountChanged)?;
+                        coordinator.settings.validate_revision(settings.global_config_revision)
+                            .map_err(|_| LaunchError::SettingsChanged)?;
+                        refused.diagnostics = Some(facts);
+                    }
                 }
                 drop((planned_performance, bundle_guard));
                 result

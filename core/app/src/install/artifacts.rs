@@ -10,7 +10,7 @@ use axial_minecraft::loaders::{
     LoaderInstallBaseCommit, LoaderInstallBaseCommitVerificationFailure,
     VerifiedLoaderInstallBaseCommit,
 };
-use axial_minecraft::managed_path::ManagedLibraryOperation;
+use axial_minecraft::managed_path::{FileAbsence, FileObservation, ManagedLibraryOperation};
 use axial_minecraft::portable_path::{PortableFileName, PortableRelativePath};
 use axial_minecraft::{
     KnownGoodInstallReceipt, ManagedInstallCommittedEvidence, ManagedInstallDurableOutcome,
@@ -77,9 +77,17 @@ impl ActivatedVersion {
     }
 
     pub(crate) fn verify(
-        mut self,
+        self,
         pin: GenerationPin,
     ) -> Result<InstalledVersionReceipt, super::queue::InstallError> {
+        self.inspect(pin, false)?.into_ready()
+    }
+
+    pub(crate) fn inspect(
+        mut self,
+        pin: GenerationPin,
+        diagnostics: bool,
+    ) -> Result<VersionInspection, super::queue::InstallError> {
         use super::queue::InstallError;
         axial_minecraft::ManagedInstallActivationContractId::parse(&self.contract_id)
             .map_err(|_| InstallError::NotReady)?;
@@ -97,6 +105,8 @@ impl ActivatedVersion {
         let client_path =
             PortableRelativePath::new_exact(&client).map_err(|_| InstallError::NotReady)?;
         let mut guards = Vec::with_capacity(self.files.len());
+        let mut missing = Vec::new();
+        let mut reasons = Vec::new();
         let mut version = None;
         let mut exact = BTreeMap::new();
         let mut asset_flags = BTreeMap::new();
@@ -133,27 +143,40 @@ impl ActivatedVersion {
                     .path
                     .strip_prefix("assets/log_configs/")
                     .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
-            let file = batch
-                .observe_file(&path)
+            let file = match batch
+                .observe_file_with_absence(&path)
                 .map_err(|_| InstallError::NotReady)?
-                .ok_or(if path == client_path {
-                    InstallError::ClientJarMissing
-                } else if expected.path == metadata_path {
-                    InstallError::VersionJsonMissing
-                } else if is_required_library {
-                    InstallError::LibrariesMissing
-                } else if is_asset_index {
-                    InstallError::AssetIndexMissing
-                } else {
-                    InstallError::NotReady
-                })?;
+            {
+                FileObservation::Present(file) => file,
+                FileObservation::Missing(absence) => {
+                    let reason = if path == client_path {
+                        InstallError::ClientJarMissing
+                    } else if expected.path == metadata_path {
+                        InstallError::VersionJsonMissing
+                    } else if is_required_library {
+                        InstallError::LibrariesMissing
+                    } else if is_asset_index {
+                        InstallError::AssetIndexMissing
+                    } else {
+                        InstallError::NotReady
+                    };
+                    if !diagnostics || reason == InstallError::NotReady {
+                        return Err(reason);
+                    }
+                    if !reasons.contains(&reason) {
+                        reasons.push(reason);
+                        missing.push(absence);
+                    }
+                    continue;
+                }
+            };
             if file.size() != expected.size
                 || file
                     .sha1_bounded(expected.size)
                     .map_err(|_| InstallError::NotReady)?
                     != expected_digest
             {
-                return Err(if path == client_path {
+                let reason = if path == client_path {
                     InstallError::ClientJarCorrupt
                 } else if is_required_library {
                     InstallError::LibrariesCorrupt
@@ -161,7 +184,15 @@ impl ActivatedVersion {
                     InstallError::AssetIndexCorrupt
                 } else {
                     InstallError::NotReady
-                });
+                };
+                if !diagnostics || reason == InstallError::NotReady {
+                    return Err(reason);
+                }
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                }
+                guards.push((path, file.revision_observation()));
+                continue;
             }
             if expected.path == metadata_path {
                 let bytes = file
@@ -194,55 +225,137 @@ impl ActivatedVersion {
             // every asset object. Re-observation below is bounded to one file.
             guards.push((path, file.revision_observation()));
         }
-        let mut version = version.ok_or(InstallError::NotReady)?;
-        if version.id != self.version_id
-            || (!version.inherits_from.is_empty() && !version.materialized)
-        {
+        if !exact.contains_key(&client) || !exact.contains_key(&metadata_path) {
             return Err(InstallError::NotReady);
         }
-        version.java_version = axial_minecraft::effective_java_version_for(
-            &version.id,
-            &version.kind,
-            &version.java_version,
-        );
-        if version.asset_index.id.is_empty() && !version.assets.is_empty() {
-            version.asset_index.id = version.assets.clone();
-        }
-        let virtual_assets = if version.asset_index.id.is_empty() {
-            false
+        let virtual_assets = if let Some(version) = version.as_mut() {
+            if version.id != self.version_id
+                || (!version.inherits_from.is_empty() && !version.materialized)
+            {
+                return Err(InstallError::NotReady);
+            }
+            version.java_version = axial_minecraft::effective_java_version_for(
+                &version.id,
+                &version.kind,
+                &version.java_version,
+            );
+            if version.asset_index.id.is_empty() && !version.assets.is_empty() {
+                version.asset_index.id = version.assets.clone();
+            }
+            if version.asset_index.id.is_empty() {
+                Some(false)
+            } else {
+                PortableFileName::new_exact(&version.asset_index.id)
+                    .map_err(|_| InstallError::NotReady)?;
+                let index = format!("assets/indexes/{}.json", version.asset_index.id);
+                if !exact.contains_key(&index) {
+                    return Err(InstallError::NotReady);
+                }
+                asset_flags.get(&index).copied()
+            }
         } else {
-            *asset_flags
-                .get(&format!("assets/indexes/{}.json", version.asset_index.id))
-                .ok_or(InstallError::NotReady)?
+            None
         };
-        if !exact.contains_key(&client) {
-            return Err(InstallError::NotReady);
+        let evidence = InventoryEvidence {
+            pin,
+            operation,
+            guards,
+            missing,
+        };
+        if !reasons.is_empty() {
+            evidence.revalidate()?;
+            return Ok(VersionInspection::Damaged(ObservedDamage {
+                evidence,
+                reasons,
+            }));
         }
+        let version = version.ok_or(InstallError::NotReady)?;
+        let virtual_assets = virtual_assets.ok_or(InstallError::NotReady)?;
         let client_jar = client_path.join_under(
-            &pin.read_projection()
+            &evidence
+                .pin
+                .read_projection()
                 .map_err(|_| InstallError::LibraryUnavailable)?,
         );
         let receipt = InstalledVersionReceipt {
-            pin,
-            operation,
+            evidence,
             version,
             exact,
-            guards,
             virtual_assets,
             client_jar,
         };
         receipt.revalidate()?;
-        Ok(receipt)
+        Ok(VersionInspection::Ready(receipt))
+    }
+}
+
+pub(crate) enum VersionInspection {
+    Ready(InstalledVersionReceipt),
+    Damaged(ObservedDamage),
+}
+
+impl VersionInspection {
+    pub(crate) fn into_ready(self) -> Result<InstalledVersionReceipt, super::queue::InstallError> {
+        match self {
+            Self::Ready(receipt) => Ok(receipt),
+            Self::Damaged(damage) => Err(damage
+                .reasons
+                .first()
+                .copied()
+                .unwrap_or(super::queue::InstallError::NotReady)),
+        }
+    }
+}
+
+pub(crate) struct ObservedDamage {
+    evidence: InventoryEvidence,
+    // Distinct supported reasons, not an enumeration of every damaged file.
+    reasons: Vec<super::queue::InstallError>,
+}
+
+impl ObservedDamage {
+    pub(crate) fn reasons(&self) -> &[super::queue::InstallError] {
+        &self.reasons
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), super::queue::InstallError> {
+        self.evidence.revalidate()
+    }
+}
+
+struct InventoryEvidence {
+    pin: GenerationPin,
+    operation: ManagedLibraryOperation,
+    guards: Vec<(PortableRelativePath, axial_fs::FileRevisionObservation)>,
+    missing: Vec<FileAbsence>,
+}
+
+impl InventoryEvidence {
+    fn revalidate(&self) -> Result<(), super::queue::InstallError> {
+        use super::queue::InstallError;
+        self.pin.revalidate().map_err(|_| InstallError::NotReady)?;
+        let mut batch = self.operation.file_batch();
+        for (path, expected) in &self.guards {
+            let file = batch
+                .observe_file(path)
+                .map_err(|_| InstallError::NotReady)?
+                .ok_or(InstallError::NotReady)?;
+            if file.revision_observation() != *expected {
+                return Err(InstallError::NotReady);
+            }
+        }
+        for absence in &self.missing {
+            absence.revalidate().map_err(|_| InstallError::NotReady)?;
+        }
+        Ok(())
     }
 }
 
 /// Verified installation inputs kept alive until the game and output streams settle.
 pub struct InstalledVersionReceipt {
-    pin: GenerationPin,
-    operation: ManagedLibraryOperation,
+    evidence: InventoryEvidence,
     version: VersionJson,
     exact: BTreeMap<String, (String, u64)>,
-    guards: Vec<(PortableRelativePath, axial_fs::FileRevisionObservation)>,
     virtual_assets: bool,
     client_jar: PathBuf,
 }
@@ -278,20 +391,7 @@ impl InstalledVersionReceipt {
     }
 
     pub fn revalidate(&self) -> Result<(), super::queue::InstallError> {
-        self.pin
-            .revalidate()
-            .map_err(|_| super::queue::InstallError::NotReady)?;
-        let mut batch = self.operation.file_batch();
-        for (path, expected) in &self.guards {
-            let file = batch
-                .observe_file(path)
-                .map_err(|_| super::queue::InstallError::NotReady)?
-                .ok_or(super::queue::InstallError::NotReady)?;
-            if file.revision_observation() != *expected {
-                return Err(super::queue::InstallError::NotReady);
-            }
-        }
-        Ok(())
+        self.evidence.revalidate()
     }
 
     pub(crate) async fn prepare_game_libraries(
@@ -323,12 +423,14 @@ impl InstalledVersionReceipt {
                 let path = PortableRelativePath::new_exact(&client_path)
                     .map_err(|_| InstallError::NotReady)?;
                 let expected = self
+                    .evidence
                     .guards
                     .iter()
                     .find(|(recorded, _)| recorded == &path)
                     .map(|(_, revision)| revision)
                     .ok_or(InstallError::NotReady)?;
                 let client = self
+                    .evidence
                     .operation
                     .observe_file(&path)
                     .map_err(|_| InstallError::NotReady)?
@@ -353,12 +455,14 @@ impl InstalledVersionReceipt {
                         let path = PortableRelativePath::new_exact(&path)
                             .map_err(|_| InstallError::NotReady)?;
                         let expected = self
+                            .evidence
                             .guards
                             .iter()
                             .find(|(recorded, _)| recorded == &path)
                             .map(|(_, revision)| revision)
                             .ok_or(InstallError::NotReady)?;
                         let source = self
+                            .evidence
                             .operation
                             .observe_file(&path)
                             .map_err(|_| InstallError::NotReady)?
@@ -390,7 +494,8 @@ impl InstalledVersionReceipt {
         environment: &Environment,
     ) -> Result<Option<super::vanilla::PreparedNatives>, super::vanilla::NativePreparationError>
     {
-        self.operation
+        self.evidence
+            .operation
             .validate_read_projection(root)
             .map_err(|_| super::vanilla::NativePreparationError::Changed)?;
         super::vanilla::prepare_natives_with_exact_files(
@@ -406,6 +511,7 @@ impl InstalledVersionReceipt {
 
 #[cfg(test)]
 mod tests {
+    use super::super::queue::InstallError;
     use super::*;
     use crate::library::{LibraryLifecycle, LibraryOpenOutcome};
     use sha1::{Digest, Sha1};
@@ -465,6 +571,82 @@ mod tests {
         .unwrap();
         assert!(receipt.revalidate().is_err());
         assert!(activated.verify(pin).is_err());
+    }
+
+    #[test]
+    fn missing_client_observation_refuses_restored_file() {
+        let (temporary, library, activated) = fixture();
+        let pin = library.admit().unwrap();
+        activated.clone().verify(pin.clone()).unwrap();
+        let client = temporary.path().join("versions/1.21.4/1.21.4.jar");
+        let original = std::fs::read(&client).unwrap();
+        std::fs::remove_file(&client).unwrap();
+        let VersionInspection::Damaged(damage) =
+            activated.clone().inspect(pin.clone(), true).unwrap()
+        else {
+            panic!("missing client must retain observed damage");
+        };
+        assert_eq!(damage.reasons(), &[InstallError::ClientJarMissing]);
+        damage.revalidate().unwrap();
+
+        std::fs::write(&client, &original).unwrap();
+        assert!(matches!(damage.revalidate(), Err(InstallError::NotReady)));
+        let VersionInspection::Ready(receipt) = activated.inspect(pin, true).unwrap() else {
+            panic!("fresh inspection must admit the restored client");
+        };
+        receipt.revalidate().unwrap();
+        assert_eq!(std::fs::read(client).unwrap(), original);
+    }
+
+    #[test]
+    fn corrupt_client_observation_refuses_same_byte_replacement() {
+        let (temporary, library, activated) = fixture();
+        let pin = library.admit().unwrap();
+        activated.clone().verify(pin.clone()).unwrap();
+        let client = temporary.path().join("versions/1.21.4/1.21.4.jar");
+        let corrupt = b"corrupt client";
+        assert_eq!(std::fs::read(&client).unwrap().len(), corrupt.len());
+        std::fs::write(&client, corrupt).unwrap();
+        let VersionInspection::Damaged(damage) =
+            activated.clone().inspect(pin.clone(), true).unwrap()
+        else {
+            panic!("corrupt client must retain observed damage");
+        };
+        assert_eq!(damage.reasons(), &[InstallError::ClientJarCorrupt]);
+        damage.revalidate().unwrap();
+
+        let previous = client.with_file_name("previous-client.jar");
+        std::fs::rename(&client, &previous).unwrap();
+        std::fs::write(&client, corrupt).unwrap();
+        assert!(matches!(damage.revalidate(), Err(InstallError::NotReady)));
+        let VersionInspection::Damaged(fresh) = activated.inspect(pin, true).unwrap() else {
+            panic!("replacement client must remain corrupt");
+        };
+        assert_eq!(fresh.reasons(), &[InstallError::ClientJarCorrupt]);
+        fresh.revalidate().unwrap();
+        assert_eq!(std::fs::read(previous).unwrap(), corrupt);
+        assert_eq!(std::fs::read(client).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn diagnostic_inspection_refuses_later_malformed_inventory() {
+        let (temporary, library, mut activated) = fixture();
+        let pin = library.admit().unwrap();
+        activated.clone().verify(pin.clone()).unwrap();
+        std::fs::remove_file(temporary.path().join("versions/1.21.4/1.21.4.jar")).unwrap();
+        activated.files.push(ActivatedFile {
+            path: "versions/z/z.jar".into(),
+            sha1: "x".repeat(40),
+            size: 0,
+        });
+        assert!(matches!(
+            activated.clone().inspect(pin.clone(), false),
+            Err(InstallError::ClientJarMissing)
+        ));
+        assert!(matches!(
+            activated.inspect(pin, true),
+            Err(InstallError::NotReady)
+        ));
     }
 }
 

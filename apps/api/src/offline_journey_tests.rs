@@ -2854,12 +2854,57 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     let queue_before = api.get("/api/v1/install/queue").await;
     let sessions_before = api.get("/api/v1/launch/sessions").await;
     let library = services.library.admit().unwrap().read_projection().unwrap();
+    let client = library.join(format!("versions/{VERSION}/{VERSION}.jar"));
+    let original = std::fs::read(&client).unwrap();
+    assert_eq!(original, provider.state.routes["GET /artifacts/client.jar"]);
+    let required_library = library.join("libraries/org/axial/fixture/1.0/fixture-1.0.jar");
+    let original_library = std::fs::read(&required_library).unwrap();
+    assert_eq!(
+        original_library,
+        provider.state.routes["GET /artifacts/library.jar"]
+    );
+    std::fs::remove_file(&client).unwrap();
+    std::fs::remove_file(&required_library).unwrap();
+    let missing_files = api.get(&preflight).await;
+    let files_absent = [&client, &required_library].map(|path| {
+        std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    });
+    std::fs::write(&client, &original).unwrap();
+    std::fs::write(&required_library, &original_library).unwrap();
+    let client_after_restore = std::fs::read(&client).unwrap();
+    let library_after_restore = std::fs::read(&required_library).unwrap();
+    let metadata = library.join(format!("versions/{VERSION}/{VERSION}.json"));
+    let original_metadata = std::fs::read(&metadata).unwrap();
+    let mut changed_metadata = original_metadata.clone();
+    changed_metadata[0] ^= 1;
+    std::fs::remove_file(&required_library).unwrap();
+    std::fs::write(&metadata, &changed_metadata).unwrap();
+    let invalid_metadata = api.get(&preflight).await;
+    let library_absent_with_invalid_metadata = std::fs::symlink_metadata(&required_library)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    let metadata_after_preflight = std::fs::read(&metadata).unwrap();
+    std::fs::write(&required_library, &original_library).unwrap();
+    std::fs::write(&metadata, &original_metadata).unwrap();
+    let library_after_metadata_restore = std::fs::read(&required_library).unwrap();
+    let metadata_after_restore = std::fs::read(&metadata).unwrap();
     let log_config = library.join("assets/log_configs/fixture-log.xml");
     let original_log_config = std::fs::read(&log_config).unwrap();
     assert_eq!(
         original_log_config,
         provider.state.routes["GET /artifacts/log.xml"]
     );
+    std::fs::remove_file(&log_config).unwrap();
+    std::fs::remove_file(&required_library).unwrap();
+    let missing_libraries = api.get(&preflight).await;
+    let libraries_absent = [&log_config, &required_library].map(|path| {
+        std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    });
+    std::fs::write(&log_config, &original_log_config).unwrap();
+    std::fs::write(&required_library, &original_library).unwrap();
+    let log_config_after_restore = std::fs::read(&log_config).unwrap();
+    let library_after_log_restore = std::fs::read(&required_library).unwrap();
     let mut changed_log_config = original_log_config.clone();
     changed_log_config[0] ^= 1;
     std::fs::write(&log_config, &changed_log_config).unwrap();
@@ -2881,10 +2926,6 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     let log_canary_after = std::fs::read(&log_canary).unwrap();
     std::fs::remove_file(&log_config).unwrap();
     std::fs::write(&log_config, &original_log_config).unwrap();
-    let client = library.join(format!("versions/{VERSION}/{VERSION}.jar"));
-    let original = std::fs::read(&client).unwrap();
-    let metadata = library.join(format!("versions/{VERSION}/{VERSION}.json"));
-    let original_metadata = std::fs::read(&metadata).unwrap();
     let asset_index = library.join("assets/indexes/fixture-assets.json");
     let original_index = std::fs::read(&asset_index).unwrap();
     assert_eq!(
@@ -2925,12 +2966,6 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     let asset_absent = std::fs::symlink_metadata(&asset)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     std::fs::write(&asset, &original_asset).unwrap();
-    let required_library = library.join("libraries/org/axial/fixture/1.0/fixture-1.0.jar");
-    let original_library = std::fs::read(&required_library).unwrap();
-    assert_eq!(
-        original_library,
-        provider.state.routes["GET /artifacts/library.jar"]
-    );
     let mut changed_library = original_library.clone();
     changed_library[0] ^= 1;
     std::fs::write(&required_library, &changed_library).unwrap();
@@ -3002,6 +3037,32 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     assert_eq!(queue_after, queue_before);
     assert_eq!(sessions_before, json!({"sessions":[]}));
     assert_eq!(sessions_after, sessions_before);
+    assert_eq!(
+        files_absent,
+        [true, true],
+        "preflight must not repair files"
+    );
+    assert_eq!(client_after_restore, original);
+    assert_eq!(library_after_restore, original_library);
+    assert!(
+        library_absent_with_invalid_metadata,
+        "preflight must not repair libraries"
+    );
+    assert_eq!(changed_metadata.len(), original_metadata.len());
+    assert_ne!(changed_metadata, original_metadata);
+    assert_eq!(
+        metadata_after_preflight, changed_metadata,
+        "preflight must not repair metadata"
+    );
+    assert_eq!(library_after_metadata_restore, original_library);
+    assert_eq!(metadata_after_restore, original_metadata);
+    assert_eq!(
+        libraries_absent,
+        [true, true],
+        "preflight must not repair libraries"
+    );
+    assert_eq!(log_config_after_restore, original_log_config);
+    assert_eq!(library_after_log_restore, original_library);
     for (before, after, target, expected_target) in [
         (
             &log_link_before,
@@ -3072,6 +3133,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     assert_eq!(client_after_metadata, original);
     assert_eq!(canary_after, original);
     for response in [
+        invalid_metadata,
         log_inadmissible,
         missing_asset,
         index_inadmissible,
@@ -3100,7 +3162,12 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         !client.try_exists().unwrap(),
         "preflight must not repair files"
     );
-    for (response, reason, message) in [
+    let responses = [
+        (
+            missing_libraries,
+            "libraries_missing",
+            "Required libraries are missing. Install this version before launching.",
+        ),
         (
             corrupt_log_config,
             "libraries_corrupt",
@@ -3146,7 +3213,29 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
             "client_jar_corrupt",
             "Client game files are corrupt. Repair this version before launching.",
         ),
-    ] {
+    ]
+    .map(|(response, reason, message)| {
+        (
+            response,
+            json!([{"id":reason,"severity":"blocking","message":message}]),
+        )
+    });
+    for (response, reasons) in [(
+        missing_files,
+        json!([
+            {
+                "id":"client_jar_missing","severity":"blocking",
+                "message":"Client game files are missing. Install this version before launching."
+            },
+            {
+                "id":"libraries_missing","severity":"blocking",
+                "message":"Required libraries are missing. Install this version before launching."
+            }
+        ]),
+    )]
+    .into_iter()
+    .chain(responses)
+    {
         assert_eq!(response["instance_id"], instance);
         assert_eq!(response["launchable"], false, "{response}");
         assert_eq!(
@@ -3157,12 +3246,12 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
             })
         );
         assert_eq!(response["status"], "ready", "{response}");
-        assert_eq!(
-            response["readiness"],
-            json!({"launchable":false,"reasons":[{
-                "id":reason,"severity":"blocking","message":message
-            }]})
-        );
+        let mut readiness = response["readiness"].clone();
+        readiness["reasons"]
+            .as_array_mut()
+            .expect("readiness reasons")
+            .sort_unstable_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+        assert_eq!(readiness, json!({"launchable":false,"reasons":reasons}));
         assert_eq!(
             response["memory"],
             json!({"max_memory_mb":2048,"min_memory_mb":1024,"min_clamped":false})

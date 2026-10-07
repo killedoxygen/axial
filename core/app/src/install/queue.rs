@@ -4,7 +4,7 @@
 
 pub use super::artifacts::InstalledVersionReceipt;
 use super::{
-    artifacts::{self, ActivatedVersion, InstallReceiptState, LoaderBaseState},
+    artifacts::{self, ActivatedVersion, InstallReceiptState, LoaderBaseState, VersionInspection},
     model::*,
 };
 use crate::{
@@ -1850,6 +1850,17 @@ impl InstallQueue {
         pin: &GenerationPin,
         version_id: &str,
     ) -> Result<InstalledVersionReceipt, InstallError> {
+        self.inspect_version(pin, version_id, false)
+            .await?
+            .into_ready()
+    }
+
+    pub(crate) async fn inspect_version(
+        &self,
+        pin: &GenerationPin,
+        version_id: &str,
+        diagnostics: bool,
+    ) -> Result<VersionInspection, InstallError> {
         let library_id = pin.library_id().to_string();
         let version_id = version_id.to_owned();
         let storage = self.inner.storage.clone();
@@ -1863,7 +1874,7 @@ impl InstallQueue {
             if record.len() > 128 << 20 { return Err(InstallError::NotReady); }
             let activated: ActivatedVersion = serde_json::from_str(&record).map_err(|_| InstallError::NotReady)?;
             if activated.version_id != version_id { return Err(InstallError::NotReady); }
-            activated.verify(pin)
+            activated.inspect(pin, diagnostics)
         }).await.map_err(|_| InstallError::NotReady)?
     }
 
