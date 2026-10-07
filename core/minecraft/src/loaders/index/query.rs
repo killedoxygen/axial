@@ -60,12 +60,77 @@ pub async fn fetch_builds(
     component_id: LoaderComponentId,
     minecraft_version: &str,
 ) -> Result<(Vec<LoaderBuildRecord>, LoaderCatalogState), LoaderError> {
+    fetch_builds_cancellable(
+        operation,
+        component_id,
+        minecraft_version,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// Cancellation applies only to acquisition; a received result settles its cache work.
+pub async fn fetch_builds_cancellable(
+    operation: &ManagedLibraryOperation,
+    component_id: LoaderComponentId,
+    minecraft_version: &str,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> Result<(Vec<LoaderBuildRecord>, LoaderCatalogState), LoaderError> {
+    fetch_builds_with(
+        operation,
+        component_id,
+        minecraft_version,
+        cancelled,
+        |minecraft_version| async move {
+            providers::fetch_build_index(component_id, &minecraft_version).await
+        },
+    )
+    .await
+}
+
+#[cfg(feature = "test-support")]
+pub async fn fetch_fabric_builds_for_test(
+    operation: &ManagedLibraryOperation,
+    minecraft_version: &str,
+    url: &reqwest::Url,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> Result<(Vec<LoaderBuildRecord>, LoaderCatalogState), LoaderError> {
+    crate::loaders::http::validate_loopback_url_for_test(url)?;
+    fetch_builds_with(
+        operation,
+        LoaderComponentId::Fabric,
+        minecraft_version,
+        cancelled,
+        |minecraft_version| async move {
+            providers::fetch_builds_from_loopback_for_test(&minecraft_version, url).await
+        },
+    )
+    .await
+}
+
+async fn fetch_builds_with<F, Fut>(
+    operation: &ManagedLibraryOperation,
+    component_id: LoaderComponentId,
+    minecraft_version: &str,
+    cancelled: impl std::future::Future<Output = ()>,
+    fetch_live: F,
+) -> Result<(Vec<LoaderBuildRecord>, LoaderCatalogState), LoaderError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<LoaderVersionIndex, LoaderError>>,
+{
     let minecraft_version = sanitize_segment(minecraft_version)?;
     let (index, catalog) = resolve_cached(
         operation,
         build_index_cache_name(component_id, &minecraft_version)?,
         BUILD_INDEX_TTL,
-        || providers::fetch_build_index(component_id, &minecraft_version),
+        || async {
+            tokio::select! {
+                biased;
+                result = fetch_live(minecraft_version.clone()) => result,
+                _ = cancelled => Err(LoaderError::Cancelled),
+            }
+        },
     )
     .await?;
     let normalized = normalize_build_index(index);
@@ -245,15 +310,176 @@ fn catalog_version_order(entries: &[crate::manifest::ManifestEntry]) -> HashMap<
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_build_record_for_install_with, validate_build_index_identity};
+    use super::{
+        fetch_builds_with, fetch_cached_builds, resolve_build_record_for_install_with,
+        validate_build_index_identity,
+    };
     use crate::loaders::types::{
-        LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
-        LoaderComponentId, LoaderError, LoaderInstallSource, LoaderInstallStrategy,
-        LoaderInstallability, LoaderProviderFailureKind, LoaderVersionIndex,
+        CachedCatalog, LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord,
+        LoaderBuildSubjectKind, LoaderComponentId, LoaderError, LoaderInstallSource,
+        LoaderInstallStrategy, LoaderInstallability, LoaderProviderFailureKind, LoaderVersionIndex,
     };
     use crate::loaders::{build_id_for, installed_version_id_for};
+    use crate::managed_fs::ManagedLibraryRoot;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn build_acquisition_cancellation_leaves_no_catalog() {
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        operation.prepare_layout().unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            fetch_builds_with(
+                &operation,
+                LoaderComponentId::Fabric,
+                "1.21.5",
+                std::future::ready(()),
+                |_| std::future::pending(),
+            ),
+        )
+        .await
+        .expect("pending acquisition must be cancellable")
+        .expect_err("cancelled acquisition");
+
+        assert!(matches!(error, LoaderError::Cancelled));
+        assert_eq!(error.availability_failure_kind(), None);
+        assert!(
+            fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.5")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !temporary
+                .path()
+                .join("cache/loaders/catalog/component-fabric-builds-1.21.5.json")
+                .exists()
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn build_acquisition_cancellation_preserves_stale_catalog() {
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        operation.prepare_layout().unwrap();
+        let component = LoaderComponentId::Fabric;
+        let build_id = build_id_for(component, "1.21.5", "0.16.14");
+        super::persist_loader_build_cache_fixture_for_test(
+            &operation,
+            "1.21.5",
+            &LoaderVersionIndex {
+                component_id: component,
+                builds: vec![build_record(component, &build_id)],
+            },
+            1,
+        )
+        .unwrap();
+        let path = temporary
+            .path()
+            .join("cache/loaders/catalog/component-fabric-builds-1.21.5.json");
+        let original = std::fs::read(&path).unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            fetch_builds_with(
+                &operation,
+                component,
+                "1.21.5",
+                std::future::ready(()),
+                |_| std::future::pending(),
+            ),
+        )
+        .await
+        .expect("pending acquisition must be cancellable")
+        .expect_err("cancellation must not serve stale catalog");
+
+        assert!(matches!(error, LoaderError::Cancelled));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn completed_build_acquisition_failure_wins_over_cancellation() {
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        operation.prepare_layout().unwrap();
+
+        let error = fetch_builds_with(
+            &operation,
+            LoaderComponentId::Fabric,
+            "1.21.5",
+            std::future::ready(()),
+            |_| {
+                std::future::ready(Err(LoaderError::ProviderUnavailable {
+                    kind: LoaderProviderFailureKind::HttpServer,
+                    status: Some(503),
+                }))
+            },
+        )
+        .await
+        .expect_err("completed provider refusal");
+
+        assert!(matches!(
+            error,
+            LoaderError::CatalogUnavailable {
+                provider_failure_kind: Some(LoaderProviderFailureKind::HttpServer),
+                provider_status: Some(503),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_build_acquisition_publishes_cache_despite_cancellation() {
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        operation.prepare_layout().unwrap();
+        let component = LoaderComponentId::Fabric;
+        let build_id = build_id_for(component, "1.21.5", "0.16.14");
+        let index = LoaderVersionIndex {
+            component_id: component,
+            builds: vec![build_record(component, &build_id)],
+        };
+
+        let (builds, state) = fetch_builds_with(
+            &operation,
+            component,
+            "1.21.5",
+            std::future::ready(()),
+            |_| std::future::ready(Ok(index.clone())),
+        )
+        .await
+        .expect("successful acquisition must settle publication");
+        let persisted: CachedCatalog<LoaderVersionIndex> = serde_json::from_slice(
+            &std::fs::read(
+                temporary
+                    .path()
+                    .join("cache/loaders/catalog/component-fabric-builds-1.21.5.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(builds, index.builds);
+        assert!(state.availability.fresh);
+        assert!(!state.availability.cache_hit);
+        assert_eq!(state.availability.last_error, None);
+        assert_eq!(persisted.value, index);
+        assert_eq!(
+            fetch_cached_builds(&operation, component, "1.21.5")
+                .unwrap()
+                .expect("published catalog")
+                .0,
+            builds
+        );
+    }
 
     #[test]
     fn catalog_rejects_noncanonical_installed_version_id() {

@@ -175,6 +175,17 @@ pub async fn fetch_builds(
     build_index_from_entries(minecraft_version, raw)
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) async fn fetch_builds_from_loopback_for_test(
+    minecraft_version: &str,
+    url: &reqwest::Url,
+) -> Result<LoaderVersionIndex, crate::loaders::types::LoaderError> {
+    let raw =
+        crate::loaders::http::fetch_json_from_loopback_for_test::<Vec<FabricInstallEntry>>(url)
+            .await?;
+    build_index_from_entries(minecraft_version, raw)
+}
+
 fn build_index_from_entries(
     minecraft_version: &str,
     raw: Vec<FabricInstallEntry>,

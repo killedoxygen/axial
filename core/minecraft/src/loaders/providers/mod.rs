@@ -7,6 +7,8 @@ mod quilt;
 pub use common::{
     apply_forge_promotion_selection, forge_install_source, infer_loader_build_metadata,
 };
+#[cfg(feature = "test-support")]
+pub(crate) use fabric::fetch_builds_from_loopback_for_test;
 pub(crate) use quilt::validate_profile_mappings as validate_quilt_profile_mappings;
 
 use crate::loaders::types::{

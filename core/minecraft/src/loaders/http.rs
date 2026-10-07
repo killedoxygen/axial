@@ -23,6 +23,8 @@ enum LoaderSourceTransportPolicy {
     HttpsOnly,
     #[cfg(test)]
     AllowHttpForTest,
+    #[cfg(feature = "test-support")]
+    LoopbackForTest,
 }
 
 impl LoaderSourceTransportPolicy {
@@ -31,6 +33,8 @@ impl LoaderSourceTransportPolicy {
             Self::HttpsOnly => true,
             #[cfg(test)]
             Self::AllowHttpForTest => false,
+            #[cfg(feature = "test-support")]
+            Self::LoopbackForTest => false,
         }
     }
 }
@@ -48,6 +52,30 @@ where
     T: DeserializeOwned + Send + 'static,
 {
     fetch_json_with_policy(url, LoaderSourceTransportPolicy::AllowHttpForTest).await
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn validate_loopback_url_for_test(url: &reqwest::Url) -> Result<(), LoaderError> {
+    crate::download::TransferOrigin::from_loopback_http_for_test_support(url).map_err(|_| {
+        insecure_loader_source_error("loader test source must use literal loopback HTTP")
+    })?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(insecure_loader_source_error(
+            "loader test source cannot contain query or fragment",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) async fn fetch_json_from_loopback_for_test<T>(
+    url: &reqwest::Url,
+) -> Result<T, LoaderError>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    validate_loopback_url_for_test(url)?;
+    fetch_json_with_policy(url.as_str(), LoaderSourceTransportPolicy::LoopbackForTest).await
 }
 
 async fn fetch_json_with_policy<T>(
@@ -272,29 +300,42 @@ fn loader_error_allows_primitive_retry(error: &LoaderError) -> bool {
 fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            .read_timeout(Duration::from_secs(120))
-            .user_agent(USER_AGENT)
-            .pool_max_idle_per_host(LOADER_HTTP_CLIENT_MAX_IDLE_PER_HOST)
-            .pool_idle_timeout(Duration::from_secs(
-                LOADER_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECS,
-            ))
-            .tcp_keepalive(Duration::from_secs(LOADER_HTTP_CLIENT_TCP_KEEPALIVE_SECS))
+        client_builder()
             .build()
             .expect("loader HTTP client configuration should be valid")
     })
 }
 
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .read_timeout(Duration::from_secs(120))
+        .user_agent(USER_AGENT)
+        .pool_max_idle_per_host(LOADER_HTTP_CLIENT_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(Duration::from_secs(
+            LOADER_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECS,
+        ))
+        .tcp_keepalive(Duration::from_secs(LOADER_HTTP_CLIENT_TCP_KEEPALIVE_SECS))
+}
+
 fn source_client(policy: LoaderSourceTransportPolicy) -> &'static reqwest::Client {
+    #[cfg(feature = "test-support")]
+    if matches!(policy, LoaderSourceTransportPolicy::LoopbackForTest) {
+        static LOOPBACK_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+        return LOOPBACK_CLIENT.get_or_init(|| {
+            client_builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("loader loopback HTTP client configuration should be valid")
+        });
+    }
     if !policy.requires_https() {
         return client();
     }
     static SOURCE_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     SOURCE_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            .read_timeout(Duration::from_secs(120))
+        client_builder()
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 match loader_source_redirect_decision(attempt.url(), attempt.previous().len()) {
                     LoaderSourceRedirectDecision::Follow => attempt.follow(),
@@ -306,12 +347,6 @@ fn source_client(policy: LoaderSourceTransportPolicy) -> &'static reqwest::Clien
                     }
                 }
             }))
-            .user_agent(USER_AGENT)
-            .pool_max_idle_per_host(LOADER_HTTP_CLIENT_MAX_IDLE_PER_HOST)
-            .pool_idle_timeout(Duration::from_secs(
-                LOADER_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECS,
-            ))
-            .tcp_keepalive(Duration::from_secs(LOADER_HTTP_CLIENT_TCP_KEEPALIVE_SECS))
             .build()
             .expect("loader source HTTP client configuration should be valid")
     })

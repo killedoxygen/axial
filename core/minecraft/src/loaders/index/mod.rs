@@ -5,11 +5,11 @@ mod query;
 pub use normalize::normalize_supported_versions;
 
 pub use query::{
-    fetch_builds, fetch_cached_builds, fetch_components, fetch_supported_versions,
-    resolve_build_record_for_install,
+    fetch_builds, fetch_builds_cancellable, fetch_cached_builds, fetch_components,
+    fetch_supported_versions, resolve_build_record_for_install,
 };
 #[cfg(feature = "test-support")]
 pub use query::{
-    persist_loader_build_cache_fixture_for_test,
+    fetch_fabric_builds_for_test, persist_loader_build_cache_fixture_for_test,
     persist_loader_supported_versions_cache_fixture_for_test,
 };

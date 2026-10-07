@@ -50,6 +50,8 @@ pub struct SetupService {
     pub(super) pending: Mutex<BTreeMap<InstanceId, RegisteredInstance>>,
     #[cfg(test)]
     loader_catalog_fixture: Option<readiness_tests::LoaderCatalogFixture>,
+    #[cfg(test)]
+    loader_build_url: Option<url::Url>,
 }
 
 type QueuedSetup = (Instance, InstallQueueStateResponse, CreateResultView);
@@ -199,6 +201,8 @@ impl SetupService {
             pending: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             loader_catalog_fixture: None,
+            #[cfg(test)]
+            loader_build_url: None,
         }
     }
 
@@ -745,9 +749,9 @@ impl SetupService {
                 let component_id =
                     LoaderComponentId::parse(component).ok_or(InstanceError::InvalidInput)?;
                 let (builds, state) = self
-                    .loader_build_catalog(&library, component_id, minecraft)
+                    .loader_build_catalog(&library, component_id, minecraft, &cancel)
                     .await
-                    .map_err(|_| InstanceError::VersionUnavailable)?;
+                    .map_err(loader_catalog_error)?;
                 admission.validate()?;
                 let build = preferred_build(builds).ok_or(InstanceError::VersionUnavailable)?;
                 let target = loader_install_target(component_id, &build.build_id)?;
@@ -917,12 +921,24 @@ impl SetupService {
         library: &axial_minecraft::managed_path::ManagedLibraryOperation,
         component: LoaderComponentId,
         minecraft: &str,
+        cancel: &CancellationToken,
     ) -> Result<(Vec<LoaderBuildRecord>, loaders::LoaderCatalogState), loaders::LoaderError> {
+        #[cfg(test)]
+        if let Some(url) = &self.loader_build_url {
+            assert_eq!(component, LoaderComponentId::Fabric);
+            return loaders::fetch_fabric_builds_for_test(
+                library,
+                minecraft,
+                url,
+                cancel.cancelled(),
+            )
+            .await;
+        }
         #[cfg(test)]
         if let Some(fixture) = &self.loader_catalog_fixture {
             return Ok((fixture.builds.clone(), fixture.state.clone()));
         }
-        loaders::fetch_builds(library, component, minecraft).await
+        loaders::fetch_builds_cancellable(library, component, minecraft, cancel.cancelled()).await
     }
 
     async fn loader_version_catalog(
@@ -1317,9 +1333,9 @@ impl SetupService {
         let service = Arc::clone(self);
         self.instances
             .tasks
-            .try_spawn(pin.clone(), move |_cancel| async move {
+            .try_spawn(pin.clone(), move |cancel| async move {
                 service
-                    .loader_builds_admitted(&source, &minecraft, component, pin)
+                    .loader_builds_admitted(&source, &minecraft, component, pin, cancel)
                     .await
             })
             .map_err(|_| InstanceError::Closed)?
@@ -1334,15 +1350,16 @@ impl SetupService {
         minecraft: &str,
         component: LoaderComponentId,
         pin: crate::library::GenerationPin,
+        cancel: CancellationToken,
     ) -> InstanceResult<CreateLoaderBuildsView> {
         let library = pin
             .managed_library()
             .map_err(|_| InstanceError::LibraryUnavailable)?;
         let admission = Admission::capture(pin).await?;
         let (builds, catalog) = self
-            .loader_build_catalog(&library, component, minecraft)
+            .loader_build_catalog(&library, component, minecraft, &cancel)
             .await
-            .map_err(|_| InstanceError::VersionUnavailable)?;
+            .map_err(loader_catalog_error)?;
         admission.validate()?;
         let displayed_installed =
             self.display_installed_ids(admission.generation(), admission.scan().versions())?;
@@ -1420,6 +1437,13 @@ impl SetupService {
 
 fn nonempty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
+}
+
+fn loader_catalog_error(error: loaders::LoaderError) -> InstanceError {
+    match error {
+        loaders::LoaderError::Cancelled => InstanceError::Cancelled,
+        _ => InstanceError::VersionUnavailable,
+    }
 }
 fn display_name(id: &str, label: &str) -> String {
     if label.is_empty() { id } else { label }.to_owned()

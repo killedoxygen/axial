@@ -383,6 +383,8 @@ impl LoaderProviderFailureKind {
 
 #[derive(Debug, Error)]
 pub enum LoaderError {
+    #[error("loader provider acquisition was cancelled")]
+    Cancelled,
     #[error("invalid minecraft version")]
     InvalidMinecraftVersion,
     #[error("invalid loader build id")]
@@ -966,7 +968,8 @@ fn active_install_failure_kind(source: &LoaderError) -> LoaderInstallFailureKind
         | LoaderError::ProviderDataInvalid { kind, .. } => {
             provider_active_install_failure_kind(*kind)
         }
-        LoaderError::CatalogUnavailable { .. }
+        LoaderError::Cancelled
+        | LoaderError::CatalogUnavailable { .. }
         | LoaderError::CatalogStale
         | LoaderError::BuildNotFound(_)
         | LoaderError::InvalidMinecraftVersion

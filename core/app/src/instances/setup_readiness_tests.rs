@@ -953,6 +953,332 @@ async fn dropped_resolution_caller_keeps_owned_fetch_until_shutdown() {
 }
 
 #[tokio::test]
+async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
+    use futures_util::FutureExt;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    for cancel_fetch in [false, true] {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
+        let library = service.instances.directories().library().clone();
+        let owner = service.instances.tasks.clone();
+        let registry_revision = service.installs.snapshot().registry_revision;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        service.loader_build_url = Some(
+            format!(
+                "http://{}/v2/versions/loader/1.21.4",
+                listener.local_addr().unwrap()
+            )
+            .parse()
+            .unwrap(),
+        );
+        let (requested, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "loader request was not received");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("loader fixture accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            let mut length = 0;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !request[..length]
+                .windows(4)
+                .any(|bytes| bytes == b"\r\n\r\n")
+            {
+                stream
+                    .set_read_timeout(Some(
+                        deadline.checked_duration_since(Instant::now()).unwrap(),
+                    ))
+                    .unwrap();
+                assert!(
+                    length < request.len(),
+                    "loader request headers exceed their bound"
+                );
+                let read = stream.read(&mut request[length..]).unwrap();
+                assert!(read > 0, "loader request ended before its headers");
+                length += read;
+            }
+            assert!(request[..length].starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n"));
+            let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            requested.send(()).expect("loader request observer dropped");
+            released
+                .recv_timeout(Duration::from_secs(8))
+                .expect("loader body was not released");
+            match stream.write_all(body) {
+                Ok(()) => true,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => panic!("loader body write failed: {error}"),
+            }
+        });
+        let service = Arc::new(service);
+        let mut release = Some(release);
+        let mut caller = None;
+        let absent = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
+        let cache = root
+            .path()
+            .join("cache/loaders/catalog/component-fabric-builds-1.21.4.json");
+        let canary = root.path().join("unrelated-user-file.txt");
+        let journey = std::panic::AssertUnwindSafe(async {
+            let pin = library.admit().unwrap();
+            let original_generation = pin.generation();
+            let operation = pin.managed_library().unwrap();
+            operation.prepare_layout().unwrap();
+            let cache_before = loaders::fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.4").unwrap();
+            drop(operation);
+            drop(pin);
+            std::fs::write(&canary, b"preserve unrelated user bytes\n").unwrap();
+            let initially_absent = absent(&cache) && absent(&root.path().join("instances"));
+            let instances_before = service.instances.registry().list().unwrap();
+            let pending_before = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+            let queue_before = service.installs.snapshot();
+            caller = Some(tokio::spawn({
+                let service = service.clone();
+                async move {
+                    service
+                        .loader_builds(LoaderComponentId::Fabric.as_str(), "1.21.4")
+                        .await
+                }
+            }));
+            let observed = tokio::time::timeout(Duration::from_secs(5), observed).await;
+            if !matches!(observed, Ok(Ok(()))) && caller.as_ref().unwrap().is_finished() {
+                let result = caller.take().unwrap().await.map(|result| result.map(|_| ()));
+                panic!("loader picker finished before provider request: {result:?}");
+            }
+            observed
+                .expect("loader HTTP request was not observed")
+                .expect("loader request observer closed");
+            let held = !caller.as_ref().unwrap().is_finished() && !server.is_finished();
+            let accepted = owner.status();
+            let mut view = None;
+            let mut held_shutdown = None;
+            if cancel_fetch {
+                caller.as_ref().unwrap().abort();
+                let joined = tokio::time::timeout(Duration::from_secs(1), caller.as_mut().unwrap())
+                    .await
+                    .expect("disposable loader caller did not join");
+                drop(caller.take());
+                let after_drop = owner.status();
+                let shutdown = owner.shutdown(Duration::from_secs(2)).await;
+                let receipt = owner.shutdown_receipt();
+                let receipted = receipt.as_ref().is_some_and(|receipt| receipt.belongs_to(&owner));
+                held_shutdown = Some((joined.is_err_and(|error| error.is_cancelled()), after_drop, shutdown, receipted, !server.is_finished()));
+            } else {
+                release.take().unwrap().send(()).unwrap();
+                let joined = tokio::time::timeout(Duration::from_secs(5), caller.as_mut().unwrap())
+                    .await
+                    .expect("loader picker did not settle");
+                drop(caller.take());
+                view = Some(joined.unwrap().unwrap());
+            }
+            let pin = library.admit().unwrap();
+            let final_generation = pin.generation();
+            let operation = pin.managed_library().unwrap();
+            let cache_after = loaders::fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.4").unwrap();
+            drop(operation);
+            drop(pin);
+            let instances_after = service.instances.registry().list().unwrap();
+            let pending_after = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+            let queue_after = service.installs.snapshot();
+            move || {
+                assert!(initially_absent && cache_before.is_none() && held);
+                assert_eq!(accepted.running.len(), 1);
+                assert!(!accepted.closing && accepted.unsettled.is_empty());
+                assert_eq!(final_generation, original_generation);
+                if let Some((caller_cancelled, after_drop, shutdown, receipted, body_held)) = held_shutdown {
+                    assert!(caller_cancelled);
+                    assert_eq!(after_drop, accepted, "dropping the caller must not cancel accepted work");
+                    assert!(body_held, "provider body escaped the cancellation gate");
+                    assert!(shutdown.is_ok() && receipted, "loader fetch did not settle on owner cancellation while its body remained withheld");
+                    assert!(cache_after.is_none(), "cancelled provider fetch published a cache");
+                } else {
+                    let view = view.unwrap();
+                    assert_eq!(view.source_id, "net.fabricmc.fabric-loader");
+                    assert_eq!(view.minecraft_version_id, "1.21.4");
+                    assert_eq!(
+                        view.auto.selection_id,
+                        "loader_auto|net.fabricmc.fabric-loader|1.21.4"
+                    );
+                    assert!(view.auto.enabled);
+                    assert_eq!(view.builds.len(), 1);
+                    let build = &view.builds[0];
+                    assert_eq!(loaders::parse_build_id(&build.build_id), Some((LoaderComponentId::Fabric, "1.21.4".into(), "0.16.14".into())));
+                    assert_eq!(build.label, "0.16.14");
+                    assert!(build.enabled && !build.installed && build.recommended);
+                    let (cached, state) = cache_after.expect("valid provider body was not cached");
+                    assert!(state.availability.fresh && state.availability.cache_hit && !state.availability.stale);
+                    assert_eq!(cached.len(), 1);
+                    assert_eq!(cached[0].build_id, build.build_id);
+                    assert!(matches!(&cached[0].install_source, loaders::LoaderInstallSource::ProfileJson { url } if url == "https://meta.fabricmc.net/v2/versions/loader/1.21.4/0.16.14/profile/json"));
+                }
+                assert!(instances_before.is_empty());
+                assert_eq!(instances_after, instances_before);
+                assert_eq!(pending_before, serde_json::json!([]));
+                assert_eq!(pending_after, pending_before);
+                assert_eq!(queue_after, queue_before);
+            }
+        })
+        .catch_unwind()
+        .await;
+        let released = release.take().map(|release| release.send(()));
+        service.installs.close_admission();
+        let shutdown = std::panic::AssertUnwindSafe(owner.shutdown(Duration::from_secs(15)))
+            .catch_unwind()
+            .await;
+        let remaining = match caller.take() {
+            Some(mut caller) => {
+                caller.abort();
+                Some(
+                    tokio::time::timeout(Duration::from_secs(1), &mut caller)
+                        .await
+                        .is_ok_and(|joined| match joined {
+                            Ok(_) => true,
+                            Err(error) => error.is_cancelled(),
+                        }),
+                )
+            }
+            None => None,
+        };
+        let observers =
+            tokio::time::timeout(Duration::from_secs(5), service.installs.join_observers()).await;
+        let server = tokio::task::spawn_blocking(move || server.join());
+        let server = tokio::time::timeout(Duration::from_secs(18), server).await;
+        let final_state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let pin = library.admit().unwrap();
+            let operation = pin.managed_library().unwrap();
+            (
+                service.instances.registry().list().unwrap(),
+                service.instances.pending().unwrap(),
+                service.installs.snapshot(),
+                loaders::fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.4")
+                    .unwrap()
+                    .is_none(),
+            )
+        }));
+        let receipt = owner.shutdown_receipt();
+        let receipted = receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.belongs_to(&owner));
+        let idle = owner.status().is_idle();
+        let unsettled = service.installs.has_unsettled_effects();
+        let runtime_settled = service.installs.runtime_cache().settle();
+        drop(receipt);
+        drop(service);
+        drop(owner);
+        let pins = library.wait_for_pins(Duration::from_secs(2)).await;
+        let preserved = if matches!(&shutdown, Ok(Ok(())))
+            && matches!(&observers, Ok(Ok(())))
+            && matches!(&server, Ok(Ok(Ok(_))))
+            && receipted
+            && idle
+            && !unsettled
+            && runtime_settled.is_ok()
+            && pins.is_ok()
+        {
+            Some(library.try_preserve())
+        } else {
+            None
+        };
+        let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(released) = released {
+                assert!(released.is_ok(), "loader body gate ended before cleanup");
+            }
+            assert!(
+                matches!(shutdown, Ok(Ok(()))),
+                "loader owner did not join after release"
+            );
+            assert!(
+                remaining.is_none_or(|joined| joined),
+                "disposable loader caller did not join"
+            );
+            assert!(
+                matches!(observers, Ok(Ok(()))),
+                "queue observers did not join"
+            );
+            assert!(
+                matches!(server, Ok(Ok(Ok(_)))),
+                "loader HTTP server did not join"
+            );
+            if !cancel_fetch {
+                assert!(
+                    matches!(server, Ok(Ok(Ok(true)))),
+                    "positive provider body was not delivered"
+                );
+            }
+            assert!(receipted && idle && !unsettled && runtime_settled.is_ok());
+            assert!(
+                pins.is_ok(),
+                "profile capabilities remained after loader work joined"
+            );
+            assert!(
+                matches!(preserved, Some(Ok(()))),
+                "loader fixture root did not preserve"
+            );
+            let (records, pending, queue, cache_absent) = final_state.unwrap();
+            assert!(records.is_empty() && pending.is_empty());
+            assert!(
+                queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none()
+            );
+            assert_eq!(queue.registry_revision, registry_revision);
+            assert!(absent(&root.path().join("instances")));
+            assert!(absent(&root.path().join("cache/version_manifest_v2.json")));
+            assert!(
+                std::fs::read_dir(root.path().join("versions"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            assert_eq!(
+                std::fs::read(&canary).unwrap(),
+                b"preserve unrelated user bytes\n"
+            );
+            match journey {
+                Ok(verify) => verify(),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+            assert_eq!(cache_absent, cancel_fetch);
+            assert_eq!(absent(&cache), cancel_fetch);
+        }));
+        if let Err(panic) = verification {
+            eprintln!(
+                "Retained loader cancellation fixture (cancel_fetch={cancel_fetch}): {}",
+                root.keep().display()
+            );
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
 async fn resolution_retains_its_generation_across_managed_reselection() {
     use crate::library::{AdmissionState, LibraryId, LibraryMode};
     use futures_util::FutureExt;
