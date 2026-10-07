@@ -34,10 +34,27 @@ fn client() -> ProviderClient {
     .unwrap()
 }
 
-pub(crate) fn fixture_catalog(body: Vec<u8>) -> (Catalog, std::thread::JoinHandle<()>) {
+pub(crate) fn fixture_catalog(
+    body: Vec<u8>,
+    response_gate: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+) -> (Catalog, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
+    let provider = if response_gate.is_some() {
+        ProviderClient::new(ClientConfig {
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_secs(8),
+            total_timeout: Duration::from_secs(10),
+            ..ClientConfig::default()
+        })
+        .unwrap()
+    } else {
+        client()
+    };
     let thread = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut stream = loop {
@@ -57,19 +74,43 @@ pub(crate) fn fixture_catalog(body: Vec<u8>) -> (Catalog, std::thread::JoinHandl
         // uses a bounded blocking HTTP read after accepting its one connection.
         stream.set_nonblocking(false).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_write_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let mut request = [0_u8; 4096];
-        assert!(stream.read(&mut request).unwrap() > 0);
+        let mut length = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !request[..length]
+            .windows(4)
+            .any(|bytes| bytes == b"\r\n\r\n")
+        {
+            let remaining = deadline.checked_duration_since(Instant::now()).unwrap();
+            stream.set_read_timeout(Some(remaining)).unwrap();
+            assert!(
+                length < request.len(),
+                "fixture request headers exceed their bound"
+            );
+            let read = stream.read(&mut request[length..]).unwrap();
+            assert!(read > 0, "fixture request ended before its headers");
+            length += read;
+        }
+        assert!(request[..length].starts_with(b"GET /manifest.json HTTP/1.1\r\n"));
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .unwrap();
+        if let Some((requested, release)) = response_gate {
+            requested
+                .send(())
+                .expect("fixture request observer dropped");
+            release
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fixture response was not released");
+        }
         stream.write_all(&body).unwrap();
     });
-    let mut catalog = Catalog::new(client());
+    let mut catalog = Catalog::new(provider);
     catalog.source_fixture = Some((
         format!("{origin}/manifest.json"),
         OriginPolicy::loopback_for_tests([&origin], 0).unwrap(),
@@ -227,7 +268,7 @@ fn invalid_provider_identity_and_metadata_sources_never_become_descriptors() {
 async fn live_manifest_is_persisted_and_reused_by_a_new_catalog_instance() {
     let root = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let authority = ManagedLibraryTestAuthority::open(root.path()).unwrap();
-    let (catalog, server) = fixture_catalog(manifest(&[("1.21.11", "release")]));
+    let (catalog, server) = fixture_catalog(manifest(&[("1.21.11", "release")]), None);
     let snapshot = catalog
         .snapshot(authority.operation(), &CancellationToken::new())
         .await;
@@ -262,7 +303,7 @@ async fn malformed_refresh_preserves_stale_records_without_poisoning_the_cache()
         .await
         .unwrap();
     make_cache_stale(root.path());
-    let (catalog, server) = fixture_catalog(b"{ malformed".to_vec());
+    let (catalog, server) = fixture_catalog(b"{ malformed".to_vec(), None);
     let snapshot = catalog
         .snapshot(authority.operation(), &CancellationToken::new())
         .await;
@@ -284,7 +325,7 @@ async fn malformed_refresh_preserves_stale_records_without_poisoning_the_cache()
 async fn valid_empty_catalog_is_distinct_from_malformed_response_and_missing_cache() {
     let root = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let authority = ManagedLibraryTestAuthority::open(root.path()).unwrap();
-    let (catalog, server) = fixture_catalog(manifest(&[]));
+    let (catalog, server) = fixture_catalog(manifest(&[]), None);
     let empty = catalog
         .snapshot(authority.operation(), &CancellationToken::new())
         .await;
@@ -292,7 +333,7 @@ async fn valid_empty_catalog_is_distinct_from_malformed_response_and_missing_cac
     assert_eq!(empty.catalog_state.state_id, CatalogStateId::Empty);
     assert!(empty.catalog_state.empty && empty.catalog_state.fresh);
     make_cache_stale(root.path());
-    let (catalog, server) = fixture_catalog(b"{}".to_vec());
+    let (catalog, server) = fixture_catalog(b"{}".to_vec(), None);
     let stale_empty = catalog
         .snapshot(authority.operation(), &CancellationToken::new())
         .await;
@@ -303,7 +344,7 @@ async fn valid_empty_catalog_is_distinct_from_malformed_response_and_missing_cac
     let other_root =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let other = ManagedLibraryTestAuthority::open(other_root.path()).unwrap();
-    let (catalog, server) = fixture_catalog(b"{}".to_vec());
+    let (catalog, server) = fixture_catalog(b"{}".to_vec(), None);
     let malformed = catalog
         .snapshot(other.operation(), &CancellationToken::new())
         .await;

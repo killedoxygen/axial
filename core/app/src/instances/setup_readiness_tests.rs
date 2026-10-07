@@ -546,6 +546,226 @@ async fn instance_enrichment_leaves_resource_counts_to_detailed_reads_even_durin
 }
 
 #[tokio::test]
+async fn resolution_rejects_library_drift_during_a_catalog_response() {
+    use futures_util::FutureExt;
+    use std::time::Duration;
+
+    for drift in [false, true] {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
+        let manifest = crate::catalog::tests::manifest(&[("1.21.11", "release")]);
+        let (requested, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (catalog, server) =
+            crate::catalog::tests::fixture_catalog(manifest.clone(), Some((requested, released)));
+        service.catalog = Arc::new(catalog);
+        let service = Arc::new(service);
+        let mut release = Some(release);
+        let mut waiter = None;
+        let journey = std::panic::AssertUnwindSafe(async {
+            let pin = service.instances.directories().library().admit().unwrap();
+            let operation = pin.managed_library().unwrap();
+            operation.prepare_layout().unwrap();
+            let versions = pin
+                .directory()
+                .unwrap()
+                .open_directory(&axial_fs::LeafName::new("versions").unwrap())
+                .unwrap();
+            let revision_before = versions.revision().unwrap();
+            let canary = root.path().join("unrelated-user-file.txt");
+            std::fs::write(&canary, b"preserve unrelated user bytes\n").unwrap();
+            let absent = |path: &std::path::Path| {
+                std::fs::symlink_metadata(path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            };
+            let target = root.path().join("versions/1.21.11");
+            let instance_parent = root.path().join("instances");
+            let cache_absent = absent(&root.path().join("cache/version_manifest_v2.json"));
+            let target_absent = absent(&target);
+            let namespace_absent = absent(&instance_parent);
+            let instances_before = service.instances.registry().list().unwrap();
+            let pending_before =
+                serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+            let queue_before = service.installs.snapshot();
+            waiter = Some(tokio::spawn({
+                let service = service.clone();
+                async move { service.resolve("vanilla|1.21.11").await }
+            }));
+            tokio::time::timeout(Duration::from_secs(5), observed)
+                .await
+                .expect("catalog request was not observed")
+                .expect("catalog request observer closed");
+            let pending_response = !waiter.as_ref().unwrap().is_finished();
+            let external = root.path().join("versions/external-degraded-entry");
+            let external_absent = absent(&external);
+            let metadata = external.join("external-degraded-entry.json");
+            let malformed = b"{not valid external version metadata\n";
+            let changed_revision = if drift {
+                std::fs::create_dir(&external).unwrap();
+                std::fs::write(&metadata, malformed).unwrap();
+                Some(
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            let revision = versions.revision().unwrap();
+                            if revision != revision_before {
+                                break revision;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await,
+                )
+            } else {
+                None
+            };
+            release.take().unwrap().send(()).unwrap();
+            let old_result = tokio::time::timeout(Duration::from_secs(5), waiter.as_mut().unwrap())
+                .await
+                .expect("original resolution did not settle")
+                .unwrap()
+                .map(|(target, request, admission)| {
+                    let valid = admission.validate();
+                    (target.version_id().to_owned(), request, valid)
+                });
+            drop(waiter.take());
+            // Successful cache publication proves a complete, validated HTTP body,
+            // independently of the VersionUnavailable result under test.
+            let cached = axial_minecraft::manifest::read_cached_manifest_bytes(&operation).unwrap();
+            let preserved = if drift {
+                let bytes = std::fs::read(&metadata).unwrap();
+                std::fs::remove_file(&metadata).unwrap();
+                std::fs::remove_dir(&external).unwrap();
+                Some(bytes)
+            } else {
+                None
+            };
+            waiter = Some(tokio::spawn({
+                let service = service.clone();
+                async move { service.resolve("vanilla|1.21.11").await }
+            }));
+            let fresh_result =
+                tokio::time::timeout(Duration::from_secs(5), waiter.as_mut().unwrap())
+                    .await
+                    .expect("fresh resolution did not settle")
+                    .unwrap()
+                    .map(|(target, request, admission)| {
+                        let valid = admission.validate();
+                        (target.version_id().to_owned(), request, valid)
+                    });
+            drop(waiter.take());
+            let instances_after = service.instances.registry().list().unwrap();
+            let pending_after = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+            let queue_after = service.installs.snapshot();
+            let target_still_absent = absent(&target);
+            let namespace_still_absent = absent(&instance_parent);
+            let external_removed = absent(&external);
+            drop(versions);
+            drop(operation);
+            drop(pin);
+            move || {
+                assert!(cache_absent && target_absent && namespace_absent && external_absent);
+                assert!(
+                    pending_response,
+                    "HTTP body did not hold resolution pending"
+                );
+                let expected_request = InstallQueueRequest::Vanilla {
+                    version_id: "1.21.11".into(),
+                };
+                if drift {
+                    assert_ne!(changed_revision.unwrap().unwrap(), revision_before);
+                    assert!(matches!(old_result, Err(InstanceError::VersionUnavailable)));
+                    assert_eq!(preserved.as_deref(), Some(malformed.as_slice()));
+                } else {
+                    assert!(changed_revision.is_none() && preserved.is_none());
+                    let (version, request, valid) = old_result.unwrap();
+                    assert_eq!(version, "1.21.11");
+                    assert_eq!(request, expected_request);
+                    assert!(
+                        valid.is_ok(),
+                        "the undisturbed original admission must remain valid"
+                    );
+                }
+                assert_eq!(cached, (manifest, true));
+                assert!(external_removed && target_still_absent && namespace_still_absent);
+                let (version, request, valid) = fresh_result.unwrap();
+                assert_eq!(version, "1.21.11");
+                assert_eq!(request, expected_request);
+                assert!(
+                    valid.is_ok(),
+                    "fresh resolution did not return valid admission"
+                );
+                assert!(instances_before.is_empty());
+                assert_eq!(instances_after, instances_before);
+                assert_eq!(pending_before, serde_json::json!([]));
+                assert_eq!(pending_after, pending_before);
+                assert_eq!(queue_after, queue_before);
+                assert_eq!(
+                    std::fs::read(canary).unwrap(),
+                    b"preserve unrelated user bytes\n"
+                );
+            }
+        })
+        .catch_unwind()
+        .await;
+        if let Some(release) = release.take() {
+            let _ = release.send(());
+        }
+        service.installs.close_admission();
+        let shutdown =
+            std::panic::AssertUnwindSafe(service.instances.tasks.shutdown(Duration::from_secs(5)))
+                .catch_unwind()
+                .await;
+        let remaining = match waiter.take() {
+            Some(mut waiter) => {
+                let result = tokio::time::timeout(Duration::from_secs(5), &mut waiter).await;
+                if result.is_err() {
+                    waiter.abort();
+                    let _ = tokio::time::timeout(Duration::from_secs(1), waiter).await;
+                }
+                Some(result)
+            }
+            None => None,
+        };
+        let observers =
+            tokio::time::timeout(Duration::from_secs(5), service.installs.join_observers()).await;
+        // The server has bounded accept, header-read, gate and socket-write waits.
+        // Join even when an assertion or the client timeout interrupted the journey.
+        let server = tokio::task::spawn_blocking(move || server.join());
+        let server = tokio::time::timeout(Duration::from_secs(16), server).await;
+        let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(matches!(shutdown, Ok(Ok(()))), "task owner did not join");
+            if let Some(result) = remaining {
+                assert!(
+                    matches!(result, Ok(Ok(_))),
+                    "resolution waiter did not join"
+                );
+            }
+            assert!(
+                matches!(observers, Ok(Ok(()))),
+                "queue observers did not join"
+            );
+            assert!(
+                matches!(server, Ok(Ok(Ok(())))),
+                "catalog server did not join successfully"
+            );
+            assert!(service.instances.tasks.status().is_idle());
+            assert!(!service.installs.has_unsettled_effects());
+            match journey {
+                Ok(verify) => verify(),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }));
+        if let Err(panic) = verification {
+            eprintln!(
+                "Retained catalog-await fixture (drift={drift}): {}",
+                root.keep().display()
+            );
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
 async fn creation_rejects_a_restored_library_with_an_old_admission() {
     use futures_util::FutureExt;
     use std::time::Duration;
