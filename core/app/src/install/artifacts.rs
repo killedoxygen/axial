@@ -129,6 +129,8 @@ impl ActivatedVersion {
                 .map_err(|_| InstallError::NotReady)?
                 .ok_or(if path == client_path {
                     InstallError::ClientJarMissing
+                } else if expected.path == metadata_path {
+                    InstallError::VersionJsonMissing
                 } else {
                     InstallError::NotReady
                 })?;

@@ -177,7 +177,8 @@ pub(crate) fn failure(error: InstallError) -> ApiError {
         | InstallError::SettlementRequired
         | InstallError::NotReady
         | InstallError::ClientJarMissing
-        | InstallError::ClientJarCorrupt => StatusCode::CONFLICT,
+        | InstallError::ClientJarCorrupt
+        | InstallError::VersionJsonMissing => StatusCode::CONFLICT,
         InstallError::AtCapacity => StatusCode::TOO_MANY_REQUESTS,
         InstallError::ContentUnavailable
         | InstallError::LoaderUnavailable

@@ -180,6 +180,7 @@ pub struct PreflightReadinessReason {
 pub enum PreflightReadinessReasonId {
     ClientJarMissing,
     ClientJarCorrupt,
+    VersionJsonMissing,
     JavaOverrideMissing,
 }
 
@@ -628,6 +629,10 @@ impl LaunchCoordinator {
                                     InstallError::ClientJarCorrupt => (
                                         PreflightReadinessReasonId::ClientJarCorrupt,
                                         "Client game files are corrupt. Repair this version before launching.",
+                                    ),
+                                    InstallError::VersionJsonMissing => (
+                                        PreflightReadinessReasonId::VersionJsonMissing,
+                                        "Installed version metadata is missing. Install this version before launching.",
                                     ),
                                     _ => return Err(install_read_error(error)),
                                 };
@@ -1221,7 +1226,8 @@ fn install_read_error(error: InstallError) -> LaunchError {
     match error {
         InstallError::NotReady
         | InstallError::ClientJarMissing
-        | InstallError::ClientJarCorrupt => LaunchError::InstallUnavailable,
+        | InstallError::ClientJarCorrupt
+        | InstallError::VersionJsonMissing => LaunchError::InstallUnavailable,
         InstallError::Busy => LaunchError::InstanceBusy,
         InstallError::AtCapacity => LaunchError::AtCapacity,
         InstallError::Closed => LaunchError::Closed,

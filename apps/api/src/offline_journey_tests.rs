@@ -2483,7 +2483,7 @@ async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn preflight_reports_installed_client_damage_without_launching_or_repairing() {
+async fn preflight_reports_installed_file_damage_without_launching_or_repairing() {
     use std::os::unix::fs::MetadataExt;
 
     let temporary =
@@ -2518,7 +2518,7 @@ async fn preflight_reports_installed_client_damage_without_launching_or_repairin
     let created = api
         .post(
             "/api/v1/instances",
-            json!({"name":"Missing client preflight","selection_id":format!("vanilla|{VERSION}")}),
+            json!({"name":"Installed file preflight","selection_id":format!("vanilla|{VERSION}")}),
         )
         .await;
     let instance = created["id"].as_str().unwrap();
@@ -2541,6 +2541,24 @@ async fn preflight_reports_installed_client_damage_without_launching_or_repairin
     let library = services.library.admit().unwrap().read_projection().unwrap();
     let client = library.join(format!("versions/{VERSION}/{VERSION}.jar"));
     let original = std::fs::read(&client).unwrap();
+    let metadata = library.join(format!("versions/{VERSION}/{VERSION}.json"));
+    let original_metadata = std::fs::read(&metadata).unwrap();
+    std::fs::remove_file(&metadata).unwrap();
+    let missing_metadata = api.get(&preflight).await;
+    let metadata_absent = std::fs::symlink_metadata(&metadata)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    let metadata_canary = temporary.path().join("outside-metadata-canary.json");
+    assert!(!metadata_canary.starts_with(&profile) && !metadata_canary.starts_with(&library));
+    std::fs::write(&metadata_canary, &original_metadata).unwrap();
+    std::os::unix::fs::symlink(&metadata_canary, &metadata).unwrap();
+    let metadata_link_before = std::fs::symlink_metadata(&metadata).unwrap();
+    let metadata_inadmissible = api.get(&preflight).await;
+    let metadata_link_after = std::fs::symlink_metadata(&metadata).unwrap();
+    let metadata_link_target = std::fs::read_link(&metadata).unwrap();
+    let metadata_canary_after = std::fs::read(&metadata_canary).unwrap();
+    let client_after_metadata = std::fs::read(&client).unwrap();
+    std::fs::remove_file(&metadata).unwrap();
+    std::fs::write(&metadata, &original_metadata).unwrap();
     let mut changed = original.clone();
     changed[0] ^= 1;
     std::fs::write(&client, &changed).unwrap();
@@ -2558,6 +2576,7 @@ async fn preflight_reports_installed_client_damage_without_launching_or_repairin
     std::fs::remove_file(&client).unwrap();
     let missing = api.get(&preflight).await;
     let canary_after = std::fs::read(&canary).unwrap();
+    let metadata_after = std::fs::read(&metadata).unwrap();
     let reports_after = api.get("/api/v1/launch/reports").await;
     let queue_after = api.get("/api/v1/install/queue").await;
     let sessions_after = api.get("/api/v1/launch/sessions").await;
@@ -2571,24 +2590,37 @@ async fn preflight_reports_installed_client_damage_without_launching_or_repairin
     assert_eq!(queue_after, queue_before);
     assert_eq!(sessions_before, json!({"sessions":[]}));
     assert_eq!(sessions_after, sessions_before);
-    assert!(link_before.file_type().is_symlink());
-    assert!(link_after.file_type().is_symlink());
-    assert_eq!(
-        (link_after.dev(), link_after.ino()),
-        (link_before.dev(), link_before.ino())
-    );
-    assert_eq!(link_target, canary);
+    for (before, after, target, expected_target) in [
+        (
+            &metadata_link_before,
+            &metadata_link_after,
+            &metadata_link_target,
+            &metadata_canary,
+        ),
+        (&link_before, &link_after, &link_target, &canary),
+    ] {
+        assert!(before.file_type().is_symlink());
+        assert!(after.file_type().is_symlink());
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(target, expected_target);
+    }
+    assert!(metadata_absent, "preflight must not repair metadata");
+    assert_eq!(metadata_canary_after, original_metadata);
+    assert_eq!(metadata_after, original_metadata);
+    assert_eq!(client_after_metadata, original);
     assert_eq!(canary_after, original);
-    assert_eq!(
-        inadmissible,
-        json!({
-            "instance_id":instance,"launchable":false,
-            "error":{
-                "code":"install_unavailable",
-                "error":"The installed version requires a completed installation before launch."
-            }
-        })
-    );
+    for response in [metadata_inadmissible, inadmissible] {
+        assert_eq!(
+            response,
+            json!({
+                "instance_id":instance,"launchable":false,
+                "error":{
+                    "code":"install_unavailable",
+                    "error":"The installed version requires a completed installation before launch."
+                }
+            })
+        );
+    }
     assert_eq!(changed.len(), original.len());
     assert_ne!(changed, original);
     assert_eq!(
@@ -2600,6 +2632,11 @@ async fn preflight_reports_installed_client_damage_without_launching_or_repairin
         "preflight must not repair files"
     );
     for (response, reason, message) in [
+        (
+            missing_metadata,
+            "version_json_missing",
+            "Installed version metadata is missing. Install this version before launching.",
+        ),
         (
             missing,
             "client_jar_missing",
@@ -2656,6 +2693,8 @@ async fn preflight_reports_installed_client_damage_without_launching_or_repairin
         for private in [
             profile.to_str().unwrap(),
             client.to_str().unwrap(),
+            metadata.to_str().unwrap(),
+            metadata_canary.to_str().unwrap(),
             private_args,
             "missing-client-secret",
             &api.capability,

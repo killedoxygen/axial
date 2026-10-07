@@ -116,6 +116,8 @@ pub enum InstallError {
     ClientJarMissing,
     #[error("Client game files are corrupt. Repair this version before launching.")]
     ClientJarCorrupt,
+    #[error("Installed version metadata is missing. Install this version before launching.")]
+    VersionJsonMissing,
     #[error("The selected loader build is unavailable.")]
     LoaderUnavailable,
     #[error("Content installation is unavailable.")]
