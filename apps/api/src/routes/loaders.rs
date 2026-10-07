@@ -47,12 +47,19 @@ async fn versions(
     let task = state
         .tasks
         .try_spawn((pin, operation.clone()), move |cancel| async move {
-            let (mut versions, catalog_state) =
-                loaders::fetch_supported_versions(&operation, component).await?;
-            state
+            let (mut versions, catalog_state) = loaders::fetch_supported_versions_cancellable(
+                &operation,
+                component,
+                cancel.cancelled(),
+            )
+            .await?;
+            let metadata = state
                 .catalog
                 .enrich_loader_versions(&operation, &mut versions, &cancel)
                 .await;
+            if metadata.failure == Some(axial_app::catalog::CatalogFailure::Cancelled) {
+                return Err(axial_minecraft::loaders::LoaderError::Cancelled);
+            }
             Ok::<_, axial_minecraft::loaders::LoaderError>(
                 json!({"versions":versions,"catalog_state":catalog_state}),
             )
@@ -82,9 +89,14 @@ async fn builds(
     let operation = pin.managed_library().map_err(|_| unavailable())?;
     let task = state
         .tasks
-        .try_spawn((pin, operation.clone()), move |_| async move {
-            let (builds, catalog_state) =
-                loaders::fetch_builds(&operation, component, &query.minecraft_version).await?;
+        .try_spawn((pin, operation.clone()), move |cancel| async move {
+            let (builds, catalog_state) = loaders::fetch_builds_cancellable(
+                &operation,
+                component,
+                &query.minecraft_version,
+                cancel.cancelled(),
+            )
+            .await?;
             Ok::<_, axial_minecraft::loaders::LoaderError>(
                 json!({"builds":builds,"catalog_state":catalog_state}),
             )

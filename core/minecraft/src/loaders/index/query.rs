@@ -11,9 +11,12 @@ use crate::loaders::types::{
     LoaderGameVersion, LoaderProviderFailureKind, LoaderVersionIndex,
 };
 use crate::managed_fs::ManagedLibraryOperation;
-use crate::manifest::fetch_version_manifest_cached;
+use crate::manifest::{
+    FetchError as ManifestError, VersionManifest, fetch_version_manifest_cached_cancellable,
+};
 use crate::portable_path::PortableFileName;
 use crate::version_meta::{enrich_loader_game_versions, manifest_release_entries};
+use futures_util::FutureExt;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -28,13 +31,76 @@ pub async fn fetch_supported_versions(
     operation: &ManagedLibraryOperation,
     component_id: LoaderComponentId,
 ) -> Result<(Vec<LoaderGameVersion>, LoaderCatalogState), LoaderError> {
+    fetch_supported_versions_cancellable(operation, component_id, std::future::pending()).await
+}
+
+pub async fn fetch_supported_versions_cancellable(
+    operation: &ManagedLibraryOperation,
+    component_id: LoaderComponentId,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> Result<(Vec<LoaderGameVersion>, LoaderCatalogState), LoaderError> {
+    let cancelled = cancelled.shared();
+    fetch_supported_versions_with(
+        operation,
+        component_id,
+        cancelled.clone(),
+        providers::fetch_supported_versions(component_id),
+        fetch_version_manifest_cached_cancellable(operation, cancelled),
+    )
+    .await
+}
+
+#[cfg(feature = "test-support")]
+pub async fn fetch_fabric_game_versions_for_test(
+    operation: &ManagedLibraryOperation,
+    url: &reqwest::Url,
+    manifest_url: Option<&reqwest::Url>,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> Result<(Vec<LoaderGameVersion>, LoaderCatalogState), LoaderError> {
+    crate::loaders::http::validate_loopback_url_for_test(url)?;
+    let cancelled = cancelled.shared();
+    let version_manifest = async {
+        match manifest_url {
+            Some(url) => {
+                crate::manifest::fetch_version_manifest_cached_from_loopback_for_test(
+                    operation,
+                    url,
+                    cancelled.clone(),
+                )
+                .await
+            }
+            None => fetch_version_manifest_cached_cancellable(operation, cancelled.clone()).await,
+        }
+    };
+    fetch_supported_versions_with(
+        operation,
+        LoaderComponentId::Fabric,
+        cancelled.clone(),
+        providers::fetch_game_versions_from_loopback_for_test(url),
+        version_manifest,
+    )
+    .await
+}
+
+async fn fetch_supported_versions_with(
+    operation: &ManagedLibraryOperation,
+    component_id: LoaderComponentId,
+    cancelled: impl std::future::Future<Output = ()>,
+    fetch_live: impl std::future::Future<Output = Result<Vec<LoaderGameVersion>, LoaderError>>,
+    version_manifest: impl std::future::Future<Output = Result<VersionManifest, ManifestError>>,
+) -> Result<(Vec<LoaderGameVersion>, LoaderCatalogState), LoaderError> {
     let supported_versions = resolve_cached(
         operation,
         supported_versions_cache_name(component_id)?,
         SUPPORTED_VERSIONS_TTL,
-        || providers::fetch_supported_versions(component_id),
+        || async {
+            tokio::select! {
+                biased;
+                result = fetch_live => result,
+                _ = cancelled => Err(LoaderError::Cancelled),
+            }
+        },
     );
-    let version_manifest = fetch_version_manifest_cached(operation);
     let (supported_versions, version_manifest) = tokio::join!(supported_versions, version_manifest);
 
     let (mut versions, catalog) = supported_versions?;
@@ -44,7 +110,8 @@ pub async fn fetch_supported_versions(
             enrich_loader_game_versions(&mut versions, &manifest.versions, &releases);
             Some(catalog_version_order(&manifest.versions))
         }
-        Err(_) => {
+        Err(ManifestError::Cancelled) => return Err(LoaderError::Cancelled),
+        Err(ManifestError::Unavailable(_)) => {
             enrich_loader_game_versions(&mut versions, &[], &[]);
             None
         }
@@ -324,6 +391,140 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn supported_version_acquisition_cancellation_preserves_absent_or_stale_catalog() {
+        for stale in [false, true] {
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+            let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+            let operation = root.try_acquire().unwrap();
+            operation.prepare_layout().unwrap();
+            seed_manifest(&operation);
+            let component = LoaderComponentId::Fabric;
+            if stale {
+                super::persist_loader_supported_versions_cache_fixture_for_test(
+                    &operation,
+                    component,
+                    &[game_version()],
+                    1,
+                )
+                .unwrap();
+            }
+            let path = temporary
+                .path()
+                .join("cache/loaders/catalog/component-fabric-supported-versions.json");
+            let original = stale.then(|| std::fs::read(&path).unwrap());
+
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                super::fetch_supported_versions_with(
+                    &operation,
+                    component,
+                    std::future::ready(()),
+                    std::future::pending(),
+                    super::fetch_version_manifest_cached_cancellable(
+                        &operation,
+                        std::future::ready(()),
+                    ),
+                ),
+            )
+            .await
+            .expect("pending acquisition must be cancellable")
+            .expect_err("cancellation must not serve stale catalog");
+
+            assert!(matches!(error, LoaderError::Cancelled));
+            if let Some(original) = original {
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            } else {
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn supported_version_acquisition_failure_wins_over_cancellation() {
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        operation.prepare_layout().unwrap();
+        seed_manifest(&operation);
+
+        let error = super::fetch_supported_versions_with(
+            &operation,
+            LoaderComponentId::Fabric,
+            std::future::ready(()),
+            std::future::ready(Err(LoaderError::ProviderUnavailable {
+                kind: LoaderProviderFailureKind::HttpServer,
+                status: Some(503),
+            })),
+            super::fetch_version_manifest_cached_cancellable(&operation, std::future::ready(())),
+        )
+        .await
+        .expect_err("completed provider refusal");
+
+        assert!(matches!(
+            error,
+            LoaderError::CatalogUnavailable {
+                provider_failure_kind: Some(LoaderProviderFailureKind::HttpServer),
+                provider_status: Some(503),
+                ..
+            }
+        ));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn supported_version_acquisition_publishes_and_enriches_despite_cancellation() {
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        operation.prepare_layout().unwrap();
+        seed_manifest(&operation);
+        let raw = vec![game_version()];
+
+        let (versions, state) = super::fetch_supported_versions_with(
+            &operation,
+            LoaderComponentId::Fabric,
+            std::future::ready(()),
+            std::future::ready(Ok(raw.clone())),
+            super::fetch_version_manifest_cached_cancellable(&operation, std::future::ready(())),
+        )
+        .await
+        .expect("successful acquisition must settle publication");
+        let persisted: CachedCatalog<Vec<super::LoaderGameVersion>> = serde_json::from_slice(
+            &std::fs::read(
+                temporary
+                    .path()
+                    .join("cache/loaders/catalog/component-fabric-supported-versions.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(persisted.value, raw);
+        assert!(state.availability.fresh);
+        assert!(!state.availability.cache_hit);
+        assert_eq!(state.availability.last_error, None);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].id, "1.21.5");
+        assert_eq!(versions[0].release_time, "2025-03-25T12:00:00+00:00");
+        assert_eq!(versions[0].stable_hint, Some(true));
+    }
+
+    #[cfg(feature = "test-support")]
+    fn game_version() -> super::LoaderGameVersion {
+        serde_json::from_str(r#"{"id":"1.21.5","stable_hint":true}"#).unwrap()
+    }
+
+    #[cfg(feature = "test-support")]
+    fn seed_manifest(operation: &crate::managed_fs::ManagedLibraryOperation) {
+        crate::manifest::persist_version_manifest_cache_fixture_for_test(
+            operation,
+            br#"{"latest":{"release":"1.21.5","snapshot":"1.21.5"},"versions":[{"id":"1.21.5","type":"release","url":"https://piston-meta.mojang.com/version.json","sha1":"0123456789012345678901234567890123456789","releaseTime":"2025-03-25T12:00:00+00:00"}]}"#,
+        ).unwrap();
+    }
 
     #[tokio::test]
     async fn build_acquisition_cancellation_leaves_no_catalog() {

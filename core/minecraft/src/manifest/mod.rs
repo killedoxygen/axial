@@ -83,6 +83,14 @@ struct ManifestCache {
 
 static MANIFEST_CACHE: OnceLock<Mutex<ManifestCache>> = OnceLock::new();
 
+#[derive(Debug, thiserror::Error)]
+pub enum FetchError {
+    #[error("version manifest acquisition was cancelled")]
+    Cancelled,
+    #[error("{0}")]
+    Unavailable(String),
+}
+
 pub(crate) async fn fetch_registered_repair_version_manifest(
     version_id: &str,
     expected_metadata_sha1: &str,
@@ -164,69 +172,88 @@ pub(crate) async fn fetch_fresh_install_version_manifest_at_test_endpoint(
 pub async fn fetch_version_manifest_cached(
     operation: &ManagedLibraryOperation,
 ) -> Result<VersionManifest, String> {
-    fetch_version_manifest_cached_from_url(operation, MANIFEST_URL).await
+    fetch_version_manifest_cached_cancellable(operation, std::future::pending())
+        .await
+        .map_err(|error| error.to_string())
 }
 
-async fn fetch_version_manifest_cached_from_url(
+/// Only live acquisition is cancellable; cache publication remains owned through settlement.
+pub async fn fetch_version_manifest_cached_cancellable(
     operation: &ManagedLibraryOperation,
-    manifest_url: &str,
-) -> Result<VersionManifest, String> {
+    cancelled: impl Future<Output = ()>,
+) -> Result<VersionManifest, FetchError> {
+    fetch_version_manifest_cached_with(operation, cancelled, true, fetch_manifest_live_body()).await
+}
+
+#[cfg(feature = "test-support")]
+pub async fn fetch_version_manifest_cached_from_loopback_for_test(
+    operation: &ManagedLibraryOperation,
+    url: &reqwest::Url,
+    cancelled: impl Future<Output = ()>,
+) -> Result<VersionManifest, FetchError> {
+    crate::download::TransferOrigin::from_loopback_http_for_test_support(url).map_err(|_| {
+        FetchError::Unavailable("manifest test source must use literal loopback HTTP".into())
+    })?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(FetchError::Unavailable(
+            "manifest test source cannot contain query or fragment".into(),
+        ));
+    }
+    let client = manifest_client_builder().no_proxy().build().map_err(|_| {
+        FetchError::Unavailable("manifest test client configuration is invalid".into())
+    })?;
+    fetch_version_manifest_cached_with(operation, cancelled, false, async {
+        fetch_manifest_live_body_attempt_with_client(url.as_str(), false, &client)
+            .await
+            .map_err(|failure| failure.message)
+    })
+    .await
+}
+
+async fn fetch_version_manifest_cached_with(
+    operation: &ManagedLibraryOperation,
+    cancelled: impl Future<Output = ()>,
+    shared_cache: bool,
+    fetch_body: impl Future<Output = Result<Vec<u8>, String>>,
+) -> Result<VersionManifest, FetchError> {
     if let Some(value) = fresh_persistent_manifest_cache(operation) {
-        update_manifest_cache(value.clone());
+        if shared_cache {
+            update_manifest_cache(value.clone());
+        }
         return Ok(value);
     }
 
-    if let Some(value) = fresh_cached_manifest() {
+    if let Some(value) = shared_cache.then(fresh_cached_manifest).flatten() {
         let _ = write_persistent_manifest_cache_value(operation, &value).await;
         return Ok(value);
     }
 
     let stale = read_persistent_manifest_cache(operation)
         .ok()
-        .or_else(stale_cached_manifest);
-    if let Some(stale) = stale {
-        return Ok(refresh_stale_manifest(operation, manifest_url, stale).await);
-    }
-
-    let (manifest, live_body) = resolve_manifest_from_live_or_cache(
-        operation,
-        fetch_manifest_live_body_with_policy(
-            manifest_url,
-            manifest_url == MANIFEST_URL,
-            manifest_url == MANIFEST_URL,
-        )
-        .await,
-        None,
-    )?;
+        .or_else(|| shared_cache.then(stale_cached_manifest).flatten());
+    let live = tokio::select! {
+        biased;
+        result = fetch_body => result,
+        _ = cancelled => return Err(FetchError::Cancelled),
+    };
+    let (manifest, live_body) = if let Some(stale) = stale {
+        match live.and_then(|body| parse_manifest_body(&body).map(|manifest| (manifest, body))) {
+            Ok((manifest, body)) => (manifest, Some(body)),
+            Err(_) => return Ok(stale),
+        }
+    } else {
+        resolve_manifest_from_live_or_cache(operation, live, None)
+            .map_err(FetchError::Unavailable)?
+    };
 
     if let Some(live_body) = live_body {
         let _ = write_persistent_manifest_cache(operation, &live_body).await;
     }
 
-    update_manifest_cache(manifest.clone());
+    if shared_cache {
+        update_manifest_cache(manifest.clone());
+    }
     Ok(manifest)
-}
-
-async fn refresh_stale_manifest(
-    operation: &ManagedLibraryOperation,
-    manifest_url: &str,
-    stale: VersionManifest,
-) -> VersionManifest {
-    let Ok(body) = fetch_manifest_live_body_with_policy(
-        manifest_url,
-        manifest_url == MANIFEST_URL,
-        manifest_url == MANIFEST_URL,
-    )
-    .await
-    else {
-        return stale;
-    };
-    let Ok(manifest) = parse_manifest_body(&body) else {
-        return stale;
-    };
-    let _ = write_persistent_manifest_cache(operation, &body).await;
-    update_manifest_cache(manifest.clone());
-    manifest
 }
 
 fn fresh_cached_manifest() -> Option<VersionManifest> {
@@ -342,7 +369,15 @@ async fn fetch_manifest_live_body_attempt(
     url: &str,
     require_https: bool,
 ) -> Result<Vec<u8>, ManifestFetchFailure> {
-    let response = manifest_client().get(url).send().await.map_err(|error| {
+    fetch_manifest_live_body_attempt_with_client(url, require_https, manifest_client()).await
+}
+
+async fn fetch_manifest_live_body_attempt_with_client(
+    url: &str,
+    require_https: bool,
+    client: &reqwest::Client,
+) -> Result<Vec<u8>, ManifestFetchFailure> {
+    let response = client.get(url).send().await.map_err(|error| {
         let kind = if error.is_redirect() {
             ManifestFetchFailureKind::InsecureRedirect
         } else if error.is_timeout() {
@@ -538,17 +573,21 @@ fn parse_manifest_body(data: &[u8]) -> Result<VersionManifest, String> {
 fn manifest_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("axial/0.3")
-            .pool_max_idle_per_host(MANIFEST_CLIENT_MAX_IDLE_PER_HOST)
-            .pool_idle_timeout(Duration::from_secs(MANIFEST_CLIENT_POOL_IDLE_TIMEOUT_SECS))
-            .tcp_keepalive(Duration::from_secs(MANIFEST_CLIENT_TCP_KEEPALIVE_SECS))
+        manifest_client_builder()
             .build()
             .expect("version manifest HTTP client configuration should be valid")
     })
+}
+
+fn manifest_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("axial/0.3")
+        .pool_max_idle_per_host(MANIFEST_CLIENT_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(Duration::from_secs(MANIFEST_CLIENT_POOL_IDLE_TIMEOUT_SECS))
+        .tcp_keepalive(Duration::from_secs(MANIFEST_CLIENT_TCP_KEEPALIVE_SECS))
 }
 
 #[cfg(test)]
@@ -754,17 +793,71 @@ mod tests {
         write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.8").as_bytes())
             .await
             .expect("write cache");
-        let stale = read_persistent_manifest_cache(&operation).expect("read stale cache");
-        let manifest = refresh_stale_manifest(
+        fs::File::open(root.join("cache").join(MANIFEST_CACHE_NAME))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .unwrap();
+        let manifest = fetch_version_manifest_cached_with(
             &operation,
-            "http://127.0.0.1:9/version_manifest_v2.json",
-            stale,
+            std::future::pending(),
+            false,
+            fetch_manifest_live_body_from_url("http://127.0.0.1:9/version_manifest_v2.json"),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(manifest.latest.release, "1.21.8");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancelled_manifest_acquisition_preserves_absent_or_stale_cache() {
+        for stale in [false, true] {
+            let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+            let (_library, operation) = test_library(temporary.path());
+            let path = temporary.path().join("cache").join(MANIFEST_CACHE_NAME);
+            let body = sample_manifest_body("1.21.8");
+            if stale {
+                write_persistent_manifest_cache(&operation, body.as_bytes())
+                    .await
+                    .unwrap();
+                fs::File::open(&path)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH))
+                    .unwrap();
+                assert_eq!(
+                    read_cached_manifest_bytes(&operation).unwrap(),
+                    (body.as_bytes().to_vec(), false)
+                );
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                fetch_version_manifest_cached_with(
+                    &operation,
+                    std::future::ready(()),
+                    false,
+                    std::future::pending(),
+                ),
+            )
+            .await
+            .expect("manifest acquisition must settle on cancellation");
+            assert!(
+                matches!(result, Err(FetchError::Cancelled)),
+                "cancellation cannot serve stale metadata"
+            );
+            if stale {
+                assert_eq!(
+                    read_cached_manifest_bytes(&operation).unwrap(),
+                    (body.as_bytes().to_vec(), false)
+                );
+            } else {
+                assert!(
+                    fs::symlink_metadata(&path)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -774,10 +867,20 @@ mod tests {
         write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.8").as_bytes())
             .await
             .expect("write cache");
-        let stale = read_persistent_manifest_cache(&operation).expect("read stale cache");
+        fs::File::open(root.join("cache").join(MANIFEST_CACHE_NAME))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .unwrap();
         let server = TestManifestServer::start(200, sample_manifest_body("1.21.9"));
-
-        let manifest = refresh_stale_manifest(&operation, &server.url(), stale).await;
+        let source = server.url();
+        let manifest = fetch_version_manifest_cached_with(
+            &operation,
+            std::future::pending(),
+            false,
+            fetch_manifest_live_body_from_url(&source),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(manifest.latest.release, "1.21.9");
         assert_eq!(

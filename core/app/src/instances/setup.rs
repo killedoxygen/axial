@@ -52,6 +52,10 @@ pub struct SetupService {
     loader_catalog_fixture: Option<readiness_tests::LoaderCatalogFixture>,
     #[cfg(test)]
     loader_build_url: Option<url::Url>,
+    #[cfg(test)]
+    loader_game_url: Option<url::Url>,
+    #[cfg(test)]
+    loader_manifest_url: Option<url::Url>,
 }
 
 type QueuedSetup = (Instance, InstallQueueStateResponse, CreateResultView);
@@ -203,6 +207,10 @@ impl SetupService {
             loader_catalog_fixture: None,
             #[cfg(test)]
             loader_build_url: None,
+            #[cfg(test)]
+            loader_game_url: None,
+            #[cfg(test)]
+            loader_manifest_url: None,
         }
     }
 
@@ -945,6 +953,7 @@ impl SetupService {
         &self,
         library: &axial_minecraft::managed_path::ManagedLibraryOperation,
         component: LoaderComponentId,
+        cancel: &CancellationToken,
     ) -> Result<
         (
             Vec<axial_minecraft::LoaderGameVersion>,
@@ -953,10 +962,21 @@ impl SetupService {
         loaders::LoaderError,
     > {
         #[cfg(test)]
+        if let Some(url) = &self.loader_game_url {
+            assert_eq!(component, LoaderComponentId::Fabric);
+            return loaders::fetch_fabric_game_versions_for_test(
+                library,
+                url,
+                self.loader_manifest_url.as_ref(),
+                cancel.cancelled(),
+            )
+            .await;
+        }
+        #[cfg(test)]
         if let Some(fixture) = &self.loader_catalog_fixture {
             return Ok((fixture.versions.clone(), fixture.state.clone()));
         }
-        loaders::fetch_supported_versions(library, component).await
+        loaders::fetch_supported_versions_cancellable(library, component, cancel.cancelled()).await
     }
 
     pub async fn enrich(&self, instance: Instance, versions: &[VersionEntry]) -> EnrichedInstance {
@@ -1180,12 +1200,16 @@ impl SetupService {
             Vec::new()
         } else if let Some(component) = component {
             let (mut versions, state) = self
-                .loader_version_catalog(&library, component)
+                .loader_version_catalog(&library, component, &cancel)
                 .await
-                .map_err(|_| InstanceError::VersionUnavailable)?;
-            self.catalog
+                .map_err(loader_catalog_error)?;
+            let metadata = self
+                .catalog
                 .enrich_loader_versions(&library, &mut versions, &cancel)
                 .await;
+            if metadata.failure == Some(crate::catalog::CatalogFailure::Cancelled) {
+                return Err(InstanceError::Cancelled);
+            }
             let fresh = state.availability.fresh && !state.availability.stale;
             if !fresh {
                 notices.push(CreateNotice::catalog_unavailable());

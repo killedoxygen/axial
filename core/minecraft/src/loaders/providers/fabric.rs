@@ -84,8 +84,20 @@ impl From<FabricMainClassSource> for FabricMainClass {
 pub async fn fetch_game_versions()
 -> Result<Vec<LoaderGameVersion>, crate::loaders::types::LoaderError> {
     let raw = fetch_json::<Vec<FabricGameEntry>>(&format!("{FABRIC_META_BASE}/game")).await?;
-    Ok(raw
-        .into_iter()
+    Ok(game_versions_from_entries(raw))
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) async fn fetch_game_versions_from_loopback_for_test(
+    url: &reqwest::Url,
+) -> Result<Vec<LoaderGameVersion>, crate::loaders::types::LoaderError> {
+    let raw = crate::loaders::http::fetch_json_from_loopback_for_test::<Vec<FabricGameEntry>>(url)
+        .await?;
+    Ok(game_versions_from_entries(raw))
+}
+
+fn game_versions_from_entries(raw: Vec<FabricGameEntry>) -> Vec<LoaderGameVersion> {
+    raw.into_iter()
         .map(|entry| LoaderGameVersion {
             subject_kind: VersionSubjectKind::MinecraftVersion,
             id: entry.version,
@@ -94,7 +106,7 @@ pub async fn fetch_game_versions()
             lifecycle: LifecycleMeta::default(),
             stable_hint: Some(entry.stable),
         })
-        .collect())
+        .collect()
 }
 
 pub(crate) async fn fetch_profile_install_proof(

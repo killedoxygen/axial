@@ -1279,6 +1279,419 @@ async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
 }
 
 #[tokio::test]
+async fn dropped_loader_versions_caller_keeps_owned_fetch_until_shutdown() {
+    use axial_minecraft::loaders::types::CachedCatalog;
+    use futures_util::FutureExt;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    for (hold_manifest, cancel_fetch) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
+        let library = service.instances.directories().library().clone();
+        let owner = service.instances.tasks.clone();
+        let manifest =
+            crate::catalog::tests::manifest(&[("25w01a", "snapshot"), ("1.21.4", "release")]);
+        let cache = root
+            .path()
+            .join("cache/loaders/catalog/component-fabric-supported-versions.json");
+        let manifest_cache = root.path().join("cache/version_manifest_v2.json");
+        let missing_cache = if hold_manifest {
+            &manifest_cache
+        } else {
+            &cache
+        };
+        let raw: Vec<axial_minecraft::LoaderGameVersion> =
+            serde_json::from_value(serde_json::json!([
+                {"id":"1.21.4","stable_hint":true}, {"id":"25w01a","stable_hint":false}
+            ]))
+            .unwrap();
+        let canary = root.path().join("unrelated-user-file.txt");
+        let absent = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
+        let queue_before = service.installs.snapshot();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        service.loader_game_url = Some(
+            format!("http://{}/v2/versions/game", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+        );
+        let (request_line, body): (&[u8], Vec<u8>) = if hold_manifest {
+            service.loader_manifest_url = Some(
+                format!("http://{}/manifest.json", listener.local_addr().unwrap())
+                    .parse()
+                    .unwrap(),
+            );
+            (b"GET /manifest.json HTTP/1.1\r\n", manifest.clone())
+        } else {
+            (
+                b"GET /v2/versions/game HTTP/1.1\r\n",
+                br#"[{"version":"1.21.4","stable":true},{"version":"25w01a","stable":false}]"#
+                    .to_vec(),
+            )
+        };
+        let (requested, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "supported-version request was not received"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("supported-version accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            let mut length = 0;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !request[..length]
+                .windows(4)
+                .any(|bytes| bytes == b"\r\n\r\n")
+            {
+                stream
+                    .set_read_timeout(Some(
+                        deadline.checked_duration_since(Instant::now()).unwrap(),
+                    ))
+                    .unwrap();
+                assert!(
+                    length < request.len(),
+                    "supported-version request exceeds its bound"
+                );
+                let read = stream.read(&mut request[length..]).unwrap();
+                assert!(read > 0, "supported-version request ended before headers");
+                length += read;
+            }
+            assert!(request[..length].starts_with(request_line));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            requested
+                .send(())
+                .expect("supported-version observer dropped");
+            released
+                .recv_timeout(Duration::from_secs(8))
+                .expect("supported-version body was not released");
+            match stream.write_all(&body) {
+                Ok(()) => true,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => panic!("supported-version body write failed: {error}"),
+            }
+        });
+        let service = Arc::new(service);
+        let mut caller = None;
+        let mut release = Some(release);
+        let mut view = None;
+        let mut held_shutdown = None;
+        let mut provider_cache_before = None;
+        let begun_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let journey = std::panic::AssertUnwindSafe(async {
+            let pin = library.admit().unwrap();
+            let operation = pin.managed_library().unwrap();
+            operation.prepare_layout().unwrap();
+            if hold_manifest {
+                loaders::persist_loader_supported_versions_cache_fixture_for_test(
+                    &operation,
+                    LoaderComponentId::Fabric,
+                    &raw,
+                    begun_at_ms,
+                )
+                .unwrap();
+                provider_cache_before = Some(std::fs::read(&cache).unwrap());
+            } else {
+                axial_minecraft::manifest::persist_version_manifest_cache_fixture_for_test(
+                    &operation, &manifest,
+                )
+                .unwrap();
+                assert_eq!(
+                    axial_minecraft::manifest::read_cached_manifest_bytes(&operation).unwrap(),
+                    (manifest.clone(), true)
+                );
+            }
+            drop(operation);
+            drop(pin);
+            std::fs::write(&canary, b"preserve supported-version canary\n").unwrap();
+            assert!(
+                absent(missing_cache) && service.instances.registry().list().unwrap().is_empty()
+            );
+            assert!(service.instances.pending().unwrap().is_empty());
+            caller = Some(tokio::spawn({
+                let service = service.clone();
+                async move {
+                    service
+                        .create_view(Some(LoaderComponentId::Fabric.as_str()))
+                        .await
+                }
+            }));
+            let observed = tokio::time::timeout(Duration::from_secs(5), observed).await;
+            if !matches!(observed, Ok(Ok(()))) && caller.as_ref().unwrap().is_finished() {
+                let result = tokio::time::timeout(Duration::from_secs(1), caller.as_mut().unwrap())
+                    .await
+                    .map(|joined| joined.map(|result| result.map(|_| ())));
+                if result.is_ok() {
+                    drop(caller.take());
+                }
+                panic!("create view finished before supported-version request: {result:?}");
+            }
+            observed
+                .expect("supported-version request was not observed")
+                .expect("supported-version observer closed");
+            let accepted = owner.status();
+            assert!(!caller.as_ref().unwrap().is_finished() && !server.is_finished());
+            assert_eq!(accepted.running.len(), 1);
+            assert!(!accepted.closing && accepted.unsettled.is_empty());
+            if cancel_fetch {
+                caller.as_ref().unwrap().abort();
+                let joined = tokio::time::timeout(Duration::from_secs(1), caller.as_mut().unwrap())
+                    .await
+                    .expect("disposable caller did not join");
+                drop(caller.take());
+                let after_drop = owner.status();
+                let shutdown = owner.shutdown(Duration::from_secs(2)).await;
+                let receipt = owner.shutdown_receipt();
+                held_shutdown = Some((
+                    joined.is_err_and(|error| error.is_cancelled()),
+                    after_drop == accepted,
+                    shutdown.is_ok(),
+                    receipt
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.belongs_to(&owner)),
+                    !server.is_finished(),
+                    absent(missing_cache),
+                ));
+            } else {
+                release.take().unwrap().send(()).unwrap();
+                let joined = tokio::time::timeout(Duration::from_secs(5), caller.as_mut().unwrap())
+                    .await
+                    .expect("create view did not settle");
+                drop(caller.take());
+                view = Some(serde_json::to_value(joined.unwrap().unwrap()).unwrap());
+            }
+            assert_eq!(service.installs.snapshot(), queue_before);
+        })
+        .catch_unwind()
+        .await;
+        let released = release.take().map(|release| release.send(()));
+        service.installs.close_admission();
+        let shutdown = std::panic::AssertUnwindSafe(owner.shutdown(Duration::from_secs(15)))
+            .catch_unwind()
+            .await;
+        let caller_joined = match caller.take() {
+            Some(mut caller) => {
+                caller.abort();
+                tokio::time::timeout(Duration::from_secs(1), &mut caller)
+                    .await
+                    .is_ok_and(|joined| match joined {
+                        Ok(_) => true,
+                        Err(error) => error.is_cancelled(),
+                    })
+            }
+            None => true,
+        };
+        let observers =
+            tokio::time::timeout(Duration::from_secs(5), service.installs.join_observers()).await;
+        let server = tokio::time::timeout(
+            Duration::from_secs(18),
+            tokio::task::spawn_blocking(move || server.join()),
+        )
+        .await;
+        let final_state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let pin = library.admit().unwrap();
+            let operation = pin.managed_library().unwrap();
+            (
+                service.instances.registry().list().unwrap(),
+                service.instances.pending().unwrap(),
+                service.installs.snapshot(),
+                axial_minecraft::manifest::read_cached_manifest_bytes(&operation),
+            )
+        }));
+        let receipt = owner.shutdown_receipt();
+        let receipted = receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.belongs_to(&owner));
+        let idle = owner.status().is_idle();
+        let unsettled = service.installs.has_unsettled_effects();
+        let runtime_settled = service.installs.runtime_cache().settle();
+        drop(receipt);
+        drop(service);
+        drop(owner);
+        let pins = library.wait_for_pins(Duration::from_secs(2)).await;
+        let preserved = if matches!(&shutdown, Ok(Ok(())))
+            && matches!(&observers, Ok(Ok(())))
+            && matches!(&server, Ok(Ok(Ok(_))))
+            && receipted
+            && idle
+            && !unsettled
+            && runtime_settled.is_ok()
+            && pins.is_ok()
+        {
+            Some(library.try_preserve())
+        } else {
+            None
+        };
+        let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(
+                matches!(shutdown, Ok(Ok(()))) && caller_joined,
+                "supported-version owner/caller did not join"
+            );
+            assert!(
+                matches!(observers, Ok(Ok(()))),
+                "queue observers did not join"
+            );
+            assert!(
+                matches!(server, Ok(Ok(Ok(_)))),
+                "supported-version server did not join"
+            );
+            assert!(
+                released.is_none_or(|result| result.is_ok()),
+                "body gate ended before cleanup"
+            );
+            assert!(receipted && idle && !unsettled && runtime_settled.is_ok() && pins.is_ok());
+            assert!(
+                matches!(preserved, Some(Ok(()))),
+                "supported-version root did not preserve"
+            );
+            let (records, pending, queue, cached_manifest) = final_state.unwrap();
+            assert!(records.is_empty() && pending.is_empty());
+            assert!(
+                queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none()
+            );
+            assert_eq!(queue.registry_revision, queue_before.registry_revision);
+            if let Some(provider_cache_before) = provider_cache_before {
+                assert_eq!(std::fs::read(&cache).unwrap(), provider_cache_before);
+            } else {
+                assert_eq!(cached_manifest.as_ref().unwrap(), &(manifest.clone(), true));
+                assert_eq!(std::fs::read(&manifest_cache).unwrap(), manifest);
+            }
+            assert_eq!(
+                std::fs::read(&canary).unwrap(),
+                b"preserve supported-version canary\n"
+            );
+            assert!(absent(&root.path().join("instances")));
+            assert!(
+                std::fs::read_dir(root.path().join("versions"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            if let Err(panic) = journey {
+                std::panic::resume_unwind(panic);
+            }
+            if let Some((
+                caller_cancelled,
+                retained,
+                shutdown,
+                receipted,
+                body_held,
+                cache_absent,
+            )) = held_shutdown
+            {
+                assert!(
+                    caller_cancelled && retained,
+                    "dropping the caller revoked accepted work"
+                );
+                assert!(body_held, "supported-version body escaped its gate");
+                assert!(
+                    shutdown && receipted,
+                    "create catalog did not settle on owner cancellation while its body remained withheld (hold_manifest={hold_manifest})"
+                );
+                assert!(
+                    cache_absent && absent(missing_cache),
+                    "cancelled create catalog fetch published a cache (hold_manifest={hold_manifest})"
+                );
+            } else {
+                assert!(
+                    matches!(server, Ok(Ok(Ok(true)))),
+                    "positive body was not delivered"
+                );
+                let view = view.unwrap();
+                assert_eq!(view["defaults"]["source_id"], "net.fabricmc.fabric-loader");
+                assert_eq!(view["notices"], serde_json::json!([]));
+                assert_eq!(
+                    view["versions"],
+                    serde_json::json!([
+                        {"source_id":"net.fabricmc.fabric-loader", "selection_id":"loader_auto|net.fabricmc.fabric-loader|25w01a", "minecraft_version_id":"25w01a", "display_name":"25w01a", "hint":"~ 1.21.4", "channel":"preview", "download_state":"none", "create_enabled":true, "disabled_reason":null},
+                        {"source_id":"net.fabricmc.fabric-loader", "selection_id":"loader_auto|net.fabricmc.fabric-loader|1.21.4", "minecraft_version_id":"1.21.4", "display_name":"1.21.4", "hint":null, "channel":"stable", "download_state":"none", "create_enabled":true, "disabled_reason":null}
+                    ])
+                );
+                assert_eq!(
+                    view["channels"],
+                    serde_json::json!([
+                        {"id":"stable","label":"Stable","enabled":true}, {"id":"preview","label":"Preview","enabled":true},
+                        {"id":"experimental","label":"Experimental","enabled":true}, {"id":"legacy","label":"Legacy","enabled":true},
+                        {"id":"unknown","label":"Other","enabled":true}
+                    ])
+                );
+                let mut bytes = Vec::new();
+                std::fs::File::open(&cache)
+                    .unwrap()
+                    .take(16 * 1024 + 1)
+                    .read_to_end(&mut bytes)
+                    .unwrap();
+                assert!(bytes.len() <= 16 * 1024);
+                let cached: CachedCatalog<Vec<axial_minecraft::LoaderGameVersion>> =
+                    serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    cached.schema_version,
+                    loaders::LOADER_CATALOG_SCHEMA_VERSION
+                );
+                let finished_at_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                assert!((begun_at_ms..=finished_at_ms).contains(&cached.fetched_at_ms));
+                assert_eq!(
+                    cached.value, raw,
+                    "offline provider list must remain raw rather than cache manifest enrichment"
+                );
+            }
+            if hold_manifest {
+                if cancel_fetch {
+                    assert!(cached_manifest.is_err() && absent(&manifest_cache));
+                } else {
+                    assert_eq!(cached_manifest.unwrap(), (manifest.clone(), true));
+                    assert_eq!(std::fs::read(&manifest_cache).unwrap(), manifest);
+                }
+            }
+        }));
+        if let Err(panic) = verification {
+            eprintln!(
+                "Retained create catalog cancellation fixture (hold_manifest={hold_manifest}, cancel_fetch={cancel_fetch}): {}",
+                root.keep().display()
+            );
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
 async fn resolution_retains_its_generation_across_managed_reselection() {
     use crate::library::{AdmissionState, LibraryId, LibraryMode};
     use futures_util::FutureExt;
