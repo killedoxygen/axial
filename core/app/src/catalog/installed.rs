@@ -1,10 +1,58 @@
 use super::{CatalogError, CatalogSnapshot};
+use crate::library::GenerationPin;
 use axial_minecraft::managed_path::ManagedLibraryOperation;
 use axial_minecraft::{
-    VersionEntry, VersionScanReport, VersionScanState, compare_version_entries,
-    enrich_version_entries, scan_versions_snapshot,
+    VersionEntry, VersionScanReport, VersionScanSnapshot, VersionScanState,
+    compare_version_entries, enrich_version_entries, scan_versions_snapshot,
 };
 use serde::{Deserialize, Serialize};
+
+pub(crate) struct InstalledSnapshot {
+    pin: GenerationPin,
+    snapshot: VersionScanSnapshot,
+}
+
+impl InstalledSnapshot {
+    pub(crate) fn is_degraded(&self) -> bool {
+        self.snapshot.report.state == VersionScanState::Degraded
+    }
+
+    pub(crate) fn generation_matches(&self, pin: &GenerationPin) -> bool {
+        self.pin.generation() == pin.generation() && self.pin.library_id() == pin.library_id()
+    }
+
+    pub(crate) fn revalidate_for(&self, pin: &GenerationPin) -> Result<(), CatalogError> {
+        if !self.generation_matches(pin) {
+            return Err(CatalogError::InstalledUnavailable);
+        }
+        self.pin
+            .revalidate()
+            .map_err(|_| CatalogError::InstalledUnavailable)?;
+        pin.revalidate()
+            .map_err(|_| CatalogError::InstalledUnavailable)?;
+        if !self.snapshot.dependencies().is_revalidated() {
+            return Err(CatalogError::InstalledUnavailable);
+        }
+        self.pin
+            .revalidate()
+            .map_err(|_| CatalogError::InstalledUnavailable)?;
+        pin.revalidate()
+            .map_err(|_| CatalogError::InstalledUnavailable)
+    }
+}
+
+pub(crate) async fn installed_snapshot(
+    pin: &GenerationPin,
+) -> Result<InstalledSnapshot, CatalogError> {
+    let pin = pin.clone();
+    let operation = pin
+        .managed_library()
+        .map_err(|_| CatalogError::InstalledUnavailable)?;
+    let snapshot = scan_installed(&operation).await?;
+    pin.revalidate()
+        .map_err(|_| CatalogError::InstalledUnavailable)?;
+    Ok(InstalledSnapshot { pin, snapshot })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VersionScanViewModel {
@@ -27,18 +75,24 @@ pub async fn installed_versions(
     operation: &ManagedLibraryOperation,
     catalog: Option<&CatalogSnapshot>,
 ) -> Result<VersionsResponse, CatalogError> {
+    let snapshot = scan_installed(operation).await?;
+    Ok(project_installed(snapshot.report, catalog))
+}
+
+async fn scan_installed(
+    operation: &ManagedLibraryOperation,
+) -> Result<VersionScanSnapshot, CatalogError> {
     let operation = operation.clone();
-    let report = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let snapshot =
             scan_versions_snapshot(&operation).map_err(|_| CatalogError::InstalledUnavailable)?;
         if !snapshot.dependencies().is_revalidated() {
             return Err(CatalogError::InstalledUnavailable);
         }
-        Ok(snapshot.report)
+        Ok(snapshot)
     })
     .await
-    .map_err(|_| CatalogError::InstalledUnavailable)??;
-    Ok(project_installed(report, catalog))
+    .map_err(|_| CatalogError::InstalledUnavailable)?
 }
 
 pub(crate) fn project_installed(

@@ -1496,6 +1496,148 @@ async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
+async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
+    use futures_util::FutureExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, service, accounts) = fixture();
+    let service = Arc::new(service);
+    let mut waiter = None;
+    let journey = std::panic::AssertUnwindSafe(async {
+        crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+        accounts.create_offline_account("GroupedPlayer").unwrap();
+        let java = root.path().join("java");
+        std::fs::write(&java, format!(
+            "#!/bin/sh\nprobe_dir=${{0%/*}}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nif [ -s \"$probe_dir/probe-first\" ]; then\n  while [ ! -s \"$probe_dir/probe-release\" ]; do sleep 0.01; done\nelse\n  printf 'first' > \"$probe_dir/probe-first\"\nfi\nprintf 'java.version = 21.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
+            std::env::consts::ARCH,
+        )).unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(root.path().join("probe-first"), b"").unwrap();
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        service.settings.update(serde_json::from_value(serde_json::json!({
+            "expected_revision":service.settings.current().unwrap().revision,
+            "java_path_override":java.to_str().unwrap(),
+        })).unwrap()).unwrap();
+        let first = super::super::create::tests::create(&service.instances, "First healthy").await;
+        let last = super::super::create::tests::create(&service.instances, "Last healthy").await;
+        let input = vec![first.clone(), last];
+        let versions = service.installed().await.unwrap();
+        let healthy = service.enrich_all(input.clone(), &versions).await;
+        let protected: Vec<_> = ["json", "jar"].into_iter().map(|extension| {
+            let path = root.path().join(format!("versions/1.21.4/1.21.4.{extension}"));
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        }).collect();
+        let versions_root = root.path().join("versions");
+        let revision_before = std::fs::metadata(&versions_root).unwrap().modified().unwrap();
+        std::fs::write(root.path().join("probes"), b"").unwrap();
+        std::fs::write(root.path().join("probe-first"), b"").unwrap();
+        std::fs::write(root.path().join("probe-release"), b"").unwrap();
+        waiter = Some(tokio::spawn({
+            let service = service.clone();
+            let input = input.clone();
+            let versions = versions.clone();
+            async move { service.enrich_all(input, &versions).await }
+        }));
+        // The first row has completed before the second actual Java probe pauses.
+        let paused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while std::fs::read_to_string(root.path().join("probes")).unwrap().lines().count() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await;
+        let still_pending = !waiter.as_ref().unwrap().is_finished();
+        let probe_count = std::fs::read_to_string(root.path().join("probes")).unwrap().lines().count();
+        let external = versions_root.join("external-degraded-entry");
+        let absent_before = std::fs::symlink_metadata(&external)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        std::fs::create_dir(&external).unwrap();
+        let metadata = external.join("external-degraded-entry.json");
+        let malformed = b"{not valid external version metadata\n";
+        std::fs::write(&metadata, malformed).unwrap();
+        let revision_after = std::fs::metadata(&versions_root).unwrap().modified().unwrap();
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        let rows = waiter.take().unwrap().await.unwrap();
+        let degraded = serde_json::to_value(service.launch.preflight(first.id.clone()).await).unwrap();
+        let preserved = std::fs::read(&metadata).unwrap();
+        std::fs::remove_file(&metadata).unwrap();
+        std::fs::remove_dir(&external).unwrap();
+        let versions = service.installed().await.unwrap();
+        let restored = service.enrich_all(input.clone(), &versions).await;
+        move || {
+            assert!(paused.is_ok() && still_pending, "second probe did not remain pending");
+            assert_eq!(probe_count, 2);
+            assert!(absent_before);
+            assert_ne!(revision_after, revision_before, "directory revision did not advance");
+            assert_eq!(preserved, malformed);
+            assert!(std::fs::symlink_metadata(external)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
+            for (path, bytes) in protected {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+            for ready in [&healthy, &restored] {
+                assert_eq!(ready.len(), input.len());
+                for (row, instance) in ready.iter().zip(&input) {
+                    assert_eq!(row.instance.id, instance.id);
+                    assert!(row.launchable, "{}", row.status_detail);
+                    assert!(row.launch_action.launchable);
+                    assert_eq!(row.launch_action.primary_action, "launch");
+                    assert!(row.needs_install.is_empty());
+                }
+            }
+            assert_eq!(degraded["status"], "ready", "{degraded}");
+            assert_eq!(degraded["launchable"], false);
+            assert_eq!(degraded["readiness"], serde_json::json!({
+                "launchable":false,"reasons":[{
+                    "id":"installed_versions_degraded","severity":"blocking",
+                    "message":"Could not verify installed versions. Check the library folder and try again."
+                }]
+            }));
+            assert_eq!(rows.len(), input.len());
+            for (row, instance) in rows.iter().zip(&input) {
+                assert_eq!(row.instance.id, instance.id);
+                assert!(!row.launchable, "{} retained stale Launch", instance.name);
+                assert!(!row.launch_action.launchable);
+                assert_eq!(row.launch_action.primary_action, "blocked");
+                assert!(row.needs_install.is_empty());
+            }
+        }
+    }).catch_unwind().await;
+    let released = std::fs::write(root.path().join("probe-release"), b"release");
+    let remaining = match waiter.take() {
+        Some(waiter) => Some(waiter.await),
+        None => None,
+    };
+    let shutdown = std::panic::AssertUnwindSafe(
+        service
+            .instances
+            .tasks
+            .shutdown(std::time::Duration::from_secs(5)),
+    )
+    .catch_unwind()
+    .await;
+    let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(released.is_ok());
+        if let Some(result) = remaining {
+            assert!(result.is_ok(), "enrichment waiter did not join");
+        }
+        match shutdown {
+            Ok(result) => assert!(result.is_ok(), "{result:?}"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+        assert!(service.instances.tasks.status().is_idle());
+        match journey {
+            Ok(verify) => verify(),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }));
+    if let Err(panic) = verification {
+        eprintln!("Retained grouped scan fixture: {}", root.keep().display());
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn create_view_download_indicators_use_settled_install_and_scanner_status() {
     let (root, mut service, _) = fixture();
     service.loader_catalog_fixture = Some(stale_loader_catalog());

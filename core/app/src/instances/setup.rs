@@ -937,10 +937,25 @@ impl SetupService {
                 .launch
                 .preflight_with_projection(instance.id.clone(), &mut projection)
                 .await;
-            enriched.push((index, self.enrich_preflight(instance, versions, preflight)));
+            enriched.push((index, instance, preflight));
         }
-        enriched.sort_unstable_by_key(|(index, _)| *index);
-        enriched.into_iter().map(|(_, instance)| instance).collect()
+        let scan = self.launch.finish_preflight_projection(&projection).await;
+        enriched.sort_unstable_by_key(|(index, _, _)| *index);
+        enriched.into_iter().map(|(_, instance, preflight)| {
+            let current = scan.clone().and_then(|_| self.launch
+                .validate_projection_target(&projection, &instance));
+            let preflight = match &current {
+                Ok(()) => preflight,
+                Err(error) if preflight.launchable || preflight.diagnostics.is_some()
+                    || preflight.error.as_ref().is_some_and(|error|
+                        error.code == crate::launch::coordinator::LaunchError::InstallUnavailable) =>
+                    crate::launch::coordinator::LaunchPreflight::refused(
+                    instance.id.clone(), error.clone(),
+                ),
+                Err(_) => preflight,
+            };
+            self.enrich_preflight(instance, versions, preflight)
+        }).collect()
     }
 
     fn enrich_preflight(

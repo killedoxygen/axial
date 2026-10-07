@@ -6,6 +6,7 @@
 mod installed;
 mod model;
 
+pub(crate) use installed::{InstalledSnapshot, installed_snapshot};
 pub use installed::{VersionScanViewModel, VersionsResponse, installed_versions};
 pub use model::{
     CatalogError, CatalogFailure, CatalogSnapshot, CatalogState, CatalogStateId, VersionDescriptor,

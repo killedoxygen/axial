@@ -2970,6 +2970,244 @@ async fn preflight_reports_publication_contention_without_waiting_or_launching()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preflight_reports_unrelated_degraded_versions_without_repairing() {
+    use futures_util::FutureExt;
+
+    let temporary =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let profile = temporary.path().join("profile");
+    let provider = Provider::start(false).await;
+    let services = start_profile_with_test_endpoints(profile, provider.endpoints())
+        .await
+        .unwrap();
+    let api = Api::new(&services);
+    let journey = std::panic::AssertUnwindSafe(async {
+        api.post(
+            "/api/v1/accounts/offline",
+            json!({"username":PLAYER,"expected_selection_revision":0}),
+        )
+        .await;
+        api.request(
+            reqwest::Method::PUT,
+            "/api/v1/config",
+            Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
+        )
+        .await;
+        let install = api
+            .post(
+                "/api/v1/install/queue",
+                json!({"kind":"vanilla","version_id":VERSION}),
+            )
+            .await;
+        assert_eq!(
+            install_terminal(&api, &install).await["outcome"],
+            "succeeded"
+        );
+        let created = api
+            .post(
+                "/api/v1/instances",
+                json!({"name":"Degraded scan preflight","selection_id":format!("vanilla|{VERSION}")}),
+            )
+            .await;
+        let instance = created["id"].as_str().unwrap().to_owned();
+        let detail_path = format!("/api/v1/instances/{instance}");
+        let preflight_path = format!("/api/v1/launch/preflight/{instance}");
+        assert_eq!(api.get(&preflight_path).await["launchable"], true);
+        assert_eq!(
+            api.get(&detail_path).await["launch_action"]["primary_action"],
+            "launch"
+        );
+        assert_installed(&api, true).await;
+        let root = services.library.admit().unwrap().read_projection().unwrap();
+        let client = root.join(format!("versions/{VERSION}/{VERSION}.jar"));
+        let original_client = std::fs::read(&client).unwrap();
+        assert_eq!(
+            original_client,
+            provider.state.routes["GET /artifacts/client.jar"]
+        );
+        let classifier = if cfg!(target_os = "macos") {
+            "natives-macos"
+        } else {
+            "natives-linux"
+        };
+        let asset_hash = sha1(ASSET);
+        let protected: Vec<_> = [
+            format!("versions/{VERSION}/{VERSION}.json"),
+            format!("versions/{VERSION}/{VERSION}.jar"),
+            "libraries/org/axial/fixture/1.0/fixture-1.0.jar".to_owned(),
+            format!("libraries/org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-{classifier}.jar"),
+            "assets/log_configs/fixture-log.xml".to_owned(),
+            "assets/indexes/fixture-assets.json".to_owned(),
+            format!("assets/objects/{}/{asset_hash}", &asset_hash[..2]),
+        ]
+        .into_iter()
+        .map(|relative| {
+            let path = root.join(relative);
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+        let queue_before = api.get("/api/v1/install/queue").await;
+        let requests_before = provider.state.requests.lock().unwrap().clone();
+        let read_projection = |path: &str| {
+            let request = api.client.get(format!("{}{path}", api.base))
+                .header(transport::CAPABILITY_HEADER, &api.capability);
+            async move {
+                let response = request.send().await.unwrap();
+                (response.status(), response.json::<Value>().await.unwrap())
+            }
+        };
+        // This is an external library entry, not another accepted installation.
+        let unrelated = root.join("versions/external-degraded-entry");
+        assert!(std::fs::symlink_metadata(&unrelated)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
+        std::fs::create_dir(&unrelated).unwrap();
+        let metadata = unrelated.join("external-degraded-entry.json");
+        let malformed = b"{not valid version metadata\n";
+        std::fs::write(&metadata, malformed).unwrap();
+        let degraded_versions = read_projection("/api/v1/versions").await;
+        let degraded = read_projection(&preflight_path).await;
+        let degraded_detail = read_projection(&detail_path).await;
+        let degraded_list = read_projection("/api/v1/instances").await;
+        let intact: Vec<_> = protected.iter()
+            .map(|(path, _)| std::fs::read(path).unwrap()).collect();
+        let malformed_after = std::fs::read(&metadata).unwrap();
+
+        std::fs::remove_file(&client).unwrap();
+        let missing_before = std::fs::symlink_metadata(&client)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let combined_versions = read_projection("/api/v1/versions").await;
+        let combined = read_projection(&preflight_path).await;
+        let combined_detail = read_projection(&detail_path).await;
+        let combined_list = read_projection("/api/v1/instances").await;
+        let missing_after = std::fs::symlink_metadata(&client)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let malformed_combined = std::fs::read(&metadata).unwrap();
+        std::fs::write(&client, &original_client).unwrap();
+        std::fs::remove_file(&metadata).unwrap();
+        std::fs::remove_dir(&unrelated).unwrap();
+        let unrelated_absent = std::fs::symlink_metadata(&unrelated)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let restored_versions = read_projection("/api/v1/versions").await;
+        let restored = read_projection(&preflight_path).await;
+        let restored_detail = read_projection(&detail_path).await;
+        let restored_list = read_projection("/api/v1/instances").await;
+        let restored_bytes: Vec<_> = protected.iter()
+            .map(|(path, _)| std::fs::read(path).unwrap()).collect();
+        let requests_after = provider.state.requests.lock().unwrap().clone();
+        let queue_after = api.get("/api/v1/install/queue").await;
+        let sessions = api.get("/api/v1/launch/sessions").await;
+        let reports = api.get("/api/v1/launch/reports").await;
+        move || {
+            assert_eq!(requests_after, requests_before);
+            assert_eq!(queue_after, queue_before);
+            assert_eq!(sessions, json!({"sessions":[]}));
+            assert_eq!(reports, json!({"reports":[]}));
+            for (((_, before), intact), restored) in
+                protected.into_iter().zip(intact).zip(restored_bytes)
+            {
+                assert_eq!(intact, before);
+                assert_eq!(restored, before);
+            }
+            assert_eq!(malformed_after, malformed);
+            assert_eq!(malformed_combined, malformed);
+            assert!(missing_before && missing_after, "preflight must not repair the client");
+            assert!(unrelated_absent);
+            for (status, versions) in [&degraded_versions, &combined_versions] {
+                assert_eq!(*status, StatusCode::OK, "{versions}");
+                assert_eq!(versions["scan_state"]["degraded"], true, "{versions}");
+            }
+            let installed = degraded_versions.1["versions"].as_array().unwrap().iter()
+                .find(|version| version["id"] == VERSION).unwrap();
+            assert_eq!(installed["installed"], true);
+            assert_eq!(installed["launchable"], true, "{installed}");
+            for (status, response) in [&restored_versions, &restored, &restored_detail, &restored_list] {
+                assert_eq!(*status, StatusCode::OK, "{response}");
+            }
+            assert_eq!(restored_versions.1["scan_state"]["degraded"], false);
+            assert_eq!(restored.1["launchable"], true, "{restored:?}");
+            assert_eq!(restored.1["readiness"], json!({"launchable":true,"reasons":[]}));
+            assert_eq!(restored_list.1["instances"].as_array().unwrap().len(), 1);
+            for detail in [&restored_detail.1, &restored_list.1["instances"][0]] {
+                assert_eq!(detail["id"], instance);
+                assert_eq!(detail["launch_action"]["launchable"], true);
+                assert_eq!(detail["launch_action"]["primary_action"], "launch");
+            }
+            let degraded_reason = json!({
+                "id":"installed_versions_degraded","severity":"blocking",
+                "message":"Could not verify installed versions. Check the library folder and try again."
+            });
+            for ((status, response), expected) in [
+                (degraded, json!([degraded_reason.clone()])),
+                (combined, json!([
+                    {"id":"client_jar_missing","severity":"blocking",
+                     "message":"Client game files are missing. Install this version before launching."},
+                    degraded_reason
+                ])),
+            ] {
+                assert_eq!(status, StatusCode::OK, "{response}");
+                assert_eq!(response["instance_id"], instance);
+                assert_eq!(response["status"], "ready", "{response}");
+                assert_eq!(response["launchable"], false, "{response}");
+                assert_eq!(response["error"]["code"], "installed_versions_degraded");
+                assert_eq!(response["error"]["error"],
+                    "Could not verify installed versions. Check the library folder and try again.");
+                let mut reasons = response["readiness"]["reasons"].clone();
+                reasons.as_array_mut().unwrap().sort_by(|left, right| {
+                    left["id"].as_str().cmp(&right["id"].as_str())
+                });
+                assert_eq!(response["readiness"]["launchable"], false);
+                assert_eq!(reasons, expected);
+            }
+            for ((detail_status, detail), (list_status, list)) in
+                [(degraded_detail, degraded_list), (combined_detail, combined_list)]
+            {
+                assert_eq!(detail_status, StatusCode::OK, "{detail}");
+                assert_eq!(list_status, StatusCode::OK, "{list}");
+                assert_eq!(list["instances"].as_array().unwrap().len(), 1);
+                for observed in [&detail, &list["instances"][0]] {
+                    assert_eq!(observed["id"], instance);
+                    assert_eq!(observed["launch_action"]["launchable"], false);
+                    assert_eq!(observed["launch_action"]["primary_action"], "blocked");
+                    assert_eq!(observed["needs_install"], "");
+                }
+            }
+        }
+    })
+    .catch_unwind()
+    .await;
+    let shutdown = std::panic::AssertUnwindSafe(services.server.shutdown())
+        .catch_unwind()
+        .await;
+    let settled = services.server.is_shutdown_settled();
+    drop(services);
+    let provider_join = std::panic::AssertUnwindSafe(provider.shutdown())
+        .catch_unwind()
+        .await;
+    let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match shutdown {
+            Ok(result) => assert!(result.is_ok(), "{result:?}"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+        assert!(settled);
+        if let Err(panic) = provider_join {
+            std::panic::resume_unwind(panic);
+        }
+        match journey {
+            Ok(verify) => verify(),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }));
+    if let Err(panic) = verification {
+        eprintln!(
+            "Retained degraded-scan preflight fixture: {}",
+            temporary.keep().display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preflight_reports_installed_file_damage_without_launching_or_repairing() {
     use std::os::unix::fs::MetadataExt;
 
@@ -3334,6 +3572,10 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         !client.try_exists().unwrap(),
         "preflight must not repair files"
     );
+    let install_error = json!({
+        "code":"install_unavailable",
+        "error":"The installed version requires a completed installation before launch."
+    });
     let responses = [
         (
             missing_libraries,
@@ -3371,11 +3613,6 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
             "Required libraries are missing. Install this version before launching.",
         ),
         (
-            missing_metadata,
-            "version_json_missing",
-            "Installed version metadata is missing. Install this version before launching.",
-        ),
-        (
             missing,
             "client_jar_missing",
             "Client game files are missing. Install this version before launching.",
@@ -3390,9 +3627,10 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         (
             response,
             json!([{"id":reason,"severity":"blocking","message":message}]),
+            install_error.clone(),
         )
     });
-    for (response, reasons) in [(
+    for (response, reasons, error) in [(
         missing_files,
         json!([
             {
@@ -3404,19 +3642,31 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
                 "message":"Required libraries are missing. Install this version before launching."
             }
         ]),
+        install_error,
     )]
     .into_iter()
     .chain(responses)
+    .chain([(
+        missing_metadata,
+        json!([
+            {
+                "id":"installed_versions_degraded","severity":"blocking",
+                "message":"Could not verify installed versions. Check the library folder and try again."
+            },
+            {
+                "id":"version_json_missing","severity":"blocking",
+                "message":"Installed version metadata is missing. Install this version before launching."
+            }
+        ]),
+        json!({
+            "code":"installed_versions_degraded",
+            "error":"Could not verify installed versions. Check the library folder and try again."
+        }),
+    )])
     {
         assert_eq!(response["instance_id"], instance);
         assert_eq!(response["launchable"], false, "{response}");
-        assert_eq!(
-            response["error"],
-            json!({
-                "code":"install_unavailable",
-                "error":"The installed version requires a completed installation before launch."
-            })
-        );
+        assert_eq!(response["error"], error, "{response}");
         assert_eq!(response["status"], "ready", "{response}");
         let mut readiness = response["readiness"].clone();
         readiness["reasons"]

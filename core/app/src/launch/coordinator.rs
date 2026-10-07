@@ -81,6 +81,9 @@ pub struct LaunchCoordinator {
 
 pub(crate) struct PreflightProjection {
     current: Option<Arc<PreflightArtifacts>>,
+    scan: Option<Result<Arc<crate::catalog::InstalledSnapshot>, LaunchError>>,
+    finalize_scan: bool,
+    context: Result<(CapturedSelection, u64), LaunchError>,
     host: Arc<super::resources::HostResources>,
     diagnostics: bool,
     installs: InstallQueue,
@@ -89,6 +92,7 @@ pub(crate) struct PreflightProjection {
 impl Drop for PreflightProjection {
     fn drop(&mut self) {
         drop(self.current.take());
+        drop(self.scan.take());
         // Admission refusal can release proof without a task-completion wake.
         self.installs.resume_queued();
     }
@@ -111,7 +115,7 @@ pub struct LaunchPreflight {
 }
 
 impl LaunchPreflight {
-    fn refused(instance_id: InstanceId, error: LaunchError) -> Self {
+    pub(crate) fn refused(instance_id: InstanceId, error: LaunchError) -> Self {
         Self {
             instance_id,
             launchable: false,
@@ -538,12 +542,25 @@ impl LaunchCoordinator {
     pub async fn preflight(&self, id: InstanceId) -> LaunchPreflight {
         let mut projection = self.preflight_projection();
         projection.diagnostics = true;
+        projection.finalize_scan = true;
         self.preflight_with_projection(id, &mut projection).await
     }
 
     pub(crate) fn preflight_projection(&self) -> PreflightProjection {
         PreflightProjection {
             current: None,
+            scan: None,
+            finalize_scan: false,
+            context: (|| {
+                Ok((
+                    CapturedSelection::capture(&self.accounts)
+                        .map_err(|_| LaunchError::AccountUnavailable)?,
+                    self.settings
+                        .current()
+                        .map_err(|_| LaunchError::SettingsChanged)?
+                        .revision,
+                ))
+            })(),
             host: Arc::new(super::resources::capture_host()),
             diagnostics: false,
             installs: self.installs.clone(),
@@ -560,6 +577,111 @@ impl LaunchCoordinator {
             .unwrap_or_else(|error| LaunchPreflight::refused(id, error))
     }
 
+    pub(crate) async fn finish_preflight_projection(
+        &self,
+        projection: &PreflightProjection,
+    ) -> Result<(), LaunchError> {
+        let Some(scan) = projection.scan.clone() else {
+            return Ok(());
+        };
+        let scan = scan?;
+        let coordinator = self.clone();
+        self.tasks
+            .try_spawn(scan.clone(), move |_| async move {
+                coordinator.revalidate_scan(scan).await
+            })
+            .map_err(|_| LaunchError::AtCapacity)?
+            .join()
+            .await
+            .map_err(|_| LaunchError::PreparationFailed)??;
+        let (selection, revision) = projection.context.as_ref().map_err(Clone::clone)?;
+        selection
+            .validate(&self.accounts)
+            .map_err(|_| LaunchError::AccountChanged)?;
+        self.settings
+            .validate_revision(*revision)
+            .map_err(|_| LaunchError::SettingsChanged)?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_projection_target(
+        &self,
+        projection: &PreflightProjection,
+        instance: &crate::instances::model::Instance,
+    ) -> Result<(), LaunchError> {
+        let admitted = self
+            .instances
+            .admit_read(&instance.id)
+            .map_err(instance_error)?;
+        let _target = self.validate_preflight_target(&admitted)?;
+        let pin = self
+            .instances
+            .library()
+            .admit()
+            .map_err(|_| LaunchError::LibraryUnavailable)?;
+        if let Some(Ok(scan)) = &projection.scan
+            && (!scan.generation_matches(admitted.game_directory().pin())
+                || !scan.generation_matches(&pin))
+        {
+            return Err(LaunchError::LibraryUnavailable);
+        }
+        let current = self
+            .instances
+            .registry()
+            .get_live(&instance.id)
+            .map_err(instance_error)?;
+        if &current.instance != instance {
+            return Err(LaunchError::InstanceChanged);
+        }
+        Ok(())
+    }
+
+    fn validate_preflight_target(
+        &self,
+        admitted: &ReadInstance,
+    ) -> Result<ExclusionLease, LaunchError> {
+        let target = self
+            .instances
+            .exclusions()
+            .try_acquire([admitted.record().instance.id.as_str()], [])
+            .map_err(|_| LaunchError::InstanceBusy)?;
+        admitted.validate_current().map_err(instance_error)?;
+        let current = self
+            .instances
+            .registry()
+            .get_live(&admitted.record().instance.id)
+            .map_err(instance_error)?;
+        if current.instance.settings != admitted.record().instance.settings {
+            return Err(LaunchError::InstanceChanged);
+        }
+        Ok(target)
+    }
+
+    async fn revalidate_scan(
+        &self,
+        scan: Arc<crate::catalog::InstalledSnapshot>,
+    ) -> Result<(), LaunchError> {
+        let pin = self
+            .instances
+            .library()
+            .admit()
+            .map_err(|_| LaunchError::LibraryUnavailable)?;
+        let checked = scan.clone();
+        tokio::task::spawn_blocking(move || checked.revalidate_for(&pin))
+            .await
+            .map_err(|_| LaunchError::PreparationFailed)?
+            .map_err(|_| LaunchError::LibraryUnavailable)?;
+        let current = self
+            .instances
+            .library()
+            .admit()
+            .map_err(|_| LaunchError::LibraryUnavailable)?;
+        if !scan.generation_matches(&current) {
+            return Err(LaunchError::LibraryUnavailable);
+        }
+        Ok(())
+    }
+
     async fn check_preflight(
         &self,
         id: &InstanceId,
@@ -567,6 +689,12 @@ impl LaunchCoordinator {
     ) -> Result<LaunchPreflight, LaunchError> {
         let admitted = Arc::new(self.instances.admit_read(id).map_err(instance_error)?);
         let pin = admitted.game_directory().pin().clone();
+        if projection.scan.as_ref().is_some_and(|scan| {
+            scan.as_ref()
+                .is_ok_and(|scan| !scan.generation_matches(&pin))
+        }) {
+            return Err(LaunchError::LibraryUnavailable);
+        }
         if projection.current.as_ref().is_some_and(|proof| {
             proof.pin.generation() != pin.generation()
                 || proof.pin.library_id() != pin.library_id()
@@ -589,9 +717,12 @@ impl LaunchCoordinator {
             .map_err(|_| LaunchError::InstanceBusy)?;
         let retained = (admitted.clone(), artifacts.clone(), proof_slot.clone());
         let owned_proof = proof_slot.clone();
+        let scan_slot = Arc::new(Mutex::new(projection.scan.clone()));
+        let owned_scan = scan_slot.clone();
         let coordinator = self.clone();
         let host = projection.host.clone();
         let diagnostics = projection.diagnostics;
+        let finalize_scan = projection.finalize_scan;
         let task = self
             .tasks
             .try_spawn(retained, move |cancel| async move {
@@ -600,6 +731,7 @@ impl LaunchCoordinator {
                 let mut observed_damage = None;
                 let mut runtime_absence = None;
                 let mut refused_reasons = None;
+                let mut captured_context = None;
                 let mut result = async {
                     // Installation can be repaired without selecting an account.
                     // Only the guarded install proof establishes that need;
@@ -646,13 +778,21 @@ impl LaunchCoordinator {
                                 ));
                             }
                         });
+                        if owned_scan.lock().unwrap().is_none() {
+                            let scan = crate::catalog::installed_snapshot(&pin).await
+                                .map(Arc::new).map_err(|_| LaunchError::LibraryUnavailable);
+                            *owned_scan.lock().unwrap() = Some(scan);
+                        }
+                        let scan = owned_scan.lock().unwrap().clone()
+                            .ok_or(LaunchError::PreparationFailed)??;
                         #[cfg(test)]
                         coordinator
                             .fresh_install_checks
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let collect_damage = diagnostics || scan.is_degraded();
                         let installed = match coordinator
                             .installs
-                            .inspect_version(&pin, &admitted.record().instance.version_id, diagnostics)
+                            .inspect_version(&pin, &admitted.record().instance.version_id, collect_damage)
                             .await
                         {
                             Ok(VersionInspection::Ready(installed)) => installed,
@@ -681,6 +821,7 @@ impl LaunchCoordinator {
                     let version = proof.installed.version();
                     let (selection, settings, _) =
                         coordinator.capture(&admitted.record().instance, None)?;
+                    captured_context = Some((selection.clone(), settings.global_config_revision));
                     let result = async {
                         if let Some(account) = selection.account()
                             && account.kind() == AccountKind::Microsoft
@@ -829,20 +970,17 @@ impl LaunchCoordinator {
                 };
                 // Nonblocking and synchronous: preserve the busy projection
                 // and fence both successful and failed readiness observations.
-                let _target = coordinator
-                    .instances
-                    .exclusions()
-                    .try_acquire([admitted.record().instance.id.as_str()], [])
-                    .map_err(|_| LaunchError::InstanceBusy)?;
-                admitted.validate_current().map_err(instance_error)?;
-                let current = coordinator
-                    .instances
-                    .registry()
-                    .get_live(&admitted.record().instance.id)
-                    .map_err(instance_error)?;
-                if current.instance.settings != admitted.record().instance.settings {
-                    return Err(LaunchError::InstanceChanged);
+                let scan = owned_scan.lock().unwrap().clone();
+                if finalize_scan && let Some(scan) = scan {
+                    coordinator.revalidate_scan(scan?).await?;
                 }
+                if let Some((selection, revision)) = captured_context {
+                    selection.validate(&coordinator.accounts)
+                        .map_err(|_| LaunchError::AccountChanged)?;
+                    coordinator.settings.validate_revision(revision)
+                        .map_err(|_| LaunchError::SettingsChanged)?;
+                }
+                let _target = coordinator.validate_preflight_target(&admitted)?;
                 if let Some(absence) = runtime_absence {
                     absence.revalidate()
                         .map_err(|_| LaunchError::RuntimeFailure(JavaDiscoveryError::Replaced))?;
@@ -895,7 +1033,7 @@ impl LaunchCoordinator {
                         })
                     }).collect::<Result<Vec<_>, _>>()?);
                 }
-                if let Some(reasons) = refused_reasons {
+                if diagnostics && let Some(reasons) = refused_reasons {
                     let target = &admitted.record().instance;
                     if let Ok(ref mut refused) = result
                         && let Ok((selection, settings, _)) = coordinator.capture(target, None)
@@ -913,16 +1051,34 @@ impl LaunchCoordinator {
                         refused.diagnostics = Some(facts);
                     }
                 }
+                if owned_scan.lock().unwrap().as_ref().is_some_and(|scan|
+                    scan.as_ref().is_ok_and(|scan| scan.is_degraded()))
+                    && let Ok(ref mut preflight) = result
+                    && (preflight.launchable || preflight.diagnostics.is_some()
+                        || preflight.error.as_ref().is_some_and(|error|
+                            error.code == LaunchError::InstallUnavailable))
+                {
+                    preflight.launchable = false;
+                    preflight.error = Some(LaunchError::InstalledVersionsDegraded.into());
+                    if let Some(facts) = &mut preflight.diagnostics {
+                        facts.readiness.launchable = false;
+                        facts.readiness.reasons.push(PreflightReadinessReason {
+                            id: PreflightReadinessReasonId::InstalledVersionsDegraded,
+                            severity: PreflightReadinessSeverity::Blocking,
+                            message: "Could not verify installed versions. Check the library folder and try again.",
+                        });
+                    }
+                }
                 drop((planned_performance, bundle_guard));
                 result
             })
             .map_err(|_| LaunchError::AtCapacity)?;
-        let result = task
-            .join()
-            .await
-            .map_err(|_| LaunchError::PreparationFailed)?;
-        projection.current = proof_slot.lock().unwrap().take();
-        result
+        let result = task.join().await;
+        projection.scan = scan_slot.lock().unwrap().clone();
+        if result.is_ok() {
+            projection.current = proof_slot.lock().unwrap().take();
+        }
+        result.map_err(|_| LaunchError::PreparationFailed)?
     }
 
     fn preflight_diagnostics(
@@ -1480,6 +1636,8 @@ pub enum LaunchError {
     ProfileUnsettled,
     #[error("The selected library is unavailable. Reconnect it before launching.")]
     LibraryUnavailable,
+    #[error("Could not verify installed versions. Check the library folder and try again.")]
+    InstalledVersionsDegraded,
     #[error("The installed version requires a completed installation before launch.")]
     InstallUnavailable,
     #[error("The selected Java runtime could not be verified. Check Java settings.")]
@@ -3242,6 +3400,21 @@ mod tests {
         let after = change.commit_after_persistence().unwrap();
         assert_ne!(before, after);
         drop((operation, pin));
+        let reselected = coordinator
+            .preflight_with_projection(id.clone(), &mut projection)
+            .await;
+        assert_eq!(
+            reselected.error.unwrap().code,
+            LaunchError::LibraryUnavailable
+        );
+        assert!(
+            coordinator
+                .finish_preflight_projection(&projection)
+                .await
+                .is_err()
+        );
+        drop(projection);
+        let mut projection = coordinator.preflight_projection();
         let reselected = coordinator
             .preflight_with_projection(id, &mut projection)
             .await;
