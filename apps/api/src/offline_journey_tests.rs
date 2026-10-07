@@ -2864,6 +2864,11 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         original_index,
         provider.state.routes["GET /assets/index.json"]
     );
+    let mut changed_index = original_index.clone();
+    changed_index[0] ^= 1;
+    std::fs::write(&asset_index, &changed_index).unwrap();
+    let corrupt_index = api.get(&preflight).await;
+    let index_after_preflight = std::fs::read(&asset_index).unwrap();
     std::fs::remove_file(&asset_index).unwrap();
     let missing_index = api.get(&preflight).await;
     let index_absent = std::fs::symlink_metadata(&asset_index)
@@ -2995,6 +3000,12 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
         assert_eq!(target, expected_target);
     }
+    assert_eq!(changed_index.len(), original_index.len());
+    assert_ne!(changed_index, original_index);
+    assert_eq!(
+        index_after_preflight, changed_index,
+        "preflight must not repair the asset index"
+    );
     assert!(index_absent, "preflight must not repair the asset index");
     assert_eq!(index_canary_after, original_index);
     assert_eq!(index_after, original_index);
@@ -3043,6 +3054,11 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         "preflight must not repair files"
     );
     for (response, reason, message) in [
+        (
+            corrupt_index,
+            "asset_index_corrupt",
+            "Asset index is corrupt. Repair this version before launching.",
+        ),
         (
             missing_index,
             "asset_index_missing",

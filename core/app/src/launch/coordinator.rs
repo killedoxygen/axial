@@ -184,6 +184,7 @@ pub enum PreflightReadinessReasonId {
     LibrariesMissing,
     LibrariesCorrupt,
     AssetIndexMissing,
+    AssetIndexCorrupt,
     JavaOverrideMissing,
 }
 
@@ -648,6 +649,10 @@ impl LaunchCoordinator {
                                     InstallError::AssetIndexMissing => (
                                         PreflightReadinessReasonId::AssetIndexMissing,
                                         "Asset index is missing. Install this version before launching.",
+                                    ),
+                                    InstallError::AssetIndexCorrupt => (
+                                        PreflightReadinessReasonId::AssetIndexCorrupt,
+                                        "Asset index is corrupt. Repair this version before launching.",
                                     ),
                                     _ => return Err(install_read_error(error)),
                                 };
@@ -1245,7 +1250,8 @@ fn install_read_error(error: InstallError) -> LaunchError {
         | InstallError::VersionJsonMissing
         | InstallError::LibrariesMissing
         | InstallError::LibrariesCorrupt
-        | InstallError::AssetIndexMissing => LaunchError::InstallUnavailable,
+        | InstallError::AssetIndexMissing
+        | InstallError::AssetIndexCorrupt => LaunchError::InstallUnavailable,
         InstallError::Busy => LaunchError::InstanceBusy,
         InstallError::AtCapacity => LaunchError::AtCapacity,
         InstallError::Closed => LaunchError::Closed,

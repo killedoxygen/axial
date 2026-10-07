@@ -124,6 +124,8 @@ pub enum InstallError {
     LibrariesCorrupt,
     #[error("Asset index is missing. Install this version before launching.")]
     AssetIndexMissing,
+    #[error("Asset index is corrupt. Repair this version before launching.")]
+    AssetIndexCorrupt,
     #[error("The selected loader build is unavailable.")]
     LoaderUnavailable,
     #[error("Content installation is unavailable.")]

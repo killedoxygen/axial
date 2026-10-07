@@ -152,6 +152,8 @@ impl ActivatedVersion {
                     InstallError::ClientJarCorrupt
                 } else if root == Some("libraries") {
                     InstallError::LibrariesCorrupt
+                } else if is_asset_index {
+                    InstallError::AssetIndexCorrupt
                 } else {
                     InstallError::NotReady
                 });
