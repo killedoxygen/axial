@@ -3573,6 +3573,264 @@ async fn degraded_versions_block_create_view_and_create_without_mutation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn created_instance_survives_install_queue_refusal_and_reopen() {
+    use futures_util::FutureExt;
+
+    let temporary =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let profile = temporary.path().join("profile");
+    let provider = Provider::start(false).await;
+    let mut services: Option<DesktopServices> = None;
+    let journey =
+        std::panic::AssertUnwindSafe(async {
+            services = Some(
+                start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+                    .await
+                    .unwrap(),
+            );
+            let initial = services.as_ref().unwrap();
+            let api = Api::new(initial);
+            api.post(
+                "/api/v1/accounts/offline",
+                json!({"username":PLAYER,"expected_selection_revision":0}),
+            )
+            .await;
+            api.request(
+                reqwest::Method::PUT,
+                "/api/v1/config",
+                Some(json!({
+                    "expected_revision":0,"performance_mode":"vanilla"
+                })),
+            )
+            .await;
+            let pin = initial.library.admit().unwrap();
+            let operation = pin.managed_library().unwrap();
+            let root = pin.read_projection().unwrap();
+            let manifest = serde_json::to_vec(&json!({
+                "latest":{"release":VERSION,"snapshot":VERSION},
+                "versions":[{
+                    "id":VERSION,"type":"release",
+                    "url":"https://piston-meta.mojang.com/axial-offline-fixture.json",
+                    "sha1":sha1(&provider.state.routes["GET /versions/fixture.json"]),
+                    "time":"2024-01-01T00:00:00Z","releaseTime":"2024-01-01T00:00:00Z"
+                }]
+            }))
+            .unwrap();
+            axial_minecraft::manifest::persist_version_manifest_cache_fixture_for_test(
+                &operation, &manifest,
+            )
+            .unwrap();
+            let cached = axial_minecraft::manifest::read_cached_manifest_bytes(&operation).unwrap();
+            let target = root.join(format!("versions/{VERSION}"));
+            assert!(
+                std::fs::symlink_metadata(&target)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            );
+            let versions_before = api.get("/api/v1/versions").await;
+            let view_before = api
+                .get("/api/v1/instances/create-view?source=vanilla")
+                .await;
+            let instances_before = api.get("/api/v1/instances").await;
+            let canary = root.join("queue-refusal-canary.bin");
+            std::fs::write(&canary, b"unrelated private bytes survive queue refusal").unwrap();
+            let mut protected: Vec<_> = [
+                canary,
+                profile.join(super::PROFILE_MARKER),
+                root.join("cache/version_manifest_v2.json"),
+            ]
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+            drop(operation);
+            drop(pin);
+
+            initial.installs.close_admission();
+            let queue_before = api.get("/api/v1/install/queue").await;
+            let requests_before = provider.state.requests.lock().unwrap().clone();
+            let response = api.client
+            .post(format!("{}/api/v1/instances", api.base))
+            .header(transport::CAPABILITY_HEADER, &api.capability)
+            .json(&json!({
+                "name":"Created before queue refusal","selection_id":format!("vanilla|{VERSION}")
+            }))
+            .send().await.unwrap();
+            let status = response.status();
+            let created: Value = response.json().await.unwrap();
+            let id = created["id"]
+                .as_str()
+                .expect("one returned creation identity")
+                .to_owned();
+            let record = initial
+                .instances
+                .registry()
+                .get_live(&id.parse().unwrap())
+                .unwrap();
+            initial
+                .instances
+                .directories()
+                .admit(&record.instance.id)
+                .unwrap()
+                .revalidate()
+                .unwrap();
+            let save = root
+                .join("instances")
+                .join(&record.directory_name)
+                .join("saves/user-level.dat");
+            let save_bytes = b"created instance survives ordinary cold reopen".to_vec();
+            std::fs::write(&save, &save_bytes).unwrap();
+            protected.push((save, save_bytes));
+            let mut observations = Vec::new();
+            for _ in 0..2 {
+                observations.push((
+                    api.get(&format!("/api/v1/instances/{id}")).await,
+                    api.get("/api/v1/instances").await,
+                    api.get("/api/v1/instances/pending").await,
+                    api.get("/api/v1/install/queue").await,
+                    api.get("/api/v1/launch/sessions").await,
+                    api.get("/api/v1/launch/reports").await,
+                ));
+            }
+            let records_before_reopen = initial.instances.registry().list().unwrap();
+            let intact_before_reopen: Vec<_> = protected
+                .iter()
+                .map(|(path, _)| std::fs::read(path).unwrap())
+                .collect();
+            let requests_before_reopen = provider.state.requests.lock().unwrap().clone();
+            tokio::time::timeout(Duration::from_secs(60), initial.server.shutdown())
+                .await
+                .expect("initial API shutdown must join within the fixture deadline")
+                .unwrap();
+            assert!(initial.server.is_shutdown_settled());
+            drop(services.take());
+
+            services = Some(
+                start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+                    .await
+                    .unwrap(),
+            );
+            let reopened = services.as_ref().unwrap();
+            let restarted_api = Api::new(reopened);
+            let capability_changed = restarted_api.capability != api.capability;
+            for _ in 0..2 {
+                observations.push((
+                    restarted_api.get(&format!("/api/v1/instances/{id}")).await,
+                    restarted_api.get("/api/v1/instances").await,
+                    restarted_api.get("/api/v1/instances/pending").await,
+                    restarted_api.get("/api/v1/install/queue").await,
+                    restarted_api.get("/api/v1/launch/sessions").await,
+                    restarted_api.get("/api/v1/launch/reports").await,
+                ));
+            }
+            reopened
+                .instances
+                .directories()
+                .admit(&record.instance.id)
+                .unwrap()
+                .revalidate()
+                .unwrap();
+            let records_after_reopen = reopened.instances.registry().list().unwrap();
+            let requests_after = provider.state.requests.lock().unwrap().clone();
+            let versions_after = restarted_api.get("/api/v1/versions").await;
+            move || {
+                for ((path, bytes), observed) in protected.iter().zip(intact_before_reopen) {
+                    assert_eq!(&observed, bytes);
+                    assert_eq!(&std::fs::read(path).unwrap(), bytes);
+                }
+                assert!(
+                    std::fs::symlink_metadata(target)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                );
+                assert_eq!(requests_before_reopen, requests_before);
+                assert_eq!(requests_after, requests_before);
+                assert!(requests_before.is_empty());
+                assert!(capability_changed);
+                assert_eq!(records_before_reopen, vec![record.clone()]);
+                assert_eq!(records_after_reopen, vec![record]);
+                for (detail, list, pending, queue, sessions, reports) in observations {
+                    assert_eq!(detail["id"], id);
+                    assert_eq!(detail["version_id"], VERSION);
+                    assert_eq!(list["instances"].as_array().unwrap().len(), 1);
+                    assert_eq!(list["instances"][0]["id"], id);
+                    assert_eq!(pending, json!({"creations":[],"deletions":[]}));
+                    assert_eq!(queue["items"], json!([]));
+                    assert!(queue["active"].is_null());
+                    assert!(queue["latest_failure"].is_null());
+                    assert_eq!(queue["view_model"], queue_before["view_model"]);
+                    assert_eq!(sessions, json!({"sessions":[]}));
+                    assert_eq!(reports, json!({"reports":[]}));
+                }
+                assert_eq!(cached, (manifest, true));
+                for versions in [versions_before, versions_after] {
+                    assert_eq!(versions["scan_state"]["state_id"], "empty");
+                    assert_eq!(versions["versions"], json!([]));
+                }
+                assert_eq!(instances_before["instances"], json!([]));
+                assert_eq!(view_before["notices"], json!([]));
+                let rows = view_before["versions"].as_array().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["selection_id"], format!("vanilla|{VERSION}"));
+                assert_eq!(rows[0]["create_enabled"], true);
+                assert_eq!(rows[0]["download_state"], "none");
+                assert_eq!(status, StatusCode::OK, "{created}");
+                assert!(created.get("install_queue").is_none(), "{created}");
+                assert_eq!(
+                    created["view_model"],
+                    json!({
+                        "state_id":"created_install_unavailable","tone":"warn",
+                        "title":"Instance created",
+                        "summary":"Instance created. Installation could not be queued.",
+                        "detail":"Use Install on this instance to try again."
+                    })
+                );
+            }
+        })
+        .catch_unwind()
+        .await;
+    let shutdown = match &services {
+        Some(services) => {
+            std::panic::AssertUnwindSafe(tokio::time::timeout(
+                Duration::from_secs(60),
+                services.server.shutdown(),
+            ))
+            .catch_unwind()
+            .await
+        }
+        None => Ok(Ok(Ok(()))),
+    };
+    let settled = services
+        .as_ref()
+        .is_none_or(|services| services.server.is_shutdown_settled());
+    if matches!(&shutdown, Ok(Ok(Ok(())))) && settled {
+        drop(services);
+    } else {
+        // Unjoined owners retain authority over the preserved failed fixture.
+        std::mem::forget(services);
+    }
+    let provider_shutdown = std::panic::AssertUnwindSafe(provider.shutdown())
+        .catch_unwind()
+        .await;
+    let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        shutdown
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .expect("cleanup API shutdown must join within the fixture deadline")
+            .unwrap();
+        assert!(settled);
+        provider_shutdown.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic))();
+    }));
+    if let Err(panic) = verified {
+        eprintln!(
+            "Retained postcommit queue-refusal fixture: {}",
+            temporary.keep().display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preflight_reports_installed_file_damage_without_launching_or_repairing() {
     use std::os::unix::fs::MetadataExt;
 

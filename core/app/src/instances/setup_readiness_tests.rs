@@ -766,6 +766,193 @@ async fn resolution_rejects_library_drift_during_a_catalog_response() {
 }
 
 #[tokio::test]
+async fn dropped_resolution_caller_keeps_owned_fetch_until_shutdown() {
+    use futures_util::FutureExt;
+    use std::time::Duration;
+
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
+    let library = service.instances.directories().library().clone();
+    let owner = service.instances.tasks.clone();
+    let registry_revision = service.installs.snapshot().registry_revision;
+    let (requested, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (catalog, server) = crate::catalog::tests::fixture_catalog(
+        crate::catalog::tests::manifest(&[("1.21.11", "release")]),
+        Some((requested, released)),
+    );
+    service.catalog = Arc::new(catalog);
+    let service = Arc::new(service);
+    let mut caller = None;
+    let absent = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    };
+    let cache = root.path().join("cache/version_manifest_v2.json");
+    let target = root.path().join("versions/1.21.11");
+    let instances = root.path().join("instances");
+    let canary = root.path().join("unrelated-user-file.txt");
+    let journey = std::panic::AssertUnwindSafe(async {
+        let pin = library.admit().unwrap();
+        let operation = pin.managed_library().unwrap();
+        operation.prepare_layout().unwrap();
+        drop(operation);
+        drop(pin);
+        std::fs::write(&canary, b"preserve unrelated user bytes\n").unwrap();
+        let initially_absent = absent(&cache) && absent(&target) && absent(&instances);
+        let instances_before = service.instances.registry().list().unwrap();
+        let pending_before = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+        let queue_before = service.installs.snapshot();
+        caller = Some(tokio::spawn({
+            let service = service.clone();
+            async move { service.resolve("vanilla|1.21.11").await }
+        }));
+        tokio::time::timeout(Duration::from_secs(5), observed)
+            .await
+            .expect("catalog request was not observed")
+            .expect("catalog request observer closed");
+        let was_pending = !caller.as_ref().unwrap().is_finished();
+        let accepted = owner.status();
+        caller.as_ref().unwrap().abort();
+        let caller_cancelled =
+            tokio::time::timeout(Duration::from_secs(1), caller.as_mut().unwrap())
+                .await
+                .expect("disposable caller did not join")
+                .is_err_and(|error| error.is_cancelled());
+        drop(caller.take());
+        let after_drop = owner.status();
+        // The provider cannot deliver its body until cleanup sends release.
+        let shutdown = owner.shutdown(Duration::from_secs(2)).await;
+        let receipt = owner.shutdown_receipt();
+        let receipted = receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.belongs_to(&owner));
+        let held_through_shutdown = !server.is_finished();
+        let absent_before_release = absent(&cache) && absent(&target) && absent(&instances);
+        let instances_after = service.instances.registry().list().unwrap();
+        let pending_after = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+        let queue_after = service.installs.snapshot();
+        drop(receipt);
+        move || {
+            assert!(initially_absent && was_pending && caller_cancelled);
+            assert_eq!(accepted.running.len(), 1);
+            assert!(!accepted.closing && accepted.unsettled.is_empty());
+            assert_eq!(
+                after_drop, accepted,
+                "dropping the caller must not cancel accepted work"
+            );
+            assert!(shutdown.is_ok() && receipted && held_through_shutdown);
+            assert!(absent_before_release);
+            assert!(instances_before.is_empty());
+            assert_eq!(instances_after, instances_before);
+            assert_eq!(pending_before, serde_json::json!([]));
+            assert_eq!(pending_after, pending_before);
+            assert_eq!(queue_after, queue_before);
+        }
+    })
+    .catch_unwind()
+    .await;
+    let released = release.send(());
+    service.installs.close_admission();
+    let shutdown = std::panic::AssertUnwindSafe(owner.shutdown(Duration::from_secs(5)))
+        .catch_unwind()
+        .await;
+    let remaining = match caller.take() {
+        Some(mut caller) => {
+            caller.abort();
+            Some(
+                tokio::time::timeout(Duration::from_secs(1), &mut caller)
+                    .await
+                    .is_ok_and(|result| result.is_err_and(|error| error.is_cancelled())),
+            )
+        }
+        None => None,
+    };
+    let observers =
+        tokio::time::timeout(Duration::from_secs(5), service.installs.join_observers()).await;
+    let server = tokio::task::spawn_blocking(move || server.join());
+    let server = tokio::time::timeout(Duration::from_secs(16), server).await;
+    let final_state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (
+            service.instances.registry().list().unwrap(),
+            service.instances.pending().unwrap(),
+            service.installs.snapshot(),
+        )
+    }));
+    let receipt = owner.shutdown_receipt();
+    let receipted = receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.belongs_to(&owner));
+    let idle = owner.status().is_idle();
+    let unsettled = service.installs.has_unsettled_effects();
+    let runtime_settled = service.installs.runtime_cache().settle();
+    drop(receipt);
+    drop(service);
+    drop(owner);
+    let pins = library.wait_for_pins(Duration::from_secs(2)).await;
+    let preserved = if matches!(&shutdown, Ok(Ok(())))
+        && matches!(&observers, Ok(Ok(())))
+        && matches!(&server, Ok(Ok(Ok(()))))
+        && receipted
+        && idle
+        && !unsettled
+        && runtime_settled.is_ok()
+        && pins.is_ok()
+    {
+        Some(library.try_preserve())
+    } else {
+        None
+    };
+    let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(
+            released.is_ok(),
+            "server stopped holding the body before cleanup"
+        );
+        assert!(matches!(shutdown, Ok(Ok(()))), "task owner did not join");
+        if let Some(result) = remaining {
+            assert!(result, "disposable caller did not join");
+        }
+        assert!(
+            matches!(observers, Ok(Ok(()))),
+            "queue observers did not join"
+        );
+        assert!(
+            matches!(server, Ok(Ok(Ok(())))),
+            "catalog server did not join"
+        );
+        assert!(receipted && idle && !unsettled && runtime_settled.is_ok());
+        assert!(
+            pins.is_ok(),
+            "profile capabilities remained after owned work joined"
+        );
+        assert!(
+            matches!(preserved, Some(Ok(()))),
+            "profile root did not preserve"
+        );
+        let (records, pending, queue) = final_state.unwrap();
+        assert!(records.is_empty() && pending.is_empty());
+        assert!(queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none());
+        assert_eq!(queue.registry_revision, registry_revision);
+        assert!(absent(&cache) && absent(&target) && absent(&instances));
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"preserve unrelated user bytes\n"
+        );
+        match journey {
+            Ok(verify) => verify(),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }));
+    if let Err(panic) = verification {
+        eprintln!(
+            "Retained dropped-resolution fixture: {}",
+            root.keep().display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn creation_rejects_a_restored_library_with_an_old_admission() {
     use futures_util::FutureExt;
     use std::time::Duration;

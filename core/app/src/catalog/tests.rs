@@ -44,7 +44,8 @@ pub(crate) fn fixture_catalog(
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
-    let provider = if response_gate.is_some() {
+    let gated = response_gate.is_some();
+    let provider = if gated {
         ProviderClient::new(ClientConfig {
             connect_timeout: Duration::from_secs(2),
             read_timeout: Duration::from_secs(8),
@@ -108,7 +109,16 @@ pub(crate) fn fixture_catalog(
                 .recv_timeout(Duration::from_secs(5))
                 .expect("fixture response was not released");
         }
-        stream.write_all(&body).unwrap();
+        match stream.write_all(&body) {
+            Ok(()) => {}
+            Err(error)
+                if gated
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) => {}
+            Err(error) => panic!("fixture response write failed: {error}"),
+        }
     });
     let mut catalog = Catalog::new(provider);
     catalog.source_fixture = Some((
