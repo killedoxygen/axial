@@ -546,6 +546,209 @@ async fn instance_enrichment_leaves_resource_counts_to_detailed_reads_even_durin
 }
 
 #[tokio::test]
+async fn creation_rejects_a_restored_library_with_an_old_admission() {
+    use futures_util::FutureExt;
+    use std::time::Duration;
+
+    let (root, service, _) = fixture();
+    let service = Arc::new(service);
+    let mut waiter = None;
+    let journey = std::panic::AssertUnwindSafe(async {
+        crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+        let pin = service.instances.directories().library().admit().unwrap();
+        let receipt = service
+            .installs
+            .ready_version(&pin, "1.21.4")
+            .await
+            .unwrap();
+        let initially_valid = receipt.revalidate();
+        let protected: Vec<_> = ["json", "jar"]
+            .into_iter()
+            .map(|extension| {
+                let path = root
+                    .path()
+                    .join(format!("versions/1.21.4/1.21.4.{extension}"));
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        let request = CreateInstanceRequest {
+            name: "Restored admission".into(),
+            selection_id: "vanilla|1.21.4".into(),
+            ..Default::default()
+        };
+        let (target, _, admission) = service.resolve(&request.selection_id).await.unwrap();
+        let target_version = target.version_id().to_owned();
+        let versions = pin
+            .directory()
+            .unwrap()
+            .open_directory(&axial_fs::LeafName::new("versions").unwrap())
+            .unwrap();
+        let revision_before = versions.revision().unwrap();
+        let observe_changed_revision = || async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let revision = versions.revision().unwrap();
+                    if revision != revision_before {
+                        break revision;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+        };
+        let queue_before = service.installs.snapshot();
+        let instances_before = service.instances.registry().list().unwrap();
+        let pending_before = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+        let instance_parent = root.path().join("instances");
+        let namespace_absent_before = std::fs::symlink_metadata(&instance_parent)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        // An external entry changes the library scan, not the selected installation.
+        let external = root.path().join("versions/external-degraded-entry");
+        let absent_before = std::fs::symlink_metadata(&external)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        std::fs::create_dir(&external).unwrap();
+        let metadata = external.join("external-degraded-entry.json");
+        std::fs::write(&metadata, b"{not valid external version metadata\n").unwrap();
+        let changed_revision = observe_changed_revision().await;
+        let selected_after_change = receipt.revalidate();
+        std::fs::remove_file(&metadata).unwrap();
+        std::fs::remove_dir(&external).unwrap();
+        let restored_revision = observe_changed_revision().await;
+        let selected_after_restore = receipt.revalidate();
+        let restored_bytes: Vec<_> = protected
+            .iter()
+            .map(|(path, _)| std::fs::read(path).unwrap())
+            .collect();
+        let work = service
+            .instances
+            .create(request.clone(), target, admission)
+            .unwrap();
+        waiter = Some(tokio::spawn(async move { work.join().await }));
+        let old_result = tokio::time::timeout(Duration::from_secs(5), waiter.as_mut().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(waiter.take());
+        let queue_after = service.installs.snapshot();
+        let instances_after = service.instances.registry().list().unwrap();
+        let pending_after = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+        let namespace_absent_after = std::fs::symlink_metadata(&instance_parent)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let fresh_result = if matches!(&old_result, Err(InstanceError::VersionUnavailable)) {
+            let (target, _, admission) = service.resolve(&request.selection_id).await.unwrap();
+            let work = service
+                .instances
+                .create(request, target, admission)
+                .unwrap();
+            waiter = Some(tokio::spawn(async move { work.join().await }));
+            let result = tokio::time::timeout(Duration::from_secs(5), waiter.as_mut().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            drop(waiter.take());
+            Some(result)
+        } else {
+            None
+        };
+        let fresh_instances = service.instances.registry().list().unwrap();
+        let fresh_pending = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+        let fresh_queue = service.installs.snapshot();
+        let selected_final = receipt.revalidate();
+        drop(receipt);
+        drop(versions);
+        drop(pin);
+        move || {
+            assert!(absent_before && namespace_absent_before);
+            assert!(
+                std::fs::symlink_metadata(external)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            );
+            assert_ne!(changed_revision.unwrap(), revision_before);
+            assert_ne!(restored_revision.unwrap(), revision_before);
+            assert_eq!(target_version, "1.21.4");
+            for valid in [
+                initially_valid,
+                selected_after_change,
+                selected_after_restore,
+                selected_final,
+            ] {
+                assert!(
+                    valid.is_ok(),
+                    "selected installation lost its independent proof"
+                );
+            }
+            for ((path, before), restored) in protected.into_iter().zip(restored_bytes) {
+                assert_eq!(restored, before);
+                assert_eq!(std::fs::read(path).unwrap(), before);
+            }
+            assert!(
+                matches!(old_result, Err(InstanceError::VersionUnavailable)),
+                "the original admission did not refuse the changed library"
+            );
+            assert_eq!(instances_after, instances_before);
+            assert!(instances_before.is_empty());
+            assert_eq!(pending_after, pending_before);
+            assert_eq!(pending_before, serde_json::json!([]));
+            assert_eq!(queue_after, queue_before);
+            assert!(
+                namespace_absent_after,
+                "stale admission published an instance namespace"
+            );
+            let fresh = fresh_result
+                .expect("fresh creation follows the original refusal")
+                .unwrap();
+            assert_eq!(fresh.name, "Restored admission");
+            assert_eq!(fresh.version_id, "1.21.4");
+            assert_eq!(fresh_instances.len(), 1);
+            assert_eq!(fresh_instances[0].instance.id, fresh.id);
+            assert_eq!(fresh_pending, serde_json::json!([]));
+            assert_eq!(fresh_queue, queue_before);
+        }
+    })
+    .catch_unwind()
+    .await;
+    let shutdown =
+        std::panic::AssertUnwindSafe(service.instances.tasks.shutdown(Duration::from_secs(5)))
+            .catch_unwind()
+            .await;
+    let remaining = match waiter.take() {
+        Some(mut waiter) => {
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut waiter).await;
+            if result.is_err() {
+                waiter.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(1), waiter).await;
+            }
+            Some(result)
+        }
+        None => None,
+    };
+    let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(matches!(shutdown, Ok(Ok(()))), "task owner did not join");
+        if let Some(result) = remaining {
+            assert!(
+                matches!(result, Ok(Ok(Ok(_)))),
+                "creation waiter did not join"
+            );
+        }
+        assert!(service.instances.tasks.status().is_idle());
+        match journey {
+            Ok(verify) => verify(),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }));
+    if let Err(panic) = verification {
+        eprintln!(
+            "Retained restored-admission fixture: {}",
+            root.keep().display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn second_instance_reuses_exact_verified_install_without_requeueing() {
     let (_root, service, _) = fixture();
     crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
