@@ -193,6 +193,8 @@ pub enum PreflightReadinessReasonId {
     AssetIndexCorrupt,
     JavaOverrideMissing,
     ManagedRuntimeMissing,
+    IncompleteInstall,
+    InstalledVersionsDegraded,
 }
 
 #[derive(Clone, Debug, Serialize, TS)]
@@ -597,6 +599,7 @@ impl LaunchCoordinator {
                 let mut planned_performance = None;
                 let mut observed_damage = None;
                 let mut runtime_absence = None;
+                let mut refused_reasons = None;
                 let mut result = async {
                     // Installation can be repaired without selecting an account.
                     // Only the guarded install proof establishes that need;
@@ -620,10 +623,29 @@ impl LaunchCoordinator {
                         let operation = pin
                             .managed_library()
                             .map_err(|_| LaunchError::LibraryUnavailable)?;
-                        bundle_guard = Some(
-                            axial_minecraft::VersionBundleReadGuard::acquire(&operation)
-                                .map_err(bundle_read_error)?,
-                        );
+                        bundle_guard = Some(match axial_minecraft::VersionBundleReadGuard::acquire(&operation) {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                if diagnostics {
+                                    let (id, message) = if error.kind() == std::io::ErrorKind::WouldBlock {
+                                        (PreflightReadinessReasonId::IncompleteInstall,
+                                            "Installation is changing. Wait for it to finish before launching.")
+                                    } else {
+                                        (PreflightReadinessReasonId::InstalledVersionsDegraded,
+                                            "Installed versions could not be inspected safely.")
+                                    };
+                                    refused_reasons = Some(vec![PreflightReadinessReason {
+                                        id,
+                                        severity: PreflightReadinessSeverity::Blocking,
+                                        message,
+                                    }]);
+                                }
+                                return Ok(LaunchPreflight::refused(
+                                    admitted.record().instance.id.clone(),
+                                    bundle_read_error(error),
+                                ));
+                            }
+                        });
                         #[cfg(test)]
                         coordinator
                             .fresh_install_checks
@@ -834,7 +856,7 @@ impl LaunchCoordinator {
                         .unwrap()
                         .revalidate()
                         .map_err(bundle_read_error)?;
-                    let reasons = damage.reasons().iter().map(|&error| {
+                    refused_reasons = Some(damage.reasons().iter().map(|&error| {
                         let (id, message) = match error {
                             InstallError::ClientJarMissing => (
                                 PreflightReadinessReasonId::ClientJarMissing,
@@ -871,7 +893,9 @@ impl LaunchCoordinator {
                             severity: PreflightReadinessSeverity::Blocking,
                             message,
                         })
-                    }).collect::<Result<Vec<_>, _>>()?;
+                    }).collect::<Result<Vec<_>, _>>()?);
+                }
+                if let Some(reasons) = refused_reasons {
                     let target = &admitted.record().instance;
                     if let Ok(ref mut refused) = result
                         && let Ok((selection, settings, _)) = coordinator.capture(target, None)

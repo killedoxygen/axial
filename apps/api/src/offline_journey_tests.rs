@@ -2798,6 +2798,178 @@ async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preflight_reports_publication_contention_without_waiting_or_launching() {
+    use futures_util::FutureExt;
+
+    let temporary =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let profile = temporary.path().join("profile");
+    let provider = Provider::start(false).await;
+    let services = start_profile_with_test_endpoints(profile, provider.endpoints())
+        .await
+        .unwrap();
+    let api = Api::new(&services);
+    let journey = std::panic::AssertUnwindSafe(async {
+        api.post(
+            "/api/v1/accounts/offline",
+            json!({"username":PLAYER,"expected_selection_revision":0}),
+        )
+        .await;
+        api.request(
+            reqwest::Method::PUT,
+            "/api/v1/config",
+            Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
+        )
+        .await;
+        let install = api
+            .post(
+                "/api/v1/install/queue",
+                json!({"kind":"vanilla","version_id":VERSION}),
+            )
+            .await;
+        assert_eq!(
+            install_terminal(&api, &install).await["outcome"],
+            "succeeded"
+        );
+        let created = api
+            .post(
+                "/api/v1/instances",
+                json!({"name":"Publication preflight","selection_id":format!("vanilla|{VERSION}")}),
+            )
+            .await;
+        let preflight = format!(
+            "/api/v1/launch/preflight/{}",
+            created["id"].as_str().unwrap()
+        );
+        assert_eq!(api.get(&preflight).await["launchable"], true);
+        let pin = services.library.admit().unwrap();
+        let operation = pin.managed_library().unwrap();
+        let root = pin.read_projection().unwrap();
+        let protected: Vec<_> = ["json", "jar"]
+            .into_iter()
+            .map(|extension| {
+                let path = root.join(format!("versions/{VERSION}/{VERSION}.{extension}"));
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        let queue_before = api.get("/api/v1/install/queue").await;
+        let requests_before = provider.state.requests.lock().unwrap().clone();
+        let publication =
+            axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
+        let started = std::time::Instant::now();
+        let busy = api.get(&preflight).await;
+        let elapsed = started.elapsed();
+        drop(publication);
+        let recovered = api.get(&preflight).await;
+        let target_busy_guard = services
+            .instances
+            .directories()
+            .exclusions()
+            .try_acquire([created["id"].as_str().unwrap()], [])
+            .unwrap();
+        let target_busy = api.get(&preflight).await;
+        drop(target_busy_guard);
+        let lane = root.join(".axial-publication");
+        let retained_lane = temporary.path().join("retained-publication");
+        std::fs::rename(&lane, &retained_lane).unwrap();
+        let conflict = b"non-directory publication lane";
+        std::fs::write(&lane, conflict).unwrap();
+        let unsafe_lane = api.get(&preflight).await;
+        let conflict_after = std::fs::read(&lane).unwrap();
+        std::fs::remove_file(&lane).unwrap();
+        std::fs::rename(&retained_lane, &lane).unwrap();
+        let restored = api.get(&preflight).await;
+        let requests_after = provider.state.requests.lock().unwrap().clone();
+        let queue_after = api.get("/api/v1/install/queue").await;
+        let sessions = api.get("/api/v1/launch/sessions").await;
+        let reports = api.get("/api/v1/launch/reports").await;
+        let protected_after: Vec<_> = protected
+            .iter()
+            .map(|(path, _)| std::fs::read(path).unwrap())
+            .collect();
+        move || {
+            assert_eq!(requests_after, requests_before);
+            assert_eq!(queue_after, queue_before);
+            assert_eq!(sessions, json!({"sessions":[]}));
+            assert_eq!(reports, json!({"reports":[]}));
+            for ((_, before), after) in protected.into_iter().zip(protected_after) {
+                assert_eq!(after, before);
+            }
+            assert_eq!(conflict_after, conflict);
+            for ready in [recovered, restored] {
+                assert_eq!(ready["launchable"], true, "{ready}");
+                assert_eq!(ready["readiness"], json!({"launchable":true,"reasons":[]}));
+            }
+            assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+            assert_eq!(busy["launchable"], false, "{busy}");
+            assert_eq!(busy["error"]["code"], "instance_busy", "{busy}");
+            assert_eq!(busy["status"], "ready", "{busy}");
+            assert_eq!(
+                busy["readiness"],
+                json!({"launchable":false,"reasons":[{
+                    "id":"incomplete_install","severity":"blocking",
+                    "message":"Installation is changing. Wait for it to finish before launching."
+                }]}),
+                "{busy}"
+            );
+            assert_eq!(
+                target_busy["error"]["code"], "instance_busy",
+                "{target_busy}"
+            );
+            assert_eq!(target_busy["readiness"], Value::Null, "{target_busy}");
+            assert_eq!(target_busy["launchable"], false, "{target_busy}");
+            assert_eq!(
+                unsafe_lane["error"]["code"], "library_unavailable",
+                "{unsafe_lane}"
+            );
+            assert_eq!(unsafe_lane["status"], "ready", "{unsafe_lane}");
+            assert_eq!(unsafe_lane["launchable"], false, "{unsafe_lane}");
+            assert_eq!(
+                unsafe_lane["readiness"],
+                json!({"launchable":false,"reasons":[{
+                    "id":"installed_versions_degraded","severity":"blocking",
+                    "message":"Installed versions could not be inspected safely."
+                }]}),
+                "{unsafe_lane}"
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
+    let shutdown = std::panic::AssertUnwindSafe(services.server.shutdown())
+        .catch_unwind()
+        .await;
+    let settled = services.server.is_shutdown_settled();
+    drop(services);
+    let provider_join = std::panic::AssertUnwindSafe(provider.shutdown())
+        .catch_unwind()
+        .await;
+    let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shutdown = match shutdown {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        assert!(shutdown.is_ok(), "{shutdown:?}");
+        assert!(settled);
+        if let Err(panic) = provider_join {
+            std::panic::resume_unwind(panic);
+        }
+        match journey {
+            Ok(verify) => verify(),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }));
+    if let Err(panic) = verification {
+        eprintln!(
+            "Retained publication preflight fixture: {}",
+            temporary.keep().display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preflight_reports_installed_file_damage_without_launching_or_repairing() {
     use std::os::unix::fs::MetadataExt;
 
