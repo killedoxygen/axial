@@ -94,6 +94,20 @@ fn runtime_absence_fixture() -> (
     (temporary, session, directory, cache)
 }
 
+fn read_fixture_file(path: &Path) -> std::io::Result<([u8; 64], usize)> {
+    let mut file = fs::File::open(path)?;
+    let mut bytes = [0; 64];
+    let mut length = 0;
+    while length < bytes.len() {
+        let read = std::io::Read::read(&mut file, &mut bytes[length..])?;
+        if read == 0 {
+            break;
+        }
+        length += read;
+    }
+    Ok((bytes, length))
+}
+
 #[test]
 fn runtime_absence_retains_known_empty_component_observation() {
     let (_temporary, session, directory, cache) = runtime_absence_fixture();
@@ -1217,19 +1231,6 @@ fn missing_runtime_source_cancellation_after_claim_requires_publication_settleme
             fs::write(&unrelated, b"preserve").unwrap();
 
             // Three fixed reads consume at most 192 bytes, without file-sized allocation.
-            let read_fixture = |path: &Path| -> std::io::Result<([u8; 64], usize)> {
-                let mut file = fs::File::open(path)?;
-                let mut bytes = [0; 64];
-                let mut length = 0;
-                while length < bytes.len() {
-                    let read = std::io::Read::read(&mut file, &mut bytes[length..])?;
-                    if read == 0 {
-                        break;
-                    }
-                    length += read;
-                }
-                Ok((bytes, length))
-            };
             let mut gate = block_runtime_publication_for_test(&root);
             let (cancel, mut control) = runtime_materialization_control();
             let task_cache = cache.clone();
@@ -1247,7 +1248,7 @@ fn missing_runtime_source_cancellation_after_claim_requires_publication_settleme
                 .await
             });
             let reached = tokio::time::timeout(wait, gate.wait_until_reached()).await;
-            let staged_bytes = read_fixture(&java_executable(&staging));
+            let staged_bytes = read_fixture_file(&java_executable(&staging));
             let canonical_before = fs::symlink_metadata(&root);
             let held_before = !runtime_publication_lock_available_for_test(&cache, &component);
             let cancellation = cancel.cancel_before_publication();
@@ -1274,8 +1275,8 @@ fn missing_runtime_source_cancellation_after_claim_requires_publication_settleme
             let revalidated =
                 tokio::time::timeout(wait, receipt.revalidate(&cache, &component)).await;
             let held_by_receipt = !runtime_publication_lock_available_for_test(&cache, &component);
-            let canonical_bytes = read_fixture(&java_executable(&root));
-            let unrelated_bytes = read_fixture(&unrelated);
+            let canonical_bytes = read_fixture_file(&java_executable(&root));
+            let unrelated_bytes = read_fixture_file(&unrelated);
             let staging_after = fs::symlink_metadata(&staging);
             let quarantine_after = fs::symlink_metadata(&quarantine);
             let ready = cache
@@ -1331,6 +1332,169 @@ fn missing_runtime_source_cancellation_after_claim_requires_publication_settleme
             assert!(exclusion_released);
             settled.expect("joined publisher released its native effects");
             assert!(revoked, "settled runtime fixture releases its root session");
+        });
+    }));
+    if join_unknown.get() {
+        std::mem::forget(executor);
+    }
+    if let Err(error) = observed {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
+fn missing_runtime_source_preserves_conflicts_after_publication_claim() {
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime publication executor");
+    let join_unknown = std::cell::Cell::new(false);
+    let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        executor.block_on(async {
+            let wait = std::time::Duration::from_secs(30);
+            // Both fixtures sample at most 384 file bytes and four directory entries.
+            for conflict in ["canonical", "quarantine"] {
+                let (temporary, session, directory, cache) = runtime_absence_fixture();
+                let component = RuntimeId::from("jre-legacy");
+                let root = cache.component_root(component.as_str()).unwrap();
+                let staging = root.with_file_name("jre-legacy.staging");
+                let quarantine = root.with_file_name("jre-legacy.quarantine");
+                let source = match tokio::time::timeout(
+                    wait,
+                    runtime_source_receipt_fixture(&component, &root, b"unpublished java"),
+                )
+                .await
+                {
+                    Ok(source) => source,
+                    Err(error) => {
+                        std::mem::forget((temporary, session, directory, cache));
+                        panic!("{conflict} source timed out; fixture retained: {error}");
+                    }
+                };
+                let unrelated = cache.root().join("unrelated");
+                fs::write(&unrelated, b"preserve").unwrap();
+                let mut gate = block_runtime_publication_for_test(&root);
+                let (_cancel, mut control) = runtime_materialization_control();
+                let task_cache = cache.clone();
+                let mut task = tokio::spawn(async move {
+                    let mut ready = false;
+                    let result = materialize_missing_runtime_source(
+                        &task_cache,
+                        &JavaVersion {
+                            component: "jre-legacy".into(),
+                            major_version: 8,
+                        },
+                        source,
+                        &mut |event| {
+                            if matches!(event, RuntimeEnsureEvent::ManagedRuntimeReady { .. }) {
+                                ready = true;
+                            }
+                        },
+                        &mut control,
+                    )
+                    .await;
+                    (result, ready)
+                });
+                let reached = tokio::time::timeout(wait, gate.wait_until_reached()).await;
+                let staged_bytes = read_fixture_file(&java_executable(&staging));
+                let canonical_before = fs::symlink_metadata(&root);
+                let quarantine_before = fs::symlink_metadata(&quarantine);
+                let held = !runtime_publication_lock_available_for_test(&cache, &component);
+                let (foreign, absent) = if conflict == "canonical" {
+                    (&root, &quarantine)
+                } else {
+                    (&quarantine, &root)
+                };
+                let sentinel = foreign.join("sentinel");
+                let injected = fs::create_dir(foreign)
+                    .and_then(|()| fs::write(&sentinel, b"foreign publication conflict"));
+                gate.release();
+                let joined = tokio::time::timeout(wait, &mut task).await;
+                let ready = match joined {
+                    Ok(Ok((
+                        Err(ManagedRuntimeRebuildError::Preparation(
+                            JavaRuntimeLookupError::ManagedMutationRefused,
+                        )),
+                        ready,
+                    ))) => ready,
+                    Err(error) => {
+                        join_unknown.set(true);
+                        let detail = format!(
+                            "gate: {reached:?}, injection: {injected:?}, join: {error}"
+                        );
+                        std::mem::forget((temporary, session, directory, cache, task));
+                        panic!("{conflict} join unknown; running fixture retained: {detail}");
+                    }
+                    Ok(outcome) => {
+                        let detail = format!(
+                            "gate: {reached:?}, injection: {injected:?}, producer: {outcome:?}"
+                        );
+                        std::mem::forget((temporary, session, directory, cache, outcome));
+                        panic!("{conflict} did not refuse before publication; fixture retained: {detail}");
+                    }
+                };
+
+                let foreign_bytes = read_fixture_file(&sentinel);
+                let unrelated_bytes = read_fixture_file(&unrelated);
+                let namespace = fs::read_dir(foreign).and_then(|mut entries| {
+                    let first = entries.next().transpose()?.map(|entry| entry.file_name());
+                    let second = entries.next().transpose()?.map(|entry| entry.file_name());
+                    Ok((first, second))
+                });
+                let staging_after = fs::symlink_metadata(&staging);
+                let absent_after = fs::symlink_metadata(absent);
+                let exclusion_released =
+                    runtime_publication_lock_available_for_test(&cache, &component);
+                let settled = cache.settle();
+                let revoked = if settled.is_ok() {
+                    drop((cache, directory));
+                    let outcome = session.revoke();
+                    let revoked = matches!(outcome, axial_fs::RootRevokeOutcome::Revoked);
+                    if !revoked {
+                        std::mem::forget((temporary, outcome));
+                    }
+                    revoked
+                } else {
+                    std::mem::forget((temporary, session, directory, cache));
+                    false
+                };
+
+                reached.expect("missing runtime reaches publication after settlement claim");
+                let (bytes, length) = staged_bytes.expect("verified Java is staged at the gate");
+                assert_eq!(&bytes[..length], b"unpublished java", "{conflict}");
+                assert!(matches!(
+                    canonical_before,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ));
+                assert!(matches!(
+                    quarantine_before,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ));
+                assert!(held, "{conflict}");
+                injected.expect("foreign directory is introduced while publication is held");
+                assert!(!ready, "{conflict} refusal must not announce readiness");
+                let (bytes, length) = foreign_bytes.expect("foreign sentinel remains readable");
+                assert_eq!(&bytes[..length], b"foreign publication conflict", "{conflict}");
+                assert_eq!(
+                    namespace.expect("foreign directory remains readable"),
+                    (Some(std::ffi::OsString::from("sentinel")), None),
+                    "{conflict} namespace must remain exact"
+                );
+                let (bytes, length) = unrelated_bytes.expect("unrelated canary remains readable");
+                assert_eq!(&bytes[..length], b"preserve", "{conflict}");
+                assert!(matches!(
+                    staging_after,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ));
+                assert!(matches!(
+                    absent_after,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ));
+                assert!(exclusion_released, "{conflict}");
+                settled.expect("refused publication released its native effects");
+                assert!(revoked, "{conflict} fixture releases its root session");
+            }
         });
     }));
     if join_unknown.get() {
