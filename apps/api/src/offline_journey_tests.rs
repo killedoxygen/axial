@@ -493,6 +493,9 @@ fn provider_routes(
 struct ProviderState {
     routes: Arc<BTreeMap<String, Vec<u8>>>,
     requests: Arc<Mutex<Vec<String>>>,
+    client_hold: tokio::sync::watch::Sender<bool>,
+    client_held: Arc<tokio::sync::Notify>,
+    client_gate_failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct Provider {
@@ -515,20 +518,55 @@ impl Provider {
         let state = ProviderState {
             routes: Arc::new(provider_routes(&base, corrupt_client, natural_exit)),
             requests: Arc::new(Mutex::new(Vec::new())),
+            client_hold: tokio::sync::watch::channel(false).0,
+            client_held: Arc::new(tokio::sync::Notify::new()),
+            client_gate_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let router = Router::new()
             .fallback(
                 |State(state): State<ProviderState>,
                  method: Method,
                  OriginalUri(uri): OriginalUri| async move {
+                    use axum::response::IntoResponse;
+
                     let key = format!("{method} {uri}");
                     state.requests.lock().unwrap().push(key.clone());
+                    if key == "GET /artifacts/client.jar" && *state.client_hold.borrow() {
+                        let bytes = state.routes[&key].clone();
+                        let size = bytes.len();
+                        let mut gate = state.client_hold.subscribe();
+                        let body = axum::body::Body::from_stream(async_stream::stream! {
+                            state.client_held.notify_one();
+                            let released = tokio::time::timeout(Duration::from_secs(30), async {
+                                loop {
+                                    let held = *gate.borrow_and_update();
+                                    if !held {
+                                        return true;
+                                    }
+                                    if gate.changed().await.is_err() {
+                                        return false;
+                                    }
+                                }
+                            }).await;
+                            if matches!(released, Ok(true)) {
+                                yield Ok::<_, std::io::Error>(bytes);
+                            } else {
+                                state.client_gate_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                                yield Err(std::io::Error::other("fixture client gate did not release"));
+                            }
+                        });
+                        return axum::response::Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-length", size)
+                            .body(body)
+                            .unwrap();
+                    }
                     match state.routes.get(&key) {
-                        Some(bytes) => (StatusCode::OK, bytes.clone()),
+                        Some(bytes) => (StatusCode::OK, bytes.clone()).into_response(),
                         None => (
                             StatusCode::NOT_IMPLEMENTED,
                             b"unmatched fixture request".to_vec(),
-                        ),
+                        ).into_response(),
                     }
                 },
             )
@@ -5975,6 +6013,358 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
     );
     reopened.server.shutdown().await.unwrap();
     assert!(reopened.server.is_shutdown_settled());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_refuses_held_materialization_then_installation_survives_reopen() {
+    use axial_app::{install::queue::library_artifact, tasks::ExclusionError};
+    use futures_util::FutureExt;
+    use std::io::Read;
+
+    let mut temporary =
+        Some(tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap());
+    let profile = temporary.as_ref().unwrap().path().join("profile");
+    let mut provider = Provider::start(false).await;
+    provider.state.client_hold.send_replace(true);
+    let mut services: Option<DesktopServices> = None;
+    let journey = std::panic::AssertUnwindSafe(async {
+        services = Some(
+            start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+                .await
+                .unwrap(),
+        );
+        let initial = services.as_ref().unwrap();
+        let api = Api::new(initial);
+        let pin = initial.library.admit().unwrap();
+        let library = pin.read_projection().unwrap();
+        let artifact = library_artifact(&pin.library_id().to_string());
+        drop(pin);
+        let canary = library.join("materialization-canary.bin");
+        std::fs::write(&canary, EXTERNAL_CANARY).unwrap();
+        let marker = profile.join(super::PROFILE_MARKER);
+        let marker_bytes = std::fs::read(&marker).unwrap();
+        let start = api
+            .post(
+                "/api/v1/install/queue",
+                json!({"kind":"vanilla","version_id":VERSION}),
+            )
+            .await;
+        let id = start["started_install"]["install_id"]
+            .as_str()
+            .expect("accepted durable installation")
+            .to_owned();
+        let status_path = format!("/api/v1/install/{id}/status");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            provider.state.client_held.notified(),
+        )
+        .await
+        .expect("real materialization must request the client body");
+        let before = api.get(&status_path).await;
+        let response = api
+            .client
+            .post(format!("{}/api/v1/install/{id}/cancel", api.base))
+            .header(transport::CAPABILITY_HEADER, &api.capability)
+            .send()
+            .await
+            .unwrap();
+        let cancel_status = response.status();
+        let cancel_body: Value = response.json().await.unwrap();
+        let held_shutdown = initial.tasks.shutdown(Duration::from_secs(2)).await;
+        let held_receipt = initial.tasks.shutdown_receipt().is_some();
+        eprintln!(
+            "Original held-materialization shutdown: {held_shutdown:?}; receipt={held_receipt}"
+        );
+        let after = api.get(&status_path).await;
+        let held_pins = initial.library.snapshot().current.unwrap().pins;
+        let exclusion = initial
+            .instances
+            .directories()
+            .exclusions()
+            .try_acquire(std::iter::empty::<String>(), [artifact.clone()])
+            .map(drop);
+        let version_absent =
+            std::fs::symlink_metadata(library.join(format!("versions/{VERSION}/{VERSION}.jar")))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let canary_while_held = std::fs::read(&canary).unwrap();
+        provider.state.client_hold.send_replace(false);
+        let terminal = install_terminal(&api, &start).await;
+        let pin = initial.library.admit().unwrap();
+        let ready = initial.installs.ready_version(&pin, VERSION).await.is_ok();
+        drop(pin);
+        let runtime_verified = initial
+            .installs
+            .runtime_cache()
+            .admit_component(COMPONENT)
+            .unwrap()
+            .is_some_and(|component| component.contents_verified());
+        let asset_hash = sha1(ASSET);
+        let classifier = if cfg!(target_os = "macos") {
+            "natives-macos"
+        } else {
+            "natives-linux"
+        };
+        let runtime = initial.installs.runtime_cache().root().join(COMPONENT);
+        let expected = [
+            (
+                library.join(format!("versions/{VERSION}/{VERSION}.jar")),
+                "GET /artifacts/client.jar".to_owned(),
+            ),
+            (
+                library.join("libraries/org/axial/fixture/1.0/fixture-1.0.jar"),
+                "GET /artifacts/library.jar".to_owned(),
+            ),
+            (
+                library.join(format!(
+                    "libraries/org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-{classifier}.jar"
+                )),
+                "GET /artifacts/natives.jar".to_owned(),
+            ),
+            (
+                library.join("assets/log_configs/fixture-log.xml"),
+                "GET /artifacts/log.xml".to_owned(),
+            ),
+            (
+                library.join("assets/indexes/fixture-assets.json"),
+                "GET /assets/index.json".to_owned(),
+            ),
+            (
+                library.join(format!("assets/objects/{}/{asset_hash}", &asset_hash[..2])),
+                format!("GET /assets/objects/{}/{asset_hash}", &asset_hash[..2]),
+            ),
+            (
+                runtime.join(java_relative_path()),
+                "GET /java-runtime/java".to_owned(),
+            ),
+            (
+                runtime.join(java_relative_path().replace("/java", "/fake_java.py")),
+                "GET /java-runtime/fake_java.py".to_owned(),
+            ),
+        ]
+        .map(|(path, key)| (path, provider.state.routes[&key].clone()));
+        let mut paths: Vec<_> = expected.iter().map(|(path, _)| path.clone()).collect();
+        paths.extend([
+            library.join(format!("versions/{VERSION}/{VERSION}.json")),
+            runtime.join(".axial-runtime-manifest.json"),
+            runtime.join(".axial-ready"),
+            canary.clone(),
+            marker.clone(),
+        ]);
+        let read_files = |paths: &[PathBuf]| {
+            assert!(paths.len() <= 128);
+            let mut total = 0;
+            paths
+                .iter()
+                .map(|path| {
+                    let metadata = std::fs::symlink_metadata(path).unwrap();
+                    assert!(metadata.is_file() && metadata.len() <= 4 << 20);
+                    let limit = (4 << 20).min((8 << 20) - total);
+                    assert!(metadata.len() <= limit as u64);
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(path)
+                        .unwrap()
+                        .take(limit as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .unwrap();
+                    assert!(bytes.len() <= limit);
+                    total += bytes.len();
+                    assert!(total <= 8 << 20);
+                    bytes
+                })
+                .collect::<Vec<_>>()
+        };
+        let published = read_files(&paths);
+        let queue = api.get("/api/v1/install/queue").await;
+        let sessions = api.get("/api/v1/launch/sessions").await;
+        let reports = api.get("/api/v1/launch/reports").await;
+        tokio::time::timeout(Duration::from_secs(60), initial.server.shutdown())
+            .await
+            .expect("initial API shutdown must settle after payload release")
+            .unwrap();
+        assert!(initial.server.is_shutdown_settled());
+        assert!(initial.tasks.shutdown_receipt().is_some());
+        assert!(initial.tasks.status().is_idle());
+        let released_exclusion = initial
+            .instances
+            .directories()
+            .exclusions()
+            .try_acquire(std::iter::empty::<String>(), [artifact])
+            .map(drop);
+        let after_shutdown = read_files(&paths);
+        let requests_before_reopen = provider.state.requests.lock().unwrap().clone();
+        drop(api);
+        drop(services.take());
+
+        services = Some(
+            start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+                .await
+                .unwrap(),
+        );
+        let reopened = services.as_ref().unwrap();
+        let reopened_api = Api::new(reopened);
+        let reopened_status = reopened_api.get(&status_path).await;
+        let reopened_queue = reopened_api.get("/api/v1/install/queue").await;
+        let reopened_sessions = reopened_api.get("/api/v1/launch/sessions").await;
+        let reopened_reports = reopened_api.get("/api/v1/launch/reports").await;
+        let pin = reopened.library.admit().unwrap();
+        let same_library = pin.read_projection().unwrap() == library;
+        let reopened_ready = reopened.installs.ready_version(&pin, VERSION).await.is_ok();
+        drop(pin);
+        let requests_after_reopen = provider.state.requests.lock().unwrap().clone();
+        let expected_requests: BTreeSet<_> = provider.state.routes.keys().cloned().collect();
+        tokio::time::timeout(Duration::from_secs(60), reopened.server.shutdown())
+            .await
+            .expect("reopened API shutdown must settle")
+            .unwrap();
+        assert!(reopened.server.is_shutdown_settled());
+        assert!(reopened.tasks.shutdown_receipt().is_some());
+        assert!(reopened.tasks.status().is_idle());
+        let after_reopen = read_files(&paths);
+        drop(reopened_api);
+        drop(services.take());
+        move || {
+            assert_eq!(published, after_shutdown);
+            assert_eq!(published, after_reopen);
+            for ((_, bytes), observed) in expected.iter().zip(&published) {
+                assert_eq!(observed, bytes);
+            }
+            assert_eq!(canary_while_held, EXTERNAL_CANARY);
+            assert_eq!(published[paths.len() - 2], EXTERNAL_CANARY);
+            assert_eq!(published[paths.len() - 1], marker_bytes);
+            assert_eq!(requests_after_reopen, requests_before_reopen);
+            assert_eq!(
+                requests_before_reopen
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                expected_requests
+            );
+            for observed in [sessions, reopened_sessions] {
+                assert_eq!(observed, json!({"sessions":[]}));
+            }
+            for observed in [reports, reopened_reports] {
+                assert_eq!(observed, json!({"reports":[]}));
+            }
+            assert_eq!(released_exclusion, Ok(()));
+            assert!(same_library && ready && reopened_ready && runtime_verified);
+            let refusal = held_shutdown.expect_err(
+                "accepted materialization must remain owned while the client body is withheld",
+            );
+            assert!(refusal.work.closing && !refusal.work.running.is_empty());
+            assert!(refusal.work.unsettled.is_empty());
+            assert!(!held_receipt && held_pins > 0 && version_absent);
+            assert_eq!(exclusion, Err(ExclusionError::Busy));
+            for held in [before, after] {
+                assert_eq!(held["install_id"], id);
+                assert_eq!(held["done"], false);
+                assert!(held["outcome"].is_null());
+                assert_ne!(held["view_model"]["phase_id"], "starting");
+                assert_eq!(held["allowed_actions"], json!([]));
+            }
+            assert_eq!(cancel_status, StatusCode::CONFLICT);
+            assert_eq!(
+                cancel_body,
+                json!({"error":"The library is in use. Wait for its current operation to finish."})
+            );
+            assert_eq!(terminal["install_id"], id);
+            assert_eq!(terminal["done"], true);
+            assert_eq!(terminal["outcome"], "succeeded");
+            assert_eq!(reopened_status, terminal);
+            for state in [queue, reopened_queue] {
+                assert_eq!(state["items"], json!([]));
+                assert!(state["active"].is_null() && state["latest_failure"].is_null());
+            }
+        }
+    })
+    .catch_unwind()
+    .await;
+    if journey.is_err() {
+        eprintln!(
+            "Retained materialization fixture before cleanup: {}",
+            temporary.take().unwrap().keep().display()
+        );
+    }
+    provider.state.client_hold.send_replace(false);
+    let shutdown = match &services {
+        Some(services) => {
+            std::panic::AssertUnwindSafe(tokio::time::timeout(
+                Duration::from_secs(60),
+                services.server.shutdown(),
+            ))
+            .catch_unwind()
+            .await
+        }
+        None => Ok(Ok(Ok(()))),
+    };
+    let settled = services
+        .as_ref()
+        .is_none_or(|services| services.server.is_shutdown_settled());
+    if matches!(&shutdown, Ok(Ok(Ok(())))) && settled {
+        drop(services);
+    } else {
+        if let Some(temporary) = temporary.take() {
+            eprintln!(
+                "Retained unjoined materialization fixture: {}",
+                temporary.keep().display()
+            );
+        }
+        std::mem::forget(services);
+    }
+    let provider_stop = provider
+        .stop
+        .take()
+        .is_some_and(|stop| stop.send(()).is_ok());
+    let provider_joined =
+        match tokio::time::timeout(Duration::from_secs(5), &mut provider.task).await {
+            Ok(result) => result.is_ok(),
+            Err(_) => {
+                provider.task.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(1), &mut provider.task).await;
+                false
+            }
+        };
+    let client_gate_failed = provider
+        .state
+        .client_gate_failed
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let client_requests = provider
+        .state
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.as_str() == "GET /artifacts/client.jar")
+        .count();
+    drop(provider);
+    let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        shutdown
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .expect("cleanup API shutdown must join within its deadline")
+            .unwrap();
+        assert!(settled);
+        assert!(
+            provider_stop && provider_joined,
+            "fixture provider must shut down and join"
+        );
+        assert!(
+            !client_gate_failed,
+            "the held client body must not fail or time out"
+        );
+        assert_eq!(
+            client_requests, 1,
+            "one valid client body must suffice without retries"
+        );
+        journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic))();
+    }));
+    if let Err(panic) = verified {
+        if let Some(temporary) = temporary.take() {
+            eprintln!(
+                "Retained materialization fixture: {}",
+                temporary.keep().display()
+            );
+        }
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
