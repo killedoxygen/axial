@@ -4583,6 +4583,101 @@ async fn preflight_reports_missing_java_override_without_launching() {
     let reports_before = api.get("/api/v1/launch/reports").await;
     let queue_before = api.get("/api/v1/install/queue").await;
     let sessions_before = api.get("/api/v1/launch/sessions").await;
+    let requests_before = provider.state.requests.lock().unwrap().clone();
+    let library = services.library.admit().unwrap().read_projection().unwrap();
+    let runtime = services.installs.runtime_cache().root().join(COMPONENT);
+    let classifier = if cfg!(target_os = "macos") {
+        "natives-macos"
+    } else {
+        "natives-linux"
+    };
+    let asset_hash = sha1(ASSET);
+    let mut protection_remaining = 4usize << 20;
+    let mut read_protected = |path: &PathBuf| -> std::io::Result<Vec<u8>> {
+        use std::io::{Error, ErrorKind, Read};
+
+        let overflow = || {
+            Error::new(
+                ErrorKind::InvalidData,
+                "Protection snapshot exceeds its byte budget.",
+            )
+        };
+        let mut file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > 1 << 20 {
+            return Err(overflow());
+        }
+        let allocation = usize::try_from(metadata.len())
+            .ok()
+            .and_then(|size| size.checked_add(1))
+            .ok_or_else(overflow)?;
+        protection_remaining = protection_remaining
+            .checked_sub(allocation)
+            .ok_or_else(overflow)?;
+        let mut bytes = vec![0; allocation];
+        let mut read = 0usize;
+        loop {
+            let count = file.read(&mut bytes[read..])?;
+            if count == 0 {
+                break;
+            }
+            read = read.checked_add(count).ok_or_else(overflow)?;
+            if read == allocation {
+                return Err(overflow());
+            }
+        }
+        bytes.truncate(read);
+        Ok(bytes)
+    };
+    let protected: Vec<_> = [
+        library.join(format!("versions/{VERSION}/{VERSION}.json")),
+        library.join(format!("versions/{VERSION}/{VERSION}.jar")),
+        library.join("libraries/org/axial/fixture/1.0/fixture-1.0.jar"),
+        library.join(format!(
+            "libraries/org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-{classifier}.jar"
+        )),
+        library.join("assets/log_configs/fixture-log.xml"),
+        library.join("assets/indexes/fixture-assets.json"),
+        library.join(format!("assets/objects/{}/{asset_hash}", &asset_hash[..2])),
+        runtime.join(java_relative_path()),
+        runtime.join(java_relative_path().replace("/java", "/fake_java.py")),
+        runtime.join(".axial-runtime-manifest.json"),
+        runtime.join(".axial-ready"),
+    ]
+    .into_iter()
+    .map(|path| {
+        let bytes = read_protected(&path);
+        (path, bytes)
+    })
+    .collect();
+    let config = api.get("/api/v1/config").await;
+    api.request(
+        reqwest::Method::PUT,
+        "/api/v1/config",
+        Some(json!({
+            "expected_revision":config["revision"],"java_path_override":missing_java
+        })),
+    )
+    .await;
+    let current = api.get(&instance_path).await;
+    let selected = api
+        .request(
+            reqwest::Method::PUT,
+            &instance_path,
+            Some(json!({"expected_revision":current["revision"],"java_path":COMPONENT})),
+        )
+        .await;
+    let selected_override = api.get(&preflight).await;
+    let inherited = api
+        .request(
+            reqwest::Method::PUT,
+            &instance_path,
+            Some(json!({"expected_revision":selected["revision"],"java_path":""})),
+        )
+        .await;
+    let inherited_override = api.get(&preflight).await;
+    let inherited_detail = api.get(&instance_path).await;
+    let inherited_list = api.get("/api/v1/instances").await;
     let private_args = "-Dpreflight.private=java-override-secret";
     let mut responses = Vec::new();
     for java in [&missing_java, &broken_java, &non_executable_java] {
@@ -4604,6 +4699,11 @@ async fn preflight_reports_missing_java_override_without_launching() {
     let reports_after = api.get("/api/v1/launch/reports").await;
     let queue_after = api.get("/api/v1/install/queue").await;
     let sessions_after = api.get("/api/v1/launch/sessions").await;
+    let requests_after = provider.state.requests.lock().unwrap().clone();
+    let protected_after: Vec<_> = protected
+        .iter()
+        .map(|(path, _)| read_protected(path))
+        .collect();
     services.server.shutdown().await.unwrap();
     assert!(services.server.is_shutdown_settled());
     drop(services);
@@ -4614,6 +4714,65 @@ async fn preflight_reports_missing_java_override_without_launching() {
     assert_eq!(queue_after, queue_before);
     assert_eq!(sessions_before, json!({"sessions":[]}));
     assert_eq!(sessions_after, sessions_before);
+    assert_eq!(
+        requests_after, requests_before,
+        "preflight must not acquire runtime sources"
+    );
+    for ((_, original), observed) in protected.into_iter().zip(protected_after) {
+        assert_eq!(
+            observed.expect("bounded protected-file observation"),
+            original.expect("bounded protected-file baseline"),
+            "preflight must preserve runtime and installed artifacts"
+        );
+    }
+    assert_eq!(selected["java_path"], "");
+    assert_eq!(selected_override["status"], "ready");
+    assert_eq!(selected_override["launchable"], true);
+    assert_eq!(
+        selected_override["readiness"],
+        json!({"launchable":true,"reasons":[]})
+    );
+    assert_eq!(
+        selected_override["overrides"],
+        json!({
+            "java":{"present":true,"origin":"instance"},"preset":{"present":false},
+            "raw_jvm_args":{"present":false}
+        })
+    );
+    assert_eq!(selected_override.get("error"), Some(&Value::Null));
+    assert_eq!(inherited["java_path"], "");
+    assert_eq!(inherited_detail["java_path"], "");
+    assert_eq!(inherited_override["status"], "ready");
+    assert_eq!(inherited_override["launchable"], false);
+    assert_eq!(
+        inherited_override["overrides"],
+        json!({
+            "java":{"present":true,"origin":"global"},"preset":{"present":false},
+            "raw_jvm_args":{"present":false}
+        })
+    );
+    assert_eq!(
+        inherited_override["error"],
+        json!({
+            "code":"runtime_unavailable","error":"The selected Java executable is missing."
+        })
+    );
+    assert_eq!(
+        inherited_override["readiness"],
+        json!({
+            "launchable":false,"reasons":[{
+                "id":"java_override_missing","severity":"blocking",
+                "message":"Selected Java override is unavailable. Choose another Java runtime."
+            }]
+        })
+    );
+    let listed = inherited_list["instances"].as_array().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], instance);
+    for view in [&inherited, &inherited_detail, &listed[0]] {
+        assert_eq!(view["launch_action"]["launchable"], false);
+        assert_eq!(view["launch_action"]["primary_action"], "blocked");
+    }
     assert_eq!(script_after, script.as_bytes());
     assert_eq!(data_after, data);
     assert_eq!(canary_after, canary_bytes);
@@ -4679,6 +4838,11 @@ async fn preflight_reports_missing_java_override_without_launching() {
             assert!(budget[pressure].is_boolean(), "{pressure}: {budget:?}");
         }
         assert_eq!(budget["install_pressure"], false);
+    }
+    for response in responses
+        .iter()
+        .chain([&selected_override, &inherited_override])
+    {
         let encoded = response.to_string();
         for private in [
             temporary.path().to_str().unwrap(),
