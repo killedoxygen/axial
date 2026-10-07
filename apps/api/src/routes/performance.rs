@@ -650,6 +650,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn performance_health_plan_mismatch_does_not_claim_file_damage() {
+        let fixture = ProjectionFixture::new().await;
+        fixture.seed_managed().await;
+        let before = files(&fixture.mods);
+        let response = get_json(
+            fixture.router(),
+            &format!(
+                "/api/v1/performance/health?instance_id={}",
+                fixture.instance
+            ),
+        )
+        .await;
+        let after = files(&fixture.mods);
+        fixture.close().await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        assert_eq!(response.1["health"], "invalid");
+        assert_eq!(
+            response.1["state"]["installed_mods"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            response.1["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| {
+                    warning == "managed composition does not match the current declarative plan"
+                })
+        );
+        assert_eq!(before, after);
+        assert_eq!(
+            response.1["view_model"]["detail"],
+            "The managed bundle could not be validated."
+        );
+    }
+
+    #[tokio::test]
     async fn performance_projection_nonmanaged_health_is_disabled_without_file_changes() {
         let fixture = ProjectionFixture::new().await;
         fixture.seed_managed().await;

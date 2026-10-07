@@ -67,7 +67,7 @@ pub fn health_response(inspection: ManagedCompositionInspection) -> PerformanceH
         BundleHealth::Invalid => (
             "invalid",
             "Performance needs attention",
-            "Managed files do not match their recorded composition.",
+            "The managed bundle could not be validated.",
             ViewModelTone::Warn,
         ),
     };
