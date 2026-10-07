@@ -78,7 +78,7 @@ function productionCompositionSource(source) {
   const wrapper = functionSource(source, 'start_profile');
   assert.match(
     wrapper.slice(wrapper.indexOf('{')),
-    /^\{\s*start_profile_inner\(\s*profile_root,\s*extra_origin,\s*native_login,\s*collector,\s*(?:#\[cfg\(test\)\]\s*None,\s*){2}\)\s*\.await\s*\}$/,
+    /^\{\s*let telemetry = Arc::new\(Telemetry::new\(collector\)\);\s*let result = start_profile_inner\(\s*profile_root,\s*extra_origin,\s*native_login,\s*telemetry\.clone\(\),\s*(?:#\[cfg\(test\)\]\s*None,\s*){2}\)\s*\.await;\s*if result\.is_err\(\) && telemetry\.report_startup_failure\(\) \{\s*telemetry\.flush_once\(\)\.await;\s*\}\s*result\s*\}$/,
     'production startup must delegate directly to the shared composition without test input injection',
   );
   return functionSource(source, 'start_profile_inner');
@@ -381,16 +381,22 @@ pub fn unmounted_router() -> Router {
 test('route inventory follows production delegation without including test-only startup mounts', () => {
   const source = `
 async fn start_profile() {
-    start_profile_inner(
+    let telemetry = Arc::new(Telemetry::new(collector));
+    let result = start_profile_inner(
         profile_root,
         extra_origin,
         native_login,
-        collector,
+        telemetry.clone(),
         #[cfg(test)]
         None,
         #[cfg(test)]
         None,
-    ).await
+    )
+    .await;
+    if result.is_err() && telemetry.report_startup_failure() {
+        telemetry.flush_once().await;
+    }
+    result
 }
 #[cfg(test)]
 async fn start_profile_with_test_endpoints() {
@@ -412,7 +418,12 @@ async fn start_profile_inner() {
     }
   }
   assert.throws(
-    () => productionCompositionSource(source.replace('    start_profile_inner(', '    test_startup(')),
+    () =>
+      productionCompositionSource(source.replace('let result = start_profile_inner(', 'let result = test_startup(')),
+    /delegate directly/,
+  );
+  assert.throws(
+    () => productionCompositionSource(source.replace('    result\n}', '    alternate_result\n}')),
     /delegate directly/,
   );
 });
