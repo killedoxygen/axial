@@ -72,11 +72,11 @@ pub(super) fn capture(
                 })
                 .max_by_key(|(mount, _)| mount.components().count())
                 .and_then(|selected| {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     {
                         available_disk_bytes(&selected.0)
                     }
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                     {
                         Some(selected.1.available_space())
                     }
@@ -113,6 +113,50 @@ pub(super) fn capture(
 fn available_disk_bytes(path: &Path) -> Option<u64> {
     let disk = rustix::fs::statvfs(path).ok()?;
     disk.f_bavail.checked_mul(disk.f_frsize)
+}
+
+#[cfg(target_os = "macos")]
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    use core_foundation::{
+        array::CFArray,
+        base::{CFType, TCFType},
+        dictionary::CFDictionary,
+        number::CFNumber,
+        string::{CFString, CFStringRef},
+        url::{CFURL, CFURLCopyResourcePropertiesForKeys, kCFURLVolumeAvailableCapacityKey},
+    };
+    unsafe extern "C" {
+        static kCFURLVolumeAvailableCapacityForImportantUsageKey: CFStringRef;
+    }
+
+    let url = CFURL::from_path(path, true)?;
+    // These process-lifetime framework constants are retained by their wrappers.
+    let important =
+        unsafe { CFString::wrap_under_get_rule(kCFURLVolumeAvailableCapacityForImportantUsageKey) };
+    let available = unsafe { CFString::wrap_under_get_rule(kCFURLVolumeAvailableCapacityKey) };
+    let keys = CFArray::from_CFTypes(&[important.clone(), available.clone()]);
+    // The Copy result is owned; a null result carries no capacity observation.
+    let properties = unsafe {
+        CFURLCopyResourcePropertiesForKeys(
+            url.as_concrete_TypeRef(),
+            keys.as_concrete_TypeRef(),
+            std::ptr::null_mut(),
+        )
+    };
+    if properties.is_null() {
+        return None;
+    }
+    let properties: CFDictionary<CFString, CFType> =
+        unsafe { CFDictionary::wrap_under_create_rule(properties) };
+    let bytes = |key: &CFString| {
+        let value = properties.find(key)?.downcast::<CFNumber>()?.to_i64()?;
+        u64::try_from(value).ok()
+    };
+    let preferred = bytes(&important);
+    preferred
+        .filter(|value| *value > 0)
+        .or_else(|| bytes(&available))
+        .or(preferred)
 }
 
 fn cpu_pressure(threads: Option<usize>, sessions: usize, loads: [Option<u64>; 3]) -> bool {
@@ -152,6 +196,41 @@ fn load_x100(value: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires the isolated native capacity probe"]
+    fn native_capacity_observation_retains_failure_zero_and_reclaimable_space() {
+        let mode = std::env::var("AXIAL_CAPACITY_PROBE").expect("native probe mode required");
+        let expected = match mode.as_str() {
+            "missing" | "negative" | "wrong_type" | "failure" => None,
+            "zero" | "important_zero_only" => Some(0),
+            "important" => Some(4096),
+            "fallback" | "missing_important" => Some(2048),
+            _ => panic!("unknown native probe mode"),
+        };
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let disks = Disks::new_with_refreshed_list();
+        assert!(
+            disks.list().iter().any(|disk| {
+                disk.mount_point()
+                    .canonicalize()
+                    .is_ok_and(|mount| root.path().starts_with(mount))
+            }),
+            "the capacity probe must retain the fixture's eligible disk"
+        );
+        let budget = capture(&capture_host(), (0, 0), 0, 2048, [root.path(), root.path()]);
+        assert_eq!(budget.launch_disk_available_mb, expected);
+        assert_eq!(
+            budget.disk_pressure,
+            expected.is_some_and(|value| value < 2048)
+        );
+        let payload = serde_json::to_value(budget).unwrap();
+        assert_eq!(
+            payload.get("launch_disk_available_mb"),
+            expected.map(serde_json::Value::from).as_ref()
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn run_observation_child(test: &str, marker: &str) {
