@@ -542,3 +542,43 @@ test('download and install reaches apply through ready but still waits for insta
   await h.poll();
   assert.equal(h.restarts(), 1);
 });
+
+for (const activity of ['game', 'download', 'queue'] as const) {
+  test(`download and install waits for ${activity} activity before applying exactly once`, async () => {
+    const h = harness();
+    h.store.updateInfo.value = info();
+    if (activity === 'game') h.store.launchState.value.status = 'running';
+    if (activity === 'download') h.downloads.activeDownload.value = {};
+    if (activity === 'queue') h.downloads.downloadQueue.value.view_model.queued_count = 1;
+    await h.updater.downloadAndInstallUpdate();
+    assert.equal(h.updater.updateFlow.value.phase, 'downloading');
+    h.responses.set('/update/flow', flow('ready'));
+    await h.poll();
+    assert.equal(h.updater.updateFlow.value.phase, 'ready');
+    assert.deepEqual(
+      h.calls.filter((call) => call.method === 'POST').map((call) => call.path),
+      ['/update/download'],
+    );
+    assert.equal(h.restarts(), 0);
+
+    const waitingNotices = h.notices.length;
+    await h.poll();
+    assert.equal(h.notices.length, waitingNotices);
+    assert.equal(h.calls.filter((call) => call.path === '/update/apply').length, 0);
+    assert.equal(h.restarts(), 0);
+    h.store.launchState.value.status = 'idle';
+    h.downloads.activeDownload.value = null;
+    h.downloads.downloadQueue.value.view_model.queued_count = 0;
+    await h.poll();
+    assert.equal(h.updater.updateFlow.value.phase, 'applying');
+    assert.equal(h.calls.filter((call) => call.path === '/update/apply').length, 1);
+    assert.equal(h.restarts(), 0);
+    h.responses.set('/update/flow', flow('applying'));
+    await h.poll();
+    assert.equal(h.calls.filter((call) => call.path === '/update/apply').length, 1);
+    h.responses.set('/update/flow', flow('restart-pending'));
+    await h.poll();
+    assert.equal(h.restarts(), 1);
+    assert.equal(h.calls.filter((call) => call.method === 'POST').length, 2);
+  });
+}

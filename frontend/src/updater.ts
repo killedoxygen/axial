@@ -209,20 +209,25 @@ function setUpdateFlow(next: UpdateFlowState, applyOnReady = true): void {
   if (previous.phase !== 'ready' && next.phase === 'ready') {
     Sound.ui('affirm');
     if (autoApplyOnReady && applyOnReady) {
-      autoApplyOnReady = false;
       if (restartBlockedByActivity()) {
         toast(`Update ${displayVersion(next.version)} ready. It installs once downloads and games finish.`);
-      } else {
-        void applyUpdateAndRestart();
       }
     } else {
       toast(`Update ${displayVersion(next.version)} downloaded. Restart to install.`);
     }
   }
+  if (next.phase === 'ready' && autoApplyOnReady && applyOnReady && !restartBlockedByActivity()) {
+    void applyUpdateAndRestart();
+  }
 }
 
 function updateFlowPollActive(phase: UpdateFlowPhase): boolean {
   return phase === 'downloading' || phase === 'applying';
+}
+
+function updateFlowNeedsPolling(): boolean {
+  const phase = updateFlow.value.phase;
+  return updateFlowPollActive(phase) || (phase === 'ready' && autoApplyOnReady);
 }
 
 function scheduleUpdateFlowPoll(): void {
@@ -254,10 +259,7 @@ async function pollUpdateFlow(): Promise<void> {
     // An unavailable read cannot settle an accepted or possibly accepted command.
   } finally {
     flowPollPending = false;
-    if (
-      (pendingUpdateRequest && pendingUpdateRequest.response !== 'pending') ||
-      updateFlowPollActive(updateFlow.value.phase)
-    )
+    if ((pendingUpdateRequest && pendingUpdateRequest.response !== 'pending') || updateFlowNeedsPolling())
       scheduleUpdateFlowPoll();
   }
 }
@@ -305,7 +307,7 @@ export async function startUpdateDownload(): Promise<void> {
     const next = updateFlowFromResponse(res);
     pendingUpdateRequest = null;
     setUpdateFlow(next);
-    if (updateFlowPollActive(updateFlow.value.phase)) scheduleUpdateFlowPoll();
+    if (updateFlowNeedsPolling()) scheduleUpdateFlowPoll();
   } catch (err: unknown) {
     recoverUpdateRequest(err);
   }
@@ -333,6 +335,7 @@ export async function applyUpdateAndRestart(): Promise<void> {
     return;
   }
   if (!beginUpdateRequest('apply', updateFlow.value.version)) return;
+  autoApplyOnReady = false;
   try {
     const res = await api('POST', '/update/apply');
     const next = updateFlowFromResponse(res);
