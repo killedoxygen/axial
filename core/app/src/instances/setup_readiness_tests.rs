@@ -1737,6 +1737,368 @@ async fn shutdown_preserves_created_instance_while_install_provider_is_pending()
 }
 
 #[tokio::test]
+async fn explicit_build_resolution_cancels_without_publishing() {
+    use futures_util::FutureExt;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    for cancel_fetch in [false, true] {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
+        let library = service.instances.directories().library().clone();
+        let owner = service.instances.tasks.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        service.installs = Arc::new(
+            (*service.installs).clone().with_loader_url(
+                format!(
+                    "http://{}/v2/versions/loader/1.21.4",
+                    listener.local_addr().unwrap()
+                )
+                .parse()
+                .unwrap(),
+            ),
+        );
+        let (requested, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "explicit build request was not received"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("explicit build fixture accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            let mut length = 0;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !request[..length]
+                .windows(4)
+                .any(|bytes| bytes == b"\r\n\r\n")
+            {
+                stream
+                    .set_read_timeout(Some(
+                        deadline.checked_duration_since(Instant::now()).unwrap(),
+                    ))
+                    .unwrap();
+                assert!(
+                    length < request.len(),
+                    "explicit build headers exceed their bound"
+                );
+                let read = stream.read(&mut request[length..]).unwrap();
+                assert!(read > 0, "explicit build request ended before its headers");
+                length += read;
+            }
+            assert!(request[..length].starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n"));
+            let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            requested.send(()).expect("explicit build observer dropped");
+            released
+                .recv_timeout(Duration::from_secs(8))
+                .expect("explicit build body was not released");
+            match stream.write_all(body) {
+                Ok(()) => true,
+                Err(error)
+                    if cancel_fetch
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                {
+                    false
+                }
+                Err(error) => panic!("explicit build body write failed: {error}"),
+            }
+        });
+        let service = Arc::new(service);
+        let mut release = Some(release);
+        let mut caller = None;
+        let absent = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
+        let cache = root
+            .path()
+            .join("cache/loaders/catalog/component-fabric-builds-1.21.4.json");
+        let canary = root.path().join("unrelated-user-file.txt");
+        let build_id = loaders::build_id_for(LoaderComponentId::Fabric, "1.21.4", "0.16.14");
+        let selection_id = format!("loader_build|net.fabricmc.fabric-loader|{build_id}");
+        let version_id = axial_minecraft::installed_version_id_for(
+            LoaderComponentId::Fabric,
+            "1.21.4",
+            "0.16.14",
+        )
+        .unwrap();
+        let queue_before = service.installs.snapshot();
+        let journey = std::panic::AssertUnwindSafe(async {
+            let pin = library.admit().unwrap();
+            let original_generation = pin.generation();
+            let original_library = pin.library_id();
+            let operation = pin.managed_library().unwrap();
+            operation.prepare_layout().unwrap();
+            let initially_absent = absent(&cache)
+                && absent(&root.path().join("instances"))
+                && absent(&root.path().join("cache/version_manifest_v2.json"))
+                && loaders::fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.4")
+                    .unwrap()
+                    .is_none();
+            let not_ready = matches!(
+                service.installs.ready_version(&pin, &version_id).await,
+                Err(crate::install::queue::InstallError::NotReady)
+            );
+            drop(operation);
+            drop(pin);
+            std::fs::write(&canary, b"preserve unrelated user bytes\n").unwrap();
+            caller = Some(tokio::spawn({
+                let service = service.clone();
+                let selection_id = selection_id.clone();
+                async move { service.resolve(&selection_id).await }
+            }));
+            tokio::time::timeout(Duration::from_secs(5), observed)
+                .await
+                .expect("explicit build request was not observed")
+                .expect("explicit build observer closed");
+            let held = !server.is_finished() && !caller.as_ref().unwrap().is_finished();
+            let records_held = service.instances.registry().list().unwrap();
+            let pending_held = service.instances.pending().unwrap();
+            let queue_held = service.installs.snapshot();
+            let accepted = owner.status();
+            let held_shutdown = if cancel_fetch {
+                Some(owner.shutdown(Duration::from_secs(2)).await)
+            } else {
+                release.take().unwrap().send(()).unwrap();
+                None
+            };
+            let receipt = owner.shutdown_receipt();
+            let held_receipted = receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.belongs_to(&owner));
+            drop(receipt);
+            let result = if held_shutdown.as_ref().is_none_or(|result| result.is_ok()) {
+                match tokio::time::timeout(Duration::from_secs(2), caller.as_mut().unwrap()).await {
+                    Ok(joined) => {
+                        drop(caller.take());
+                        Some(joined.unwrap().map(|(target, request, admission)| {
+                            let original = admission.generation().generation()
+                                == original_generation
+                                && admission.generation().library_id() == original_library;
+                            let valid = admission.validate().is_ok();
+                            (target, request, original, valid)
+                        }))
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let body_still_held = !server.is_finished();
+            let final_pin = library.admit().unwrap();
+            let same_generation = final_pin.generation() == original_generation
+                && final_pin.library_id() == original_library
+                && final_pin.revalidate().is_ok();
+            drop(final_pin);
+            move || {
+                assert!(initially_absent && not_ready && held && same_generation);
+                assert!(
+                    !accepted.closing
+                        && accepted.unsettled.is_empty()
+                        && !accepted.running.is_empty()
+                );
+                assert!(records_held.is_empty() && pending_held.is_empty());
+                (
+                    held_shutdown,
+                    held_receipted,
+                    body_still_held,
+                    result,
+                    queue_held,
+                )
+            }
+        })
+        .catch_unwind()
+        .await;
+        service.installs.close_admission();
+        let released = release.take().map(|release| release.send(()));
+        let shutdown = std::panic::AssertUnwindSafe(owner.shutdown(Duration::from_secs(15)))
+            .catch_unwind()
+            .await;
+        let remaining = match caller.take() {
+            Some(mut caller) => {
+                match tokio::time::timeout(Duration::from_secs(5), &mut caller).await {
+                    Ok(Ok(_)) => true,
+                    Ok(Err(_)) => false,
+                    Err(_) => {
+                        caller.abort();
+                        let _ = tokio::time::timeout(Duration::from_secs(1), caller).await;
+                        false
+                    }
+                }
+            }
+            None => true,
+        };
+        let observers =
+            tokio::time::timeout(Duration::from_secs(5), service.installs.join_observers()).await;
+        let server = tokio::task::spawn_blocking(move || server.join());
+        let server = tokio::time::timeout(Duration::from_secs(18), server).await;
+        let final_state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let pin = library.admit().unwrap();
+            let operation = pin.managed_library().unwrap();
+            (
+                service.instances.registry().list().unwrap(),
+                service.instances.pending().unwrap(),
+                service.installs.snapshot(),
+                loaders::fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.4")
+                    .unwrap()
+                    .is_none(),
+            )
+        }));
+        let receipt = owner.shutdown_receipt();
+        let receipted = receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.belongs_to(&owner));
+        let idle = owner.status().is_idle();
+        let unsettled = service.installs.has_unsettled_effects()
+            || service.instances.has_unsettled_effects()
+            || service.instances.has_pending_intents();
+        let runtime_settled = service.installs.runtime_cache().settle();
+        drop(receipt);
+        drop(service);
+        drop(owner);
+        let pins = library.wait_for_pins(Duration::from_secs(2)).await;
+        let preserved = if matches!(&shutdown, Ok(Ok(())))
+            && matches!(&observers, Ok(Ok(())))
+            && matches!(&server, Ok(Ok(Ok(_))))
+            && receipted
+            && idle
+            && !unsettled
+            && runtime_settled.is_ok()
+            && pins.is_ok()
+        {
+            Some(library.try_preserve())
+        } else {
+            None
+        };
+        let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(
+                released.is_none_or(|released| released.is_ok()),
+                "explicit build gate ended before cleanup"
+            );
+            assert!(
+                matches!(shutdown, Ok(Ok(()))),
+                "explicit resolution owner did not join after release"
+            );
+            assert!(remaining, "live explicit resolution caller did not join");
+            assert!(
+                matches!(observers, Ok(Ok(()))),
+                "queue observers did not join"
+            );
+            let delivered = server
+                .expect("provider server join timed out")
+                .expect("provider join task failed")
+                .expect("provider server failed");
+            assert!(
+                cancel_fetch || delivered,
+                "positive provider body was not delivered"
+            );
+            assert!(receipted && idle && !unsettled && runtime_settled.is_ok());
+            assert!(
+                pins.is_ok(),
+                "profile capabilities remained after explicit resolution joined"
+            );
+            assert!(
+                matches!(preserved, Some(Ok(()))),
+                "explicit resolution fixture root did not preserve"
+            );
+            let (records, pending, queue, cache_absent) = final_state.unwrap();
+            assert!(records.is_empty() && pending.is_empty() && cache_absent);
+            assert!(
+                queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none()
+            );
+            assert_eq!(queue.registry_revision, queue_before.registry_revision);
+            assert!(
+                absent(&cache)
+                    && absent(&root.path().join("instances"))
+                    && absent(&root.path().join("cache/version_manifest_v2.json"))
+            );
+            for name in ["versions", "libraries", "assets", "cache/loaders/catalog"] {
+                assert!(
+                    std::fs::read_dir(root.path().join(name))
+                        .unwrap()
+                        .next()
+                        .is_none()
+                );
+            }
+            assert_eq!(
+                std::fs::read(&canary).unwrap(),
+                b"preserve unrelated user bytes\n"
+            );
+            let (held_shutdown, held_receipted, body_still_held, result, queue_held) = match journey
+            {
+                Ok(verify) => verify(),
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+            assert_eq!(queue_held, queue_before);
+            if cancel_fetch {
+                assert!(
+                    body_still_held,
+                    "explicit provider body escaped the cancellation gate"
+                );
+                let held_shutdown = held_shutdown.unwrap();
+                assert!(
+                    held_shutdown.is_ok() && held_receipted,
+                    "explicit build resolution did not settle while its provider body remained withheld: {held_shutdown:?}"
+                );
+                assert!(
+                    matches!(result, Some(Err(InstanceError::Cancelled))),
+                    "live explicit resolution caller did not return typed cancellation before release: {result:?}"
+                );
+            } else {
+                let (target, request, original, valid) = result
+                    .expect("positive explicit resolution did not return")
+                    .unwrap();
+                assert_eq!(target.selection_id(), selection_id);
+                assert_eq!(target.version_id(), version_id);
+                assert_eq!(target.minecraft_version(), "1.21.4");
+                assert_eq!(target.loader_key(), "fabric");
+                assert_eq!(
+                    request,
+                    InstallQueueRequest::Loader {
+                        component_id: LoaderComponentId::Fabric,
+                        build_id
+                    }
+                );
+                assert!(
+                    original && valid,
+                    "explicit resolution did not retain its valid original Admission"
+                );
+            }
+        }));
+        if let Err(panic) = verification {
+            eprintln!(
+                "Retained explicit resolution fixture (cancel_fetch={cancel_fetch}): {}",
+                root.keep().display()
+            );
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
 async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
     use futures_util::FutureExt;
     use std::io::{Read, Write};

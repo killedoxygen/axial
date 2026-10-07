@@ -23,7 +23,7 @@ use crate::{
             InstallQueueContentActionRequest, InstallQueueInstallItemViewModel,
             InstallQueueLoaderItemViewModel, InstallQueueRequest, InstallQueueStateResponse,
         },
-        queue::InstallQueue,
+        queue::{InstallError, InstallQueue},
     },
     settings::SettingsStore,
     tasks::{CancellationToken, TaskHandle},
@@ -787,9 +787,12 @@ impl SetupService {
             Some(target) => target,
             None => self
                 .installs
-                .resolve_target(&request)
+                .resolve_target_cancellable(&request, cancel.cancelled())
                 .await
-                .map_err(|_| InstanceError::VersionUnavailable)?,
+                .map_err(|error| match error {
+                    InstallError::Cancelled => InstanceError::Cancelled,
+                    _ => InstanceError::VersionUnavailable,
+                })?,
         };
         admission.validate()?;
         let (minecraft_version, loader_key) = match resolved.loader {
