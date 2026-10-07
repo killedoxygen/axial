@@ -31,7 +31,7 @@ pub(crate) use forge_installer::{
 pub use index::{
     fetch_builds, fetch_builds_cancellable, fetch_cached_builds, fetch_components,
     fetch_supported_versions, fetch_supported_versions_cancellable,
-    resolve_build_record_for_install,
+    resolve_build_record_for_install, resolve_build_record_for_install_cancellable,
 };
 #[cfg(feature = "test-support")]
 pub use index::{

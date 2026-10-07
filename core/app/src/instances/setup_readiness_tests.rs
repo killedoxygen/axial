@@ -1333,6 +1333,410 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
 }
 
 #[tokio::test]
+async fn shutdown_preserves_created_instance_while_install_provider_is_pending() {
+    use futures_util::FutureExt;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
+    let library = service.instances.directories().library().clone();
+    let owner = service.instances.tasks.clone();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    service.loader_build_url = Some(format!("{base}/v2/versions/loader/1.21.4").parse().unwrap());
+    service.installs = Arc::new(
+        (*service.installs).clone().with_loader_url(
+            format!("{base}/pending-install-resolution")
+                .parse()
+                .unwrap(),
+        ),
+    );
+    let (requested, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut requested = Some(requested);
+        let mut routes = Vec::new();
+        for path in ["/v2/versions/loader/1.21.4", "/pending-install-resolution"] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "creation provider request was not received"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("creation fixture accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            let mut length = 0;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !request[..length]
+                .windows(4)
+                .any(|bytes| bytes == b"\r\n\r\n")
+            {
+                stream
+                    .set_read_timeout(Some(
+                        deadline.checked_duration_since(Instant::now()).unwrap(),
+                    ))
+                    .unwrap();
+                assert!(
+                    length < request.len(),
+                    "creation request headers exceed their bound"
+                );
+                let read = stream.read(&mut request[length..]).unwrap();
+                assert!(read > 0, "creation request ended before its headers");
+                length += read;
+            }
+            assert!(request[..length].starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()));
+            let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            routes.push(path);
+            let held = path == "/pending-install-resolution";
+            if held {
+                requested
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .expect("creation request observer dropped");
+                released
+                    .recv_timeout(Duration::from_secs(8))
+                    .expect("creation provider body was not released");
+            }
+            match stream.write_all(body) {
+                Ok(()) => {}
+                Err(error)
+                    if held
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ) => {}
+                Err(error) => panic!("creation provider body write failed: {error}"),
+            }
+        }
+        routes
+    });
+    let service = Arc::new(service);
+    let mut caller = None;
+    let cache = root
+        .path()
+        .join("cache/loaders/catalog/component-fabric-builds-1.21.4.json");
+    let canary = root.path().join("unrelated-user-file.txt");
+    let version_id =
+        axial_minecraft::installed_version_id_for(LoaderComponentId::Fabric, "1.21.4", "0.16.14")
+            .unwrap();
+    let queue_before = service.installs.snapshot();
+    let journey = std::panic::AssertUnwindSafe(async {
+        let pin = library.admit().unwrap();
+        let operation = pin.managed_library().unwrap();
+        operation.prepare_layout().unwrap();
+        let cache_absent = std::fs::symlink_metadata(&cache)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            && loaders::fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.4")
+                .unwrap()
+                .is_none();
+        let not_ready = matches!(
+            service.installs.ready_version(&pin, &version_id).await,
+            Err(crate::install::queue::InstallError::NotReady)
+        );
+        drop(operation);
+        drop(pin);
+        std::fs::write(&canary, b"preserve unrelated user bytes\n").unwrap();
+        let initially_empty = service.instances.registry().list().unwrap().is_empty()
+            && service.instances.pending().unwrap().is_empty();
+        caller = Some(tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .create(
+                        serde_json::from_value(serde_json::json!({
+                            "name": "PendingInstallProvider",
+                            "selection_id": "loader_auto|net.fabricmc.fabric-loader|1.21.4"
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .map(|created| serde_json::to_value(created).unwrap())
+            }
+        }));
+        tokio::time::timeout(Duration::from_secs(5), observed)
+            .await
+            .expect("postcommit provider request was not observed")
+            .expect("provider observer closed");
+        let records = service.instances.registry().list().unwrap();
+        let record = records
+            .first()
+            .expect("provider request preceded registry commit");
+        let live = service
+            .instances
+            .registry()
+            .get_live(&record.instance.id)
+            .unwrap();
+        let registered = service
+            .instances
+            .directories()
+            .admit(&record.instance.id)
+            .is_ok_and(|admitted| admitted.revalidate().is_ok());
+        let pending_empty = service.instances.pending().unwrap().is_empty();
+        let cache_at_commit = std::fs::read(&cache).unwrap();
+        let queue_at_commit = service.installs.snapshot();
+        let held = !server.is_finished() && !caller.as_ref().unwrap().is_finished();
+        let accepted = owner.status();
+        let held_shutdown = owner.shutdown(Duration::from_secs(2)).await;
+        let receipt = owner.shutdown_receipt();
+        let held_receipted = receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.belongs_to(&owner));
+        drop(receipt);
+        let response = if held_shutdown.is_ok() {
+            let joined =
+                tokio::time::timeout(Duration::from_secs(1), caller.as_mut().unwrap()).await;
+            match joined {
+                Ok(joined) => {
+                    drop(caller.take());
+                    Some(joined.unwrap())
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let body_still_held = !server.is_finished();
+        let records_after_shutdown = service.instances.registry().list().unwrap();
+        let queue_after_shutdown = service.installs.snapshot();
+        let cache_after_shutdown = std::fs::read(&cache).unwrap();
+        move || {
+            assert!(cache_absent && not_ready && initially_empty);
+            assert!(
+                held && body_still_held,
+                "postcommit provider body escaped its gate"
+            );
+            assert!(
+                !accepted.closing && accepted.unsettled.is_empty() && !accepted.running.is_empty()
+            );
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0], live);
+            assert!(
+                registered && pending_empty,
+                "held provider must follow complete registry and namespace publication"
+            );
+            assert_eq!(records_after_shutdown, records);
+            assert_eq!(queue_after_shutdown, queue_at_commit);
+            assert_eq!(cache_after_shutdown, cache_at_commit);
+            (
+                held_shutdown,
+                held_receipted,
+                response,
+                records,
+                queue_at_commit,
+                cache_at_commit,
+            )
+        }
+    })
+    .catch_unwind()
+    .await;
+    service.installs.close_admission();
+    let released = release.send(());
+    let shutdown = std::panic::AssertUnwindSafe(owner.shutdown(Duration::from_secs(15)))
+        .catch_unwind()
+        .await;
+    let remaining = match caller.take() {
+        Some(mut caller) => match tokio::time::timeout(Duration::from_secs(5), &mut caller).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                caller.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(1), caller).await;
+                false
+            }
+        },
+        None => true,
+    };
+    let observers =
+        tokio::time::timeout(Duration::from_secs(5), service.installs.join_observers()).await;
+    let server = tokio::task::spawn_blocking(move || server.join());
+    let server = tokio::time::timeout(Duration::from_secs(18), server).await;
+    let final_state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let pin = library.admit().unwrap();
+        let operation = pin.managed_library().unwrap();
+        let records = service.instances.registry().list().unwrap();
+        let registered = records.first().is_some_and(|record| {
+            service
+                .instances
+                .directories()
+                .admit(&record.instance.id)
+                .is_ok_and(|admitted| admitted.revalidate().is_ok())
+        });
+        (
+            records,
+            registered,
+            service.instances.pending().unwrap(),
+            service.installs.snapshot(),
+            loaders::fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.4").unwrap(),
+        )
+    }));
+    let receipt = owner.shutdown_receipt();
+    let receipted = receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.belongs_to(&owner));
+    let idle = owner.status().is_idle();
+    let unsettled = service.installs.has_unsettled_effects()
+        || service.instances.has_unsettled_effects()
+        || service.instances.has_pending_intents();
+    let runtime_settled = service.installs.runtime_cache().settle();
+    drop(receipt);
+    drop(service);
+    drop(owner);
+    let pins = library.wait_for_pins(Duration::from_secs(2)).await;
+    let preserved = if matches!(&shutdown, Ok(Ok(())))
+        && matches!(&observers, Ok(Ok(())))
+        && matches!(&server, Ok(Ok(Ok(_))))
+        && receipted
+        && idle
+        && !unsettled
+        && runtime_settled.is_ok()
+        && pins.is_ok()
+    {
+        Some(library.try_preserve())
+    } else {
+        None
+    };
+    let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(released.is_ok(), "provider body gate ended before cleanup");
+        assert!(
+            matches!(shutdown, Ok(Ok(()))),
+            "creation owner did not join after body release"
+        );
+        assert!(remaining, "live creation caller did not join");
+        assert!(
+            matches!(observers, Ok(Ok(()))),
+            "queue observers did not join"
+        );
+        let routes = server
+            .expect("provider server join timed out")
+            .expect("provider join task failed")
+            .expect("provider server failed");
+        assert_eq!(
+            routes,
+            ["/v2/versions/loader/1.21.4", "/pending-install-resolution"]
+        );
+        assert!(receipted && idle && !unsettled && runtime_settled.is_ok());
+        assert!(
+            pins.is_ok(),
+            "profile capabilities remained after creation joined"
+        );
+        assert!(
+            matches!(preserved, Some(Ok(()))),
+            "creation fixture root did not preserve"
+        );
+        let (records, registered, pending, queue, cached) = final_state.unwrap();
+        let (held_shutdown, held_receipted, response, committed, queue_at_commit, cache_at_commit) =
+            match journey {
+                Ok(verify) => verify(),
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+        assert_eq!(records, committed);
+        assert!(registered && pending.is_empty());
+        assert_eq!(records[0].instance.name, "PendingInstallProvider");
+        assert_eq!(records[0].instance.version_id, version_id);
+        assert_eq!(queue_at_commit, queue_before);
+        assert!(queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none());
+        assert_eq!(queue.registry_revision, queue_before.registry_revision);
+        assert_eq!(std::fs::read(&cache).unwrap(), cache_at_commit);
+        let (builds, state) = cached.expect("initial real Fabric response was not cached");
+        assert!(
+            state.availability.fresh && state.availability.cache_hit && !state.availability.stale
+        );
+        assert_eq!(builds.len(), 1);
+        assert_eq!(
+            loaders::parse_build_id(&builds[0].build_id),
+            Some((LoaderComponentId::Fabric, "1.21.4".into(), "0.16.14".into()))
+        );
+        assert_eq!(builds[0].version_id, version_id);
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"preserve unrelated user bytes\n"
+        );
+        for name in ["versions", "libraries", "assets"] {
+            assert!(
+                std::fs::read_dir(root.path().join(name))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
+        let instance_root = root
+            .path()
+            .join("instances")
+            .join(&records[0].directory_name);
+        let mut names = std::fs::read_dir(&instance_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "config",
+                "logs",
+                "mods",
+                "resourcepacks",
+                "saves",
+                "screenshots",
+                "shaderpacks"
+            ]
+            .map(std::ffi::OsString::from)
+        );
+        for name in names {
+            assert!(
+                std::fs::read_dir(instance_root.join(name))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
+        assert!(
+            held_shutdown.is_ok() && held_receipted,
+            "postcommit create did not settle on owner shutdown while the provider body remained withheld: {held_shutdown:?}"
+        );
+        let created = response
+            .expect("live create caller did not return before body release")
+            .unwrap();
+        assert_eq!(created["id"], records[0].instance.id.as_str());
+        assert_eq!(
+            created["view_model"],
+            serde_json::json!({
+                "state_id": "created_install_unavailable", "tone": "warn", "title": "Instance created",
+                "summary": "Instance created. Installation could not be queued.",
+                "detail": "Use Install on this instance to try again."
+            })
+        );
+        assert!(created.get("install_queue").is_none());
+    }));
+    if let Err(panic) = verification {
+        eprintln!(
+            "Retained postcommit creation shutdown fixture: {}",
+            root.keep().display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
 async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
     use futures_util::FutureExt;
     use std::io::{Read, Write};

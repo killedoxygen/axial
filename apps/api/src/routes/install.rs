@@ -186,6 +186,7 @@ pub(crate) fn failure(error: InstallError) -> ApiError {
         InstallError::AtCapacity => StatusCode::TOO_MANY_REQUESTS,
         InstallError::ContentUnavailable
         | InstallError::LoaderUnavailable
+        | InstallError::Cancelled
         | InstallError::Closed => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };

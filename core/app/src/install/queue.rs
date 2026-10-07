@@ -142,6 +142,8 @@ pub enum InstallError {
     SettlementRequired,
     #[error("Installations are unavailable while the application is shutting down.")]
     Closed,
+    #[error("Installation resolution was cancelled.")]
+    Cancelled,
     #[error("The installation failed. Check your connection and try again.")]
     Failed,
 }
@@ -531,6 +533,15 @@ impl InstallQueue {
         &self,
         request: &InstallQueueRequest,
     ) -> Result<InstallQueueInstallItemViewModel, InstallError> {
+        self.resolve_target_cancellable(request, std::future::pending())
+            .await
+    }
+
+    pub(crate) async fn resolve_target_cancellable(
+        &self,
+        request: &InstallQueueRequest,
+        cancelled: impl std::future::Future<Output = ()>,
+    ) -> Result<InstallQueueInstallItemViewModel, InstallError> {
         match request {
             InstallQueueRequest::Vanilla { version_id } => {
                 axial_minecraft::portable_path::PortableFileName::new_exact(version_id)
@@ -550,14 +561,30 @@ impl InstallQueue {
                     if *component_id != LoaderComponentId::Fabric {
                         return Err(InstallError::InvalidRequest);
                     }
-                    axial_minecraft::loaders::resolve_fabric_build_for_test(build_id, url)
-                        .await
-                        .map_err(|_| InstallError::LoaderUnavailable)?
+                    axial_minecraft::loaders::resolve_fabric_build_for_test(
+                        build_id, url, cancelled,
+                    )
+                    .await
                 } else {
-                    resolve_loader(*component_id, build_id).await?
+                    axial_minecraft::loaders::resolve_build_record_for_install_cancellable(
+                        *component_id,
+                        build_id,
+                        cancelled,
+                    )
+                    .await
                 };
                 #[cfg(not(test))]
-                let record = resolve_loader(*component_id, build_id).await?;
+                let record =
+                    axial_minecraft::loaders::resolve_build_record_for_install_cancellable(
+                        *component_id,
+                        build_id,
+                        cancelled,
+                    )
+                    .await;
+                let record = record.map_err(|error| match error {
+                    axial_minecraft::loaders::LoaderError::Cancelled => InstallError::Cancelled,
+                    _ => InstallError::LoaderUnavailable,
+                })?;
                 Ok(item_for_loader(&record))
             }
             InstallQueueRequest::Content {
@@ -603,8 +630,11 @@ impl InstallQueue {
         request: InstallQueueRequest,
         version_id: &str,
         admission: &crate::instances::create::Admission,
+        cancel: &CancellationToken,
     ) -> Result<InstallQueueStateResponse, InstallError> {
-        let item = self.resolve_target(&request).await?;
+        let item = self
+            .resolve_target_cancellable(&request, cancel.cancelled())
+            .await?;
         if item.version_id != version_id {
             return Err(InstallError::InvalidRequest);
         }

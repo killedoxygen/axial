@@ -248,9 +248,23 @@ pub async fn resolve_build_record_for_install(
     component_id: LoaderComponentId,
     build_id: &str,
 ) -> Result<LoaderBuildRecord, LoaderError> {
-    resolve_build_record_for_install_with(component_id, build_id, |minecraft_version| async move {
-        providers::fetch_build_index(component_id, &minecraft_version).await
-    })
+    resolve_build_record_for_install_cancellable(component_id, build_id, std::future::pending())
+        .await
+}
+
+pub async fn resolve_build_record_for_install_cancellable(
+    component_id: LoaderComponentId,
+    build_id: &str,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> Result<LoaderBuildRecord, LoaderError> {
+    resolve_build_record_for_install_with(
+        component_id,
+        build_id,
+        cancelled,
+        |minecraft_version| async move {
+            providers::fetch_build_index(component_id, &minecraft_version).await
+        },
+    )
     .await
 }
 
@@ -258,11 +272,13 @@ pub async fn resolve_build_record_for_install(
 pub async fn resolve_fabric_build_for_test(
     build_id: &str,
     url: &reqwest::Url,
+    cancelled: impl std::future::Future<Output = ()>,
 ) -> Result<LoaderBuildRecord, LoaderError> {
     crate::loaders::http::validate_loopback_url_for_test(url)?;
     resolve_build_record_for_install_with(
         LoaderComponentId::Fabric,
         build_id,
+        cancelled,
         |minecraft_version| async move {
             providers::fetch_builds_from_loopback_for_test(&minecraft_version, url).await
         },
@@ -273,6 +289,7 @@ pub async fn resolve_fabric_build_for_test(
 async fn resolve_build_record_for_install_with<F, Fut>(
     component_id: LoaderComponentId,
     build_id: &str,
+    cancelled: impl std::future::Future<Output = ()>,
     fetch_live: F,
 ) -> Result<LoaderBuildRecord, LoaderError>
 where
@@ -288,7 +305,12 @@ where
     }
     let minecraft_version = sanitize_segment(&minecraft_version)?;
 
-    let normalized = normalize_build_index(fetch_live(minecraft_version.clone()).await?);
+    let live = tokio::select! {
+        biased;
+        result = fetch_live(minecraft_version.clone()) => result,
+        _ = cancelled => Err(LoaderError::Cancelled),
+    }?;
+    let normalized = normalize_build_index(live);
     validate_build_index_identity(&normalized, component_id, &minecraft_version)?;
     resolve_live_build_record(component_id, build_id, normalized.builds)
 }
@@ -725,6 +747,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_resolution_cancels_pending_provider_acquisition() {
+        let component = LoaderComponentId::Fabric;
+        let build_id = build_id_for(component, "1.21.5", "0.16.14");
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            resolve_build_record_for_install_with(
+                component,
+                &build_id,
+                std::future::ready(()),
+                |_| std::future::pending(),
+            ),
+        )
+        .await
+        .expect("pending acquisition must be cancellable")
+        .expect_err("cancelled acquisition");
+
+        assert!(matches!(error, LoaderError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn install_resolution_completed_provider_result_wins_over_cancellation() {
+        let component = LoaderComponentId::Fabric;
+        let build_id = build_id_for(component, "1.21.5", "0.16.14");
+        let expected = build_record(component, &build_id);
+        let resolved = resolve_build_record_for_install_with(
+            component,
+            &build_id,
+            std::future::ready(()),
+            |_| {
+                std::future::ready(Ok(LoaderVersionIndex {
+                    component_id: component,
+                    builds: vec![expected.clone()],
+                }))
+            },
+        )
+        .await
+        .expect("completed provider result");
+
+        assert_eq!(resolved, expected);
+    }
+
+    #[tokio::test]
+    async fn install_resolution_completed_provider_error_wins_over_cancellation() {
+        let component = LoaderComponentId::Fabric;
+        let build_id = build_id_for(component, "1.21.5", "0.16.14");
+        let error = resolve_build_record_for_install_with(
+            component,
+            &build_id,
+            std::future::ready(()),
+            |_| {
+                std::future::ready(Err(LoaderError::ProviderUnavailable {
+                    kind: LoaderProviderFailureKind::HttpServer,
+                    status: Some(503),
+                }))
+            },
+        )
+        .await
+        .expect_err("completed provider refusal");
+
+        assert!(matches!(
+            error,
+            LoaderError::ProviderUnavailable {
+                kind: LoaderProviderFailureKind::HttpServer,
+                status: Some(503),
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn install_resolution_always_fetches_the_live_provider_index() {
         let component_id = LoaderComponentId::Fabric;
         let build_id = build_id_for(component_id, "1.21.5", "0.16.14");
@@ -735,6 +826,7 @@ mod tests {
         let resolved = resolve_build_record_for_install_with(
             component_id,
             &build_id,
+            std::future::pending(),
             move |minecraft_version| {
                 assert_eq!(minecraft_version, "1.21.5");
                 fetch_calls.fetch_add(1, Ordering::SeqCst);
@@ -759,6 +851,7 @@ mod tests {
         let error = resolve_build_record_for_install_with(
             component_id,
             &build_id,
+            std::future::pending(),
             move |minecraft_version| {
                 assert_eq!(minecraft_version, "26.2");
                 std::future::ready(Ok(LoaderVersionIndex {
@@ -782,6 +875,7 @@ mod tests {
         let error = resolve_build_record_for_install_with(
             LoaderComponentId::Fabric,
             &build_id,
+            std::future::ready(()),
             move |_| {
                 fetch_calls.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(LoaderVersionIndex {

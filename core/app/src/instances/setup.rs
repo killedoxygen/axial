@@ -825,7 +825,7 @@ impl SetupService {
         let work = self
             .instances
             .tasks
-            .try_spawn(admission.clone(), move |_cancel| async move {
+            .try_spawn(admission.clone(), move |cancel| async move {
                 let instance = service
                     .instances
                     .create(request, target, admission.clone())?
@@ -851,7 +851,7 @@ impl SetupService {
                 } else {
                     match service
                         .installs
-                        .enqueue_creation(install, &instance.version_id, &admission)
+                        .enqueue_creation(install, &instance.version_id, &admission, &cancel)
                         .await
                     {
                         Ok(queue) => (
