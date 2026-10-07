@@ -2146,6 +2146,12 @@ impl InstallQueue {
         let progress = move |event| queue.progress(&progress_id, event);
         let result = match request {
             InstallQueueRequest::Vanilla { version_id } => {
+                let cancelled = async {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {},
+                        _ = owner_cancel.cancelled() => {},
+                    }
+                };
                 #[cfg(feature = "test-support")]
                 let installed = super::vanilla::install_with_test_endpoints(
                     &operation,
@@ -2153,6 +2159,7 @@ impl InstallQueue {
                     &version_id,
                     self.test_endpoints.clone(),
                     progress,
+                    cancelled,
                 )
                 .await;
                 #[cfg(not(feature = "test-support"))]
@@ -2161,9 +2168,13 @@ impl InstallQueue {
                     self.inner.runtime.clone(),
                     &version_id,
                     progress,
+                    cancelled,
                 )
                 .await;
                 match installed {
+                    Err(DownloadError::Cancelled) => {
+                        Err(WorkFailure::Failed(InstallError::Cancelled))
+                    }
                     Ok(receipt) => {
                         self.settle_receipt(&id, &pin, operation.clone(), receipt)
                             .await
@@ -2986,6 +2997,7 @@ fn download_failure_diagnostic(error: &DownloadError) -> DownloadFailureDiagnost
             DownloadError::Integrity(_) => "integrity",
             DownloadError::PublicationIndeterminate(_) => "publication_indeterminate",
             DownloadError::LibraryPlan(_) => "library_plan",
+            DownloadError::Cancelled => "cancelled",
         },
         file_failure_class: error.file_failure_class(),
         io_kind: None,
@@ -3632,43 +3644,46 @@ pub(crate) mod tests {
         (root, storage, library, exclusions, owner, queue)
     }
 
+    fn tree_contents(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+        use std::io::Read;
+        const FILE_BYTES: u64 = 4 * 1024 * 1024;
+        const TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+        let mut files = BTreeMap::new();
+        let mut pending = vec![root.to_owned()];
+        let mut total_bytes = 0;
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                assert!(files.len() < 128, "fixture tree exceeded its bound");
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                let bytes = if metadata.is_dir() {
+                    pending.push(path.clone());
+                    None
+                } else {
+                    assert!(metadata.is_file() && metadata.len() <= FILE_BYTES);
+                    assert!(total_bytes + metadata.len() <= TOTAL_BYTES);
+                    let file = std::fs::File::open(&path).unwrap();
+                    assert!(file.metadata().unwrap().is_file());
+                    let mut bytes = Vec::new();
+                    file.take(FILE_BYTES.min(TOTAL_BYTES - total_bytes) + 1)
+                        .read_to_end(&mut bytes)
+                        .unwrap();
+                    assert_eq!(bytes.len() as u64, metadata.len());
+                    total_bytes += bytes.len() as u64;
+                    assert!(bytes.len() as u64 <= FILE_BYTES && total_bytes <= TOTAL_BYTES);
+                    Some(bytes)
+                };
+                files.insert(path.strip_prefix(root).unwrap().to_owned(), bytes);
+            }
+        }
+        files
+    }
+
     #[tokio::test]
     async fn shutdown_cancels_accepted_loader_while_worker_provider_body_is_pending() {
         use futures_util::FutureExt;
-        use std::{path::Path, time::Duration};
+        use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        fn files(root: &Path) -> BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
-            let mut files = BTreeMap::new();
-            let mut pending = vec![root.to_owned()];
-            let mut total_bytes = 0;
-            while let Some(directory) = pending.pop() {
-                for entry in std::fs::read_dir(directory).unwrap() {
-                    let path = entry.unwrap().path();
-                    assert!(files.len() < 128, "fixture tree exceeded its bound");
-                    let metadata = std::fs::symlink_metadata(&path).unwrap();
-                    let bytes = if metadata.is_dir() {
-                        pending.push(path.clone());
-                        None
-                    } else {
-                        assert!(
-                            metadata.is_file() && metadata.len() <= 4 * 1024 * 1024,
-                            "unexpected fixture file {}: {} bytes",
-                            path.display(),
-                            metadata.len()
-                        );
-                        total_bytes += metadata.len();
-                        assert!(
-                            total_bytes <= 8 * 1024 * 1024,
-                            "fixture bytes exceeded bound"
-                        );
-                        Some(std::fs::read(&path).unwrap())
-                    };
-                    files.insert(path.strip_prefix(root).unwrap().to_owned(), bytes);
-                }
-            }
-            files
-        }
 
         let (root, storage, library, exclusions, owner, isolated_queue) = fixture();
         drop(isolated_queue);
@@ -3684,7 +3699,7 @@ pub(crate) mod tests {
             b"preserve these bytes\n",
         )
         .unwrap();
-        let before = files(root.path());
+        let before = tree_contents(root.path());
         let generation = library.snapshot().current.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
@@ -3816,7 +3831,7 @@ pub(crate) mod tests {
                 Err(crate::tasks::ExclusionError::Busy)
             );
             let held = !server.is_finished();
-            let unchanged_while_held = files(root.path()) == before;
+            let unchanged_while_held = tree_contents(root.path()) == before;
             queue.close_admission();
             let held_shutdown = owner.shutdown(Duration::from_secs(2)).await;
             let receipted = owner
@@ -3884,7 +3899,12 @@ pub(crate) mod tests {
             let persisted = started
                 .as_ref()
                 .map(|started| reopened.status(&started.install_id).unwrap());
-            (status, persisted, queue.snapshot(), files(root.path()))
+            (
+                status,
+                persisted,
+                queue.snapshot(),
+                tree_contents(root.path()),
+            )
         }));
         let receipt = owner.shutdown_receipt();
         let receipted = receipt
@@ -3954,6 +3974,376 @@ pub(crate) mod tests {
         }));
         if let Err(panic) = verification {
             eprintln!("Retained loader worker fixture: {}", root.keep().display());
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn shutdown_cancels_vanilla_while_version_metadata_body_is_pending() {
+        use futures_util::FutureExt;
+        use sha1::{Digest, Sha1};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const VERSION: &str = "1.21.4";
+
+        let (root, storage, library, exclusions, owner, isolated_queue) = fixture();
+        drop(isolated_queue);
+        let preparation = std::panic::AssertUnwindSafe(async {
+            let runtime = library.runtime_cache().unwrap();
+            let pin = library.admit().unwrap();
+            let library_id = pin.library_id().to_string();
+            let operation = pin.managed_library().unwrap();
+            operation.prepare_layout().unwrap();
+            // Failure classification owns this coordination lane even when no install was published.
+            assert!(matches!(
+                axial_minecraft::classify_managed_install_publication(operation.clone(), VERSION)
+                    .await,
+                ManagedInstallDurableOutcome::NoEffect
+            ));
+            drop(operation);
+            drop(pin);
+            std::fs::write(
+                root.path().join("unrelated-user-file.txt"),
+                b"preserve these bytes\n",
+            )
+            .unwrap();
+            let before = tree_contents(root.path());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let endpoints = InstallTestEndpoints::from_loopback_base_url(&base).unwrap();
+            let version: axial_minecraft::VersionJson = serde_json::from_value(serde_json::json!({
+                "id": "1.21.4", "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "arguments": {"game": [], "jvm": []}, "libraries": [],
+                "downloads": {"client": {
+                    "url": format!("{base}/unused-client.jar"),
+                    "size": 7, "sha1": format!("{:x}", Sha1::digest(b"fixture"))
+                }},
+                "javaVersion": {"component": "java-runtime-delta", "majorVersion": 21}
+            }))
+            .unwrap();
+            let metadata = serde_json::to_vec(&version).unwrap();
+            let expected_sha1 = format!("{:x}", Sha1::digest(&metadata));
+            let manifest: axial_minecraft::manifest::VersionManifest =
+                serde_json::from_value(serde_json::json!({
+                    "latest": {"release": "1.21.4", "snapshot": "1.21.4"},
+                    "versions": [{
+                        "id": "1.21.4", "type": "release",
+                        "url": format!("{base}/version.json"),
+                        "sha1": expected_sha1,
+                        "time": "2024-12-03T10:12:57+00:00",
+                        "releaseTime": "2024-12-03T10:12:57+00:00",
+                        "complianceLevel": 1
+                    }]
+                }))
+                .unwrap();
+            let manifest = serde_json::to_vec(&manifest).unwrap();
+            let mut refused_metadata = metadata.clone();
+            refused_metadata[0] ^= 1;
+            assert_eq!(refused_metadata.len(), metadata.len());
+            assert_ne!(
+                format!("{:x}", Sha1::digest(&refused_metadata)),
+                expected_sha1
+            );
+            let queue = InstallQueue::new(
+                storage.clone(),
+                library.clone(),
+                exclusions.clone(),
+                owner.clone(),
+                runtime.clone(),
+            )
+            .unwrap()
+            .with_test_endpoints(endpoints);
+            let generation = library.snapshot().current.unwrap();
+            (
+                runtime,
+                library_id,
+                before,
+                listener,
+                queue,
+                generation,
+                manifest,
+                refused_metadata,
+            )
+        })
+        .catch_unwind()
+        .await;
+        let (runtime, library_id, before, listener, queue, generation, manifest, refused_metadata) =
+            match preparation {
+                Ok(prepared) => prepared,
+                Err(panic) => {
+                    eprintln!(
+                        "Retained Vanilla fixture setup failure: {}",
+                        root.keep().display()
+                    );
+                    std::panic::resume_unwind(panic);
+                }
+            };
+        let (requested, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(async move {
+            let mut requested = Some(requested);
+            let mut released = Some(released);
+            let mut routes = Vec::new();
+            for (path, body, held) in [
+                ("/version_manifest_v2.json", manifest, false),
+                ("/version.json", refused_metadata, true),
+            ] {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("Vanilla provider request was not received")
+                        .unwrap();
+                let mut request = [0_u8; 4096];
+                let mut length = 0;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !request[..length]
+                        .windows(4)
+                        .any(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        assert!(
+                            length < request.len(),
+                            "provider request headers exceeded bound"
+                        );
+                        let read = socket.read(&mut request[length..]).await.unwrap();
+                        assert!(read > 0, "provider request closed before its headers");
+                        length += read;
+                    }
+                })
+                .await
+                .expect("provider request headers timed out");
+                assert!(
+                    request[..length].starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes())
+                );
+                routes.push(path);
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                tokio::time::timeout(Duration::from_secs(2), socket.write_all(headers.as_bytes()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if held {
+                    requested.take().unwrap().send(()).unwrap();
+                    tokio::time::timeout(Duration::from_secs(8), released.take().unwrap())
+                        .await
+                        .expect("version metadata body was not released")
+                        .unwrap();
+                }
+                // Checksum mismatch is non-retryable and cannot reach artifact/runtime preparation.
+                match tokio::time::timeout(Duration::from_secs(2), socket.write_all(&body))
+                    .await
+                    .unwrap()
+                {
+                    Ok(()) => {}
+                    Err(error)
+                        if held
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                            ) => {}
+                    Err(error) => panic!("provider response failed: {error}"),
+                }
+            }
+            routes
+        });
+        let mut caller = Some(tokio::spawn({
+            let queue = queue.clone();
+            async move {
+                queue
+                    .enqueue(InstallQueueRequest::Vanilla {
+                        version_id: VERSION.into(),
+                    })
+                    .await
+            }
+        }));
+        let mut started = None;
+        let journey = std::panic::AssertUnwindSafe(async {
+            let joined = tokio::time::timeout(Duration::from_secs(5), caller.as_mut().unwrap())
+                .await
+                .expect("queue admission did not return");
+            drop(caller.take());
+            let response = joined.unwrap().unwrap();
+            started = response.started_install;
+            let started = started
+                .as_ref()
+                .expect("queue admission omitted install identity")
+                .clone();
+            tokio::time::timeout(Duration::from_secs(5), observed)
+                .await
+                .expect("version metadata request was not observed")
+                .unwrap();
+            let status = queue.status(&started.install_id).unwrap();
+            let active = queue
+                .snapshot()
+                .active
+                .expect("accepted worker was not active");
+            let accepted = owner.status();
+            let pinned = library.snapshot().current.unwrap();
+            let excluded = matches!(
+                exclusions.try_acquire(
+                    std::iter::empty::<String>(),
+                    [library_artifact(&library_id)]
+                ),
+                Err(crate::tasks::ExclusionError::Busy)
+            );
+            let held = !server.is_finished();
+            // Fresh install manifests do not publish a persistent or process-global cache.
+            let unchanged_while_held = tree_contents(root.path()) == before;
+            queue.close_admission();
+            let held_shutdown = owner.shutdown(Duration::from_secs(2)).await;
+            let receipted = owner
+                .shutdown_receipt()
+                .is_some_and(|receipt| receipt.belongs_to(&owner));
+            let after_shutdown = queue.status(&started.install_id).unwrap();
+            let body_still_held = !server.is_finished();
+            move || {
+                assert!(!status.done && status.outcome.is_none());
+                assert_eq!(status.install_id, started.install_id);
+                assert_eq!(status.operation_id, started.operation_id);
+                assert_eq!(status.view_model.phase_id, "version_json");
+                assert_eq!(active.queue_id, started.install_id);
+                assert_eq!(active.install_item.version_id, "1.21.4");
+                assert!(active.install_item.loader.is_none());
+                assert!(accepted.unsettled.is_empty() && accepted.running.len() == 1);
+                assert_eq!(pinned.generation, generation.generation);
+                assert_eq!(pinned.library_id, generation.library_id);
+                assert!(pinned.pins > generation.pins && excluded && held && body_still_held);
+                assert!(unchanged_while_held);
+                (held_shutdown, receipted, after_shutdown)
+            }
+        })
+        .catch_unwind()
+        .await;
+
+        queue.close_admission();
+        let released = release.send(());
+        let shutdown = std::panic::AssertUnwindSafe(owner.shutdown(Duration::from_secs(15)))
+            .catch_unwind()
+            .await;
+        let caller_joined = match caller.take() {
+            Some(mut caller) => {
+                match tokio::time::timeout(Duration::from_secs(5), &mut caller).await {
+                    Ok(joined) => joined.is_ok(),
+                    Err(_) => {
+                        caller.abort();
+                        let _ = tokio::time::timeout(Duration::from_secs(1), caller).await;
+                        false
+                    }
+                }
+            }
+            None => true,
+        };
+        let observers = tokio::time::timeout(Duration::from_secs(5), queue.join_observers()).await;
+        let server_result = match tokio::time::timeout(Duration::from_secs(18), &mut server).await {
+            Ok(joined) => joined.ok(),
+            Err(_) => {
+                server.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
+                None
+            }
+        };
+        let final_state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let status = started
+                .as_ref()
+                .map(|started| queue.status(&started.install_id).unwrap());
+            let reloaded = InstallQueue::new(
+                storage,
+                library.clone(),
+                exclusions.clone(),
+                owner.clone(),
+                runtime.clone(),
+            )
+            .unwrap();
+            let persisted = started
+                .as_ref()
+                .map(|started| reloaded.status(&started.install_id).unwrap());
+            (
+                status,
+                persisted,
+                queue.snapshot(),
+                tree_contents(root.path()),
+            )
+        }));
+        let receipt = owner.shutdown_receipt();
+        let receipted = receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.belongs_to(&owner));
+        let queue_preserved = receipt
+            .as_ref()
+            .map(|receipt| queue.preserve_shutdown(receipt));
+        let idle = owner.status().is_idle();
+        let unsettled = queue.has_unsettled_effects();
+        let exclusion_released = exclusions
+            .try_acquire(
+                std::iter::empty::<String>(),
+                [library_artifact(&library_id)],
+            )
+            .is_ok();
+        let runtime_settled = runtime.settle();
+        drop(receipt);
+        drop(queue);
+        drop(runtime);
+        drop(owner);
+        let pins = library.wait_for_pins(Duration::from_secs(2)).await;
+        let preserved = if matches!(&shutdown, Ok(Ok(())))
+            && matches!(&observers, Ok(Ok(())))
+            && server_result.is_some()
+            && caller_joined
+            && receipted
+            && idle
+            && !unsettled
+            && matches!(&queue_preserved, Some(Ok(())))
+            && runtime_settled.is_ok()
+            && pins.is_ok()
+        {
+            Some(library.try_preserve())
+        } else {
+            None
+        };
+        let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(
+                released.is_ok(),
+                "version metadata gate ended before cleanup"
+            );
+            assert!(
+                matches!(shutdown, Ok(Ok(()))),
+                "Vanilla worker did not join after checksum refusal release: {shutdown:?}"
+            );
+            assert!(caller_joined && matches!(observers, Ok(Ok(()))));
+            assert_eq!(
+                server_result.unwrap(),
+                ["/version_manifest_v2.json", "/version.json"]
+            );
+            assert!(receipted && idle && !unsettled && exclusion_released);
+            assert!(matches!(queue_preserved, Some(Ok(()))) && runtime_settled.is_ok());
+            assert!(pins.is_ok() && matches!(preserved, Some(Ok(()))));
+            let (status, persisted, snapshot, after) = final_state.unwrap();
+            let status = status.expect("queue admission was not observed");
+            assert!(status.done && snapshot.active.is_none() && snapshot.items.is_empty());
+            assert_eq!(persisted.as_ref(), Some(&status));
+            assert_eq!(after, before);
+            let (held_shutdown, held_receipted, held_status) = match journey {
+                Ok(verify) => verify(),
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+            assert!(
+                held_shutdown.is_ok() && held_receipted,
+                "accepted Vanilla worker did not settle while version metadata body was withheld: {held_shutdown:?}"
+            );
+            assert!(held_status.done);
+            assert_eq!(held_status.outcome, Some(InstallOutcome::Cancelled));
+            assert_eq!(status, held_status);
+        }));
+        if let Err(panic) = verification {
+            eprintln!(
+                "Retained Vanilla metadata fixture: {}",
+                root.keep().display()
+            );
             std::panic::resume_unwind(panic);
         }
     }

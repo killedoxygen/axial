@@ -501,8 +501,8 @@ fn extract_native_archive(
 /// URL is never substituted for that authority. It retains the existing client,
 /// logging, library, native, asset, legacy virtual-asset, and Java requirements.
 ///
-/// The caller owns cancellation and settlement: dropping the waiter alone must
-/// not be reported as a cancelled installation. It must retain `library` and
+/// Cancellation governs metadata acquisition only. Dropping the waiter alone
+/// must not be reported as a cancelled installation. The caller retains `library` and
 /// classify any publication, including `DownloadError::PublicationIndeterminate`,
 /// before releasing target exclusion or choosing a terminal outcome.
 pub async fn install<F>(
@@ -510,11 +510,12 @@ pub async fn install<F>(
     runtime_cache: ManagedRuntimeCache,
     version_id: &str,
     send: F,
+    cancelled: impl std::future::Future<Output = ()>,
 ) -> Result<KnownGoodInstallReceipt, DownloadError>
 where
     F: FnMut(DownloadProgress),
 {
-    install_with_facts(library, runtime_cache, version_id, send, |_| {}).await
+    install_with_facts(library, runtime_cache, version_id, send, |_| {}, cancelled).await
 }
 
 /// Materialize Vanilla while retaining the installer's artifact evidence events.
@@ -528,6 +529,7 @@ pub async fn install_with_facts<F, G>(
     version_id: &str,
     send: F,
     send_fact: G,
+    cancelled: impl std::future::Future<Output = ()>,
 ) -> Result<KnownGoodInstallReceipt, DownloadError>
 where
     F: FnMut(DownloadProgress),
@@ -539,6 +541,7 @@ where
         version_id,
         send,
         send_fact,
+        cancelled,
     )
     .await
 }
@@ -553,6 +556,7 @@ pub(crate) async fn install_with_test_endpoints<F>(
     version_id: &str,
     endpoints: Option<axial_minecraft::download::InstallTestEndpoints>,
     send: F,
+    cancelled: impl std::future::Future<Output = ()>,
 ) -> Result<KnownGoodInstallReceipt, DownloadError>
 where
     F: FnMut(DownloadProgress),
@@ -562,7 +566,7 @@ where
         Some(endpoints) => downloader.with_test_endpoints(endpoints),
         None => downloader,
     };
-    install_using_downloader(library, downloader, version_id, send, |_| {}).await
+    install_using_downloader(library, downloader, version_id, send, |_| {}, cancelled).await
 }
 
 async fn install_using_downloader<F, G>(
@@ -571,6 +575,7 @@ async fn install_using_downloader<F, G>(
     version_id: &str,
     mut send: F,
     send_fact: G,
+    cancelled: impl std::future::Future<Output = ()>,
 ) -> Result<KnownGoodInstallReceipt, DownloadError>
 where
     F: FnMut(DownloadProgress),
@@ -578,10 +583,11 @@ where
 {
     library.revalidate().map_err(DownloadError::FileOperation)?;
     downloader
-        .install_version_with_facts(
+        .install_version_with_facts_cancellable(
             version_id,
             |progress| forward_pending_progress(progress, &mut send),
             send_fact,
+            cancelled,
         )
         .await
 }
@@ -652,6 +658,7 @@ mod tests {
                 version_id,
                 |event| events.push(event),
                 |fact| facts.push(fact),
+                std::future::ready(()),
             )
             .await;
 

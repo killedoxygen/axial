@@ -925,6 +925,8 @@ impl ManagedInstallPublicationRecovery {
 
 #[derive(Debug, Error)]
 pub enum DownloadError {
+    #[error("download acquisition cancelled")]
+    Cancelled,
     #[error("file operation failed: {0}")]
     FileOperation(#[from] io::Error),
     #[error("resolve manifest url: {0}")]

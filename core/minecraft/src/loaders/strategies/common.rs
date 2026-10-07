@@ -1475,6 +1475,7 @@ fn log_library_download_failure(stage: &'static str, error: &crate::DownloadErro
         DownloadError::Integrity(_) => "integrity",
         DownloadError::PublicationIndeterminate(_) => "publication_indeterminate",
         DownloadError::LibraryPlan(_) => "library_plan",
+        DownloadError::Cancelled => "cancelled",
     };
     let (io_kind, raw_os_error) = match error {
         DownloadError::FileOperation(error) => (Some(error.kind()), error.raw_os_error()),

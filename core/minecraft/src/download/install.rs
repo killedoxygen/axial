@@ -1760,7 +1760,13 @@ impl Downloader {
     where
         F: FnMut(DownloadProgress),
     {
-        Box::pin(self.install_version_with_fact_sender(version_id, &mut send, None)).await
+        Box::pin(self.install_version_with_fact_sender(
+            version_id,
+            &mut send,
+            None,
+            std::future::pending(),
+        ))
+        .await
     }
 
     pub(crate) async fn reconstruct_version(
@@ -2271,17 +2277,43 @@ impl Downloader {
     pub async fn install_version_with_facts<F, G>(
         &self,
         version_id: &str,
+        send: F,
+        send_fact: G,
+    ) -> Result<KnownGoodInstallReceipt, DownloadError>
+    where
+        F: FnMut(DownloadProgress),
+        G: FnMut(ExecutionDownloadFact),
+    {
+        self.install_version_with_facts_cancellable(
+            version_id,
+            send,
+            send_fact,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    /// Only effect-free metadata acquisition is cancellable. Completed acquisition
+    /// wins a tie; materialization, publication and fact drainage remain joined.
+    pub async fn install_version_with_facts_cancellable<F, G>(
+        &self,
+        version_id: &str,
         mut send: F,
         mut send_fact: G,
+        cancelled: impl std::future::Future<Output = ()>,
     ) -> Result<KnownGoodInstallReceipt, DownloadError>
     where
         F: FnMut(DownloadProgress),
         G: FnMut(ExecutionDownloadFact),
     {
         let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-        let result =
-            Box::pin(self.install_version_with_fact_sender(version_id, &mut send, Some(fact_tx)))
-                .await;
+        let result = Box::pin(self.install_version_with_fact_sender(
+            version_id,
+            &mut send,
+            Some(fact_tx),
+            cancelled,
+        ))
+        .await;
         while let Ok(fact) = fact_rx.try_recv() {
             send_fact(fact);
         }
@@ -2293,6 +2325,7 @@ impl Downloader {
         version_id: &str,
         send: &mut F,
         fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+        cancelled: impl std::future::Future<Output = ()>,
     ) -> Result<KnownGoodInstallReceipt, DownloadError>
     where
         F: FnMut(DownloadProgress),
@@ -2312,10 +2345,14 @@ impl Downloader {
                 1,
                 Some(format!("{version_id}.json")),
             ));
-            let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
-            let authenticated = self
-                .acquire_vanilla_plan(version_id, &version_manifest_entry, fact_tx.as_ref())
-                .await?;
+            let authenticated = tokio::select! {
+                biased;
+                result = async {
+                    let entry = self.resolve_manifest_entry(version_id).await?;
+                    self.acquire_vanilla_plan(version_id, &entry, fact_tx.as_ref()).await
+                } => result,
+                _ = cancelled => Err(DownloadError::Cancelled),
+            }?;
             send(progress(
                 "version_json",
                 1,
