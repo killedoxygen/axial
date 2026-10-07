@@ -120,6 +120,8 @@ pub enum InstallError {
     VersionJsonMissing,
     #[error("Required libraries are missing. Install this version before launching.")]
     LibrariesMissing,
+    #[error("Required libraries are corrupt. Repair this version before launching.")]
+    LibrariesCorrupt,
     #[error("The selected loader build is unavailable.")]
     LoaderUnavailable,
     #[error("Content installation is unavailable.")]

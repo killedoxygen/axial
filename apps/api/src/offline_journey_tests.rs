@@ -2864,6 +2864,11 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         original_library,
         provider.state.routes["GET /artifacts/library.jar"]
     );
+    let mut changed_library = original_library.clone();
+    changed_library[0] ^= 1;
+    std::fs::write(&required_library, &changed_library).unwrap();
+    let corrupt_library = api.get(&preflight).await;
+    let library_after_preflight = std::fs::read(&required_library).unwrap();
     std::fs::remove_file(&required_library).unwrap();
     let missing_library = api.get(&preflight).await;
     let library_absent = std::fs::symlink_metadata(&required_library)
@@ -2947,6 +2952,12 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
         assert_eq!(target, expected_target);
     }
+    assert_eq!(changed_library.len(), original_library.len());
+    assert_ne!(changed_library, original_library);
+    assert_eq!(
+        library_after_preflight, changed_library,
+        "preflight must not repair libraries"
+    );
     assert!(library_absent, "preflight must not repair libraries");
     assert_eq!(library_canary_after, original_library);
     assert_eq!(library_after, original_library);
@@ -2978,6 +2989,11 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         "preflight must not repair files"
     );
     for (response, reason, message) in [
+        (
+            corrupt_library,
+            "libraries_corrupt",
+            "Required libraries are corrupt. Repair this version before launching.",
+        ),
         (
             missing_library,
             "libraries_missing",

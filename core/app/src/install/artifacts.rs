@@ -143,6 +143,8 @@ impl ActivatedVersion {
             {
                 return Err(if path == client_path {
                     InstallError::ClientJarCorrupt
+                } else if root == Some("libraries") {
+                    InstallError::LibrariesCorrupt
                 } else {
                     InstallError::NotReady
                 });

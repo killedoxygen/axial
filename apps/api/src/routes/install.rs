@@ -179,7 +179,8 @@ pub(crate) fn failure(error: InstallError) -> ApiError {
         | InstallError::ClientJarMissing
         | InstallError::ClientJarCorrupt
         | InstallError::VersionJsonMissing
-        | InstallError::LibrariesMissing => StatusCode::CONFLICT,
+        | InstallError::LibrariesMissing
+        | InstallError::LibrariesCorrupt => StatusCode::CONFLICT,
         InstallError::AtCapacity => StatusCode::TOO_MANY_REQUESTS,
         InstallError::ContentUnavailable
         | InstallError::LoaderUnavailable
