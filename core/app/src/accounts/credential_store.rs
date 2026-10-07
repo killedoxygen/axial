@@ -1469,6 +1469,53 @@ mod tests {
     #[ignore = "Requires a locally signed executable and an unlocked macOS test keychain"]
     async fn macos_saved_credentials_reopen_in_a_signed_process() {
         const CHILD_PROFILE: &str = "AXIAL_TEST_KEYCHAIN_REOPEN_PROFILE";
+        const CHILD_EXECUTABLE: &str = "AXIAL_TEST_KEYCHAIN_REOPEN_EXECUTABLE";
+        const TEST: &str =
+            "accounts::credential_store::tests::macos_saved_credentials_reopen_in_a_signed_process";
+
+        async fn verify_inventory(executable: &std::path::Path) -> Result<(), &'static str> {
+            use tokio::io::AsyncReadExt;
+
+            let mut child = tokio::process::Command::new(executable)
+                .args(["--list", "--exact", TEST])
+                .env_remove(CHILD_PROFILE)
+                .env_remove(CHILD_EXECUTABLE)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|_| "Inventory spawn")?;
+            let stdout = child.stdout.take().expect("Piped inventory output");
+            let mut output = Vec::new();
+            let status = match tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                stdout.take(4097).read_to_end(&mut output).await?;
+                child.wait().await
+            })
+            .await
+            {
+                Ok(Ok(status)) => status,
+                _ => {
+                    if !matches!(
+                        tokio::time::timeout(std::time::Duration::from_secs(3), child.kill()).await,
+                        Ok(Ok(()))
+                    ) {
+                        return Err("Unsettled inventory child");
+                    }
+                    return Err("Inventory");
+                }
+            };
+            let expected = format!("{TEST}: test\n\n1 test, 0 benchmarks");
+            if status.success()
+                && output.len() <= 4096
+                && std::str::from_utf8(&output).is_ok_and(|value| value.trim() == expected)
+            {
+                Ok(())
+            } else {
+                Err("Inventory")
+            }
+        }
+
         let child_profile = std::env::var(CHILD_PROFILE).ok();
         let profile = child_profile
             .as_deref()
@@ -1482,31 +1529,53 @@ mod tests {
             assert_eq!(loaded.credentials(), &secrets);
             return;
         }
+        let writer = std::env::current_exe().expect("Writer executable");
+        let reader = std::env::var_os(CHILD_EXECUTABLE)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| writer.clone());
+        assert!(reader.is_absolute(), "Reader executable must be absolute");
+        // Refuse missing or zero-test readers before publishing any synthetic item.
+        verify_inventory(&writer).await.expect("Writer inventory");
+        verify_inventory(&reader).await.expect("Reader inventory");
         let outcome = async {
-            let fence = store.begin_change(ACCOUNT, 0).await.map_err(|_| "Publication")?;
-            store.save(&fence, secrets).await.map_err(|_| "Publication")?;
-            let mut child = tokio::process::Command::new(std::env::current_exe().map_err(|_| "Executable")?)
-            .args([
-                "--ignored", "--exact",
-                "accounts::credential_store::tests::macos_saved_credentials_reopen_in_a_signed_process",
-                "--test-threads=1",
-            ])
-            .env(CHILD_PROFILE, profile.to_string())
-            .stdout(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| "Spawn")?;
+            let fence = store
+                .begin_change(ACCOUNT, 0)
+                .await
+                .map_err(|_| "Publication")?;
+            store
+                .save(&fence, secrets)
+                .await
+                .map_err(|_| "Publication")?;
+            let mut child = tokio::process::Command::new(reader)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    TEST,
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD_PROFILE, profile.to_string())
+                .env_remove(CHILD_EXECUTABLE)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|_| "Spawn")?;
             match tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await {
                 Ok(Ok(status)) if status.success() => Ok(()),
                 Ok(Ok(_)) => Err("Reopen"),
                 _ => {
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(3), child.kill()).await, Ok(Ok(()))) {
+                    if !matches!(
+                        tokio::time::timeout(std::time::Duration::from_secs(3), child.kill()).await,
+                        Ok(Ok(()))
+                    ) {
                         return Err("Unsettled child");
                     }
                     Err("Reopen")
                 }
             }
-        }.await;
+        }
+        .await;
         assert_ne!(
             outcome,
             Err("Unsettled child"),
