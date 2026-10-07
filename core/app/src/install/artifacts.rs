@@ -11,7 +11,7 @@ use axial_minecraft::loaders::{
     VerifiedLoaderInstallBaseCommit,
 };
 use axial_minecraft::managed_path::ManagedLibraryOperation;
-use axial_minecraft::portable_path::PortableRelativePath;
+use axial_minecraft::portable_path::{PortableFileName, PortableRelativePath};
 use axial_minecraft::{
     KnownGoodInstallReceipt, ManagedInstallCommittedEvidence, ManagedInstallDurableOutcome,
     ManagedInstallDurableRecovery, ManagedInstallReceiptVerificationFailure,
@@ -123,6 +123,11 @@ impl ActivatedVersion {
             {
                 return Err(InstallError::NotReady);
             }
+            let is_asset_index = expected
+                .path
+                .strip_prefix("assets/indexes/")
+                .and_then(|path| path.strip_suffix(".json"))
+                .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
             let file = batch
                 .observe_file(&path)
                 .map_err(|_| InstallError::NotReady)?
@@ -132,6 +137,8 @@ impl ActivatedVersion {
                     InstallError::VersionJsonMissing
                 } else if root == Some("libraries") {
                     InstallError::LibrariesMissing
+                } else if is_asset_index {
+                    InstallError::AssetIndexMissing
                 } else {
                     InstallError::NotReady
                 })?;
@@ -158,7 +165,7 @@ impl ActivatedVersion {
                         .map_err(|_| InstallError::NotReady)?,
                 );
             }
-            if expected.path.starts_with("assets/indexes/") && expected.path.ends_with(".json") {
+            if is_asset_index {
                 #[derive(Deserialize)]
                 struct AssetFlags {
                     #[serde(default, rename = "virtual")]

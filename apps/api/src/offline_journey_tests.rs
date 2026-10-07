@@ -2858,6 +2858,41 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     let original = std::fs::read(&client).unwrap();
     let metadata = library.join(format!("versions/{VERSION}/{VERSION}.json"));
     let original_metadata = std::fs::read(&metadata).unwrap();
+    let asset_index = library.join("assets/indexes/fixture-assets.json");
+    let original_index = std::fs::read(&asset_index).unwrap();
+    assert_eq!(
+        original_index,
+        provider.state.routes["GET /assets/index.json"]
+    );
+    std::fs::remove_file(&asset_index).unwrap();
+    let missing_index = api.get(&preflight).await;
+    let index_absent = std::fs::symlink_metadata(&asset_index)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    let index_canary = temporary.path().join("outside-index-canary.json");
+    assert!(!index_canary.starts_with(&profile) && !index_canary.starts_with(&library));
+    std::fs::write(&index_canary, &original_index).unwrap();
+    std::os::unix::fs::symlink(&index_canary, &asset_index).unwrap();
+    let index_link_before = std::fs::symlink_metadata(&asset_index).unwrap();
+    let index_inadmissible = api.get(&preflight).await;
+    let index_link_after = std::fs::symlink_metadata(&asset_index).unwrap();
+    let index_link_target = std::fs::read_link(&asset_index).unwrap();
+    let index_canary_after = std::fs::read(&index_canary).unwrap();
+    std::fs::remove_file(&asset_index).unwrap();
+    std::fs::write(&asset_index, &original_index).unwrap();
+    let asset_hash = sha1(ASSET);
+    let asset_path = format!("assets/objects/{}/{asset_hash}", &asset_hash[..2]);
+    let asset = library.join(&asset_path);
+    let original_asset = std::fs::read(&asset).unwrap();
+    assert_eq!(original_asset, ASSET);
+    assert_eq!(
+        original_asset,
+        provider.state.routes[&format!("GET /{asset_path}")]
+    );
+    std::fs::remove_file(&asset).unwrap();
+    let missing_asset = api.get(&preflight).await;
+    let asset_absent = std::fs::symlink_metadata(&asset)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    std::fs::write(&asset, &original_asset).unwrap();
     let required_library = library.join("libraries/org/axial/fixture/1.0/fixture-1.0.jar");
     let original_library = std::fs::read(&required_library).unwrap();
     assert_eq!(
@@ -2919,6 +2954,8 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     let canary_after = std::fs::read(&canary).unwrap();
     let metadata_after = std::fs::read(&metadata).unwrap();
     let library_after = std::fs::read(&required_library).unwrap();
+    let index_after = std::fs::read(&asset_index).unwrap();
+    let asset_after = std::fs::read(&asset).unwrap();
     let reports_after = api.get("/api/v1/launch/reports").await;
     let queue_after = api.get("/api/v1/install/queue").await;
     let sessions_after = api.get("/api/v1/launch/sessions").await;
@@ -2933,6 +2970,12 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     assert_eq!(sessions_before, json!({"sessions":[]}));
     assert_eq!(sessions_after, sessions_before);
     for (before, after, target, expected_target) in [
+        (
+            &index_link_before,
+            &index_link_after,
+            &index_link_target,
+            &index_canary,
+        ),
         (
             &library_link_before,
             &library_link_after,
@@ -2952,6 +2995,11 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
         assert_eq!(target, expected_target);
     }
+    assert!(index_absent, "preflight must not repair the asset index");
+    assert_eq!(index_canary_after, original_index);
+    assert_eq!(index_after, original_index);
+    assert!(asset_absent, "preflight must not repair asset objects");
+    assert_eq!(asset_after, original_asset);
     assert_eq!(changed_library.len(), original_library.len());
     assert_ne!(changed_library, original_library);
     assert_eq!(
@@ -2966,7 +3014,13 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     assert_eq!(metadata_after, original_metadata);
     assert_eq!(client_after_metadata, original);
     assert_eq!(canary_after, original);
-    for response in [library_inadmissible, metadata_inadmissible, inadmissible] {
+    for response in [
+        missing_asset,
+        index_inadmissible,
+        library_inadmissible,
+        metadata_inadmissible,
+        inadmissible,
+    ] {
         assert_eq!(
             response,
             json!({
@@ -2989,6 +3043,11 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         "preflight must not repair files"
     );
     for (response, reason, message) in [
+        (
+            missing_index,
+            "asset_index_missing",
+            "Asset index is missing. Install this version before launching.",
+        ),
         (
             corrupt_library,
             "libraries_corrupt",
@@ -3070,6 +3129,9 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
             metadata_canary.to_str().unwrap(),
             required_library.to_str().unwrap(),
             library_canary.to_str().unwrap(),
+            asset_index.to_str().unwrap(),
+            index_canary.to_str().unwrap(),
+            asset.to_str().unwrap(),
             private_args,
             "missing-client-secret",
             &api.capability,
