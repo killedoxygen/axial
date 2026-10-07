@@ -1840,6 +1840,321 @@ async fn assert_fixture_processes_gone(processes: &BTreeSet<u64>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once() {
+    use axial_app::storage::StorageError;
+    use futures_util::FutureExt;
+
+    const SUITE: &str = "live-stop-resume-suite";
+    let mut temporary =
+        Some(tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap());
+    let profile = temporary.as_ref().unwrap().path().join("profile");
+    let mut preserve = || {
+        if let Some(temporary) = temporary.take() {
+            eprintln!(
+                "Retained benchmark fixture after failure: {}",
+                temporary.keep().display()
+            );
+        }
+    };
+    let provider = Provider::start(false).await;
+    let services =
+        match start_profile_with_test_endpoints(profile.clone(), provider.endpoints()).await {
+            Ok(services) => services,
+            Err(error) => {
+                preserve();
+                provider.shutdown().await;
+                panic!("benchmark fixture startup failed: {error}");
+            }
+        };
+    let mut processes = BTreeSet::new();
+    let journey = std::panic::AssertUnwindSafe(async {
+        let api = Api::new(&services);
+        api.post(
+            "/api/v1/accounts/offline",
+            json!({"username":PLAYER,"expected_selection_revision":0}),
+        )
+        .await;
+        api.request(
+            reqwest::Method::PUT,
+            "/api/v1/config",
+            Some(json!({
+                "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
+            })),
+        )
+        .await;
+        let install = api
+            .post(
+                "/api/v1/install/queue",
+                json!({"kind":"vanilla","version_id":VERSION}),
+            )
+            .await;
+        let terminal = install_terminal(&api, &install).await;
+        assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+        let created = api
+            .post(
+                "/api/v1/instances",
+                json!({"name":"Live scheduler continuation","selection_id":format!("vanilla|{VERSION}")}),
+            )
+            .await;
+        assert!(created["install_queue"].is_null(), "{created}");
+        let instance = created["id"].as_str().unwrap();
+        let started = api
+            .post(
+                "/api/v1/launch/benchmark/suite/driver",
+                json!({"instance_id":instance,"suite_id":SUITE,"suite_mode":"development","interval_ms":5000}),
+            )
+            .await;
+        let driver_id = started["driver"]["id"].as_str().unwrap();
+        let driver_path = format!("/api/v1/launch/benchmark/suite/drivers/{driver_id}");
+        let suite_path = format!("/api/v1/launch/benchmark/suites/{SUITE}");
+        let first = wait_benchmark_run(&api, SUITE, 0).await;
+        let first_session = first["session_id"].as_str().unwrap();
+        let (_, first_processes) = observe_running_session(&api, first_session).await;
+        processes.extend(first_processes.iter().copied());
+        let live = api
+            .get(&format!("/api/v1/launch/{first_session}/status"))
+            .await;
+        assert!(first_processes.contains(&live["pid"].as_u64().unwrap()));
+        let original_suite = api.get(&suite_path).await;
+        assert_eq!(original_suite["runs"].as_array().unwrap().len(), 2);
+        let first_intent = first["launch_intent"].as_str().unwrap();
+        let second_intent = original_suite["runs"][1]["launch_intent"]
+            .as_str()
+            .unwrap();
+        assert_ne!(first_intent, second_intent);
+        for (index, profile, run_type) in [
+            (0, "vanilla_baseline", "coldish"),
+            (1, "managed_default", "repeat"),
+        ] {
+            assert_eq!(original_suite["runs"][index]["profile"], profile);
+            assert_eq!(original_suite["runs"][index]["run_type"], run_type);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = api.get(&driver_path).await;
+                if status["driver"]["state"] == "waiting" {
+                    break;
+                }
+                assert_eq!(status["driver"]["state"], "running", "{status}");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("first accepted run must reach its public driver checkpoint");
+        let request = services.instances.registry().storage().read(|db| -> Result<Vec<u8>, StorageError> {
+            Ok(db.query_row("SELECT request FROM benchmark_drivers WHERE driver_id=?1", [driver_id], |row| row.get(0))?)
+        }).unwrap();
+
+        // No task-owner idle wait or mutation retry separates Stop from Resume.
+        for (action, state) in [("stop", "stopped"), ("resume", "running")] {
+            let response = api
+                .client
+                .post(format!("{}{driver_path}/{action}", api.base))
+                .header(transport::CAPABILITY_HEADER, &api.capability)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            let checkpoint = api.get(&driver_path).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{action}: {body}; driver: {checkpoint}"
+            );
+            if action == "resume" {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let status = api.get(&driver_path).await;
+                        if status["driver"]["state"] == "waiting" {
+                            assert_eq!(status["driver"]["active_session_id"], first_session);
+                            break;
+                        }
+                        assert_eq!(status["driver"]["state"], "running", "{status}");
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .expect("resumed scheduler must observe the original still-running session");
+            }
+            let suite = api.get(&suite_path).await;
+            let session = api
+                .get(&format!("/api/v1/launch/{first_session}/status"))
+                .await;
+            assert_eq!(body["driver"]["id"], driver_id);
+            assert_eq!(body["driver"]["suite_id"], SUITE);
+            assert_eq!(body["driver"]["state"], state);
+            assert_eq!(body["driver"]["interval_ms"], 5000);
+            assert_eq!(body["driver"]["launched_run_count"], 1);
+            assert_eq!(body["driver"]["pending_run_index"], 1);
+            assert_eq!(body["driver"]["active_session_id"], first_session);
+            assert_eq!(body["driver"]["last_session_id"], first_session);
+            assert_eq!(body["view_model"]["can_stop"], action == "resume");
+            assert_eq!(body["view_model"]["can_resume"], action == "stop");
+            assert_eq!(suite["runs"], original_suite["runs"]);
+            assert_eq!(suite["runs"][1]["state"], "pending");
+            assert!(suite["runs"][1]["session_id"].is_null());
+            assert_eq!(session["phase"], "running");
+            assert_eq!(session["process_alive"], true);
+            assert_eq!(session["pid"], live["pid"]);
+            let sessions = api.get("/api/v1/launch/sessions").await;
+            assert_eq!(sessions["sessions"].as_array().unwrap().len(), 1);
+            assert_eq!(sessions["sessions"][0]["session_id"], first_session);
+            let unreserved = api
+                .client
+                .get(format!("{}/api/v1/launch/intents/{second_intent}", api.base))
+                .header(transport::CAPABILITY_HEADER, &api.capability)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unreserved.status(), StatusCode::NOT_FOUND);
+        }
+
+        assert_eq!(
+            observe_and_stop_session(&api, first_session).await,
+            first_processes
+        );
+        services.instances.registry().storage().read(|db| -> Result<(), StorageError> {
+            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents WHERE intent_key=?1 AND state='accepted' AND terminal_ack=1 AND settlement IS NOT NULL", [first_intent], |row| row.get::<_, i64>(0))?, 1);
+            Ok(())
+        }).unwrap();
+        let second = wait_benchmark_run(&api, SUITE, 1).await;
+        let second_session = second["session_id"].as_str().unwrap();
+        assert_ne!(second_session, first_session);
+        assert_eq!(second["launch_intent"], second_intent);
+        let (_, second_processes) = observe_running_session(&api, second_session).await;
+        processes.extend(second_processes.iter().copied());
+        assert_eq!(
+            observe_and_stop_session(&api, second_session).await,
+            second_processes
+        );
+        let complete_driver = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let status = api.get(&driver_path).await;
+                if status["driver"]["state"] == "complete" {
+                    break status;
+                }
+                assert!(matches!(status["driver"]["state"].as_str(), Some("running" | "waiting")), "{status}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("resumed driver must complete its original two-run plan");
+        assert_eq!(complete_driver["driver"]["id"], driver_id);
+        assert_eq!(complete_driver["driver"]["run_count"], 2);
+        assert_eq!(complete_driver["driver"]["launched_run_count"], 2);
+        assert!(complete_driver["driver"]["pending_run_index"].is_null());
+        assert!(complete_driver["driver"]["active_session_id"].is_null());
+        assert!(!complete_driver["view_model"]["can_resume"].as_bool().unwrap());
+        let complete_suite = api.get(&suite_path).await;
+        assert_eq!(complete_suite["runs"].as_array().unwrap().len(), 2);
+        let mut reports = Vec::new();
+        for (index, session, intent) in [
+            (0, first_session, first_intent),
+            (1, second_session, second_intent),
+        ] {
+            let run = &complete_suite["runs"][index];
+            assert_eq!(run["session_id"], session);
+            assert_eq!(run["launch_intent"], intent);
+            assert_eq!(run["state"], "stopped");
+            for field in ["benchmark_id", "profile", "run_type", "target_id"] {
+                assert_eq!(run[field], original_suite["runs"][index][field]);
+            }
+            let accepted = api.get(&format!("/api/v1/launch/intents/{intent}")).await;
+            assert_eq!(accepted["state"], "accepted");
+            assert_eq!(accepted["session"]["session_id"], session);
+            assert_eq!(accepted["session"]["phase"], "exited");
+            assert_eq!(accepted["session"]["tree_settled"], true);
+            assert_eq!(accepted["session"]["output_drained"], true);
+            let report = api.get(&format!("/api/v1/launch/reports/{session}")).await;
+            assert_eq!(report["instance_id"], instance);
+            assert_eq!(report["scenario"]["benchmark_id"], run["benchmark_id"]);
+            assert_eq!(report["scenario"]["benchmark_profile"], run["profile"]);
+            assert_eq!(report["scenario"]["benchmark_run_type"], run["run_type"]);
+            assert_eq!(report["scenario"]["benchmark_mode"], "development");
+            assert_eq!(report["session_outcome"]["kind"], "stopped");
+            reports.push((session.to_owned(), report));
+        }
+        (driver_path, suite_path, complete_driver, complete_suite, reports, request)
+    })
+    .catch_unwind()
+    .await;
+    let shutdown = std::panic::AssertUnwindSafe(services.server.shutdown())
+        .catch_unwind()
+        .await;
+    let settled = services.server.is_shutdown_settled();
+    drop(services);
+    let provider_shutdown = std::panic::AssertUnwindSafe(provider.shutdown())
+        .catch_unwind()
+        .await;
+    let absent = std::panic::AssertUnwindSafe(assert_fixture_processes_gone(&processes))
+        .catch_unwind()
+        .await;
+    if !matches!(&shutdown, Ok(Ok(())))
+        || !settled
+        || provider_shutdown.is_err()
+        || absent.is_err()
+        || journey.is_err()
+    {
+        preserve();
+    }
+    shutdown
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        .unwrap();
+    assert!(settled);
+    provider_shutdown.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    absent.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let (driver_path, suite_path, driver, suite, reports, request) =
+        journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+    let reopened = match start_in_profile(profile, None).await {
+        Ok(services) => services,
+        Err(error) => {
+            preserve();
+            panic!("benchmark fixture reopen failed: {error}");
+        }
+    };
+    let persisted = std::panic::AssertUnwindSafe(async {
+        let api = Api::new(&reopened);
+        assert_eq!(api.get(&driver_path).await, driver);
+        assert_eq!(api.get(&suite_path).await, suite);
+        assert_eq!(api.get("/api/v1/launch/sessions").await, json!({"sessions":[]}));
+        for (session, report) in reports {
+            assert_eq!(api.get(&format!("/api/v1/launch/reports/{session}")).await, report);
+        }
+        reopened.instances.registry().storage().read(|db| -> Result<(), StorageError> {
+            let saved: Vec<u8> = db.query_row("SELECT request FROM benchmark_drivers WHERE driver_id=?1", [driver["driver"]["id"].as_str().unwrap()], |row| row.get(0))?;
+            assert!(saved == request, "resumption must preserve the captured driver request");
+            assert_eq!(db.query_row("SELECT count(*) FROM benchmark_drivers", [], |row| row.get::<_, i64>(0))?, 1);
+            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get::<_, i64>(0))?, 2);
+            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents WHERE state='accepted' AND terminal_ack=1 AND settlement IS NOT NULL", [], |row| row.get::<_, i64>(0))?, 2);
+            assert_eq!(db.query_row("SELECT count(*) FROM launch_reports", [], |row| row.get::<_, i64>(0))?, 2);
+            Ok(())
+        }).unwrap();
+    })
+    .catch_unwind()
+    .await;
+    let shutdown = std::panic::AssertUnwindSafe(reopened.server.shutdown())
+        .catch_unwind()
+        .await;
+    let settled = reopened.server.is_shutdown_settled();
+    drop(reopened);
+    let absent = std::panic::AssertUnwindSafe(assert_fixture_processes_gone(&processes))
+        .catch_unwind()
+        .await;
+    if !matches!(&shutdown, Ok(Ok(()))) || !settled || absent.is_err() || persisted.is_err() {
+        preserve();
+    }
+    shutdown
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        .unwrap();
+    assert!(settled);
+    absent.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    persisted.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_benchmark_driver_automatically_resumes_remaining_run_once() {
     use axial_app::storage::StorageError;
     use std::process::Stdio;
