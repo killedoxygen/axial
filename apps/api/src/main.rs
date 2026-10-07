@@ -27,6 +27,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result = services.server.wait() => result.map_err(std::io::Error::other),
         result = tokio::signal::ctrl_c() => result,
     };
+    if outcome.is_err() {
+        services.telemetry.report_startup_failure();
+    }
     // Even a listener or signal error must settle owned application effects.
     loop {
         match services.server.shutdown().await {

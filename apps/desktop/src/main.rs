@@ -84,6 +84,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(presence) => presence,
         Err(error) => {
             tracing::error!(%error, "Could not start desktop presence; settling application services");
+            services.telemetry.report_startup_failure();
             lifecycle::shutdown_server_after_failure(&services.server).await;
             let message = startup::report(context, error.into()).await;
             return Err(std::io::Error::other(message).into());
@@ -102,6 +103,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let reset = match reset::NativeReset::new(services.library.clone(), services.tasks.clone()) {
         Ok(reset) => reset,
         Err(error) => {
+            services.telemetry.report_startup_failure();
             lifecycle.shutdown_after_event_loop().await;
             let message = startup::report(context, error.into()).await;
             return Err(std::io::Error::other(message).into());
@@ -111,6 +113,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) = bootstrap::confine_content_policy(context.config_mut(), &transport.base_url)
     {
         tracing::error!(%error, "Desktop transport policy failed; settling application services");
+        services.telemetry.report_startup_failure();
         lifecycle.shutdown_after_event_loop().await;
         return Err(error.into());
     }
@@ -118,6 +121,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
             tracing::error!(%error, "Desktop bootstrap failed; settling application services");
+            services.telemetry.report_startup_failure();
             lifecycle.shutdown_after_event_loop().await;
             return Err(std::io::Error::other(error).into());
         }
@@ -125,6 +129,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let webview_directory = services.profile_root.join("webview");
     if let Err(error) = tokio::fs::create_dir_all(&webview_directory).await {
         tracing::error!(%error, "Could not prepare desktop storage; settling application services");
+        services.telemetry.report_startup_failure();
         lifecycle.shutdown_after_event_loop().await;
         return Err(error.into());
     }
@@ -134,6 +139,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let setup_lifecycle = lifecycle.clone();
     let setup_updates = services.updates.clone();
     let setup_tasks = services.tasks.clone();
+    let setup_telemetry = services.telemetry.clone();
     let event_lifecycle = lifecycle.clone();
     let event_bootstrap = bootstrap.clone();
     let event_skin_files = skin_files.clone();
@@ -200,6 +206,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .is_err()
             {
+                setup_telemetry.report_startup_failure();
                 lifecycle::report_window_startup_failure(app.handle().clone(), setup_lifecycle);
                 return Ok(());
             }
@@ -219,6 +226,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             {
                 // Tauri panics if setup returns Err. Preserve application work
                 // in this event loop while native error UI reports the failure.
+                setup_telemetry.report_startup_failure();
                 lifecycle::report_window_startup_failure(app.handle().clone(), setup_lifecycle);
                 return Ok(());
             }
@@ -230,13 +238,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 loop {
                     let event = preferences.borrow_and_update().clone();
                     if let Some(event) = event {
-                        if handle.emit_to(window::MAIN_WINDOW, lifecycle::PREFERENCES_EVENT, &event).is_err() {
+                        if handle
+                            .emit_to(window::MAIN_WINDOW, lifecycle::PREFERENCES_EVENT, &event)
+                            .is_err()
+                        {
                             setup_lifecycle.interface_preferences_delivery_failed(&event);
                         }
                     }
                     tokio::select! {
                         result = &mut waiting => {
-                            if result.is_err() { tracing::error!("The embedded API stopped unexpectedly."); }
+                            if result.is_err() {
+                                tracing::error!("The embedded API stopped unexpectedly.");
+                            }
                             break;
                         }
                         changed = preferences.changed() => {
@@ -260,6 +273,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(app) => app,
         Err(error) => {
             tracing::error!(%error, "Could not build the desktop shell; settling application services");
+            services.telemetry.report_startup_failure();
             lifecycle.shutdown_after_event_loop().await;
             return Err(error.into());
         }
@@ -268,6 +282,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let termination = match termination::install(app.handle()) {
         Ok(guard) => guard,
         Err(error) => {
+            services.telemetry.report_startup_failure();
             lifecycle.shutdown_after_event_loop().await;
             return Err(error.into());
         }
@@ -284,6 +299,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
     #[cfg(target_os = "macos")]
     drop(termination);
+    if exit_code != 0 {
+        services.telemetry.report_startup_failure();
+    }
     lifecycle.shutdown_after_event_loop().await;
     #[cfg(debug_assertions)]
     reset.quiesce_after_exit().await;

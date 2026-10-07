@@ -115,6 +115,24 @@ impl Telemetry {
             })
     }
 
+    pub fn report_startup_failure(&self) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state
+            .errors_by_kind
+            .contains_key(&TelemetryErrorKind::StartupFailed)
+        {
+            return false;
+        }
+        self.enqueue(
+            &mut state,
+            TelemetryEvent::ErrorCaptured {
+                kind: TelemetryErrorKind::StartupFailed,
+            },
+        )
+    }
+
     fn enqueue(&self, state: &mut State, event: TelemetryEvent) -> bool {
         if self.collector.is_none() || state.identity.is_none() {
             return false;

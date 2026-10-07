@@ -484,17 +484,22 @@ async fn start_profile(
     native_login: bool,
     collector: Option<CollectorConfig>,
 ) -> Result<DesktopServices, StartupError> {
-    start_profile_inner(
+    let telemetry = Arc::new(Telemetry::new(collector));
+    let result = start_profile_inner(
         profile_root,
         extra_origin,
         native_login,
-        collector,
+        telemetry.clone(),
         #[cfg(test)]
         None,
         #[cfg(test)]
         None,
     )
-    .await
+    .await;
+    if result.is_err() && telemetry.report_startup_failure() {
+        telemetry.flush_once().await;
+    }
+    result
 }
 
 #[cfg(test)]
@@ -502,7 +507,15 @@ async fn start_profile_with_test_endpoints(
     profile_root: PathBuf,
     endpoints: axial_minecraft::download::InstallTestEndpoints,
 ) -> Result<DesktopServices, StartupError> {
-    start_profile_inner(profile_root, None, false, None, Some(endpoints), None).await
+    start_profile_inner(
+        profile_root,
+        None,
+        false,
+        Arc::new(Telemetry::new(None)),
+        Some(endpoints),
+        None,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -515,7 +528,7 @@ async fn start_profile_with_performance_test_inputs(
         profile_root,
         None,
         false,
-        None,
+        Arc::new(Telemetry::new(None)),
         None,
         Some((content_base_url, transfers)),
     )
@@ -526,7 +539,7 @@ async fn start_profile_inner(
     profile_root: PathBuf,
     extra_origin: Option<&str>,
     native_login: bool,
-    collector: Option<CollectorConfig>,
+    telemetry: Arc<Telemetry>,
     #[cfg(test)] test_endpoints: Option<axial_minecraft::download::InstallTestEndpoints>,
     #[cfg(test)] performance_inputs: Option<(
         String,
@@ -542,7 +555,6 @@ async fn start_profile_inner(
             .map_err(|_| "Local API address is unavailable.")?,
         extra_origin,
     )?;
-    let telemetry = Arc::new(Telemetry::new(collector));
     let telemetry_for_init = telemetry.clone();
     let (profile, library, metadata, settings, accounts, consent, identity, inspector_override) = tokio::task::spawn_blocking(move || {
         let profile = admit_profile(&profile_root)?;
@@ -937,7 +949,14 @@ async fn start_profile_inner(
             Ok(())
         })
     };
-    let join = tokio::spawn(serve(listener, router, receiver));
+    let serving_telemetry = telemetry.clone();
+    let join = tokio::spawn(async move {
+        let result = serve(listener, router, receiver).await;
+        if result.is_err() && serving_telemetry.report_startup_failure() {
+            serving_telemetry.flush_once().await;
+        }
+        result
+    });
     let server = Arc::new(ServerHandle {
         authority,
         tasks: tasks.clone(),
@@ -1431,8 +1450,12 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn configured_telemetry_restores_consent_and_joins_final_flush() {
+    async fn telemetry_collector() -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+        watch::Sender<bool>,
+        JoinHandle<io::Result<()>>,
+    ) {
         use axum::{Json, extract::State, http::StatusCode, routing::post};
         async fn collect(
             State(batches): State<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
@@ -1445,12 +1468,7 @@ mod tests {
             .await
             .unwrap();
         let host = format!("http://{}", listener.local_addr().unwrap());
-        let collector = || {
-            Some(
-                CollectorConfig::new("phc_fixture_key", &host, TelemetryEnvironment::Test).unwrap(),
-            )
-        };
-        let (batches, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (batches, received) = tokio::sync::mpsc::unbounded_channel();
         let (stop, stopped) = watch::channel(false);
         let collecting = tokio::spawn(serve(
             listener,
@@ -1459,11 +1477,23 @@ mod tests {
                 .with_state(batches),
             stopped,
         ));
+        (host, received, stop, collecting)
+    }
+
+    #[tokio::test]
+    async fn configured_telemetry_restores_consent_and_joins_final_flush() {
+        let (host, mut received, stop, collecting) = telemetry_collector().await;
+        let collector = || {
+            Some(
+                CollectorConfig::new("phc_fixture_key", &host, TelemetryEnvironment::Test).unwrap(),
+            )
+        };
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("replacement");
         let services = start_profile(root.clone(), None, false, collector())
             .await
             .unwrap();
+        assert!(!services.telemetry.report_startup_failure());
         let bootstrap = services.server.bootstrap();
         reqwest::Client::new()
             .put(format!("{}/api/v1/config", bootstrap.base_url))
@@ -1475,30 +1505,132 @@ mod tests {
             .error_for_status()
             .unwrap();
         let identity = services.settings.telemetry_identity().unwrap().unwrap();
+        assert!(services.telemetry.report_startup_failure());
+        assert!(!services.telemetry.report_startup_failure());
         services.server.shutdown().await.unwrap();
         drop(services);
+        let first_batches: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
         // The initial launch occurred without consent. The reopened launch
         // must observe persisted consent before publishing its startup event.
-        while received.try_recv().is_ok() {}
         let reopened = start_profile(root, None, false, collector()).await.unwrap();
         assert_eq!(
             reopened.settings.telemetry_identity().unwrap().as_deref(),
             Some(identity.as_str())
         );
+        assert!(reopened.telemetry.report_startup_failure());
+        assert!(!reopened.telemetry.report_startup_failure());
         reopened.server.shutdown().await.unwrap();
-        let batch = tokio::time::timeout(Duration::from_secs(1), received.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            batch["batch"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|event| event["event"] == "app_started")
-        );
+        let reopened_batches: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
         stop.send_replace(true);
         collecting.await.unwrap().unwrap();
+        for batches in [&first_batches, &reopened_batches] {
+            let failures: Vec<_> = batches
+                .iter()
+                .flat_map(|batch| batch["batch"].as_array().unwrap())
+                .filter(|event| event["properties"]["$exception_fingerprint"] == "startup_failed")
+                .collect();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0]["properties"]["distinct_id"], identity);
+        }
+        assert!(
+            reopened_batches
+                .iter()
+                .flat_map(|batch| batch["batch"].as_array().unwrap())
+                .any(|event| event["event"] == "app_started")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_failure_flushes_only_with_readable_saved_consent() {
+        let (host, mut received, stop, collecting) = telemetry_collector().await;
+        let collector = || {
+            Some(
+                CollectorConfig::new("phc_fixture_key", &host, TelemetryEnvironment::Test).unwrap(),
+            )
+        };
+        let mut observations = Vec::new();
+        for (enabled, configured, corrupt) in [
+            (false, true, false),
+            (true, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let temporary =
+                tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let root = temporary.path().join("profile");
+            let services = start_profile(root.clone(), None, false, collector())
+                .await
+                .unwrap();
+            let bootstrap = services.server.bootstrap();
+            reqwest::Client::new()
+                .put(format!("{}/api/v1/config", bootstrap.base_url))
+                .header(transport::CAPABILITY_HEADER, bootstrap.capability)
+                .json(&serde_json::json!({"expected_revision":0,"telemetry_enabled":enabled}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let identity = services.settings.telemetry_identity().unwrap();
+            services.server.shutdown().await.unwrap();
+            drop(services);
+            while received.try_recv().is_ok() {}
+            fs::rename(root.join("runtime"), root.join("preserved-runtime")).unwrap();
+            let blocker = b"synthetic private startup blocker";
+            fs::write(root.join("runtime"), blocker).unwrap();
+            if corrupt {
+                fs::rename(
+                    root.join("metadata.sqlite"),
+                    root.join("preserved-metadata.sqlite"),
+                )
+                .unwrap();
+                fs::write(root.join("metadata.sqlite"), blocker).unwrap();
+            }
+            let marker = fs::read(root.join(PROFILE_MARKER)).unwrap();
+            let failure = start_profile(
+                root.clone(),
+                None,
+                false,
+                configured.then(collector).flatten(),
+            )
+            .await
+            .err()
+            .expect("the real filesystem blocker must refuse startup");
+            failure.try_preserve().unwrap();
+            assert_eq!(fs::read(root.join("runtime")).unwrap(), blocker);
+            assert_eq!(fs::read(root.join(PROFILE_MARKER)).unwrap(), marker);
+            observations.push((
+                enabled && configured && !corrupt,
+                identity,
+                received.try_recv().ok(),
+            ));
+            assert!(received.try_recv().is_err());
+        }
+        stop.send_replace(true);
+        collecting.await.unwrap().unwrap();
+        for (expected, identity, batch) in observations {
+            assert_eq!(
+                batch.is_some(),
+                expected,
+                "post-consent startup failure must flush before returning"
+            );
+            if let Some(batch) = batch {
+                let events = batch["batch"].as_array().unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0]["event"], "$exception");
+                let properties = &events[0]["properties"];
+                assert_eq!(properties["distinct_id"], identity.unwrap());
+                assert_eq!(properties["$exception_fingerprint"], "startup_failed");
+                assert_eq!(properties["area"], "startup");
+                assert_eq!(
+                    properties["$exception_list"],
+                    serde_json::json!([
+                        {"type":"startup_failed", "value":"Application startup failed."}
+                    ])
+                );
+                assert!(!batch.to_string().contains("private startup blocker"));
+            }
+        }
     }
 
     #[tokio::test]
