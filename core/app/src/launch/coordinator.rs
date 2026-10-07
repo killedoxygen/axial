@@ -53,7 +53,10 @@ use crate::{
     },
     library::{ApplicationRootPin, GenerationPin},
     performance::{PerformanceMutationError, PerformanceService},
-    runtime::{discovery::RuntimeDiscovery, model::JavaDiscoveryError},
+    runtime::{
+        discovery::{RuntimeDiscovery, RuntimeObservation},
+        model::JavaDiscoveryError,
+    },
     settings::{EffectiveLaunchSettings, OverrideOrigin, SettingsStore},
     tasks::{CancellationToken, ExclusionLease, TaskOwner},
 };
@@ -189,12 +192,14 @@ pub enum PreflightReadinessReasonId {
     AssetIndexMissing,
     AssetIndexCorrupt,
     JavaOverrideMissing,
+    ManagedRuntimeMissing,
 }
 
 #[derive(Clone, Debug, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum PreflightReadinessSeverity {
     Blocking,
+    Recoverable,
 }
 
 #[derive(Clone, Debug, Serialize, TS)]
@@ -591,6 +596,7 @@ impl LaunchCoordinator {
                 let mut bundle_guard = None;
                 let mut planned_performance = None;
                 let mut observed_damage = None;
+                let mut runtime_absence = None;
                 let mut result = async {
                     // Installation can be repaired without selecting an account.
                     // Only the guarded install proof establishes that need;
@@ -687,10 +693,14 @@ impl LaunchCoordinator {
                         );
                         let runtime = match coordinator
                             .runtimes
-                            .select(&required, &settings.java_path, &cancel)
+                            .observe_for_preflight(&required, &settings.java_path, &cancel)
                             .await
                         {
-                            Ok(runtime) => runtime,
+                            Ok(RuntimeObservation::Ready(runtime)) => Some(runtime),
+                            Ok(RuntimeObservation::Missing(absence)) => {
+                                runtime_absence = Some(absence);
+                                None
+                            }
                             Err(error @ (JavaDiscoveryError::Missing | JavaDiscoveryError::NotExecutable))
                                 if diagnostics && settings.java_override_origin.is_some() =>
                             {
@@ -721,11 +731,14 @@ impl LaunchCoordinator {
                         let contribution =
                             axial_performance::effective_performance_plan(performance.plan());
                         let options = launch_options(&settings, target, &contribution, &host)?;
-                        super::plan::validate_options(
-                            &options,
-                            &target.minecraft_version,
-                            runtime.probe.info(),
-                        )
+                        match runtime {
+                            Some(runtime) => super::plan::validate_options(
+                                &options,
+                                &target.minecraft_version,
+                                runtime.probe.info(),
+                            ).map(|_| ()),
+                            None => super::plan::validate_settings(&options, None),
+                        }
                         .map_err(|error| {
                             tracing::warn!(
                                 ?error,
@@ -741,7 +754,15 @@ impl LaunchCoordinator {
                                 &host,
                                 PreflightReadiness {
                                     launchable: true,
-                                    reasons: Vec::new(),
+                                    reasons: if runtime_absence.is_some() {
+                                        vec![PreflightReadinessReason {
+                                            id: PreflightReadinessReasonId::ManagedRuntimeMissing,
+                                            severity: PreflightReadinessSeverity::Recoverable,
+                                            message: "Managed Java runtime is missing and will be prepared before launch.",
+                                        }]
+                                    } else {
+                                        Vec::new()
+                                    },
                                 },
                             )?)
                         } else {
@@ -799,6 +820,13 @@ impl LaunchCoordinator {
                     .map_err(instance_error)?;
                 if current.instance.settings != admitted.record().instance.settings {
                     return Err(LaunchError::InstanceChanged);
+                }
+                if let Some(absence) = runtime_absence {
+                    absence.revalidate()
+                        .map_err(|_| LaunchError::RuntimeFailure(JavaDiscoveryError::Replaced))?;
+                    let proof = owned_proof.lock().unwrap().clone()
+                        .ok_or(LaunchError::PreparationFailed)?;
+                    proof.bundle.revalidate().map_err(bundle_read_error)?;
                 }
                 if let Some(damage) = observed_damage {
                     bundle_guard

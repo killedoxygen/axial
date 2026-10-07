@@ -212,17 +212,7 @@ pub(crate) fn validate_options(
     target: &str,
     info: &axial_minecraft::JavaRuntimeInfo,
 ) -> Result<String, LaunchPlanError> {
-    if let Some((width, height)) = settings.resolution {
-        if !(320..=16384).contains(&width) || !(320..=16384).contains(&height) {
-            return Err(LaunchPlanError::InvalidResolution);
-        }
-    }
-    let maximum = settings.max_memory_mb.unwrap_or(4096);
-    let minimum = settings.min_memory_mb.unwrap_or(512);
-    if !(512..=1024 * 1024).contains(&maximum) || !(256..=maximum).contains(&minimum) {
-        return Err(LaunchPlanError::InvalidMemory);
-    }
-    validate_extra_args(&settings.extra_jvm_args, info)?;
+    validate_settings(settings, Some(info))?;
     if settings.jvm_preset.is_empty() {
         Ok(jvm::auto_select_preset_with_host(
             target,
@@ -247,6 +237,23 @@ pub(crate) fn validate_options(
     }
 }
 
+pub(crate) fn validate_settings(
+    settings: &LaunchOptions,
+    info: Option<&axial_minecraft::JavaRuntimeInfo>,
+) -> Result<(), LaunchPlanError> {
+    if let Some((width, height)) = settings.resolution {
+        if !(320..=16384).contains(&width) || !(320..=16384).contains(&height) {
+            return Err(LaunchPlanError::InvalidResolution);
+        }
+    }
+    let maximum = settings.max_memory_mb.unwrap_or(4096);
+    let minimum = settings.min_memory_mb.unwrap_or(512);
+    if !(512..=1024 * 1024).contains(&maximum) || !(256..=maximum).contains(&minimum) {
+        return Err(LaunchPlanError::InvalidMemory);
+    }
+    validate_extra_args(&settings.extra_jvm_args, info)
+}
+
 pub(crate) fn split_extra_args(input: &str) -> Result<Vec<String>, LaunchPlanError> {
     if input.len() > 8192 {
         return Err(LaunchPlanError::InvalidJvmArguments);
@@ -256,7 +263,7 @@ pub(crate) fn split_extra_args(input: &str) -> Result<Vec<String>, LaunchPlanErr
 
 fn validate_extra_args(
     args: &[String],
-    info: &axial_minecraft::JavaRuntimeInfo,
+    info: Option<&axial_minecraft::JavaRuntimeInfo>,
 ) -> Result<(), LaunchPlanError> {
     let unlock = args
         .iter()
@@ -296,14 +303,15 @@ fn validate_extra_args(
         {
             return Err(LaunchPlanError::ReservedJvmArgument);
         }
-        if (arg == "-XX:+UseShenandoahGC" && !jvm::supports_shenandoah(info))
-            || (arg == "-XX:+UseZGC" && !jvm::supports_zgc(info))
-            || (arg == "-XX:+ZGenerational" && !jvm::supports_generational_zgc(info))
-        {
+        if info.is_some_and(|info| {
+            (arg == "-XX:+UseShenandoahGC" && !jvm::supports_shenandoah(info))
+                || (arg == "-XX:+UseZGC" && !jvm::supports_zgc(info))
+                || (arg == "-XX:+ZGenerational" && !jvm::supports_generational_zgc(info))
+        }) {
             return Err(LaunchPlanError::UnsupportedJvmOption);
         }
         if arg.starts_with("-XX:G1NewSizePercent=") || arg.starts_with("-XX:G1MaxNewSizePercent=") {
-            if !jvm::supports_hotspot_tuning(info) {
+            if info.is_some_and(|info| !jvm::supports_hotspot_tuning(info)) {
                 return Err(LaunchPlanError::UnsupportedJvmOption);
             }
             if unlock.is_none_or(|unlock| unlock > index) {
@@ -426,7 +434,7 @@ mod tests {
         ] {
             for argument in [format!("-D{key}=/verified/natives"), format!("-D{key}")] {
                 assert_eq!(
-                    validate_extra_args(&[argument.clone()], &info()),
+                    validate_extra_args(&[argument.clone()], Some(&info())),
                     Err(LaunchPlanError::ReservedJvmArgument)
                 );
                 let mut provider_args = vec![argument, "-Dunrelated.tmpdir=value".into()];
@@ -434,7 +442,7 @@ mod tests {
                 assert_eq!(provider_args, ["-Dunrelated.tmpdir=value"]);
             }
         }
-        assert!(validate_extra_args(&["-Djna.tmpdir.other=value".into()], &info()).is_ok());
+        assert!(validate_extra_args(&["-Djna.tmpdir.other=value".into()], Some(&info())).is_ok());
     }
 
     #[test]
@@ -480,11 +488,11 @@ mod tests {
             "Main",
         ] {
             assert!(
-                validate_extra_args(&[arg.into()], &info()).is_err(),
+                validate_extra_args(&[arg.into()], Some(&info())).is_err(),
                 "{arg}"
             );
         }
-        assert!(validate_extra_args(&["-Dexample=value".into()], &info()).is_ok());
+        assert!(validate_extra_args(&["-Dexample=value".into()], Some(&info())).is_ok());
     }
     #[test]
     fn quoting_and_experimental_option_order_are_preserved() {
@@ -502,7 +510,7 @@ mod tests {
                     "-XX:G1NewSizePercent=20".into(),
                     "-XX:+UnlockExperimentalVMOptions".into()
                 ],
-                &info()
+                Some(&info())
             ),
             Err(LaunchPlanError::JvmOptionOrdering)
         );

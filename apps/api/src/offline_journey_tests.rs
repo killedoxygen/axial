@@ -3617,9 +3617,27 @@ async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
         assert_ne!(api.capability, restarted_api.capability);
         assert_eq!(restarted_api.get("/api/v1/config").await["java_path_override"], "");
         let preflight = format!("/api/v1/launch/preflight/{instance}");
+        let readonly_requests_before = provider.state.requests.lock().unwrap().clone();
         let preflight_before = restarted_api.get(&preflight).await;
-        let instance_before = restarted_api.get(&format!("/api/v1/instances/{instance}")).await;
+        let instance_path = format!("/api/v1/instances/{instance}");
+        let instance_before = restarted_api.get(&instance_path).await;
         assert!(!runtime.try_exists().unwrap());
+        let original_args = reopened.instances.registry()
+            .get_live(&instance.parse().unwrap()).unwrap().instance.settings.extra_jvm_args;
+        restarted_api.request(reqwest::Method::PUT, &instance_path, Some(json!({
+            "expected_revision":instance_before["revision"],
+            "extra_jvm_args":"-javaagent:fixture-agent.jar"
+        }))).await;
+        let invalid_plan = restarted_api.get(&preflight).await;
+        let invalid_instance = restarted_api.get(&instance_path).await;
+        let runtime_absent_after_invalid_plan = std::fs::symlink_metadata(&runtime)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let restored_instance = restarted_api.request(reqwest::Method::PUT, &instance_path, Some(json!({
+            "expected_revision":invalid_instance["revision"],"extra_jvm_args":original_args
+        }))).await;
+        let restored_args = reopened.instances.registry()
+            .get_live(&instance.parse().unwrap()).unwrap().instance.settings.extra_jvm_args;
+        let readonly_requests_after = provider.state.requests.lock().unwrap().clone();
         let request_count = provider.state.requests.lock().unwrap().len();
         let response = restarted_api
             .client
@@ -3696,6 +3714,8 @@ async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
             assert!(runtime_before.is_dir());
             assert_eq!(std::fs::canonicalize(&runtime).unwrap(), runtime);
             std::fs::rename(&runtime, &preserved_runtime).unwrap();
+            let override_preflight = restarted_api.get(&preflight).await;
+            let override_instance = restarted_api.get(&instance_path).await;
             let response = restarted_api.client
                 .post(format!("{}/api/v1/launch", restarted_api.base))
                 .header(transport::CAPABILITY_HEADER, &restarted_api.capability)
@@ -3737,6 +3757,30 @@ async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
                 for (path, bytes) in runtime_files {
                     assert_eq!(std::fs::read(path).unwrap(), bytes);
                 }
+                assert!(runtime_absent_after_invalid_plan, "invalid plan reads must not acquire Java");
+                assert_eq!(restored_args, original_args);
+                assert_eq!(restored_instance["extra_jvm_args"], "");
+                assert_eq!(invalid_instance["extra_jvm_args"], "");
+                assert_eq!(invalid_plan["launchable"], false, "{invalid_plan}");
+                assert_eq!(invalid_plan["status"], Value::Null);
+                assert_eq!(invalid_plan["readiness"], Value::Null);
+                assert_eq!(invalid_plan["error"], json!({
+                    "code":"plan_rejected",
+                    "error":"The launch command could not be validated. Check the instance settings and installation."
+                }));
+                for blocked in [&invalid_instance, &override_instance] {
+                    assert_eq!(blocked["launch_action"]["launchable"], false, "{blocked}");
+                    assert_eq!(blocked["launch_action"]["primary_action"], "blocked");
+                }
+                assert_eq!(override_preflight["status"], "ready", "{override_preflight}");
+                assert_eq!(override_preflight["launchable"], false);
+                assert_eq!(override_preflight["overrides"]["java"], json!({"present":true,"origin":"global"}));
+                assert_eq!(override_preflight["readiness"], json!({
+                    "launchable":false,"reasons":[{
+                        "id":"java_override_missing","severity":"blocking",
+                        "message":"Selected Java override is unavailable. Choose another Java runtime."
+                    }]
+                }));
                 for (status, body, message) in [
                     (corrupt_status, corrupt_body, "The selected Java executable changed. Select it again."),
                     (override_status, override_body, "The selected Java executable is missing."),
@@ -3749,7 +3793,8 @@ async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
         assert_eq!(restarted_api.get("/api/v1/install/queue").await, queue_before);
         assert_eq!(restarted_api.get(&install_path).await, terminal);
         provider.assert_requests(false);
-        (status, body, preflight_before, instance_before, protected, verify_guards)
+        (status, body, preflight_before, instance_before, protected, verify_guards,
+            readonly_requests_before, readonly_requests_after)
     })
     .catch_unwind()
     .await;
@@ -3778,8 +3823,16 @@ async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
         assert!(settled);
         provider_shutdown.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         absent.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        let (status, body, preflight_before, instance_before, protected, verify_guards) =
-            journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let (
+            status,
+            body,
+            preflight_before,
+            instance_before,
+            protected,
+            verify_guards,
+            readonly_requests_before,
+            readonly_requests_after,
+        ) = journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         for (path, bytes) in protected {
             assert_eq!(std::fs::read(path).unwrap(), bytes);
         }
@@ -3789,6 +3842,29 @@ async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
             instance_before["launch_action"]
         );
         verify_guards.expect("successful Play must exercise refusal guards")();
+        assert_eq!(
+            readonly_requests_after, readonly_requests_before,
+            "readiness must not acquire provider data"
+        );
+        assert_eq!(preflight_before["status"], "ready", "{preflight_before}");
+        assert_eq!(preflight_before["launchable"], true, "{preflight_before}");
+        assert_eq!(preflight_before["error"], Value::Null);
+        assert_eq!(
+            preflight_before["readiness"],
+            json!({
+                "launchable":true,
+                "reasons":[{
+                    "id":"managed_runtime_missing","severity":"recoverable",
+                    "message":"Managed Java runtime is missing and will be prepared before launch."
+                }]
+            })
+        );
+        assert_eq!(
+            instance_before["launch_action"]["launchable"], true,
+            "{instance_before}"
+        );
+        assert_eq!(instance_before["launch_action"]["primary_action"], "launch");
+        assert_eq!(instance_before["launch_action"]["label"], "Launch");
     }));
     if let Err(panic) = verified {
         eprintln!(

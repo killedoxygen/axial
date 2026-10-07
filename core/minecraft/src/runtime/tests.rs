@@ -71,6 +71,206 @@ fn test_runtime_component() -> RuntimeId {
     RuntimeId::from("java-runtime-delta")
 }
 
+fn runtime_absence_fixture() -> (
+    tempfile::TempDir,
+    axial_fs::RootSession,
+    axial_fs::Directory,
+    ManagedRuntimeCache,
+) {
+    let temporary = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let path = temporary.path().join("runtime");
+    fs::create_dir(&path).unwrap();
+    let session = match axial_fs::RootSession::acquire(temporary.path()) {
+        axial_fs::RootSessionAcquireOutcome::Acquired(session) => session,
+        outcome => panic!("could not acquire fixture: {outcome:?}"),
+    };
+    let directory = session
+        .root()
+        .unwrap()
+        .open_directory(&axial_fs::LeafName::new("runtime").unwrap())
+        .unwrap();
+    let cache = ManagedRuntimeCache::from_directory(directory.clone(), path).unwrap();
+    (temporary, session, directory, cache)
+}
+
+#[test]
+fn runtime_absence_retains_known_empty_component_observation() {
+    let (_temporary, session, directory, cache) = runtime_absence_fixture();
+    for unknown in ["", "unknown", "../java-runtime-delta"] {
+        assert!(cache.observe_missing_component(unknown).is_err());
+    }
+    let absence = cache
+        .observe_missing_component("java-runtime-delta")
+        .unwrap()
+        .expect("known component is absent");
+    absence.revalidate().unwrap();
+    cache.settle().unwrap();
+    drop(cache);
+    absence.revalidate().unwrap();
+    drop((absence, directory));
+    assert!(matches!(
+        session.revoke(),
+        axial_fs::RootRevokeOutcome::Revoked
+    ));
+}
+
+#[test]
+fn runtime_absence_preserves_existing_canonical_and_sidecar_entries() {
+    for (name, is_directory) in [
+        ("java-runtime-delta", true),
+        ("java-runtime-delta", false),
+        ("java-runtime-delta.staging", true),
+        ("java-runtime-delta.staging", false),
+        ("java-runtime-delta.quarantine", true),
+        ("java-runtime-delta.quarantine", false),
+    ] {
+        let (_temporary, session, directory, cache) = runtime_absence_fixture();
+        let absence = cache
+            .observe_missing_component("java-runtime-delta")
+            .unwrap()
+            .unwrap();
+        let path = cache.root().join(name);
+        let canary = if is_directory {
+            fs::create_dir(&path).unwrap();
+            path.join("preserved")
+        } else {
+            path.clone()
+        };
+        fs::write(&canary, b"preserved runtime conflict").unwrap();
+        let observation = cache.observe_missing_component("java-runtime-delta");
+        if name == "java-runtime-delta" && is_directory {
+            assert!(observation.unwrap().is_none());
+            // Existing runtime selection, not absence, owns its sidecar policy.
+            let sidecar = cache.root().join("java-runtime-delta.staging");
+            fs::write(&sidecar, b"preserved existing sidecar").unwrap();
+            assert!(
+                cache
+                    .observe_missing_component("java-runtime-delta")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(fs::read(sidecar).unwrap(), b"preserved existing sidecar");
+        } else {
+            assert!(observation.is_err(), "{name}");
+        }
+        assert!(absence.revalidate().is_err());
+        assert_eq!(fs::read(canary).unwrap(), b"preserved runtime conflict");
+        cache.settle().unwrap();
+        drop((absence, cache, directory));
+        assert!(matches!(
+            session.revoke(),
+            axial_fs::RootRevokeOutcome::Revoked
+        ));
+    }
+}
+
+#[test]
+fn runtime_absence_does_not_refresh_after_observed_namespace_churn() {
+    let (_temporary, session, directory, cache) = runtime_absence_fixture();
+    let original = directory.revision().unwrap();
+    let absence = cache
+        .observe_missing_component("java-runtime-delta")
+        .unwrap()
+        .unwrap();
+    let component = cache.root().join("java-runtime-delta");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        fs::create_dir(&component).unwrap();
+        fs::remove_dir(&component).unwrap();
+        if directory.revision().unwrap() != original {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native revision did not change"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(directory.validate_revision(&original).is_err());
+    assert!(
+        cache
+            .admit_component("java-runtime-delta")
+            .unwrap()
+            .is_none()
+    );
+    assert!(absence.revalidate().is_err());
+    assert!(absence.revalidate().is_err());
+    let fresh = cache
+        .observe_missing_component("java-runtime-delta")
+        .unwrap()
+        .unwrap();
+    fresh.revalidate().unwrap();
+    cache.settle().unwrap();
+    drop((fresh, absence, cache, directory));
+    assert!(matches!(
+        session.revoke(),
+        axial_fs::RootRevokeOutcome::Revoked
+    ));
+}
+
+#[test]
+fn runtime_absence_refuses_portable_aliases_without_changing_them() {
+    for name in [
+        "JAVA-RUNTIME-DELTA",
+        "JAVA-RUNTIME-DELTA.STAGING",
+        "JAVA-RUNTIME-DELTA.QUARANTINE",
+    ] {
+        let (_temporary, session, directory, cache) = runtime_absence_fixture();
+        let path = cache.root().join(name);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("preserved"), b"preserved alias").unwrap();
+        assert!(
+            cache
+                .observe_missing_component("java-runtime-delta")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(path.join("preserved")).unwrap(),
+            b"preserved alias"
+        );
+        cache.settle().unwrap();
+        drop((cache, directory));
+        assert!(matches!(
+            session.revoke(),
+            axial_fs::RootRevokeOutcome::Revoked
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_absence_refuses_replaced_cache_root() {
+    let (temporary, session, directory, cache) = runtime_absence_fixture();
+    fs::write(cache.root().join("preserved"), b"preserved root").unwrap();
+    let absence = cache
+        .observe_missing_component("java-runtime-delta")
+        .unwrap()
+        .unwrap();
+    let root = cache.root().to_path_buf();
+    let retained = temporary.path().join("retained-runtime");
+    fs::rename(&root, &retained).unwrap();
+    fs::create_dir(&root).unwrap();
+    assert!(absence.revalidate().is_err());
+    assert!(
+        cache
+            .observe_missing_component("java-runtime-delta")
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(retained.join("preserved")).unwrap(),
+        b"preserved root"
+    );
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+    fs::remove_dir(&root).unwrap();
+    fs::rename(&retained, &root).unwrap();
+    cache.settle().unwrap();
+    drop((absence, cache, directory));
+    assert!(matches!(
+        session.revoke(),
+        axial_fs::RootRevokeOutcome::Revoked
+    ));
+}
+
 fn admit_runtime_component(
     cache: &ManagedRuntimeCache,
     component: &str,

@@ -2021,7 +2021,7 @@ fn runtime_sidecar_path(install_root: &Path, suffix: &str) -> PathBuf {
     install_root.with_file_name(name)
 }
 
-fn runtime_sidecar_name(component: &str, suffix: &str) -> String {
+pub(super) fn runtime_sidecar_name(component: &str, suffix: &str) -> String {
     format!("{component}.{suffix}")
 }
 

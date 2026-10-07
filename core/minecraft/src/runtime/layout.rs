@@ -2,7 +2,7 @@ use super::file_download::runtime_filesystem_path;
 use crate::loaders::types::LoaderError;
 use crate::managed_fs::{ManagedDir, ManagedExecutableGuard};
 use crate::portable_path::PortableRelativePath;
-use axial_fs::Directory;
+use axial_fs::{Directory, DirectoryRevision, EntryKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -50,6 +50,72 @@ mod lifetime_tests {
 #[derive(Clone)]
 pub struct ManagedRuntimeCache {
     inner: Arc<ManagedRuntimeCacheInner>,
+}
+
+/// Read-only evidence of an empty component namespace, never creation authority.
+pub struct RuntimeAbsence {
+    cache: ManagedRuntimeCache,
+    root: ManagedDir,
+    component: String,
+    revision: DirectoryRevision,
+}
+
+impl std::fmt::Debug for RuntimeAbsence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeAbsence")
+            .field("component", &self.component)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeAbsence {
+    /// Recheck the original namespace revision; never adopt a newer observation.
+    pub fn revalidate(&self) -> std::io::Result<()> {
+        if self.component_absent()? {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("observed runtime absence changed"))
+        }
+    }
+
+    fn component_absent(&self) -> std::io::Result<bool> {
+        self.cache.validate_projection().map_err(runtime_cache_io)?;
+        self.root
+            .validate_passive_revision(&self.revision)
+            .map_err(runtime_cache_io)?;
+        let absent = match self
+            .root
+            .exact_entry_kind(&self.component)
+            .map_err(runtime_cache_io)?
+        {
+            None => true,
+            Some(EntryKind::Directory) => false,
+            Some(_) => {
+                return Err(std::io::Error::other(
+                    "runtime component is not a directory",
+                ));
+            }
+        };
+        if absent {
+            for suffix in ["staging", "quarantine"] {
+                let name = super::install::runtime_sidecar_name(&self.component, suffix);
+                if self
+                    .root
+                    .exact_entry_kind(&name)
+                    .map_err(runtime_cache_io)?
+                    .is_some()
+                {
+                    return Err(std::io::Error::other("runtime sidecar requires settlement"));
+                }
+            }
+        }
+        self.root
+            .validate_passive_revision(&self.revision)
+            .map_err(runtime_cache_io)?;
+        self.cache.validate_projection().map_err(runtime_cache_io)?;
+        Ok(absent)
+    }
 }
 
 #[derive(Clone)]
@@ -146,6 +212,29 @@ impl ManagedRuntimeCache {
 
     pub fn root(&self) -> &Path {
         &self.inner.root_path
+    }
+
+    /// An existing canonical directory returns `None` for normal selection.
+    /// Absence additionally requires both publication sidecars to be absent.
+    pub fn observe_missing_component(
+        &self,
+        component: &str,
+    ) -> std::io::Result<Option<RuntimeAbsence>> {
+        if !super::discovery::is_known_runtime_component(component) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "runtime component is outside the managed cache vocabulary",
+            ));
+        }
+        let root = self.authority().map_err(runtime_cache_io)?;
+        let revision = root.passive_revision().map_err(runtime_cache_io)?;
+        let observation = RuntimeAbsence {
+            cache: self.clone(),
+            root,
+            component: component.to_owned(),
+            revision,
+        };
+        Ok(observation.component_absent()?.then_some(observation))
     }
 
     /// Call after runtime producers have joined. Retain this cache on failure;

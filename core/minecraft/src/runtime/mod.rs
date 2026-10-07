@@ -54,7 +54,9 @@ pub(crate) use install::{
     take_runtime_tree_verification_counts_for_test,
 };
 pub(crate) use layout::runtime_java_relative_path;
-pub use layout::{ManagedRuntimeCache, ManagedRuntimeComponent, ManagedRuntimeLaunchReceipt};
+pub use layout::{
+    ManagedRuntimeCache, ManagedRuntimeComponent, ManagedRuntimeLaunchReceipt, RuntimeAbsence,
+};
 pub use model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, ManagedRuntimeMutationRefused,
     RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,

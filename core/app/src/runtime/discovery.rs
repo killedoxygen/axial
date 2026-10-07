@@ -21,6 +21,11 @@ pub(crate) struct SelectedRuntime {
     pub managed: Option<ManagedRuntimeLaunchReceipt>,
 }
 
+pub(crate) enum RuntimeObservation {
+    Ready(SelectedRuntime),
+    Missing(axial_minecraft::runtime::RuntimeAbsence),
+}
+
 impl RuntimeDiscovery {
     pub fn new(cache: ManagedRuntimeCache, tasks: TaskOwner) -> Self {
         Self {
@@ -128,6 +133,33 @@ impl RuntimeDiscovery {
         }
         drop(receipt);
         Ok(selected)
+    }
+
+    pub(crate) async fn observe_for_preflight(
+        &self,
+        java: &JavaVersion,
+        override_value: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<RuntimeObservation, JavaDiscoveryError> {
+        if cancellation.is_cancelled() {
+            return Err(JavaDiscoveryError::Cancelled);
+        }
+        if override_value.trim().is_empty() {
+            let component = axial_minecraft::runtime::preferred_runtime_component(java);
+            if !axial_minecraft::runtime::is_known_runtime_component(&component) {
+                return Err(JavaDiscoveryError::ManagedNotReady);
+            }
+            if let Some(absence) = self
+                .cache
+                .observe_missing_component(&component)
+                .map_err(|_| JavaDiscoveryError::Replaced)?
+            {
+                return Ok(RuntimeObservation::Missing(absence));
+            }
+        }
+        self.select(java, override_value, cancellation)
+            .await
+            .map(RuntimeObservation::Ready)
     }
 
     pub(crate) async fn select(
