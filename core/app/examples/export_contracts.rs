@@ -2,6 +2,7 @@
 
 use axial_app::{
     instances::{delete::DeletionSnapshot, setup::CreateLoaderBuildsView},
+    launch::coordinator::PreflightDiagnostics,
     public::{ErrorResponse, OperationId},
     resources::{InstanceLogTailResponse, InstanceResourcesResponse},
     settings::{
@@ -65,6 +66,7 @@ fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     PendingSkinStatus::export_all(&config)?;
     DeletionSnapshot::export_all(&config)?;
     CreateLoaderBuildsView::export_all(&config)?;
+    PreflightDiagnostics::export_all(&config)?;
     Ok(())
 }
 

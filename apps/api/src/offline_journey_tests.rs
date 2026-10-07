@@ -2318,6 +2318,171 @@ async fn observed_settlement_crash_helper() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
+    let temporary =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let profile = temporary.path().join("profile");
+    let provider = Provider::start(false).await;
+    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+        .await
+        .unwrap();
+    let api = Api::new(&services);
+    api.post(
+        "/api/v1/accounts/offline",
+        json!({"username":PLAYER,"expected_selection_revision":0}),
+    )
+    .await;
+    let config = api
+        .request(
+            reqwest::Method::PUT,
+            "/api/v1/config",
+            Some(json!({
+                "expected_revision":0,"performance_mode":"vanilla","jvm_preset":"",
+                "java_path_override":"","max_memory_mb":2048,"min_memory_mb":1024
+            })),
+        )
+        .await;
+    let start = api
+        .post(
+            "/api/v1/install/queue",
+            json!({"kind":"vanilla","version_id":VERSION}),
+        )
+        .await;
+    assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
+    let created = api
+        .post(
+            "/api/v1/instances",
+            json!({"name":"Preflight diagnostics","selection_id":format!("vanilla|{VERSION}")}),
+        )
+        .await;
+    let instance = created["id"].as_str().unwrap();
+    let preflight = format!("/api/v1/launch/preflight/{instance}");
+    let reports_before = api.get("/api/v1/launch/reports").await;
+    let queue_before = api.get("/api/v1/install/queue").await;
+    let inherited = api.get(&preflight).await;
+    let java = services
+        .installs
+        .runtime_cache()
+        .root()
+        .join(COMPONENT)
+        .join(java_relative_path());
+    api.request(
+        reqwest::Method::PUT,
+        "/api/v1/config",
+        Some(json!({
+            "expected_revision":config["revision"],"java_path_override":java,
+            "jvm_preset":"performance"
+        })),
+    )
+    .await;
+    let global = api.get(&preflight).await;
+    let current = api.get(&format!("/api/v1/instances/{instance}")).await;
+    let private_args = "-Dpreflight.private=preflight-secret-sentinel";
+    api.request(
+        reqwest::Method::PUT,
+        &format!("/api/v1/instances/{instance}"),
+        Some(json!({
+            "expected_revision":current["revision"],"java_path":java,"jvm_preset":"performance",
+            "extra_jvm_args":private_args,"max_memory_mb":768,"min_memory_mb":1536
+        })),
+    )
+    .await;
+    let local = api.get(&preflight).await;
+    let sessions = api.get("/api/v1/launch/sessions").await;
+    let reports_after = api.get("/api/v1/launch/reports").await;
+    let queue_after = api.get("/api/v1/install/queue").await;
+    services.server.shutdown().await.unwrap();
+    assert!(services.server.is_shutdown_settled());
+    drop(services);
+    provider.shutdown().await;
+
+    assert_eq!(sessions, json!({"sessions":[]}));
+    assert_eq!(reports_before, json!({"reports":[]}));
+    assert_eq!(reports_after, reports_before);
+    assert_eq!(queue_after, queue_before);
+    for (response, maximum, minimum, clamped, overrides) in [
+        (
+            inherited,
+            2048,
+            1024,
+            false,
+            json!({
+                "java":{"present":false},"preset":{"present":false},"raw_jvm_args":{"present":false}
+            }),
+        ),
+        (
+            global,
+            2048,
+            1024,
+            false,
+            json!({
+                "java":{"present":true,"origin":"global"},"preset":{"present":true,"origin":"global"},
+                "raw_jvm_args":{"present":false}
+            }),
+        ),
+        (
+            local,
+            768,
+            768,
+            true,
+            json!({
+                "java":{"present":true,"origin":"instance"},"preset":{"present":true,"origin":"instance"},
+                "raw_jvm_args":{"present":true,"origin":"instance"}
+            }),
+        ),
+    ] {
+        assert_eq!(response["status"], "ready", "{response}");
+        assert_eq!(response["instance_id"], instance);
+        assert_eq!(response["launchable"], true, "{response}");
+        assert_eq!(response.get("error"), Some(&Value::Null));
+        assert_eq!(
+            response["readiness"],
+            json!({"launchable":true,"reasons":[]})
+        );
+        assert_eq!(
+            response["memory"],
+            json!({
+                "max_memory_mb":maximum,"min_memory_mb":minimum,"min_clamped":clamped
+            })
+        );
+        assert_eq!(response["overrides"], overrides);
+        assert_eq!(response.as_object().unwrap().len(), 8);
+        let budget = response["resource_budget"]
+            .as_object()
+            .expect("safe resource budget");
+        assert_eq!(budget.len(), 9);
+        assert_eq!(budget["active_session_count"], 0);
+        assert_eq!(budget["active_install_count"], 0);
+        assert_eq!(budget["active_memory_allocation_mb"], 0);
+        assert_eq!(budget["requested_memory_mb"], maximum);
+        let remaining = budget.get("estimated_remaining_memory_mb").unwrap();
+        assert!(remaining.is_null() || remaining.as_i64().is_some());
+        for pressure in [
+            "memory_pressure",
+            "cpu_pressure",
+            "install_pressure",
+            "disk_pressure",
+        ] {
+            assert!(budget[pressure].is_boolean(), "{pressure}: {budget:?}");
+        }
+        assert_eq!(budget["install_pressure"], false);
+        let encoded = response.to_string();
+        for private in [
+            profile.to_str().unwrap(),
+            java.to_str().unwrap(),
+            private_args,
+            "preflight-secret-sentinel",
+            &api.capability,
+        ] {
+            assert!(
+                !encoded.contains(private),
+                "preflight exposed private input"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_offline_vanilla_install_launch_stop_and_restart() {
     offline_vanilla_journey(false).await;
 }

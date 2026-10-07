@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
+use ts_rs::TS;
 
 pub const INTENT_MIGRATION: Migration = Migration {
     id: "launch_intents.v1",
@@ -50,7 +51,7 @@ use crate::{
     library::{ApplicationRootPin, GenerationPin},
     performance::{PerformanceMutationError, PerformanceService},
     runtime::{discovery::RuntimeDiscovery, model::JavaDiscoveryError},
-    settings::{EffectiveLaunchSettings, SettingsStore},
+    settings::{EffectiveLaunchSettings, OverrideOrigin, SettingsStore},
     tasks::{CancellationToken, ExclusionLease, TaskOwner},
 };
 
@@ -74,6 +75,8 @@ pub struct LaunchCoordinator {
 
 pub(crate) struct PreflightProjection {
     current: Option<Arc<PreflightArtifacts>>,
+    host: Arc<super::resources::HostResources>,
+    diagnostics: bool,
     installs: InstallQueue,
 }
 
@@ -97,6 +100,110 @@ pub struct LaunchPreflight {
     pub instance_id: InstanceId,
     pub launchable: bool,
     pub error: Option<LaunchErrorResponse>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<PreflightDiagnostics>,
+}
+
+/// Safe facts from a completed successful diagnostic probe, not launch authority.
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct PreflightDiagnostics {
+    pub status: PreflightStatus,
+    pub memory: PreflightMemory,
+    pub overrides: PreflightOverrides,
+    pub readiness: PreflightReadiness,
+    pub resource_budget: PreflightResourceBudget,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightStatus {
+    Ready,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct PreflightMemory {
+    pub max_memory_mb: i32,
+    pub min_memory_mb: i32,
+    pub min_clamped: bool,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct PreflightOverrides {
+    pub java: PreflightOverride,
+    pub preset: PreflightOverride,
+    pub raw_jvm_args: PreflightOverride,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct PreflightOverride {
+    pub present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub origin: Option<OverrideOrigin>,
+}
+
+impl From<Option<OverrideOrigin>> for PreflightOverride {
+    fn from(origin: Option<OverrideOrigin>) -> Self {
+        Self {
+            present: origin.is_some(),
+            origin,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct PreflightReadiness {
+    pub launchable: bool,
+    pub reasons: [(); 0],
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct PreflightResourceBudget {
+    pub active_session_count: usize,
+    pub active_install_count: usize,
+    pub active_memory_allocation_mb: u64,
+    pub requested_memory_mb: Option<i32>,
+    pub estimated_remaining_memory_mb: Option<i64>,
+    pub memory_pressure: bool,
+    pub cpu_pressure: bool,
+    pub install_pressure: bool,
+    pub disk_pressure: bool,
+}
+
+impl PreflightDiagnostics {
+    fn ready(
+        settings: &EffectiveLaunchSettings,
+        budget: super::reports::LaunchProofResourceBudget,
+    ) -> Self {
+        Self {
+            status: PreflightStatus::Ready,
+            memory: PreflightMemory {
+                max_memory_mb: settings.max_memory_mb,
+                min_memory_mb: settings.min_memory_mb,
+                min_clamped: settings.min_memory_clamped,
+            },
+            overrides: PreflightOverrides {
+                java: settings.java_override_origin.into(),
+                preset: settings.preset_override_origin.into(),
+                raw_jvm_args: settings.raw_jvm_args_origin.into(),
+            },
+            readiness: PreflightReadiness {
+                launchable: true,
+                reasons: [],
+            },
+            resource_budget: PreflightResourceBudget {
+                active_session_count: budget.active_session_count,
+                active_install_count: budget.active_install_count,
+                active_memory_allocation_mb: budget.active_memory_allocation_mb,
+                requested_memory_mb: budget.requested_memory_mb,
+                estimated_remaining_memory_mb: budget.estimated_remaining_memory_mb,
+                memory_pressure: budget.memory_pressure,
+                cpu_pressure: budget.cpu_pressure,
+                install_pressure: budget.install_pressure,
+                disk_pressure: budget.disk_pressure,
+            },
+        }
+    }
 }
 
 impl LaunchCoordinator {
@@ -384,13 +491,16 @@ impl LaunchCoordinator {
     /// Read-only readiness with an owned Java diagnostic probe, never game
     /// launch or native extraction. It does not reserve the instance while probing.
     pub async fn preflight(&self, id: InstanceId) -> LaunchPreflight {
-        self.preflight_with_projection(id, &mut self.preflight_projection())
-            .await
+        let mut projection = self.preflight_projection();
+        projection.diagnostics = true;
+        self.preflight_with_projection(id, &mut projection).await
     }
 
     pub(crate) fn preflight_projection(&self) -> PreflightProjection {
         PreflightProjection {
             current: None,
+            host: Arc::new(super::resources::capture_host()),
+            diagnostics: false,
             installs: self.installs.clone(),
         }
     }
@@ -401,10 +511,16 @@ impl LaunchCoordinator {
         projection: &mut PreflightProjection,
     ) -> LaunchPreflight {
         let result = self.check_preflight(&id, projection).await;
+        let launchable = result.is_ok();
+        let (diagnostics, error) = match result {
+            Ok(diagnostics) => (diagnostics, None),
+            Err(error) => (None, Some(error.into())),
+        };
         LaunchPreflight {
             instance_id: id,
-            launchable: result.is_ok(),
-            error: result.err().map(Into::into),
+            launchable,
+            error,
+            diagnostics,
         }
     }
 
@@ -412,7 +528,7 @@ impl LaunchCoordinator {
         &self,
         id: &InstanceId,
         projection: &mut PreflightProjection,
-    ) -> Result<(), LaunchError> {
+    ) -> Result<Option<PreflightDiagnostics>, LaunchError> {
         let admitted = Arc::new(self.instances.admit_read(id).map_err(instance_error)?);
         let pin = admitted.game_directory().pin().clone();
         if projection.current.as_ref().is_some_and(|proof| {
@@ -438,6 +554,8 @@ impl LaunchCoordinator {
         let retained = (admitted.clone(), artifacts.clone(), proof_slot.clone());
         let owned_proof = proof_slot.clone();
         let coordinator = self.clone();
+        let host = projection.host.clone();
+        let diagnostics = projection.diagnostics;
         let task = self
             .tasks
             .try_spawn(retained, move |cancel| async move {
@@ -534,7 +652,6 @@ impl LaunchCoordinator {
                             .map_err(LaunchError::RuntimeFailure)?;
                         let contribution =
                             axial_performance::effective_performance_plan(performance.plan());
-                        let host = super::resources::capture_host();
                         let options = launch_options(&settings, target, &contribution, &host)?;
                         super::plan::validate_options(
                             &options,
@@ -549,7 +666,27 @@ impl LaunchCoordinator {
                             );
                             LaunchError::PlanRejected
                         })?;
-                        Ok::<(), LaunchError>(())
+                        let diagnostics = if diagnostics {
+                            let library_dir = proof
+                                .pin
+                                .read_projection()
+                                .map_err(|_| LaunchError::LibraryUnavailable)?;
+                            let game_dir = admitted
+                                .game_directory()
+                                .read_projection()
+                                .map_err(|_| LaunchError::InstanceChanged)?;
+                            let budget = super::resources::capture(
+                                &host,
+                                coordinator.sessions.resource_use(),
+                                coordinator.installs.active_count(),
+                                settings.max_memory_mb,
+                                [&library_dir, &game_dir],
+                            );
+                            Some(PreflightDiagnostics::ready(&settings, budget))
+                        } else {
+                            None
+                        };
+                        Ok::<_, LaunchError>(diagnostics)
                     }
                     .await;
                     selection

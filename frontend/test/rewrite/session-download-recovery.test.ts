@@ -73,16 +73,32 @@ const statusContract = source<typeof import('../../src/launch-response-adapters'
   './dto-contract': contract, './launch-notice-tracker': noticeContract,
 });
 
-function historicalStatusApi(statusCode = 404, payload: unknown = { error: 'The instance was not found.', code: 'instance_not_found' }) {
-  return source<typeof import('../../src/api')>('api.ts', {
-    './native': { getNativeApiTransportBootstrap: async () => null }, './dto-contract': contract,
-  }, {
-    URL, Headers, __AXIAL_WEB_API_BASE__: 'http://127.0.0.1:1', __AXIAL_TEST_API_CAPABILITY__: 'fixture-capability', __AXIAL_MOCK_API__: false,
-    fetch: async (url: string) => {
-      assert.equal(url, 'http://127.0.0.1:1/api/v1/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status');
-      return new Response(JSON.stringify(payload), { status: statusCode, headers: { 'Content-Type': 'application/json' } });
+function historicalStatusApi(
+  statusCode = 404,
+  payload: unknown = { error: 'The instance was not found.', code: 'instance_not_found' },
+  path = '/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status',
+) {
+  return source<typeof import('../../src/api')>(
+    'api.ts',
+    {
+      './native': { getNativeApiTransportBootstrap: async () => null },
+      './dto-contract': contract,
     },
-  });
+    {
+      URL,
+      Headers,
+      __AXIAL_WEB_API_BASE__: 'http://127.0.0.1:1',
+      __AXIAL_TEST_API_CAPABILITY__: 'fixture-capability',
+      __AXIAL_MOCK_API__: false,
+      fetch: async (url: string) => {
+        assert.equal(url, `http://127.0.0.1:1/api/v1${path}`);
+        return new Response(JSON.stringify(payload), {
+          status: statusCode,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      },
+    },
+  );
 }
 const apiContract = historicalStatusApi();
 
@@ -122,6 +138,9 @@ function launchHarness(intentResult?: unknown, running = true) {
   const finalLogs = deferred<unknown>();
   let currentStatus = status();
   let readStatus: () => Promise<unknown> = async () => currentStatus;
+  let postLaunch: ((body: unknown) => Promise<unknown>) | undefined;
+  let postKill: () => Promise<unknown> = async () => status(6, true);
+  let readIntent: (path: string) => Promise<unknown> = async () => intentResult;
   let subscription: ApiEventOptions<unknown> | undefined;
   let closed = 0;
   let connections = 0;
@@ -131,55 +150,131 @@ function launchHarness(intentResult?: unknown, running = true) {
   const lines: Array<{ source: string; text: string }> = [];
   let readInstance: () => Promise<unknown> = async () => instance(true);
   const store = {
-    launchSessions: signal<Record<string, LaunchSession>>(statusContract.launchSessionsResponse({ sessions: intentResult === undefined && running ? [currentStatus] : [] })),
-    launchState: signal<import('../../src/store').LaunchState>({ status: 'idle' }), config: signal<Config | null>(null), instances: signal([instance()]),
-    selectedInstance: signal(instance(true)), instanceLaunchDrafts: signal({}),
-    selectedInstanceId: signal('instance-1'), launchNotices: signal({}),
-    versions: signal<unknown[]>([]), lastInstanceId: signal<string | null>(null),
+    launchSessions: signal<Record<string, LaunchSession>>(
+      statusContract.launchSessionsResponse({ sessions: intentResult === undefined && running ? [currentStatus] : [] }),
+    ),
+    launchState: signal<import('../../src/store').LaunchState>({ status: 'idle' }),
+    config: signal<Config | null>(null),
+    instances: signal([instance()]),
+    selectedInstance: signal(instance(true)),
+    instanceLaunchDrafts: signal({}),
+    selectedInstanceId: signal('instance-1'),
+    launchNotices: signal({}),
+    versions: signal<unknown[]>([]),
+    lastInstanceId: signal<string | null>(null),
   };
   const actions = source<typeof import('../../src/actions')>('actions.ts', {
-    './store': store, './launch-response-adapters': statusContract,
+    './store': store,
+    './launch-response-adapters': statusContract,
   });
-  const api = { isApiError: apiContract.isApiError, api: async (method: string, path: string) => {
-      if (intentResult !== undefined && path === '/launch') {
-        assert.equal(method, 'POST'); calls.push(path); throw new Error('Launch response lost');
+  const api = {
+    isApiError: apiContract.isApiError,
+    api: async (method: string, path: string, body?: unknown) => {
+      if (path === '/launch' && (intentResult !== undefined || postLaunch)) {
+        assert.equal(method, 'POST');
+        calls.push(path);
+        if (postLaunch) return postLaunch(body);
+        throw new Error('Launch response lost');
       }
       if (method === 'POST' && path.endsWith('/kill')) {
         calls.push(path);
-        return status(6, true);
+        return postKill();
       }
-      assert.equal(method, 'GET'); calls.push(path);
-      if (path.startsWith('/launch/intents/') && intentResult !== undefined) return intentResult;
+      assert.equal(method, 'GET');
+      calls.push(path);
+      if (path.startsWith('/launch/intents/')) return readIntent(path);
       if (path.endsWith('/logs')) return finalLogs.promise;
       if (path.endsWith('/status')) return readStatus();
       if (path === '/instances/instance-1') return readInstance();
       if (path === '/instances') return { instances: [await readInstance()], last_instance_id: null };
       throw new Error(`Unexpected launch read ${path}`);
-    } };
-  const readiness = source<typeof import('../../src/instance-readiness')>('instance-readiness.ts', {
-    './api': api, './dto-core': coreContract, './store': store,
-    './utils': { showError: (message: string) => errors.push(message) },
-  }, { window: clock });
-  const launch = source<typeof import('../../src/launch')>('launch.ts', {
-    './api': api,
-    './backend/events': { subscribeApiEvents: (_path: string, options: ApiEventOptions<unknown>) => {
-      connections++; subscription = options; return () => { closed++; };
-    } },
-    './sound': { Sound: { init() {}, ui: (sound: string) => sounds.push(sound) } }, './music': { Music: { suppress() {}, unsuppress() {} } },
-    './utils': { appendLog: (source: string, text: string) => lines.push({ source, text }), showError: (message: string) => errors.push(message), errMessage: String },
-    './store': store, './actions': actions, './launch-notice-tracker': noticeContract,
-    './launch-response-adapters': statusContract, './dto-contract': contract, './dto-core': {}, './dto-launch': logContract,
-    './instance-readiness': readiness,
-  }, { ...clock, window: clock, crypto: { randomUUID: () => '9eb6ce58-c29a-44bc-a290-aea8973e9bdb' } });
+    },
+  };
+  const readiness = source<typeof import('../../src/instance-readiness')>(
+    'instance-readiness.ts',
+    {
+      './api': api,
+      './dto-core': coreContract,
+      './store': store,
+      './utils': { showError: (message: string) => errors.push(message) },
+    },
+    { window: clock },
+  );
+  const launch = source<typeof import('../../src/launch')>(
+    'launch.ts',
+    {
+      './api': api,
+      './backend/events': {
+        subscribeApiEvents: (_path: string, options: ApiEventOptions<unknown>) => {
+          connections++;
+          subscription = options;
+          return () => {
+            closed++;
+          };
+        },
+      },
+      './sound': { Sound: { init() {}, ui: (sound: string) => sounds.push(sound) } },
+      './music': { Music: { suppress() {}, unsuppress() {} } },
+      './utils': {
+        appendLog: (source: string, text: string) => lines.push({ source, text }),
+        showError: (message: string) => errors.push(message),
+        errMessage: String,
+      },
+      './store': store,
+      './actions': actions,
+      './launch-notice-tracker': noticeContract,
+      './launch-response-adapters': statusContract,
+      './dto-contract': contract,
+      './dto-core': {},
+      './dto-launch': logContract,
+      './instance-readiness': readiness,
+    },
+    { ...clock, window: clock, crypto: { randomUUID: () => '9eb6ce58-c29a-44bc-a290-aea8973e9bdb' } },
+  );
   if (intentResult === undefined && running) launch.reconnectLaunchSession('instance-1', 'Example');
   return {
-    store, actions, lines, calls, errors, sounds, clock, finalLogs, readiness, launch, closed: () => closed,
+    store,
+    actions,
+    lines,
+    calls,
+    errors,
+    sounds,
+    clock,
+    finalLogs,
+    readiness,
+    launch,
+    closed: () => closed,
     connections: () => connections,
-    readInstance(next: typeof readInstance): void { readInstance = next; },
-    readStatus(next: typeof readStatus): void { readStatus = next; },
-    emit(value: unknown, event: string): void { assert.ok(subscription); subscription.onValue(value, event, null); },
-    interruptStream(): void { assert.ok(subscription); subscription.onError?.(new Error('Interrupted')); },
-    pollTerminal(): void { currentStatus = status(2, true); for (const poll of clock.intervals.values()) poll(); },
+    postLaunch(next: (body: unknown) => Promise<unknown>): void {
+      postLaunch = next;
+    },
+    postKill(next: typeof postKill): void {
+      postKill = next;
+    },
+    readIntent(next: typeof readIntent): void {
+      readIntent = next;
+    },
+    readInstance(next: typeof readInstance): void {
+      readInstance = next;
+    },
+    readStatus(next: typeof readStatus): void {
+      readStatus = next;
+    },
+    poll(): void {
+      for (const poll of clock.intervals.values()) poll();
+    },
+    emit(value: unknown, event: string): void {
+      assert.ok(subscription);
+      subscription.onValue(value, event, null);
+    },
+    interruptStream(): void {
+      assert.ok(subscription);
+      subscription.onError?.(new Error('Interrupted'));
+    },
+    pollTerminal(): void {
+      currentStatus = status(2, true);
+      for (const poll of clock.intervals.values()) poll();
+    },
   };
 }
 
@@ -244,6 +339,400 @@ test('ordinary accepted Play retains one launch sound and accepted recency', asy
   assert.equal(h.store.instances.value[0].last_played_at, status().launched_at);
   h.emit(status(2), 'status');
   assert.deepEqual(h.sounds, ['launchSuccess']);
+});
+
+function settledIntent() {
+  return {
+    state: 'accepted',
+    session: {
+      session_id: '4772f752-5f75-48fb-a1f0-bb484f858ea0',
+      instance_id: 'instance-1',
+      revision: 1,
+      phase: 'exited',
+      launched_at: '2026-09-08T08:00:00.000Z',
+      started_at_ms: null,
+      pid: null,
+      process_alive: false,
+      stop_allowed: false,
+      exit_code: 0,
+      tree_settled: true,
+      output_drained: true,
+      boot_observed: true,
+      outcome: {
+        kind: 'stopped',
+        reason: 'launcher_stopped',
+        failure_class: null,
+        summary: 'The game was stopped from the launcher.',
+      },
+      notice: { message: 'The game was stopped from the launcher.', tone: 'info' },
+      view_model: {
+        state_id: 'exited',
+        label: 'Session ended',
+        progress_pct: 100,
+        terminal: true,
+        playing: false,
+        process_live: false,
+        can_stop: false,
+      },
+    },
+  };
+}
+
+async function acceptedPlay() {
+  const h = launchHarness(undefined, false);
+  const sessionId = '4772f752-5f75-48fb-a1f0-bb484f858ea0';
+  const intentPath = '/launch/intents/9eb6ce58-c29a-44bc-a290-aea8973e9bdb';
+  const accepted = { ...status(7), session_id: sessionId, launched_at: '2026-09-08T08:00:00.000Z' };
+  h.postLaunch(async (body) => {
+    assert.equal((body as { instance_id: string }).instance_id, 'instance-1');
+    assert.equal((body as { intent_key: string }).intent_key, '9eb6ce58-c29a-44bc-a290-aea8973e9bdb');
+    return accepted;
+  });
+  h.readStatus(async () => accepted);
+  await h.launch.launchGame();
+  await flush();
+  assert.equal(h.store.launchSessions.value['instance-1'].statusRevision, 7);
+  assert.equal(h.store.launchSessions.value['instance-1'].viewModel.playing, true);
+  const missing = historicalStatusApi();
+  const settled = historicalStatusApi(200, settledIntent(), intentPath);
+  h.readStatus(() => missing.api('GET', `/launch/${sessionId}/status`));
+  h.readIntent((path) => settled.api('GET', path));
+  return { ...h, sessionId, intentPath, accepted };
+}
+
+test('accepted Play settles from its original terminal intent after API reopen without replaying launch', async () => {
+  const h = await acceptedPlay();
+  h.finalLogs.reject(new Error('Historical live logs are unavailable after reopen'));
+  // Retain the rejection until the existing terminal owner requests the log tail.
+  void h.finalLogs.promise.catch(() => {});
+  h.interruptStream();
+  h.poll();
+  await flush();
+  await flush();
+
+  assert.equal(
+    h.store.launchSessions.value['instance-1'],
+    undefined,
+    'authenticated original settlement must clear stale Playing even when the cold snapshot revision is lower',
+  );
+  assert.equal(h.store.instances.value[0].launch_action.launchable, true);
+  assert.equal(h.clock.intervals.size, 0);
+  assert.equal(h.closed(), 1);
+  assert.equal(h.calls.filter((path) => path === '/launch').length, 1);
+  assert.equal(h.calls.filter((path) => path === h.intentPath).length, 1);
+  assert.equal(
+    h.calls.some((path) => path.endsWith('/kill')),
+    false,
+  );
+  assert.deepEqual(h.sounds, ['launchSuccess']);
+  assert.equal(h.lines.filter((line) => line.text === 'The game was stopped from the launcher.').length, 1);
+});
+
+test('a restored Playing session without its original intent cannot infer settlement from absence', async () => {
+  const h = launchHarness();
+  await flush();
+  const sessions = h.store.launchSessions.value;
+  const path = '/launch/session-1/status';
+  const missing = historicalStatusApi(404, { error: 'The instance was not found.', code: 'instance_not_found' }, path);
+  h.readStatus(() => missing.api('GET', path));
+  h.poll();
+  await flush();
+  assert.equal(h.store.launchSessions.value, sessions);
+  assert.equal(
+    h.calls.some((call) => call.startsWith('/launch/intents/')),
+    false,
+  );
+  assert.equal(
+    h.calls.some((call) => call === '/launch' || call.endsWith('/kill') || call.endsWith('/logs')),
+    false,
+  );
+  assert.equal(h.closed(), 0);
+});
+
+for (const [code, payload] of [
+  [404, { error: 'Unclassified absence' }],
+  [404, { error: 'Different refusal', code: 'another_error' }],
+  [404, { code: 'instance_not_found' }],
+  [503, { error: 'Status unavailable', code: 'instance_not_found' }],
+] as const) {
+  test(`unclassified or unavailable status cannot authorize an intent read: ${code} ${JSON.stringify(payload)}`, async () => {
+    const h = await acceptedPlay();
+    const sessions = h.store.launchSessions.value;
+    const path = `/launch/${h.sessionId}/status`;
+    const response = historicalStatusApi(code, payload, path);
+    h.readStatus(() => response.api('GET', path));
+    h.poll();
+    await flush();
+    assert.equal(h.store.launchSessions.value, sessions);
+    assert.equal(
+      h.calls.some((call) => call.startsWith('/launch/intents/')),
+      false,
+    );
+    assert.equal(h.calls.filter((call) => call === '/launch').length, 1);
+    assert.equal(h.closed(), 0);
+  });
+}
+
+const terminal = settledIntent();
+for (const [label, payload] of [
+  ['preparing', { state: 'preparing' }],
+  ['rejected', { state: 'rejected', error: 'The launch could not be prepared.', code: 'preparation_failed' }],
+  [
+    'interrupted',
+    {
+      state: 'interrupted',
+      session_id: terminal.session.session_id,
+      error: 'The process outcome is unknown.',
+      code: 'interrupted',
+    },
+  ],
+  ['missing snapshot', { state: 'accepted' }],
+  ['different session', { ...terminal, session: { ...terminal.session, session_id: 'different-session' } }],
+  ['different instance', { ...terminal, session: { ...terminal.session, instance_id: 'different-instance' } }],
+  ['different launch time', { ...terminal, session: { ...terminal.session, launched_at: '2026-09-08T08:00:01.000Z' } }],
+  ['unresolved phase', { ...terminal, session: { ...terminal.session, phase: 'unresolved' } }],
+  ['unsettled tree', { ...terminal, session: { ...terminal.session, tree_settled: false } }],
+  ['undrained output', { ...terminal, session: { ...terminal.session, output_drained: false } }],
+  ['live process', { ...terminal, session: { ...terminal.session, process_alive: true } }],
+  ['stop allowed', { ...terminal, session: { ...terminal.session, stop_allowed: true } }],
+  ['missing outcome', { ...terminal, session: { ...terminal.session, outcome: null } }],
+  ['unsafe revision', { ...terminal, session: { ...terminal.session, revision: Number.MAX_SAFE_INTEGER + 1 } }],
+  ...(['playing', 'process_live', 'can_stop'] as const).map(
+    (flag) =>
+      [
+        flag,
+        {
+          ...terminal,
+          session: { ...terminal.session, view_model: { ...terminal.session.view_model, [flag]: true } },
+        },
+      ] as const,
+  ),
+] as const) {
+  test(`unverified original intent cannot clear Playing: ${label}`, async () => {
+    const h = await acceptedPlay();
+    const sessions = h.store.launchSessions.value;
+    const response = historicalStatusApi(200, payload, h.intentPath);
+    h.readIntent((path) => response.api('GET', path));
+    h.poll();
+    await flush();
+    await flush();
+    assert.equal(h.calls.filter((path) => path === h.intentPath).length, 1);
+    assert.equal(h.store.launchSessions.value, sessions);
+    assert.equal(h.store.launchSessions.value['instance-1'].viewModel.playing, true);
+    assert.equal(
+      h.calls.some((path) => path.endsWith('/logs') || path.endsWith('/kill')),
+      false,
+    );
+    assert.equal(h.calls.filter((path) => path === '/launch').length, 1);
+    assert.equal(h.closed(), 0);
+    assert.deepEqual(h.errors, []);
+  });
+}
+
+for (const change of ['replacement session', 'same-session lifetime', 'newer revision'] as const) {
+  test(`late original settlement cannot clear ${change}`, async () => {
+    const h = await acceptedPlay();
+    const reply = deferred<unknown>();
+    h.readIntent(() => reply.promise);
+    h.poll();
+    await flush();
+    assert.equal(h.calls.filter((path) => path === h.intentPath).length, 1);
+    const current = h.store.launchSessions.value['instance-1'];
+    if (change === 'replacement session') {
+      h.actions.confirmLaunch('instance-1', { ...current, sessionId: 'session-2', intentKey: 'another-intent' });
+    } else if (change === 'same-session lifetime') {
+      h.actions.endSessionIfCurrent('instance-1', h.sessionId);
+      h.actions.confirmLaunch('instance-1', { ...current });
+    } else h.emit({ ...h.accepted, revision: 8 }, 'status');
+    const sessions = h.store.launchSessions.value;
+    reply.resolve(settledIntent());
+    await flush();
+    assert.equal(h.store.launchSessions.value, sessions);
+    assert.equal(
+      h.calls.some((path) => path.endsWith('/logs')),
+      false,
+    );
+    assert.equal(h.calls.filter((path) => path === '/launch').length, 1);
+    assert.equal(h.closed(), 0);
+  });
+}
+
+test('repeated original settlement completes once while another instance is selected and logs are pending', async () => {
+  const h = await acceptedPlay();
+  const other = { ...instance(true), id: 'instance-2', name: 'Other' };
+  h.store.instances.value = [...h.store.instances.value, other];
+  h.store.selectedInstance.value = other;
+  h.actions.selectInstance('instance-2');
+  h.actions.confirmLaunch('instance-2', {
+    sessionId: 'session-2',
+    launchedAt: h.accepted.launched_at,
+    statusRevision: 3,
+    viewModel: status(3).view_model,
+  });
+  const otherSession = h.store.launchSessions.value['instance-2'];
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    h.poll();
+    await flush();
+    await flush();
+  }
+  assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
+  assert.equal(h.closed(), 0);
+  const settled = h.store.launchSessions.value['instance-1'];
+  assert.equal(
+    settled.viewModel.playing,
+    false,
+    'verified terminal proof must remove Playing before final logs arrive',
+  );
+  assert.equal(settled.viewModel.can_stop, false);
+  assert.equal(settled.viewModel.process_live, false);
+  assert.equal(settled.viewModel.terminal, true);
+  assert.equal(settled.statusRevision, 7, 'cold settlement must not rebase the live revision');
+  h.finalLogs.resolve({ entries: [] });
+  await flush();
+  assert.equal(h.store.launchSessions.value['instance-1'], undefined);
+  assert.equal(h.store.launchSessions.value['instance-2'], otherSession);
+  assert.equal(h.store.selectedInstance.value, other);
+  assert.equal(h.clock.intervals.size, 0);
+  assert.equal(h.closed(), 1);
+  assert.equal(h.calls.filter((path) => path === '/instances/instance-1').length, 1);
+  assert.equal(
+    h.calls.some((path) => path.endsWith('/kill')),
+    false,
+  );
+  assert.equal(h.calls.filter((path) => path === '/launch').length, 1);
+  assert.equal(h.lines.filter((line) => line.text === 'The game was stopped from the launcher.').length, 1);
+  assert.deepEqual(h.sounds, ['launchSuccess']);
+});
+
+test('delayed live status cannot restore Playing after verified settlement while final logs are pending', async () => {
+  const h = await acceptedPlay();
+  h.poll();
+  await flush();
+  await flush();
+  assert.equal(h.store.launchSessions.value['instance-1'].viewModel.terminal, true);
+  assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
+  assert.equal(h.closed(), 0);
+
+  h.emit({ ...h.accepted, revision: 8 }, 'status');
+  const current = h.store.launchSessions.value['instance-1'];
+  assert.equal(
+    current.viewModel.playing,
+    false,
+    'a delayed higher live revision cannot undo authenticated terminal settlement',
+  );
+  assert.equal(current.viewModel.can_stop, false);
+  assert.equal(current.viewModel.process_live, false);
+  assert.equal(current.viewModel.terminal, true);
+  assert.equal(current.statusRevision, 7);
+  assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
+  h.finalLogs.resolve({ entries: [] });
+  await flush();
+  assert.equal(h.store.launchSessions.value['instance-1'], undefined);
+  assert.equal(h.closed(), 1);
+  assert.equal(h.lines.filter((line) => line.text === 'The game was stopped from the launcher.').length, 1);
+  assert.deepEqual(h.sounds, ['launchSuccess']);
+});
+
+test('a pending Stop response cannot undo verified settlement while final logs are pending', async () => {
+  const h = await acceptedPlay();
+  const reply = deferred<unknown>();
+  h.postKill(() => reply.promise);
+  const stopping = h.launch.killGame();
+  assert.equal(h.calls.filter((path) => path === `/launch/${h.sessionId}/kill`).length, 1);
+  h.poll();
+  await flush();
+  await flush();
+  assert.equal(h.store.launchSessions.value['instance-1'].viewModel.terminal, true);
+  assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
+
+  reply.resolve({
+    ...h.accepted,
+    revision: 8,
+    phase: 'stopping',
+    process_alive: true,
+    stop_allowed: true,
+    tree_settled: false,
+    output_drained: false,
+    view_model: { ...h.accepted.view_model, state_id: 'stopping', label: 'Stopping Minecraft', playing: false },
+  });
+  await stopping;
+  const current = h.store.launchSessions.value['instance-1'];
+  assert.equal(
+    current.viewModel.terminal,
+    true,
+    'a delayed Stop response cannot undo authenticated terminal settlement',
+  );
+  assert.equal(current.viewModel.process_live, false);
+  assert.equal(current.viewModel.can_stop, false);
+  assert.equal(current.statusRevision, 7);
+  assert.deepEqual(h.errors, []);
+  h.finalLogs.resolve({ entries: [] });
+  await flush();
+  assert.equal(h.store.launchSessions.value['instance-1'], undefined);
+  assert.equal(h.closed(), 1);
+  assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
+});
+
+for (const failure of ['refused', 'response lost'] as const) {
+  test(`an obsolete Stop ${failure} cannot publish a warning after verified settlement`, async () => {
+    const h = await acceptedPlay();
+    const reply = deferred<unknown>();
+    h.postKill(() => reply.promise);
+    const stopping = h.launch.killGame();
+    h.poll();
+    await flush();
+    await flush();
+    const settled = h.store.launchSessions.value['instance-1'];
+    assert.equal(settled.viewModel.terminal, true);
+    if (failure === 'refused') {
+      const path = `/launch/${h.sessionId}/kill`;
+      const response = historicalStatusApi(404, { error: 'The instance was not found.', code: 'instance_not_found' }, path);
+      await response.api('POST', path).catch(reply.reject);
+    } else reply.reject(new Error('Stop response lost'));
+    await stopping;
+    assert.equal(h.store.launchSessions.value['instance-1'], settled);
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.calls.filter((path) => path.endsWith('/kill')).length, 1);
+    h.finalLogs.resolve({ entries: [] });
+    await flush();
+    assert.equal(h.store.launchSessions.value['instance-1'], undefined);
+    assert.equal(h.closed(), 1);
+    assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
+  });
+}
+
+test('original final-log completion cannot clear a replacement launch or refresh its readiness', async () => {
+  const h = await acceptedPlay();
+  h.poll();
+  await flush();
+  await flush();
+  assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
+  h.actions.confirmLaunch('instance-1', {
+    sessionId: 'session-2',
+    intentKey: 'another-intent',
+    launchedAt: '2026-09-08T08:00:01.000Z',
+    statusRevision: 1,
+    viewModel: status().view_model,
+  });
+  const sessions = h.store.launchSessions.value;
+  const rows = h.store.instances.value;
+  h.finalLogs.resolve({ entries: [log(1)] });
+  await flush();
+  assert.equal(h.store.launchSessions.value, sessions);
+  assert.equal(h.store.instances.value, rows);
+  assert.equal(
+    h.calls.some((path) => path.startsWith('/instances')),
+    false,
+  );
+  assert.equal(
+    h.lines.some((line) => line.text === 'The game was stopped from the launcher.'),
+    false,
+  );
+  assert.equal(
+    h.lines.some((line) => line.text === 'line-1'),
+    false,
+  );
+  assert.equal(h.closed(), 1);
 });
 
 test('a known external session is adopted once and ordinary Stop targets its exact identity', async () => {

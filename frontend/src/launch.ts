@@ -17,7 +17,7 @@ import {
   updateLaunchPrepView,
   updateLaunchSessionState,
 } from './actions';
-import type { LaunchSessionOutcome } from './types-launch';
+import type { LaunchSessionOutcome, LaunchStatusUpdate } from './types-launch';
 import { createBackendLaunchNoticeTracker, type BackendLaunchNoticeTracker } from './launch-notice-tracker';
 import { launchSessionsResponse, launchStatusUpdate } from './launch-response-adapters';
 import { dtoEnum, dtoError, dtoRecord, dtoString, isDtoRecord } from './dto-contract';
@@ -68,6 +68,7 @@ export async function launchGame(): Promise<void> {
 
   const acceptLaunch = (value: unknown): void => {
     const res = dtoRecord(value, 'Launch');
+    if (res.instance_id !== inst.id) throw new Error('Launch response did not match the requested instance.');
     const sessionId = dtoString(res.session_id, 'Launch session id');
     const initialStatus = launchStatusUpdate(res, sessionId);
     if (!initialStatus) throw new Error('Launch response did not match the status contract.');
@@ -77,6 +78,7 @@ export async function launchGame(): Promise<void> {
     updateLaunchPrepView(inst.id, initialStatus.viewModel);
     confirmLaunch(inst.id, {
       sessionId,
+      intentKey,
       launchedAt,
       viewModel: initialStatus.viewModel,
       statusRevision: initialStatus.revision,
@@ -201,6 +203,7 @@ function makeLaunchStatusPoller(
   sessionId: string,
   instanceId: string,
   onStatus: (data: unknown, handle: { close(): void }) => void,
+  onSettled: (update: LaunchStatusUpdate) => void,
 ): { close(): void } {
   let stopped = false;
   let timerId = 0;
@@ -216,7 +219,9 @@ function makeLaunchStatusPoller(
   const poll = async (): Promise<void> => {
     if (stopped) return;
     if (inFlight) return;
-    if (launchSessions.value[instanceId]?.sessionId !== sessionId) {
+    if (finishingSessions.has(sessionId)) return;
+    const session = launchSessions.value[instanceId];
+    if (session?.sessionId !== sessionId) {
       handle.close();
       return;
     }
@@ -224,8 +229,50 @@ function makeLaunchStatusPoller(
     try {
       const data = await api('GET', `/launch/${encodeURIComponent(sessionId)}/status`);
       if (!stopped && !dtoError(data)) onStatus(data, handle);
-    } catch {
-      // A failed read never implies process exit. The stream and future reads can converge.
+    } catch (error) {
+      if (
+        stopped ||
+        launchSessions.value[instanceId] !== session ||
+        !session.intentKey ||
+        !isApiError(error) ||
+        error.status !== 404 ||
+        !isDtoRecord(error.payload) ||
+        error.payload.code !== 'instance_not_found' ||
+        dtoError(error.payload) === null
+      )
+        return;
+      try {
+        const result = dtoRecord(
+          await api('GET', `/launch/intents/${encodeURIComponent(session.intentKey)}`),
+          'Launch intent',
+        );
+        if (stopped || launchSessions.value[instanceId] !== session || result.state !== 'accepted') return;
+        const snapshot = dtoRecord(result.session, 'Settled launch');
+        if (
+          snapshot.instance_id !== instanceId ||
+          snapshot.session_id !== sessionId ||
+          snapshot.launched_at !== session.launchedAt ||
+          snapshot.phase !== 'exited' ||
+          snapshot.process_alive !== false ||
+          snapshot.stop_allowed !== false ||
+          snapshot.tree_settled !== true ||
+          snapshot.output_drained !== true
+        )
+          return;
+        const update = launchStatusUpdate(snapshot, sessionId);
+        if (
+          !update?.viewModel.terminal ||
+          update.viewModel.playing ||
+          update.viewModel.process_live ||
+          update.viewModel.can_stop
+        )
+          return;
+        // Cold settlement snapshots have their own revision. Only the original
+        // authenticated terminal intent may bypass live status ordering.
+        onSettled(update);
+      } catch {
+        // Missing, refused or unreadable intent status never proves process exit.
+      }
     } finally {
       inFlight = false;
     }
@@ -334,6 +381,7 @@ function connectLaunchEvents(
       handle.close();
       return;
     }
+    if (finishingSessions.has(sessionId)) return;
     const update = convergeLaunchStatus(instanceId, sessionId, data);
     if (!update) return;
     surfaceBackendLaunchNotice(update.notice, instanceId, instanceName, noticeTracker);
@@ -363,9 +411,16 @@ function connectLaunchEvents(
   };
   launchConnections.set(sessionId, streamHandle);
   onPlaying();
-  pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, (data) => {
-    onStatus(data, streamHandle);
-  });
+  pollSubscription = makeLaunchStatusPoller(
+    sessionId,
+    instanceId,
+    (data) => onStatus(data, streamHandle),
+    (update) => {
+      updateLaunchSessionState(instanceId, { viewModel: update.viewModel });
+      surfaceBackendLaunchNotice(update.notice, instanceId, instanceName, noticeTracker);
+      onSessionTerminal(update.outcome, instanceId, instanceName, sessionId, streamHandle);
+    },
+  );
   unsubscribe = subscribeApiEvents(`/launch/${encodeURIComponent(sessionId)}/events`, {
     decode: (value: unknown) => value,
     events: ['status', 'log'],
@@ -442,6 +497,7 @@ export async function killGame(): Promise<void> {
     updateLaunchSessionState(inst.id, { stopping: true });
     const result = await api('POST', `/launch/${encodeURIComponent(session.sessionId)}/kill`);
     if (launchSessions.value[inst.id]?.sessionId !== session.sessionId) return;
+    if (finishingSessions.has(session.sessionId)) return;
     const error = dtoError(result);
     if (error) {
       updateLaunchSessionState(inst.id, { stopping: false });
@@ -462,6 +518,7 @@ export async function killGame(): Promise<void> {
     }
   } catch (err: unknown) {
     if (launchSessions.value[inst.id]?.sessionId !== session.sessionId) return;
+    if (finishingSessions.has(session.sessionId)) return;
     updateLaunchSessionState(inst.id, { stopping: false });
     showError(`Could not stop the game: ${errMessage(err)}`);
   }

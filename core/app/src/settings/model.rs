@@ -314,17 +314,28 @@ pub struct InstanceSettings {
     pub auto_optimize: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum OverrideOrigin {
+    Global,
+    Instance,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectiveLaunchSettings {
     pub global_config_revision: u64,
     pub max_memory_mb: i32,
     pub min_memory_mb: i32,
+    pub min_memory_clamped: bool,
     pub java_path: String,
+    pub java_override_origin: Option<OverrideOrigin>,
     pub window_width: i32,
     pub window_height: i32,
     pub jvm_preset: ConfigJvmPreset,
+    pub preset_override_origin: Option<OverrideOrigin>,
     pub performance_mode: ConfigPerformanceMode,
     pub extra_jvm_args: String,
+    pub raw_jvm_args_origin: Option<OverrideOrigin>,
     pub auto_optimize: bool,
 }
 
@@ -363,16 +374,29 @@ impl InstanceSettings {
         global.validate()?;
         let inherit = |local, fallback| if local > 0 { local } else { fallback };
         let max_memory_mb = inherit(self.max_memory_mb, global.max_memory_mb);
+        let min_memory_mb = inherit(self.min_memory_mb, global.min_memory_mb);
+        let origin = |local: bool, global: bool| {
+            if local {
+                Some(OverrideOrigin::Instance)
+            } else {
+                global.then_some(OverrideOrigin::Global)
+            }
+        };
         Ok(EffectiveLaunchSettings {
             global_config_revision: global.revision,
             max_memory_mb,
-            min_memory_mb: inherit(self.min_memory_mb, global.min_memory_mb).min(max_memory_mb),
+            min_memory_mb: min_memory_mb.min(max_memory_mb),
+            min_memory_clamped: min_memory_mb > max_memory_mb,
             java_path: if self.java_path.trim().is_empty() {
                 global.java_path_override.trim()
             } else {
                 self.java_path.trim()
             }
             .into(),
+            java_override_origin: origin(
+                !self.java_path.trim().is_empty(),
+                !global.java_path_override.trim().is_empty(),
+            ),
             window_width: inherit(self.window_width, global.window_width),
             window_height: inherit(self.window_height, global.window_height),
             jvm_preset: if self.jvm_preset.trim().is_empty() {
@@ -381,6 +405,10 @@ impl InstanceSettings {
                 ConfigJvmPreset::parse(self.jvm_preset.trim())
                     .ok_or(SettingsError::Validation("Unknown JVM preset."))?
             },
+            preset_override_origin: origin(
+                !self.jvm_preset.trim().is_empty(),
+                global.jvm_preset != ConfigJvmPreset::Automatic,
+            ),
             performance_mode: if self.performance_mode.trim().is_empty() {
                 global.performance_mode
             } else {
@@ -388,6 +416,8 @@ impl InstanceSettings {
                     .ok_or(SettingsError::Validation("Unknown performance mode."))?
             },
             extra_jvm_args: self.extra_jvm_args.clone(),
+            raw_jvm_args_origin: (!self.extra_jvm_args.trim().is_empty())
+                .then_some(OverrideOrigin::Instance),
             auto_optimize: self.auto_optimize,
         })
     }

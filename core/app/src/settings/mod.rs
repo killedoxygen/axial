@@ -10,7 +10,8 @@ pub use flags::{
 };
 pub use model::{
     ConfigJvmPreset, ConfigLaunchAuthMode, ConfigPatch, ConfigPerformanceMode, ConfigTheme,
-    ConfigView, EffectiveLaunchSettings, InstanceSettings, NullablePatch, validate_username,
+    ConfigView, EffectiveLaunchSettings, InstanceSettings, NullablePatch, OverrideOrigin,
+    validate_username,
 };
 pub use preferences::{
     InterfacePreferences, InterfacePreferencesChange, InterfacePreferencesReceipt,
