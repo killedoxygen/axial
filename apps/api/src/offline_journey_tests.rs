@@ -2854,6 +2854,33 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     let queue_before = api.get("/api/v1/install/queue").await;
     let sessions_before = api.get("/api/v1/launch/sessions").await;
     let library = services.library.admit().unwrap().read_projection().unwrap();
+    let log_config = library.join("assets/log_configs/fixture-log.xml");
+    let original_log_config = std::fs::read(&log_config).unwrap();
+    assert_eq!(
+        original_log_config,
+        provider.state.routes["GET /artifacts/log.xml"]
+    );
+    let mut changed_log_config = original_log_config.clone();
+    changed_log_config[0] ^= 1;
+    std::fs::write(&log_config, &changed_log_config).unwrap();
+    let corrupt_log_config = api.get(&preflight).await;
+    let log_config_after_preflight = std::fs::read(&log_config).unwrap();
+    std::fs::write(&log_config, &original_log_config).unwrap();
+    std::fs::remove_file(&log_config).unwrap();
+    let missing_log_config = api.get(&preflight).await;
+    let log_config_absent = std::fs::symlink_metadata(&log_config)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    let log_canary = temporary.path().join("outside-log-canary.xml");
+    assert!(!log_canary.starts_with(&profile) && !log_canary.starts_with(&library));
+    std::fs::write(&log_canary, &original_log_config).unwrap();
+    std::os::unix::fs::symlink(&log_canary, &log_config).unwrap();
+    let log_link_before = std::fs::symlink_metadata(&log_config).unwrap();
+    let log_inadmissible = api.get(&preflight).await;
+    let log_link_after = std::fs::symlink_metadata(&log_config).unwrap();
+    let log_link_target = std::fs::read_link(&log_config).unwrap();
+    let log_canary_after = std::fs::read(&log_canary).unwrap();
+    std::fs::remove_file(&log_config).unwrap();
+    std::fs::write(&log_config, &original_log_config).unwrap();
     let client = library.join(format!("versions/{VERSION}/{VERSION}.jar"));
     let original = std::fs::read(&client).unwrap();
     let metadata = library.join(format!("versions/{VERSION}/{VERSION}.json"));
@@ -2957,6 +2984,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     std::fs::remove_file(&client).unwrap();
     let missing = api.get(&preflight).await;
     let canary_after = std::fs::read(&canary).unwrap();
+    let log_config_after = std::fs::read(&log_config).unwrap();
     let metadata_after = std::fs::read(&metadata).unwrap();
     let library_after = std::fs::read(&required_library).unwrap();
     let index_after = std::fs::read(&asset_index).unwrap();
@@ -2975,6 +3003,12 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     assert_eq!(sessions_before, json!({"sessions":[]}));
     assert_eq!(sessions_after, sessions_before);
     for (before, after, target, expected_target) in [
+        (
+            &log_link_before,
+            &log_link_after,
+            &log_link_target,
+            &log_canary,
+        ),
         (
             &index_link_before,
             &index_link_after,
@@ -3000,6 +3034,18 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
         assert_eq!(target, expected_target);
     }
+    assert_eq!(changed_log_config.len(), original_log_config.len());
+    assert_ne!(changed_log_config, original_log_config);
+    assert_eq!(
+        log_config_after_preflight, changed_log_config,
+        "preflight must not repair logging configuration"
+    );
+    assert!(
+        log_config_absent,
+        "preflight must not repair logging configuration"
+    );
+    assert_eq!(log_canary_after, original_log_config);
+    assert_eq!(log_config_after, original_log_config);
     assert_eq!(changed_index.len(), original_index.len());
     assert_ne!(changed_index, original_index);
     assert_eq!(
@@ -3026,6 +3072,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     assert_eq!(client_after_metadata, original);
     assert_eq!(canary_after, original);
     for response in [
+        log_inadmissible,
         missing_asset,
         index_inadmissible,
         library_inadmissible,
@@ -3054,6 +3101,16 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         "preflight must not repair files"
     );
     for (response, reason, message) in [
+        (
+            corrupt_log_config,
+            "libraries_corrupt",
+            "Required libraries are corrupt. Repair this version before launching.",
+        ),
+        (
+            missing_log_config,
+            "libraries_missing",
+            "Required libraries are missing. Install this version before launching.",
+        ),
         (
             corrupt_index,
             "asset_index_corrupt",
@@ -3140,6 +3197,8 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         let encoded = response.to_string();
         for private in [
             profile.to_str().unwrap(),
+            log_config.to_str().unwrap(),
+            log_canary.to_str().unwrap(),
             client.to_str().unwrap(),
             metadata.to_str().unwrap(),
             metadata_canary.to_str().unwrap(),

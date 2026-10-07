@@ -128,6 +128,11 @@ impl ActivatedVersion {
                 .strip_prefix("assets/indexes/")
                 .and_then(|path| path.strip_suffix(".json"))
                 .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
+            let is_required_library = root == Some("libraries")
+                || expected
+                    .path
+                    .strip_prefix("assets/log_configs/")
+                    .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
             let file = batch
                 .observe_file(&path)
                 .map_err(|_| InstallError::NotReady)?
@@ -135,7 +140,7 @@ impl ActivatedVersion {
                     InstallError::ClientJarMissing
                 } else if expected.path == metadata_path {
                     InstallError::VersionJsonMissing
-                } else if root == Some("libraries") {
+                } else if is_required_library {
                     InstallError::LibrariesMissing
                 } else if is_asset_index {
                     InstallError::AssetIndexMissing
@@ -150,7 +155,7 @@ impl ActivatedVersion {
             {
                 return Err(if path == client_path {
                     InstallError::ClientJarCorrupt
-                } else if root == Some("libraries") {
+                } else if is_required_library {
                     InstallError::LibrariesCorrupt
                 } else if is_asset_index {
                     InstallError::AssetIndexCorrupt
