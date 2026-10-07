@@ -180,6 +180,7 @@ pub struct PreflightReadinessReason {
 pub enum PreflightReadinessReasonId {
     ClientJarMissing,
     ClientJarCorrupt,
+    JavaOverrideMissing,
 }
 
 #[derive(Clone, Debug, Serialize, TS)]
@@ -716,11 +717,39 @@ impl LaunchCoordinator {
                             &version.kind,
                             &version.java_version,
                         );
-                        let runtime = coordinator
+                        let runtime = match coordinator
                             .runtimes
                             .select(&required, &settings.java_path, &cancel)
                             .await
-                            .map_err(LaunchError::RuntimeFailure)?;
+                        {
+                            Ok(runtime) => runtime,
+                            Err(error @ (JavaDiscoveryError::Missing | JavaDiscoveryError::NotExecutable))
+                                if diagnostics && settings.java_override_origin.is_some() =>
+                            {
+                                proof.bundle.revalidate().map_err(bundle_read_error)?;
+                                let mut refused = LaunchPreflight::refused(
+                                    target.id.clone(),
+                                    LaunchError::RuntimeFailure(error),
+                                );
+                                refused.diagnostics = coordinator
+                                    .preflight_diagnostics(
+                                        &admitted,
+                                        &settings,
+                                        &host,
+                                        PreflightReadiness {
+                                            launchable: false,
+                                            reasons: vec![PreflightReadinessReason {
+                                                id: PreflightReadinessReasonId::JavaOverrideMissing,
+                                                severity: PreflightReadinessSeverity::Blocking,
+                                                message: "Selected Java override is unavailable. Choose another Java runtime.",
+                                            }],
+                                        },
+                                    )
+                                    .ok();
+                                return Ok(refused);
+                            }
+                            Err(error) => return Err(LaunchError::RuntimeFailure(error)),
+                        };
                         let contribution =
                             axial_performance::effective_performance_plan(performance.plan());
                         let options = launch_options(&settings, target, &contribution, &host)?;

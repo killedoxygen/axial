@@ -2669,6 +2669,182 @@ async fn preflight_reports_installed_client_damage_without_launching_or_repairin
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preflight_reports_missing_java_override_without_launching() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let profile = temporary.path().join("profile");
+    let missing_java = temporary.path().join("private-missing-java");
+    let broken_java = temporary.path().join("private-java-script");
+    let script = format!("#!{}\nexit 0\n", missing_java.display());
+    std::fs::write(&broken_java, &script).unwrap();
+    std::fs::set_permissions(&broken_java, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let non_executable_java = temporary.path().join("private-java-data");
+    let data = b"preserve non-executable Java fixture";
+    std::fs::write(&non_executable_java, data).unwrap();
+    std::fs::set_permissions(&non_executable_java, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let canary = temporary.path().join("runtime-canary.bin");
+    let canary_bytes = b"preserve unrelated runtime canary";
+    std::fs::write(&canary, canary_bytes).unwrap();
+    let provider = Provider::start(false).await;
+    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+        .await
+        .unwrap();
+    let api = Api::new(&services);
+    api.post(
+        "/api/v1/accounts/offline",
+        json!({"username":PLAYER,"expected_selection_revision":0}),
+    )
+    .await;
+    api.request(
+        reqwest::Method::PUT,
+        "/api/v1/config",
+        Some(json!({
+            "expected_revision":0,"performance_mode":"vanilla","jvm_preset":"",
+            "java_path_override":"","max_memory_mb":2048,"min_memory_mb":1024
+        })),
+    )
+    .await;
+    let start = api
+        .post(
+            "/api/v1/install/queue",
+            json!({"kind":"vanilla","version_id":VERSION}),
+        )
+        .await;
+    assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
+    let created = api
+        .post(
+            "/api/v1/instances",
+            json!({"name":"Missing Java preflight","selection_id":format!("vanilla|{VERSION}")}),
+        )
+        .await;
+    let instance = created["id"].as_str().unwrap();
+    let instance_path = format!("/api/v1/instances/{instance}");
+    let preflight = format!("/api/v1/launch/preflight/{instance}");
+    let ready = api.get(&preflight).await;
+    assert_eq!(ready["status"], "ready", "{ready}");
+    assert_eq!(ready["launchable"], true, "{ready}");
+    assert_eq!(ready["readiness"], json!({"launchable":true,"reasons":[]}));
+    let reports_before = api.get("/api/v1/launch/reports").await;
+    let queue_before = api.get("/api/v1/install/queue").await;
+    let sessions_before = api.get("/api/v1/launch/sessions").await;
+    let private_args = "-Dpreflight.private=java-override-secret";
+    let mut responses = Vec::new();
+    for java in [&missing_java, &broken_java, &non_executable_java] {
+        let current = api.get(&instance_path).await;
+        api.request(
+            reqwest::Method::PUT,
+            &instance_path,
+            Some(json!({
+                "expected_revision":current["revision"],"java_path":java,
+                "extra_jvm_args":private_args
+            })),
+        )
+        .await;
+        responses.push(api.get(&preflight).await);
+    }
+    let script_after = std::fs::read(&broken_java).unwrap();
+    let data_after = std::fs::read(&non_executable_java).unwrap();
+    let canary_after = std::fs::read(&canary).unwrap();
+    let reports_after = api.get("/api/v1/launch/reports").await;
+    let queue_after = api.get("/api/v1/install/queue").await;
+    let sessions_after = api.get("/api/v1/launch/sessions").await;
+    services.server.shutdown().await.unwrap();
+    assert!(services.server.is_shutdown_settled());
+    drop(services);
+    provider.shutdown().await;
+
+    assert_eq!(reports_before, json!({"reports":[]}));
+    assert_eq!(reports_after, reports_before);
+    assert_eq!(queue_after, queue_before);
+    assert_eq!(sessions_before, json!({"sessions":[]}));
+    assert_eq!(sessions_after, sessions_before);
+    assert_eq!(script_after, script.as_bytes());
+    assert_eq!(data_after, data);
+    assert_eq!(canary_after, canary_bytes);
+    assert!(!missing_java.try_exists().unwrap());
+    assert_eq!(
+        responses[1],
+        json!({
+            "instance_id":instance,"launchable":false,
+            "error":{
+                "code":"runtime_unavailable","error":"The selected Java executable could not run."
+            }
+        })
+    );
+    for (response, error) in [
+        (&responses[0], "The selected Java executable is missing."),
+        (
+            &responses[2],
+            "The selected Java file is not an executable regular file.",
+        ),
+    ] {
+        assert_eq!(response["instance_id"], instance);
+        assert_eq!(response["launchable"], false, "{response}");
+        assert_eq!(
+            response["error"],
+            json!({"code":"runtime_unavailable","error":error})
+        );
+        assert_eq!(response["status"], "ready", "{response}");
+        assert_eq!(
+            response["readiness"],
+            json!({"launchable":false,"reasons":[{
+                "id":"java_override_missing","severity":"blocking",
+                "message":"Selected Java override is unavailable. Choose another Java runtime."
+            }]})
+        );
+        assert_eq!(
+            response["memory"],
+            json!({"max_memory_mb":2048,"min_memory_mb":1024,"min_clamped":false})
+        );
+        assert_eq!(
+            response["overrides"],
+            json!({
+                "java":{"present":true,"origin":"instance"},"preset":{"present":false},
+                "raw_jvm_args":{"present":true,"origin":"instance"}
+            })
+        );
+        assert_eq!(response.as_object().unwrap().len(), 8);
+        let budget = response["resource_budget"]
+            .as_object()
+            .expect("safe resource budget");
+        assert_eq!(budget.len(), 9);
+        assert_eq!(budget["active_session_count"], 0);
+        assert_eq!(budget["active_install_count"], 0);
+        assert_eq!(budget["active_memory_allocation_mb"], 0);
+        assert_eq!(budget["requested_memory_mb"], 2048);
+        let remaining = budget.get("estimated_remaining_memory_mb").unwrap();
+        assert!(remaining.is_null() || remaining.as_i64().is_some());
+        for pressure in [
+            "memory_pressure",
+            "cpu_pressure",
+            "install_pressure",
+            "disk_pressure",
+        ] {
+            assert!(budget[pressure].is_boolean(), "{pressure}: {budget:?}");
+        }
+        assert_eq!(budget["install_pressure"], false);
+        let encoded = response.to_string();
+        for private in [
+            temporary.path().to_str().unwrap(),
+            profile.to_str().unwrap(),
+            missing_java.to_str().unwrap(),
+            broken_java.to_str().unwrap(),
+            non_executable_java.to_str().unwrap(),
+            private_args,
+            "java-override-secret",
+            &api.capability,
+        ] {
+            assert!(
+                !encoded.contains(private),
+                "preflight exposed private input"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_offline_vanilla_install_launch_stop_and_restart() {
     offline_vanilla_journey(false).await;
 }

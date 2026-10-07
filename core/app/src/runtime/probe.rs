@@ -293,9 +293,6 @@ fn read_output(
 }
 
 fn spawn_error(error: &std::io::Error) -> JavaDiscoveryError {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        return JavaDiscoveryError::Missing;
-    }
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) && error.raw_os_error() == Some(86) {
         return JavaDiscoveryError::RosettaRequired;
     }
@@ -609,6 +606,32 @@ mod tests {
             probe_java_runtime(&path, None).await,
             Err(JavaDiscoveryError::InvalidVersion)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_executable_with_missing_interpreter_is_failed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let interpreter = root.path().join("missing-interpreter");
+        assert!(matches!(
+            probe_java_runtime(&interpreter, None).await,
+            Err(JavaDiscoveryError::Missing)
+        ));
+        let executable = root.path().join("java");
+        let bytes = format!("#!{}\nexit 0\n", interpreter.display()).into_bytes();
+        fs::write(&executable, &bytes).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = probe_java_runtime(&executable, None).await.unwrap_err();
+        assert_eq!(fs::read(&executable).unwrap(), bytes);
+        assert!(!interpreter.try_exists().unwrap());
+        assert_eq!(error, JavaDiscoveryError::Failed);
+        assert_eq!(
+            error.to_string(),
+            "The selected Java executable could not run."
+        );
     }
 
     #[cfg(unix)]
