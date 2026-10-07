@@ -576,6 +576,8 @@ impl ResourceService {
             name,
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -584,6 +586,7 @@ impl ResourceService {
         id: &InstanceId,
         name: &str,
         #[cfg(test)] before_copy: Option<Box<dyn FnOnce() + Send + 'static>>,
+        #[cfg(test)] after_copy: Option<Box<dyn FnOnce() -> io::Result<()> + Send + 'static>>,
     ) -> Result<TaskHandle<Result<ResourceCommand, ResourceError>>, ResourceError> {
         use axial_minecraft::managed_path::{
             ManagedTreeCopyLimits, ManagedTreeCopyOutcome, ManagedTreeRoot,
@@ -640,16 +643,33 @@ impl ResourceService {
                         if let Some(before_copy) = before_copy {
                             before_copy();
                         }
-                        match destination.copy_tree_no_replace(
-                            &source,
-                            &final_names,
-                            &[stage],
-                            ManagedTreeCopyLimits {
-                                max_depth: worlds::WORLD_BACKUP_MAX_DEPTH,
-                                max_entries: worlds::WORLD_BACKUP_MAX_ENTRIES,
-                                max_bytes: worlds::WORLD_BACKUP_MAX_BYTES,
-                            },
-                        ) {
+                        let limits = ManagedTreeCopyLimits {
+                            max_depth: worlds::WORLD_BACKUP_MAX_DEPTH,
+                            max_entries: worlds::WORLD_BACKUP_MAX_ENTRIES,
+                            max_bytes: worlds::WORLD_BACKUP_MAX_BYTES,
+                        };
+                        let copy = || {
+                            destination.copy_tree_no_replace(
+                                &source,
+                                &final_names,
+                                std::slice::from_ref(&stage),
+                                limits,
+                            )
+                        };
+                        #[cfg(test)]
+                        let outcome = match after_copy {
+                            Some(after_copy) => destination.copy_tree_no_replace_with_copy_hook(
+                                &source,
+                                &final_names,
+                                std::slice::from_ref(&stage),
+                                limits,
+                                after_copy,
+                            ),
+                            None => copy(),
+                        };
+                        #[cfg(not(test))]
+                        let outcome = copy();
+                        match outcome {
                             ManagedTreeCopyOutcome::Applied(name) => {
                                 let mut result = ResourceCommand::ok(None);
                                 result.backup = Some(name.as_str().into());
@@ -778,7 +798,13 @@ mod tests {
             LibraryOpenOutcome::Ready(library) => library,
             other => panic!("fixture root: {other:?}"),
         };
-        let storage = Arc::new(MetadataStore::in_memory().unwrap());
+        let service = compose_fixture(library, MetadataStore::in_memory().unwrap());
+        let id = create_fixture_instance(&service).await;
+        (root, service, id)
+    }
+
+    fn compose_fixture(library: LibraryLifecycle, storage: MetadataStore) -> ResourceService {
+        let storage = Arc::new(storage);
         storage
             .migrate(&[
                 crate::instances::directory::MIGRATION,
@@ -792,8 +818,22 @@ mod tests {
         let directories =
             InstanceDirectories::new(Registry::new(storage.clone()), library, Exclusions::new());
         let tasks = TaskOwner::new(16).unwrap();
-        let instances = InstanceService::new(directories.clone(), tasks.clone());
-        let instance = instances
+        let client = ProviderClient::new(ClientConfig::default()).unwrap();
+        let performance = crate::performance::PerformanceService::new(
+            storage,
+            directories.clone(),
+            tasks.clone(),
+            Arc::new(crate::content::catalog::ContentService::new(client.clone()).unwrap()),
+            crate::performance::public_transfer_resolver(),
+        )
+        .unwrap();
+        let content = ContentMutations::new(directories.clone(), client, tasks.clone())
+            .with_performance(performance);
+        ResourceService::new(directories, content, tasks)
+    }
+
+    async fn create_fixture_instance(service: &ResourceService) -> InstanceId {
+        InstanceService::new(service.directories.clone(), service.tasks.clone())
             .create(
                 CreateInstanceRequest {
                     name: "Resources".into(),
@@ -811,23 +851,8 @@ mod tests {
             .join()
             .await
             .unwrap()
-            .unwrap();
-        let client = ProviderClient::new(ClientConfig::default()).unwrap();
-        let performance = crate::performance::PerformanceService::new(
-            storage,
-            directories.clone(),
-            tasks.clone(),
-            Arc::new(crate::content::catalog::ContentService::new(client.clone()).unwrap()),
-            crate::performance::public_transfer_resolver(),
-        )
-        .unwrap();
-        let content = ContentMutations::new(directories.clone(), client, tasks.clone())
-            .with_performance(performance);
-        (
-            root,
-            ResourceService::new(directories, content, tasks),
-            instance.id,
-        )
+            .unwrap()
+            .id
     }
 
     fn recorded_mod(game: &std::path::Path, enabled: bool) -> Vec<u8> {
@@ -1252,6 +1277,226 @@ mod tests {
         ));
     }
 
+    const BACKUP_CRASH_ROOT: &str = "AXIAL_WORLD_BACKUP_CRASH_ROOT";
+    const BACKUP_CRASH_LIBRARY: &str = "AXIAL_WORLD_BACKUP_CRASH_LIBRARY";
+
+    async fn open_backup_fixture(
+        root: &std::path::Path,
+        library_id: crate::library::LibraryId,
+    ) -> ResourceService {
+        assert_eq!(root.canonicalize().unwrap(), root);
+        let library = match LibraryLifecycle::open_with_id(root, library_id) {
+            LibraryOpenOutcome::Ready(library) => library,
+            other => panic!("backup fixture root: {other:?}"),
+        };
+        let service = compose_fixture(
+            library,
+            MetadataStore::open(root.join("metadata.sqlite")).unwrap(),
+        );
+        let instances = InstanceService::new(service.directories.clone(), service.tasks.clone());
+        instances.recover_pending().await.unwrap();
+        assert!(!instances.has_pending_intents());
+        service
+    }
+
+    async fn close_backup_fixture(service: ResourceService) {
+        let library = service.directories.library().clone();
+        library.close_admission();
+        service
+            .tasks
+            .shutdown(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(!service.has_unsettled_effects());
+        assert!(!service.content.has_unsettled_effects());
+        service
+            .content
+            .release_shutdown_admissions(&service.tasks.shutdown_receipt().unwrap())
+            .unwrap();
+        library.try_preserve().unwrap();
+    }
+
+    fn backup_tree(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+        use std::io::Read;
+
+        assert!(std::fs::symlink_metadata(root).unwrap().is_dir());
+        let mut result = std::collections::BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        let mut total = 0;
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                assert!(result.len() < 16 && relative.components().count() <= 4);
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                let bytes = if metadata.is_dir() {
+                    pending.push(path);
+                    None
+                } else {
+                    assert!(metadata.is_file() && metadata.len() <= 4096);
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(path)
+                        .unwrap()
+                        .take(4097)
+                        .read_to_end(&mut bytes)
+                        .unwrap();
+                    assert_eq!(bytes.len() as u64, metadata.len());
+                    total += bytes.len();
+                    assert!(total <= 16 * 1024);
+                    Some(bytes)
+                };
+                result.insert(relative, bytes);
+            }
+        }
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper for the interrupted world backup test"]
+    async fn world_backup_exit_after_copy_helper() {
+        let Some(root) = std::env::var_os(BACKUP_CRASH_ROOT) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let library_id =
+            crate::library::LibraryId::parse(&std::env::var(BACKUP_CRASH_LIBRARY).unwrap())
+                .unwrap();
+        let service = open_backup_fixture(&root, library_id).await;
+        let records = service.directories.registry().list().unwrap();
+        assert_eq!(records.len(), 1);
+        let id = records[0].instance.id.clone();
+        let game = root.join("instances").join(&records[0].directory_name);
+        let source = backup_tree(&game.join("saves/Original"));
+        let protected = backup_tree(&game.join("saves"));
+        assert_eq!(source.len(), 3);
+        let result = service
+            .backup_world_inner(
+                &id,
+                "Original",
+                None,
+                Some(Box::new(move || {
+                    let copies = std::fs::read_dir(game.join("backups/worlds"))
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .collect::<Vec<_>>();
+                    assert_eq!(copies.len(), 1);
+                    assert_eq!(backup_tree(&copies[0]), source);
+                    assert_eq!(backup_tree(&game.join("saves")), protected);
+                    std::process::exit(42);
+                })),
+            )
+            .unwrap()
+            .join()
+            .await;
+        panic!("backup returned before its crash boundary: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn interrupted_world_backup_preserves_stage_and_allows_independent_backup_after_reopen() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let library_id = crate::library::LibraryId::new();
+        let service = open_backup_fixture(root.path(), library_id).await;
+        let id = create_fixture_instance(&service).await;
+        let records = service.directories.registry().list().unwrap();
+        let game = root
+            .path()
+            .join("instances")
+            .join(&records[0].directory_name);
+        std::fs::create_dir_all(game.join("saves/Original/region")).unwrap();
+        std::fs::write(game.join("saves/Original/level.dat"), b"world metadata").unwrap();
+        std::fs::write(
+            game.join("saves/Original/region/r.0.0.mca"),
+            b"world region",
+        )
+        .unwrap();
+        std::fs::create_dir(game.join("saves/Other")).unwrap();
+        std::fs::write(game.join("saves/Other/level.dat"), b"unrelated world").unwrap();
+        let protected = backup_tree(&game.join("saves"));
+        let source = backup_tree(&game.join("saves/Original"));
+        assert!(!game.join("backups").exists());
+        close_backup_fixture(service).await;
+
+        let mut output = tempfile::tempfile().unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "resources::service::tests::world_backup_exit_after_copy_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(BACKUP_CRASH_ROOT, root.path())
+            .env(BACKUP_CRASH_LIBRARY, library_id.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(output.try_clone().unwrap())
+            .stderr(output.try_clone().unwrap())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), child.wait()).await;
+        let completed = matches!(result, Ok(Ok(_)));
+        let status = match result {
+            Ok(Ok(status)) => status,
+            _ => {
+                child.kill().await.unwrap();
+                child.wait().await.unwrap()
+            }
+        };
+        output
+            .seek(SeekFrom::Start(
+                output.metadata().unwrap().len().saturating_sub(4096),
+            ))
+            .unwrap();
+        let mut tail = String::new();
+        output.read_to_string(&mut tail).unwrap();
+        assert!(completed && status.code() == Some(42), "{status}: {tail}");
+
+        let backups = game.join("backups/worlds");
+        let stages = std::fs::read_dir(&backups)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(stages.len(), 1);
+        let stage = &stages[0];
+        assert_eq!(backup_tree(stage), source);
+        let interrupted = backup_tree(&backups);
+        let mut published = None;
+        for reopen in 0..2 {
+            let service = open_backup_fixture(root.path(), library_id).await;
+            assert_eq!(service.directories.registry().list().unwrap(), records);
+            assert_eq!(backup_tree(&game.join("saves")), protected);
+            assert_eq!(backup_tree(stage), source);
+            assert!(service.tasks.status().is_idle());
+            if reopen == 0 {
+                assert_eq!(backup_tree(&backups), interrupted);
+                let result = service
+                    .backup_world(&id, "Original")
+                    .unwrap()
+                    .join()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(result.status, "ok");
+                let copy = game.join(result.location.unwrap());
+                assert_ne!(&copy, stage);
+                assert_eq!(result.backup.as_deref(), copy.file_name().unwrap().to_str());
+                assert_eq!(backup_tree(&copy), source);
+                assert_eq!(backup_tree(stage), source);
+                assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 2);
+                published = Some(backup_tree(&backups));
+            }
+            assert_eq!(backup_tree(&backups), *published.as_ref().unwrap());
+            assert_eq!(backup_tree(&game.join("saves")), protected);
+            assert_eq!(service.directories.registry().list().unwrap(), records);
+            close_backup_fixture(service).await;
+            assert_eq!(backup_tree(&backups), *published.as_ref().unwrap());
+            assert_eq!(backup_tree(&game.join("saves")), protected);
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn world_backup_keeps_current_thread_responsive_and_retains_dropped_waiter_until_joined()
     {
@@ -1278,6 +1523,7 @@ mod tests {
                     // the real copy settle before reporting any failed assertion.
                     let _ = release_rx.recv_timeout(Duration::from_secs(5));
                 })),
+                None,
             )
             .unwrap();
         let task_id = task.id();
@@ -1360,6 +1606,7 @@ mod tests {
                 &id,
                 "Original",
                 Some(Box::new(|| panic!("test backup worker panic"))),
+                None,
             )
             .unwrap();
         let task_id = task.id();

@@ -6224,6 +6224,8 @@ impl ManagedTreeDirectory {
             limits,
             #[cfg(any(test, feature = "test-support"))]
             None,
+            #[cfg(any(test, feature = "test-support"))]
+            None,
         )
     }
 
@@ -6245,6 +6247,29 @@ impl ManagedTreeDirectory {
             stage_names,
             limits,
             Some(Box::new(after_stage)),
+            None,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn copy_tree_no_replace_with_copy_hook<Hook>(
+        &self,
+        source: &Self,
+        final_names: &[PortableFileName],
+        stage_names: &[PortableFileName],
+        limits: ManagedTreeCopyLimits,
+        after_copy: Hook,
+    ) -> ManagedTreeCopyOutcome
+    where
+        Hook: FnOnce() -> io::Result<()> + 'static,
+    {
+        self.copy_tree_no_replace_inner(
+            source,
+            final_names,
+            stage_names,
+            limits,
+            None,
+            Some(Box::new(after_copy)),
         )
     }
 
@@ -6255,6 +6280,9 @@ impl ManagedTreeDirectory {
         stage_names: &[PortableFileName],
         limits: ManagedTreeCopyLimits,
         #[cfg(any(test, feature = "test-support"))] after_stage: Option<
+            Box<dyn FnOnce() -> io::Result<()>>,
+        >,
+        #[cfg(any(test, feature = "test-support"))] after_copy: Option<
             Box<dyn FnOnce() -> io::Result<()>>,
         >,
     ) -> ManagedTreeCopyOutcome {
@@ -6335,6 +6363,12 @@ impl ManagedTreeDirectory {
             );
         }
         if let Err(error) = stage.sync() {
+            return cleanup_tree_failure(&self.directory, &stage_name, stage, error.into());
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(after_copy) = after_copy
+            && let Err(error) = after_copy()
+        {
             return cleanup_tree_failure(&self.directory, &stage_name, stage, error.into());
         }
         let final_leaf = match leaf(final_name.as_str()) {
