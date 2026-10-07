@@ -946,9 +946,12 @@ impl LibraryLifecycle {
             return Err(LibraryError::RetirementPending);
         }
         let generations = {
-            let state = lock(&self.inner.state);
-            if state.unresolved_admission.is_some() {
-                return Err(LibraryError::AdmissionUnresolved);
+            let mut state = lock(&self.inner.state);
+            if let Some(obligation) = state.unresolved_admission.take() {
+                if let Err(obligation) = obligation.acknowledge_preserved() {
+                    state.unresolved_admission = Some(obligation);
+                    return Err(LibraryError::AdmissionUnresolved);
+                }
             }
             state.retiring.clone()
         };

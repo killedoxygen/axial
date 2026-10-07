@@ -207,6 +207,267 @@ async fn invalid_library_selection_refuses_startup_and_preserves_configuration()
     assert_eq!(fs::read(root.join("library.json")).unwrap(), bytes);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unresolved_external_admission_allows_preserve_only_startup_exit() {
+    use axial_fs::{RootSession, RootSessionAcquireOutcome, RootSessionError};
+    use futures_util::FutureExt;
+    use std::io::Read;
+
+    let mut temporary = Some(temporary());
+    let root = temporary.as_ref().unwrap().path().join("replacement");
+    let external = temporary.as_ref().unwrap().path().join("external");
+    let mut services: Option<DesktopServices> = None;
+    let mut retained: Option<StartupError> = None;
+    let mut unresolved = false;
+    let journey = std::panic::AssertUnwindSafe(async {
+        let profile = admit_profile(&root).unwrap();
+        assert_eq!(profile.root, root);
+        fs::create_dir(&external).unwrap();
+        select(&root, &external, LibraryId::new());
+        let control = external.join(".axial-root.lease");
+        let payload = external.join("keep.txt");
+        let stage = external.join(".axial-rstage-11111111111111111111111111111111");
+        fs::write(&control, [0x7a]).unwrap();
+        fs::write(&payload, b"external payload must remain exact").unwrap();
+        fs::write(&stage, b"unknown staged payload must remain exact").unwrap();
+        let paths = [
+            root.join(PROFILE_MARKER),
+            root.join("library.json"),
+            control.clone(),
+            payload,
+            stage,
+        ];
+        let read = || {
+            paths
+                .iter()
+                .map(|path| {
+                    let metadata = fs::symlink_metadata(path).unwrap();
+                    assert!(metadata.is_file() && metadata.len() <= 16 << 10);
+                    let mut bytes = Vec::new();
+                    fs::File::open(path)
+                        .unwrap()
+                        .take((16 << 10) + 1)
+                        .read_to_end(&mut bytes)
+                        .unwrap();
+                    assert!(bytes.len() <= 16 << 10);
+                    bytes
+                })
+                .collect::<Vec<_>>()
+        };
+        let entries = || {
+            let mut names = fs::read_dir(&external)
+                .unwrap()
+                .take(5)
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert!(names.len() <= 4);
+            names.sort();
+            names
+        };
+        let before = read();
+        let entries_before = entries();
+        match start_in_profile(root.clone(), None).await {
+            Ok(started) => {
+                services = Some(started);
+                return None;
+            }
+            Err(failure) => retained = Some(failure),
+        }
+        let failure = retained.as_ref().unwrap();
+        let message = failure.to_string();
+        let reset_refused = match failure.root.as_ref() {
+            Some(LibraryOpenOutcome::Ready(library)) => {
+                library.close_admission();
+                match library.take_reset_session() {
+                    Err(axial_app::library::LibraryError::AdmissionUnresolved) => true,
+                    Err(_) => false,
+                    Ok(session) => {
+                        unresolved = true;
+                        std::mem::forget(session);
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
+        let lease_held = match RootSession::acquire(&external) {
+            RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy) => true,
+            RootSessionAcquireOutcome::NoEffect(_) => false,
+            outcome => {
+                unresolved = true;
+                std::mem::forget(outcome);
+                false
+            }
+        };
+        let after_refusal = read();
+        let displaced = external.join("displaced-control");
+        fs::rename(&control, &displaced).unwrap();
+        fs::write(&control, b"replacement control").unwrap();
+        let binding_refused = match retained.take().unwrap().try_preserve() {
+            Ok(_) => false,
+            Err(failure) => {
+                retained = Some(failure);
+                true
+            }
+        };
+        let replacement_untouched = read()[2] == b"replacement control";
+        fs::remove_file(&control).unwrap();
+        fs::rename(&displaced, &control).unwrap();
+        let preserved = match retained.take().unwrap().try_preserve() {
+            Ok(_) => true,
+            Err(failure) => {
+                eprintln!("Original preserve-only refusal: {failure:?}");
+                retained = Some(failure);
+                false
+            }
+        };
+        let released = if preserved {
+            match RootSession::acquire(&external) {
+                RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                    let corrupt = matches!(obligation.error(), RootSessionError::Recovery(_));
+                    match obligation.acknowledge_preserved() {
+                        Ok(()) => corrupt,
+                        Err(obligation) => {
+                            unresolved = true;
+                            std::mem::forget(obligation);
+                            false
+                        }
+                    }
+                }
+                RootSessionAcquireOutcome::NoEffect(_) => false,
+                outcome => {
+                    unresolved = true;
+                    std::mem::forget(outcome);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let application_released = if preserved {
+            match RootSession::acquire(&root) {
+                RootSessionAcquireOutcome::Acquired(session) => match session.revoke() {
+                    axial_fs::RootRevokeOutcome::Revoked => true,
+                    outcome => {
+                        unresolved = true;
+                        std::mem::forget(outcome);
+                        false
+                    }
+                },
+                RootSessionAcquireOutcome::NoEffect(_) => false,
+                outcome => {
+                    unresolved = true;
+                    std::mem::forget(outcome);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let after_preservation = read();
+        let entries_after = entries();
+        let no_fallback = [
+            "instances",
+            "versions",
+            "libraries",
+            "assets",
+            "runtime",
+            "metadata.sqlite",
+        ]
+        .into_iter()
+        .all(|name| {
+            fs::symlink_metadata(root.join(name))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        });
+        Some(move || {
+            assert_eq!(after_refusal, before);
+            assert_eq!(after_preservation, before);
+            assert_eq!(entries_after, entries_before);
+            assert!(no_fallback);
+            assert_eq!(
+                message,
+                "external library acquisition needs explicit reconciliation"
+            );
+            assert!(
+                reset_refused && lease_held,
+                "partial admission must retain its lease and refuse reset authority"
+            );
+            assert!(
+                binding_refused && replacement_untouched,
+                "preservation must refuse a replaced lease binding without modifying it"
+            );
+            assert!(
+                preserved,
+                "preserve-only startup exit must acknowledge the retained external acquisition"
+            );
+            assert!(
+                released,
+                "preservation must release the external lease without repairing its control"
+            );
+            assert!(
+                application_released,
+                "preservation must also release the original application root lease"
+            );
+        })
+    })
+    .catch_unwind()
+    .await;
+    if journey.is_err() || retained.is_some() || unresolved {
+        eprintln!(
+            "Retained external-preservation fixture: {}",
+            temporary.take().unwrap().keep().display()
+        );
+    }
+    if let Some(failure) = retained.take() {
+        // Baseline refusal still owns an abort-on-drop native obligation.
+        std::mem::forget(failure);
+    }
+    let shutdown = match &services {
+        Some(services) => {
+            std::panic::AssertUnwindSafe(tokio::time::timeout(
+                Duration::from_secs(60),
+                services.server.shutdown(),
+            ))
+            .catch_unwind()
+            .await
+        }
+        None => Ok(Ok(Ok(()))),
+    };
+    if matches!(&shutdown, Ok(Ok(Ok(()))))
+        && services
+            .as_ref()
+            .is_none_or(|services| services.server.is_shutdown_settled())
+    {
+        drop(services);
+    } else {
+        std::mem::forget(services);
+        unresolved = true;
+    }
+    let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(
+            !unresolved,
+            "unexpected acquisition or service cleanup remained owned"
+        );
+        shutdown
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .expect("unexpected successful startup must join within its deadline")
+            .unwrap();
+        journey
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .expect("corrupt external recovery control must refuse startup")();
+    }));
+    if let Err(panic) = verified {
+        if let Some(temporary) = temporary.take() {
+            eprintln!(
+                "Retained external-preservation fixture: {}",
+                temporary.keep().display()
+            );
+        }
+        std::panic::resume_unwind(panic);
+    }
+}
+
 const PENDING_INSTANCE_PROFILE: &str = "AXIAL_TEST_PENDING_INSTANCE_PROFILE";
 const PENDING_INSTANCE_DELETE: &str = "AXIAL_TEST_PENDING_INSTANCE_DELETE";
 const PENDING_INSTANCE_EXIT: i32 = 79;
