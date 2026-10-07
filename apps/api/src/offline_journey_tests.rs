@@ -38,6 +38,108 @@ const INTERRUPTED_CLEANUP_TOKEN: &str = "AXIAL_TEST_INTERRUPTED_GAME_CLEANUP_TOK
 const INTERRUPTED_CHILD_EXIT: i32 = 75;
 const EXTERNAL_CANARY: &[u8] = b"external user file survives launch and profile reopen";
 
+#[derive(Clone, Copy, serde::Serialize)]
+pub(super) enum KillAckStage {
+    #[serde(rename = "kill_send")]
+    Send,
+    #[serde(rename = "kill_result")]
+    Result,
+    #[serde(rename = "kill_enter")]
+    Enter,
+    #[serde(rename = "kill_return")]
+    Return,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct KillAckEvent {
+    stage: KillAckStage,
+    elapsed_ms: u64,
+    session_id: String,
+    status: Option<u16>,
+    timeout: bool,
+    connect: bool,
+}
+
+struct KillAckCapture {
+    started: std::time::Instant,
+    events: Mutex<Vec<KillAckEvent>>,
+    incomplete: std::sync::atomic::AtomicBool,
+}
+
+thread_local! {
+    static KILL_ACK_CAPTURE: std::cell::RefCell<Option<Arc<KillAckCapture>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct KillAckScope;
+
+impl Drop for KillAckScope {
+    fn drop(&mut self) {
+        KILL_ACK_CAPTURE.with(|capture| drop(capture.borrow_mut().take()));
+    }
+}
+
+pub(super) fn record_kill_ack(
+    stage: KillAckStage,
+    session_id: &str,
+    status: Option<u16>,
+    timeout: bool,
+    connect: bool,
+) {
+    if !uuid::Uuid::parse_str(session_id)
+        .is_ok_and(|id| !id.is_nil() && id.to_string() == session_id)
+    {
+        return;
+    }
+    KILL_ACK_CAPTURE.with(|capture| {
+        let capture = capture.borrow();
+        let Some(capture) = capture.as_ref() else {
+            return;
+        };
+        let Ok(mut events) = capture.events.try_lock() else {
+            capture
+                .incomplete
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        };
+        if events.len() == 32 {
+            capture
+                .incomplete
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        events.push(KillAckEvent {
+            stage,
+            elapsed_ms: capture.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            session_id: session_id.to_owned(),
+            status,
+            timeout,
+            connect,
+        });
+    });
+}
+
+impl KillAckCapture {
+    fn dump(&self, preserved: Option<&std::path::Path>) {
+        let events = self.events.try_lock().ok().map(|events| events.clone());
+        let complete =
+            events.is_some() && !self.incomplete.load(std::sync::atomic::Ordering::Relaxed);
+        let encoded = serde_json::to_vec(&json!({
+            "complete": complete, "events": events.unwrap_or_default(),
+        }))
+        .expect("bounded kill acknowledgement diagnostic serialization");
+        eprintln!(
+            "[DEBUG-kill-ack] {}",
+            std::str::from_utf8(&encoded).unwrap()
+        );
+        if let Some(parent) = preserved {
+            if std::fs::write(parent.join("kill-ack-probe.json"), &encoded).is_err() {
+                eprintln!("[DEBUG-kill-ack] diagnostic file unavailable; parent remains preserved");
+            }
+        }
+    }
+}
+
 fn configure_external(profile: &std::path::Path) -> (axial_app::library::LibraryId, PathBuf) {
     let admitted = super::admit_profile(profile).unwrap();
     let external = admitted.root.parent().unwrap().join("external");
@@ -697,6 +799,14 @@ impl Api {
     }
 
     async fn request(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Value {
+        let capture_active = KILL_ACK_CAPTURE.with(|capture| capture.borrow().is_some());
+        let kill_session = (capture_active && method == reqwest::Method::POST)
+            .then(|| path.strip_prefix("/api/v1/launch/")?.strip_suffix("/kill"))
+            .flatten()
+            .filter(|id| {
+                uuid::Uuid::parse_str(id)
+                    .is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == *id)
+            });
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.base))
@@ -704,7 +814,28 @@ impl Api {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request.send().await.unwrap();
+        if let Some(id) = kill_session {
+            record_kill_ack(KillAckStage::Send, id, None, false, false);
+        }
+        let response = request.send().await;
+        if let Some(id) = kill_session {
+            let (status, timeout, connect) = match &response {
+                Ok(response) => (Some(response.status().as_u16()), false, false),
+                Err(error) => (
+                    error.status().map(|status| status.as_u16()),
+                    error.is_timeout(),
+                    error.is_connect(),
+                ),
+            };
+            record_kill_ack(KillAckStage::Result, id, status, timeout, connect);
+        }
+        let response = if kill_session.is_some() {
+            response.unwrap_or_else(|_| {
+                panic!("Kill request failed before response headers; Stop acceptance is unknown")
+            })
+        } else {
+            response.unwrap()
+        };
         let status = response.status();
         let body = response.text().await.unwrap();
         assert!(status.is_success(), "{path}: {status}: {body}");
@@ -4539,14 +4670,28 @@ async fn real_external_offline_vanilla_install_launch_stop_and_restart() {
     offline_vanilla_journey(true).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
+#[test]
+fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
+    let capture = Arc::new(KillAckCapture {
+        started: std::time::Instant::now(),
+        events: Mutex::new(Vec::with_capacity(32)),
+        incomplete: std::sync::atomic::AtomicBool::new(false),
+    });
+    KILL_ACK_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&capture)));
+    let _capture_scope = KillAckScope;
+    let (runtime, _diagnostics) = diagnostic_runtime(Some(Arc::clone(&capture)));
+    runtime.block_on(missing_default_runtime_after_reopen());
+    capture.dump(None);
+}
+
+async fn missing_default_runtime_after_reopen() {
     use futures_util::FutureExt;
     use std::os::unix::fs::MetadataExt;
 
-    let temporary =
-        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-    let profile = temporary.path().join("profile");
+    let mut temporary =
+        Some(tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap());
+    let parent = temporary.as_ref().unwrap().path().to_owned();
+    let profile = parent.join("profile");
     let provider = Provider::start(false).await;
     let mut services: Option<DesktopServices> = None;
     let mut processes = BTreeSet::new();
@@ -4752,7 +4897,7 @@ async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
             restarted_api.request(reqwest::Method::PUT, "/api/v1/config", Some(json!({
                 "expected_revision":config["revision"],"java_path_override":COMPONENT
             }))).await;
-            let preserved_runtime = temporary.path().join("preserved-runtime");
+            let preserved_runtime = parent.join("preserved-runtime");
             assert!(std::fs::symlink_metadata(&preserved_runtime)
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
             let runtime_before = std::fs::symlink_metadata(&runtime).unwrap();
@@ -4843,6 +4988,24 @@ async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
     })
     .catch_unwind()
     .await;
+    let mut preserve = || {
+        if let Some(temporary) = temporary.take() {
+            let preserved = temporary.keep();
+            KILL_ACK_CAPTURE.with(|capture| {
+                if let Some(capture) = capture.borrow().as_ref() {
+                    capture.dump(Some(&preserved));
+                }
+            });
+            eprintln!(
+                "[DEBUG-kill-ack] Retained missing-runtime fixture: {}; process/tree settlement is not inferred",
+                preserved.display()
+            );
+        }
+    };
+    if journey.is_err() {
+        preserve();
+        eprintln!("[DEBUG-kill-ack] API/provider joins unknown; attempting existing owner cleanup");
+    }
     let shutdown = match &services {
         Some(services) => {
             std::panic::AssertUnwindSafe(services.server.shutdown())
@@ -4854,13 +5017,22 @@ async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
     let settled = services
         .as_ref()
         .is_none_or(|services| services.server.is_shutdown_settled());
+    if !matches!(&shutdown, Ok(Ok(()))) || !settled {
+        preserve();
+    }
     drop(services);
     let provider_shutdown = std::panic::AssertUnwindSafe(provider.shutdown())
         .catch_unwind()
         .await;
+    if provider_shutdown.is_err() {
+        preserve();
+    }
     let absent = std::panic::AssertUnwindSafe(assert_fixture_processes_gone(&processes))
         .catch_unwind()
         .await;
+    if absent.is_err() {
+        preserve();
+    }
     let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         shutdown
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
@@ -4912,10 +5084,7 @@ async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
         assert_eq!(instance_before["launch_action"]["label"], "Launch");
     }));
     if let Err(panic) = verified {
-        eprintln!(
-            "Retained missing-runtime fixture after failure: {}",
-            temporary.keep().display()
-        );
+        preserve();
         std::panic::resume_unwind(panic);
     }
 }
@@ -5424,6 +5593,12 @@ fn real_benchmark_mapping_survives_response_loss_and_restart() {
 }
 
 fn benchmark_diagnostic_runtime() -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
+    diagnostic_runtime(None)
+}
+
+fn diagnostic_runtime(
+    kill_ack: Option<Arc<KillAckCapture>>,
+) -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
     use tracing_subscriber::prelude::*;
 
     thread_local! {
@@ -5459,8 +5634,10 @@ fn benchmark_diagnostic_runtime() -> (tokio::runtime::Runtime, tracing::dispatch
             DIAGNOSTICS.with(|guard| {
                 *guard.borrow_mut() = Some(tracing::dispatcher::set_default(&diagnostics));
             });
+            KILL_ACK_CAPTURE.with(|capture| *capture.borrow_mut() = kill_ack.clone());
         })
         .on_thread_stop(|| {
+            KILL_ACK_CAPTURE.with(|capture| drop(capture.borrow_mut().take()));
             DIAGNOSTICS.with(|guard| drop(guard.borrow_mut().take()));
         })
         .build()

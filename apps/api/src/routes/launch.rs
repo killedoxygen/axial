@@ -141,11 +141,31 @@ async fn kill(
     Path(id): Path<String>,
 ) -> Result<Json<SessionSnapshot>, ApiError> {
     session_id(&id)?;
-    state
+    #[cfg(all(test, unix))]
+    crate::offline_journey_tests::record_kill_ack(
+        crate::offline_journey_tests::KillAckStage::Enter,
+        &id,
+        None,
+        false,
+        false,
+    );
+    let result = state
         .sessions
         .stop_by_session_id(&id)
         .map(Json)
-        .map_err(|_| error(LaunchError::InstanceNotFound))
+        .map_err(|_| error(LaunchError::InstanceNotFound));
+    #[cfg(all(test, unix))]
+    crate::offline_journey_tests::record_kill_ack(
+        crate::offline_journey_tests::KillAckStage::Return,
+        &id,
+        Some(match &result {
+            Ok(_) => StatusCode::OK.as_u16(),
+            Err((status, _)) => status.as_u16(),
+        }),
+        false,
+        false,
+    );
+    result
 }
 
 async fn logs(
