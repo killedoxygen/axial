@@ -253,6 +253,7 @@ async fn loader_picker_retains_beta_labels_without_treating_unknown_as_an_unstab
         .collect();
     let unknown = catalog.builds.last().unwrap().clone();
     service.loader_catalog_fixture = Some(catalog);
+    let mut service = Arc::new(service);
     let view = service
         .loader_builds(LoaderComponentId::Fabric.as_str(), "1.21.4")
         .await
@@ -264,7 +265,12 @@ async fn loader_picker_retains_beta_labels_without_treating_unknown_as_an_unstab
         assert_eq!(option.recommended, index == 0);
         assert!(option.enabled);
     }
-    service.loader_catalog_fixture.as_mut().unwrap().builds = vec![unknown];
+    Arc::get_mut(&mut service)
+        .unwrap()
+        .loader_catalog_fixture
+        .as_mut()
+        .unwrap()
+        .builds = vec![unknown];
     let unknown_only = service
         .loader_builds(LoaderComponentId::Fabric.as_str(), "1.21.4")
         .await
@@ -309,8 +315,10 @@ async fn incompatible_quilt_build_is_disabled_and_rejected_even_when_installed()
             .is_ok(),
         "the compatibility gate must not rely on missing or damaged artifacts"
     );
+    let mut service = Arc::new(service);
     for fresh in [true, false] {
-        let availability = &mut service
+        let availability = &mut Arc::get_mut(&mut service)
+            .unwrap()
             .loader_catalog_fixture
             .as_mut()
             .unwrap()
@@ -332,7 +340,6 @@ async fn incompatible_quilt_build_is_disabled_and_rejected_even_when_installed()
         assert!(view.builds[1].installed && view.builds[1].enabled && view.builds[1].recommended);
         assert_eq!(view.builds[1].channel_label, "Beta");
     }
-    let mut service = Arc::new(service);
     let automatic = format!("loader_auto|{}|{minecraft}", component.as_str());
     assert_eq!(
         service.resolve(&automatic).await.unwrap().0.version_id(),
@@ -382,6 +389,121 @@ async fn incompatible_quilt_build_is_disabled_and_rejected_even_when_installed()
     assert!(matches!(result, Err(InstanceError::VersionUnavailable)));
     assert!(service.instances.registry().list().unwrap().is_empty());
     assert_eq!(service.installs.snapshot(), before);
+}
+
+#[tokio::test]
+async fn loader_picker_refuses_a_degraded_library_and_recovers_after_restoration() {
+    use futures_util::FutureExt;
+
+    let (root, mut service, _) = fixture();
+    let catalog = stale_loader_catalog();
+    let build = catalog.builds[0].clone();
+    service.loader_catalog_fixture = Some(catalog);
+    let service = Arc::new(service);
+    let journey = std::panic::AssertUnwindSafe(async {
+        crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+        crate::install::queue::tests::install_ready_fixture(&service.installs, &build.version_id)
+            .await;
+        let pin = service.instances.directories().library().admit().unwrap();
+        let receipt = service
+            .installs
+            .ready_version(&pin, &build.version_id)
+            .await
+            .unwrap();
+        let library = pin.read_projection().unwrap();
+        let protected: Vec<_> = ["1.21.4", build.version_id.as_str()]
+            .into_iter()
+            .flat_map(|id| {
+                let library = &library;
+                ["json", "jar"].map(move |extension| {
+                    let path = library.join(format!("versions/{id}/{id}.{extension}"));
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+            })
+            .collect();
+        let healthy = service
+            .loader_builds(LoaderComponentId::Fabric.as_str(), "1.21.4")
+            .await
+            .unwrap();
+        let queue_before = service.installs.snapshot();
+        let instances_before = service.instances.registry().list().unwrap();
+        let pending_before = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+        let external = library.join("versions/external-degraded-entry");
+        assert!(
+            std::fs::symlink_metadata(&external)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        );
+        std::fs::create_dir(&external).unwrap();
+        let metadata = external.join("external-degraded-entry.json");
+        let malformed = b"{not valid external version metadata\n";
+        std::fs::write(&metadata, malformed).unwrap();
+        let degraded = service
+            .loader_builds(LoaderComponentId::Fabric.as_str(), "1.21.4")
+            .await
+            .err();
+        let preserved = std::fs::read(&metadata).unwrap();
+        let queue_after = service.installs.snapshot();
+        let instances_after = service.instances.registry().list().unwrap();
+        let pending_after = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
+        receipt.revalidate().unwrap();
+        std::fs::remove_file(&metadata).unwrap();
+        std::fs::remove_dir(&external).unwrap();
+        let restored = service
+            .loader_builds(LoaderComponentId::Fabric.as_str(), "1.21.4")
+            .await
+            .unwrap();
+        drop(receipt);
+        drop(pin);
+        move || {
+            assert_eq!(preserved, malformed);
+            assert!(
+                std::fs::symlink_metadata(external)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            );
+            for (path, bytes) in protected {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+            assert_eq!(queue_after, queue_before);
+            assert_eq!(instances_after, instances_before);
+            assert_eq!(pending_after, pending_before);
+            for view in [&healthy, &restored] {
+                assert!(view.auto.enabled);
+                assert_eq!(view.builds.len(), 1);
+                assert_eq!(view.builds[0].build_id, build.build_id);
+                assert!(view.builds[0].installed && view.builds[0].enabled);
+            }
+            assert!(
+                matches!(degraded, Some(InstanceError::InstalledVersionsDegraded)),
+                "{degraded:?}"
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
+    let shutdown = std::panic::AssertUnwindSafe(
+        service
+            .instances
+            .tasks
+            .shutdown(std::time::Duration::from_secs(5)),
+    )
+    .catch_unwind()
+    .await;
+    let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match shutdown {
+            Ok(result) => assert!(result.is_ok(), "{result:?}"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+        assert!(service.instances.tasks.status().is_idle());
+        match journey {
+            Ok(verify) => verify(),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }));
+    if let Err(panic) = verification {
+        eprintln!("Retained loader picker fixture: {}", root.keep().display());
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]

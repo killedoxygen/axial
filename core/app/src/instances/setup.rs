@@ -1301,7 +1301,7 @@ impl SetupService {
     }
 
     pub async fn loader_builds(
-        &self,
+        self: &Arc<Self>,
         source: &str,
         minecraft: &str,
     ) -> InstanceResult<CreateLoaderBuildsView> {
@@ -1312,23 +1312,46 @@ impl SetupService {
             .library()
             .admit()
             .map_err(|_| InstanceError::LibraryUnavailable)?;
+        let source = source.to_owned();
+        let minecraft = minecraft.to_owned();
+        let service = Arc::clone(self);
+        self.instances
+            .tasks
+            .try_spawn(pin.clone(), move |_cancel| async move {
+                service
+                    .loader_builds_admitted(&source, &minecraft, component, pin)
+                    .await
+            })
+            .map_err(|_| InstanceError::Closed)?
+            .join()
+            .await
+            .map_err(|_| InstanceError::VersionUnavailable)?
+    }
+
+    async fn loader_builds_admitted(
+        &self,
+        source: &str,
+        minecraft: &str,
+        component: LoaderComponentId,
+        pin: crate::library::GenerationPin,
+    ) -> InstanceResult<CreateLoaderBuildsView> {
         let library = pin
             .managed_library()
             .map_err(|_| InstanceError::LibraryUnavailable)?;
+        let admission = Admission::capture(pin).await?;
         let (builds, catalog) = self
             .loader_build_catalog(&library, component, minecraft)
             .await
             .map_err(|_| InstanceError::VersionUnavailable)?;
-        let installed = installed_versions(&library, None)
-            .await
-            .map_err(|_| InstanceError::VersionUnavailable)?;
-        let displayed_installed = self.display_installed_ids(&pin, &installed.versions)?;
+        admission.validate()?;
+        let displayed_installed =
+            self.display_installed_ids(admission.generation(), admission.scan().versions())?;
         let fresh = catalog.availability.fresh && !catalog.availability.stale;
         let preferred = preferred_build(builds.clone());
         let auto_enabled = preferred
             .as_ref()
             .is_some_and(|build| fresh || displayed_installed.contains(&build.version_id));
-        Ok(CreateLoaderBuildsView {
+        let view = CreateLoaderBuildsView {
             source_id: source.into(),
             minecraft_version_id: minecraft.into(),
             auto: AutoBuildOption {
@@ -1380,7 +1403,18 @@ impl SetupService {
                     }
                 })
                 .collect(),
-        })
+        };
+        admission.validate()?;
+        let current = self
+            .instances
+            .directories()
+            .library()
+            .admit()
+            .map_err(|_| InstanceError::LibraryUnavailable)?;
+        if !admission.scan().generation_matches(&current) {
+            return Err(InstanceError::LibraryUnavailable);
+        }
+        Ok(view)
     }
 }
 
