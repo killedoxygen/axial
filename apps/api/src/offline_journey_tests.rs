@@ -2858,6 +2858,27 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     let original = std::fs::read(&client).unwrap();
     let metadata = library.join(format!("versions/{VERSION}/{VERSION}.json"));
     let original_metadata = std::fs::read(&metadata).unwrap();
+    let required_library = library.join("libraries/org/axial/fixture/1.0/fixture-1.0.jar");
+    let original_library = std::fs::read(&required_library).unwrap();
+    assert_eq!(
+        original_library,
+        provider.state.routes["GET /artifacts/library.jar"]
+    );
+    std::fs::remove_file(&required_library).unwrap();
+    let missing_library = api.get(&preflight).await;
+    let library_absent = std::fs::symlink_metadata(&required_library)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    let library_canary = temporary.path().join("outside-library-canary.jar");
+    assert!(!library_canary.starts_with(&profile) && !library_canary.starts_with(&library));
+    std::fs::write(&library_canary, &original_library).unwrap();
+    std::os::unix::fs::symlink(&library_canary, &required_library).unwrap();
+    let library_link_before = std::fs::symlink_metadata(&required_library).unwrap();
+    let library_inadmissible = api.get(&preflight).await;
+    let library_link_after = std::fs::symlink_metadata(&required_library).unwrap();
+    let library_link_target = std::fs::read_link(&required_library).unwrap();
+    let library_canary_after = std::fs::read(&library_canary).unwrap();
+    std::fs::remove_file(&required_library).unwrap();
+    std::fs::write(&required_library, &original_library).unwrap();
     std::fs::remove_file(&metadata).unwrap();
     let missing_metadata = api.get(&preflight).await;
     let metadata_absent = std::fs::symlink_metadata(&metadata)
@@ -2892,6 +2913,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     let missing = api.get(&preflight).await;
     let canary_after = std::fs::read(&canary).unwrap();
     let metadata_after = std::fs::read(&metadata).unwrap();
+    let library_after = std::fs::read(&required_library).unwrap();
     let reports_after = api.get("/api/v1/launch/reports").await;
     let queue_after = api.get("/api/v1/install/queue").await;
     let sessions_after = api.get("/api/v1/launch/sessions").await;
@@ -2907,6 +2929,12 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     assert_eq!(sessions_after, sessions_before);
     for (before, after, target, expected_target) in [
         (
+            &library_link_before,
+            &library_link_after,
+            &library_link_target,
+            &library_canary,
+        ),
+        (
             &metadata_link_before,
             &metadata_link_after,
             &metadata_link_target,
@@ -2919,12 +2947,15 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
         assert_eq!(target, expected_target);
     }
+    assert!(library_absent, "preflight must not repair libraries");
+    assert_eq!(library_canary_after, original_library);
+    assert_eq!(library_after, original_library);
     assert!(metadata_absent, "preflight must not repair metadata");
     assert_eq!(metadata_canary_after, original_metadata);
     assert_eq!(metadata_after, original_metadata);
     assert_eq!(client_after_metadata, original);
     assert_eq!(canary_after, original);
-    for response in [metadata_inadmissible, inadmissible] {
+    for response in [library_inadmissible, metadata_inadmissible, inadmissible] {
         assert_eq!(
             response,
             json!({
@@ -2948,6 +2979,11 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     );
     for (response, reason, message) in [
         (
+            missing_library,
+            "libraries_missing",
+            "Required libraries are missing. Install this version before launching.",
+        ),
+        (
             missing_metadata,
             "version_json_missing",
             "Installed version metadata is missing. Install this version before launching.",
@@ -2965,7 +3001,13 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     ] {
         assert_eq!(response["instance_id"], instance);
         assert_eq!(response["launchable"], false, "{response}");
-        assert_eq!(response["error"]["code"], "install_unavailable");
+        assert_eq!(
+            response["error"],
+            json!({
+                "code":"install_unavailable",
+                "error":"The installed version requires a completed installation before launch."
+            })
+        );
         assert_eq!(response["status"], "ready", "{response}");
         assert_eq!(
             response["readiness"],
@@ -3010,6 +3052,8 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
             client.to_str().unwrap(),
             metadata.to_str().unwrap(),
             metadata_canary.to_str().unwrap(),
+            required_library.to_str().unwrap(),
+            library_canary.to_str().unwrap(),
             private_args,
             "missing-client-secret",
             &api.capability,

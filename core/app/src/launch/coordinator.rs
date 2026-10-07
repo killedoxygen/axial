@@ -181,6 +181,7 @@ pub enum PreflightReadinessReasonId {
     ClientJarMissing,
     ClientJarCorrupt,
     VersionJsonMissing,
+    LibrariesMissing,
     JavaOverrideMissing,
 }
 
@@ -633,6 +634,10 @@ impl LaunchCoordinator {
                                     InstallError::VersionJsonMissing => (
                                         PreflightReadinessReasonId::VersionJsonMissing,
                                         "Installed version metadata is missing. Install this version before launching.",
+                                    ),
+                                    InstallError::LibrariesMissing => (
+                                        PreflightReadinessReasonId::LibrariesMissing,
+                                        "Required libraries are missing. Install this version before launching.",
                                     ),
                                     _ => return Err(install_read_error(error)),
                                 };
@@ -1227,7 +1232,8 @@ fn install_read_error(error: InstallError) -> LaunchError {
         InstallError::NotReady
         | InstallError::ClientJarMissing
         | InstallError::ClientJarCorrupt
-        | InstallError::VersionJsonMissing => LaunchError::InstallUnavailable,
+        | InstallError::VersionJsonMissing
+        | InstallError::LibrariesMissing => LaunchError::InstallUnavailable,
         InstallError::Busy => LaunchError::InstanceBusy,
         InstallError::AtCapacity => LaunchError::AtCapacity,
         InstallError::Closed => LaunchError::Closed,

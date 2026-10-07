@@ -118,6 +118,8 @@ pub enum InstallError {
     ClientJarCorrupt,
     #[error("Installed version metadata is missing. Install this version before launching.")]
     VersionJsonMissing,
+    #[error("Required libraries are missing. Install this version before launching.")]
+    LibrariesMissing,
     #[error("The selected loader build is unavailable.")]
     LoaderUnavailable,
     #[error("Content installation is unavailable.")]

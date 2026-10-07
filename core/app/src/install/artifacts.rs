@@ -112,15 +112,14 @@ impl ActivatedVersion {
             }
             let path = PortableRelativePath::new_exact(&expected.path)
                 .map_err(|_| InstallError::NotReady)?;
-            if !matches!(
-                expected.path.split('/').next(),
-                Some("versions" | "libraries" | "assets")
-            ) || exact
-                .insert(
-                    expected.path.clone(),
-                    (expected.sha1.clone(), expected.size),
-                )
-                .is_some()
+            let root = expected.path.split('/').next();
+            if !matches!(root, Some("versions" | "libraries" | "assets"))
+                || exact
+                    .insert(
+                        expected.path.clone(),
+                        (expected.sha1.clone(), expected.size),
+                    )
+                    .is_some()
             {
                 return Err(InstallError::NotReady);
             }
@@ -131,6 +130,8 @@ impl ActivatedVersion {
                     InstallError::ClientJarMissing
                 } else if expected.path == metadata_path {
                     InstallError::VersionJsonMissing
+                } else if root == Some("libraries") {
+                    InstallError::LibrariesMissing
                 } else {
                     InstallError::NotReady
                 })?;
