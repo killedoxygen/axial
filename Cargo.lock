@@ -363,6 +363,7 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "png 0.17.16",
+ "semver",
  "serde",
  "serde_json",
  "tauri",

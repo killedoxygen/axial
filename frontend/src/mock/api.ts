@@ -3,7 +3,9 @@ import type { Config, SystemInfo } from '../types-settings';
 import type { EnrichedInstance, InstanceMod, InstanceResourceSummary } from '../types-instance';
 import type { InstallQueueStateResponse } from '../types-install';
 import type { FeatureFlagViewModel, FlagsResponse } from '../types-flags';
-import type { UpdateFlowState, UpdateInfo } from '../types-update';
+import type { UpdateFlow } from '../generated/UpdateFlow';
+import type { UpdateInfo } from '../generated/UpdateInfo';
+import type { UpdateSnapshot } from '../generated/UpdateSnapshot';
 import type { Version } from '../types-version';
 import type {
   CanonicalContent,
@@ -970,7 +972,8 @@ const handlers: Record<string, Handler> = {
     ],
   }),
   'GET /performance/health': () => ({ health: null }),
-  'GET /update': (): UpdateInfo & { checked_at: string } => mockUpdateInfo(),
+  'GET /update': () => mockUpdateInfo(),
+  'GET /update/snapshot': (): UpdateSnapshot => ({ info: mockUpdateInfo(), flow: mockUpdateFlow() }),
   'GET /update/flow': () => mockUpdateFlow(),
   'POST /update/download': () => startMockUpdateDownload(),
   'POST /update/apply': () => applyMockUpdate(),
@@ -1022,7 +1025,7 @@ const MOCK_UPDATE_DOWNLOAD_MS = 6500;
 let mockUpdateDownloadStartedAt: number | null = null;
 let mockUpdateApplied = false;
 
-function mockUpdateInfo(): UpdateInfo & { checked_at: string } {
+function mockUpdateInfo(): UpdateInfo {
   return {
     current_version: 'mock-dev',
     latest_version: MOCK_UPDATE_VERSION,
@@ -1039,7 +1042,7 @@ function mockUpdateInfo(): UpdateInfo & { checked_at: string } {
   };
 }
 
-function mockUpdateFlow(): UpdateFlowState {
+function mockUpdateFlow(): UpdateFlow {
   if (mockUpdateApplied) {
     return {
       revision: MOCK_UPDATE_DOWNLOAD_MS + 2,
@@ -1049,7 +1052,10 @@ function mockUpdateFlow(): UpdateFlowState {
       total_bytes: MOCK_UPDATE_TOTAL_BYTES,
       percent: 100,
       message: '',
+      supported: true,
+      can_check: false,
       can_download: false,
+      can_apply: false,
       can_restart: true,
     };
   }
@@ -1062,7 +1068,10 @@ function mockUpdateFlow(): UpdateFlowState {
       total_bytes: null,
       percent: null,
       message: '',
+      supported: true,
+      can_check: true,
       can_download: true,
+      can_apply: false,
       can_restart: false,
     };
   }
@@ -1077,7 +1086,10 @@ function mockUpdateFlow(): UpdateFlowState {
       total_bytes: MOCK_UPDATE_TOTAL_BYTES,
       percent: 100,
       message: '',
+      supported: true,
+      can_check: false,
       can_download: false,
+      can_apply: true,
       can_restart: false,
     };
   }
@@ -1089,18 +1101,21 @@ function mockUpdateFlow(): UpdateFlowState {
     total_bytes: MOCK_UPDATE_TOTAL_BYTES,
     percent: Math.round(fraction * 100),
     message: '',
+    supported: true,
+    can_check: false,
     can_download: false,
+    can_apply: false,
     can_restart: false,
   };
 }
 
-function startMockUpdateDownload(): UpdateFlowState {
+function startMockUpdateDownload(): UpdateFlow {
   if (mockUpdateApplied) throw apiError(409, 'Conflict', { error: 'an update is already applied; restart to finish' });
   mockUpdateDownloadStartedAt = Date.now();
   return mockUpdateFlow();
 }
 
-function applyMockUpdate(): UpdateFlowState {
+function applyMockUpdate(): UpdateFlow {
   if (mockUpdateFlow().phase !== 'ready') {
     throw apiError(409, 'Conflict', { error: 'no staged update is ready to apply' });
   }

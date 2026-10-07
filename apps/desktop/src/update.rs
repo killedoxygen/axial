@@ -9,12 +9,13 @@ use axial_app::{
         UpdateService,
     },
 };
+use semver::Version;
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tauri::{AppHandle, Runtime};
-use tauri_plugin_updater::{Update, Updater, UpdaterExt};
+use tauri_plugin_updater::{RemoteRelease, Update, Updater, UpdaterExt};
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -104,9 +105,25 @@ fn build_updater<R: Runtime>(
     app.updater_builder()
         .target(target)
         .timeout(CHECK_TIMEOUT)
-        .version_comparator(|current, release| release.version > current)
+        .version_comparator(release_is_newer)
         .configure_client(|client| client.https_only(true))
         .build()
+}
+
+fn release_is_newer(current: Version, release: RemoteRelease) -> bool {
+    let next = release.version;
+    let channel_rank = |version: &Version| match version.pre.as_str().split('.').next() {
+        Some("alpha") => 1,
+        Some("beta") => 2,
+        Some("rc") => 3,
+        _ => 0,
+    };
+    (next.major, next.minor, next.patch)
+        .cmp(&(current.major, current.minor, current.patch))
+        .then_with(|| next.pre.is_empty().cmp(&current.pre.is_empty()))
+        .then_with(|| channel_rank(&next).cmp(&channel_rank(&current)))
+        .then_with(|| next.pre.cmp(&current.pre))
+        .is_gt()
 }
 
 #[derive(Default)]
@@ -466,7 +483,13 @@ mod tests {
         }
     }
 
-    async fn fixture(target: &str, version: &str, payload: &[u8], signature: &str) -> Fixture {
+    async fn fixture(
+        current_version: &str,
+        target: &str,
+        version: &str,
+        payload: &[u8],
+        signature: &str,
+    ) -> Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let manifest = serde_json::to_vec(&json!({
@@ -503,6 +526,7 @@ mod tests {
             }
         });
         let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context.package_info_mut().version = current_version.parse().unwrap();
         context.config_mut().plugins.0.insert(
             "updater".into(),
             json!({
@@ -520,6 +544,7 @@ mod tests {
             .updater_builder()
             .target(TARGET)
             .timeout(Duration::from_secs(5))
+            .version_comparator(release_is_newer)
             .no_proxy()
             .build()
             .unwrap();
@@ -527,6 +552,38 @@ mod tests {
             _app: app,
             updater: Arc::new(updater),
             server,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_check_preserves_release_channel_precedence() {
+        for (current, version, available) in [
+            ("0.4.0-dev.5", "0.4.0-alpha.1", true),
+            ("0.4.0-dev.5", "0.4.0-beta.1", true),
+            ("0.4.0-alpha.1", "0.4.0-dev.6", false),
+            ("0.4.0-beta.1", "0.4.0-dev.6", false),
+            ("0.4.0-beta.1", "0.4.0-alpha.9", false),
+            ("0.4.0-alpha.1", "0.4.0-beta.1", true),
+            ("0.4.0-beta.1", "0.4.0-rc.1", true),
+            ("0.4.0-dev.9", "0.4.0-dev.10", true),
+            ("0.4.0-rc.9", "0.4.0-rc.10", true),
+            ("0.4.0-dev.10", "0.4.0-dev.9", false),
+            ("0.4.0-rc.1", "0.4.0", true),
+            ("0.4.0", "0.4.0-rc.10", false),
+            ("0.4.0", "0.4.0", false),
+            ("0.4.0-dev.5", "0.4.0-dev.5", false),
+            ("0.4.1-dev.1", "0.4.0", false),
+            ("0.4.0", "0.4.1-dev.1", true),
+            ("0.4.0+build.1", "0.4.0+build.2", false),
+            ("0.4.0-dev.5+build.1", "0.4.0-dev.5+build.2", false),
+        ] {
+            let fixture = fixture(current, TARGET, version, PAYLOAD, SIGNATURE).await;
+            let update = fixture.updater.check().await.unwrap();
+            assert_eq!(
+                update.as_ref().map(|update| update.version.as_str()),
+                available.then_some(version),
+                "{current} -> {version}"
+            );
         }
     }
 
@@ -561,7 +618,14 @@ mod tests {
 
     #[tokio::test]
     async fn plugin_verifies_exact_bytes_before_native_stage_accepts_them() {
-        let fixture = fixture(TARGET, "9.9.9", PAYLOAD, SIGNATURE).await;
+        let fixture = fixture(
+            env!("CARGO_PKG_VERSION"),
+            TARGET,
+            "9.9.9",
+            PAYLOAD,
+            SIGNATURE,
+        )
+        .await;
         let update = fixture.updater.check().await.unwrap().unwrap();
         let (service, attempt) = download_service("9.9.9");
         let package = download_verified(update, &service, attempt).await.unwrap();
@@ -580,7 +644,14 @@ mod tests {
             (PAYLOAD, "invalid-signature"),
             (b"tampered".as_slice(), SIGNATURE),
         ] {
-            let fixture = fixture(TARGET, "9.9.9", payload, signature).await;
+            let fixture = fixture(
+                env!("CARGO_PKG_VERSION"),
+                TARGET,
+                "9.9.9",
+                payload,
+                signature,
+            )
+            .await;
             let update = fixture.updater.check().await.unwrap().unwrap();
             let (service, attempt) = download_service("9.9.9");
             let guard = AttemptGuard::new(service.clone(), attempt);
@@ -595,7 +666,14 @@ mod tests {
 
     #[tokio::test]
     async fn valid_signature_cannot_be_relabelled_as_a_different_version() {
-        let fixture = fixture(TARGET, "99.0.0", PAYLOAD, SIGNATURE).await;
+        let fixture = fixture(
+            env!("CARGO_PKG_VERSION"),
+            TARGET,
+            "99.0.0",
+            PAYLOAD,
+            SIGNATURE,
+        )
+        .await;
         let update = fixture.updater.check().await.unwrap().unwrap();
         let (service, attempt) = download_service("99.0.0");
         assert!(download_verified(update, &service, attempt).await.is_err());
@@ -604,7 +682,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_release_for_another_platform_is_not_an_available_update() {
-        let fixture = fixture("axial-rewrite-other-platform", "9.9.9", PAYLOAD, SIGNATURE).await;
+        let fixture = fixture(
+            env!("CARGO_PKG_VERSION"),
+            "axial-rewrite-other-platform",
+            "9.9.9",
+            PAYLOAD,
+            SIGNATURE,
+        )
+        .await;
         assert!(matches!(
             fixture.updater.check().await,
             Err(tauri_plugin_updater::Error::TargetNotFound(_))
@@ -613,7 +698,14 @@ mod tests {
 
     #[tokio::test]
     async fn release_notes_preserve_only_a_valid_https_entrypoint() {
-        let fixture = fixture(TARGET, "9.9.9", PAYLOAD, SIGNATURE).await;
+        let fixture = fixture(
+            env!("CARGO_PKG_VERSION"),
+            TARGET,
+            "9.9.9",
+            PAYLOAD,
+            SIGNATURE,
+        )
+        .await;
         let mut update = fixture.updater.check().await.unwrap().unwrap();
         update.download_url = "https://example.invalid/rewrite/package".parse().unwrap();
         assert!(validate_release(&update, TARGET).is_ok());
@@ -633,7 +725,14 @@ mod tests {
 
     #[tokio::test]
     async fn stale_verified_completion_cannot_replace_a_newer_download() {
-        let fixture = fixture(TARGET, "9.9.9", PAYLOAD, SIGNATURE).await;
+        let fixture = fixture(
+            env!("CARGO_PKG_VERSION"),
+            TARGET,
+            "9.9.9",
+            PAYLOAD,
+            SIGNATURE,
+        )
+        .await;
         let update = fixture.updater.check().await.unwrap().unwrap();
         let (service, first) = download_service("9.9.9");
         let package = download_verified(update, &service, first).await.unwrap();
@@ -652,7 +751,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_rejection_before_installation_releases_the_shutdown_fence() {
-        let fixture = fixture(TARGET, "9.9.9", PAYLOAD, SIGNATURE).await;
+        let fixture = fixture(
+            env!("CARGO_PKG_VERSION"),
+            TARGET,
+            "9.9.9",
+            PAYLOAD,
+            SIGNATURE,
+        )
+        .await;
         let update = fixture.updater.check().await.unwrap().unwrap();
         let (service, attempt) = download_service("9.9.9");
         let package = download_verified(update, &service, attempt).await.unwrap();

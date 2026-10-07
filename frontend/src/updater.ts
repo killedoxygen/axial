@@ -1,4 +1,4 @@
-import { signal } from '@preact/signals';
+import { batch, signal } from '@preact/signals';
 import { local, saveLocalState, canEditPreferences } from './state';
 import { api, isApiError } from './api';
 import { toast } from './toast';
@@ -201,14 +201,14 @@ function announceUpdateFlowTransition(previous: UpdateFlowState, next: UpdateFlo
   }
 }
 
-function setUpdateFlow(next: UpdateFlowState): void {
+function setUpdateFlow(next: UpdateFlowState, applyOnReady = true): void {
   const previous = updateFlow.value;
   updateFlow.value = next;
   announceUpdateFlowTransition(previous, next);
   if (next.phase === 'failed') autoApplyOnReady = false;
   if (previous.phase !== 'ready' && next.phase === 'ready') {
     Sound.ui('affirm');
-    if (autoApplyOnReady) {
+    if (autoApplyOnReady && applyOnReady) {
       autoApplyOnReady = false;
       if (restartBlockedByActivity()) {
         toast(`Update ${displayVersion(next.version)} ready. It installs once downloads and games finish.`);
@@ -415,10 +415,50 @@ async function runAutoUpdateCheck(): Promise<void> {
   if (!updaterSurfaceAvailable()) return;
   if (
     bootstrapState.value !== 'ready' ||
+    pendingCheck ||
+    pendingUpdateRequest ||
+    updateFlowPollActive(updateFlow.value.phase)
+  ) {
+    queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);
+    return;
+  }
+  const checkSequence = pendingCheckSeq;
+  const requestSequence = updateRequestSequence;
+  const flowRevision = updateFlow.value.revision;
+  try {
+    const snapshot = dtoRecord(await api('GET', '/update/snapshot'), 'Update snapshot');
+    const flow = updateFlowFromResponse(snapshot.flow);
+    const info = snapshot.info === null ? null : updateInfoResponse(snapshot.info);
+    const canCheck = dtoBoolean(dtoRecord(snapshot.flow, 'Update flow').can_check, 'Update check availability');
+    if (
+      checkSequence !== pendingCheckSeq ||
+      requestSequence !== updateRequestSequence ||
+      flowRevision !== updateFlow.value.revision ||
+      flow.revision < flowRevision ||
+      pendingCheck ||
+      pendingUpdateRequest
+    ) {
+      queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);
+      return;
+    }
+    batch(() => {
+      updateInfo.value = info;
+      if (info) updateCheckState.value = 'ready';
+      setUpdateFlow(flow, false);
+    });
+    if (updateFlowPollActive(flow.phase)) scheduleUpdateFlowPoll();
+    if (!canCheck) {
+      queueAutoUpdateCheck(AUTO_CHECK_INTERVAL_MS);
+      return;
+    }
+  } catch {
+    queueAutoUpdateCheck(nextFailedAutoCheckDelay());
+    return;
+  }
+  if (
     activeDownload.value !== null ||
     downloadQueue.value.view_model.queued_count > 0 ||
-    launchState.value.status !== 'idle' ||
-    updateFlowPollActive(updateFlow.value.phase)
+    launchState.value.status !== 'idle'
   ) {
     queueAutoUpdateCheck(AUTO_CHECK_RETRY_MS);
     return;

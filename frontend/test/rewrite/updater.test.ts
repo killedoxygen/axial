@@ -4,8 +4,10 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
+import { mockApi } from '../../src/mock/api';
 import type { UpdateFlowState, UpdateInfo } from '../../src/types-update';
 import type { UpdateFlow } from '../../src/generated/UpdateFlow';
+import type { UpdateSnapshot } from '../../src/generated/UpdateSnapshot';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
@@ -32,7 +34,7 @@ function source<T>(path: string, imports: Record<string, unknown> = {}, globals:
       exports,
       Error,
       require(id: string): unknown {
-        if (id === '@preact/signals') return { signal };
+        if (id === '@preact/signals') return { signal, batch: (action: () => unknown) => action() };
         if (id === 'preact/jsx-runtime') return jsx;
         if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
         throw new Error(`Unreviewed updater test dependency: ${id}`);
@@ -81,7 +83,7 @@ function info(): UpdateInfo {
   };
 }
 
-function harness() {
+function harness(mockRequest?: typeof mockApi) {
   let nextTimer = 0;
   let restarts = 0;
   let saved = 0;
@@ -120,6 +122,7 @@ function harness() {
       './api': {
         api: async (method: string, path: string, body?: unknown) => {
           calls.push({ method, path, body });
+          if (mockRequest) return mockRequest(method, path, body);
           assert.ok(responses.has(path), `Unexpected update request ${path}`);
           const response = responses.get(path);
           if (response instanceof Error) throw response;
@@ -129,7 +132,7 @@ function harness() {
       },
       './toast': { toast: (message: string) => notices.push(message) },
       './native': {
-        hasNativeDesktopRuntime: () => true,
+        hasNativeDesktopRuntime: () => mockRequest === undefined,
         openExternalURL: async () => {},
         requestNativeAppRestart: async () => {
           restarts++;
@@ -144,7 +147,7 @@ function harness() {
       './dto-contract': dto,
     },
     {
-      __AXIAL_MOCK_API__: false,
+      __AXIAL_MOCK_API__: mockRequest !== undefined,
       window: {
         setTimeout(callback: () => void): number {
           const id = ++nextTimer;
@@ -192,6 +195,86 @@ test('force checks retain their query and downloads submit the exact checked ver
   assert.equal(JSON.stringify(h.calls[1].body), '{"version":"1.1.0"}');
   assert.equal(h.updater.updateFlow.value.phase, 'downloading');
   assert.equal(h.timers.size, 1);
+});
+
+test('startup restores a staged update after frontend reload without issuing update commands', async () => {
+  const h = harness();
+  const retained = {
+    info: { ...info(), checksum_url: null },
+    flow: flow('ready'),
+  } satisfies UpdateSnapshot;
+  h.responses.set('/update/snapshot', retained);
+  h.responses.set(
+    '/update',
+    Object.assign(new Error('An update operation is already in progress.'), {
+      name: 'ApiError',
+      status: 409,
+      payload: { code: 'update_busy' },
+    }),
+  );
+
+  h.updater.scheduleAutoUpdateCheck();
+  await h.poll();
+
+  assert.equal(h.updater.updateFlow.value.phase, 'ready');
+  assert.equal(h.updater.updateFlow.value.version, '1.1.0');
+  assert.equal(JSON.stringify(h.store.updateInfo.value), JSON.stringify(retained.info));
+  assert.equal(h.updater.canInstallUpdateInApp(), true);
+  assert.deepEqual(h.calls, [{ method: 'GET', path: '/update/snapshot', body: undefined }]);
+  assert.equal(h.restarts(), 0);
+});
+
+test('mock frontend startup discovers updates through its actual API', async () => {
+  const h = harness(mockApi);
+
+  h.updater.scheduleAutoUpdateCheck();
+  await h.poll();
+
+  assert.equal(h.store.updateCheckState.value, 'ready');
+  assert.equal(h.store.updateInfo.value?.latest_version, '9.9.9');
+  assert.equal(h.updater.updateFlow.value.phase, 'idle');
+  assert.equal(h.updater.canInstallUpdateInApp(), true);
+  assert.deepEqual(
+    h.calls.map(({ method, path }) => ({ method, path })),
+    [
+      { method: 'GET', path: '/update/snapshot' },
+      { method: 'GET', path: '/update' },
+    ],
+  );
+  assert.equal(h.restarts(), 0);
+});
+
+test('a late startup snapshot cannot replace a newer explicit update check', async () => {
+  const h = harness();
+  let finishSnapshot: ((snapshot: UpdateSnapshot) => void) | undefined;
+  h.responses.set(
+    '/update/snapshot',
+    () =>
+      new Promise<UpdateSnapshot>((resolve) => {
+        finishSnapshot = resolve;
+      }),
+  );
+  h.updater.scheduleAutoUpdateCheck();
+  await h.poll();
+  assert.ok(finishSnapshot);
+
+  const newer = { ...info(), latest_version: '1.2.0' };
+  h.responses.set('/update?force=1', newer);
+  await h.updater.checkForUpdates({ force: true });
+  finishSnapshot({ info: { ...info(), checksum_url: null }, flow: flow('ready') });
+  await settle();
+
+  assert.equal(JSON.stringify(h.store.updateInfo.value), JSON.stringify(newer));
+  assert.equal(h.store.updateCheckState.value, 'ready');
+  assert.equal(h.updater.updateFlow.value.phase, 'idle');
+  assert.deepEqual(
+    h.calls.map(({ method, path }) => ({ method, path })),
+    [
+      { method: 'GET', path: '/update/snapshot' },
+      { method: 'GET', path: '/update?force=1' },
+    ],
+  );
+  assert.equal(h.restarts(), 0);
 });
 
 for (const operation of ['download', 'apply'] as const) {
