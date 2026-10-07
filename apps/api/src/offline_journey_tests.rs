@@ -3494,6 +3494,311 @@ async fn real_external_offline_vanilla_install_launch_stop_and_restart() {
     offline_vanilla_journey(true).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
+    use futures_util::FutureExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let temporary =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let profile = temporary.path().join("profile");
+    let provider = Provider::start(false).await;
+    let mut services: Option<DesktopServices> = None;
+    let mut processes = BTreeSet::new();
+    let journey = std::panic::AssertUnwindSafe(async {
+        services = Some(
+            start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+                .await
+                .unwrap(),
+        );
+        let initial = services.as_ref().unwrap();
+        let api = Api::new(initial);
+        api.post(
+            "/api/v1/accounts/offline",
+            json!({"username":PLAYER,"expected_selection_revision":0}),
+        )
+        .await;
+        api.request(
+            reqwest::Method::PUT,
+            "/api/v1/config",
+            Some(json!({
+                "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
+            })),
+        )
+        .await;
+        let install = api
+            .post(
+                "/api/v1/install/queue",
+                json!({"kind":"vanilla","version_id":VERSION}),
+            )
+            .await;
+        let terminal = install_terminal(&api, &install).await;
+        assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+        let install_path = format!(
+            "/api/v1/install/{}/status",
+            install["started_install"]["install_id"].as_str().unwrap()
+        );
+        let created = api
+            .post(
+                "/api/v1/instances",
+                json!({"name":"Missing default runtime","selection_id":format!("vanilla|{VERSION}")}),
+            )
+            .await;
+        assert!(created["install_queue"].is_null(), "{created}");
+        let instance = created["id"].as_str().unwrap();
+        wait_launchable(&api, instance).await;
+        assert_installed(&api, true).await;
+        let queue_before_restart = api.get("/api/v1/install/queue").await;
+        assert_eq!(queue_before_restart["items"], json!([]));
+        let library = initial.library.admit().unwrap().read_projection().unwrap();
+        let record = initial
+            .instances
+            .registry()
+            .get_live(&instance.parse().unwrap())
+            .unwrap();
+        let save = library
+            .join("instances")
+            .join(record.directory_name)
+            .join("saves/user-level.dat");
+        std::fs::create_dir_all(save.parent().unwrap()).unwrap();
+        std::fs::write(&save, b"user-owned save survives runtime provisioning").unwrap();
+        let asset_hash = sha1(ASSET);
+        let protected: Vec<_> = [
+            save,
+            library.join(format!("versions/{VERSION}/{VERSION}.json")),
+            library.join(format!("versions/{VERSION}/{VERSION}.jar")),
+            library.join("libraries/org/axial/fixture/1.0/fixture-1.0.jar"),
+            library.join("assets/log_configs/fixture-log.xml"),
+            library.join("assets/indexes/fixture-assets.json"),
+            library.join(format!("assets/objects/{}/{asset_hash}", &asset_hash[..2])),
+        ]
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+        let runtime = initial.installs.runtime_cache().root().join(COMPONENT);
+        assert!(runtime.starts_with(&profile));
+        assert_eq!(runtime.file_name().unwrap(), COMPONENT);
+        let runtime_files: Vec<_> = [
+            java_relative_path().to_owned(),
+            java_relative_path().replace("/java", "/fake_java.py"),
+            ".axial-runtime-manifest.json".to_owned(),
+            ".axial-ready".to_owned(),
+        ]
+        .into_iter()
+        .map(|relative| {
+            let path = runtime.join(relative);
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+        assert_eq!(runtime_files[0].1, provider.state.routes["GET /java-runtime/java"]);
+        assert_eq!(runtime_files[1].1, provider.state.routes["GET /java-runtime/fake_java.py"]);
+        initial.server.shutdown().await.unwrap();
+        assert!(initial.server.is_shutdown_settled());
+        drop(services.take());
+        assert!(std::fs::symlink_metadata(&runtime).unwrap().is_dir());
+        assert_eq!(std::fs::canonicalize(&runtime).unwrap(), runtime);
+        std::fs::remove_dir_all(&runtime).unwrap();
+        assert!(!runtime.try_exists().unwrap());
+
+        services = Some(
+            start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+                .await
+                .unwrap(),
+        );
+        let reopened = services.as_ref().unwrap();
+        let restarted_api = Api::new(reopened);
+        let queue_before = restarted_api.get("/api/v1/install/queue").await;
+        assert_eq!(queue_before["items"], queue_before_restart["items"]);
+        assert_eq!(queue_before["view_model"], queue_before_restart["view_model"]);
+        assert_ne!(api.capability, restarted_api.capability);
+        assert_eq!(restarted_api.get("/api/v1/config").await["java_path_override"], "");
+        let preflight = format!("/api/v1/launch/preflight/{instance}");
+        let preflight_before = restarted_api.get(&preflight).await;
+        let instance_before = restarted_api.get(&format!("/api/v1/instances/{instance}")).await;
+        assert!(!runtime.try_exists().unwrap());
+        let request_count = provider.state.requests.lock().unwrap().len();
+        let response = restarted_api
+            .client
+            .post(format!("{}/api/v1/launch", restarted_api.base))
+            .header(transport::CAPABILITY_HEADER, &restarted_api.capability)
+            .json(&json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        let mut verify_guards = None;
+        if status.is_success() {
+            let session = body["session_id"].as_str().unwrap();
+            processes.extend(observe_and_stop_session(&restarted_api, session).await);
+            let report = restarted_api.get(&format!("/api/v1/launch/reports/{session}")).await;
+            assert_eq!(report["instance_id"], instance);
+            assert_eq!(report["session_outcome"]["kind"], "stopped");
+            assert_eq!(report["session_outcome"]["reason"], "launcher_stopped");
+            assert!(reopened.installs.runtime_cache().admit_component(COMPONENT)
+                .unwrap().unwrap().contents_verified());
+            for (path, bytes) in &runtime_files {
+                assert_eq!(std::fs::read(path).unwrap(), *bytes);
+            }
+            let requests = provider.state.requests.lock().unwrap();
+            for expected in [
+                "GET /java-runtime/all.json",
+                "GET /java-runtime/component.json",
+                "GET /java-runtime/java",
+                "GET /java-runtime/fake_java.py",
+            ] {
+                assert!(requests[request_count..].iter().any(|request| request == expected),
+                    "Play must reacquire {expected}: {:?}", &requests[request_count..]);
+            }
+            drop(requests);
+            let ready = restarted_api.get(&preflight).await;
+            assert_eq!(ready["status"], "ready", "{ready}");
+            assert_eq!(ready["launchable"], true, "{ready}");
+            assert_installed(&restarted_api, true).await;
+
+            let sessions_before = restarted_api.get("/api/v1/launch/sessions").await;
+            let reports_before = restarted_api.get("/api/v1/launch/reports").await;
+            let requests_before = provider.state.requests.lock().unwrap().clone();
+            let executable = &runtime_files[0].0;
+            let original_java = runtime_files[0].1.clone();
+            let mut changed_java = original_java.clone();
+            changed_java[0] ^= 1;
+            std::fs::write(executable, &changed_java).unwrap();
+            let response = restarted_api.client
+                .post(format!("{}/api/v1/launch", restarted_api.base))
+                .header(transport::CAPABILITY_HEADER, &restarted_api.capability)
+                .json(&json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()}))
+                .send().await.unwrap();
+            let corrupt_status = response.status();
+            let corrupt_body: Value = response.json().await.unwrap();
+            if corrupt_status.is_success() {
+                processes.extend(observe_and_stop_session(
+                    &restarted_api, corrupt_body["session_id"].as_str().unwrap(),
+                ).await);
+            }
+            let java_after_refusal = std::fs::read(executable).unwrap();
+            std::fs::write(executable, &original_java).unwrap();
+            let sessions_after_corruption = restarted_api.get("/api/v1/launch/sessions").await;
+            let reports_after_corruption = restarted_api.get("/api/v1/launch/reports").await;
+
+            let config = restarted_api.get("/api/v1/config").await;
+            restarted_api.request(reqwest::Method::PUT, "/api/v1/config", Some(json!({
+                "expected_revision":config["revision"],"java_path_override":COMPONENT
+            }))).await;
+            let preserved_runtime = temporary.path().join("preserved-runtime");
+            assert!(std::fs::symlink_metadata(&preserved_runtime)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
+            let runtime_before = std::fs::symlink_metadata(&runtime).unwrap();
+            assert!(runtime_before.is_dir());
+            assert_eq!(std::fs::canonicalize(&runtime).unwrap(), runtime);
+            std::fs::rename(&runtime, &preserved_runtime).unwrap();
+            let response = restarted_api.client
+                .post(format!("{}/api/v1/launch", restarted_api.base))
+                .header(transport::CAPABILITY_HEADER, &restarted_api.capability)
+                .json(&json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()}))
+                .send().await.unwrap();
+            let override_status = response.status();
+            let override_body: Value = response.json().await.unwrap();
+            if override_status.is_success() {
+                processes.extend(observe_and_stop_session(
+                    &restarted_api, override_body["session_id"].as_str().unwrap(),
+                ).await);
+            }
+            let runtime_absent = std::fs::symlink_metadata(&runtime)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if runtime_absent {
+                std::fs::rename(&preserved_runtime, &runtime).unwrap();
+            }
+            let runtime_after = std::fs::symlink_metadata(&runtime).unwrap();
+            let current = restarted_api.get("/api/v1/config").await;
+            let restored_config = restarted_api.request(reqwest::Method::PUT, "/api/v1/config", Some(json!({
+                "expected_revision":current["revision"],"java_path_override":config["java_path_override"]
+            }))).await;
+            let sessions_after_override = restarted_api.get("/api/v1/launch/sessions").await;
+            let reports_after_override = restarted_api.get("/api/v1/launch/reports").await;
+            let requests_after = provider.state.requests.lock().unwrap().clone();
+            verify_guards = Some(move || {
+                assert_eq!(requests_after, requests_before, "refused Play must not download");
+                assert_eq!(sessions_after_corruption, sessions_before);
+                assert_eq!(sessions_after_override, sessions_before);
+                assert_eq!(reports_after_corruption, reports_before);
+                assert_eq!(reports_after_override, reports_before);
+                assert_eq!(changed_java.len(), original_java.len());
+                assert_ne!(changed_java, original_java);
+                assert_eq!(java_after_refusal, changed_java, "Play must not repair existing Java");
+                assert!(runtime_absent, "explicit Java selection must not provision a fallback");
+                assert_eq!((runtime_after.dev(), runtime_after.ino()), (runtime_before.dev(), runtime_before.ino()));
+                assert_eq!(current["java_path_override"], COMPONENT);
+                assert_eq!(restored_config["java_path_override"], config["java_path_override"]);
+                for (path, bytes) in runtime_files {
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                }
+                for (status, body, message) in [
+                    (corrupt_status, corrupt_body, "The selected Java executable changed. Select it again."),
+                    (override_status, override_body, "The selected Java executable is missing."),
+                ] {
+                    assert_eq!(status, reqwest::StatusCode::CONFLICT, "{body}");
+                    assert_eq!(body, json!({"code":"runtime_unavailable","error":message}));
+                }
+            });
+        }
+        assert_eq!(restarted_api.get("/api/v1/install/queue").await, queue_before);
+        assert_eq!(restarted_api.get(&install_path).await, terminal);
+        provider.assert_requests(false);
+        (status, body, preflight_before, instance_before, protected, verify_guards)
+    })
+    .catch_unwind()
+    .await;
+    let shutdown = match &services {
+        Some(services) => {
+            std::panic::AssertUnwindSafe(services.server.shutdown())
+                .catch_unwind()
+                .await
+        }
+        None => Ok(Ok(())),
+    };
+    let settled = services
+        .as_ref()
+        .is_none_or(|services| services.server.is_shutdown_settled());
+    drop(services);
+    let provider_shutdown = std::panic::AssertUnwindSafe(provider.shutdown())
+        .catch_unwind()
+        .await;
+    let absent = std::panic::AssertUnwindSafe(assert_fixture_processes_gone(&processes))
+        .catch_unwind()
+        .await;
+    let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        shutdown
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .unwrap();
+        assert!(settled);
+        provider_shutdown.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        absent.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let (status, body, preflight_before, instance_before, protected, verify_guards) =
+            journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        for (path, bytes) in protected {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert!(
+            status.is_success(),
+            "ordinary Play must reacquire missing default Java: {status}: {body}; preflight={preflight_before}; launch_action={}",
+            instance_before["launch_action"]
+        );
+        verify_guards.expect("successful Play must exercise refusal guards")();
+    }));
+    if let Err(panic) = verified {
+        eprintln!(
+            "Retained missing-runtime fixture after failure: {}",
+            temporary.keep().display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
 async fn offline_vanilla_journey(existing: bool) {
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();

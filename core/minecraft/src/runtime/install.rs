@@ -67,6 +67,12 @@ pub(crate) struct StagedManagedRuntime {
     stage: OwnedRuntimeStage,
     source: Option<RuntimeSourceReceipt>,
     publication_lease: Option<ManagedRuntimePublicationLease>,
+    replace_existing: bool,
+}
+
+pub(super) enum MissingRuntimePreparation {
+    Ready(ManagedRuntimeCommitReceipt),
+    Staged(StagedManagedRuntime),
 }
 
 struct ManagedRuntimePublicationLease {
@@ -565,7 +571,7 @@ pub(super) async fn stage_managed_runtime_until_cancelled(
     }
     let download_concurrency = runtime_file_download_concurrency();
     let admission = validate_managed_runtime_source(&source, download_concurrency)?;
-    let install_root = cache.component_root(component.as_str()).ok_or_else(|| {
+    cache.component_root(component.as_str()).ok_or_else(|| {
         JavaRuntimeLookupError::Install(
             "runtime component is outside the managed cache vocabulary".to_string(),
         )
@@ -576,6 +582,109 @@ pub(super) async fn stage_managed_runtime_until_cancelled(
     else {
         return Ok(None);
     };
+    stage_with_publication_lease(
+        cache,
+        component,
+        source,
+        observer,
+        cancellation,
+        publication_lease,
+        admission,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn prepare_missing_runtime_until_cancelled(
+    cache: &ManagedRuntimeCache,
+    component: &RuntimeId,
+    source: RuntimeSourceReceipt,
+    observer: &mut impl FnMut(RuntimeEnsureEvent),
+    cancellation: &mut RuntimeCancellation,
+) -> Result<Option<MissingRuntimePreparation>, JavaRuntimeLookupError> {
+    if source.component() != component {
+        return Err(JavaRuntimeLookupError::ManagedMutationRefused);
+    }
+    let admission = validate_managed_runtime_source(&source, runtime_file_download_concurrency())?;
+    let Some(publication_lease) =
+        acquire_managed_runtime_publication_lease_until_cancelled(cache, component, cancellation)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let root = cache
+        .authority()
+        .map_err(|_| JavaRuntimeLookupError::ManagedMutationRefused)?;
+    for suffix in ["staging", "quarantine"] {
+        if root
+            .open_child_if_exists(&runtime_sidecar_name(component.as_str(), suffix))
+            .map_err(|_| JavaRuntimeLookupError::ManagedMutationRefused)?
+            .is_some()
+        {
+            return Err(JavaRuntimeLookupError::ManagedMutationRefused);
+        }
+    }
+    if let Some(canonical) = root
+        .open_child_if_exists(component.as_str())
+        .map_err(|_| JavaRuntimeLookupError::ManagedMutationRefused)?
+    {
+        let install_root = cache
+            .component_root(component.as_str())
+            .ok_or(JavaRuntimeLookupError::ManagedMutationRefused)?;
+        let matches = runtime_tree_matches_source_until_cancelled(
+            &canonical,
+            &install_root,
+            &source,
+            RuntimeTreeVerificationReason::CanonicalReuse,
+            cancellation,
+        )
+        .await;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if !matches {
+            return Err(JavaRuntimeLookupError::ManagedMutationRefused);
+        }
+        return Ok(Some(MissingRuntimePreparation::Ready(
+            ManagedRuntimeCommitReceipt {
+                cache: cache.clone(),
+                component: component.clone(),
+                source: Some(source),
+                quarantine: None,
+                _publication_lease: publication_lease,
+            },
+        )));
+    }
+    observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
+        component: component.as_str().to_owned(),
+    });
+    stage_with_publication_lease(
+        cache,
+        component,
+        source,
+        observer,
+        cancellation,
+        publication_lease,
+        admission,
+        false,
+    )
+    .await
+    .map(|stage| stage.map(MissingRuntimePreparation::Staged))
+}
+
+async fn stage_with_publication_lease(
+    cache: &ManagedRuntimeCache,
+    component: &RuntimeId,
+    source: RuntimeSourceReceipt,
+    observer: &mut impl FnMut(RuntimeEnsureEvent),
+    cancellation: &mut RuntimeCancellation,
+    publication_lease: ManagedRuntimePublicationLease,
+    admission: RuntimeManifestAdmission,
+    replace_existing: bool,
+) -> Result<Option<StagedManagedRuntime>, JavaRuntimeLookupError> {
+    let install_root = cache
+        .component_root(component.as_str())
+        .ok_or(JavaRuntimeLookupError::ManagedMutationRefused)?;
     let cache_root = cache
         .authority()
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
@@ -584,7 +693,23 @@ pub(super) async fn stage_managed_runtime_until_cancelled(
     if cancellation.is_cancelled() {
         return Ok(None);
     }
-    remove_runtime_child_if_present(&cache_root, &staging_name)?;
+    if replace_existing {
+        remove_runtime_child_if_present(&cache_root, &staging_name)?;
+    } else {
+        for name in [
+            component.as_str(),
+            &staging_name,
+            &runtime_sidecar_name(component.as_str(), "quarantine"),
+        ] {
+            if cache_root
+                .open_child_if_exists(name)
+                .map_err(|_| JavaRuntimeLookupError::ManagedMutationRefused)?
+                .is_some()
+            {
+                return Err(JavaRuntimeLookupError::ManagedMutationRefused);
+            }
+        }
+    }
     if cancellation.is_cancelled() {
         return Ok(None);
     }
@@ -642,6 +767,7 @@ pub(super) async fn stage_managed_runtime_until_cancelled(
         stage,
         source: Some(source),
         publication_lease: Some(publication_lease),
+        replace_existing,
     }))
 }
 
@@ -817,6 +943,11 @@ async fn publish_staged_managed_runtime_inner(
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let mut publication_effect_started = false;
 
+    if !staged.replace_existing && quarantine.is_some() {
+        let _ = staged.stage.cleanup().await;
+        return Err(JavaRuntimeLookupError::ManagedMutationRefused.into());
+    }
+
     if let Some(retained) = canonical.as_ref()
         && runtime_tree_matches_source(
             retained,
@@ -836,6 +967,11 @@ async fn publish_staged_managed_runtime_inner(
             source,
             quarantine.is_some(),
         ));
+    }
+
+    if !staged.replace_existing && canonical.is_some() {
+        let _ = staged.stage.cleanup().await;
+        return Err(JavaRuntimeLookupError::ManagedMutationRefused.into());
     }
 
     if canonical.is_none()
@@ -969,7 +1105,8 @@ async fn publish_staged_managed_runtime_inner(
             }
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
-                publication_effect_started,
+                publication_effect_started
+                    || promotion_error == ManagedDirectoryMoveFailure::MoveAttempted,
                 source,
                 JavaRuntimeLookupError::Install(format!("{promotion_error:?}")),
             ));
@@ -1097,11 +1234,12 @@ fn classify_managed_runtime_publish_failure(
         component: staged.component.clone(),
         source: Some(Box::new(source)),
         cause,
-        quarantine: observe_runtime_child(
-            &staged.cache,
-            &runtime_sidecar_name(staged.component.as_str(), "quarantine"),
-        )
-        .retains_obligation()
+        quarantine: (staged.replace_existing
+            && observe_runtime_child(
+                &staged.cache,
+                &runtime_sidecar_name(staged.component.as_str(), "quarantine"),
+            )
+            .retains_obligation())
         .then(|| ManagedRuntimeQuarantineObligation {
             cache: staged.cache.clone(),
             component: staged.component.clone(),

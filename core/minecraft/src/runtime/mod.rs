@@ -32,8 +32,8 @@ pub use ensure::{
 pub(crate) use ensure::{ProcessorRuntime, materialize_ephemeral_processor_runtime};
 pub use ensure::{
     RuntimeMaterializationCancelHandle, RuntimeMaterializationCancellation,
-    RuntimeMaterializationTaskControl, materialize_preferred_runtime_source,
-    runtime_materialization_control,
+    RuntimeMaterializationTaskControl, materialize_missing_runtime_source,
+    materialize_preferred_runtime_source, runtime_materialization_control,
 };
 #[cfg(test)]
 pub(crate) use ensure::{
@@ -116,7 +116,7 @@ pub async fn acquire_preferred_runtime_source(
 }
 
 #[cfg(feature = "test-support")]
-pub(crate) async fn acquire_preferred_runtime_source_at_test_endpoint(
+pub async fn acquire_preferred_runtime_source_at_test_endpoint(
     java_version: &crate::launch::JavaVersion,
     endpoints: &crate::download::InstallTestEndpoints,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {

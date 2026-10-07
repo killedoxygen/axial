@@ -677,6 +677,11 @@ async fn start_profile_inner(
                         .with_telemetry(telemetry.clone()),
                 );
                 let runtimes = RuntimeDiscovery::new(runtime_cache.clone(), tasks.clone());
+                #[cfg(test)]
+                let runtimes = match test_endpoints.as_ref() {
+                    Some(endpoints) => runtimes.with_test_endpoints(endpoints.clone()),
+                    None => runtimes,
+                };
                 let installs = InstallQueue::new(
                     metadata.clone(),
                     library.clone(),

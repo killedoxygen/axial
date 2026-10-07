@@ -5,15 +5,16 @@ use super::{
     ManagedRuntimeCache, ManagedRuntimeComponent, ManagedRuntimeRebuildError,
     RosettaRuntimeDecision, RuntimeDownloadActual, RuntimeDownloadEvidence,
     RuntimeDownloadIntegrityError, RuntimeDownloadManifest, RuntimeEnsureEvent, RuntimeId,
-    RuntimeInstallState, RuntimeManifest, RuntimeRecord, RuntimeSource, RuntimeSourceFailure,
-    RuntimeSourceFailureKind, RuntimeSourceReceipt, acquire_runtime_source_for_test,
-    authenticated_runtime_source_from_manifest_for_test, block_runtime_decompression_for_test,
+    RuntimeInstallState, RuntimeManifest, RuntimeMaterializationCancellation, RuntimeRecord,
+    RuntimeSource, RuntimeSourceFailure, RuntimeSourceFailureKind, RuntimeSourceReceipt,
+    acquire_runtime_source_for_test, authenticated_runtime_source_from_manifest_for_test,
+    block_runtime_before_publication_claim_for_test, block_runtime_decompression_for_test,
     component_manifest_destination, component_manifest_proof_bytes, detect_distribution,
     detect_runtime_state, discard_staged_managed_runtime, ensure_runtime_with_events,
     fetch_runtime_manifest_bytes_for_test, install_runtime_manifest_file,
     install_runtime_manifest_files, java_executable, java_executable_for_os,
-    materialize_preferred_runtime_source, parse_mach_o_arm64_compatibility,
-    plan_runtime_manifest_files, publish_staged_managed_runtime,
+    materialize_missing_runtime_source, materialize_preferred_runtime_source,
+    parse_mach_o_arm64_compatibility, plan_runtime_manifest_files, publish_staged_managed_runtime,
     publish_staged_managed_runtime_and_finalize,
     publish_staged_managed_runtime_with_displacement_failure_for_test,
     publish_staged_managed_runtime_with_finalization_failure_for_test,
@@ -780,6 +781,207 @@ async fn ready_managed_runtime_matches_the_full_authenticated_source() {
     fs::write(java_executable(&root), b"tampered java").expect("tamper runtime file");
     make_executable(&java_executable(&root));
     assert!(!runtime_record_matches_source_for_test(&cache, &runtime, &source).await);
+}
+
+#[tokio::test]
+async fn missing_runtime_source_preserves_canonical_and_sidecar_conflicts() {
+    for conflict in ["canonical", "staging", "quarantine"] {
+        let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        let component = RuntimeId::from("jre-legacy");
+        let root = cache.component_root(component.as_str()).unwrap();
+        let source = runtime_source_receipt_fixture(&component, &root, b"original java").await;
+        let repeated = authenticated_runtime_source_from_manifest_for_test(
+            component.clone(),
+            source.manifest().clone(),
+        )
+        .expect("same authenticated source");
+        assert_eq!(source.bytes(), repeated.bytes());
+        let java_version = JavaVersion {
+            component: component.as_str().to_string(),
+            major_version: 8,
+        };
+        let (_cancel, mut control) = runtime_materialization_control();
+        let receipt = materialize_missing_runtime_source(
+            &cache,
+            &java_version,
+            source,
+            &mut |_| {},
+            &mut control,
+        )
+        .await
+        .expect("initial runtime publication")
+        .expect("published runtime receipt");
+        assert!(receipt.revalidate(&cache, &component).await);
+        drop(receipt);
+
+        let preserved = if conflict == "canonical" {
+            java_executable(&root)
+        } else {
+            let sidecar = root.with_file_name(format!("jre-legacy.{conflict}"));
+            fs::create_dir(&sidecar).unwrap();
+            sidecar.join("unknown")
+        };
+        fs::write(&preserved, b"foreign bytes").unwrap();
+        let (_cancel, mut control) = runtime_materialization_control();
+        let result = materialize_missing_runtime_source(
+            &cache,
+            &java_version,
+            repeated,
+            &mut |_| {},
+            &mut control,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ManagedRuntimeRebuildError::Preparation(
+                JavaRuntimeLookupError::ManagedMutationRefused
+            ))
+        ));
+        assert_eq!(fs::read(&preserved).unwrap(), b"foreign bytes");
+        assert_eq!(
+            fs::read(java_executable(&root)).unwrap(),
+            if conflict == "canonical" {
+                &b"foreign bytes"[..]
+            } else {
+                &b"original java"[..]
+            }
+        );
+        for suffix in ["staging", "quarantine"] {
+            assert_eq!(
+                root.with_file_name(format!("jre-legacy.{suffix}")).exists(),
+                conflict == suffix
+            );
+        }
+        assert_eq!(
+            admit_runtime_component(&cache, component.as_str()).contents_verified(),
+            conflict != "canonical"
+        );
+        assert!(runtime_publication_lock_available_for_test(
+            &cache, &component
+        ));
+        cache.settle().expect("refusal leaves no owned effects");
+    }
+}
+
+#[tokio::test]
+async fn missing_runtime_source_concurrent_producers_publish_once_and_reuse() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache.component_root(component.as_str()).unwrap();
+    let source = runtime_source_receipt_fixture(&component, &root, b"concurrent java").await;
+    let repeated = authenticated_runtime_source_from_manifest_for_test(
+        component.clone(),
+        source.manifest().clone(),
+    )
+    .expect("same authenticated source");
+    assert_eq!(source.bytes(), repeated.bytes());
+    let java_version = JavaVersion {
+        component: component.as_str().to_string(),
+        major_version: 8,
+    };
+    let produce = |source| {
+        let (cache, component, java_version) = (&cache, &component, &java_version);
+        async move {
+            let (_cancel, mut control) = runtime_materialization_control();
+            let mut downloads = 0;
+            let receipt = materialize_missing_runtime_source(
+                cache,
+                java_version,
+                source,
+                &mut |event| {
+                    if matches!(event, RuntimeEnsureEvent::DownloadingManagedRuntime { .. }) {
+                        downloads += 1;
+                    }
+                },
+                &mut control,
+            )
+            .await
+            .expect("concurrent runtime materialization")
+            .expect("published or reused receipt");
+            let valid = receipt.revalidate(cache, component).await;
+            drop(receipt);
+            (valid, downloads)
+        }
+    };
+    let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(produce(source), produce(repeated))
+    })
+    .await
+    .expect("both producers settle");
+
+    assert!(first.0 && second.0);
+    assert_eq!(first.1 + second.1, 1);
+    assert_eq!(
+        fs::read(java_executable(&root)).unwrap(),
+        b"concurrent java"
+    );
+    assert!(admit_runtime_component(&cache, component.as_str()).contents_verified());
+    assert!(!root.with_file_name("jre-legacy.staging").exists());
+    assert!(!root.with_file_name("jre-legacy.quarantine").exists());
+    assert!(runtime_publication_lock_available_for_test(
+        &cache, &component
+    ));
+    cache
+        .settle()
+        .expect("both producers released owned effects");
+}
+
+#[tokio::test]
+async fn missing_runtime_source_cancellation_before_publication_cleans_only_owned_stage() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache.component_root(component.as_str()).unwrap();
+    let source = runtime_source_receipt_fixture(&component, &root, b"cancelled java").await;
+    let unrelated = cache.root().join("unrelated");
+    fs::write(&unrelated, b"preserve").unwrap();
+    let mut gate = block_runtime_before_publication_claim_for_test(&root);
+    let (cancel, mut control) = runtime_materialization_control();
+    let task_cache = cache.clone();
+    let task = tokio::spawn(async move {
+        materialize_missing_runtime_source(
+            &task_cache,
+            &JavaVersion {
+                component: "jre-legacy".into(),
+                major_version: 8,
+            },
+            source,
+            &mut |_| {},
+            &mut control,
+        )
+        .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        gate.wait_until_reached(),
+    )
+    .await
+    .expect("actual stage reaches publication claim");
+    let staging = root.with_file_name("jre-legacy.staging");
+    let staged_bytes = fs::read(java_executable(&staging));
+    let held = !runtime_publication_lock_available_for_test(&cache, &component);
+    let cancellation = cancel.cancel_before_publication();
+    gate.release();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), task)
+        .await
+        .expect("cancelled producer drains")
+        .expect("producer joins")
+        .expect("owned stage cleanup settles");
+
+    assert_eq!(staged_bytes.unwrap(), b"cancelled java");
+    assert!(held);
+    assert_eq!(cancellation, RuntimeMaterializationCancellation::Cancelled);
+    assert!(result.is_none());
+    assert!(cache.admit_component(component.as_str()).unwrap().is_none());
+    assert!(!root.exists());
+    assert!(!staging.exists());
+    assert!(!root.with_file_name("jre-legacy.quarantine").exists());
+    assert_eq!(fs::read(unrelated).unwrap(), b"preserve");
+    assert!(runtime_publication_lock_available_for_test(
+        &cache, &component
+    ));
+    cache
+        .settle()
+        .expect("cancelled producer released owned effects");
 }
 
 #[tokio::test]

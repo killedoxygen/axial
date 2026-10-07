@@ -121,6 +121,12 @@ pub enum JavaDiscoveryError {
     RosettaRequired,
     #[error("The managed Java runtime is not ready.")]
     ManagedNotReady,
+    #[error("Managed Java runtime acquisition failed: {}.", .0.as_str())]
+    ManagedSource(axial_minecraft::runtime::RuntimeSourceFailureKind),
+    #[error("The managed Java runtime is unavailable for this platform.")]
+    ManagedUnsupportedPlatform,
+    #[error("Managed Java runtime file changes have not settled.")]
+    ManagedSettlementRequired,
     #[error("The Java runtime library is unavailable.")]
     LibraryUnavailable,
     #[error("The Java probe process has not finished shutting down.")]

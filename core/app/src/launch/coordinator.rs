@@ -998,7 +998,7 @@ impl LaunchCoordinator {
         );
         let runtime = self
             .runtimes
-            .select(&required, &effective.java_path, cancellation)
+            .prepare_for_launch(&required, &effective.java_path, cancellation)
             .await
             .map_err(LaunchError::RuntimeFailure)?;
         if cancellation.is_cancelled() {

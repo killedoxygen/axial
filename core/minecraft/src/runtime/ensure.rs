@@ -12,11 +12,12 @@ use super::discovery::{
 };
 use super::install::{
     CachedManagedRuntimeVerification, ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError,
-    RuntimeTreeVerificationReason, discard_staged_managed_runtime,
+    MissingRuntimePreparation, RuntimeTreeVerificationReason, discard_staged_managed_runtime,
     ephemeral_processor_filesystem_failure, install_ephemeral_processor_runtime,
-    publish_staged_managed_runtime, publish_staged_managed_runtime_and_finalize,
-    stage_managed_runtime, stage_managed_runtime_until_cancelled,
-    trace_ephemeral_processor_runtime_failure, verify_cached_managed_runtime_until_cancelled,
+    prepare_missing_runtime_until_cancelled, publish_staged_managed_runtime,
+    publish_staged_managed_runtime_and_finalize, stage_managed_runtime,
+    stage_managed_runtime_until_cancelled, trace_ephemeral_processor_runtime_failure,
+    verify_cached_managed_runtime_until_cancelled,
 };
 use super::layout::{ManagedRuntimeCache, runtime_os_arch};
 use super::manifest::{RuntimeSourceReceipt, acquire_runtime_source};
@@ -553,6 +554,53 @@ fn admit_processor_program(
         .validate_absolute_projection(root)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     Ok(guard)
+}
+
+pub async fn materialize_missing_runtime_source<F>(
+    cache: &ManagedRuntimeCache,
+    java_version: &JavaVersion,
+    source: RuntimeSourceReceipt,
+    observer: &mut F,
+    control: &mut RuntimeMaterializationTaskControl,
+) -> Result<Option<ManagedRuntimeCommitReceipt>, ManagedRuntimeRebuildError>
+where
+    F: FnMut(RuntimeEnsureEvent),
+{
+    let component = RuntimeId::from(preferred_runtime_component(java_version));
+    if source.component() != &component || !is_known_runtime_component(component.as_str()) {
+        return Err(JavaRuntimeLookupError::ManagedMutationRefused.into());
+    }
+    let prepared = prepare_missing_runtime_until_cancelled(
+        cache,
+        &component,
+        source,
+        observer,
+        control.cancellation(),
+    )
+    .await?;
+    let receipt = match prepared {
+        None => return Ok(None),
+        Some(MissingRuntimePreparation::Ready(receipt)) => receipt,
+        Some(MissingRuntimePreparation::Staged(staged)) => {
+            #[cfg(test)]
+            wait_for_runtime_test_hook(
+                RuntimeTestHookPoint::BeforePublicationClaim,
+                &cache
+                    .component_root(component.as_str())
+                    .expect("admitted runtime root"),
+            )
+            .await;
+            if !control.claim_publication_settlement() {
+                discard_staged_managed_runtime(staged).await?;
+                return Ok(None);
+            }
+            publish_staged_managed_runtime_and_finalize(staged).await?
+        }
+    };
+    observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+        component: component.as_str().to_owned(),
+    });
+    Ok(Some(receipt))
 }
 
 pub async fn materialize_preferred_runtime_source<F>(
