@@ -4504,6 +4504,8 @@ struct CapabilityAuthority {
     #[cfg(test)]
     successful_entries: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
+    ancestry_steps: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     directory_open_pause: Mutex<Option<DirectoryOpenReservationPause>>,
     #[cfg(test)]
     file_observation_pause: Mutex<Option<FileObservationPause>>,
@@ -9735,6 +9737,10 @@ impl Directory {
     fn validate_for_authority(&self, authority: &Arc<CapabilityAuthority>) -> io::Result<()> {
         let mut current = self.inner.as_ref();
         loop {
+            #[cfg(test)]
+            authority
+                .ancestry_steps
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if current.authority.as_ptr() != Arc::as_ptr(authority) {
                 return Err(stale_capability());
             }
@@ -10720,10 +10726,12 @@ impl Directory {
     pub fn open_file(&self, name: &LeafName) -> io::Result<FileCapability> {
         let authority = self.authority()?;
         let operation = authority.enter()?;
-        self.open_file_in(name, &operation)
+        let file = self.open_file_unvalidated_in(name, &operation)?;
+        file.validate(&operation)?;
+        Ok(file)
     }
 
-    fn open_file_in(
+    fn open_file_unvalidated_in(
         &self,
         name: &LeafName,
         operation: &CapabilityOperation,
@@ -10735,15 +10743,13 @@ impl Directory {
         authority.ensure_leaf_not_transient_reserved(operation, self, name)?;
         let handle = platform::open_file(&self.inner.handle, name.as_os_str())?;
         let identity = platform::file_identity(&handle)?;
-        let file = FileCapability::new(
+        Ok(FileCapability::new(
             handle,
             identity,
             self.clone(),
             name.clone(),
             self.inner.authority.clone(),
-        );
-        file.validate(operation)?;
-        Ok(file)
+        ))
     }
 
     /// Reobserve the exact leaf against original evidence without retaining a file.
@@ -10754,7 +10760,7 @@ impl Directory {
     ) -> io::Result<()> {
         let authority = self.authority()?;
         let operation = authority.enter()?;
-        let file = self.open_file_in(name, &operation)?;
+        let file = self.open_file_unvalidated_in(name, &operation)?;
         #[cfg(test)]
         authority.pause_file_observation_after_open(self, name)?;
         // Retaining admission does not freeze externally replaceable root bindings.
@@ -14515,6 +14521,8 @@ fn finish_root_session_with_recovery(
         authority: Arc::new(CapabilityAuthority {
             #[cfg(test)]
             successful_entries: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            ancestry_steps: std::sync::atomic::AtomicUsize::new(0),
             operations: Mutex::new(OperationState {
                 phase: AUTHORITY_LIVE,
                 root_identity: identity,
@@ -23634,25 +23642,33 @@ mod tests {
     }
 
     #[test]
-    fn file_revision_observation_uses_one_owned_admission() {
+    fn file_revision_observation_bounds_admission_and_ancestry_work() {
         use std::sync::atomic::Ordering;
 
         let temporary = crate::test_tempdir().expect("temporary root");
-        std::fs::write(temporary.path().join("sample.bin"), b"sample").unwrap();
+        let parent = temporary.path().join("assets/objects/aa");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("sample.bin"), b"sample").unwrap();
         let session = acquire_test_root(temporary.path());
-        let root = session.root().unwrap();
+        let mut root = session.root().unwrap();
+        for name in ["assets", "objects", "aa"] {
+            root = root.open_directory(&LeafName::new(name).unwrap()).unwrap();
+        }
         let name = LeafName::new("sample.bin").unwrap();
         let file = root.open_file(&name).unwrap();
         let expected = file.revision().unwrap().observation();
         let authority = root.authority().unwrap();
         authority.successful_entries.store(0, Ordering::Relaxed);
+        authority.ancestry_steps.store(0, Ordering::Relaxed);
         root.validate_file_revision_observation(&name, &expected)
             .unwrap();
         let entries = authority.successful_entries.load(Ordering::Relaxed);
+        let steps = authority.ancestry_steps.load(Ordering::Relaxed);
         assert_eq!(file.read_bounded(6).unwrap(), b"sample");
         drop((file, expected, authority, root));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
         assert_eq!(entries, 1, "Native observation must own one admission");
+        assert!(steps <= 12, "Repeated ancestry validation: {steps}");
     }
 
     fn paused_file_observation(
