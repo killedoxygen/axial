@@ -5934,7 +5934,6 @@ impl ManagedLibraryFile {
     }
 
     pub fn sha1_bounded(&self, max_size: u64) -> io::Result<[u8; 20]> {
-        self.operation.revalidate()?;
         let digest = self
             .directory
             .sha1_guarded_file_bytes_with_check(&self.name, &self.guard, max_size, || {
@@ -7235,6 +7234,31 @@ mod library_lifecycle_tests {
         assert!(checks >= 5, "every read chunk retains its admission check");
         assert_eq!(std::fs::read(path.join("manifest.json")).unwrap(), b"after");
         assert_eq!(file.sha1_bounded(bytes.len() as u64).unwrap(), digest);
+    }
+
+    #[test]
+    fn bounded_sha1_keeps_entry_validation_work_bounded() {
+        use std::sync::atomic::Ordering;
+
+        let (temporary, root) = managed_library("bounded-sha1-entry-work");
+        std::fs::write(temporary.path().join("artifact.bin"), b"abc").unwrap();
+        let operation = root.try_acquire().unwrap();
+        let file = operation
+            .observe_file(&PortableRelativePath::new_exact("artifact.bin").unwrap())
+            .unwrap()
+            .unwrap();
+        let validations = &root.authority.root.inner.root.directory_revalidations;
+        validations.store(0, Ordering::Relaxed);
+        let digest = file.sha1_bounded(3).unwrap();
+        let validations = validations.load(Ordering::Relaxed);
+        assert_eq!(
+            hex_lower(&digest),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert!(
+            validations <= 7,
+            "managed directory revalidations: {validations}"
+        );
     }
 
     #[test]
