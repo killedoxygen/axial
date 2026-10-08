@@ -972,6 +972,7 @@ const handlers: Record<string, Handler> = {
     return created;
   },
   'GET /install/queue': (): InstallQueueStateResponse => mockEmptyInstallQueue(),
+  'GET /launch/sessions': () => ({ sessions: [] }),
   'GET /flags': () => flagsResponse(),
   'PUT /flags/{key}': (body, path) => updateFlag(path?.slice('/flags/'.length) ?? '', body),
   'POST /telemetry/frontend-error': () => null,
