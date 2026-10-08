@@ -3002,16 +3002,23 @@ fn log_loader_failure(error: &LoaderInstallError) {
             );
         }
         LoaderInstallError::ArtifactDownloadFailed(failure) => {
-            let recent_fact_kinds = failure
+            let recent_facts = failure
                 .facts()
                 .iter()
                 .rev()
                 .take(8)
-                .map(|fact| fact.kind)
+                .map(|fact| {
+                    let http_status = fact.fields.iter().find_map(|(key, value)| {
+                        (key == "status")
+                            .then(|| value.parse::<u16>().ok())
+                            .flatten()
+                    });
+                    (fact.kind, fact.target.as_str(), http_status)
+                })
                 .collect::<Vec<_>>();
             tracing::warn!(
                 category = "artifact_download",
-                ?recent_fact_kinds,
+                ?recent_facts,
                 "Loader installer failed; classifying publication state."
             );
         }

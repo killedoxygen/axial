@@ -383,6 +383,7 @@ fn provider_routes(
     base: &str,
     corrupt_client: bool,
     natural_exit: bool,
+    fabric_artifact_failure: bool,
 ) -> BTreeMap<String, Vec<u8>> {
     let mut routes = BTreeMap::new();
     let mut source = |path: &str, bytes: Vec<u8>| {
@@ -486,12 +487,62 @@ fn provider_routes(
         // Change one byte after all parent metadata has committed to its digest.
         routes.get_mut("GET /artifacts/client.jar").unwrap()[0] ^= 1;
     }
+    if fabric_artifact_failure {
+        let proof = json!({
+            "loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},
+            "intermediary":{"version":VERSION,"maven":format!("net.fabricmc:intermediary:{VERSION}")},
+            "launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}
+        });
+        let profile = json!({
+            "id":format!("fabric-loader-0.16.14-{VERSION}"),"inheritsFrom":VERSION,"type":"release",
+            "mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient",
+            "libraries":[
+                {"name":"net.fabricmc:fabric-loader:0.16.14","downloads":{"artifact":{
+                    "path":"net/fabricmc/fabric-loader/0.16.14/fabric-loader-0.16.14.jar",
+                    "url":format!("{base}/artifacts/fabric-loader.jar")
+                }}},
+                {"name":format!("net.fabricmc:intermediary:{VERSION}"),"downloads":{"artifact":{
+                    "path":format!("net/fabricmc/intermediary/{VERSION}/intermediary-{VERSION}.jar"),
+                    "url":format!("{base}/artifacts/intermediary.jar")
+                }}}
+            ]
+        });
+        for (path, value) in [
+            (
+                format!("/v2/versions/loader/{VERSION}"),
+                json!([proof.clone()]),
+            ),
+            (format!("/v2/versions/loader/{VERSION}/0.16.14"), proof),
+            (
+                format!("/v2/versions/loader/{VERSION}/0.16.14/profile/json"),
+                profile,
+            ),
+        ] {
+            assert!(
+                routes
+                    .insert(format!("GET {path}"), serde_json::to_vec(&value).unwrap())
+                    .is_none()
+            );
+        }
+        routes.insert(
+            "GET /artifacts/fabric-loader.jar".to_owned(),
+            archive(
+                "net/fabricmc/loader/impl/launch/knot/KnotClient.class",
+                b"fixture loader class",
+            ),
+        );
+        routes.insert(
+            "GET /artifacts/intermediary.jar".to_owned(),
+            b"fixture unavailable".to_vec(),
+        );
+    }
     routes
 }
 
 #[derive(Clone)]
 struct ProviderState {
     routes: Arc<BTreeMap<String, Vec<u8>>>,
+    fabric_artifact_failure: bool,
     requests: Arc<Mutex<Vec<String>>>,
     client_hold: tokio::sync::watch::Sender<bool>,
     client_held: Arc<tokio::sync::Notify>,
@@ -511,12 +562,26 @@ impl Provider {
     }
 
     async fn start_with_java_exit(corrupt_client: bool, natural_exit: bool) -> Self {
+        Self::start_with_sources(corrupt_client, natural_exit, false).await
+    }
+
+    async fn start_with_sources(
+        corrupt_client: bool,
+        natural_exit: bool,
+        fabric_artifact_failure: bool,
+    ) -> Self {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let state = ProviderState {
-            routes: Arc::new(provider_routes(&base, corrupt_client, natural_exit)),
+            routes: Arc::new(provider_routes(
+                &base,
+                corrupt_client,
+                natural_exit,
+                fabric_artifact_failure,
+            )),
+            fabric_artifact_failure,
             requests: Arc::new(Mutex::new(Vec::new())),
             client_hold: tokio::sync::watch::channel(false).0,
             client_held: Arc::new(tokio::sync::Notify::new()),
@@ -531,6 +596,9 @@ impl Provider {
 
                     let key = format!("{method} {uri}");
                     state.requests.lock().unwrap().push(key.clone());
+                    if state.fabric_artifact_failure && key == "GET /artifacts/intermediary.jar" {
+                        return (StatusCode::SERVICE_UNAVAILABLE, state.routes[&key].clone()).into_response();
+                    }
                     if key == "GET /artifacts/client.jar" && *state.client_hold.borrow() {
                         let bytes = state.routes[&key].clone();
                         let size = bytes.len();
@@ -5803,10 +5871,6 @@ fn diagnostic_runtime(
 ) -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
     use tracing_subscriber::prelude::*;
 
-    thread_local! {
-        static DIAGNOSTICS: std::cell::RefCell<Option<tracing::dispatcher::DefaultGuard>> =
-            const { std::cell::RefCell::new(None) };
-    }
     let diagnostics = tracing::Dispatch::new(
         tracing_subscriber::fmt()
             .with_test_writer()
@@ -5827,8 +5891,19 @@ fn diagnostic_runtime(
                     .with_target("axial_app::launch::prepare", tracing::Level::WARN),
             ),
     );
+    runtime_with_diagnostics(diagnostics, kill_ack)
+}
+
+fn runtime_with_diagnostics(
+    diagnostics: tracing::Dispatch,
+    kill_ack: Option<Arc<KillAckCapture>>,
+) -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
+    thread_local! {
+        static DIAGNOSTICS: std::cell::RefCell<Option<tracing::dispatcher::DefaultGuard>> =
+            const { std::cell::RefCell::new(None) };
+    }
     let current_thread = tracing::dispatcher::set_default(&diagnostics);
-    // HTTP and retained launch tasks run on this test's runtime threads.
+    // HTTP and accepted work run on this test's runtime threads.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -6528,6 +6603,160 @@ async fn shutdown_refuses_held_materialization_then_installation_survives_reopen
             );
         }
         std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+fn queued_fabric_artifact_failure_preserves_safe_provider_diagnostic() {
+    use axial_minecraft::loaders::{LoaderComponentId, build_id_for, installed_version_id_for};
+    use futures_util::FutureExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Default)]
+    struct Capture {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        overflow: Arc<AtomicBool>,
+    }
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let mut captured = self.bytes.lock().unwrap();
+            if bytes.len() > (8 << 10) - captured.len() {
+                self.overflow.store(true, Ordering::SeqCst);
+                return Err(std::io::Error::other("fixture diagnostic limit"));
+            }
+            captured.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let diagnostics = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish()
+            .with(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("axial_app::install::queue", tracing::Level::WARN),
+            ),
+    );
+    let (runtime, _diagnostics) = runtime_with_diagnostics(diagnostics, None);
+    let cleanup = runtime.block_on(async {
+        let mut temporary = Some(
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap(),
+        );
+        let profile = temporary.as_ref().unwrap().path().join("profile");
+        let mut provider = Provider::start_with_sources(false, false, true).await;
+        let mut services: Option<DesktopServices> = None;
+        let journey = std::panic::AssertUnwindSafe(async {
+            services = Some(start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+                .await.unwrap());
+            let initial = services.as_ref().unwrap();
+            let api = Api::new(initial);
+            let pin = initial.library.admit().unwrap();
+            let library = pin.read_projection().unwrap();
+            drop(pin);
+            let canary = library.join("artifact-failure-canary.bin");
+            std::fs::write(&canary, EXTERNAL_CANARY).unwrap();
+            let start = api.post("/api/v1/install/queue", json!({
+                "kind":"loader","component_id":"net.fabricmc.fabric-loader",
+                "build_id":build_id_for(LoaderComponentId::Fabric, VERSION, "0.16.14")
+            })).await;
+            let terminal = install_terminal(&api, &start).await;
+            let queue = api.get("/api/v1/install/queue").await;
+            let pin = initial.library.admit().unwrap();
+            let base_ready = initial.installs.ready_version(&pin, VERSION).await.is_ok();
+            let loader_id = installed_version_id_for(LoaderComponentId::Fabric, VERSION, "0.16.14").unwrap();
+            let loader_ready = initial.installs.ready_version(&pin, &loader_id).await.is_ok();
+            drop(pin);
+            let runtime_ready = initial.installs.runtime_cache().admit_component(COMPONENT)
+                .unwrap().is_some_and(|component| component.contents_verified());
+            (terminal, queue, base_ready, loader_ready, runtime_ready, canary)
+        }).catch_unwind().await;
+
+        let shutdown = match &services {
+            Some(services) => std::panic::AssertUnwindSafe(tokio::time::timeout(
+                Duration::from_secs(60), services.server.shutdown(),
+            )).catch_unwind().await,
+            None => Ok(Ok(Ok(()))),
+        };
+        let settled = services.as_ref().is_some_and(|services| {
+            services.server.is_shutdown_settled()
+                && services.tasks.shutdown_receipt().is_some()
+                && services.tasks.status().is_idle()
+        });
+        if !matches!(&shutdown, Ok(Ok(Ok(())))) || !settled {
+            return Err((services, provider, temporary.take().unwrap(),
+                "API cleanup did not prove settlement; provider remains available"));
+        }
+        let provider_stop = provider.stop.take().is_some_and(|stop| stop.send(()).is_ok());
+        let provider_joined = match tokio::time::timeout(Duration::from_secs(5), &mut provider.task).await {
+            Ok(result) => result.is_ok(),
+            Err(_) => {
+                provider.task.abort();
+                match tokio::time::timeout(Duration::from_secs(1), &mut provider.task).await {
+                    Ok(Ok(())) | Ok(Err(_)) => false,
+                    Err(_) => return Err((services, provider, temporary.take().unwrap(),
+                        "Provider cleanup remained unjoined after abort")),
+                }
+            }
+        };
+        let requests = provider.state.requests.lock().unwrap().clone();
+        let expected_requests: BTreeSet<_> = provider.state.routes.keys().cloned().collect();
+        let provider_base = provider.base.clone();
+        drop(services);
+        drop(provider);
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shutdown.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                .expect("API cleanup must finish within its deadline").unwrap();
+            assert!(settled && provider_stop && provider_joined, "all fixture owners must join");
+            let (terminal, queue, base_ready, loader_ready, runtime_ready, canary) =
+                journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            assert_eq!(requests.iter().cloned().collect::<BTreeSet<_>>(), expected_requests,
+                "real base, Java, exact Fabric proof/profile and both artifacts must be requested");
+            assert!(requests.iter().any(|request| request == "GET /artifacts/intermediary.jar"),
+                "the designated persistent HTTP 503 must be reached before checking diagnostics");
+            assert!(base_ready && runtime_ready && !loader_ready);
+            assert_eq!(std::fs::read(canary).unwrap(), EXTERNAL_CANARY);
+            assert_eq!(terminal["outcome"], "failed");
+            assert_eq!(terminal["view_model"]["failed"], true);
+            assert_eq!(queue["items"], json!([]));
+            assert!(queue["active"].is_null());
+            assert_eq!(queue["latest_failure"]["install_id"], terminal["install_id"]);
+            assert!(!capture.overflow.load(Ordering::SeqCst), "diagnostic capture must be complete");
+            let diagnostic = String::from_utf8(capture.bytes.lock().unwrap().clone()).unwrap();
+            assert!(!diagnostic.contains(&provider_base));
+            assert!(!diagnostic.contains(profile.to_str().unwrap()));
+            assert!(!diagnostic.contains("fixture unavailable"));
+            let artifact_failures: Vec<_> = diagnostic.lines()
+                .filter(|line| line.contains("category=\"artifact_download\""))
+                .collect();
+            assert!(!artifact_failures.is_empty(), "the queued artifact warning must be observed");
+            assert!(artifact_failures.iter().any(|line| {
+                line.contains("ProviderFailure") && line.contains("503")
+                    && line.contains("minecraft_library_source")
+            }), "the queued artifact warning must retain the safe provider failure, HTTP status and native source label: {artifact_failures:?}");
+        }));
+        if let Err(panic) = verified {
+            if let Some(temporary) = temporary.take() {
+                eprintln!("Retained Fabric diagnostic fixture: {}", temporary.keep().display());
+            }
+            std::panic::resume_unwind(panic);
+        }
+        Ok(())
+    });
+    if let Err((services, provider, temporary, reason)) = cleanup {
+        let retained = temporary.path().to_owned();
+        std::mem::forget((runtime, services, provider, temporary));
+        panic!(
+            "{reason}; retained Fabric owners and fixture: {}",
+            retained.display()
+        );
     }
 }
 
