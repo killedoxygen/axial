@@ -282,11 +282,31 @@ pub struct LoaderInstallPlan {
 #[must_use = "dropping the continuation releases exact loader install inputs"]
 pub struct LoaderInstallContinuation {
     plan: LoaderInstallPlan,
+    #[cfg(feature = "test-support")]
+    test_endpoints: Option<crate::download::InstallTestEndpoints>,
 }
 
 impl LoaderInstallContinuation {
     pub(crate) fn new(plan: LoaderInstallPlan) -> Self {
-        Self { plan }
+        Self {
+            plan,
+            #[cfg(feature = "test-support")]
+            test_endpoints: None,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn with_test_endpoints(
+        mut self,
+        endpoints: Option<crate::download::InstallTestEndpoints>,
+    ) -> Self {
+        self.test_endpoints = endpoints;
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn test_endpoints(&self) -> Option<&crate::download::InstallTestEndpoints> {
+        self.test_endpoints.as_ref()
     }
 
     pub(crate) fn plan(&self) -> &LoaderInstallPlan {

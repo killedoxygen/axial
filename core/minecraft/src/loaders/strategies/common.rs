@@ -180,9 +180,20 @@ impl AuthenticatedProfileSource {
 async fn acquire_profile_source(
     provider_url: &str,
     logical_identity: &str,
+    #[cfg(feature = "test-support")] transport_url: Option<&reqwest::Url>,
 ) -> Result<AuthenticatedProfileSource, LoaderError> {
+    #[cfg(feature = "test-support")]
+    let bytes = match transport_url {
+        Some(url) => {
+            crate::loaders::http::fetch_bytes_from_loopback_for_test(url, MAX_LOADER_SOURCE_BYTES)
+                .await?
+        }
+        None => fetch_bytes(provider_url, MAX_LOADER_SOURCE_BYTES).await?,
+    };
+    #[cfg(not(feature = "test-support"))]
+    let bytes = fetch_bytes(provider_url, MAX_LOADER_SOURCE_BYTES).await?;
     Ok(AuthenticatedProfileSource {
-        bytes: fetch_bytes(provider_url, MAX_LOADER_SOURCE_BYTES).await?,
+        bytes,
         provider_url: provider_url.to_string(),
         logical_identity: logical_identity.to_string(),
     })
@@ -227,7 +238,13 @@ async fn reconstruct_profile_with_downloader(
         .reconstruct_version_authority(&plan.record.minecraft_version, context)
         .await
         .map_err(|error| LoaderError::Verify(format!("reconstruct vanilla base: {error}")))?;
-    let profile_source = acquire_profile_source(url, &plan.record.version_id).await?;
+    let profile_source = acquire_profile_source(
+        url,
+        &plan.record.version_id,
+        #[cfg(feature = "test-support")]
+        None,
+    )
+    .await?;
     reconstruct_profile_after_sources(plan, base, profile_source, proof, context).await
 }
 
@@ -639,28 +656,32 @@ pub(super) async fn install_base<F>(
     runtime_cache: &ManagedRuntimeCache,
     plan: LoaderInstallPlan,
     send: &mut F,
+    #[cfg(feature = "test-support")] test_endpoints: Option<crate::download::InstallTestEndpoints>,
 ) -> Result<crate::loaders::LoaderInstallBaseCommit, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
+    let continuation = LoaderInstallContinuation::new(plan);
+    #[cfg(feature = "test-support")]
+    let continuation = continuation.with_test_endpoints(test_endpoints);
     let base_receipt = match Box::pin(ensure_base_version(
         library_root,
         runtime_cache,
-        &plan.record.minecraft_version,
+        &continuation.plan().record.minecraft_version,
         send,
+        #[cfg(feature = "test-support")]
+        continuation.test_endpoints(),
     ))
     .await
     {
         Ok(receipt) => receipt,
         Err(error) => {
-            return Err(
-                error.retain_base_publication_continuation(LoaderInstallContinuation::new(plan))
-            );
+            return Err(error.retain_base_publication_continuation(continuation));
         }
     };
     Ok(crate::loaders::LoaderInstallBaseCommit::new(
         base_receipt,
-        LoaderInstallContinuation::new(plan),
+        continuation,
     ))
 }
 
@@ -670,10 +691,26 @@ pub(super) async fn continue_profile_install_after_base<F>(
     plan: LoaderInstallPlan,
     base_derivation: KnownGoodLoaderBaseDerivation,
     send: &mut F,
+    #[cfg(feature = "test-support")] test_endpoints: Option<&crate::download::InstallTestEndpoints>,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
+    #[cfg(feature = "test-support")]
+    let source_proof = if let Some(endpoints) = test_endpoints {
+        if plan.record.component_id != LoaderComponentId::Fabric {
+            return Err(LoaderError::InvalidBuildId);
+        }
+        providers::fetch_profile_install_proof_from_loopback_for_test(
+            &plan.record,
+            &endpoints
+                .fabric_profile_proof(&plan.record.minecraft_version, &plan.record.loader_version),
+        )
+        .await?
+    } else {
+        providers::fetch_profile_install_proof(&plan.record).await?
+    };
+    #[cfg(not(feature = "test-support"))]
     let source_proof = providers::fetch_profile_install_proof(&plan.record).await?;
     Box::pin(install_profile_source_after_authenticated_base(
         library_root,
@@ -681,6 +718,8 @@ where
         base_derivation,
         source_proof,
         send,
+        #[cfg(feature = "test-support")]
+        test_endpoints,
     ))
     .await
 }
@@ -691,6 +730,7 @@ async fn install_profile_source_after_authenticated_base<F>(
     base_derivation: KnownGoodLoaderBaseDerivation,
     source_proof: ProfileInstallProof,
     send: &mut F,
+    #[cfg(feature = "test-support")] test_endpoints: Option<&crate::download::InstallTestEndpoints>,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
@@ -711,9 +751,18 @@ where
         1,
         Some("Fetching loader profile...".to_string()),
     ));
-    let profile_bytes = acquire_profile_source(profile_url, &plan.record.version_id)
-        .await?
-        .into_bytes_for(profile_url, &plan.record.version_id)?;
+    #[cfg(feature = "test-support")]
+    let transport_url = test_endpoints.map(|endpoints| {
+        endpoints.fabric_profile(&plan.record.minecraft_version, &plan.record.loader_version)
+    });
+    let profile_bytes = acquire_profile_source(
+        profile_url,
+        &plan.record.version_id,
+        #[cfg(feature = "test-support")]
+        transport_url.as_ref(),
+    )
+    .await?
+    .into_bytes_for(profile_url, &plan.record.version_id)?;
     let fragment = parse_profile_json(&profile_bytes, &plan.record.component_name)?;
     validate_profile_source_structure(
         &fragment,
@@ -1375,11 +1424,17 @@ async fn ensure_base_version<F>(
     runtime_cache: &ManagedRuntimeCache,
     version_id: &str,
     send: &mut F,
+    #[cfg(feature = "test-support")] test_endpoints: Option<&crate::download::InstallTestEndpoints>,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
     let downloader = Downloader::new(library_root.clone(), runtime_cache.clone());
+    #[cfg(feature = "test-support")]
+    let downloader = match test_endpoints {
+        Some(endpoints) => downloader.with_test_endpoints(endpoints.clone()),
+        None => downloader,
+    };
     let mut facts = Vec::new();
     let result = Box::pin(downloader.install_version_with_facts(
         version_id,
@@ -2030,6 +2085,8 @@ mod tests {
                 test_loader_base_derivation(base_receipt),
                 install_proof,
                 &mut |_| {},
+                #[cfg(feature = "test-support")]
+                None,
             )
             .await
             .expect("install profile loader");
@@ -2263,6 +2320,8 @@ mod tests {
                 test_loader_base_derivation(base_receipt),
                 install_proof,
                 &mut |_| {},
+                #[cfg(feature = "test-support")]
+                None,
             )
             .await
             .expect_err("mapping admission must refuse install");
@@ -3250,6 +3309,8 @@ printf '%s' 'processor-terminal' > "$last"
             test_loader_base_derivation(base_receipt),
             install_proof,
             &mut |_| {},
+            #[cfg(feature = "test-support")]
+            None,
         )
         .await
         .expect("install profile loader");
@@ -4209,6 +4270,8 @@ printf '%s' 'processor-terminal' > "$last"
                 &runtime_cache,
                 "1.21.5",
                 &mut send,
+                #[cfg(feature = "test-support")]
+                None,
             )) < 4096,
             "loader base-version future should not embed the full vanilla install future"
         );
@@ -4220,6 +4283,8 @@ printf '%s' 'processor-terminal' > "$last"
                 &runtime_cache,
                 profile_plan.clone(),
                 &mut send,
+                #[cfg(feature = "test-support")]
+                None,
             )) < 4096,
             "profile-backed loader install future should stay small"
         );
@@ -4231,6 +4296,8 @@ printf '%s' 'processor-terminal' > "$last"
                 &runtime_cache,
                 installer_plan.clone(),
                 &mut send,
+                #[cfg(feature = "test-support")]
+                None,
             )) < 4096,
             "installer-backed loader install future should stay small"
         );
@@ -4242,6 +4309,8 @@ printf '%s' 'processor-terminal' > "$last"
                 &runtime_cache,
                 legacy_plan.clone(),
                 &mut send,
+                #[cfg(feature = "test-support")]
+                None,
             )) < 4096,
             "legacy archive loader install future should stay small"
         );
@@ -4252,6 +4321,8 @@ printf '%s' 'processor-terminal' > "$last"
                 &runtime_cache,
                 installer_plan.clone(),
                 |_| {},
+                #[cfg(feature = "test-support")]
+                None,
             )) < 4096,
             "loader strategy dispatcher future should not embed the largest strategy branch"
         );
@@ -4392,6 +4463,8 @@ printf '%s' 'processor-terminal' > "$last"
             test_loader_base_derivation(base),
             proof,
             &mut |progress| progress_events.push(progress),
+            #[cfg(feature = "test-support")]
+            None,
         )
         .await
         .expect("Fabric profile install");
@@ -4585,6 +4658,8 @@ printf '%s' 'processor-terminal' > "$last"
             test_loader_base_derivation(base),
             proof,
             &mut |_progress| {},
+            #[cfg(feature = "test-support")]
+            None,
         )
         .await;
         if matches!(proof_mode, Some("wrong_hash" | "wrong_size")) {

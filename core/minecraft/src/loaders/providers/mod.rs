@@ -10,6 +10,7 @@ pub use common::{
 #[cfg(feature = "test-support")]
 pub(crate) use fabric::{
     fetch_builds_from_loopback_for_test, fetch_game_versions_from_loopback_for_test,
+    fetch_profile_install_proof_from_loopback_for_test,
 };
 pub(crate) use quilt::validate_profile_mappings as validate_quilt_profile_mappings;
 

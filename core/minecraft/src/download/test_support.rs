@@ -6,6 +6,7 @@ pub struct InstallTestEndpoints {
     version_manifest: String,
     runtime_catalog: String,
     asset_objects: String,
+    fabric: reqwest::Url,
 }
 
 impl InstallTestEndpoints {
@@ -33,6 +34,7 @@ impl InstallTestEndpoints {
             version_manifest: url.join("version_manifest_v2.json").unwrap().into(),
             runtime_catalog: url.join("java-runtime/all.json").unwrap().into(),
             asset_objects: url.join("assets/objects").unwrap().into(),
+            fabric: url.join("v2/versions/").unwrap(),
         })
     }
 
@@ -46,6 +48,41 @@ impl InstallTestEndpoints {
 
     pub(crate) fn asset_objects(&self) -> &str {
         &self.asset_objects
+    }
+
+    pub fn fabric_builds(&self, minecraft_version: &str) -> reqwest::Url {
+        self.fabric_url(&["loader", minecraft_version])
+    }
+
+    pub(crate) fn fabric_profile_proof(
+        &self,
+        minecraft_version: &str,
+        loader_version: &str,
+    ) -> reqwest::Url {
+        self.fabric_url(&["loader", minecraft_version, loader_version])
+    }
+
+    pub(crate) fn fabric_profile(
+        &self,
+        minecraft_version: &str,
+        loader_version: &str,
+    ) -> reqwest::Url {
+        self.fabric_url(&[
+            "loader",
+            minecraft_version,
+            loader_version,
+            "profile",
+            "json",
+        ])
+    }
+
+    fn fabric_url(&self, segments: &[&str]) -> reqwest::Url {
+        let mut url = self.fabric.clone();
+        url.path_segments_mut()
+            .expect("validated fixture HTTP origin")
+            .pop_if_empty()
+            .extend(segments.iter().copied());
+        url
     }
 }
 

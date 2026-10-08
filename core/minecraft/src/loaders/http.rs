@@ -115,6 +115,20 @@ pub(crate) async fn fetch_bytes_for_test(url: &str, max_size: u64) -> Result<Vec
     fetch_bytes_with_policy(url, max_size, LoaderSourceTransportPolicy::AllowHttpForTest).await
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) async fn fetch_bytes_from_loopback_for_test(
+    url: &reqwest::Url,
+    max_size: u64,
+) -> Result<Vec<u8>, LoaderError> {
+    validate_loopback_url_for_test(url)?;
+    fetch_bytes_with_policy(
+        url.as_str(),
+        max_size,
+        LoaderSourceTransportPolicy::LoopbackForTest,
+    )
+    .await
+}
+
 async fn fetch_bytes_with_policy(
     url: &str,
     max_size: u64,

@@ -73,6 +73,41 @@ pub fn install_build<'a, F>(
 where
     F: FnMut(DownloadProgress) + 'a,
 {
+    install_build_owned(
+        library_root,
+        runtime_cache,
+        record,
+        send,
+        #[cfg(feature = "test-support")]
+        None,
+    )
+}
+
+/// Redirect only acquisition endpoints; retain live record and publication checks.
+#[cfg(feature = "test-support")]
+pub fn install_build_with_test_endpoints<'a, F>(
+    library_root: &'a ManagedLibraryOperation,
+    runtime_cache: ManagedRuntimeCache,
+    record: LoaderBuildRecord,
+    endpoints: crate::download::InstallTestEndpoints,
+    send: F,
+) -> impl std::future::Future<Output = Result<LoaderInstallPublicationOutcome, LoaderInstallError>> + 'a
+where
+    F: FnMut(DownloadProgress) + 'a,
+{
+    install_build_owned(library_root, runtime_cache, record, send, Some(endpoints))
+}
+
+fn install_build_owned<'a, F>(
+    library_root: &'a ManagedLibraryOperation,
+    runtime_cache: ManagedRuntimeCache,
+    record: LoaderBuildRecord,
+    send: F,
+    #[cfg(feature = "test-support")] test_endpoints: Option<crate::download::InstallTestEndpoints>,
+) -> impl std::future::Future<Output = Result<LoaderInstallPublicationOutcome, LoaderInstallError>> + 'a
+where
+    F: FnMut(DownloadProgress) + 'a,
+{
     Box::pin(async move {
         api::validate_loader_build_record_identity(&record).map_err(LoaderInstallError::from)?;
         validate_version_id(&record.version_id, "loader build version id")
@@ -80,9 +115,24 @@ where
         let install_flight = install_flight::acquire(library_root, &record.version_id)
             .await
             .map_err(LoaderInstallError::from)?;
-        let live_record = resolve_build_record_for_install(record.component_id, &record.build_id)
+        #[cfg(feature = "test-support")]
+        let live_record = if let Some(endpoints) = &test_endpoints {
+            if record.component_id != LoaderComponentId::Fabric {
+                return Err(LoaderInstallError::from(LoaderError::InvalidBuildId));
+            }
+            resolve_fabric_build_for_test(
+                &record.build_id,
+                &endpoints.fabric_builds(&record.minecraft_version),
+                std::future::pending(),
+            )
             .await
-            .map_err(LoaderInstallError::from)?;
+        } else {
+            resolve_build_record_for_install(record.component_id, &record.build_id).await
+        };
+        #[cfg(not(feature = "test-support"))]
+        let live_record =
+            resolve_build_record_for_install(record.component_id, &record.build_id).await;
+        let live_record = live_record.map_err(LoaderInstallError::from)?;
         let record = require_exact_live_build_record(&record, live_record)
             .map_err(LoaderInstallError::from)?;
         let plan = LoaderInstallPlan { record };
@@ -94,6 +144,8 @@ where
             &runtime_cache,
             plan,
             send,
+            #[cfg(feature = "test-support")]
+            test_endpoints,
         ))
         .await
         .map(LoaderInstallPublicationOutcome::BaseCommitted)

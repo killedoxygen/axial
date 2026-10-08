@@ -543,8 +543,26 @@ impl InstallQueue {
         build: &str,
         cancelled: impl std::future::Future<Output = ()>,
     ) -> Result<LoaderBuildRecord, InstallError> {
+        #[cfg(feature = "test-support")]
+        let fixture_url = if let Some(endpoints) = &self.test_endpoints {
+            let Some((parsed_component, minecraft_version, _)) =
+                axial_minecraft::loaders::parse_build_id(build)
+            else {
+                return Err(InstallError::InvalidRequest);
+            };
+            if component != LoaderComponentId::Fabric || parsed_component != component {
+                return Err(InstallError::InvalidRequest);
+            }
+            Some(endpoints.fabric_builds(&minecraft_version))
+        } else {
+            None
+        };
+        #[cfg(all(test, not(feature = "test-support")))]
+        let fixture_url: Option<url::Url> = None;
         #[cfg(test)]
-        let record = if let Some(url) = &self.loader_url {
+        let fixture_url = self.loader_url.clone().or(fixture_url);
+        #[cfg(any(test, feature = "test-support"))]
+        let record = if let Some(url) = &fixture_url {
             if component != LoaderComponentId::Fabric {
                 return Err(InstallError::InvalidRequest);
             }
@@ -555,7 +573,7 @@ impl InstallQueue {
             )
             .await
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let record = axial_minecraft::loaders::resolve_build_record_for_install_cancellable(
             component, build, cancelled,
         )
@@ -2217,14 +2235,37 @@ impl InstallQueue {
                 Err(error) => Err(WorkFailure::Failed(error)),
                 Ok(record) => {
                     let version_id = record.version_id.clone();
-                    match axial_minecraft::loaders::install_build(
+                    #[cfg(feature = "test-support")]
+                    let installed = match self.test_endpoints.clone() {
+                        Some(endpoints) => {
+                            axial_minecraft::loaders::install_build_with_test_endpoints(
+                                &operation,
+                                self.inner.runtime.clone(),
+                                record,
+                                endpoints,
+                                progress,
+                            )
+                            .await
+                        }
+                        None => {
+                            axial_minecraft::loaders::install_build(
+                                &operation,
+                                self.inner.runtime.clone(),
+                                record,
+                                progress,
+                            )
+                            .await
+                        }
+                    };
+                    #[cfg(not(feature = "test-support"))]
+                    let installed = axial_minecraft::loaders::install_build(
                         &operation,
                         self.inner.runtime.clone(),
                         record,
                         progress,
                     )
-                    .await
-                    {
+                    .await;
+                    match installed {
                         Ok(outcome) => {
                             self.settle_loader(&id, &pin, operation.clone(), &version_id, outcome)
                                 .await

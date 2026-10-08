@@ -20,6 +20,7 @@ pub async fn install_build<F>(
     runtime_cache: &ManagedRuntimeCache,
     plan: LoaderInstallPlan,
     mut send: F,
+    #[cfg(feature = "test-support")] test_endpoints: Option<crate::download::InstallTestEndpoints>,
 ) -> Result<LoaderInstallBaseCommit, LoaderError>
 where
     F: FnMut(DownloadProgress),
@@ -29,6 +30,8 @@ where
         runtime_cache,
         plan,
         &mut send,
+        #[cfg(feature = "test-support")]
+        test_endpoints,
     ))
     .await
 }
@@ -42,6 +45,8 @@ pub(crate) async fn continue_install_build_after_base<F>(
 where
     F: FnMut(DownloadProgress),
 {
+    #[cfg(feature = "test-support")]
+    let test_endpoints = continuation.test_endpoints().cloned();
     let plan = continuation.into_plan();
     match plan.record.strategy {
         LoaderInstallStrategy::FabricProfile | LoaderInstallStrategy::QuiltProfile => {
@@ -50,6 +55,8 @@ where
                 plan,
                 base_derivation,
                 &mut send,
+                #[cfg(feature = "test-support")]
+                test_endpoints.as_ref(),
             ))
             .await
         }
