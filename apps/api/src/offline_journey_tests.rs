@@ -44,6 +44,10 @@ pub(super) enum KillAckStage {
     Send,
     #[serde(rename = "kill_result")]
     Result,
+    #[serde(rename = "kill_ingress")]
+    Ingress,
+    #[serde(rename = "kill_response")]
+    Response,
     #[serde(rename = "kill_enter")]
     Enter,
     #[serde(rename = "kill_return")]
@@ -58,6 +62,7 @@ struct KillAckEvent {
     status: Option<u16>,
     timeout: bool,
     connect: bool,
+    tls_matches: bool,
 }
 
 struct KillAckCapture {
@@ -96,30 +101,66 @@ pub(super) fn record_kill_ack(
         let Some(capture) = capture.as_ref() else {
             return;
         };
-        let Ok(mut events) = capture.events.try_lock() else {
-            capture
-                .incomplete
+        capture.record(stage, session_id, status, timeout, connect, true);
+    });
+}
+
+pub(super) fn observe_kill_router(router: Router) -> Router {
+    let capture = KILL_ACK_CAPTURE.with(|capture| capture.borrow().clone());
+    let Some(capture) = capture else {
+        return router;
+    };
+    router.layer(axum::middleware::from_fn_with_state(capture, observe_kill_request))
+}
+
+async fn observe_kill_request(
+    State(capture): State<Arc<KillAckCapture>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let session = (request.method() == Method::POST)
+        .then(|| request.uri().path().strip_prefix("/api/v1/launch/")?.strip_suffix("/kill"))
+        .flatten()
+        .filter(|id| uuid::Uuid::parse_str(id)
+            .is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == *id))
+        .map(str::to_owned);
+    let tls_matches = KILL_ACK_CAPTURE.with(|slot| slot.borrow().as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &capture)));
+    if let Some(id) = &session {
+        capture.record(KillAckStage::Ingress, id, None, false, false, tls_matches);
+    }
+    let response = next.run(request).await;
+    if let Some(id) = &session {
+        capture.record(KillAckStage::Response, id, Some(response.status().as_u16()), false, false,
+            KILL_ACK_CAPTURE.with(|slot| slot.borrow().as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &capture))));
+    }
+    response
+}
+
+impl KillAckCapture {
+    fn record(&self, stage: KillAckStage, session_id: &str, status: Option<u16>, timeout: bool,
+        connect: bool, tls_matches: bool) {
+        let Ok(mut events) = self.events.try_lock() else {
+            self.incomplete
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         };
         if events.len() == 32 {
-            capture
-                .incomplete
+            self.incomplete
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         events.push(KillAckEvent {
             stage,
-            elapsed_ms: capture.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            elapsed_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             session_id: session_id.to_owned(),
             status,
             timeout,
             connect,
+            tls_matches,
         });
-    });
-}
-
-impl KillAckCapture {
+    }
     fn dump(&self, preserved: Option<&std::path::Path>) {
         let events = self.events.try_lock().ok().map(|events| events.clone());
         let complete =
@@ -1090,7 +1131,16 @@ async fn launch_and_stop(api: &Api, instance: &str) -> String {
 }
 
 async fn observe_and_stop_session(api: &Api, id: &str) -> BTreeSet<u64> {
-    let (mut events, processes) = observe_running_session(api, id).await;
+    let (events, processes) = observe_running_session(api, id).await;
+    stop_observed_session(api, id, events, processes).await
+}
+
+async fn stop_observed_session(
+    api: &Api,
+    id: &str,
+    mut events: Events,
+    processes: BTreeSet<u64>,
+) -> BTreeSet<u64> {
     api.post(&format!("/api/v1/launch/{id}/kill"), json!({}))
         .await;
     let terminal = tokio::time::timeout(Duration::from_secs(15), async {
@@ -5112,7 +5162,9 @@ async fn missing_default_runtime_after_reopen() {
         let mut verify_guards = None;
         if status.is_success() {
             let session = body["session_id"].as_str().unwrap();
-            processes.extend(observe_and_stop_session(&restarted_api, session).await);
+            let (events, observed) = observe_running_session(&restarted_api, session).await;
+            processes.extend(observed.iter().copied());
+            stop_observed_session(&restarted_api, session, events, observed).await;
             let report = restarted_api.get(&format!("/api/v1/launch/reports/{session}")).await;
             assert_eq!(report["instance_id"], instance);
             assert_eq!(report["session_outcome"]["kind"], "stopped");
@@ -5303,6 +5355,14 @@ async fn missing_default_runtime_after_reopen() {
     if absent.is_err() {
         preserve();
     }
+    KILL_ACK_CAPTURE.with(|slot| {
+        if let Some(capture) = slot.borrow().as_ref() {
+            eprintln!("[DEBUG-kill-ack] post_cleanup shutdown_joined={} shutdown_settled={} provider_joined={} observed_process_count={} observed_processes_absent={:?}",
+                matches!(&shutdown, Ok(Ok(()))), settled, provider_shutdown.is_ok(), processes.len(),
+                (!processes.is_empty()).then_some(absent.is_ok()));
+            capture.dump(None);
+        }
+    });
     let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         shutdown
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
@@ -6608,6 +6668,31 @@ async fn shutdown_refuses_held_materialization_then_installation_survives_reopen
 
 #[test]
 fn queued_fabric_artifact_failure_preserves_safe_provider_diagnostic() {
+    const CHILD: &str = "AXIAL_TEST_FABRIC_DIAGNOSTIC_CHILD";
+    // Unknown-size Fabric sources reserve the whole process scratch budget.
+    if std::env::var_os(CHILD).is_none() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut output = tempfile::tempfile().unwrap();
+            let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "offline_journey_tests::queued_fabric_artifact_failure_preserves_safe_provider_diagnostic",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::from(output.try_clone().unwrap()))
+                .stderr(std::process::Stdio::from(output.try_clone().unwrap()))
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            assert_fixture_child_exit(child, &mut output, 0).await;
+        });
+        return;
+    }
     use axial_minecraft::loaders::{LoaderComponentId, build_id_for, installed_version_id_for};
     use futures_util::FutureExt;
     use std::sync::atomic::{AtomicBool, Ordering};

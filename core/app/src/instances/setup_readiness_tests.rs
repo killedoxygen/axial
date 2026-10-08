@@ -4350,6 +4350,114 @@ async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
 
 #[tokio::test]
 #[cfg(unix)]
+async fn grouped_readiness_refuses_earlier_inventory_drift_during_a_later_probe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, service, accounts) = fixture();
+    let service = Arc::new(service);
+    for version in ["1.20.1", "1.21.4"] {
+        crate::install::queue::tests::install_ready_fixture(&service.installs, version).await;
+    }
+    accounts.create_offline_account("GroupedPlayer").unwrap();
+    let java = root.path().join("java");
+    std::fs::write(&java, format!(
+        "#!/bin/sh\nprobe_dir=${{0%/*}}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nif [ -s \"$probe_dir/probe-first\" ]; then\n  while [ ! -s \"$probe_dir/probe-release\" ]; do sleep 0.01; done\n  major=21\nelse\n  printf 'first' > \"$probe_dir/probe-first\"\n  major=17\nfi\nprintf 'java.version = %s.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' \"$major\" >&2\n",
+        std::env::consts::ARCH,
+    )).unwrap();
+    std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+    service
+        .settings
+        .update(
+            serde_json::from_value(serde_json::json!({
+                "expected_revision":service.settings.current().unwrap().revision,
+                "java_path_override":java.to_str().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let first = service
+        .instances
+        .create(
+            CreateInstanceRequest {
+                name: "Earlier version".into(),
+                selection_id: "vanilla|1.20.1".into(),
+                ..Default::default()
+            },
+            CreateTarget {
+                selection_id: "vanilla|1.20.1".into(),
+                version_id: "1.20.1".into(),
+                minecraft_version: "1.20.1".into(),
+                loader_key: "vanilla".into(),
+            },
+            service
+                .instances
+                .creation_admission_for_tests()
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+        .join()
+        .await
+        .unwrap()
+        .unwrap();
+    let last = super::super::create::tests::create(&service.instances, "Later version").await;
+    let input = vec![first, last];
+    let versions = service.installed().await.unwrap();
+    let healthy = service.enrich_all(input.clone(), &versions).await;
+    assert!(healthy.iter().all(|row| row.launchable), "{healthy:?}");
+    let asset = root
+        .path()
+        .join("assets/log_configs/guardian-version-bundle.xml");
+    let original = std::fs::read(&asset).unwrap();
+    std::fs::write(root.path().join("probes"), b"").unwrap();
+    std::fs::write(root.path().join("probe-first"), b"").unwrap();
+    std::fs::write(root.path().join("probe-release"), b"").unwrap();
+    let waiter = tokio::spawn({
+        let service = service.clone();
+        let input = input.clone();
+        async move { service.enrich_all(input, &versions).await }
+    });
+    let paused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while std::fs::read_to_string(root.path().join("probes"))?
+            .lines()
+            .count()
+            < 2
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await;
+    let pending = !waiter.is_finished();
+    let changed = std::fs::write(&asset, b"external change");
+    let released = std::fs::write(root.path().join("probe-release"), b"release");
+    let rows = waiter.await;
+    let stopped = service
+        .instances
+        .tasks
+        .shutdown(std::time::Duration::from_secs(5))
+        .await;
+    assert!(
+        matches!(paused, Ok(Ok(()))) && pending,
+        "second probe did not remain pending: {paused:?}"
+    );
+    changed.unwrap();
+    released.unwrap();
+    stopped.unwrap();
+    let rows = rows.unwrap();
+    assert_eq!(std::fs::read(&asset).unwrap(), b"external change");
+    assert_ne!(original, b"external change");
+    assert_eq!(rows.len(), input.len());
+    for (row, instance) in rows.iter().zip(&input) {
+        assert_eq!(row.instance.id, instance.id);
+        assert!(!row.launchable, "{} retained stale Launch", instance.name);
+        assert!(!row.launch_action.launchable);
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
 async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
     use futures_util::FutureExt;
     use std::os::unix::fs::PermissionsExt;

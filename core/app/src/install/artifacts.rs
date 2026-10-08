@@ -22,7 +22,85 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
+
+const MAX_INVENTORY_ENTRIES: usize = 1_000_000;
+
+/// One grouped projection's cumulative file visits and declared read bytes.
+pub(crate) struct InventoryBudget {
+    remaining_checks: u64,
+    remaining_bytes: u64,
+}
+
+impl InventoryBudget {
+    pub(crate) fn projection() -> Self {
+        Self {
+            remaining_checks: MAX_INVENTORY_ENTRIES as u64,
+            remaining_bytes: axial_minecraft::known_good::MAX_TIER2_AGGREGATE_BYTES,
+        }
+    }
+
+    pub(crate) fn reserve_record(&mut self, bytes: u64) -> Result<(), super::queue::InstallError> {
+        self.reserve(0, bytes)
+    }
+
+    pub(crate) fn reserve_checks(
+        &mut self,
+        entries: u64,
+    ) -> Result<(), super::queue::InstallError> {
+        self.reserve(entries, 0)
+    }
+
+    pub(crate) fn reserve_inventory(
+        &mut self,
+        inventory: &ActivatedVersion,
+    ) -> Result<(), super::queue::InstallError> {
+        use super::queue::InstallError;
+        let checks = (inventory.files.len() as u64)
+            .checked_mul(2)
+            .ok_or(InstallError::AtCapacity)?;
+        if checks > self.remaining_checks {
+            return Err(InstallError::AtCapacity);
+        }
+        let metadata = format!("versions/{0}/{0}.json", inventory.version_id);
+        let mut bytes = 0_u64;
+        for file in &inventory.files {
+            bytes = bytes
+                .checked_add(file.size)
+                .and_then(|bytes| bytes.checked_add(2))
+                .ok_or(InstallError::AtCapacity)?;
+            let asset_index = file
+                .path
+                .strip_prefix("assets/indexes/")
+                .and_then(|path| path.strip_suffix(".json"))
+                .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
+            if file.path == metadata || asset_index {
+                // Bounded JSON reads also perform EOF and completion probes.
+                bytes = bytes
+                    .checked_add(file.size)
+                    .and_then(|bytes| bytes.checked_add(2))
+                    .ok_or(InstallError::AtCapacity)?;
+            }
+        }
+        self.reserve(checks, bytes)
+    }
+
+    fn reserve(&mut self, checks: u64, bytes: u64) -> Result<(), super::queue::InstallError> {
+        use super::queue::InstallError;
+        let remaining_checks = self
+            .remaining_checks
+            .checked_sub(checks)
+            .ok_or(InstallError::AtCapacity)?;
+        let remaining_bytes = self
+            .remaining_bytes
+            .checked_sub(bytes)
+            .ok_or(InstallError::AtCapacity)?;
+        self.remaining_checks = remaining_checks;
+        self.remaining_bytes = remaining_bytes;
+        Ok(())
+    }
+}
 
 /// Private durable projection, produced exclusively by verified activation. A
 /// serialized record is never itself filesystem authority: every use observes
@@ -91,7 +169,7 @@ impl ActivatedVersion {
         use super::queue::InstallError;
         axial_minecraft::ManagedInstallActivationContractId::parse(&self.contract_id)
             .map_err(|_| InstallError::NotReady)?;
-        if self.files.is_empty() || self.files.len() > 1_000_000 {
+        if self.files.is_empty() || self.files.len() > MAX_INVENTORY_ENTRIES {
             return Err(InstallError::NotReady);
         }
         let operation = pin
@@ -261,6 +339,7 @@ impl ActivatedVersion {
             operation,
             guards,
             missing,
+            scratch: None,
         };
         if !reasons.is_empty() {
             evidence.revalidate()?;
@@ -278,7 +357,7 @@ impl ActivatedVersion {
                 .map_err(|_| InstallError::LibraryUnavailable)?,
         );
         let receipt = InstalledVersionReceipt {
-            evidence,
+            evidence: Arc::new(evidence),
             version,
             exact,
             virtual_assets,
@@ -318,20 +397,29 @@ impl ObservedDamage {
         &self.reasons
     }
 
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.evidence.entry_count()
+    }
+
     pub(crate) fn revalidate(&self) -> Result<(), super::queue::InstallError> {
         self.evidence.revalidate()
     }
 }
 
-struct InventoryEvidence {
+pub(crate) struct InventoryEvidence {
     pin: GenerationPin,
     operation: ManagedLibraryOperation,
     guards: Vec<(PortableRelativePath, axial_fs::FileRevisionObservation)>,
     missing: Vec<FileAbsence>,
+    scratch: Option<axial_resource::PhysicalScratchPermit>,
 }
 
 impl InventoryEvidence {
-    fn revalidate(&self) -> Result<(), super::queue::InstallError> {
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.guards.len() as u64 + self.missing.len() as u64
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), super::queue::InstallError> {
         use super::queue::InstallError;
         self.pin.revalidate().map_err(|_| InstallError::NotReady)?;
         let mut batch = self.operation.file_batch();
@@ -349,7 +437,7 @@ impl InventoryEvidence {
 
 /// Verified installation inputs kept alive until the game and output streams settle.
 pub struct InstalledVersionReceipt {
-    evidence: InventoryEvidence,
+    evidence: Arc<InventoryEvidence>,
     version: VersionJson,
     exact: BTreeMap<String, (String, u64)>,
     virtual_assets: bool,
@@ -376,6 +464,34 @@ impl std::fmt::Debug for InstalledVersionReceipt {
 }
 
 impl InstalledVersionReceipt {
+    pub(crate) fn retain_inventory(
+        &mut self,
+    ) -> Result<Arc<InventoryEvidence>, super::queue::InstallError> {
+        use super::queue::InstallError;
+        if !self.evidence.missing.is_empty() {
+            return Err(InstallError::NotReady);
+        }
+        if self.evidence.scratch.is_some() {
+            return Ok(self.evidence.clone());
+        }
+        let evidence = Arc::get_mut(&mut self.evidence).ok_or(InstallError::NotReady)?;
+        // Account for shared retained evidence and its compact holder, not
+        // initial construction or transient decoding heap.
+        let per_entry =
+            std::mem::size_of::<(PortableRelativePath, axial_fs::FileRevisionObservation)>() as u64
+                + axial_minecraft::portable_path::MAX_PORTABLE_RELATIVE_PATH_BYTES as u64;
+        let bytes = evidence
+            .entry_count()
+            .checked_mul(per_entry)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<InventoryEvidence>() as u64))
+            .and_then(|bytes| bytes.checked_add(1024))
+            .ok_or(InstallError::AtCapacity)?;
+        evidence.scratch = axial_resource::process_physical_work()
+            .try_reserve_scratch(bytes)
+            .map_err(|_| InstallError::AtCapacity)?;
+        Ok(self.evidence.clone())
+    }
+
     pub fn version(&self) -> &VersionJson {
         &self.version
     }
@@ -392,6 +508,7 @@ impl InstalledVersionReceipt {
 
     pub(crate) async fn prepare_game_libraries(
         self,
+        budget: Option<Arc<std::sync::Mutex<InventoryBudget>>>,
     ) -> Result<(Self, Option<GameLibraries>), GameLibrariesError> {
         use super::queue::InstallError;
         use axial_minecraft::loaders::game_libraries;
@@ -408,79 +525,106 @@ impl InstalledVersionReceipt {
             .ok_or(GameLibrariesError::Install(InstallError::NotReady))?;
         let scratch = game_libraries::scratch_bytes(size)
             .map_err(|_| GameLibrariesError::Install(InstallError::NotReady))?;
-        process_physical_work()
-            .admit(PhysicalWorkRequest::foreground(
-                PhysicalIoClass::Read,
-                scratch,
-            ))
-            .await
-            .map_err(GameLibrariesError::Physical)?
-            .run(move |_| {
-                let path = PortableRelativePath::new_exact(&client_path)
-                    .map_err(|_| InstallError::NotReady)?;
-                let expected = self
-                    .evidence
-                    .guards
-                    .iter()
-                    .find(|(recorded, _)| recorded == &path)
-                    .map(|(_, revision)| revision)
-                    .ok_or(InstallError::NotReady)?;
-                let client = self
-                    .evidence
-                    .operation
-                    .observe_file(&path)
-                    .map_err(|_| InstallError::NotReady)?
-                    .ok_or(InstallError::NotReady)?;
-                if client.revision_observation() != *expected {
-                    return Err(InstallError::NotReady);
-                }
-                let bytes = client
-                    .read_bounded(size)
-                    .map_err(|_| InstallError::NotReady)?;
-                let requirements = game_libraries::recognize(&self.version.id, &bytes)
-                    .map_err(|_| InstallError::NotReady)?;
-                let mut sources = Vec::new();
-                if let Some(requirements) = &requirements {
-                    for entry in requirements.entries() {
-                        let path = format!("libraries/{}", entry.path());
-                        if !self.exact.get(&path).is_some_and(|(sha1, size)| {
-                            sha1 == entry.sha1() && *size == entry.size()
-                        }) {
-                            return Err(InstallError::NotReady);
-                        }
-                        let path = PortableRelativePath::new_exact(&path)
-                            .map_err(|_| InstallError::NotReady)?;
-                        let expected = self
-                            .evidence
-                            .guards
-                            .iter()
-                            .find(|(recorded, _)| recorded == &path)
-                            .map(|(_, revision)| revision)
-                            .ok_or(InstallError::NotReady)?;
-                        let source = self
-                            .evidence
-                            .operation
-                            .observe_file(&path)
-                            .map_err(|_| InstallError::NotReady)?
-                            .ok_or(InstallError::NotReady)?;
-                        if source.revision_observation() != *expected {
-                            return Err(InstallError::NotReady);
-                        }
-                        sources.push(source);
+        if let Some(budget) = &budget {
+            let bytes = size
+                .checked_add(2)
+                .ok_or(GameLibrariesError::Install(InstallError::AtCapacity))?;
+            budget
+                .lock()
+                .unwrap()
+                .reserve(1, bytes)
+                .map_err(GameLibrariesError::Install)?;
+        }
+        let work = process_physical_work();
+        let retained_scratch = if budget.is_some() {
+            work.try_reserve_scratch(scratch)
+                .map_err(GameLibrariesError::Physical)?
+        } else {
+            None
+        };
+        work.admit(PhysicalWorkRequest::foreground(
+            PhysicalIoClass::Read,
+            if budget.is_some() { 0 } else { scratch },
+        ))
+        .await
+        .map_err(GameLibrariesError::Physical)?
+        .run(move |_| {
+            let _scratch = retained_scratch;
+            let path = PortableRelativePath::new_exact(&client_path)
+                .map_err(|_| InstallError::NotReady)?;
+            let expected = self
+                .evidence
+                .guards
+                .iter()
+                .find(|(recorded, _)| recorded == &path)
+                .map(|(_, revision)| revision)
+                .ok_or(InstallError::NotReady)?;
+            let client = self
+                .evidence
+                .operation
+                .observe_file(&path)
+                .map_err(|_| InstallError::NotReady)?
+                .ok_or(InstallError::NotReady)?;
+            if client.revision_observation() != *expected {
+                return Err(InstallError::NotReady);
+            }
+            let bytes = client
+                .read_bounded(size)
+                .map_err(|_| InstallError::NotReady)?;
+            let requirements = game_libraries::recognize(&self.version.id, &bytes)
+                .map_err(|_| InstallError::NotReady)?;
+            if let Some(budget) = &budget {
+                let checks = requirements
+                    .as_ref()
+                    .map_or(0, |requirements| requirements.entries().len() as u64)
+                    .checked_add(self.evidence.entry_count())
+                    .ok_or(InstallError::AtCapacity)?;
+                budget.lock().unwrap().reserve_checks(checks)?;
+            }
+            let mut sources = Vec::new();
+            if let Some(requirements) = &requirements {
+                for entry in requirements.entries() {
+                    let path = format!("libraries/{}", entry.path());
+                    if !self
+                        .exact
+                        .get(&path)
+                        .is_some_and(|(sha1, size)| sha1 == entry.sha1() && *size == entry.size())
+                    {
+                        return Err(InstallError::NotReady);
                     }
+                    let path = PortableRelativePath::new_exact(&path)
+                        .map_err(|_| InstallError::NotReady)?;
+                    let expected = self
+                        .evidence
+                        .guards
+                        .iter()
+                        .find(|(recorded, _)| recorded == &path)
+                        .map(|(_, revision)| revision)
+                        .ok_or(InstallError::NotReady)?;
+                    let source = self
+                        .evidence
+                        .operation
+                        .observe_file(&path)
+                        .map_err(|_| InstallError::NotReady)?
+                        .ok_or(InstallError::NotReady)?;
+                    if source.revision_observation() != *expected {
+                        return Err(InstallError::NotReady);
+                    }
+                    sources.push(source);
                 }
-                self.revalidate()?;
-                Ok((
-                    self,
-                    requirements.map(|requirements| GameLibraries {
-                        requirements,
-                        sources,
-                    }),
-                ))
-            })
-            .await
-            .map_err(GameLibrariesError::Physical)?
-            .map_err(GameLibrariesError::Install)
+            }
+            self.revalidate()?;
+            Ok((
+                self,
+                requirements.map(|requirements| GameLibraries {
+                    requirements,
+                    sources,
+                }),
+            ))
+        })
+        .await
+        .map_err(GameLibrariesError::Physical)?
+        .map_err(GameLibrariesError::Install)
     }
 
     pub(crate) async fn prepare_natives(
@@ -546,6 +690,394 @@ mod tests {
                 files,
             },
         )
+    }
+
+    async fn preparation_child(selector: &str) -> bool {
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "AXIAL_INVENTORY_PREPARATION_CHILD";
+        if std::env::var(CHILD).ok().as_deref() == Some(selector) {
+            return true;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", selector, "--nocapture"])
+            .env(CHILD, selector)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let observed = loop {
+            match child.try_wait() {
+                Ok(None) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                result => break result,
+            }
+        };
+        if !matches!(&observed, Ok(Some(_))) {
+            let _ = child.kill();
+        }
+        let joined = child.wait();
+        assert!(
+            matches!(&observed, Ok(Some(status)) if status.success())
+                && joined.as_ref().is_ok_and(|status| status.success()),
+            "isolated preparation control: observed={observed:?}, joined={joined:?}",
+        );
+        false
+    }
+
+    fn historical_fixture() -> (tempfile::TempDir, LibraryLifecycle, ActivatedVersion) {
+        let temporary =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let version_id = axial_minecraft::loaders::installed_version_id_for(
+            axial_minecraft::LoaderComponentId::Forge,
+            "1.4.7",
+            "6.6.2.534",
+        )
+        .unwrap();
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "id": version_id, "type": "release",
+        }))
+        .unwrap();
+        // A valid empty ZIP reaches historical preparation without an FML declaration.
+        let client = b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let mut files = Vec::new();
+        for (extension, bytes) in [("json", metadata.as_slice()), ("jar", client.as_slice())] {
+            let path = format!("versions/{version_id}/{version_id}.{extension}");
+            let target = temporary.path().join(&path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, bytes).unwrap();
+            files.push(ActivatedFile {
+                path,
+                sha1: hex::encode(Sha1::digest(bytes)),
+                size: bytes.len() as u64,
+            });
+        }
+        let LibraryOpenOutcome::Ready(library) = LibraryLifecycle::open(temporary.path()) else {
+            panic!("isolated library admission");
+        };
+        let activated = ActivatedVersion {
+            version_id,
+            contract_id: format!("managed-install-activation-v1.{}", "A".repeat(43)),
+            files,
+        };
+        (temporary, library, activated)
+    }
+
+    #[test]
+    fn inventory_budget_includes_checksum_and_json_growth_probes() {
+        let (_temporary, library, activated) = fixture();
+        let mut budget = InventoryBudget::projection();
+        // Four payloads total 73 bytes; checksum probes add 8, metadata reread 34.
+        budget.reserve_record((16_u64 << 30) - 115).unwrap();
+        budget.reserve_inventory(&activated).unwrap();
+        let receipt = activated.verify(library.admit().unwrap()).unwrap();
+        receipt.revalidate().unwrap();
+        drop(receipt);
+        assert!(matches!(
+            budget.reserve_record(1),
+            Err(InstallError::AtCapacity)
+        ));
+    }
+
+    #[tokio::test]
+    async fn grouped_historical_preparation_refuses_retained_scratch_pressure() {
+        use axial_resource::{PhysicalWorkClass, PhysicalWorkError, process_physical_work};
+        use std::time::Duration;
+
+        if !preparation_child("install::artifacts::tests::grouped_historical_preparation_refuses_retained_scratch_pressure").await {
+            return;
+        }
+        let (temporary, library, activated) = historical_fixture();
+        let version_id = activated.version_id.clone();
+        let metadata = std::fs::read(
+            temporary
+                .path()
+                .join(format!("versions/{version_id}/{version_id}.json")),
+        )
+        .unwrap();
+        let client = std::fs::read(
+            temporary
+                .path()
+                .join(format!("versions/{version_id}/{version_id}.jar")),
+        )
+        .unwrap();
+        let pin = library.admit().unwrap();
+        let mut receipt = activated.clone().verify(pin.clone()).unwrap();
+        let evidence = receipt.retain_inventory().unwrap();
+        let original_valid = evidence.revalidate().is_ok();
+        let work = process_physical_work();
+        let remaining = work
+            .snapshot(PhysicalWorkClass::Foreground)
+            .available_scratch_bytes;
+        let occupied = work.try_reserve_scratch(remaining);
+        let pressure_admitted = matches!(&occupied, Ok(Some(_)));
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            receipt.prepare_game_libraries(Some(Arc::new(std::sync::Mutex::new(
+                InventoryBudget::projection(),
+            )))),
+        )
+        .await;
+        let refused = matches!(
+            &result,
+            Ok(Err(GameLibrariesError::Physical(
+                PhysicalWorkError::Unavailable
+            )))
+        );
+        drop(result);
+        let before_release = work.snapshot(PhysicalWorkClass::Foreground);
+        drop(occupied);
+        let preserved = evidence.revalidate().is_ok();
+        let positive = match activated.verify(pin.clone()) {
+            Ok(receipt) => receipt.prepare_game_libraries(None).await,
+            Err(error) => Err(GameLibrariesError::Install(error)),
+        };
+        let prepared = matches!(&positive, Ok((_, None)));
+        drop(positive);
+        let unchanged = std::fs::read(
+            temporary
+                .path()
+                .join(format!("versions/{version_id}/{version_id}.json")),
+        )
+        .is_ok_and(|bytes| bytes == metadata)
+            && std::fs::read(
+                temporary
+                    .path()
+                    .join(format!("versions/{version_id}/{version_id}.jar")),
+            )
+            .is_ok_and(|bytes| bytes == client);
+        drop((evidence, pin));
+        let settled = library.try_preserve();
+        drop(library);
+        let idle = work.snapshot(PhysicalWorkClass::Foreground);
+        if !original_valid
+            || !pressure_admitted
+            || !refused
+            || !preserved
+            || !prepared
+            || !unchanged
+            || settled.is_err()
+            || before_release.active_admissions != 0
+            || before_release.running_workers != 0
+            || before_release.available_scratch_bytes != 0
+            || idle.active_admissions != 0
+            || idle.running_workers != 0
+            || idle.available_scratch_bytes != work.scratch_limit_bytes()
+        {
+            eprintln!(
+                "scratch control fixture retained at {}",
+                temporary.keep().display()
+            );
+        }
+        assert!(
+            original_valid
+                && pressure_admitted
+                && preserved
+                && prepared
+                && unchanged
+                && settled.is_ok()
+        );
+        assert_eq!(before_release.active_admissions, 0);
+        assert_eq!(before_release.running_workers, 0);
+        assert_eq!(before_release.available_scratch_bytes, 0);
+        assert_eq!(idle.active_admissions, 0);
+        assert_eq!(idle.running_workers, 0);
+        assert_eq!(idle.available_scratch_bytes, work.scratch_limit_bytes());
+        assert!(
+            refused,
+            "grouped preparation must refuse rather than await retained scratch"
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_historical_preparation_reserves_reads_and_revision_passes() {
+        use axial_resource::{PhysicalWorkClass, process_physical_work};
+
+        if !preparation_child("install::artifacts::tests::grouped_historical_preparation_reserves_reads_and_revision_passes").await {
+            return;
+        }
+        let (temporary, library, activated) = historical_fixture();
+        let version_id = &activated.version_id;
+        let paths = [
+            temporary
+                .path()
+                .join(format!("versions/{version_id}/{version_id}.json")),
+            temporary
+                .path()
+                .join(format!("versions/{version_id}/{version_id}.jar")),
+        ];
+        let before = paths.each_ref().map(|path| std::fs::read(path).unwrap());
+        let pin = library.admit().unwrap();
+        let original = activated.clone().verify(pin.clone()).unwrap();
+        let positive = match activated.clone().verify(pin.clone()) {
+            Ok(receipt) => {
+                receipt
+                    .prepare_game_libraries(Some(Arc::new(std::sync::Mutex::new(
+                        InventoryBudget::projection(),
+                    ))))
+                    .await
+            }
+            Err(error) => Err(GameLibrariesError::Install(error)),
+        };
+        let prepared = matches!(&positive, Ok((_, None)));
+        drop(positive);
+
+        let mut observations = Vec::new();
+        for (name, checks, bytes) in [
+            ("client observation", 0, 24),
+            ("client read and probes", 3, 23),
+            ("final original revisions", 2, 24),
+            ("exact allowance", 3, 24),
+        ] {
+            let mut budget = InventoryBudget::projection();
+            budget.reserve_checks(1_000_000 - checks).unwrap();
+            budget.reserve_record((16_u64 << 30) - bytes).unwrap();
+            let result = match activated.clone().verify(pin.clone()) {
+                Ok(receipt) => {
+                    receipt
+                        .prepare_game_libraries(Some(Arc::new(std::sync::Mutex::new(budget))))
+                        .await
+                }
+                Err(error) => Err(GameLibrariesError::Install(error)),
+            };
+            observations.push((
+                name,
+                matches!(
+                    &result,
+                    Err(GameLibrariesError::Install(InstallError::AtCapacity))
+                ),
+                matches!(&result, Ok((_, None))),
+            ));
+            drop(result);
+        }
+        let preserved = original.revalidate().is_ok();
+        let unchanged = paths
+            .iter()
+            .zip(&before)
+            .all(|(path, expected)| std::fs::read(path).is_ok_and(|bytes| bytes == *expected));
+        drop((original, pin));
+        let settled = library.try_preserve();
+        drop(library);
+        let work = process_physical_work();
+        let idle = work.snapshot(PhysicalWorkClass::Foreground);
+        let expected = [
+            ("client observation", true, false),
+            ("client read and probes", true, false),
+            ("final original revisions", true, false),
+            ("exact allowance", false, true),
+        ];
+        if !prepared
+            || !preserved
+            || !unchanged
+            || settled.is_err()
+            || idle.active_admissions != 0
+            || idle.running_workers != 0
+            || idle.available_scratch_bytes != work.scratch_limit_bytes()
+            || observations != expected
+        {
+            eprintln!(
+                "preparation budget fixture retained at {}",
+                temporary.keep().display()
+            );
+        }
+        assert!(prepared && preserved && unchanged && settled.is_ok());
+        assert_eq!(idle.active_admissions, 0);
+        assert_eq!(idle.running_workers, 0);
+        assert_eq!(idle.available_scratch_bytes, work.scratch_limit_bytes());
+        assert_eq!(observations, expected);
+    }
+
+    #[tokio::test]
+    async fn repeated_inventory_retention_shares_charge_until_last_reader_drops() {
+        use axial_resource::{PhysicalWorkClass, process_physical_work};
+
+        if !preparation_child("install::artifacts::tests::repeated_inventory_retention_shares_charge_until_last_reader_drops").await {
+            return;
+        }
+        let (temporary, library, activated) = historical_fixture();
+        let client = temporary
+            .path()
+            .join(format!("versions/{0}/{0}.jar", activated.version_id,));
+        let original_bytes = std::fs::read(&client).unwrap();
+        let pin = library.admit().unwrap();
+        let mut receipt = activated.clone().verify(pin.clone()).unwrap();
+        let work = process_physical_work();
+        let before = work
+            .snapshot(PhysicalWorkClass::Foreground)
+            .available_scratch_bytes;
+        let first = receipt.retain_inventory().unwrap();
+        let once = work
+            .snapshot(PhysicalWorkClass::Foreground)
+            .available_scratch_bytes;
+        let second = receipt.retain_inventory().unwrap();
+        let twice = work
+            .snapshot(PhysicalWorkClass::Foreground)
+            .available_scratch_bytes;
+        let valid = first.revalidate().is_ok() && second.revalidate().is_ok();
+        drop(receipt);
+        let receipt_dropped = work
+            .snapshot(PhysicalWorkClass::Foreground)
+            .available_scratch_bytes;
+        drop(first);
+        let first_dropped = work
+            .snapshot(PhysicalWorkClass::Foreground)
+            .available_scratch_bytes;
+
+        let previous = client.with_file_name("previous-client.jar");
+        let replacement = std::fs::rename(&client, &previous)
+            .and_then(|()| std::fs::write(&client, &original_bytes));
+        let refused = matches!(second.revalidate(), Err(InstallError::NotReady));
+        let fresh = activated.verify(pin.clone());
+        let fresh_valid = fresh
+            .as_ref()
+            .is_ok_and(|receipt| receipt.revalidate().is_ok());
+        drop(fresh);
+        let restored = if replacement.is_ok() {
+            std::fs::remove_file(&client).and_then(|()| std::fs::rename(&previous, &client))
+        } else {
+            Err(std::io::Error::other("fixture replacement failed"))
+        };
+        let unchanged = std::fs::read(&client).is_ok_and(|bytes| bytes == original_bytes);
+        drop((second, pin));
+        let settled = library.try_preserve();
+        drop(library);
+        let idle = work.snapshot(PhysicalWorkClass::Foreground);
+        let charges = [twice, receipt_dropped, first_dropped];
+        if !valid
+            || replacement.is_err()
+            || !refused
+            || !fresh_valid
+            || restored.is_err()
+            || !unchanged
+            || settled.is_err()
+            || once >= before
+            || charges != [once; 3]
+            || idle.available_scratch_bytes != before
+            || idle.active_admissions != 0
+            || idle.running_workers != 0
+        {
+            eprintln!(
+                "inventory retention fixture retained at {}",
+                temporary.keep().display()
+            );
+        }
+        assert!(
+            valid
+                && replacement.is_ok()
+                && refused
+                && fresh_valid
+                && restored.is_ok()
+                && unchanged
+                && settled.is_ok()
+        );
+        assert_eq!(idle.active_admissions, 0);
+        assert_eq!(idle.running_workers, 0);
+        assert_eq!(idle.available_scratch_bytes, before);
+        assert!(once < before);
+        assert_eq!(
+            charges, [once; 3],
+            "one charge survives until the last reader"
+        );
     }
 
     #[test]

@@ -1966,7 +1966,7 @@ impl InstallQueue {
         pin: &GenerationPin,
         version_id: &str,
     ) -> Result<InstalledVersionReceipt, InstallError> {
-        self.inspect_version(pin, version_id, false)
+        self.inspect_version(pin, version_id, false, None)
             .await?
             .into_ready()
     }
@@ -1976,6 +1976,7 @@ impl InstallQueue {
         pin: &GenerationPin,
         version_id: &str,
         diagnostics: bool,
+        budget: Option<Arc<Mutex<artifacts::InventoryBudget>>>,
     ) -> Result<VersionInspection, InstallError> {
         let library_id = pin.library_id().to_string();
         let version_id = version_id.to_owned();
@@ -1983,13 +1984,23 @@ impl InstallQueue {
         let pin = pin.clone();
         tokio::task::spawn_blocking(move || {
             let record: Option<String> = storage.read(|db| {
-                db.query_row("SELECT inventory_json FROM installed_versions WHERE library_id=?1 AND version_id=?2 AND state='ready'", params![library_id, version_id], |row| row.get(0))
-                    .optional().map_err(InstallError::from)
+                let mut statement = db.prepare("SELECT length(CAST(inventory_json AS BLOB)), inventory_json FROM installed_versions WHERE library_id=?1 AND version_id=?2 AND state='ready'")?;
+                let mut rows = statement.query(params![library_id, version_id])?;
+                let Some(row) = rows.next()? else { return Ok(None); };
+                let bytes: u64 = row.get(0)?;
+                if bytes > 128 << 20 { return Err(InstallError::NotReady); }
+                if let Some(budget) = &budget {
+                    budget.lock().unwrap().reserve_record(bytes)?;
+                }
+                row.get(1).map(Some).map_err(InstallError::from)
             })?;
             let record = record.ok_or(InstallError::NotReady)?;
             if record.len() > 128 << 20 { return Err(InstallError::NotReady); }
             let activated: ActivatedVersion = serde_json::from_str(&record).map_err(|_| InstallError::NotReady)?;
             if activated.version_id != version_id { return Err(InstallError::NotReady); }
+            if let Some(budget) = &budget {
+                budget.lock().unwrap().reserve_inventory(&activated)?;
+            }
             activated.inspect(pin, diagnostics)
         }).await.map_err(|_| InstallError::NotReady)?
     }

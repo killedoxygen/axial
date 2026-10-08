@@ -44,7 +44,7 @@ use crate::{
         session::AuthService,
     },
     install::{
-        artifacts::VersionInspection,
+        artifacts::{InventoryBudget, InventoryEvidence, VersionInspection},
         queue::{InstallError, InstallQueue, InstalledVersionReceipt},
     },
     instances::{
@@ -81,6 +81,8 @@ pub struct LaunchCoordinator {
 
 pub(crate) struct PreflightProjection {
     current: Option<Arc<PreflightArtifacts>>,
+    inventories: Vec<Arc<PreflightInventory>>,
+    budget: Arc<Mutex<InventoryBudget>>,
     scan: Option<Result<Arc<crate::catalog::InstalledSnapshot>, LaunchError>>,
     finalize_scan: bool,
     context: Result<(CapturedSelection, u64), LaunchError>,
@@ -92,6 +94,7 @@ pub(crate) struct PreflightProjection {
 impl Drop for PreflightProjection {
     fn drop(&mut self) {
         drop(self.current.take());
+        self.inventories.clear();
         drop(self.scan.take());
         // Admission refusal can release proof without a task-completion wake.
         self.installs.resume_queued();
@@ -99,16 +102,21 @@ impl Drop for PreflightProjection {
 }
 
 struct PreflightArtifacts {
-    pin: GenerationPin,
-    _lease: ExclusionLease,
-    bundle: axial_minecraft::VersionBundleReadGuard,
+    inventory: Arc<PreflightInventory>,
     installed: InstalledVersionReceipt,
 }
 
-impl PreflightArtifacts {
+struct PreflightInventory {
+    pin: GenerationPin,
+    _lease: ExclusionLease,
+    bundle: axial_minecraft::VersionBundleReadGuard,
+    evidence: Arc<InventoryEvidence>,
+}
+
+impl PreflightInventory {
     fn revalidate(&self) -> Result<(), LaunchError> {
         self.bundle.revalidate().map_err(bundle_read_error)?;
-        self.installed.revalidate().map_err(install_read_error)
+        self.evidence.revalidate().map_err(install_read_error)
     }
 }
 
@@ -556,6 +564,8 @@ impl LaunchCoordinator {
     pub(crate) fn preflight_projection(&self) -> PreflightProjection {
         PreflightProjection {
             current: None,
+            inventories: Vec::new(),
+            budget: Arc::new(Mutex::new(InventoryBudget::projection())),
             scan: None,
             finalize_scan: false,
             context: (|| {
@@ -592,10 +602,36 @@ impl LaunchCoordinator {
             return Ok(());
         };
         let scan = scan?;
+        let inventories = projection.inventories.clone();
+        let checks = inventories.iter().try_fold(0u64, |sum, inventory| {
+            sum.checked_add(inventory.evidence.entry_count())
+                .ok_or(LaunchError::AtCapacity)
+        })?;
+        projection
+            .budget
+            .lock()
+            .unwrap()
+            .reserve_checks(checks)
+            .map_err(install_read_error)?;
         let coordinator = self.clone();
         self.tasks
-            .try_spawn(scan.clone(), move |_| async move {
-                coordinator.revalidate_scan(scan).await
+            .try_spawn((scan.clone(), inventories.clone()), move |_| async move {
+                coordinator.revalidate_scan(scan).await?;
+                axial_resource::process_physical_work()
+                    .admit(axial_resource::PhysicalWorkRequest::foreground(
+                        axial_resource::PhysicalIoClass::Metadata,
+                        0,
+                    ))
+                    .await
+                    .map_err(|_| LaunchError::AtCapacity)?
+                    .run(move |_| {
+                        for inventory in inventories {
+                            inventory.revalidate()?;
+                        }
+                        Ok::<_, LaunchError>(())
+                    })
+                    .await
+                    .map_err(|_| LaunchError::PreparationFailed)?
             })
             .map_err(|_| LaunchError::AtCapacity)?
             .join()
@@ -707,6 +743,12 @@ impl LaunchCoordinator {
         id: &InstanceId,
         projection: &mut PreflightProjection,
     ) -> Result<LaunchPreflight, LaunchError> {
+        projection
+            .budget
+            .lock()
+            .unwrap()
+            .reserve_checks(1)
+            .map_err(install_read_error)?;
         let admitted = Arc::new(self.instances.admit_read(id).map_err(instance_error)?);
         let pin = admitted.game_directory().pin().clone();
         if projection.scan.as_ref().is_some_and(|scan| {
@@ -716,8 +758,8 @@ impl LaunchCoordinator {
             return Err(LaunchError::LibraryUnavailable);
         }
         if projection.current.as_ref().is_some_and(|proof| {
-            proof.pin.generation() != pin.generation()
-                || proof.pin.library_id() != pin.library_id()
+            proof.inventory.pin.generation() != pin.generation()
+                || proof.inventory.pin.library_id() != pin.library_id()
                 || proof.installed.version().id != admitted.record().instance.version_id
         }) {
             projection.current = None;
@@ -743,6 +785,7 @@ impl LaunchCoordinator {
         let host = projection.host.clone();
         let diagnostics = projection.diagnostics;
         let finalize_scan = projection.finalize_scan;
+        let budget = projection.budget.clone();
         let task = self
             .tasks
             .try_spawn(retained, move |cancel| async move {
@@ -758,7 +801,10 @@ impl LaunchCoordinator {
                     // catalogue display flags and transient admission failures do not.
                     let previous = owned_proof.lock().unwrap().clone();
                     let proof = if let Some(proof) = previous {
-                        let checked = proof.clone();
+                        budget.lock().unwrap()
+                            .reserve_checks(proof.inventory.evidence.entry_count())
+                            .map_err(install_read_error)?;
+                        let checked = proof.inventory.clone();
                         let result = tokio::task::spawn_blocking(move || checked.revalidate())
                         .await
                         .map_err(|_| LaunchError::PreparationFailed)
@@ -809,7 +855,8 @@ impl LaunchCoordinator {
                         let collect_damage = diagnostics || scan.is_degraded();
                         let installed = match coordinator
                             .installs
-                            .inspect_version(&pin, &admitted.record().instance.version_id, collect_damage)
+                            .inspect_version(&pin, &admitted.record().instance.version_id,
+                                collect_damage, Some(budget.clone()))
                             .await
                         {
                             Ok(VersionInspection::Ready(installed)) => installed,
@@ -822,14 +869,18 @@ impl LaunchCoordinator {
                             }
                             Err(error) => return Err(install_read_error(error)),
                         };
-                        let (installed, _) = installed
-                            .prepare_game_libraries()
+                        let (mut installed, _) = installed
+                            .prepare_game_libraries(Some(budget.clone()))
                             .await
                             .map_err(game_libraries_error)?;
-                        let proof = Arc::new(PreflightArtifacts {
+                        let inventory = Arc::new(PreflightInventory {
                             pin,
                             _lease: artifacts,
                             bundle: bundle_guard.take().unwrap(),
+                            evidence: installed.retain_inventory().map_err(install_read_error)?,
+                        });
+                        let proof = Arc::new(PreflightArtifacts {
+                            inventory,
                             installed,
                         });
                         *owned_proof.lock().unwrap() = Some(proof.clone());
@@ -884,7 +935,7 @@ impl LaunchCoordinator {
                             Err(error @ (JavaDiscoveryError::Missing | JavaDiscoveryError::NotExecutable))
                                 if diagnostics && settings.java_override_origin.is_some() =>
                             {
-                                proof.bundle.revalidate().map_err(bundle_read_error)?;
+                                proof.inventory.bundle.revalidate().map_err(bundle_read_error)?;
                                 let mut refused = LaunchPreflight::refused(
                                     target.id.clone(),
                                     LaunchError::RuntimeFailure(error),
@@ -968,13 +1019,21 @@ impl LaunchCoordinator {
                 .await;
                 let observed_damage = match observed_damage {
                     Some(damage) => {
-                        let checked = tokio::task::spawn_blocking(move || {
-                            damage.revalidate()?;
-                            Ok::<_, InstallError>(damage)
-                        })
-                        .await
-                        .map_err(|_| LaunchError::PreparationFailed)
-                        .and_then(|result| result.map_err(install_read_error));
+                        let reserved = budget
+                            .lock()
+                            .unwrap()
+                            .reserve_checks(damage.entry_count())
+                            .map_err(install_read_error);
+                        let checked = match reserved {
+                            Ok(()) => tokio::task::spawn_blocking(move || {
+                                damage.revalidate()?;
+                                Ok::<_, InstallError>(damage)
+                            })
+                            .await
+                            .map_err(|_| LaunchError::PreparationFailed)
+                            .and_then(|result| result.map_err(install_read_error)),
+                            Err(error) => Err(error),
+                        };
                         match checked {
                             Ok(damage) => Some(damage),
                             Err(error) => {
@@ -990,12 +1049,20 @@ impl LaunchCoordinator {
                     coordinator.revalidate_scan(scan?).await?;
                 }
                 let final_proof = owned_proof.lock().unwrap().clone();
-                if let Some(proof) = &final_proof {
-                    let proof = proof.clone();
-                    let checked = tokio::task::spawn_blocking(move || proof.revalidate())
-                        .await
-                        .map_err(|_| LaunchError::PreparationFailed)
-                        .and_then(|result| result);
+                if finalize_scan && let Some(proof) = &final_proof {
+                    let reserved = budget.lock().unwrap()
+                        .reserve_checks(proof.inventory.evidence.entry_count())
+                        .map_err(install_read_error);
+                    let checked = match reserved {
+                        Ok(()) => {
+                            let proof = proof.inventory.clone();
+                            tokio::task::spawn_blocking(move || proof.revalidate())
+                                .await
+                                .map_err(|_| LaunchError::PreparationFailed)
+                                .and_then(|result| result)
+                        }
+                        Err(error) => Err(error),
+                    };
                     if let Err(error) = checked {
                         *owned_proof.lock().unwrap() = None;
                         result = Err(error);
@@ -1012,7 +1079,7 @@ impl LaunchCoordinator {
                     absence.revalidate()
                         .map_err(|_| LaunchError::RuntimeFailure(JavaDiscoveryError::Replaced))?;
                     let proof = final_proof.as_ref().ok_or(LaunchError::PreparationFailed)?;
-                    proof.bundle.revalidate().map_err(bundle_read_error)?;
+                    proof.inventory.bundle.revalidate().map_err(bundle_read_error)?;
                 }
                 if let Some(damage) = observed_damage {
                     bundle_guard
@@ -1103,6 +1170,14 @@ impl LaunchCoordinator {
         projection.scan = scan_slot.lock().unwrap().clone();
         if result.is_ok() {
             projection.current = proof_slot.lock().unwrap().take();
+            if let Some(proof) = &projection.current
+                && !projection
+                    .inventories
+                    .iter()
+                    .any(|inventory| Arc::ptr_eq(inventory, &proof.inventory))
+            {
+                projection.inventories.push(proof.inventory.clone());
+            }
         }
         result.map_err(|_| LaunchError::PreparationFailed)?
     }
@@ -1226,7 +1301,7 @@ impl LaunchCoordinator {
             return Err(LaunchError::InstalledVersionsDegraded);
         }
         let (installed, game_libraries) = installed
-            .prepare_game_libraries()
+            .prepare_game_libraries(None)
             .await
             .map_err(game_libraries_error)?;
         let mode = crate::performance::plan::configured_mode(effective.performance_mode);
@@ -2915,6 +2990,56 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn preflight_reserves_observed_damage_revalidation_before_publication() {
+        let (root, coordinator, id) = preflight_fixture().await;
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        let client = root.path().join("versions/1.20.1/1.20.1.jar");
+        std::fs::remove_file(&client).unwrap();
+        let mut ordinary = coordinator.preflight_projection();
+        ordinary.diagnostics = true;
+        let damaged = coordinator
+            .preflight_with_projection(id.clone(), &mut ordinary)
+            .await;
+        drop(ordinary);
+        let source =
+            axial_minecraft::known_good::managed_version_bundle_activation_source_fixture_for_test(
+                "1.20.1",
+            )
+            .unwrap();
+        let files = crate::install::artifacts::ActivatedVersion::from_source(&source)
+            .files
+            .len() as u64;
+        let mut limited = coordinator.preflight_projection();
+        limited.diagnostics = true;
+        limited
+            .budget
+            .lock()
+            .unwrap()
+            .reserve_checks(1_000_000 - 1 - 2 * files)
+            .unwrap();
+        let exhausted = coordinator
+            .preflight_with_projection(id, &mut limited)
+            .await;
+        drop(limited);
+        let stopped = coordinator
+            .tasks
+            .shutdown(std::time::Duration::from_secs(3))
+            .await;
+        stopped.unwrap();
+        assert_eq!(
+            damaged.error.map(|error| error.code),
+            Some(LaunchError::InstallUnavailable)
+        );
+        assert_eq!(
+            exhausted.error.map(|error| error.code),
+            Some(LaunchError::AtCapacity)
+        );
+        assert!(!exhausted.launchable);
+        assert!(!client.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn preflight_wrong_java_major_keeps_safe_cause() {
         assert_runtime_failure_keeps_safe_cause(false, false).await;
     }
@@ -3509,7 +3634,16 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             3
         );
-        assert_eq!(projection.current.as_ref().unwrap().pin.generation(), after);
+        assert_eq!(
+            projection
+                .current
+                .as_ref()
+                .unwrap()
+                .inventory
+                .pin
+                .generation(),
+            after
+        );
     }
 
     #[cfg(unix)]
@@ -3868,6 +4002,11 @@ mod tests {
             ("foreground", false, Some(LaunchError::InstanceBusy)),
             ("foreground", true, Some(LaunchError::InstanceBusy)),
             ("generation", false, Some(LaunchError::LibraryUnavailable)),
+            (
+                "capacity_foreground",
+                false,
+                Some(LaunchError::InstanceBusy),
+            ),
             ("display", false, None),
             (
                 "none",
@@ -3881,6 +4020,7 @@ mod tests {
                 coordinator.accounts.remove(account.account_id()).unwrap();
             }
             let mut projection = coordinator.preflight_projection();
+            projection.finalize_scan = change == "capacity_foreground";
             std::fs::write(root.path().join("probe-release"), b"release").unwrap();
             assert!(
                 coordinator
@@ -3893,6 +4033,7 @@ mod tests {
             if fail_probe {
                 std::fs::write(root.path().join("probe-fail"), b"fail").unwrap();
             }
+            let budget = projection.budget.clone();
             let waiter = tokio::spawn({
                 let coordinator = coordinator.clone();
                 let id = id.clone();
@@ -3964,6 +4105,14 @@ mod tests {
                         }
                     }
                     "foreground" => foreground = Some(coordinator.admit(&id)?),
+                    "capacity_foreground" => {
+                        foreground = Some(coordinator.admit(&id)?);
+                        let mut budget = budget.lock().unwrap();
+                        *budget = InventoryBudget::projection();
+                        budget
+                            .reserve_checks(1_000_000)
+                            .map_err(install_read_error)?;
+                    }
                     "generation" => {
                         let library = coordinator.instances.library();
                         let pin = library

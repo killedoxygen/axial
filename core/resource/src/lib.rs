@@ -281,6 +281,16 @@ impl PhysicalWorkOwner {
             .map(|permit| PhysicalScratchPermit { _permit: permit }))
     }
 
+    /// Reserve without waiting while earlier allocations remain retained.
+    pub fn try_reserve_scratch(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<PhysicalScratchPermit>, PhysicalWorkError> {
+        Ok(self
+            .try_reserve_scratch_inner(bytes)?
+            .map(|permit| PhysicalScratchPermit { _permit: permit }))
+    }
+
     pub fn snapshot(&self, class: PhysicalWorkClass) -> PhysicalWorkSnapshot {
         PhysicalWorkSnapshot {
             active_admissions: self.inner.active[class.index()].load(Ordering::Acquire),

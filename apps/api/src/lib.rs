@@ -928,6 +928,8 @@ async fn start_profile_inner(
         .merge(routes::system::router())
         .merge(routes::music::router(music.clone()));
     let router = transport::protected_router(router, authority.clone());
+    #[cfg(all(test, unix))]
+    let router = offline_journey_tests::observe_kill_router(router);
     #[cfg(feature = "embedded-frontend")]
     let router = if native_login {
         router
