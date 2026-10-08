@@ -653,13 +653,16 @@ fn nonempty_url(value: &str) -> Option<String> {
 }
 
 fn maven_url(lib: &Library, path: &PortableRelativePath) -> String {
-    let base_url = if lib.url.is_empty() {
+    let mut base_url = if lib.url.is_empty() {
         "https://libraries.minecraft.net/".to_string()
     } else if lib.url.ends_with('/') {
         lib.url.clone()
     } else {
         format!("{}/", lib.url)
     };
+    if base_url == "http://repo.maven.apache.org/maven2/" {
+        base_url = "https://repo.maven.apache.org/maven2/".to_string();
+    }
     format!("{base_url}{}", path.as_str())
 }
 
@@ -979,6 +982,59 @@ mod tests {
             stop_tx,
             task,
         )
+    }
+
+    #[test]
+    fn historical_central_repository_uses_https() {
+        for repository in [
+            "http://repo.maven.apache.org/maven2",
+            "http://repo.maven.apache.org/maven2/",
+        ] {
+            let library: Library = serde_json::from_value(serde_json::json!({
+                "name": "org.ow2.asm:asm:7.0",
+                "url": repository,
+            }))
+            .expect("historical Fabric library");
+            let plans =
+                library_artifact_plans_for(&[library], &crate::rules::default_environment())
+                    .expect("historical library plan");
+            assert_eq!(plans.len(), 1);
+            assert_eq!(
+                plans[0].source_url.as_deref(),
+                Some("https://repo.maven.apache.org/maven2/org/ow2/asm/asm/7.0/asm-7.0.jar")
+            );
+            assert_eq!(
+                plans[0].relative_path.as_str(),
+                "org/ow2/asm/asm/7.0/asm-7.0.jar"
+            );
+            assert!(plans[0].expected.size.is_none());
+            assert!(plans[0].expected.sha1.is_none());
+        }
+    }
+
+    #[test]
+    fn other_maven_repositories_keep_their_declared_source() {
+        for repository in [
+            "https://repo.maven.apache.org/maven2/",
+            "http://repo.maven.apache.org:8080/maven2/",
+            "http://repo.maven.apache.org.example.invalid/maven2/",
+            "http://repo.maven.apache.org/other/",
+            "http://127.0.0.1:1234/",
+        ] {
+            let library = Library {
+                name: "org.example:fixture:1".to_string(),
+                url: repository.to_string(),
+                ..Library::default()
+            };
+            let plans =
+                library_artifact_plans_for(&[library], &crate::rules::default_environment())
+                    .expect("declared repository plan");
+            assert_eq!(plans.len(), 1);
+            assert_eq!(
+                plans[0].source_url.as_deref(),
+                Some(format!("{repository}org/example/fixture/1/fixture-1.jar").as_str())
+            );
+        }
     }
 
     #[test]
