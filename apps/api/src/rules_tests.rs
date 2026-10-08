@@ -1,7 +1,22 @@
 use super::tests::{read_rules_http_json, run_rules_http_child};
 use super::*;
+use axial_app::performance::model::PerformanceRulesStatusResponse;
+use axial_performance::{RuleChannel, RuleSource, RulesCacheState, RulesValidation};
+use reqwest::{Method, StatusCode};
+use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
+
 #[tokio::test]
 async fn explicit_rules_refresh_survives_http_waiter_loss() {
+    run_held_rules_http_child("rules_tests::rules_waiter_loss_helper").await;
+}
+
+#[tokio::test]
+async fn shutdown_joins_held_rules_refresh_after_http_waiter_loss() {
+    run_held_rules_http_child("rules_tests::rules_shutdown_helper").await;
+}
+
+async fn run_held_rules_http_child(helper: &'static str) {
     use ed25519_dalek::{Signer, SigningKey};
     use futures_util::FutureExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -190,13 +205,9 @@ async fn explicit_rules_refresh_survives_http_waiter_loss() {
             _ = &mut finished => Err("child ended before the fixed provider journey completed"),
         }
     });
-    let child = std::panic::AssertUnwindSafe(run_rules_http_child(
-        "rules_tests::rules_waiter_loss_helper",
-        &url,
-        &public_key,
-    ))
-    .catch_unwind()
-    .await;
+    let child = std::panic::AssertUnwindSafe(run_rules_http_child(helper, &url, &public_key))
+        .catch_unwind()
+        .await;
     let _ = child_finished.send(());
     let provided = provider.await;
     let temporary = child.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -208,88 +219,133 @@ async fn explicit_rules_refresh_survives_http_waiter_loss() {
     }
 }
 
+async fn control(
+    client: &reqwest::Client,
+    base: &str,
+    phase: &str,
+    budget: &mut usize,
+) -> Result<Value, &'static str> {
+    *budget = budget
+        .checked_sub(512)
+        .ok_or("fixture control budget exhausted")?;
+    let mut response = client
+        .get(format!("{base}/{phase}"))
+        .send()
+        .await
+        .map_err(|_| "fixture control failed")?;
+    if response.status() != StatusCode::OK
+        || response.content_length().is_none_or(|size| size > 512)
+    {
+        return Err("fixture control response was invalid");
+    }
+    let mut bytes = Vec::with_capacity(512);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "fixture control body failed")?
+    {
+        if chunk.len() > 512 - bytes.len() {
+            return Err("fixture control response exceeded its bound");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "fixture control was not JSON")
+}
+
+async fn observe(
+    client: &reqwest::Client,
+    bootstrap: &ApiTransportBootstrap,
+    budget: &mut usize,
+    generated_at: Option<&str>,
+) -> Result<(StatusCode, Value), &'static str> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut last = None;
+        for _ in 0..64 {
+            let response = read_rules_http_json(
+                client,
+                bootstrap,
+                Method::GET,
+                "/api/v1/performance/status",
+                budget,
+            )
+            .await?;
+            if response.0 != StatusCode::OK {
+                return Err("rules status was unavailable");
+            }
+            let decoded: PerformanceRulesStatusResponse =
+                serde_json::from_value(response.1.clone())
+                    .map_err(|_| "rules status did not decode")?;
+            let ready = decoded.status.rule_source == RuleSource::Remote
+                && match generated_at {
+                    Some(expected) => decoded.status.generated_at == expected,
+                    None => decoded.status.rules_cache.warning.is_some(),
+                };
+            last = Some(response);
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        last.ok_or("rules observation produced no response")
+    })
+    .await
+    .map_err(|_| "rules observation exceeded its deadline")?
+}
+
+async fn disconnect_rules_caller(
+    client: &reqwest::Client,
+    bootstrap: &ApiTransportBootstrap,
+    base: &str,
+    control_budget: &mut usize,
+) -> Result<(), &'static str> {
+    let address: std::net::SocketAddr = bootstrap
+        .base_url
+        .strip_prefix("http://")
+        .ok_or("API origin was invalid")?
+        .parse()
+        .map_err(|_| "API address was invalid")?;
+    if !address.ip().is_loopback() || bootstrap.capability.len() > 4096 {
+        return Err("API caller admission was invalid");
+    }
+    let request = format!(
+        "POST /api/v1/performance/rules/refresh HTTP/1.1\r\nHost: {address}\r\nOrigin: http://localhost:1420\r\n{}: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        transport::CAPABILITY_HEADER,
+        bootstrap.capability
+    );
+    if request.len() > 8192 {
+        return Err("API caller request exceeded its bound");
+    }
+    let mut caller = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    .map_err(|_| "API caller connect timed out")?
+    .map_err(|_| "API caller connect failed")?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        caller.write_all(request.as_bytes()),
+    )
+    .await
+    .map_err(|_| "API caller send timed out")?
+    .map_err(|_| "API caller send failed")?;
+    if control(client, base, "observed", control_budget).await? != json!({"observed":true}) {
+        return Err("explicit provider request was not observed");
+    }
+    let caller = caller
+        .into_std()
+        .map_err(|_| "API caller could not close")?;
+    caller
+        .shutdown(std::net::Shutdown::Both)
+        .map_err(|_| "API caller shutdown failed")?;
+    drop(caller);
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "rules waiter child isolates process-wide trust configuration"]
 async fn rules_waiter_loss_helper() {
-    use axial_app::performance::model::PerformanceRulesStatusResponse;
-    use axial_performance::{RuleChannel, RuleSource, RulesCacheState, RulesValidation};
     use futures_util::FutureExt;
-    use reqwest::{Method, StatusCode};
-    use serde_json::{Value, json};
-    use tokio::io::AsyncWriteExt;
-
-    async fn control(
-        client: &reqwest::Client,
-        base: &str,
-        phase: &str,
-        budget: &mut usize,
-    ) -> Result<Value, &'static str> {
-        *budget = budget
-            .checked_sub(512)
-            .ok_or("fixture control budget exhausted")?;
-        let mut response = client
-            .get(format!("{base}/{phase}"))
-            .send()
-            .await
-            .map_err(|_| "fixture control failed")?;
-        if response.status() != StatusCode::OK
-            || response.content_length().is_none_or(|size| size > 512)
-        {
-            return Err("fixture control response was invalid");
-        }
-        let mut bytes = Vec::with_capacity(512);
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| "fixture control body failed")?
-        {
-            if chunk.len() > 512 - bytes.len() {
-                return Err("fixture control response exceeded its bound");
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice(&bytes).map_err(|_| "fixture control was not JSON")
-    }
-
-    async fn observe(
-        client: &reqwest::Client,
-        bootstrap: &ApiTransportBootstrap,
-        budget: &mut usize,
-        generated_at: Option<&str>,
-    ) -> Result<(StatusCode, Value), &'static str> {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            let mut last = None;
-            for _ in 0..64 {
-                let response = read_rules_http_json(
-                    client,
-                    bootstrap,
-                    Method::GET,
-                    "/api/v1/performance/status",
-                    budget,
-                )
-                .await?;
-                if response.0 != StatusCode::OK {
-                    return Err("rules status was unavailable");
-                }
-                let decoded: PerformanceRulesStatusResponse =
-                    serde_json::from_value(response.1.clone())
-                        .map_err(|_| "rules status did not decode")?;
-                let ready = decoded.status.rule_source == RuleSource::Remote
-                    && match generated_at {
-                        Some(expected) => decoded.status.generated_at == expected,
-                        None => decoded.status.rules_cache.warning.is_some(),
-                    };
-                last = Some(response);
-                if ready {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            last.ok_or("rules observation produced no response")
-        })
-        .await
-        .map_err(|_| "rules observation exceeded its deadline")?
-    }
 
     let root = PathBuf::from(std::env::var_os("AXIAL_TEST_RULES_PROFILE").unwrap());
     let remote = std::env::var(axial_performance::PERFORMANCE_RULES_URL_ENV).unwrap();
@@ -320,9 +376,21 @@ async fn rules_waiter_loss_helper() {
         };
         let bootstrap = services.server.bootstrap();
         let reads = std::panic::AssertUnwindSafe(async {
-            let ready = observe(&client, &bootstrap, &mut response_budget, if first { Some("2001-01-01T00:00:00Z") } else { None }).await?;
+            let ready = observe(
+                &client,
+                &bootstrap,
+                &mut response_budget,
+                if first {
+                    Some("2001-01-01T00:00:00Z")
+                } else {
+                    None
+                },
+            )
+            .await?;
             if first {
-                let decoded: PerformanceRulesStatusResponse = serde_json::from_value(ready.1.clone()).map_err(|_| "startup status did not decode")?;
+                let decoded: PerformanceRulesStatusResponse =
+                    serde_json::from_value(ready.1.clone())
+                        .map_err(|_| "startup status did not decode")?;
                 if decoded.status.rule_source != RuleSource::Remote
                     || decoded.status.generated_at != "2001-01-01T00:00:00Z"
                     || decoded.status.validation != RulesValidation::Valid
@@ -334,29 +402,44 @@ async fn rules_waiter_loss_helper() {
                 }
             }
             observations.push(ready);
-            observations.push(read_rules_http_json(&client, &bootstrap, Method::GET, "/api/v1/config", &mut response_budget).await?);
+            observations.push(
+                read_rules_http_json(
+                    &client,
+                    &bootstrap,
+                    Method::GET,
+                    "/api/v1/config",
+                    &mut response_budget,
+                )
+                .await?,
+            );
             if first {
-                let address: std::net::SocketAddr = bootstrap.base_url.strip_prefix("http://").ok_or("API origin was invalid")?.parse().map_err(|_| "API address was invalid")?;
-                if !address.ip().is_loopback() || bootstrap.capability.len() > 4096 {
-                    return Err("API caller admission was invalid");
-                }
-                let request = format!("POST /api/v1/performance/rules/refresh HTTP/1.1\r\nHost: {address}\r\nOrigin: http://localhost:1420\r\n{}: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", transport::CAPABILITY_HEADER, bootstrap.capability);
-                if request.len() > 8192 { return Err("API caller request exceeded its bound"); }
-                let mut caller = tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect(address)).await.map_err(|_| "API caller connect timed out")?.map_err(|_| "API caller connect failed")?;
-                tokio::time::timeout(Duration::from_secs(10), caller.write_all(request.as_bytes())).await.map_err(|_| "API caller send timed out")?.map_err(|_| "API caller send failed")?;
-                if control(&client, base, "observed", &mut control_budget).await? != json!({"observed":true}) {
-                    return Err("explicit provider request was not observed");
-                }
-                let caller = caller.into_std().map_err(|_| "API caller could not close")?;
-                caller.shutdown(std::net::Shutdown::Both).map_err(|_| "API caller shutdown failed")?;
-                drop(caller);
+                disconnect_rules_caller(&client, &bootstrap, base, &mut control_budget).await?;
                 caller_closed = true;
                 upstream = Some(control(&client, base, "release", &mut control_budget).await?);
-                observations.push(observe(&client, &bootstrap, &mut response_budget, Some("2001-02-01T00:00:00Z")).await?);
-                observations.push(read_rules_http_json(&client, &bootstrap, Method::GET, "/api/v1/config", &mut response_budget).await?);
+                observations.push(
+                    observe(
+                        &client,
+                        &bootstrap,
+                        &mut response_budget,
+                        Some("2001-02-01T00:00:00Z"),
+                    )
+                    .await?,
+                );
+                observations.push(
+                    read_rules_http_json(
+                        &client,
+                        &bootstrap,
+                        Method::GET,
+                        "/api/v1/config",
+                        &mut response_budget,
+                    )
+                    .await?,
+                );
             }
             Ok::<_, &'static str>(())
-        }).catch_unwind().await;
+        })
+        .catch_unwind()
+        .await;
         let shutdown = std::panic::AssertUnwindSafe(tokio::time::timeout(
             Duration::from_secs(45),
             services.server.shutdown(),
@@ -420,4 +503,205 @@ async fn rules_waiter_loss_helper() {
     normalized["warnings"] = observations[2].1["warnings"].clone();
     normalized["view_model"]["warnings"] = observations[2].1["view_model"]["warnings"].clone();
     assert_eq!(normalized, observations[2].1);
+}
+
+#[tokio::test]
+#[ignore = "rules shutdown child isolates process-wide trust configuration"]
+async fn rules_shutdown_helper() {
+    use futures_util::FutureExt;
+
+    let root = PathBuf::from(std::env::var_os("AXIAL_TEST_RULES_PROFILE").unwrap());
+    let remote = std::env::var(axial_performance::PERFORMANCE_RULES_URL_ENV).unwrap();
+    let base = remote.strip_suffix("/rules").unwrap();
+    let provider_address: std::net::SocketAddr =
+        base.strip_prefix("http://").unwrap().parse().unwrap();
+    assert!(provider_address.ip().is_loopback());
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let mut response_budget = (2 * 64 + 2) * 64 * 1024;
+    let mut control_budget = 2 * 512;
+    let mut observations = Vec::with_capacity(4);
+    let mut caller_closed = false;
+    let mut shutdown_deferred = false;
+    let mut unsettled_before_release = false;
+    let mut owner_closing = false;
+    let mut accepted_running = false;
+    let mut task_observation = None;
+    let mut upstream = None;
+    for first in [true, false] {
+        let services = match start_in_profile(root.clone(), Some("http://localhost:1420")).await {
+            Ok(services) => services,
+            Err(failure) => {
+                if let Err(retained) = failure.try_preserve() {
+                    std::mem::forget(retained);
+                }
+                panic!("rules shutdown profile could not start; parent retains fixture");
+            }
+        };
+        let bootstrap = services.server.bootstrap();
+        let reads = std::panic::AssertUnwindSafe(async {
+            let ready = observe(
+                &client,
+                &bootstrap,
+                &mut response_budget,
+                if first {
+                    Some("2001-01-01T00:00:00Z")
+                } else {
+                    None
+                },
+            )
+            .await?;
+            if first {
+                let decoded: PerformanceRulesStatusResponse =
+                    serde_json::from_value(ready.1.clone())
+                        .map_err(|_| "startup status did not decode")?;
+                if decoded.status.rule_source != RuleSource::Remote
+                    || decoded.status.generated_at != "2001-01-01T00:00:00Z"
+                    || decoded.status.validation != RulesValidation::Valid
+                    || decoded.status.rules_cache.state != RulesCacheState::Recorded
+                    || !decoded.status.rules_cache.recorded
+                    || decoded.status.rules_cache.warning.is_some()
+                {
+                    return Err("signed startup prerequisite was not established");
+                }
+            }
+            observations.push(ready);
+            observations.push(
+                read_rules_http_json(
+                    &client,
+                    &bootstrap,
+                    Method::GET,
+                    "/api/v1/config",
+                    &mut response_budget,
+                )
+                .await?,
+            );
+            if first {
+                disconnect_rules_caller(&client, &bootstrap, base, &mut control_budget).await?;
+                caller_closed = true;
+            }
+            Ok::<_, &'static str>(())
+        })
+        .catch_unwind()
+        .await;
+        let shutdown = if first {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+            let shutdown = services.server.shutdown();
+            tokio::pin!(shutdown);
+            // Borrow the original future; a pending result alone does not prove owner cancellation.
+            let held = std::panic::AssertUnwindSafe(tokio::time::timeout(
+                Duration::from_millis(250),
+                shutdown.as_mut(),
+            ))
+            .catch_unwind()
+            .await;
+            shutdown_deferred = matches!(&held, Ok(Err(_)));
+            unsettled_before_release = !services.server.is_shutdown_settled();
+            task_observation = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || {
+                    let tasks = services.tasks.status();
+                    (tasks.closing, !tasks.running.is_empty())
+                },
+            )));
+            // Attempt the sole fixture release even after a failed preparation/check, then join before asserting.
+            let released = std::panic::AssertUnwindSafe(control(
+                &client,
+                base,
+                "release",
+                &mut control_budget,
+            ))
+            .catch_unwind()
+            .await;
+            let joined = match held {
+                Ok(Err(_)) => {
+                    std::panic::AssertUnwindSafe(tokio::time::timeout_at(
+                        deadline,
+                        shutdown.as_mut(),
+                    ))
+                    .catch_unwind()
+                    .await
+                }
+                result => result,
+            };
+            upstream = Some(released);
+            joined
+        } else {
+            std::panic::AssertUnwindSafe(tokio::time::timeout(
+                Duration::from_secs(45),
+                services.server.shutdown(),
+            ))
+            .catch_unwind()
+            .await
+        };
+        let settled = services.server.is_shutdown_settled();
+        if !matches!(shutdown, Ok(Ok(Ok(())))) || !settled {
+            std::mem::forget(services);
+            panic!("rules shutdown did not settle; parent retains fixture");
+        }
+        drop(services);
+        reads
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .unwrap();
+        if first {
+            (owner_closing, accepted_running) = task_observation
+                .take()
+                .unwrap()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let released = upstream
+                .take()
+                .unwrap()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                .unwrap();
+            assert_eq!(released["headers"], "ok");
+            assert_eq!(released["body"], "ok");
+            assert_eq!(released["close"], "ok");
+            assert!(
+                caller_closed && shutdown_deferred && unsettled_before_release,
+                "public shutdown completed before the observed provider was released"
+            );
+            assert!(
+                owner_closing && accepted_running,
+                "held observation did not reach closing with accepted work running"
+            );
+        }
+    }
+
+    assert_eq!(observations.len(), 4);
+    for response in &observations {
+        assert_eq!(response.0, StatusCode::OK);
+    }
+    assert_eq!(
+        observations[3].1, observations[1].1,
+        "refresh/shutdown changed configuration"
+    );
+    let reopened: PerformanceRulesStatusResponse =
+        serde_json::from_value(observations[2].1.clone()).unwrap();
+    assert_eq!(
+        reopened.status.generated_at, "2001-02-01T00:00:00Z",
+        "joined shutdown did not preserve the held explicit refresh"
+    );
+    assert_eq!(reopened.status.rule_source, RuleSource::Remote);
+    assert_eq!(reopened.status.rule_channel, RuleChannel::Remote);
+    assert_eq!(reopened.status.validation, RulesValidation::Valid);
+    assert_eq!(reopened.status.rules_cache.state, RulesCacheState::Recorded);
+    assert!(reopened.status.rules_cache.recorded && reopened.status.remote_refresh);
+    assert!(
+        reopened.status.last_refresh_at.is_some()
+            && reopened.status.rules_cache.loaded_at.is_some()
+    );
+    assert_eq!(
+        reopened.status.last_refresh_at,
+        reopened.status.rules_cache.updated_at
+    );
+    let warning = reopened.status.rules_cache.warning.unwrap();
+    assert!(!warning.is_empty());
+    assert_eq!(reopened.status.warnings, vec![warning.clone()]);
+    assert_eq!(reopened.view_model.warnings, vec![warning]);
+    eprintln!(
+        "[rules-shutdown] caller_closed={caller_closed} shutdown_deferred={shutdown_deferred} unsettled_before_release={unsettled_before_release} owner_closing={owner_closing} accepted_running={accepted_running} shutdown_joined=true cold_cache_b=true config_unchanged=true"
+    );
 }
