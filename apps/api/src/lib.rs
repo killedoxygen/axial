@@ -13,6 +13,8 @@ mod open_folder;
 #[cfg(test)]
 mod reset_tests;
 pub mod routes;
+#[cfg(test)]
+mod rules_tests;
 pub mod transport;
 
 use axial_app::{
@@ -1276,7 +1278,11 @@ mod tests {
         run_rules_http_child("tests::unconfigured_rules_refusal_helper", "", "").await;
     }
 
-    async fn run_rules_http_child(helper: &str, url: &str, key: &str) -> tempfile::TempDir {
+    pub(super) async fn run_rules_http_child(
+        helper: &str,
+        url: &str,
+        key: &str,
+    ) -> tempfile::TempDir {
         use std::process::Stdio;
         use tokio::io::AsyncReadExt;
 
@@ -1352,7 +1358,7 @@ mod tests {
         temporary
     }
 
-    async fn read_rules_http_json(
+    pub(super) async fn read_rules_http_json(
         client: &reqwest::Client,
         bootstrap: &ApiTransportBootstrap,
         method: reqwest::Method,

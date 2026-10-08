@@ -53,8 +53,7 @@ async fn status(State(api): State<PerformanceApi>) -> ApiResult {
 }
 async fn refresh(State(api): State<PerformanceApi>) -> ApiResult {
     api.service
-        .rules()
-        .refresh()
+        .refresh_rules()
         .await
         .map(|value| Json(json!(value)))
         .map_err(|error| {

@@ -501,6 +501,18 @@ impl PerformanceService {
         &self.rules
     }
 
+    pub async fn refresh_rules(
+        &self,
+    ) -> Result<super::model::PerformanceRulesStatusResponse, RulesWorkflowError> {
+        let rules = self.rules.clone();
+        self.tasks
+            .try_spawn(rules.clone(), move |_| async move { rules.refresh().await })
+            .map_err(|_| RulesWorkflowError::Unavailable)?
+            .join()
+            .await
+            .map_err(|_| RulesWorkflowError::Changed)?
+    }
+
     #[cfg(feature = "test-support")]
     pub fn with_rules_for_test(mut self, rules: PerformanceRules) -> Self {
         assert!(rules.uses_metadata(&self.storage));
