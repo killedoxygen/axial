@@ -5440,6 +5440,9 @@ struct FileBatchParent {
 
 impl FileBatchParent {
     fn revalidate(&mut self) -> io::Result<()> {
+        // The deepest retained capability checks managed admission and every
+        // ancestor binding. Native revision reads still fence each namespace.
+        self.directory.revalidate().map_err(loader_io)?;
         for (index, name) in self
             .relative
             .split('/')
@@ -5453,7 +5456,9 @@ impl FileBatchParent {
                 .unwrap_or(&self.directory)
                 .clone();
             let (directory, revision) = &mut self.revisions[index];
-            revalidate_batch_child(directory, &child, name, revision)?;
+            if directory.inner.directory.revision()? != *revision {
+                revalidate_batch_child(directory, &child, name, revision)?;
+            }
         }
         self.directory.revalidate().map_err(loader_io)?;
         Ok(())
@@ -7262,7 +7267,7 @@ mod library_lifecycle_tests {
         }
         let observed = validations.load(Ordering::Relaxed);
         assert_eq!(last.unwrap().read_bounded(5).unwrap(), b"asset");
-        assert!(observed <= 32 * 28, "Repeated leaf validation: {observed}");
+        assert!(observed <= 32 * 8, "Repeated leaf validation: {observed}");
     }
 
     #[test]
