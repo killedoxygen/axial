@@ -2529,23 +2529,31 @@ impl ManagedDir {
         name: &str,
         guard: &ManagedFileGuard,
     ) -> Result<bool, LoaderError> {
+        Ok(self.open_matching_file(name, guard)?.is_some())
+    }
+
+    fn open_matching_file(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+    ) -> Result<Option<FileCapability>, LoaderError> {
         verify_operation_admission(&self.inner.operation_pin)?;
         let name_leaf = leaf(name)?;
         let file = match self.inner.directory.open_file(&name_leaf) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 verify_operation_admission(&self.inner.operation_pin)?;
-                return Ok(false);
+                return Ok(None);
             }
             Err(error) => return Err(error.into()),
         };
         if !guard.identity.matches(&file)? {
-            return Ok(false);
+            return Ok(None);
         }
         let matches =
             file.validate_revision(&guard.revision).is_ok() && guard.revision.size() == guard.size;
         verify_operation_admission(&self.inner.operation_pin)?;
-        Ok(matches)
+        Ok(matches.then_some(file))
     }
 
     pub(crate) fn read_guarded_file_bounded(
@@ -2586,14 +2594,19 @@ impl ManagedDir {
         mut check: impl FnMut() -> Result<(), LoaderError>,
     ) -> Result<[u8; 20], LoaderError> {
         check()?;
-        if guard.size > max_size || !self.file_guard_matches(name, guard)? {
+        if guard.size > max_size {
             return Err(LoaderError::Verify(
                 "managed guarded hash source is invalid or exceeds its bound".to_string(),
             ));
         }
+        self.revalidate()?;
+        let file = self.open_matching_file(name, guard)?.ok_or_else(|| {
+            LoaderError::Verify(
+                "managed guarded hash source is invalid or exceeds its bound".to_string(),
+            )
+        })?;
         // Callbacks may acquire the root transition lock, whose writers also
         // acquire file-proof locks. Keep this read on its own matched capability.
-        let file = self.inner.directory.open_file(&leaf(name)?)?;
         if !guard.identity.matches(&file)? {
             return Err(LoaderError::Verify(
                 "managed guarded hash source changed before hashing".to_string(),
