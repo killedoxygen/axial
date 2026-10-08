@@ -105,6 +105,13 @@ struct PreflightArtifacts {
     installed: InstalledVersionReceipt,
 }
 
+impl PreflightArtifacts {
+    fn revalidate(&self) -> Result<(), LaunchError> {
+        self.bundle.revalidate().map_err(bundle_read_error)?;
+        self.installed.revalidate().map_err(install_read_error)
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct LaunchPreflight {
     pub instance_id: InstanceId,
@@ -656,6 +663,17 @@ impl LaunchCoordinator {
         if current.instance.settings != admitted.record().instance.settings {
             return Err(LaunchError::InstanceChanged);
         }
+        let current = self
+            .instances
+            .library()
+            .admit()
+            .map_err(|_| LaunchError::LibraryUnavailable)?;
+        let captured = admitted.game_directory().pin();
+        if current.generation() != captured.generation()
+            || current.library_id() != captured.library_id()
+        {
+            return Err(LaunchError::LibraryUnavailable);
+        }
         Ok(target)
     }
 
@@ -741,10 +759,7 @@ impl LaunchCoordinator {
                     let previous = owned_proof.lock().unwrap().clone();
                     let proof = if let Some(proof) = previous {
                         let checked = proof.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            checked.bundle.revalidate().map_err(bundle_read_error)?;
-                            checked.installed.revalidate().map_err(install_read_error)
-                        })
+                        let result = tokio::task::spawn_blocking(move || checked.revalidate())
                         .await
                         .map_err(|_| LaunchError::PreparationFailed)
                         .and_then(|result| result);
@@ -970,11 +985,21 @@ impl LaunchCoordinator {
                     }
                     None => None,
                 };
-                // Nonblocking and synchronous: preserve the busy projection
-                // and fence both successful and failed readiness observations.
                 let scan = owned_scan.lock().unwrap().clone();
                 if finalize_scan && let Some(scan) = scan {
                     coordinator.revalidate_scan(scan?).await?;
+                }
+                let final_proof = owned_proof.lock().unwrap().clone();
+                if let Some(proof) = &final_proof {
+                    let proof = proof.clone();
+                    let checked = tokio::task::spawn_blocking(move || proof.revalidate())
+                        .await
+                        .map_err(|_| LaunchError::PreparationFailed)
+                        .and_then(|result| result);
+                    if let Err(error) = checked {
+                        *owned_proof.lock().unwrap() = None;
+                        result = Err(error);
+                    }
                 }
                 if let Some((selection, revision)) = captured_context {
                     selection.validate(&coordinator.accounts)
@@ -986,8 +1011,7 @@ impl LaunchCoordinator {
                 if let Some(absence) = runtime_absence {
                     absence.revalidate()
                         .map_err(|_| LaunchError::RuntimeFailure(JavaDiscoveryError::Replaced))?;
-                    let proof = owned_proof.lock().unwrap().clone()
-                        .ok_or(LaunchError::PreparationFailed)?;
+                    let proof = final_proof.as_ref().ok_or(LaunchError::PreparationFailed)?;
                     proof.bundle.revalidate().map_err(bundle_read_error)?;
                 }
                 if let Some(damage) = observed_damage {
@@ -3220,6 +3244,55 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn preflight_refuses_shared_artifact_drift_during_the_java_probe() {
+        for (fail_probe, busy) in [(false, true), (true, true), (false, false), (true, false)] {
+            let (root, coordinator, id) = preflight_fixture().await;
+            if fail_probe {
+                std::fs::write(root.path().join("probe-fail"), b"fail").unwrap();
+            }
+            let asset = root
+                .path()
+                .join("assets/log_configs/guardian-version-bundle.xml");
+            let original = std::fs::read(&asset).unwrap();
+            let waiter = tokio::spawn({
+                let coordinator = coordinator.clone();
+                let id = id.clone();
+                async move { coordinator.preflight(id).await }
+            });
+            let started = wait_for_preflight_probe(root.path()).await;
+            let foreground = busy.then(|| coordinator.admit(&id)).transpose();
+            let admitted = foreground.is_ok();
+            let changed = std::fs::write(&asset, b"external change");
+            let released = std::fs::write(root.path().join("probe-release"), b"release");
+            let result = waiter.await;
+            drop(foreground);
+            let stopped = coordinator
+                .tasks
+                .shutdown(std::time::Duration::from_secs(3))
+                .await;
+            assert!(started.is_ok(), "probe did not start");
+            assert!(admitted, "foreground admission refused");
+            changed.unwrap();
+            released.unwrap();
+            stopped.unwrap();
+            let result = result.unwrap();
+            assert!(!result.launchable, "{result:?}");
+            assert_eq!(
+                result.error.unwrap().code,
+                if busy {
+                    LaunchError::InstanceBusy
+                } else {
+                    LaunchError::InstallUnavailable
+                }
+            );
+            assert_eq!(std::fs::read(&asset).unwrap(), b"external change");
+            assert_ne!(original, b"external change");
+            assert!(coordinator.sessions.snapshots().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn preflight_projection_reuses_verified_install_but_ordinary_reads_stay_fresh() {
         let (root, coordinator, id) = preflight_fixture().await;
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
@@ -3794,6 +3867,7 @@ mod tests {
             ("absent_account", true, Some(LaunchError::AccountChanged)),
             ("foreground", false, Some(LaunchError::InstanceBusy)),
             ("foreground", true, Some(LaunchError::InstanceBusy)),
+            ("generation", false, Some(LaunchError::LibraryUnavailable)),
             ("display", false, None),
             (
                 "none",
@@ -3890,6 +3964,21 @@ mod tests {
                         }
                     }
                     "foreground" => foreground = Some(coordinator.admit(&id)?),
+                    "generation" => {
+                        let library = coordinator.instances.library();
+                        let pin = library
+                            .admit()
+                            .map_err(|_| LaunchError::LibraryUnavailable)?;
+                        let mut change = library
+                            .begin_switch()
+                            .map_err(|_| LaunchError::LibraryUnavailable)?;
+                        change
+                            .prepare_managed(pin.library_id())
+                            .map_err(|_| LaunchError::LibraryUnavailable)?;
+                        change
+                            .commit_after_persistence()
+                            .map_err(|_| LaunchError::LibraryUnavailable)?;
+                    }
                     "none" => {}
                     _ => unreachable!(),
                 }
