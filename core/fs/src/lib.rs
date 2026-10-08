@@ -59,6 +59,7 @@ const ROOT_LEASE_NAME: &str = ".axial-root.lease";
 const MAX_LEAF_UNITS: usize = 255;
 const MAX_STAGE_ATTEMPTS: usize = 32;
 pub const MAX_DIRECTORY_LIST_ENTRIES: usize = 100_000;
+pub const MAX_REVISION_DEPTH: usize = 256;
 const MAX_OUTSTANDING_EFFECTS: usize = 512;
 const MAX_FILE_RANGE_BYTES: usize = 128 * 1024;
 
@@ -4509,6 +4510,8 @@ struct CapabilityAuthority {
     directory_open_pause: Mutex<Option<DirectoryOpenReservationPause>>,
     #[cfg(test)]
     file_observation_pause: Mutex<Option<FileObservationPause>>,
+    #[cfg(test)]
+    revision_pause: Mutex<Option<RevisionPause>>,
     session_nonce: [u8; 16],
     root: platform::RootGuard,
     lease: platform::LeaseHandle,
@@ -4528,6 +4531,13 @@ struct FileObservationPause {
     parent: DirectoryIdentity,
     name: LeafName,
     opened: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct RevisionPause {
+    directory: DirectoryIdentity,
+    sampled: std::sync::mpsc::SyncSender<()>,
     resume: std::sync::mpsc::Receiver<()>,
 }
 
@@ -10593,6 +10603,92 @@ impl Directory {
         self.validate(&operation)
     }
 
+    /// Sample retained parents in anchor-first order, excluding the descendant.
+    /// Revisions are observations, not an atomic snapshot or ongoing authority.
+    /// Bounds all retained parent edges at 0..=256 before allocation or I/O;
+    /// separate absolute ancestry guards retain their normal validation.
+    /// Returns `None` when the retained chain exceeds the requested budget.
+    pub fn parent_revisions_to(
+        &self,
+        descendant: &Self,
+        max_depth: usize,
+    ) -> io::Result<Option<Vec<DirectoryRevision>>> {
+        if max_depth > MAX_REVISION_DEPTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "revision depth exceeds limit",
+            ));
+        }
+        let mut current = descendant;
+        let mut depth = 0;
+        let mut count = None;
+        loop {
+            if Arc::ptr_eq(&self.inner, &current.inner) {
+                count = Some(depth);
+            }
+            let Some(parent) = &current.inner.parent else {
+                break;
+            };
+            if depth == max_depth {
+                return Ok(None);
+            }
+            depth += 1;
+            current = &parent.directory;
+        }
+        let count = count.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "revision anchor is not retained ancestry",
+            )
+        })?;
+        let mut revisions = Vec::new();
+        revisions
+            .try_reserve_exact(count)
+            .map_err(io::Error::other)?;
+        let authority = descendant.authority()?;
+        let operation = authority.enter()?;
+        descendant.validate(&operation)?;
+        current = descendant;
+        for _ in 0..count {
+            current = &current
+                .inner
+                .parent
+                .as_ref()
+                .expect("counted retained ancestry")
+                .directory;
+            revisions.push(DirectoryRevision {
+                identity: current.inner.identity,
+                stamp: platform::directory_revision(&current.inner.handle)?,
+            });
+        }
+        #[cfg(test)]
+        {
+            let pause = {
+                let mut slot = authority
+                    .revision_pause
+                    .lock()
+                    .map_err(|_| io::Error::other("revision pause lock poisoned"))?;
+                if slot
+                    .as_ref()
+                    .is_some_and(|pause| pause.directory == descendant.inner.identity)
+                {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(pause) = pause {
+                pause.sampled.send(()).map_err(io::Error::other)?;
+                pause.resume.recv().map_err(io::Error::other)?;
+            }
+        }
+        platform::validate_lease(&authority.lease)?;
+        platform::validate_root(&authority.root)?;
+        descendant.validate(&operation)?;
+        revisions.reverse();
+        Ok(Some(revisions))
+    }
+
     fn validate_revision_in(
         &self,
         operation: &CapabilityOperation,
@@ -14554,6 +14650,8 @@ fn finish_root_session_with_recovery(
             directory_open_pause: Mutex::new(None),
             #[cfg(test)]
             file_observation_pause: Mutex::new(None),
+            #[cfg(test)]
+            revision_pause: Mutex::new(None),
             session_nonce,
             root,
             lease,
@@ -23639,6 +23737,191 @@ mod tests {
         assert_eq!(max_bytes, 16);
         drop((file, other, other_revision, root));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn parent_revision_sampling_preserves_membership_and_revocation() {
+        let temporary = crate::test_tempdir().unwrap();
+        std::fs::create_dir(temporary.path().join("child")).unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let child = root
+            .open_directory(&LeafName::new("child").unwrap())
+            .unwrap();
+        let reopened = session.root().unwrap();
+        assert_eq!(
+            root.parent_revisions_to(&root, 0).unwrap(),
+            Some(Vec::new())
+        );
+        assert!(reopened.parent_revisions_to(&child, 1).is_err());
+        assert!(child.parent_revisions_to(&root, 1).is_err());
+        assert!(
+            root.parent_revisions_to(&child, MAX_REVISION_DEPTH + 1)
+                .is_err()
+        );
+        drop(reopened);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert!(root.parent_revisions_to(&child, 1).is_err());
+    }
+
+    #[test]
+    fn parent_revision_sampling_retains_admission_until_joined() {
+        let temporary = crate::test_tempdir().unwrap();
+        std::fs::create_dir(temporary.path().join("child")).unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let descendant = root
+            .open_directory(&LeafName::new("child").unwrap())
+            .unwrap();
+        let (sampled, ready) = std::sync::mpsc::sync_channel(1);
+        let (release, resume) = std::sync::mpsc::sync_channel(1);
+        *root.authority().unwrap().revision_pause.lock().unwrap() = Some(RevisionPause {
+            directory: descendant.inner.identity,
+            sampled,
+            resume,
+        });
+        let anchor = root.clone();
+        let observing = std::thread::spawn(move || anchor.parent_revisions_to(&descendant, 1));
+        let reached = ready.recv_timeout(std::time::Duration::from_secs(5));
+        let outcome = session.revoke();
+        let _ = release.try_send(());
+        let observed = observing.join();
+        let refusal = match outcome {
+            RootRevokeOutcome::Refused(refusal) => refusal,
+            other => panic!("live sampling did not retain revocation: {other:?}"),
+        };
+        let kind = refusal.error().kind();
+        drop(root);
+        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+        reached.unwrap();
+        assert_eq!(observed.unwrap().unwrap().unwrap().len(), 1);
+        assert_eq!(kind, io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parent_revision_sampling_refuses_bindings_displaced_after_sampling() {
+        for binding in ["parent", "lease", "root"] {
+            let temporary = crate::test_tempdir().unwrap();
+            let path = temporary.path().join("root");
+            std::fs::create_dir_all(path.join("one/two")).unwrap();
+            let session = acquire_test_root(&path);
+            let root = session.root().unwrap();
+            let descendant = root
+                .open_directory(&LeafName::new("one").unwrap())
+                .unwrap()
+                .open_directory(&LeafName::new("two").unwrap())
+                .unwrap();
+            let (sampled, ready) = std::sync::mpsc::sync_channel(1);
+            let (release, resume) = std::sync::mpsc::sync_channel(1);
+            *root.authority().unwrap().revision_pause.lock().unwrap() = Some(RevisionPause {
+                directory: descendant.inner.identity,
+                sampled,
+                resume,
+            });
+            let anchor = root.clone();
+            let observing = std::thread::spawn(move || anchor.parent_revisions_to(&descendant, 2));
+            let reached = ready.recv_timeout(std::time::Duration::from_secs(5));
+            let target = match binding {
+                "parent" => path.join("one"),
+                "lease" => path.join(ROOT_LEASE_NAME),
+                "root" => path.clone(),
+                _ => unreachable!(),
+            };
+            let displaced = temporary.path().join("displaced");
+            let mut moved = false;
+            let mutation = if reached.is_ok() {
+                (|| -> io::Result<()> {
+                    std::fs::rename(&target, &displaced)?;
+                    moved = true;
+                    if binding == "lease" {
+                        std::fs::write(&target, b"replacement")
+                    } else {
+                        std::fs::create_dir(&target)
+                    }
+                })()
+            } else {
+                Err(io::Error::other("sample checkpoint was not reached"))
+            };
+            let _ = release.try_send(());
+            let observed = observing.join();
+            if moved {
+                if target.exists() {
+                    if binding == "lease" {
+                        std::fs::remove_file(&target).unwrap();
+                    } else {
+                        std::fs::remove_dir(&target).unwrap();
+                    }
+                }
+                std::fs::rename(&displaced, &target).unwrap();
+            }
+            drop(root);
+            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+            mutation.unwrap();
+            assert!(observed.unwrap().is_err(), "accepted displaced {binding}");
+        }
+    }
+
+    #[test]
+    fn parent_revision_sampling_budget_refusal_does_not_enter_authority() {
+        use std::sync::atomic::Ordering;
+
+        let temporary = crate::test_tempdir().unwrap();
+        std::fs::create_dir_all(temporary.path().join("one/two")).unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let descendant = root
+            .open_directory(&LeafName::new("one").unwrap())
+            .unwrap()
+            .open_directory(&LeafName::new("two").unwrap())
+            .unwrap();
+        let authority = root.authority().unwrap();
+        authority.successful_entries.store(0, Ordering::Relaxed);
+        let result = root.parent_revisions_to(&descendant, 1);
+        let entries = authority.successful_entries.load(Ordering::Relaxed);
+        drop((descendant, root, authority));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert!(result.unwrap().is_none());
+        assert_eq!(entries, 0);
+    }
+
+    #[test]
+    fn parent_revision_sampling_bounds_admission_and_ancestry_work() {
+        use std::sync::atomic::Ordering;
+
+        let temporary = crate::test_tempdir().unwrap();
+        std::fs::create_dir_all(temporary.path().join("assets/objects/aa")).unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let mut directories = vec![root.clone()];
+        for name in ["assets", "objects", "aa"] {
+            directories.push(
+                directories
+                    .last()
+                    .unwrap()
+                    .open_directory(&LeafName::new(name).unwrap())
+                    .unwrap(),
+            );
+        }
+        let expected = directories[..3]
+            .iter()
+            .map(Directory::revision)
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        let authority = root.authority().unwrap();
+        authority.successful_entries.store(0, Ordering::Relaxed);
+        authority.ancestry_steps.store(0, Ordering::Relaxed);
+        let observed = root
+            .parent_revisions_to(directories.last().unwrap(), 3)
+            .unwrap()
+            .unwrap();
+        let entries = authority.successful_entries.load(Ordering::Relaxed);
+        let steps = authority.ancestry_steps.load(Ordering::Relaxed);
+        assert_eq!(observed, expected);
+        drop((directories, root, authority));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(entries, 1, "Repeated native admission: {entries}");
+        assert!(steps <= 8, "Repeated native ancestry validation: {steps}");
     }
 
     #[test]

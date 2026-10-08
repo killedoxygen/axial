@@ -5449,21 +5449,44 @@ impl FileBatchParent {
         // The deepest retained capability checks managed admission and every
         // ancestor binding. Native revision reads still fence each namespace.
         self.directory.revalidate().map_err(loader_io)?;
-        for (index, name) in self
-            .relative
-            .split('/')
-            .filter(|name| !name.is_empty())
-            .enumerate()
-        {
-            let child = self
-                .revisions
-                .get(index + 1)
-                .map(|(directory, _)| directory)
-                .unwrap_or(&self.directory)
-                .clone();
-            let (directory, revision) = &mut self.revisions[index];
-            if directory.inner.directory.revision()? != *revision {
-                revalidate_batch_child(directory, &child, name, revision)?;
+        let unchanged = if let Some((anchor, _)) = self.revisions.first() {
+            match anchor.inner.directory.parent_revisions_to(
+                &self.directory.inner.directory,
+                axial_fs::MAX_REVISION_DEPTH,
+            )? {
+                Some(observed) => {
+                    if observed.len() != self.revisions.len() {
+                        return Err(io::Error::other("managed batch ancestry changed"));
+                    }
+                    observed
+                        .iter()
+                        .zip(&self.revisions)
+                        .all(|(current, (_, retained))| current == retained)
+                }
+                None => false,
+            }
+        } else {
+            true
+        };
+        // Changed namespaces and deeper retained anchors keep the original
+        // sequential refresh; an earlier sample must not bless later aliases.
+        if !unchanged {
+            for (index, name) in self
+                .relative
+                .split('/')
+                .filter(|name| !name.is_empty())
+                .enumerate()
+            {
+                let child = self
+                    .revisions
+                    .get(index + 1)
+                    .map(|(directory, _)| directory)
+                    .unwrap_or(&self.directory)
+                    .clone();
+                let (directory, revision) = &mut self.revisions[index];
+                if directory.inner.directory.revision()? != *revision {
+                    revalidate_batch_child(directory, &child, name, revision)?;
+                }
             }
         }
         self.directory.revalidate().map_err(loader_io)?;
@@ -7391,6 +7414,29 @@ mod library_lifecycle_tests {
                 .unwrap();
             assert_eq!(second.read_bounded(32).unwrap(), b"second payload");
         }
+    }
+
+    #[test]
+    fn file_batch_preserves_deep_retained_directory_support() {
+        let (temporary, owner) = managed_library("deep-file-batch");
+        let mut directory = owner.authority.root.inner.directory.clone();
+        let mut path = temporary.path().to_path_buf();
+        for _ in 0..axial_fs::MAX_REVISION_DEPTH {
+            path.push("p");
+            std::fs::create_dir(&path).unwrap();
+            directory = directory.open_directory(&leaf("p").unwrap()).unwrap();
+        }
+        std::fs::create_dir(path.join("objects")).unwrap();
+        std::fs::write(path.join("objects/first"), b"asset").unwrap();
+        let root = ManagedLibraryRoot::from_directory(directory).unwrap();
+        let operation = root.try_acquire().unwrap();
+        let relative = PortableRelativePath::new_exact("objects/first").unwrap();
+        let mut batch = operation.file_batch();
+        let file = batch.observe_file(&relative).unwrap().unwrap();
+        batch
+            .validate_revision(&relative, &file.revision_observation())
+            .unwrap();
+        assert_eq!(file.read_bounded(5).unwrap(), b"asset");
     }
 
     #[test]
