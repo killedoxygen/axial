@@ -1887,7 +1887,9 @@ mod tests {
             (LoaderComponentId::Quilt, "1.21.5", false, false),
             (LoaderComponentId::Quilt, "26.3", true, false),
             (LoaderComponentId::Quilt, "1.21.5", false, true),
+            (LoaderComponentId::Fabric, "1.14", false, false),
         ] {
+            let launchwrapper = component == LoaderComponentId::Fabric && base_id == "1.14";
             let root = temp_dir(match component {
                 LoaderComponentId::Fabric => "fabric-reconstruction-parity",
                 LoaderComponentId::Quilt => "quilt-reconstruction-parity",
@@ -1932,8 +1934,10 @@ mod tests {
                 record.component_name = component.display_name().to_string();
                 record.loader_version = "0.29.2".to_string();
                 record.strategy = LoaderInstallStrategy::QuiltProfile;
-                canonicalize_record_identity(&mut record);
+            } else if launchwrapper {
+                record.loader_version = "0.2.0.71".to_string();
             }
+            canonicalize_record_identity(&mut record);
             let (mut profile_bytes, mut proof_bytes, mut expected_fresh) =
                 profile_reconstruction_sources(
                     &record,
@@ -1943,6 +1947,26 @@ mod tests {
                     &native_server.url,
                     &extra_server.url,
                 );
+            if launchwrapper {
+                let mut profile: serde_json::Value =
+                    serde_json::from_slice(&profile_bytes).expect("profile");
+                profile["mainClass"] = serde_json::json!("net.minecraft.launchwrapper.Launch");
+                profile["arguments"] = serde_json::json!({"game": [], "jvm": []});
+                profile_bytes = serde_json::to_vec(&profile).expect("LaunchWrapper profile");
+                let mut proof: serde_json::Value =
+                    serde_json::from_slice(&proof_bytes).expect("proof");
+                // The exact official 1.14/0.2.0.71 metadata declares what its profile omits.
+                proof["launcherMeta"] = serde_json::json!({
+                    "version": 1,
+                    "mainClass": "net.minecraft.launchwrapper.Launch",
+                    "launchwrapper": {"tweakers": {
+                        "client": ["net.fabricmc.loader.launch.FabricClientTweaker"],
+                        "common": [],
+                        "server": ["net.fabricmc.loader.launch.FabricServerTweaker"]
+                    }}
+                });
+                proof_bytes = serde_json::to_vec(&proof).expect("LaunchWrapper proof");
+            }
             if omit_mappings {
                 let mut profile: serde_json::Value =
                     serde_json::from_slice(&profile_bytes).expect("profile");
@@ -2009,6 +2033,7 @@ mod tests {
             )
             .await
             .expect("install profile loader");
+            let installed_arguments = install_receipt.effective_version().arguments.clone();
             if omit_mappings {
                 assert!(!root.join("libraries/org/quiltmc/hashed").exists());
                 assert!(!root.join("libraries/net/fabricmc/intermediary").exists());
@@ -2110,6 +2135,27 @@ mod tests {
                 server.stop();
             }
             let _ = fs::remove_dir_all(root);
+            if launchwrapper {
+                let arguments = installed_arguments.expect("materialized LaunchWrapper arguments");
+                assert!(
+                    arguments
+                        .game
+                        .iter()
+                        .all(|argument| argument.rules.is_empty())
+                );
+                assert_eq!(
+                    arguments
+                        .game
+                        .into_iter()
+                        .flat_map(|argument| argument.value)
+                        .collect::<Vec<_>>(),
+                    [
+                        "--tweakClass",
+                        "net.fabricmc.loader.launch.FabricClientTweaker"
+                    ],
+                    "materialized arguments must retain the exact provider-declared client tweaker"
+                );
+            }
         }
     }
 

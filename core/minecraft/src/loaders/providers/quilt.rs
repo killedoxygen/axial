@@ -267,6 +267,7 @@ fn profile_install_proof_from_entry(
         ),
         inherits_from: record.minecraft_version.clone(),
         client_main_class: entry.launcher_meta.main_class.client,
+        launchwrapper_tweaker: None,
         required_libraries,
     })
 }

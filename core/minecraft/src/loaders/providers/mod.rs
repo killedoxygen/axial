@@ -24,6 +24,7 @@ pub(crate) struct ProfileInstallProof {
     canonical_profile_id: String,
     inherits_from: String,
     client_main_class: String,
+    launchwrapper_tweaker: Option<String>,
     required_libraries: Vec<ProfileLibraryProof>,
 }
 
@@ -51,6 +52,10 @@ impl ProfileInstallProof {
         &self.required_libraries
     }
 
+    pub(crate) fn launchwrapper_tweaker(&self) -> Option<&str> {
+        self.launchwrapper_tweaker.as_deref()
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test(
         canonical_profile_id: String,
@@ -63,8 +68,15 @@ impl ProfileInstallProof {
             canonical_profile_id,
             inherits_from,
             client_main_class,
+            launchwrapper_tweaker: None,
             required_libraries,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_launchwrapper_tweaker_for_test(mut self, tweaker: String) -> Self {
+        self.launchwrapper_tweaker = Some(tweaker);
+        self
     }
 }
 

@@ -17,6 +17,8 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use super::{ProfileInstallProof, ProfileLibraryProof};
 
+const MAX_TWEAKER_CLASS_BYTES: usize = 256;
+
 #[derive(Deserialize)]
 struct FabricGameEntry {
     version: String,
@@ -50,6 +52,46 @@ struct FabricIntermediaryVersion {
 struct FabricLauncherMeta {
     #[serde(rename = "mainClass")]
     main_class: FabricMainClass,
+    #[serde(default)]
+    launchwrapper: Option<FabricLaunchWrapper>,
+}
+
+#[derive(Deserialize, Eq, PartialEq)]
+struct FabricLaunchWrapper {
+    tweakers: FabricTweakers,
+}
+
+#[derive(Deserialize, Eq, PartialEq)]
+struct FabricTweakers {
+    #[serde(default, deserialize_with = "deserialize_client_tweaker")]
+    client: Option<String>,
+}
+
+fn deserialize_client_tweaker<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ClientTweaker;
+
+    impl<'de> serde::de::Visitor<'de> for ClientTweaker {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a client tweaker array")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            // The historical installer consumes client[0], not trailing tweakers or other sides.
+            let client = sequence.next_element::<String>()?;
+            while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(client)
+        }
+    }
+
+    deserializer.deserialize_seq(ClientTweaker)
 }
 
 #[derive(Deserialize, Eq, PartialEq)]
@@ -144,7 +186,8 @@ fn profile_install_proof_from_entry(
     url: &str,
     entry: FabricInstallEntry,
 ) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
-    let client_main_class = (entry.loader.version == record.loader_version)
+    let client_main_class = (record.component_id == LoaderComponentId::Fabric
+        && entry.loader.version == record.loader_version)
         .then(|| compatible_client_main_class(&entry, &record.minecraft_version))
         .flatten()
         .map(str::to_owned);
@@ -162,6 +205,10 @@ fn profile_install_proof_from_entry(
         ),
         inherits_from: record.minecraft_version.clone(),
         client_main_class,
+        launchwrapper_tweaker: entry
+            .launcher_meta
+            .launchwrapper
+            .and_then(|wrapper| wrapper.tweakers.client),
         required_libraries: vec![
             ProfileLibraryProof {
                 coordinate: entry.loader.maven,
@@ -270,6 +317,24 @@ fn compatible_client_main_class<'a>(
     }
 
     let client_main_class = entry.launcher_meta.main_class.client.trim();
+    if let Some(wrapper) = &entry.launcher_meta.launchwrapper {
+        if client_main_class != "net.minecraft.launchwrapper.Launch" {
+            return None;
+        }
+        let class = wrapper.tweakers.client.as_deref()?;
+        if class.is_empty()
+            || class.len() > MAX_TWEAKER_CLASS_BYTES
+            || !class.split('.').all(|segment| {
+                let mut bytes = segment.bytes();
+                bytes
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$'))
+                    && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
+            })
+        {
+            return None;
+        }
+    }
     (!client_main_class.is_empty()).then_some(client_main_class)
 }
 
@@ -358,12 +423,26 @@ mod tests {
                 "maven": "net.fabricmc:intermediary:1.14"
             },
             "launcherMeta": {
-                "mainClass": "  net.minecraft.launchwrapper.Launch  "
+                "mainClass": "  net.minecraft.launchwrapper.Launch  ",
+                "launchwrapper": { "tweakers": {
+                    "common": ["example.CommonTweaker"],
+                    "client": ["net.fabricmc.loader.launch.FabricClientTweaker", "example.ExtraTweaker", null],
+                    "server": ["net.fabricmc.loader.launch.FabricServerTweaker"]
+                } }
             }
         });
         let catalog_entry = serde_json::from_value::<FabricInstallEntry>(fixture.clone())
             .expect("historical Fabric loader catalog fixture");
-        let index = build_index_from_entries("1.14", vec![catalog_entry])
+        let mut ignored_fields = fixture.clone();
+        ignored_fields["launcherMeta"]["launchwrapper"]["tweakers"]["common"] =
+            serde_json::json!({"ignored": true});
+        ignored_fields["launcherMeta"]["launchwrapper"]["tweakers"]["client"][1] =
+            serde_json::json!({"ignored": true});
+        ignored_fields["launcherMeta"]["launchwrapper"]["tweakers"]["server"] =
+            serde_json::json!(null);
+        let duplicate = serde_json::from_value::<FabricInstallEntry>(ignored_fields)
+            .expect("unused sides and trailing values do not define the client launch");
+        let index = build_index_from_entries("1.14", vec![catalog_entry, duplicate])
             .expect("normalized historical Fabric index");
 
         assert_eq!(index.builds.len(), 1);
@@ -379,6 +458,92 @@ mod tests {
         assert_eq!(
             proof.client_main_class,
             "net.minecraft.launchwrapper.Launch"
+        );
+        assert_eq!(
+            proof.launchwrapper_tweaker(),
+            Some("net.fabricmc.loader.launch.FabricClientTweaker"),
+        );
+    }
+
+    #[test]
+    fn launchwrapper_proof_rejects_foreign_identity_and_invalid_declarations() {
+        let entry = || {
+            compatible_entry(
+                "1.14",
+                "0.2.0.71",
+                false,
+                "net.minecraft.launchwrapper.Launch",
+            )
+        };
+        let record = build_index_from_entries("1.14", vec![entry()])
+            .unwrap()
+            .builds
+            .remove(0);
+        for classes in [
+            vec![],
+            vec![String::new()],
+            vec![" example.Tweaker".to_string()],
+            vec!["example/Tweaker".to_string()],
+            vec!["example..Tweaker".to_string()],
+            vec!["x".repeat(257)],
+        ] {
+            let mut invalid = entry();
+            invalid.launcher_meta.launchwrapper = Some(
+                serde_json::from_value(serde_json::json!({"tweakers": {"client": classes}}))
+                    .unwrap(),
+            );
+            assert!(matches!(
+                profile_install_proof_from_entry(
+                    &record,
+                    "https://fixtures.invalid/proof",
+                    invalid
+                ),
+                Err(LoaderError::ProviderDataInvalid {
+                    kind: LoaderProviderFailureKind::SchemaInvalid,
+                    status: None,
+                })
+            ));
+        }
+        for case in 0..3 {
+            let mut invalid = entry();
+            invalid.launcher_meta.launchwrapper = Some(
+                serde_json::from_value(serde_json::json!({
+                    "tweakers": {"client": ["example.Tweaker"]},
+                }))
+                .unwrap(),
+            );
+            let mut record = record.clone();
+            match case {
+                0 => record.component_id = crate::loaders::types::LoaderComponentId::Quilt,
+                1 => invalid.loader.maven = "org.quiltmc:quilt-loader:0.2.0.71".to_string(),
+                2 => {
+                    invalid.launcher_meta.main_class.client = "example.NotLaunchWrapper".to_string()
+                }
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                profile_install_proof_from_entry(
+                    &record,
+                    "https://fixtures.invalid/proof",
+                    invalid
+                ),
+                Err(LoaderError::ProviderDataInvalid {
+                    kind: LoaderProviderFailureKind::SchemaInvalid,
+                    status: None,
+                })
+            ));
+        }
+        assert!(
+            serde_json::from_value::<super::FabricLaunchWrapper>(
+                serde_json::json!({"tweakers": {"client": "example.Tweaker"}}),
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<super::FabricLaunchWrapper>(
+                serde_json::json!({"tweakers": {"client": [null, "example.Tweaker"]}}),
+            )
+            .is_err()
         );
     }
 

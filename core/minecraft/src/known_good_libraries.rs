@@ -6,7 +6,9 @@ use crate::download::{
     AuthenticatedSelectedArtifactSource, DownloadJob, ExactLibraryDownloadProof,
     LibraryArtifactPlan, library_artifact_plans_for,
 };
-use crate::launch::{Library, VersionJson, effective_java_version_for, library_merge_key};
+use crate::launch::{
+    Argument, Library, VersionJson, effective_java_version_for, library_merge_key,
+};
 use crate::loaders::providers::ProfileInstallProof;
 use crate::loaders::{
     AuthenticatedEmbeddedMavenArtifact, AuthenticatedInstallerLibraryInputs,
@@ -1204,6 +1206,7 @@ pub(crate) fn seal_profile_exact_library_declarations(
     {
         return Err(SealedLibraryDeclarationError::AncestorMismatch);
     }
+    seal_profile_launchwrapper_tweaker(&mut fragment, &proof, component)?;
     reject_profile_library_shadowing(&fragment.libraries)?;
     let mut required_coordinates = BTreeMap::new();
     let mut required_keys = BTreeMap::new();
@@ -1312,6 +1315,59 @@ pub(crate) fn seal_profile_exact_library_declarations(
         selected,
         structure,
     })
+}
+
+fn seal_profile_launchwrapper_tweaker(
+    fragment: &mut LoaderProfileFragment,
+    proof: &ProfileInstallProof,
+    component: LoaderComponentId,
+) -> Result<(), SealedLibraryDeclarationError> {
+    let Some(declared) = proof.launchwrapper_tweaker() else {
+        return Ok(());
+    };
+    if component != LoaderComponentId::Fabric
+        || fragment.main_class != "net.minecraft.launchwrapper.Launch"
+    {
+        return Err(SealedLibraryDeclarationError::AncestorMismatch);
+    }
+    let mut arguments = fragment
+        .minecraft_arguments
+        .split_whitespace()
+        .map(|value| (value, true))
+        .chain(fragment.arguments.iter().flat_map(|arguments| {
+            arguments.game.iter().flat_map(|argument| {
+                argument
+                    .value
+                    .iter()
+                    .map(move |value| (value.as_str(), argument.rules.is_empty()))
+            })
+        }));
+    let mut matched = false;
+    while let Some((value, unconditional)) = arguments.next() {
+        if value == "--tweakClass" {
+            let actual = arguments.next();
+            if matched || !unconditional || actual != Some((declared, true)) {
+                return Err(SealedLibraryDeclarationError::ContractDrift);
+            }
+            matched = true;
+        } else if let Some(class) = value.strip_prefix("--tweakClass=") {
+            if matched || !unconditional || class != declared {
+                return Err(SealedLibraryDeclarationError::ContractDrift);
+            }
+            matched = true;
+        }
+    }
+    if !matched {
+        fragment
+            .arguments
+            .get_or_insert_default()
+            .game
+            .push(Argument {
+                rules: Vec::new(),
+                value: vec!["--tweakClass".to_string(), declared.to_string()],
+            });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2029,6 +2085,152 @@ mod tests {
             .unwrap();
         assert_eq!(artifact.sha1, encode_sha1([0xbb; 20]));
         assert_eq!(artifact.size, 17);
+    }
+
+    #[test]
+    fn fabric_launchwrapper_preserves_matching_tweakers_without_duplication() {
+        let coordinate = "net.fabricmc:fabric-loader:0.2.0.71";
+        let path = "net/fabricmc/fabric-loader/0.2.0.71/fabric-loader-0.2.0.71.jar";
+        let class = "net.fabricmc.loader.launch.FabricClientTweaker";
+        for (game, legacy) in [
+            (serde_json::json!([]), String::new()),
+            (serde_json::json!(["--tweakClass", class]), String::new()),
+            (
+                serde_json::json!([{ "value": ["--tweakClass", class] }]),
+                String::new(),
+            ),
+            (
+                serde_json::json!([format!("--tweakClass={class}")]),
+                String::new(),
+            ),
+            (serde_json::json!([]), format!("--tweakClass {class}")),
+        ] {
+            let mut fragment = profile_fragment(vec![profile_library(coordinate, path, "", 0)]);
+            fragment.main_class = "net.minecraft.launchwrapper.Launch".to_string();
+            fragment.arguments = Some(
+                serde_json::from_value(serde_json::json!({
+                    "game": game, "jvm": ["-Dfixture=unchanged"],
+                }))
+                .unwrap(),
+            );
+            fragment.minecraft_arguments = legacy;
+            let original = fragment.clone();
+            let proof = ProfileInstallProof::from_test(
+                fragment.id.clone(),
+                fragment.inherits_from.clone(),
+                fragment.main_class.clone(),
+                vec![ProfileLibraryProof::from_test(
+                    coordinate.to_string(),
+                    None,
+                    None,
+                )],
+            )
+            .with_launchwrapper_tweaker_for_test(class.to_string());
+            let pending = seal_profile_exact_library_declarations(
+                fragment,
+                proof,
+                LoaderComponentId::Fabric,
+                &crate::rules::default_environment(),
+            )
+            .expect("declared Fabric tweaker");
+            let (libraries, environment) = pending.profile_plan_inputs().unwrap();
+            let jobs = jobs_for(libraries, environment);
+            let (pending, classified) = pending.classify_jobs(jobs).unwrap();
+            let sealed = pending
+                .seal_streamed(vec![streamed_proof(
+                    classified.into_iter().next().unwrap().job,
+                    [0xbb; 20],
+                    17,
+                )])
+                .unwrap();
+            let authored = sealed.profile_contract().unwrap().0;
+            assert_eq!(authored.minecraft_arguments, original.minecraft_arguments);
+            assert_eq!(
+                authored.arguments.as_ref().unwrap().jvm,
+                original.arguments.as_ref().unwrap().jvm,
+            );
+            if original.minecraft_arguments.is_empty()
+                && original.arguments.as_ref().unwrap().game.is_empty()
+            {
+                assert_eq!(
+                    authored.arguments.as_ref().unwrap().game,
+                    vec![Argument {
+                        rules: Vec::new(),
+                        value: vec!["--tweakClass".to_string(), class.to_string()],
+                    }],
+                );
+            } else {
+                assert_eq!(authored.arguments, original.arguments);
+            }
+        }
+    }
+
+    #[test]
+    fn fabric_launchwrapper_refuses_conflicting_conditional_and_foreign_declarations() {
+        let coordinate = "net.fabricmc:fabric-loader:0.2.0.71";
+        let path = "net/fabricmc/fabric-loader/0.2.0.71/fabric-loader-0.2.0.71.jar";
+        let class = "net.fabricmc.loader.launch.FabricClientTweaker";
+        for case in 0..9 {
+            let mut fragment = profile_fragment(vec![profile_library(coordinate, path, "", 0)]);
+            fragment.main_class = "net.minecraft.launchwrapper.Launch".to_string();
+            let mut component = LoaderComponentId::Fabric;
+            let game = match case {
+                0 => serde_json::json!(["--tweakClass", "example.Other"]),
+                1 => serde_json::json!(["--tweakClass"]),
+                2 => serde_json::json!(["--tweakClass", class, "--tweakClass", class]),
+                3 => serde_json::json!([{
+                    "rules": [{ "action": "allow" }], "value": ["--tweakClass", class],
+                }]),
+                4 => {
+                    fragment.minecraft_arguments = "--tweakClass example.Other".to_string();
+                    serde_json::json!(["--tweakClass", class])
+                }
+                5 | 6 => {
+                    component = if case == 5 {
+                        LoaderComponentId::Quilt
+                    } else {
+                        LoaderComponentId::Forge
+                    };
+                    serde_json::json!([])
+                }
+                7 => {
+                    fragment.main_class = "example.NotLaunchWrapper".to_string();
+                    serde_json::json!([])
+                }
+                8 => serde_json::json!(["--tweakClass=example.Other"]),
+                _ => unreachable!(),
+            };
+            fragment.arguments =
+                Some(serde_json::from_value(serde_json::json!({"game": game})).unwrap());
+            let proof = ProfileInstallProof::from_test(
+                fragment.id.clone(),
+                fragment.inherits_from.clone(),
+                fragment.main_class.clone(),
+                vec![ProfileLibraryProof::from_test(
+                    coordinate.to_string(),
+                    None,
+                    None,
+                )],
+            )
+            .with_launchwrapper_tweaker_for_test(class.to_string());
+            let expected = if matches!(case, 5..=7) {
+                SealedLibraryDeclarationError::AncestorMismatch
+            } else {
+                SealedLibraryDeclarationError::ContractDrift
+            };
+            assert!(
+                matches!(
+                    seal_profile_exact_library_declarations(
+                        fragment,
+                        proof,
+                        component,
+                        &crate::rules::default_environment(),
+                    ),
+                    Err(error) if error == expected
+                ),
+                "LaunchWrapper refusal case {case}"
+            );
+        }
     }
 
     #[test]
