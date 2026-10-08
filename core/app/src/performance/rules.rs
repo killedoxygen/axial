@@ -53,6 +53,8 @@ pub enum RulesWorkflowError {
     Changed,
     #[error("performance remote rules url is not configured")]
     Unconfigured,
+    #[error("Performance rules provider response could not be verified. Try again later.")]
+    ProviderFailed,
     #[error("performance rules refresh failed; previously active rules remain selected")]
     RefreshFailed,
 }
@@ -192,14 +194,21 @@ impl PerformanceRules {
             return Err(RulesWorkflowError::Changed);
         }
         let candidate = self.authority.fetch_remote_rules().await.map_err(|error| {
-            if matches!(error, RulesRefreshError::Unconfigured) {
-                return RulesWorkflowError::Unconfigured;
-            }
+            let failure = match &error {
+                RulesRefreshError::Unconfigured => return RulesWorkflowError::Unconfigured,
+                RulesRefreshError::Request(_)
+                | RulesRefreshError::HttpStatus(_)
+                | RulesRefreshError::ResponseTooLarge
+                | RulesRefreshError::Parse(_)
+                | RulesRefreshError::Validation(_)
+                | RulesRefreshError::Signature(_) => RulesWorkflowError::ProviderFailed,
+                RulesRefreshError::Cache(_) => RulesWorkflowError::RefreshFailed,
+            };
             self.authority
                 .record_refresh_warning(axial_performance::remote_rules_refresh_warning(
                     "failed", &error,
                 ));
-            RulesWorkflowError::RefreshFailed
+            failure
         })?;
         let bytes = candidate
             .snapshot()

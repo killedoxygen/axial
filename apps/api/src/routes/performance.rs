@@ -60,6 +60,7 @@ async fn refresh(State(api): State<PerformanceApi>) -> ApiResult {
         .map_err(|error| {
             let status = match error {
                 RulesWorkflowError::Unconfigured => StatusCode::BAD_REQUEST,
+                RulesWorkflowError::ProviderFailed => StatusCode::BAD_GATEWAY,
                 _ => StatusCode::CONFLICT,
             };
             (status, Json(json!({"error":error.to_string()})))
