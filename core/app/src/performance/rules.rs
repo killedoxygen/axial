@@ -10,6 +10,7 @@ use crate::{
 };
 use axial_performance::{
     CompositionPlan, PerformanceManager, PerformanceRulesAuthority, ResolutionRequest,
+    RulesRefreshError,
 };
 use std::{
     sync::{
@@ -50,6 +51,8 @@ pub enum RulesWorkflowError {
     Unavailable,
     #[error("performance rules changed or require settlement")]
     Changed,
+    #[error("performance remote rules url is not configured")]
+    Unconfigured,
     #[error("performance rules refresh failed; previously active rules remain selected")]
     RefreshFailed,
 }
@@ -189,6 +192,9 @@ impl PerformanceRules {
             return Err(RulesWorkflowError::Changed);
         }
         let candidate = self.authority.fetch_remote_rules().await.map_err(|error| {
+            if matches!(error, RulesRefreshError::Unconfigured) {
+                return RulesWorkflowError::Unconfigured;
+            }
             self.authority
                 .record_refresh_warning(axial_performance::remote_rules_refresh_warning(
                     "failed", &error,

@@ -7,6 +7,7 @@ use axial_app::{
         health::{disabled_health_response, health_response, resolved_health_response},
         model::{PerformanceMode, PerformancePlanRequest},
         plan::{configured_mode, plan_response, resolve_mode, version_target},
+        rules::RulesWorkflowError,
     },
     settings::SettingsStore,
 };
@@ -57,10 +58,11 @@ async fn refresh(State(api): State<PerformanceApi>) -> ApiResult {
         .await
         .map(|value| Json(json!(value)))
         .map_err(|error| {
-            (
-                StatusCode::CONFLICT,
-                Json(json!({"error":error.to_string()})),
-            )
+            let status = match error {
+                RulesWorkflowError::Unconfigured => StatusCode::BAD_REQUEST,
+                _ => StatusCode::CONFLICT,
+            };
+            (status, Json(json!({"error":error.to_string()})))
         })
 }
 async fn plan(

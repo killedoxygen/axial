@@ -1271,6 +1271,218 @@ mod tests {
         assert!(settled);
     }
 
+    #[tokio::test]
+    async fn unconfigured_rules_refresh_retains_safe_http_refusal() {
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+
+        const OUTPUT_LIMIT: usize = 16 * 1024;
+        let temporary =
+            tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::unconfigured_rules_refusal_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("AXIAL_TEST_RULES_PROFILE", temporary.path().join("profile"))
+            .env(axial_performance::PERFORMANCE_RULES_URL_ENV, "")
+            .env(axial_performance::PERFORMANCE_RULES_PUBLIC_KEY_ENV, "")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap().take((OUTPUT_LIMIT + 1) as u64);
+        let mut stderr = child.stderr.take().unwrap().take((OUTPUT_LIMIT + 1) as u64);
+        let mut out = Vec::with_capacity(OUTPUT_LIMIT + 1);
+        let mut err = Vec::with_capacity(OUTPUT_LIMIT + 1);
+        let joined = tokio::time::timeout(Duration::from_secs(180), async {
+            tokio::join!(
+                child.wait(),
+                stdout.read_to_end(&mut out),
+                stderr.read_to_end(&mut err),
+            )
+        })
+        .await;
+        if joined.is_err() {
+            let retained = temporary.keep();
+            let _ = child.start_kill();
+            let reaped = matches!(
+                tokio::time::timeout(Duration::from_secs(5), child.wait()).await,
+                Ok(Ok(_))
+            );
+            panic!(
+                "rules refusal helper exceeded its deadline; child reaped: {reaped}; retained {}",
+                retained.display()
+            );
+        }
+        let (exit, out_read, err_read) = joined.unwrap();
+        if exit.is_err() {
+            let retained = temporary.keep();
+            let _ = child.start_kill();
+            let reaped = matches!(
+                tokio::time::timeout(Duration::from_secs(5), child.wait()).await,
+                Ok(Ok(_))
+            );
+            panic!(
+                "rules refusal helper wait failed; child reaped: {reaped}; retained {}",
+                retained.display()
+            );
+        }
+        let output_complete = out_read.is_ok()
+            && err_read.is_ok()
+            && out.len() <= OUTPUT_LIMIT
+            && err.len() <= OUTPUT_LIMIT;
+        let out = String::from_utf8_lossy(&out[..out.len().min(OUTPUT_LIMIT)]);
+        let err = String::from_utf8_lossy(&err[..err.len().min(OUTPUT_LIMIT)]);
+        let passed = matches!(exit, Ok(status) if status.success())
+            && output_complete
+            && out.contains("running 1 test")
+            && out.contains("test tests::unconfigured_rules_refusal_helper ... ok")
+            && out.contains("test result: ok. 1 passed; 0 failed; 0 ignored;");
+        if !passed {
+            panic!(
+                "rules refusal helper did not pass exactly once; output complete: {output_complete}; retained {}\n{out}\n{err}",
+                temporary.keep().display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "rules refusal child isolates process-wide provider configuration"]
+    async fn unconfigured_rules_refusal_helper() {
+        use axial_app::performance::model::PerformanceRulesStatusResponse;
+        use futures_util::FutureExt;
+        use reqwest::{Method, StatusCode};
+        use serde_json::{Value, json};
+
+        async fn read(
+            client: &reqwest::Client,
+            bootstrap: &ApiTransportBootstrap,
+            method: Method,
+            path: &str,
+        ) -> Result<(StatusCode, Value), &'static str> {
+            const RESPONSE_LIMIT: usize = 64 * 1024;
+            let mut response = client
+                .request(method, format!("{}{path}", bootstrap.base_url))
+                .header(transport::CAPABILITY_HEADER, &bootstrap.capability)
+                .header("origin", "http://localhost:1420")
+                .send()
+                .await
+                .map_err(|_| "rules request failed")?;
+            let status = response.status();
+            if response
+                .content_length()
+                .is_some_and(|size| size > RESPONSE_LIMIT as u64)
+            {
+                return Err("rules response exceeded its bound");
+            }
+            let mut bytes = Vec::with_capacity(RESPONSE_LIMIT);
+            while let Some(chunk) = response.chunk().await.map_err(|_| "rules body failed")? {
+                if chunk.len() > RESPONSE_LIMIT - bytes.len() {
+                    return Err("rules response exceeded its bound");
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let value =
+                serde_json::from_slice(&bytes).map_err(|_| "rules response was not JSON")?;
+            Ok((status, value))
+        }
+
+        let root = PathBuf::from(std::env::var_os("AXIAL_TEST_RULES_PROFILE").unwrap());
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut observations = Vec::with_capacity(7);
+        for first in [true, false] {
+            let services = match start_in_profile(root.clone(), Some("http://localhost:1420")).await
+            {
+                Ok(services) => services,
+                Err(failure) => {
+                    if let Err(retained) = failure.try_preserve() {
+                        std::mem::forget(retained);
+                    }
+                    panic!("rules refusal profile could not start; parent retains fixture");
+                }
+            };
+            let bootstrap = services.server.bootstrap();
+            let reads = std::panic::AssertUnwindSafe(async {
+                observations.push(
+                    read(
+                        &client,
+                        &bootstrap,
+                        Method::GET,
+                        "/api/v1/performance/status",
+                    )
+                    .await?,
+                );
+                observations.push(read(&client, &bootstrap, Method::GET, "/api/v1/config").await?);
+                if first {
+                    observations.push(
+                        read(
+                            &client,
+                            &bootstrap,
+                            Method::POST,
+                            "/api/v1/performance/rules/refresh",
+                        )
+                        .await?,
+                    );
+                    observations.push(
+                        read(
+                            &client,
+                            &bootstrap,
+                            Method::GET,
+                            "/api/v1/performance/status",
+                        )
+                        .await?,
+                    );
+                    observations
+                        .push(read(&client, &bootstrap, Method::GET, "/api/v1/config").await?);
+                }
+                Ok::<_, &'static str>(())
+            })
+            .catch_unwind()
+            .await;
+            let shutdown = std::panic::AssertUnwindSafe(tokio::time::timeout(
+                Duration::from_secs(45),
+                services.server.shutdown(),
+            ))
+            .catch_unwind()
+            .await;
+            let settled = services.server.is_shutdown_settled();
+            if !matches!(shutdown, Ok(Ok(Ok(())))) || !settled {
+                std::mem::forget(services);
+                panic!("rules refusal shutdown did not settle; parent retains fixture");
+            }
+            drop(services);
+            reads
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                .unwrap();
+        }
+
+        assert_eq!(observations.len(), 7);
+        for index in [0, 1, 3, 4, 5, 6] {
+            assert_eq!(observations[index].0, StatusCode::OK);
+        }
+        let initial: PerformanceRulesStatusResponse =
+            serde_json::from_value(observations[0].1.clone()).unwrap();
+        assert!(!initial.status.remote_refresh);
+        assert_eq!(observations[2].0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            observations[2].1,
+            json!({"error":"performance remote rules url is not configured"})
+        );
+        assert_eq!(observations[3].1, observations[0].1);
+        assert_eq!(observations[5].1, observations[0].1);
+        assert_eq!(observations[4].1, observations[1].1);
+        assert_eq!(observations[6].1, observations[1].1);
+    }
+
     #[test]
     fn profile_identity_persists_and_unknown_files_are_preserved() {
         let temporary = tempfile::tempdir().unwrap();
