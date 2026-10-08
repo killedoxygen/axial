@@ -8,7 +8,12 @@ import { toast } from '../toast';
 import { errMessage } from '../utils';
 
 let configWrites: Promise<void> = Promise.resolve();
-const targetWrites = new Map<string, Promise<void>>();
+interface InstanceAcknowledgement {
+  id: string;
+  first: number;
+  last: number;
+}
+const targetWrites = new Map<string, Promise<InstanceAcknowledgement | undefined>>();
 interface Write {
   started: boolean;
   done: Promise<boolean>;
@@ -127,18 +132,20 @@ export function saveConfigPatch(patch: Record<string, unknown>, isCurrent?: () =
   return pending;
 }
 
-export function useAutoSave<TResp extends { error?: string }>({
+export function useAutoSave<TResp extends { error?: string; id?: string; revision?: number }>({
   send,
   apply,
   errorLabel,
   target = '/config',
   flushPending,
+  instance,
 }: {
   send: (patch: Record<string, unknown>) => Promise<TResp>;
   apply: (resp: TResp) => void;
   errorLabel: string;
   target?: string;
   flushPending?: () => void;
+  instance?: { id: string; revision: number };
 }): {
   commit: (
     patch: Record<string, unknown>,
@@ -178,6 +185,10 @@ export function useAutoSave<TResp extends { error?: string }>({
       return;
     }
     const requestId = ++requestRef.current;
+    const captured = instance ? { ...instance } : undefined;
+    let expectedRevision: number | undefined;
+    let predecessor: InstanceAcknowledgement | undefined;
+    let acknowledgement: InstanceAcknowledgement | undefined;
     const fields = Object.keys(patch);
     for (const field of fields) latestFields.current.set(field, requestId);
     pendingRef.current += 1;
@@ -188,8 +199,25 @@ export function useAutoSave<TResp extends { error?: string }>({
       ? send(patch)
       : (() => {
           const work: Write = { started: false, done: Promise.resolve(true) };
-          const pending = (targetWrites.get(target) ?? Promise.resolve()).then(() =>
-            startWrite(work, () => send(patch)),
+          const pending = (targetWrites.get(target) ?? Promise.resolve(undefined)).then((previous) =>
+            startWrite(work, () => {
+              if (!captured) return send(patch);
+              if (!Number.isSafeInteger(captured.revision) || captured.revision <= 0) {
+                throw new Error('The instance revision is invalid. Refresh and try again.');
+              }
+              // Only this queue's contiguous, acknowledged revisions can carry a pending edit forward.
+              predecessor =
+                previous?.id === captured.id &&
+                captured.revision >= previous.first &&
+                captured.revision <= previous.last
+                  ? previous
+                  : undefined;
+              expectedRevision = predecessor?.last ?? captured.revision;
+              if (expectedRevision >= Number.MAX_SAFE_INTEGER) {
+                throw new Error('The instance revision cannot be advanced safely.');
+              }
+              return send({ ...patch, expected_revision: expectedRevision });
+            }),
           );
           trackWrite(pending, work);
           return pending;
@@ -198,6 +226,19 @@ export function useAutoSave<TResp extends { error?: string }>({
       try {
         const res = await sent;
         if (res?.error) throw new Error(res.error);
+        if (captured) {
+          const revision = res?.revision;
+          if (
+            res?.id !== captured.id ||
+            expectedRevision === undefined ||
+            typeof revision !== 'number' ||
+            !Number.isSafeInteger(revision) ||
+            revision !== expectedRevision + 1
+          ) {
+            throw new Error('The instance settings response did not match this save. Refresh and try again.');
+          }
+          acknowledgement = { id: captured.id, first: predecessor?.first ?? captured.revision, last: revision };
+        }
         apply(res);
         toast('Saved');
         if (mounted.current) opts?.onSuccess?.();
@@ -214,7 +255,7 @@ export function useAutoSave<TResp extends { error?: string }>({
       }
     })();
     writes.get(sent)!.done = pending;
-    const tail = pending.then(() => {});
+    const tail = pending.then((saved) => (saved ? acknowledgement : undefined));
     if (!configWrite) targetWrites.set(target, tail);
     void tail.then(() => {
       if (targetWrites.get(target) === tail) targetWrites.delete(target);

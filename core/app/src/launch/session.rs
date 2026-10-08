@@ -1922,6 +1922,7 @@ mod tests {
                         last_played_at: "2026-09-26T10:00:00.000Z".into(),
                         art_seed: 42,
                         settings: InstanceSettings::default(),
+                        java_selection: None,
                         icon: String::new(),
                         accent: String::new(),
                         loader_key: "vanilla".into(),

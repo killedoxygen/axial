@@ -108,10 +108,7 @@ export function clearLaunchNotice(instanceId: string): void {
 
 export function setConfig(c: Config): boolean {
   const current = config.value;
-  if (
-    current &&
-    (c.revision < current.revision || c.account_selection_revision < current.account_selection_revision)
-  ) {
+  if (current && (c.revision < current.revision || c.account_selection_revision < current.account_selection_revision)) {
     return false;
   }
   config.value = c;
@@ -130,5 +127,5 @@ export function removeInstance(id: string): void {
 }
 
 export function updateInstanceInList(updated: EnrichedInstance): void {
-  instances.value = instances.value.map((i) => (i.id === updated.id ? updated : i));
+  instances.value = instances.value.map((i) => (i.id === updated.id && updated.revision >= i.revision ? updated : i));
 }

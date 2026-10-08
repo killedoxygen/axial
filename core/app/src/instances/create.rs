@@ -4,8 +4,8 @@
 use super::{
     directory::{InstanceDirectories, Registry},
     model::{
-        Instance, InstanceError, InstanceId, InstanceRecord, InstanceResult, validate_label,
-        validate_name,
+        Instance, InstanceError, InstanceId, InstanceRecord, InstanceResult, JavaSelection,
+        validate_label, validate_name,
     },
 };
 use crate::{
@@ -1216,6 +1216,17 @@ fn optional_directory(
 /// Runtime overrides may contain local paths or credentials. Keep them in the
 /// registry, but retain the existing public redaction boundary.
 pub fn public_instance(mut instance: Instance) -> Instance {
+    if instance.java_selection.is_none() {
+        use axial_minecraft::runtime::{RuntimeOverride, parse_runtime_override};
+        instance.java_selection =
+            Some(match parse_runtime_override(&instance.settings.java_path) {
+                RuntimeOverride::None => JavaSelection::Inherited,
+                RuntimeOverride::Component(component) => JavaSelection::Component {
+                    component: component.as_str().to_string(),
+                },
+                RuntimeOverride::ExecutablePath(_) => JavaSelection::Custom,
+            });
+    }
     instance.settings.java_path.clear();
     instance.settings.extra_jvm_args.clear();
     instance
@@ -1259,6 +1270,7 @@ fn build_instance(
         created_at: chrono::Utc::now().to_rfc3339(),
         last_played_at: String::new(),
         settings,
+        java_selection: None,
         icon: request.icon,
         accent: request.accent,
         loader_key: target.loader_key.clone(),
@@ -1374,6 +1386,84 @@ pub(crate) mod tests {
             Err(InstanceError::NameConflict)
         ));
         assert_eq!(service.registry().list().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn public_updates_preserve_java_selection_without_exposing_private_settings() {
+        let (root, service) = fixture();
+        let instance = create(&service, "Java selection").await;
+        let custom = root.path().join("private-java-canary/bin/java");
+        let args = "-Dprivate.arguments.canary=retained";
+        let mut revision = instance.revision;
+        let mut observations = Vec::new();
+        for (java_path, selection) in [
+            (
+                custom.to_str().unwrap().to_string(),
+                serde_json::json!({"kind": "custom"}),
+            ),
+            ("  ".to_string(), serde_json::json!({"kind": "inherited"})),
+            (
+                " jre-legacy ".to_string(),
+                serde_json::json!({"kind": "component", "component": "jre-legacy"}),
+            ),
+        ] {
+            let response = service
+                .update(
+                    &instance.id,
+                    super::super::model::InstancePatch {
+                        expected_revision: Some(revision),
+                        java_path: Some(java_path.clone()),
+                        extra_jvm_args: Some(args.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            revision = response.revision;
+            let public = serde_json::to_value(&response).unwrap();
+            let repeated = serde_json::to_value(public_instance(response)).unwrap();
+            let retained = service.registry().get_live(&instance.id).unwrap();
+            let persisted = serde_json::to_value(&retained.instance).unwrap();
+            let raw = service
+                .registry()
+                .storage()
+                .read(|db| -> InstanceResult<String> {
+                    Ok(db.query_row(
+                        "SELECT record_json FROM instances WHERE id=?1",
+                        [instance.id.as_str()],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            observations.push((public, repeated, persisted, stored, java_path, selection));
+        }
+        let shutdown = service
+            .tasks
+            .shutdown(std::time::Duration::from_secs(1))
+            .await;
+        drop(service);
+        if shutdown.is_err() {
+            let _ = root.keep();
+            panic!("Java selection fixture shutdown did not join");
+        }
+        drop(root);
+
+        for (public, repeated, persisted, stored, java_path, selection) in observations {
+            assert!(stored["instance"].get("java_selection").is_none());
+            assert_eq!(stored["instance"]["java_path"], java_path);
+            assert_eq!(stored["instance"]["extra_jvm_args"], args);
+            assert_eq!(persisted["java_path"], java_path);
+            assert_eq!(persisted["extra_jvm_args"], args);
+            assert!(persisted.get("java_selection").is_none());
+            for projection in [public, repeated] {
+                assert_eq!(projection["java_path"], "");
+                assert_eq!(projection["extra_jvm_args"], "");
+                let encoded = projection.to_string();
+                assert!(!encoded.contains("private-java-canary"));
+                assert!(!encoded.contains("private.arguments.canary"));
+                assert_eq!(projection["java_selection"], selection);
+            }
+        }
     }
 
     #[tokio::test]
@@ -1614,7 +1704,7 @@ pub(crate) mod tests {
         assert_eq!(edited.instance.name, "Renamed");
         assert_eq!(edited.instance.last_played_at, "2026-09-27T10:00:00.000Z");
         assert_eq!(edited.instance.settings.max_memory_mb, 4096);
-        assert_eq!(loan.record().instance, instance);
+        assert_eq!(public_instance(loan.record().instance.clone()), instance);
         assert!(matches!(
             loan.validate_current(),
             Err(InstanceError::Conflict)

@@ -2094,6 +2094,7 @@ pub(crate) mod tests {
             last_played_at: String::new(),
             art_seed: 42,
             settings: crate::settings::InstanceSettings::default(),
+            java_selection: None,
             icon: String::new(),
             accent: String::new(),
             loader_key: component.short_key().into(),

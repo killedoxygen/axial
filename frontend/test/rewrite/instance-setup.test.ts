@@ -15,6 +15,8 @@ const ts: typeof import('typescript') = createRequire(resolve(frontend, 'package
 function response() {
   return {
     id: 'fixture-instance', name: 'Fixture pack', version_id: '1.21.4', created_at: '2026-09-27T00:00:00Z',
+    java_selection: { kind: 'inherited' },
+    revision: 1,
     launchable: false, install_target: null,
     launch_action: { state_id: 'setup_pending', label: 'Resume setup', tone: 'warn', launchable: false, primary_action: 'install' },
     version_display: { loader_key: 'vanilla', loader_label: 'Vanilla', minecraft_label: '1.21.4',

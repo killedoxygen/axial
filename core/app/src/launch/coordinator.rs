@@ -630,7 +630,9 @@ impl LaunchCoordinator {
             .registry()
             .get_live(&instance.id)
             .map_err(instance_error)?;
-        if &current.instance != instance {
+        let mut captured = instance.clone();
+        captured.java_selection = None;
+        if current.instance != captured {
             return Err(LaunchError::InstanceChanged);
         }
         Ok(())

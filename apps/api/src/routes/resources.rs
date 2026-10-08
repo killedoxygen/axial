@@ -382,6 +382,7 @@ mod tests {
                             last_played_at: String::new(),
                             art_seed: 0,
                             settings: InstanceSettings::default(),
+                            java_selection: None,
                             icon: String::new(),
                             accent: String::new(),
                             loader_key: "vanilla".into(),

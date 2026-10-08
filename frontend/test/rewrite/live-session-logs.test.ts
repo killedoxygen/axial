@@ -66,6 +66,8 @@ function instance(): EnrichedInstance {
     name: 'Example',
     version_id: '1.20.1',
     created_at: '2026-09-27T09:00:00Z',
+    java_selection: { kind: 'inherited' },
+    revision: 1,
     version_display: {
       loader_key: 'vanilla',
       loader_label: 'Vanilla',

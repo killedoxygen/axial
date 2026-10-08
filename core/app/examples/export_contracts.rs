@@ -3,6 +3,7 @@
 use axial_app::{
     instances::{
         delete::DeletionSnapshot,
+        model::JavaSelection,
         setup::{CreateLoaderBuildsView, CreateNotice},
     },
     launch::coordinator::PreflightDiagnostics,
@@ -68,6 +69,7 @@ fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     InstanceLogTailResponse::export_all(&config)?;
     PendingSkinStatus::export_all(&config)?;
     DeletionSnapshot::export_all(&config)?;
+    JavaSelection::export_all(&config)?;
     CreateLoaderBuildsView::export_all(&config)?;
     CreateNotice::export_all(&config)?;
     PreflightDiagnostics::export_all(&config)?;

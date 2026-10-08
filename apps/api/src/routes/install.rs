@@ -363,7 +363,7 @@ mod tests {
             let reserved = registry.reserve(tx, Instance {
                 id: id.clone(), name:"Pending fixture".into(), version_id:"1.21.4".into(),
                 created_at:"2026-01-01T00:00:00Z".into(), last_played_at:String::new(),
-                art_seed:0, settings:InstanceSettings::default(), icon:String::new(),
+                art_seed:0, settings:InstanceSettings::default(), java_selection:None, icon:String::new(),
                 accent:String::new(), loader_key:"vanilla".into(), minecraft_version:"1.21.4".into(), revision:1,
             }, &library_id)?;
             // This rejection fixture intentionally has no filesystem authority.

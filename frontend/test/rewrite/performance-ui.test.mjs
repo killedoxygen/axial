@@ -438,6 +438,8 @@ function driverInstance(id) {
     name: id,
     version_id: '1.21',
     created_at: '2026-10-04T08:00:00Z',
+    java_selection: { kind: 'inherited' },
+    revision: 1,
     version_display: {
       loader_key: 'vanilla',
       loader_label: 'Vanilla',

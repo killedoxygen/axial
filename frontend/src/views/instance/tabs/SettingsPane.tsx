@@ -51,6 +51,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
     apply: (res) => updateInstanceInList(res),
     errorLabel: 'instance settings',
     target: `/instances/${inst.id}`,
+    instance: { id: inst.id, revision: inst.revision },
     flushPending: () => flushArgs.current(),
   });
 
@@ -78,9 +79,10 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
   const selectedPreset =
     presetOptions.find((option) => option.id === savedPreset) ?? presetOptions.find((option) => option.default) ?? null;
 
-  const savedJavaPath = inst.java_path ?? '';
-  const [javaPath, setJavaPath] = useState(savedJavaPath);
-  const runtimeOverridden = savedPreset !== '' || savedJavaPath.trim() !== '';
+  const javaSelection = inst.java_selection;
+  const savedJavaComponent = javaSelection.kind === 'component' ? javaSelection.component : undefined;
+  const [javaPath, setJavaPath] = useState('');
+  const runtimeOverridden = savedPreset !== '' || javaSelection.kind !== 'inherited';
 
   const savedArgs = inst.extra_jvm_args ?? '';
   const [jvmArgs, setJvmArgs] = useState(savedArgs);
@@ -97,8 +99,8 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
   }, [savedMode]);
 
   useEffect(() => {
-    setJavaPath(savedJavaPath);
-  }, [savedJavaPath]);
+    setJavaPath('');
+  }, [javaSelection.kind, savedJavaComponent]);
 
   useEffect(() => {
     if (pendingArgs.current === null) setJvmArgs(savedArgs);
@@ -106,8 +108,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
 
   useEffect(() => {
     let cancelled = false;
-    void refreshInstanceReadiness(inst.id, { isCurrent: () => !cancelled, retry: false })
-      .catch(() => {});
+    void refreshInstanceReadiness(inst.id, { isCurrent: () => !cancelled, retry: false }).catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -228,7 +229,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
                   setJavaPath('');
                   commit(
                     { jvm_preset: '', java_path: '' },
-                    { label: 'runtime', revert: () => setJavaPath(savedJavaPath), onSuccess: bumpHealth },
+                    { label: 'runtime', revert: () => setJavaPath(''), onSuccess: bumpHealth },
                   );
                 }}
               />
@@ -253,12 +254,13 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
             </label>
             <JavaPathField
               value={javaPath}
+              selection={javaSelection}
               onChange={setJavaPath}
               onCommit={(next) => {
-                if (next === savedJavaPath.trim()) return;
+                if ((next === '' && javaSelection.kind === 'inherited') || next === savedJavaComponent) return;
                 commit(
                   { java_path: next },
-                  { label: 'Java runtime', revert: () => setJavaPath(savedJavaPath), onSuccess: bumpHealth },
+                  { label: 'Java runtime', revert: () => setJavaPath(''), onSuccess: bumpHealth },
                 );
               }}
             />

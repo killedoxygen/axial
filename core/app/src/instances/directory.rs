@@ -450,6 +450,7 @@ impl Registry {
         library_id: &str,
     ) -> InstanceResult<InstanceRecord> {
         let mut instance = instance;
+        instance.java_selection = None;
         instance.name = validate_name(&instance.name)?;
         instance
             .settings
@@ -633,7 +634,9 @@ fn name_taken(
 
 fn record_params(record: &InstanceRecord) -> InstanceResult<[rusqlite::types::Value; 8]> {
     use rusqlite::types::Value;
-    let json = serde_json::to_string(record).map_err(|_| InstanceError::InvalidInput)?;
+    let mut private = record.clone();
+    private.instance.java_selection = None;
+    let json = serde_json::to_string(&private).map_err(|_| InstanceError::InvalidInput)?;
     let revision = i64::try_from(record.revision).map_err(|_| InstanceError::Conflict)?;
     Ok([
         record.instance.id.as_str().to_owned().into(),
@@ -714,6 +717,7 @@ mod tests {
             last_played_at: String::new(),
             art_seed: 42,
             settings: InstanceSettings::default(),
+            java_selection: None,
             icon: String::new(),
             accent: String::new(),
             loader_key: "vanilla".to_owned(),
@@ -736,6 +740,35 @@ mod tests {
                 registry.commit_reserved(tx, &reserved, "owner-verified-test-receipt")
             })
             .unwrap()
+    }
+
+    #[test]
+    fn registry_encoding_excludes_derived_java_selection() {
+        use super::super::model::JavaSelection;
+
+        let registry = memory();
+        let mut input = instance("Presentation is not authority");
+        input.java_selection = Some(JavaSelection::Custom);
+        let private = registry
+            .storage()
+            .transaction(|tx| {
+                let reserved = registry.reserve(tx, input, "test-library")?;
+                registry.commit_reserved(tx, &reserved, "owner-verified-test-receipt")
+            })
+            .unwrap();
+        assert!(private.instance.java_selection.is_none());
+
+        let mut projected = private.clone();
+        projected.instance.java_selection = Some(JavaSelection::Component {
+            component: "jre-legacy".to_string(),
+        });
+        let encoded = record_params(&projected).unwrap();
+        let rusqlite::types::Value::Text(raw) = &encoded[7] else {
+            panic!("registry JSON parameter");
+        };
+        let stored: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert!(stored["instance"].get("java_selection").is_none());
+        assert_eq!(stored, serde_json::to_value(private).unwrap());
     }
 
     #[test]

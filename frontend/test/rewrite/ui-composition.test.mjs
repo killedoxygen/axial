@@ -384,6 +384,8 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
       name: id,
       version_id: '1.21',
       created_at: '2026-09-08T08:00:00Z',
+      java_selection: { kind: 'inherited' },
+      revision: 1,
       version_display: {
         loader_key: 'vanilla',
         loader_label: 'Vanilla',

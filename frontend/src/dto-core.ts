@@ -12,6 +12,7 @@ import type { EnrichedInstance, Instance, InstanceResourceSummary } from './type
 import type { Config, SystemInfo } from './types-settings';
 import type { Version } from './types-version';
 import { installItemResponse } from './dto-install';
+import type { JavaSelection } from './generated/JavaSelection';
 
 const JVM_PRESETS = [
   '',
@@ -100,11 +101,20 @@ export function systemInfoResponse(value: unknown): SystemInfo {
   };
 }
 
+function javaSelectionResponse(value: unknown): JavaSelection {
+  const record = dtoRecord(value, 'Instance Java selection');
+  const kind = dtoEnum(record.kind, 'Instance Java selection kind', ['inherited', 'component', 'custom'] as const);
+  return kind === 'component' ? { kind, component: dtoString(record.component, 'Instance Java component') } : { kind };
+}
+
 export function instanceResponse(value: unknown): Instance {
   const record = dtoRecord(value, 'Instance');
+  const revision = dtoNumber(record.revision, 'Instance revision');
+  if (!Number.isSafeInteger(revision) || revision <= 0) throw new Error('Instance revision was invalid.');
   const launchAction = record.launch_action == null ? undefined : launchActionResponse(record.launch_action);
   return {
     id: dtoString(record.id, 'Instance id'),
+    revision,
     name: dtoString(record.name, 'Instance name'),
     version_id: dtoString(record.version_id, 'Instance version'),
     created_at: dtoString(record.created_at, 'Instance creation time'),
@@ -113,6 +123,7 @@ export function instanceResponse(value: unknown): Instance {
     max_memory_mb: dtoOptionalNumber(record.max_memory_mb, 'Instance maximum memory'),
     min_memory_mb: dtoOptionalNumber(record.min_memory_mb, 'Instance minimum memory'),
     java_path: dtoOptionalString(record.java_path, 'Instance Java path'),
+    java_selection: javaSelectionResponse(record.java_selection),
     window_width: dtoOptionalNumber(record.window_width, 'Instance window width'),
     window_height: dtoOptionalNumber(record.window_height, 'Instance window height'),
     jvm_preset: dtoOptionalString(record.jvm_preset, 'Instance JVM preset'),

@@ -68,11 +68,22 @@ pub struct Instance {
     pub art_seed: u32,
     #[serde(flatten)]
     pub settings: InstanceSettings,
+    /// Derived presentation only. The registry encoder excludes this field.
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub java_selection: Option<JavaSelection>,
     pub icon: String,
     pub accent: String,
     pub loader_key: String,
     pub minecraft_version: String,
     pub revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JavaSelection {
+    Inherited,
+    Component { component: String },
+    Custom,
 }
 
 #[derive(Clone, Debug, Serialize)]

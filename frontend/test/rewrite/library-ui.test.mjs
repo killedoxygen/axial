@@ -165,6 +165,8 @@ function instance(id, overrides = {}) {
     name: `Instance ${id}`,
     version_id: `version-${id}`,
     created_at: '2026-01-01T00:00:00Z',
+    java_selection: { kind: 'inherited' },
+    revision: 1,
     last_played_at: '2026-01-01T00:00:00Z',
     art_seed: 40,
     mods_count: 3,

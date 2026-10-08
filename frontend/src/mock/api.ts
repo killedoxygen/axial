@@ -51,6 +51,18 @@ interface InstancesResponse {
   scan_state: ScanState;
 }
 
+type InstanceFixture = Omit<EnrichedInstance, 'java_selection'>;
+
+// Reviewed override identities from core/minecraft/src/runtime/discovery.rs.
+const javaComponents: readonly string[] = [
+  'java-runtime-epsilon',
+  'java-runtime-delta',
+  'java-runtime-gamma',
+  'java-runtime-beta',
+  'java-runtime-alpha',
+  'jre-legacy',
+];
+
 interface CreateOption {
   id: string;
   label: string;
@@ -913,7 +925,7 @@ const handlers: Record<string, Handler> = {
     scan_state: scanState,
   }),
   'GET /instances': (): InstancesResponse => ({
-    instances: instanceFixtures,
+    instances: instanceFixtures.map(publicInstance),
     last_instance_id: lastInstanceId,
     scan_state: scanState,
   }),
@@ -963,7 +975,7 @@ const handlers: Record<string, Handler> = {
   'GET /flags': () => flagsResponse(),
   'PUT /flags/{key}': (body, path) => updateFlag(path?.slice('/flags/'.length) ?? '', body),
   'POST /telemetry/frontend-error': () => null,
-  'GET /instances/{id}': (_body, path) => findInstance(instanceIdFromPath(path)),
+  'GET /instances/{id}': (_body, path) => publicInstance(findInstance(instanceIdFromPath(path))),
   'PUT /instances/{id}': (body, path) => updateInstance(instanceIdFromPath(path), body),
   'GET /java': () => ({
     runtimes: [
@@ -1140,7 +1152,7 @@ const versionFixtures: Version[] = [
   },
 ];
 
-const instanceFixtures: EnrichedInstance[] = [
+const instanceFixtures: InstanceFixture[] = [
   instanceFixture({
     id: 'mock-survival',
     name: 'Survival Ridge',
@@ -1227,7 +1239,21 @@ function modNameFromPath(path: string | undefined): string {
   return match ? decodeURIComponent(match[1]) : '';
 }
 
-function findInstance(id: string): EnrichedInstance {
+function publicInstance(instance: InstanceFixture): EnrichedInstance {
+  const javaPath = instance.java_path?.trim() ?? '';
+  return {
+    ...instance,
+    java_selection: javaComponents.includes(javaPath)
+      ? { kind: 'component', component: javaPath }
+      : javaPath
+        ? { kind: 'custom' }
+        : { kind: 'inherited' },
+    java_path: '',
+    extra_jvm_args: '',
+  };
+}
+
+function findInstance(id: string): InstanceFixture {
   const instance = instanceFixtures.find((fixture) => fixture.id === id);
   if (!instance) throw apiError(404, 'Not Found', { error: 'unknown instance' });
   return instance;
@@ -1236,6 +1262,9 @@ function findInstance(id: string): EnrichedInstance {
 function updateInstance(id: string, body: unknown): EnrichedInstance {
   const instance = findInstance(id);
   if (isRecord(body)) {
+    if (body.expected_revision !== undefined && body.expected_revision !== instance.revision) {
+      throw apiError(409, 'Conflict', { error: 'The instance changed. Refresh and try again.' });
+    }
     if (typeof body.name === 'string' && body.name.trim()) instance.name = body.name.trim();
     for (const key of ['max_memory_mb', 'min_memory_mb', 'window_width', 'window_height', 'art_seed'] as const) {
       const value = finiteNumber(body[key]);
@@ -1248,8 +1277,9 @@ function updateInstance(id: string, body: unknown): EnrichedInstance {
     if (mode === '' || mode === 'managed' || mode === 'vanilla' || mode === 'custom') {
       instance.performance_mode = mode;
     }
+    instance.revision += 1;
   }
-  return instance;
+  return publicInstance(instance);
 }
 
 function updateFlag(encodedKey: string, body: unknown): FlagsResponse {
@@ -1361,7 +1391,7 @@ function createInstance(body: unknown): CreateInstanceResponse {
   lastInstanceId = created.id;
 
   return {
-    ...created,
+    ...publicInstance(created),
     view_model: {
       state_id: 'created',
       tone: 'success',
@@ -1624,8 +1654,8 @@ function minecraftMeta(id: string): Version['minecraft_meta'] {
 }
 
 function instanceFixture(
-  input: Partial<EnrichedInstance> & Pick<EnrichedInstance, 'id' | 'name' | 'version_id' | 'created_at'>,
-): EnrichedInstance {
+  input: Partial<InstanceFixture> & Pick<InstanceFixture, 'id' | 'name' | 'version_id' | 'created_at'>,
+): InstanceFixture {
   return {
     id: input.id,
     name: input.name,
@@ -1636,6 +1666,7 @@ function instanceFixture(
     max_memory_mb: input.max_memory_mb,
     min_memory_mb: input.min_memory_mb,
     java_path: input.java_path ?? '',
+    revision: input.revision ?? 1,
     window_width: input.window_width ?? 0,
     window_height: input.window_height ?? 0,
     jvm_preset: input.jvm_preset ?? '',

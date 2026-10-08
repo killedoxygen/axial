@@ -4,6 +4,7 @@ import { SelectField } from './Select';
 import { Icon } from './Icons';
 import { api } from '../api';
 import { dtoArray, dtoRecord, dtoString } from '../dto-contract';
+import type { JavaSelection } from '../generated/JavaSelection';
 
 type JavaRuntime = { path: string; component: string; source: string };
 
@@ -52,6 +53,7 @@ export function JavaPathField({
   disabled,
   className,
   label = 'Java runtime',
+  selection,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -59,12 +61,17 @@ export function JavaPathField({
   disabled?: boolean;
   className?: string;
   label?: string;
+  selection?: JavaSelection;
 }): JSX.Element {
   const [runtimes, setRuntimes] = useState<JavaRuntime[]>(runtimeCache ?? []);
+  const component = selection?.kind === 'component' ? selection.component : undefined;
   const trimmed = value.trim();
   const matchesDetected = runtimes.some((runtime) => runtime.path === trimmed);
-  const isCustom = trimmed.length > 0 && !matchesDetected;
-  const [customOpen, setCustomOpen] = useState(isCustom);
+  const matchesComponent = component !== undefined && (trimmed === '' || trimmed === component);
+  const isCustom = trimmed.length > 0 && !matchesDetected && !matchesComponent;
+  const savedCustom = selection?.kind === 'custom' && trimmed === '';
+  const [customOpen, setCustomOpen] = useState(selection ? false : isCustom);
+  const edited = useRef(false);
 
   useEffect(() => {
     if (runtimeCache) return;
@@ -78,16 +85,25 @@ export function JavaPathField({
   }, []);
 
   useEffect(() => {
-    if (isCustom) setCustomOpen(true);
-  }, [isCustom]);
+    if (!selection && isCustom) setCustomOpen(true);
+  }, [isCustom, selection?.kind]);
 
-  const selectValue = customOpen || isCustom ? CUSTOM_VALUE : matchesDetected ? trimmed : MANAGED_VALUE;
+  useEffect(() => {
+    if (selection) {
+      setCustomOpen(false);
+      edited.current = false;
+    }
+  }, [selection?.kind, component]);
+
+  const selectValue =
+    customOpen || isCustom || savedCustom ? CUSTOM_VALUE : matchesDetected ? trimmed : (component ?? MANAGED_VALUE);
 
   const options = useMemo(() => {
-    const base = [{ value: MANAGED_VALUE, label: 'Managed (automatic)' }];
+    const base = [{ value: MANAGED_VALUE, label: selection ? 'Inherit global Java' : 'Managed (automatic)' }];
+    const selected = component ? [{ value: component, label: component }] : [];
     const detected = runtimes.map((runtime) => ({ value: runtime.path, label: runtimeLabel(runtime) }));
-    return [...base, ...detected, { value: CUSTOM_VALUE, label: 'Custom path…' }];
-  }, [runtimes]);
+    return [...base, ...selected, ...detected, { value: CUSTOM_VALUE, label: 'Custom path…' }];
+  }, [runtimes, Boolean(selection), component]);
 
   const handleSelect = (next: string): void => {
     if (next === CUSTOM_VALUE) {
@@ -95,6 +111,7 @@ export function JavaPathField({
       return;
     }
     setCustomOpen(false);
+    edited.current = false;
     onChange(next);
     onCommit?.(next);
   };
@@ -109,7 +126,7 @@ export function JavaPathField({
         onChange={handleSelect}
         options={options}
       />
-      {(customOpen || isCustom) && (
+      {(customOpen || isCustom || savedCustom) && (
         <div class="cp-ovr-input">
           <Icon name="folder" size={14} color="var(--text-mute)" />
           <input
@@ -120,8 +137,15 @@ export function JavaPathField({
             spellcheck={false}
             disabled={disabled}
             aria-label="Custom Java path"
-            onInput={(event) => onChange((event.currentTarget as HTMLInputElement).value)}
-            onBlur={() => onCommit?.(value.trim())}
+            onInput={(event) => {
+              edited.current = true;
+              onChange((event.currentTarget as HTMLInputElement).value);
+            }}
+            onBlur={() => {
+              if (selection && !edited.current) return;
+              edited.current = false;
+              onCommit?.(value.trim());
+            }}
             onKeyDown={(event) => {
               if (event.key === 'Enter') (event.currentTarget as HTMLInputElement).blur();
             }}

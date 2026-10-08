@@ -137,6 +137,8 @@ const instance = {
   name: 'Resource fixture',
   version_id: 'fixture',
   created_at: '2026-09-08T12:00:00Z',
+  java_selection: { kind: 'inherited' },
+  revision: 1,
   version_display: {
     loader_key: 'vanilla',
     loader_label: 'Vanilla',

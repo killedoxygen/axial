@@ -99,6 +99,15 @@ function hooks() {
       values[index] ??= { current: initial };
       return values[index] as { current: T };
     },
+    useMemo<T>(calculate: () => T, dependencies: unknown[]): T {
+      const index = cursor++;
+      const previous = values[index] as { dependencies: unknown[]; value: T } | undefined;
+      if (!previous || dependencies.length !== previous.dependencies.length ||
+        dependencies.some((value, offset) => !Object.is(value, previous.dependencies[offset]))) {
+        values[index] = { dependencies, value: calculate() };
+      }
+      return (values[index] as { value: T }).value;
+    },
     useEffect(run: () => void | (() => void), dependencies: unknown[]) {
       const index = cursor++;
       const previous = effects.get(index);
@@ -145,9 +154,11 @@ function config(): Config {
 
 const instance: EnrichedInstance = {
   id: '94d4ec3a-4a90-4d70-9e97-a5774f1c0a8a',
+  revision: 6,
   name: 'Autosave fixture',
   version_id: '1.20.1',
   created_at: '2026-09-08T12:00:00Z',
+  java_selection: { kind: 'inherited' },
   version_display: {
     loader_key: 'vanilla',
     loader_label: 'Vanilla',
@@ -183,6 +194,7 @@ function queue(revision = 1): InstallQueueStateResponse {
 
 function harness() {
   const viewHooks = hooks();
+  const javaHooks = hooks();
   const configState = signals.signal(config());
   const instances = signals.signal([structuredClone(instance)]);
   const store = {
@@ -217,6 +229,7 @@ function harness() {
     async api(method: string, path: string, body?: Record<string, unknown>): Promise<unknown> {
       if (method === 'GET') {
         reads.push(path);
+        if (path === '/java') return { runtimes: [] };
         if (path === '/install/queue') return currentQueue;
         if (path === '/versions') return { versions: [] };
         if (path === '/instances') return { instances: [structuredClone(storedInstance)], last_instance_id: instance.id };
@@ -239,7 +252,11 @@ function harness() {
         return respond(path, structuredClone(storedConfig));
       }
       assert.equal(path, `/instances/${instance.id}`);
-      storedInstance = { ...storedInstance, ...body };
+      const { expected_revision, ...patch } = body;
+      if (expected_revision !== undefined && expected_revision !== storedInstance.revision) {
+        throw Object.assign(new Error('The instance changed. Refresh and try again.'), { name: 'ApiError', status: 409 });
+      }
+      storedInstance = { ...storedInstance, ...patch, revision: storedInstance.revision + 1 };
       return respond(path, structuredClone(storedInstance));
     },
     isApiError: (error: unknown) => error instanceof Error && 'status' in error,
@@ -334,6 +351,13 @@ function harness() {
     },
   );
   const primitive = (...names: string[]) => Object.fromEntries(names.map((name) => [name, name]));
+  const runtimeFields = source<typeof import('../../src/ui/RuntimeFields')>('ui/RuntimeFields.tsx', {
+    'preact/hooks': javaHooks,
+    './Select': primitive('SelectField'),
+    './Icons': primitive('Icon'),
+    '../api': api,
+    '../dto-contract': contract,
+  });
   const common = {
     'preact/hooks': viewHooks,
     ui: primitive('OverrideChip', 'SettingRow', 'SettingsSection'),
@@ -389,7 +413,7 @@ function harness() {
       '../../../ui/SettingsSheet': common.ui,
       '../../../ui/MemoryField': common.memory,
       '../../../ui/WindowField': primitive('WindowField'),
-      '../../../ui/RuntimeFields': primitive('JavaPathField', 'JvmArgsInput'),
+      '../../../ui/RuntimeFields': { JavaPathField: runtimeFields.JavaPathField, JvmArgsInput: 'JvmArgsInput' },
       '../../../hooks/use-autosave': autosave,
       '../../../hooks/use-jvm-presets': common.presets,
       '../../../api': api,
@@ -434,6 +458,7 @@ function harness() {
     timers,
     config: () => storedConfig,
     instance: () => storedInstance,
+    serverInstance(value: EnrichedInstance) { storedInstance = structuredClone(value); },
     reloads: () => reloads,
     respond(next: typeof respond) {
       respond = next;
@@ -465,6 +490,14 @@ function harness() {
       assert.ok(node, name);
       return node.props as T;
     },
+    renderJava(): unknown {
+      const node = controls(tree).find((entry) => entry.type === runtimeFields.JavaPathField);
+      assert.ok(node, 'SettingsPane must render the real JavaPathField');
+      javaHooks.begin();
+      const rendered = runtimeFields.JavaPathField(node.props as Parameters<typeof runtimeFields.JavaPathField>[0]);
+      javaHooks.flush();
+      return rendered;
+    },
     emit(phase: NativePreferencesRequest['phase'], id = 'preferences-1') {
       assert.ok(listener);
       listener({ payload: { request_id: id, phase } });
@@ -476,10 +509,313 @@ function harness() {
     },
     dispose() {
       viewHooks.dispose();
+      javaHooks.dispose();
       downloads.disconnectInstallQueue();
     },
   };
 }
+
+test('cold instance Java settings retain redacted selection and explicit edits', async (context) => {
+  const component = 'java-runtime-delta';
+  for (const scenario of ['untouched custom', 'clear custom', 'replace custom', 'inherit global custom', 'component'] as const) {
+    await context.test(scenario, async () => {
+      const h = harness();
+      const inherited = scenario === 'inherit global custom';
+      const selection = inherited ? { kind: 'inherited' } : scenario === 'component'
+        ? { kind: 'component', component } : { kind: 'custom' };
+      const detail = { ...instance, java_path: '', extra_jvm_args: '', java_selection: selection };
+      h.readInstance(async () => JSON.parse(JSON.stringify(detail)));
+      h.store.config.value = { ...config(), java_path_override: inherited ? '/fixture/global-java' : '' };
+      const clears = scenario === 'clear custom' || scenario === 'component';
+      h.respond(async () => ({
+        ...detail, revision: 7, java_selection: clears ? { kind: 'inherited' } : { kind: 'custom' },
+      }));
+      const render = (): unknown => {
+        h.render('instance');
+        return h.renderJava();
+      };
+      const select = (tree: unknown) => {
+        const node = controls(tree).find((entry) => entry.type === 'SelectField' && entry.props.ariaLabel === 'Java runtime');
+        assert.ok(node, 'the real JavaPathField must render its selector');
+        return node.props as {
+          value: string;
+          options: Array<{ value: string; label: string }>;
+          onChange(value: string): void;
+        };
+      };
+      const input = (tree: unknown) => {
+        const node = controls(tree).find((entry) => entry.type === 'input' && entry.props['aria-label'] === 'Custom Java path');
+        assert.ok(node, 'the real JavaPathField must render its custom editor');
+        return node.props as {
+          value: string;
+          onInput(event: { currentTarget: { value: string } }): void;
+          onBlur(): void;
+        };
+      };
+      try {
+        h.render('instance');
+        await tick();
+        render();
+        await tick();
+        let tree = render();
+        const chooser = select(tree);
+        assert.equal(h.reads.filter((path) => path === `/instances/${instance.id}`).length, 1);
+        assert.equal(h.reads.filter((path) => path === '/java').length, 1);
+        assert.equal(h.store.instances.value[0].java_path, '');
+        assert.equal(h.store.instances.value[0].extra_jvm_args, '');
+        assert.equal(chooser.options.find((option) => option.value === chooser.value)?.label,
+          inherited ? 'Inherit global Java' : scenario === 'component' ? component : 'Custom path…');
+        assert.equal(chooser.options.find((option) => option.value === '')?.label, 'Inherit global Java');
+        assert.equal(chooser.value, inherited ? '' : scenario === 'component' ? component : '__custom__');
+        assert.equal(h.writes.length, 0, 'cold detail hydration must not write a redacted value back');
+        if (inherited) {
+          chooser.onChange('__custom__');
+          tree = render();
+          assert.equal(input(tree).value, '');
+          input(tree).onBlur();
+          await tick();
+          assert.equal(h.store.config.value.java_path_override, '/fixture/global-java');
+          assert.equal(h.writes.length, 0, 'opening an empty editor must retain global inheritance');
+        } else if (clears) {
+          chooser.onChange('');
+          await tick();
+          assert.deepEqual(h.writes, [{ path: `/instances/${instance.id}`, patch: { expected_revision: 6, java_path: '' } }]);
+          tree = render();
+          assert.equal(select(tree).value, '', 'the acknowledged clear must display inherited selection');
+        } else {
+          assert.equal(input(tree).value, '', 'saved private paths must not populate the editor');
+          input(tree).onBlur();
+          await tick();
+          assert.equal(h.writes.length, 0, 'an untouched redacted editor must not clear the saved override');
+          if (scenario === 'replace custom') {
+            input(tree).onInput({ currentTarget: { value: '/fixture/replacement-java' } });
+            tree = render();
+            input(tree).onBlur();
+            await tick();
+            assert.deepEqual(h.writes, [{
+              path: `/instances/${instance.id}`, patch: { expected_revision: 6, java_path: '/fixture/replacement-java' },
+            }]);
+            tree = render();
+            assert.equal(select(tree).options.find((option) => option.value === select(tree).value)?.label, 'Custom path…');
+            assert.equal(h.store.instances.value[0].java_path, '');
+            assert.equal(h.store.instances.value[0].extra_jvm_args, '');
+          }
+        }
+        assert.equal(h.timers.size, 0);
+      } finally {
+        h.dispose();
+        await tick();
+      }
+    });
+  }
+});
+
+test('a stale Runtime Reset carries its captured revision and preserves a newer component', async () => {
+  const h = harness();
+  const captured = {
+    ...instance, revision: 6, java_path: '', extra_jvm_args: '', java_selection: { kind: 'custom' },
+  };
+  const newer = { ...captured, revision: 7, java_selection: { kind: 'component', component: 'jre-legacy' } };
+  const cleared = { ...captured, revision: 8, java_selection: { kind: 'inherited' } };
+  let serverDetail: unknown = captured;
+  h.readInstance(async () => structuredClone(serverDetail));
+  h.admit(() => {
+    // The real endpoint refuses revision 6 against 7, but accepts an unversioned patch.
+    if (h.writes[h.writes.length - 1]?.patch.expected_revision === 6) {
+      throw Object.assign(new Error('The instance changed. Refresh and try again.'), { name: 'ApiError', status: 409 });
+    }
+  });
+  h.respond(async () => {
+    serverDetail = cleared;
+    return structuredClone(cleared);
+  });
+  let refreshed: Record<string, unknown> | undefined;
+  try {
+    h.render('instance');
+    await tick();
+    h.render('instance');
+    assert.deepEqual(h.store.instances.value[0].java_selection, { kind: 'custom' });
+    const reset = h.control<{ onReset(): void }>('OverrideChip');
+    serverDetail = newer;
+    reset.onReset();
+    await tick();
+    await h.readiness.refreshInstanceReadiness(instance.id, { retry: false });
+    refreshed = JSON.parse(JSON.stringify(h.store.instances.value[0])) as Record<string, unknown>;
+  } finally {
+    h.dispose();
+    await tick();
+  }
+  assert.deepEqual(h.writes, [{
+    path: `/instances/${instance.id}`,
+    patch: { expected_revision: 6, jvm_preset: '', java_path: '' },
+  }], 'Reset must bind the rendered revision, not omit it or refresh its evidence before sending');
+  assert.ok(h.notices.some((notice) => notice.includes('Could not save runtime: The instance changed.')));
+  assert.ok(!h.notices.includes('Saved'));
+  assert.deepEqual(refreshed?.java_selection, { kind: 'component', component: 'jre-legacy' });
+  assert.equal(refreshed?.revision, 7);
+  assert.equal(h.timers.size, 0);
+});
+
+test('native flush joins two rapid instance controls through their own acknowledged revisions', async () => {
+  const h = harness();
+  const first = deferred<unknown>();
+  let firstResponse: unknown;
+  await h.hydrate();
+  try {
+    h.render('instance');
+    await tick();
+    h.render('instance');
+    h.respond(async (_path, value) => {
+      if (h.writes.length !== 1) return value;
+      firstResponse = value;
+      return first.promise;
+    });
+    h.control<{ onCommit(low: number, high: number): void }>('MemoryField').onCommit(1, 5);
+    h.control<{ onCommit(width: number, height: number): void }>('WindowField').onCommit(1000, 600);
+    h.emit('flush');
+    await tick();
+    assert.equal(h.instance().revision, 7);
+    assert.equal(h.writes.length, 1);
+    assert.deepEqual(h.completions, []);
+    first.resolve(firstResponse);
+    await tick();
+  } finally {
+    first.resolve(firstResponse);
+    await tick();
+    h.dispose();
+  }
+  assert.deepEqual(h.writes.map((write) => write.patch.expected_revision), [6, 7]);
+  assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: true }]);
+  assert.equal(h.store.instances.value[0].revision, 8);
+  assert.equal(h.store.instances.value[0].min_memory_mb, 1024);
+  assert.equal(h.store.instances.value[0].max_memory_mb, 5120);
+  assert.equal(h.store.instances.value[0].window_width, 1000);
+  assert.equal(h.store.instances.value[0].window_height, 600);
+  assert.equal(h.instance().revision, 8);
+  assert.equal(h.timers.size, 0);
+});
+
+test('an older rendered control cannot borrow an independently admitted revision chain', async () => {
+  const h = harness();
+  const first = deferred<unknown>();
+  let firstResponse: unknown;
+  await h.hydrate();
+  try {
+    h.render('instance');
+    await tick();
+    h.render('instance');
+    const oldMemory = h.control<{ onCommit(low: number, high: number): void }>('MemoryField');
+    h.serverInstance({ ...instance, revision: 7, window_width: 900 });
+    await h.readiness.refreshInstanceReadiness(instance.id, { retry: false });
+    h.render('instance');
+    h.respond(async (_path, value) => {
+      if (h.writes.length !== 1) return value;
+      firstResponse = value;
+      return first.promise;
+    });
+    h.control<{ onCommit(width: number, height: number): void }>('WindowField').onCommit(1000, 600);
+    oldMemory.onCommit(1, 5);
+    h.emit('flush');
+    await tick();
+    assert.equal(h.instance().revision, 8);
+    assert.equal(h.writes.length, 1);
+    assert.deepEqual(h.completions, []);
+    first.resolve(firstResponse);
+    await tick();
+  } finally {
+    first.resolve(firstResponse);
+    await tick();
+    h.dispose();
+  }
+  assert.deepEqual(h.writes.map((write) => write.patch.expected_revision), [7, 6]);
+  assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: false }]);
+  assert.ok(h.notices.some((notice) => notice.includes('Could not save memory: The instance changed.')));
+  assert.equal(h.instance().revision, 8);
+  assert.equal(h.instance().window_width, 1000);
+  assert.equal(h.instance().max_memory_mb, undefined);
+  assert.equal(h.store.instances.value[0].revision, 8);
+  assert.equal(h.timers.size, 0);
+});
+
+test('pending instance controls cannot borrow external changes or untrusted acknowledgements', async (context) => {
+  for (const outcome of ['external change', 'refusal', 'lost reply', 'missing revision', 'fractional revision', 'wrong instance', 'jumped revision'] as const) {
+    await context.test(outcome, async () => {
+      const h = harness();
+      const first = deferred<unknown>();
+      let firstResponse: unknown;
+      await h.hydrate();
+      try {
+        h.render('instance');
+        await tick();
+        h.render('instance');
+        if (outcome === 'refusal') h.admit(() => {
+          if (h.writes.length === 1) {
+            throw Object.assign(new Error('The instance changed. Refresh and try again.'), { name: 'ApiError', status: 409 });
+          }
+        });
+        h.respond(async (_path, value) => {
+          if (h.writes.length !== 1) return value;
+          firstResponse = value;
+          return first.promise;
+        });
+        h.control<{ onCommit(low: number, high: number): void }>('MemoryField').onCommit(1, 5);
+        h.control<{ onCommit(width: number, height: number): void }>('WindowField').onCommit(1000, 600);
+        h.emit('flush');
+        await tick();
+        if (outcome !== 'refusal') {
+          assert.equal(h.writes.length, 1);
+          assert.deepEqual(h.completions, []);
+          const response = firstResponse as Record<string, unknown>;
+          if (outcome === 'external change') {
+            h.serverInstance({ ...h.instance(), revision: 8, window_width: 1600, window_height: 900 });
+            await h.readiness.refreshInstanceReadiness(instance.id, { retry: false });
+            assert.equal(h.store.instances.value[0].revision, 8);
+            first.resolve(response);
+          } else if (outcome === 'lost reply') first.reject(new Error('Fixture response lost'));
+          else if (outcome === 'missing revision') first.resolve({ ...response, revision: undefined });
+          else if (outcome === 'fractional revision') first.resolve({ ...response, revision: 7.5 });
+          else if (outcome === 'wrong instance') first.resolve({ ...response, id: 'f33cdfc2-1b22-4b6c-8140-ad3cfe8a7104' });
+          else first.resolve({ ...response, revision: 8 });
+          await tick();
+        }
+      } finally {
+        first.resolve(firstResponse);
+        await tick();
+        h.dispose();
+      }
+      assert.deepEqual(h.writes.map((write) => write.patch.expected_revision), outcome === 'external change' ? [6, 7] : [6, 6]);
+      assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: false }]);
+      assert.equal(h.writes.filter((write) => 'max_memory_mb' in write.patch).length, 1, 'the first intent must never replay');
+      assert.equal(h.writes.filter((write) => 'window_width' in write.patch).length, 1, 'the queued intent must never replay');
+      assert.ok(h.notices.some((notice) => notice.startsWith('Could not save')));
+      assert.equal(h.notices.filter((notice) => notice === 'Saved').length, outcome === 'external change' || outcome === 'refusal' ? 1 : 0);
+      if (outcome === 'external change') {
+        assert.equal(h.instance().revision, 8);
+        assert.equal(h.instance().window_width, 1600);
+        assert.equal(h.store.instances.value[0].revision, 8, 'the late valid revision 7 reply must not replace the current revision 8 detail');
+        assert.equal(h.store.instances.value[0].window_width, 1600);
+      } else if (outcome === 'refusal') {
+        assert.equal(h.instance().revision, 7);
+        assert.equal(h.instance().max_memory_mb, undefined);
+        assert.equal(h.instance().window_width, 1000);
+      } else {
+        assert.equal(h.instance().revision, 7);
+        assert.equal(h.instance().max_memory_mb, 5120);
+        assert.equal(h.instance().window_width, undefined);
+        assert.equal(h.store.instances.value[0].revision, 6, 'an untrusted acknowledgement must not publish');
+      }
+      assert.equal(h.timers.size, 0);
+    });
+  }
+});
+
+test('instance detail decoding requires a positive lossless integer revision', () => {
+  for (const revision of [undefined, null, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, '6']) {
+    assert.throws(() => dto.enrichedInstanceResponse({ ...instance, revision }), /Instance revision/);
+  }
+  assert.equal(dto.enrichedInstanceResponse({ ...instance, revision: 1 }).revision, 1);
+  assert.equal(dto.enrichedInstanceResponse({ ...instance, revision: Number.MAX_SAFE_INTEGER }).revision, Number.MAX_SAFE_INTEGER);
+});
 
 test('a delayed settings detail cannot replace newer Ready from the download registry', async () => {
   const h = harness();

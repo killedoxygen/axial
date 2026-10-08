@@ -922,6 +922,7 @@ mod tests {
             last_played_at: String::new(),
             art_seed: 1,
             settings: Default::default(),
+            java_selection: None,
             icon: String::new(),
             accent: String::new(),
             loader_key: "vanilla".into(),

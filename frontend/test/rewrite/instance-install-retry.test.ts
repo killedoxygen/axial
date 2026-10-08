@@ -65,6 +65,8 @@ function instance(installTarget: InstallQueueInstallItemViewModel | null) {
     name: 'Survival',
     version_id: installTarget?.version_id ?? 'unavailable-loader',
     created_at: '2026-09-27T09:00:00Z',
+    java_selection: { kind: 'inherited' as const },
+    revision: 1,
     version_display: {
       loader_key: 'fabric',
       loader_label: 'Fabric',

@@ -117,6 +117,8 @@ function log(sequence: number) { return { sequence, source: 'stdout', text: `lin
 function instance(launchable = false): EnrichedInstance {
   return {
     id: 'instance-1', name: 'Example', version_id: '1.21', created_at: '2026-09-08T08:00:00Z',
+    java_selection: { kind: 'inherited' },
+    revision: 1,
     version_display: { loader_key: 'vanilla', loader_label: 'Vanilla', minecraft_label: '1.21',
       loader_version_label: '', loader_detail_label: '', summary_label: '1.21', supports_mods: false },
     launchable, launch_action: { state_id: launchable ? 'ready' : 'blocked', label: launchable ? 'Launch' : 'Unavailable',

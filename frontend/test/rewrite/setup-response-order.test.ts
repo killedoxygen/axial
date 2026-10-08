@@ -49,6 +49,8 @@ const flush = (): Promise<void> => new Promise((done) => setImmediate(done));
 function instance(launchable = false) {
   return {
     id: 'fixture-instance', name: 'Fixture pack', version_id: '1.21.4', created_at: '2026-09-27T00:00:00Z',
+    java_selection: { kind: 'inherited' },
+    revision: 1,
     launchable, install_target: null,
     launch_action: { state_id: launchable ? 'ready' : 'busy', label: launchable ? 'Play' : 'Busy',
       tone: launchable ? 'ok' : 'warn', launchable, primary_action: launchable ? 'launch' : 'blocked' },

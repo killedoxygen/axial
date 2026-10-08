@@ -154,6 +154,8 @@ const instance: EnrichedInstance = {
   name: 'Screenshot fixture',
   version_id: 'fixture',
   created_at: '2026-10-04T12:00:00Z',
+  java_selection: { kind: 'inherited' },
+  revision: 1,
   version_display: {
     loader_key: 'vanilla',
     loader_label: 'Vanilla',

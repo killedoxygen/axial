@@ -1,9 +1,11 @@
 import type { LaunchActionState } from './types-launch';
 import type { InstancePerformanceMode } from './types-performance';
 import type { InstallQueueInstallItemViewModel } from './types-install';
+import type { JavaSelection } from './generated/JavaSelection';
 
 export interface Instance {
   id: string;
+  revision: number;
   name: string;
   version_id: string;
   created_at: string;
@@ -12,6 +14,7 @@ export interface Instance {
   max_memory_mb?: number;
   min_memory_mb?: number;
   java_path?: string;
+  java_selection: JavaSelection;
   window_width?: number;
   window_height?: number;
   jvm_preset?: string;
