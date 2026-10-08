@@ -336,13 +336,9 @@ impl InventoryEvidence {
         self.pin.revalidate().map_err(|_| InstallError::NotReady)?;
         let mut batch = self.operation.file_batch();
         for (path, expected) in &self.guards {
-            let file = batch
-                .observe_file(path)
-                .map_err(|_| InstallError::NotReady)?
-                .ok_or(InstallError::NotReady)?;
-            if file.revision_observation() != *expected {
-                return Err(InstallError::NotReady);
-            }
+            batch
+                .validate_revision(path, expected)
+                .map_err(|_| InstallError::NotReady)?;
         }
         for absence in &self.missing {
             absence.revalidate().map_err(|_| InstallError::NotReady)?;

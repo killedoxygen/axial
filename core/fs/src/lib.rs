@@ -4502,7 +4502,11 @@ fn deactivate_claimed_owner(owner: &Arc<EffectOwnerState>) {
 struct CapabilityAuthority {
     operations: Mutex<OperationState>,
     #[cfg(test)]
+    successful_entries: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     directory_open_pause: Mutex<Option<DirectoryOpenReservationPause>>,
+    #[cfg(test)]
+    file_observation_pause: Mutex<Option<FileObservationPause>>,
     session_nonce: [u8; 16],
     root: platform::RootGuard,
     lease: platform::LeaseHandle,
@@ -4515,6 +4519,14 @@ struct DirectoryOpenReservationPause {
     name: LeafName,
     prechecked: Arc<std::sync::Barrier>,
     resume: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+struct FileObservationPause {
+    parent: DirectoryIdentity,
+    name: LeafName,
+    opened: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5208,6 +5220,9 @@ impl CapabilityAuthority {
         drop(state);
         platform::validate_lease(&self.lease)?;
         platform::validate_root(&self.root)?;
+        #[cfg(test)]
+        self.successful_entries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(operation)
     }
 
@@ -5758,6 +5773,40 @@ impl CapabilityAuthority {
             prechecked.wait();
             resume.wait();
         }
+    }
+
+    #[cfg(test)]
+    fn pause_file_observation_after_open(
+        &self,
+        parent: &Directory,
+        name: &LeafName,
+    ) -> io::Result<()> {
+        let mut slot = self.file_observation_pause.lock().unwrap();
+        let pause = if slot
+            .as_ref()
+            .is_some_and(|pause| pause.parent == parent.inner.identity && pause.name == *name)
+        {
+            slot.take()
+        } else {
+            None
+        };
+        drop(slot);
+        if let Some(pause) = pause {
+            pause
+                .opened
+                .try_send(())
+                .map_err(|_| io::Error::other("file observation test receiver unavailable"))?;
+            pause
+                .resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "file observation test release unavailable",
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     fn ensure_leaf_not_transient_reserved(
@@ -10671,10 +10720,19 @@ impl Directory {
     pub fn open_file(&self, name: &LeafName) -> io::Result<FileCapability> {
         let authority = self.authority()?;
         let operation = authority.enter()?;
-        self.validate(&operation)?;
-        authority.ensure_leaf_not_root_control(&operation, self, name)?;
-        authority.ensure_leaf_not_directory_create_reserved(&operation, self, name)?;
-        authority.ensure_leaf_not_transient_reserved(&operation, self, name)?;
+        self.open_file_in(name, &operation)
+    }
+
+    fn open_file_in(
+        &self,
+        name: &LeafName,
+        operation: &CapabilityOperation,
+    ) -> io::Result<FileCapability> {
+        let authority = &operation.authority;
+        self.validate(operation)?;
+        authority.ensure_leaf_not_root_control(operation, self, name)?;
+        authority.ensure_leaf_not_directory_create_reserved(operation, self, name)?;
+        authority.ensure_leaf_not_transient_reserved(operation, self, name)?;
         let handle = platform::open_file(&self.inner.handle, name.as_os_str())?;
         let identity = platform::file_identity(&handle)?;
         let file = FileCapability::new(
@@ -10684,8 +10742,25 @@ impl Directory {
             name.clone(),
             self.inner.authority.clone(),
         );
-        file.validate(&operation)?;
+        file.validate(operation)?;
         Ok(file)
+    }
+
+    /// Reobserve the exact leaf against original evidence without retaining a file.
+    pub fn validate_file_revision_observation(
+        &self,
+        name: &LeafName,
+        expected: &FileRevisionObservation,
+    ) -> io::Result<()> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        let file = self.open_file_in(name, &operation)?;
+        #[cfg(test)]
+        authority.pause_file_observation_after_open(self, name)?;
+        // Retaining admission does not freeze externally replaceable root bindings.
+        platform::validate_lease(&authority.lease)?;
+        platform::validate_root(&authority.root)?;
+        file.validate_revision_observation_in(&operation, expected)
     }
 
     pub fn create_file_create_only(&self, name: &LeafName) -> FileCreateOutcome {
@@ -11897,7 +11972,15 @@ impl FileCapability {
     ) -> io::Result<()> {
         let authority = self.parent.authority()?;
         let operation = authority.enter()?;
-        self.validate(&operation)?;
+        self.validate_revision_observation_in(&operation, expected)
+    }
+
+    fn validate_revision_observation_in(
+        &self,
+        operation: &CapabilityOperation,
+        expected: &FileRevisionObservation,
+    ) -> io::Result<()> {
+        self.validate(operation)?;
         if self.authority.as_ptr() != Arc::as_ptr(&operation.authority) {
             return Err(stale_capability());
         }
@@ -11908,7 +11991,7 @@ impl FileCapability {
         {
             return Err(identity_changed("file revision observation changed"));
         }
-        self.validate(&operation)
+        self.validate(operation)
     }
 
     fn validate_revision_in(
@@ -14430,6 +14513,8 @@ fn finish_root_session_with_recovery(
             physical: identity,
         },
         authority: Arc::new(CapabilityAuthority {
+            #[cfg(test)]
+            successful_entries: std::sync::atomic::AtomicUsize::new(0),
             operations: Mutex::new(OperationState {
                 phase: AUTHORITY_LIVE,
                 root_identity: identity,
@@ -14459,6 +14544,8 @@ fn finish_root_session_with_recovery(
             }),
             #[cfg(test)]
             directory_open_pause: Mutex::new(None),
+            #[cfg(test)]
+            file_observation_pause: Mutex::new(None),
             session_nonce,
             root,
             lease,
@@ -23544,6 +23631,289 @@ mod tests {
         assert_eq!(max_bytes, 16);
         drop((file, other, other_revision, root));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn file_revision_observation_uses_one_owned_admission() {
+        use std::sync::atomic::Ordering;
+
+        let temporary = crate::test_tempdir().expect("temporary root");
+        std::fs::write(temporary.path().join("sample.bin"), b"sample").unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let name = LeafName::new("sample.bin").unwrap();
+        let file = root.open_file(&name).unwrap();
+        let expected = file.revision().unwrap().observation();
+        let authority = root.authority().unwrap();
+        authority.successful_entries.store(0, Ordering::Relaxed);
+        root.validate_file_revision_observation(&name, &expected)
+            .unwrap();
+        let entries = authority.successful_entries.load(Ordering::Relaxed);
+        assert_eq!(file.read_bounded(6).unwrap(), b"sample");
+        drop((file, expected, authority, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(entries, 1, "Native observation must own one admission");
+    }
+
+    fn paused_file_observation(
+        root: &Directory,
+        name: &LeafName,
+        expected: &FileRevisionObservation,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+        std::thread::JoinHandle<io::Result<()>>,
+    ) {
+        let (opened, ready) = std::sync::mpsc::sync_channel(1);
+        let (release, resume) = std::sync::mpsc::sync_channel(1);
+        *root
+            .authority()
+            .unwrap()
+            .file_observation_pause
+            .lock()
+            .unwrap() = Some(FileObservationPause {
+            parent: root.inner.identity,
+            name: name.clone(),
+            opened,
+            resume,
+        });
+        let root = root.clone();
+        let name = name.clone();
+        let expected = expected.clone();
+        let observing =
+            std::thread::spawn(move || root.validate_file_revision_observation(&name, &expected));
+        (ready, release, observing)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_revision_observation_refuses_displaced_bindings_after_open() {
+        for binding in ["file", "lease", "root"] {
+            let temporary = crate::test_tempdir().unwrap();
+            let root_path = temporary.path().join("root");
+            std::fs::create_dir(&root_path).unwrap();
+            std::fs::write(root_path.join("sample.bin"), b"sample").unwrap();
+            let session = acquire_test_root(&root_path);
+            let root = session.root().unwrap();
+            let name = LeafName::new("sample.bin").unwrap();
+            let file = root.open_file(&name).unwrap();
+            let expected = file.revision().unwrap().observation();
+            let (ready, release, observing) = paused_file_observation(&root, &name, &expected);
+            let opened = ready.recv_timeout(std::time::Duration::from_secs(5));
+            let path = match binding {
+                "file" => root_path.join("sample.bin"),
+                "lease" => root_path.join(ROOT_LEASE_NAME),
+                "root" => root_path.clone(),
+                _ => unreachable!(),
+            };
+            let displaced = temporary.path().join("displaced");
+            let mut moved = false;
+            let mutation = if opened.is_ok() {
+                (|| -> io::Result<()> {
+                    std::fs::rename(&path, &displaced)?;
+                    moved = true;
+                    if binding == "root" {
+                        std::fs::create_dir(&path)
+                    } else {
+                        std::fs::write(&path, b"sample")
+                    }
+                })()
+            } else {
+                Err(io::Error::other("observation did not reach native open"))
+            };
+            let _ = release.try_send(());
+            let observed = observing.join();
+            if moved {
+                if path.exists() {
+                    if binding == "root" {
+                        std::fs::remove_dir(&path).unwrap();
+                    } else {
+                        std::fs::remove_file(&path).unwrap();
+                    }
+                }
+                std::fs::rename(&displaced, &path).unwrap();
+            }
+            let preserved = std::fs::read(root_path.join("sample.bin"));
+            drop((file, expected, root));
+            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+            mutation.unwrap();
+            assert!(observed.unwrap().is_err(), "accepted displaced {binding}");
+            assert_eq!(preserved.unwrap(), b"sample");
+        }
+    }
+
+    #[test]
+    fn file_revision_observation_refuses_original_proof_after_file_changes() {
+        for change in [
+            "replacement",
+            "missing",
+            "hardlink",
+            "directory",
+            "restored bytes",
+        ] {
+            let temporary = crate::test_tempdir().unwrap();
+            let path = temporary.path().join("sample.bin");
+            std::fs::write(&path, b"sample").unwrap();
+            let session = acquire_test_root(temporary.path());
+            let root = session.root().unwrap();
+            let name = LeafName::new("sample.bin").unwrap();
+            let file = root.open_file(&name).unwrap();
+            let expected = file.revision().unwrap().observation();
+            match change {
+                "replacement" => {
+                    std::fs::rename(&path, temporary.path().join("previous")).unwrap();
+                    std::fs::write(&path, b"sample").unwrap();
+                }
+                "missing" => std::fs::remove_file(&path).unwrap(),
+                "hardlink" => std::fs::hard_link(&path, temporary.path().join("alias")).unwrap(),
+                "directory" => {
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                }
+                "restored bytes" => {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    loop {
+                        std::fs::write(&path, b"change").unwrap();
+                        if file.revision().unwrap().observation() != expected {
+                            break;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "file stamp did not change"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    std::fs::write(&path, b"sample").unwrap();
+                    assert!(file.revision().unwrap().observation() != expected);
+                }
+                _ => unreachable!(),
+            }
+            let observed = root.validate_file_revision_observation(&name, &expected);
+            drop((file, expected, root));
+            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+            assert!(observed.is_err(), "accepted original proof after {change}");
+        }
+    }
+
+    #[test]
+    fn file_revision_observation_preserves_authority_and_reserved_leaf_refusal() {
+        let temporary = crate::test_tempdir().unwrap();
+        let path = temporary.path().join("sample.bin");
+        std::fs::write(&path, b"sample").unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let name = LeafName::new("sample.bin").unwrap();
+        let file = root.open_file(&name).unwrap();
+        let expected = file.revision().unwrap().observation();
+        let foreign_temporary = crate::test_tempdir().unwrap();
+        std::fs::write(foreign_temporary.path().join("sample.bin"), b"sample").unwrap();
+        let foreign_session = acquire_test_root(foreign_temporary.path());
+        let foreign = foreign_session.root().unwrap();
+        let foreign_result = foreign.validate_file_revision_observation(&name, &expected);
+        drop(foreign);
+        assert!(matches!(
+            foreign_session.revoke(),
+            RootRevokeOutcome::Revoked
+        ));
+
+        let control = root.validate_file_revision_observation(
+            &LeafName::new(ROOT_LEASE_NAME).unwrap(),
+            &expected,
+        );
+        std::fs::rename(&path, temporary.path().join("previous")).unwrap();
+        let destination = root.admit_transient_destination(name.clone()).unwrap();
+        std::fs::write(&path, b"sample").unwrap();
+        let reserved = root.validate_file_revision_observation(&name, &expected);
+        let cancelled = destination.cancel();
+        let fresh = root
+            .open_file(&name)
+            .unwrap()
+            .revision()
+            .unwrap()
+            .observation();
+        let available = root.validate_file_revision_observation(&name, &fresh);
+        drop(file);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        let retired = root.validate_file_revision_observation(&name, &fresh);
+        assert!(foreign_result.is_err());
+        assert_eq!(control.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(reserved.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            cancelled,
+            TransientDestinationCancelOutcome::Cancelled
+        ));
+        available.unwrap();
+        assert!(retired.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"sample");
+        assert_eq!(
+            std::fs::read(temporary.path().join("previous")).unwrap(),
+            b"sample"
+        );
+    }
+
+    #[test]
+    fn file_revision_observation_holds_admission_until_joined() {
+        let temporary = crate::test_tempdir().unwrap();
+        std::fs::write(temporary.path().join("sample.bin"), b"sample").unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let name = LeafName::new("sample.bin").unwrap();
+        let expected = root
+            .open_file(&name)
+            .unwrap()
+            .revision()
+            .unwrap()
+            .observation();
+        let (ready, release, observing) = paused_file_observation(&root, &name, &expected);
+        let opened = ready.recv_timeout(std::time::Duration::from_secs(5));
+        let outcome = session.revoke();
+        let _ = release.try_send(());
+        let observed = observing.join();
+        let refusal = match outcome {
+            RootRevokeOutcome::Refused(refusal) => refusal,
+            other => panic!("live observation did not retain revocation: {other:?}"),
+        };
+        let kind = refusal.error().kind();
+        drop(root);
+        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+        opened.unwrap();
+        observed.unwrap().unwrap();
+        assert_eq!(kind, io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn file_revision_observation_blocks_reset_until_joined() {
+        let temporary = crate::test_tempdir().unwrap();
+        std::fs::write(temporary.path().join("sample.bin"), b"sample").unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let name = LeafName::new("sample.bin").unwrap();
+        let expected = root
+            .open_file(&name)
+            .unwrap()
+            .revision()
+            .unwrap()
+            .observation();
+        let (ready, release, observing) = paused_file_observation(&root, &name, &expected);
+        let opened = ready.recv_timeout(std::time::Duration::from_secs(5));
+        let outcome = session.begin_reset();
+        let _ = release.try_send(());
+        let observed = observing.join();
+        let refusal = match outcome {
+            ResetStartOutcome::Refused(refusal) => refusal,
+            other => panic!("live observation did not retain reset: {other:?}"),
+        };
+        let kind = refusal.error().kind();
+        let session = refusal.cancel_reset();
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        opened.unwrap();
+        observed.unwrap().unwrap();
+        assert_eq!(kind, io::ErrorKind::WouldBlock);
+        assert_eq!(
+            std::fs::read(temporary.path().join("sample.bin")).unwrap(),
+            b"sample"
+        );
     }
 
     #[test]

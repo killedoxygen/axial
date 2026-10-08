@@ -5438,6 +5438,12 @@ struct FileBatchParent {
     revisions: Vec<(ManagedDir, DirectoryRevision)>,
 }
 
+enum FileCheck<'a> {
+    Guard(&'a ManagedFileGuard),
+    Revision(&'a axial_fs::FileRevisionObservation),
+    Missing,
+}
+
 impl FileBatchParent {
     fn revalidate(&mut self) -> io::Result<()> {
         // The deepest retained capability checks managed admission and every
@@ -5468,18 +5474,27 @@ impl FileBatchParent {
         &mut self,
         name: &str,
         revision: &DirectoryRevision,
-        guard: Option<&ManagedFileGuard>,
+        check: FileCheck<'_>,
     ) -> io::Result<()> {
         self.revalidate()?;
-        if let Some(guard) = guard
-            && !self
+        match check {
+            FileCheck::Guard(guard) => {
+                if !self
+                    .directory
+                    .file_guard_matches_after_revalidation(name, guard)
+                    .map_err(loader_io)?
+                {
+                    return Err(io::Error::other(
+                        "managed batch file changed during observation",
+                    ));
+                }
+            }
+            FileCheck::Revision(expected) => self
                 .directory
-                .file_guard_matches_after_revalidation(name, guard)
-                .map_err(loader_io)?
-        {
-            return Err(io::Error::other(
-                "managed batch file changed during observation",
-            ));
+                .inner
+                .directory
+                .validate_file_revision_observation(&leaf(name).map_err(loader_io)?, expected)?,
+            FileCheck::Missing => {}
         }
         // Unlike cached ancestor proofs, the leaf namespace is fenced for
         // this observation only, including absence and newly added aliases.
@@ -5525,6 +5540,32 @@ fn revalidate_batch_child(
 }
 
 impl ManagedLibraryFileBatch {
+    pub fn validate_revision(
+        &mut self,
+        relative: &PortableRelativePath,
+        expected: &axial_fs::FileRevisionObservation,
+    ) -> io::Result<()> {
+        let result = (|| {
+            self.operation.revalidate()?;
+            let (parent_path, name) = relative
+                .as_str()
+                .rsplit_once('/')
+                .unwrap_or(("", relative.as_str()));
+            if self.prepare_parent(parent_path)?.is_some() {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
+            let parent = self.parent.as_mut().expect("observed parent chain");
+            parent.revalidate()?;
+            let revision = parent.directory.inner.directory.revision()?;
+            parent.finish_observation(name, &revision, FileCheck::Revision(expected))?;
+            self.operation.revalidate()
+        })();
+        if result.is_err() {
+            self.parent = None;
+        }
+        result
+    }
+
     pub fn observe_file(
         &mut self,
         relative: &PortableRelativePath,
@@ -5553,6 +5594,43 @@ impl ManagedLibraryFileBatch {
             .as_str()
             .rsplit_once('/')
             .unwrap_or(("", relative.as_str()));
+        if let Some(absence) = self.prepare_parent(parent_path)? {
+            return Ok(FileObservation::Missing(absence));
+        }
+        let parent = self.parent.as_mut().expect("observed parent chain");
+        parent.revalidate()?;
+        let revision = parent.directory.inner.directory.revision()?;
+        let guard = parent
+            .directory
+            .inspect_regular_file_after_revalidation(name)
+            .map_err(loader_io)?;
+        parent.finish_observation(
+            name,
+            &revision,
+            guard.as_ref().map_or(FileCheck::Missing, FileCheck::Guard),
+        )?;
+        self.operation.revalidate()?;
+        match guard {
+            Some(guard) => Ok(FileObservation::Present(ManagedLibraryFile {
+                operation: self.operation.clone(),
+                directory: parent.directory.clone(),
+                name: name.to_owned(),
+                guard,
+            })),
+            None => {
+                let absence = FileAbsence {
+                    operation: self.operation.clone(),
+                    parent: parent.clone(),
+                    name: name.to_owned(),
+                    revision,
+                };
+                absence.revalidate()?;
+                Ok(FileObservation::Missing(absence))
+            }
+        }
+    }
+
+    fn prepare_parent(&mut self, parent_path: &str) -> io::Result<Option<FileAbsence>> {
         if self
             .parent
             .as_ref()
@@ -5587,7 +5665,7 @@ impl ManagedLibraryFileBatch {
                             revision,
                         };
                         absence.revalidate()?;
-                        return Ok(FileObservation::Missing(absence));
+                        return Ok(Some(absence));
                     };
                     revalidate_batch_child(&directory, &child, segment, &mut revision)?;
                     revisions.push((directory, revision));
@@ -5600,33 +5678,7 @@ impl ManagedLibraryFileBatch {
                 revisions,
             });
         }
-        let parent = self.parent.as_mut().expect("observed parent chain");
-        parent.revalidate()?;
-        let revision = parent.directory.inner.directory.revision()?;
-        let guard = parent
-            .directory
-            .inspect_regular_file_after_revalidation(name)
-            .map_err(loader_io)?;
-        parent.finish_observation(name, &revision, guard.as_ref())?;
-        self.operation.revalidate()?;
-        match guard {
-            Some(guard) => Ok(FileObservation::Present(ManagedLibraryFile {
-                operation: self.operation.clone(),
-                directory: parent.directory.clone(),
-                name: name.to_owned(),
-                guard,
-            })),
-            None => {
-                let absence = FileAbsence {
-                    operation: self.operation.clone(),
-                    parent: parent.clone(),
-                    name: name.to_owned(),
-                    revision,
-                };
-                absence.revalidate()?;
-                Ok(FileObservation::Missing(absence))
-            }
-        }
+        Ok(None)
     }
 }
 
@@ -7239,6 +7291,109 @@ mod library_lifecycle_tests {
     }
 
     #[test]
+    fn file_batch_validates_original_revision_without_rebuilding_file_authority() {
+        use std::sync::atomic::Ordering;
+
+        let (_temporary, root, operation) = file_batch_fixture();
+        let path = batch_path("first");
+        let file = operation.observe_file(&path).unwrap().unwrap();
+        let expected = file.revision_observation();
+        let comparisons = &root.authority.root.inner.root.file_identity_comparisons;
+        comparisons.store(0, Ordering::Relaxed);
+        operation
+            .file_batch()
+            .validate_revision(&path, &expected)
+            .unwrap();
+        let observed = comparisons.load(Ordering::Relaxed);
+        assert_eq!(file.read_bounded(32).unwrap(), b"first payload");
+        assert_eq!(observed, 0, "Revision validation rebuilt file authority");
+    }
+
+    #[test]
+    fn file_batch_revision_refuses_changed_evidence_and_recovers_after_refusal() {
+        for change in [
+            "replacement",
+            "rewrite",
+            "missing",
+            "hardlink",
+            "directory",
+            "foreign",
+        ] {
+            let (temporary, _root, operation) = file_batch_fixture();
+            let first = operation
+                .observe_file(&batch_path("first"))
+                .unwrap()
+                .unwrap();
+            let mut expected = first.revision_observation();
+            let second = operation
+                .observe_file(&batch_path("second"))
+                .unwrap()
+                .unwrap();
+            let mut batch = operation.file_batch();
+            batch
+                .validate_revision(&batch_path("first"), &expected)
+                .unwrap();
+            let path = temporary.path().join("assets/objects/aa/first");
+            let foreign = if change == "foreign" {
+                Some(file_batch_fixture())
+            } else {
+                None
+            };
+            match change {
+                "replacement" => {
+                    std::fs::rename(&path, temporary.path().join("previous")).unwrap();
+                    std::fs::write(&path, b"first payload").unwrap();
+                }
+                "rewrite" => {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    loop {
+                        std::fs::write(&path, b"other payload").unwrap();
+                        let changed = operation
+                            .observe_file(&batch_path("first"))
+                            .unwrap()
+                            .unwrap();
+                        if changed.revision_observation() != expected {
+                            break;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "file stamp did not change"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                "missing" => std::fs::remove_file(&path).unwrap(),
+                "hardlink" => std::fs::hard_link(&path, temporary.path().join("alias")).unwrap(),
+                "directory" => {
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                }
+                "foreign" => {
+                    expected = foreign
+                        .as_ref()
+                        .unwrap()
+                        .2
+                        .observe_file(&batch_path("first"))
+                        .unwrap()
+                        .unwrap()
+                        .revision_observation();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                batch
+                    .validate_revision(&batch_path("first"), &expected)
+                    .is_err(),
+                "accepted {change}"
+            );
+            batch
+                .validate_revision(&batch_path("second"), &second.revision_observation())
+                .unwrap();
+            assert_eq!(second.read_bounded(32).unwrap(), b"second payload");
+        }
+    }
+
+    #[test]
     fn file_batch_does_not_repeat_validated_leaf_checks() {
         use std::sync::atomic::Ordering;
 
@@ -7372,6 +7527,10 @@ mod library_lifecycle_tests {
         let (temporary, _root, operation) = file_batch_fixture();
         let mut batch = operation.file_batch();
         let first = batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        let mut revision_batch = operation.file_batch();
+        revision_batch
+            .validate_revision(&batch_path("first"), &first.revision_observation())
+            .unwrap();
         let journal = temporary.path().join("metadata.sqlite-journal");
         std::fs::write(&journal, b"unrelated metadata transaction").unwrap();
         std::fs::remove_file(journal).unwrap();
@@ -7389,6 +7548,11 @@ mod library_lifecycle_tests {
 
         assert!(first.revalidate().is_err());
         assert!(first.sha1_bounded(32).is_err());
+        assert!(
+            revision_batch
+                .validate_revision(&batch_path("first"), &first.revision_observation())
+                .is_err()
+        );
         assert!(batch.observe_file(&batch_path("second")).is_err());
         for parent in ["assets", "previous-assets"] {
             assert_eq!(
@@ -7475,7 +7639,7 @@ mod library_lifecycle_tests {
         std::fs::remove_file(journal).unwrap();
 
         parent
-            .finish_observation("second", &revision, Some(&guard))
+            .finish_observation("second", &revision, FileCheck::Guard(&guard))
             .unwrap();
         assert!(
             parent
@@ -7529,10 +7693,26 @@ mod library_lifecycle_tests {
             }
             assert!(
                 parent
-                    .finish_observation(name, &revision, guard.as_ref())
+                    .finish_observation(
+                        name,
+                        &revision,
+                        guard.as_ref().map_or(FileCheck::Missing, FileCheck::Guard),
+                    )
                     .is_err(),
                 "accepted {change} during file observation"
             );
+            if let Some(guard) = guard {
+                assert!(
+                    parent
+                        .finish_observation(
+                            name,
+                            &revision,
+                            FileCheck::Revision(&guard.revision.observation()),
+                        )
+                        .is_err(),
+                    "accepted {change} during revision validation"
+                );
+            }
         }
     }
 
