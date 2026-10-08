@@ -69,14 +69,11 @@ pub fn router(
 
 async fn list(State(services): State<Services>) -> Result<Json<Value>, ApiError> {
     let records = services.instances.registry().list().map_err(error)?;
-    let versions = services.setup.installed().await.map_err(error)?;
     let instances = services
         .setup
-        .enrich_all(
-            records.into_iter().map(|record| record.instance).collect(),
-            &versions,
-        )
-        .await;
+        .enrich_all(records.into_iter().map(|record| record.instance).collect())
+        .await
+        .map_err(error)?;
     let last_instance_id = services
         .instances
         .registry()

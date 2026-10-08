@@ -77,6 +77,8 @@ pub struct LaunchCoordinator {
     telemetry: Option<Arc<crate::telemetry::Telemetry>>,
     #[cfg(test)]
     pub(crate) fresh_install_checks: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) installed_scans: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub(crate) struct PreflightProjection {
@@ -89,6 +91,16 @@ pub(crate) struct PreflightProjection {
     host: Arc<super::resources::HostResources>,
     diagnostics: bool,
     installs: InstallQueue,
+}
+
+impl PreflightProjection {
+    pub(crate) fn versions(&self) -> &[axial_minecraft::VersionEntry] {
+        self.scan
+            .as_ref()
+            .and_then(|scan| scan.as_ref().ok())
+            .map(|scan| scan.versions())
+            .unwrap_or_default()
+    }
 }
 
 impl Drop for PreflightProjection {
@@ -298,6 +310,8 @@ impl LaunchCoordinator {
             telemetry: None,
             #[cfg(test)]
             fresh_install_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            installed_scans: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -555,18 +569,21 @@ impl LaunchCoordinator {
     /// Read-only readiness with an owned Java diagnostic probe, never game
     /// launch or native extraction. It does not reserve the instance while probing.
     pub async fn preflight(&self, id: InstanceId) -> LaunchPreflight {
-        let mut projection = self.preflight_projection();
+        let mut projection = self.preflight_projection(None);
         projection.diagnostics = true;
         projection.finalize_scan = true;
         self.preflight_with_projection(id, &mut projection).await
     }
 
-    pub(crate) fn preflight_projection(&self) -> PreflightProjection {
+    pub(crate) fn preflight_projection(
+        &self,
+        scan: Option<Arc<crate::catalog::InstalledSnapshot>>,
+    ) -> PreflightProjection {
         PreflightProjection {
             current: None,
             inventories: Vec::new(),
             budget: Arc::new(Mutex::new(InventoryBudget::projection())),
-            scan: None,
+            scan: scan.map(Ok),
             finalize_scan: false,
             context: (|| {
                 Ok((
@@ -603,10 +620,12 @@ impl LaunchCoordinator {
         };
         let scan = scan?;
         let inventories = projection.inventories.clone();
-        let checks = inventories.iter().try_fold(0u64, |sum, inventory| {
-            sum.checked_add(inventory.evidence.entry_count())
-                .ok_or(LaunchError::AtCapacity)
-        })?;
+        let checks = inventories
+            .iter()
+            .try_fold(scan.entry_count(), |sum, inventory| {
+                sum.checked_add(inventory.evidence.entry_count())
+                    .ok_or(LaunchError::AtCapacity)
+            })?;
         projection
             .budget
             .lock()
@@ -842,12 +861,17 @@ impl LaunchCoordinator {
                             }
                         });
                         if owned_scan.lock().unwrap().is_none() {
+                            #[cfg(test)]
+                            coordinator.installed_scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let scan = crate::catalog::installed_snapshot(&pin).await
                                 .map(Arc::new).map_err(|_| LaunchError::LibraryUnavailable);
                             *owned_scan.lock().unwrap() = Some(scan);
                         }
                         let scan = owned_scan.lock().unwrap().clone()
                             .ok_or(LaunchError::PreparationFailed)??;
+                        budget.lock().unwrap().reserve_checks(scan.entry_count())
+                            .map_err(install_read_error)?;
+                        coordinator.revalidate_scan(scan.clone()).await?;
                         #[cfg(test)]
                         coordinator
                             .fresh_install_checks
@@ -1046,7 +1070,13 @@ impl LaunchCoordinator {
                 };
                 let scan = owned_scan.lock().unwrap().clone();
                 if finalize_scan && let Some(scan) = scan {
-                    coordinator.revalidate_scan(scan?).await?;
+                    let scan = scan?;
+                    let reserved = budget.lock().unwrap().reserve_checks(scan.entry_count())
+                        .map_err(install_read_error);
+                    match reserved {
+                        Ok(()) => coordinator.revalidate_scan(scan).await?,
+                        Err(error) => result = Err(error),
+                    }
                 }
                 let final_proof = owned_proof.lock().unwrap().clone();
                 if finalize_scan && let Some(proof) = &final_proof {
@@ -2995,7 +3025,7 @@ mod tests {
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
         let client = root.path().join("versions/1.20.1/1.20.1.jar");
         std::fs::remove_file(&client).unwrap();
-        let mut ordinary = coordinator.preflight_projection();
+        let mut ordinary = coordinator.preflight_projection(None);
         ordinary.diagnostics = true;
         let damaged = coordinator
             .preflight_with_projection(id.clone(), &mut ordinary)
@@ -3009,13 +3039,18 @@ mod tests {
         let files = crate::install::artifacts::ActivatedVersion::from_source(&source)
             .files
             .len() as u64;
-        let mut limited = coordinator.preflight_projection();
+        let mut limited = coordinator.preflight_projection(None);
         limited.diagnostics = true;
+        let scan_checks =
+            crate::catalog::installed_snapshot(&coordinator.instances.library().admit().unwrap())
+                .await
+                .unwrap()
+                .entry_count();
         limited
             .budget
             .lock()
             .unwrap()
-            .reserve_checks(1_000_000 - 1 - 2 * files)
+            .reserve_checks(1_000_000 - 1 - 2 * files - scan_checks)
             .unwrap();
         let exhausted = coordinator
             .preflight_with_projection(id, &mut limited)
@@ -3421,7 +3456,7 @@ mod tests {
     async fn preflight_projection_reuses_verified_install_but_ordinary_reads_stay_fresh() {
         let (root, coordinator, id) = preflight_fixture().await;
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
-        let mut projection = coordinator.preflight_projection();
+        let mut projection = coordinator.preflight_projection(None);
         for _ in 0..2 {
             let result = coordinator
                 .preflight_with_projection(id.clone(), &mut projection)
@@ -3450,10 +3485,73 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn seeded_preflight_refuses_inherited_inputs_and_reselected_generation_before_inspection()
+    {
+        for change in ["json", "jar", "generation"] {
+            let (root, coordinator, id) = preflight_fixture().await;
+            std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+            let child = root.path().join("versions/inherited");
+            std::fs::create_dir(&child).unwrap();
+            std::fs::write(
+                child.join("inherited.json"),
+                br#"{"id":"inherited","inheritsFrom":"1.20.1","type":"release"}"#,
+            )
+            .unwrap();
+            let library = coordinator.instances.library();
+            let pin = library.admit().unwrap();
+            let scan = crate::catalog::installed_snapshot(&pin).await.unwrap();
+            assert!(
+                scan.versions()
+                    .iter()
+                    .any(|version| version.id == "inherited"
+                        && version.inherits_from == "1.20.1"
+                        && version.launchable)
+            );
+            let mut projection = coordinator.preflight_projection(Some(Arc::new(scan)));
+            if change == "generation" {
+                let mut selection = library.begin_switch().unwrap();
+                selection.prepare_managed(pin.library_id()).unwrap();
+                let after = selection.commit_after_persistence().unwrap();
+                assert_ne!(pin.generation(), after);
+            } else {
+                let path = root.path().join(format!("versions/1.20.1/1.20.1.{change}"));
+                let bytes = std::fs::read(&path).unwrap();
+                std::fs::rename(&path, root.path().join("original-input")).unwrap();
+                std::fs::write(&path, bytes).unwrap();
+            }
+            let preflight = coordinator
+                .preflight_with_projection(id, &mut projection)
+                .await;
+            let finalized = coordinator.finish_preflight_projection(&projection).await;
+            drop((projection, pin));
+            coordinator
+                .tasks
+                .shutdown(std::time::Duration::from_secs(3))
+                .await
+                .unwrap();
+
+            assert!(!preflight.launchable, "accepted displaced {change}");
+            assert_eq!(
+                preflight.error.unwrap().code,
+                LaunchError::LibraryUnavailable
+            );
+            assert_eq!(finalized, Err(LaunchError::LibraryUnavailable));
+            assert_eq!(
+                coordinator
+                    .fresh_install_checks
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+            assert!(coordinator.sessions.snapshots().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn preflight_projection_release_resumes_a_queued_install() {
         let (root, coordinator, id) = preflight_fixture().await;
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
-        let mut projection = coordinator.preflight_projection();
+        let mut projection = coordinator.preflight_projection(None);
         assert!(
             coordinator
                 .preflight_with_projection(id, &mut projection)
@@ -3519,11 +3617,68 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn preflight_projection_rejects_artifact_drift_and_does_not_cache_refusals() {
+    async fn preflight_reserves_catalogue_verification_before_inspection_and_publication() {
+        let (root, coordinator, id) = preflight_fixture().await;
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        let pin = coordinator.instances.library().admit().unwrap();
+        let mut observations = Vec::new();
+        for admission in [true, false] {
+            let scan = crate::catalog::installed_snapshot(&pin).await.unwrap();
+            let mut projection = coordinator.preflight_projection(Some(Arc::new(scan)));
+            projection
+                .budget
+                .lock()
+                .unwrap()
+                .reserve_checks(1_000_000 - u64::from(admission))
+                .unwrap();
+            coordinator
+                .fresh_install_checks
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            let result = if admission {
+                coordinator
+                    .preflight_with_projection(id.clone(), &mut projection)
+                    .await
+                    .error
+                    .map(|error| error.code)
+                    .ok_or(())
+            } else {
+                coordinator
+                    .finish_preflight_projection(&projection)
+                    .await
+                    .err()
+                    .ok_or(())
+            };
+            observations.push((
+                admission,
+                result,
+                coordinator
+                    .fresh_install_checks
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ));
+            drop(projection);
+        }
+        drop(pin);
+        coordinator
+            .tasks
+            .shutdown(std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        for (admission, result, inspections) in observations {
+            assert_eq!(result, Ok(LaunchError::AtCapacity), "admission={admission}");
+            assert_eq!(
+                inspections, 0,
+                "inspection began before catalogue budget admission"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preflight_projection_rejects_changed_evidence_until_a_fresh_request() {
         for ancestor in [false, true] {
             let (root, coordinator, id) = preflight_fixture().await;
             std::fs::write(root.path().join("probe-release"), b"release").unwrap();
-            let mut projection = coordinator.preflight_projection();
+            let mut projection = coordinator.preflight_projection(None);
             assert!(
                 coordinator
                     .preflight_with_projection(id.clone(), &mut projection)
@@ -3557,9 +3712,18 @@ mod tests {
             if !ancestor {
                 std::fs::write(&jar, original).unwrap();
             }
-            let repaired = coordinator
-                .preflight_with_projection(id, &mut projection)
+            let stale = coordinator
+                .preflight_with_projection(id.clone(), &mut projection)
                 .await;
+            assert_eq!(stale.error.unwrap().code, LaunchError::LibraryUnavailable);
+            assert!(
+                coordinator
+                    .finish_preflight_projection(&projection)
+                    .await
+                    .is_err()
+            );
+            drop(projection);
+            let repaired = coordinator.preflight(id).await;
             assert!(repaired.launchable, "{repaired:?}");
             assert_eq!(
                 coordinator
@@ -3577,7 +3741,7 @@ mod tests {
         let lane = root.path().join(".axial-publication");
         std::fs::rename(&lane, root.path().join("previous-publication")).unwrap();
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
-        let mut projection = coordinator.preflight_projection();
+        let mut projection = coordinator.preflight_projection(None);
         assert!(
             coordinator
                 .preflight_with_projection(id.clone(), &mut projection)
@@ -3623,7 +3787,7 @@ mod tests {
                 .is_err()
         );
         drop(projection);
-        let mut projection = coordinator.preflight_projection();
+        let mut projection = coordinator.preflight_projection(None);
         let reselected = coordinator
             .preflight_with_projection(id, &mut projection)
             .await;
@@ -4019,7 +4183,7 @@ mod tests {
                 let account = coordinator.accounts.capture_selected().unwrap();
                 coordinator.accounts.remove(account.account_id()).unwrap();
             }
-            let mut projection = coordinator.preflight_projection();
+            let mut projection = coordinator.preflight_projection(None);
             projection.finalize_scan = change == "capacity_foreground";
             std::fs::write(root.path().join("probe-release"), b"release").unwrap();
             assert!(
@@ -4160,7 +4324,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_waiter_loss_retains_artifacts_until_the_probe_is_reaped() {
         let (root, coordinator, id) = preflight_fixture().await;
-        let mut projection = coordinator.preflight_projection();
+        let mut projection = coordinator.preflight_projection(None);
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
         assert!(
             coordinator

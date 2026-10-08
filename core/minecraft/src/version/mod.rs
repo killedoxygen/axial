@@ -82,9 +82,15 @@ pub struct VersionScanDependencyStamp {
     library: ManagedLibraryWitness,
     root_binding: ManagedDirectoryIdentity,
     facts: VersionScanDependencyFacts,
+    entries: u64,
 }
 
 impl VersionScanDependencyStamp {
+    /// Directory/file comparisons per verification, excluding native guard work.
+    pub fn entry_count(&self) -> u64 {
+        self.entries
+    }
+
     pub fn is_revalidated(&self) -> bool {
         let Ok(operation) = self.library.try_acquire() else {
             return false;
@@ -642,6 +648,17 @@ fn finish_scan_snapshot(
         dependencies: VersionScanDependencyStamp {
             library: operation.witness(),
             root_binding,
+            entries: match &facts {
+                VersionScanDependencyFacts::Invalid
+                | VersionScanDependencyFacts::MissingVersions => 1,
+                VersionScanDependencyFacts::Present { versions, .. } => {
+                    versions.iter().fold(1_u64, |count, version| {
+                        count
+                            .saturating_add(1)
+                            .saturating_add(version.files.len() as u64)
+                    })
+                }
+            },
             facts,
         },
     })
@@ -868,6 +885,38 @@ mod tests {
         assert!(version.status_detail.contains("1.20.1"));
 
         let _ = fs::remove_dir_all(&mc_dir);
+    }
+
+    #[test]
+    fn dependency_count_covers_retained_directories_and_inherited_files() {
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+        let root = crate::managed_fs::ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        assert_eq!(
+            super::scan_versions_snapshot(&operation)
+                .unwrap()
+                .dependencies()
+                .entry_count(),
+            1
+        );
+        let versions = temporary.path().join("versions");
+        fs::create_dir_all(versions.join("1.20.1")).unwrap();
+        fs::create_dir(versions.join("child")).unwrap();
+        fs::write(
+            versions.join("1.20.1/1.20.1.json"),
+            br#"{"id":"1.20.1","type":"release"}"#,
+        )
+        .unwrap();
+        fs::write(versions.join("1.20.1/1.20.1.jar"), b"client").unwrap();
+        fs::write(
+            versions.join("child/child.json"),
+            br#"{"id":"child","inheritsFrom":"1.20.1","type":"release"}"#,
+        )
+        .unwrap();
+        let snapshot = super::scan_versions_snapshot(&operation).unwrap();
+        assert_eq!(snapshot.report.versions.len(), 2);
+        assert_eq!(snapshot.dependencies().entry_count(), 6);
+        assert!(snapshot.dependencies().is_revalidated());
     }
 
     #[test]

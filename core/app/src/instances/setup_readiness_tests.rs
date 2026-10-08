@@ -4265,8 +4265,11 @@ async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
         .unwrap()
         .unwrap();
     let input = vec![first.clone(), missing.clone(), bad.clone(), last.clone()];
-    let versions = service.installed().await.unwrap();
-    let rows = service.enrich_all(input.clone(), &versions).await;
+    service
+        .launch
+        .installed_scans
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let rows = service.enrich_all(input.clone()).await.unwrap();
     assert_eq!(
         rows.iter().map(|row| &row.instance.id).collect::<Vec<_>>(),
         input.iter().map(|row| &row.id).collect::<Vec<_>>()
@@ -4286,6 +4289,15 @@ async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
             .load(std::sync::atomic::Ordering::Relaxed),
         2
     );
+    assert_eq!(
+        service
+            .launch
+            .installed_scans
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one request must scan installed metadata once for display and readiness"
+    );
+    let versions = service.installed().await.unwrap();
     assert!(service.enrich(first.clone(), &versions).await.launchable);
     assert_eq!(
         service
@@ -4301,7 +4313,7 @@ async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
     let service = Arc::new(service);
     let waiter = tokio::spawn({
         let service = service.clone();
-        async move { service.enrich_all(vec![first, last], &versions).await }
+        async move { service.enrich_all(vec![first, last]).await.unwrap() }
     });
     let started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while std::fs::read(root.path().join("probes"))
@@ -4346,6 +4358,60 @@ async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
             .try_acquire(std::iter::empty::<String>(), [artifact])
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn grouped_readiness_scans_empty_and_busy_lists_and_preserves_scan_refusal() {
+    use std::sync::atomic::Ordering;
+
+    let (_root, service, _) = fixture();
+    crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+    let instance = super::super::create::tests::create(&service.instances, "Busy row").await;
+    service.launch.installed_scans.store(0, Ordering::Relaxed);
+    for expected in 1..=2 {
+        assert!(service.enrich_all(Vec::new()).await.unwrap().is_empty());
+        assert_eq!(
+            service.launch.installed_scans.load(Ordering::Relaxed),
+            expected
+        );
+    }
+    let pin = service.instances.directories().library().admit().unwrap();
+    let blocker = service
+        .instances
+        .directories()
+        .exclusions()
+        .try_acquire(
+            std::iter::empty::<String>(),
+            [crate::install::queue::library_artifact(
+                &pin.library_id().to_string(),
+            )],
+        )
+        .unwrap();
+    let rows = service.enrich_all(vec![instance.clone()]).await.unwrap();
+    let operation = pin.managed_library().unwrap();
+    let publishing =
+        axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
+    let refused = service.enrich_all(Vec::new()).await;
+    drop((publishing, operation, blocker, pin));
+    service
+        .instances
+        .tasks
+        .shutdown(std::time::Duration::from_secs(3))
+        .await
+        .unwrap();
+
+    assert_eq!(service.launch.installed_scans.load(Ordering::Relaxed), 4);
+    assert_eq!(
+        service.launch.fresh_install_checks.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].instance.id, instance.id);
+    assert_eq!(rows[0].version_display.minecraft_label, "1.21.4");
+    assert!(!rows[0].launchable);
+    assert_eq!(rows[0].launch_action.primary_action, "blocked");
+    assert!(rows[0].needs_install.is_empty());
+    assert!(matches!(refused, Err(InstanceError::VersionUnavailable)));
 }
 
 #[tokio::test]
@@ -4403,8 +4469,7 @@ async fn grouped_readiness_refuses_earlier_inventory_drift_during_a_later_probe(
         .unwrap();
     let last = super::super::create::tests::create(&service.instances, "Later version").await;
     let input = vec![first, last];
-    let versions = service.installed().await.unwrap();
-    let healthy = service.enrich_all(input.clone(), &versions).await;
+    let healthy = service.enrich_all(input.clone()).await.unwrap();
     assert!(healthy.iter().all(|row| row.launchable), "{healthy:?}");
     let asset = root
         .path()
@@ -4416,7 +4481,7 @@ async fn grouped_readiness_refuses_earlier_inventory_drift_during_a_later_probe(
     let waiter = tokio::spawn({
         let service = service.clone();
         let input = input.clone();
-        async move { service.enrich_all(input, &versions).await }
+        async move { service.enrich_all(input).await.unwrap() }
     });
     let paused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while std::fs::read_to_string(root.path().join("probes"))?
@@ -4483,8 +4548,7 @@ async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
         let first = super::super::create::tests::create(&service.instances, "First healthy").await;
         let last = super::super::create::tests::create(&service.instances, "Last healthy").await;
         let input = vec![first.clone(), last];
-        let versions = service.installed().await.unwrap();
-        let healthy = service.enrich_all(input.clone(), &versions).await;
+        let healthy = service.enrich_all(input.clone()).await.unwrap();
         let protected: Vec<_> = ["json", "jar"].into_iter().map(|extension| {
             let path = root.path().join(format!("versions/1.21.4/1.21.4.{extension}"));
             let bytes = std::fs::read(&path).unwrap();
@@ -4498,8 +4562,7 @@ async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
         waiter = Some(tokio::spawn({
             let service = service.clone();
             let input = input.clone();
-            let versions = versions.clone();
-            async move { service.enrich_all(input, &versions).await }
+            async move { service.enrich_all(input).await.unwrap() }
         }));
         // The first row has completed before the second actual Java probe pauses.
         let paused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -4520,11 +4583,11 @@ async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
         let rows = waiter.take().unwrap().await.unwrap();
         let degraded = serde_json::to_value(service.launch.preflight(first.id.clone()).await).unwrap();
+        let degraded_rows = service.enrich_all(input.clone()).await.unwrap();
         let preserved = std::fs::read(&metadata).unwrap();
         std::fs::remove_file(&metadata).unwrap();
         std::fs::remove_dir(&external).unwrap();
-        let versions = service.installed().await.unwrap();
-        let restored = service.enrich_all(input.clone(), &versions).await;
+        let restored = service.enrich_all(input.clone()).await.unwrap();
         move || {
             assert!(paused.is_ok() && still_pending, "second probe did not remain pending");
             assert_eq!(probe_count, 2);
@@ -4545,6 +4608,14 @@ async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
                     assert_eq!(row.launch_action.primary_action, "launch");
                     assert!(row.needs_install.is_empty());
                 }
+            }
+            assert_eq!(degraded_rows.len(), input.len());
+            for (row, instance) in degraded_rows.iter().zip(&input) {
+                assert_eq!(row.instance.id, instance.id);
+                assert_eq!(row.version_display.minecraft_label, "1.21.4");
+                assert!(!row.launchable);
+                assert_eq!(row.launch_action.primary_action, "blocked");
+                assert!(row.needs_install.is_empty());
             }
             assert_eq!(degraded["status"], "ready", "{degraded}");
             assert_eq!(degraded["launchable"], false);

@@ -27,7 +27,7 @@ use std::{
 
 const MAX_INVENTORY_ENTRIES: usize = 1_000_000;
 
-/// One grouped projection's cumulative file visits and declared read bytes.
+/// One grouped projection's cumulative dependency checks and declared read bytes.
 pub(crate) struct InventoryBudget {
     remaining_checks: u64,
     remaining_bytes: u64,

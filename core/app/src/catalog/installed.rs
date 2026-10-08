@@ -17,6 +17,14 @@ impl InstalledSnapshot {
         &self.snapshot.report.versions
     }
 
+    pub(crate) fn into_versions(self) -> Vec<VersionEntry> {
+        self.snapshot.report.versions
+    }
+
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.snapshot.dependencies().entry_count()
+    }
+
     pub(crate) fn is_degraded(&self) -> bool {
         self.snapshot.report.state == VersionScanState::Degraded
     }

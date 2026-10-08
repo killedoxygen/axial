@@ -17,7 +17,7 @@ use crate::content::{
 };
 use crate::storage::{MetadataStore, StorageError, rusqlite::OptionalExtension};
 use crate::{
-    catalog::{Catalog, installed_versions},
+    catalog::Catalog,
     install::{
         model::{
             InstallQueueContentActionRequest, InstallQueueInstallItemViewModel,
@@ -894,18 +894,27 @@ impl SetupService {
     }
 
     pub async fn installed(&self) -> InstanceResult<Vec<VersionEntry>> {
+        self.installed_snapshot()
+            .await
+            .map(crate::catalog::InstalledSnapshot::into_versions)
+    }
+
+    async fn installed_snapshot(&self) -> InstanceResult<crate::catalog::InstalledSnapshot> {
         let pin = self
             .instances
             .directories()
             .library()
             .admit()
             .map_err(|_| InstanceError::LibraryUnavailable)?;
-        let library = pin
+        let _library = pin
             .managed_library()
             .map_err(|_| InstanceError::LibraryUnavailable)?;
-        installed_versions(&library, None)
+        #[cfg(test)]
+        self.launch
+            .installed_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::catalog::installed_snapshot(&pin)
             .await
-            .map(|result| result.versions)
             .map_err(|_| InstanceError::VersionUnavailable)
     }
 
@@ -990,13 +999,13 @@ impl SetupService {
     pub async fn enrich_all(
         &self,
         instances: Vec<Instance>,
-        versions: &[VersionEntry],
-    ) -> Vec<EnrichedInstance> {
+    ) -> InstanceResult<Vec<EnrichedInstance>> {
+        let scan = self.installed_snapshot().await?;
+        let mut projection = self.launch.preflight_projection(Some(Arc::new(scan)));
         let mut pending = instances.into_iter().enumerate().collect::<Vec<_>>();
         // Registry version strings only schedule adjacent work. Launch admission
         // checks the actual generation, library and version before sharing proof.
         pending.sort_by(|(_, left), (_, right)| left.version_id.cmp(&right.version_id));
-        let mut projection = self.launch.preflight_projection();
         let mut enriched = Vec::with_capacity(pending.len());
         for (index, instance) in pending {
             let preflight = self
@@ -1007,7 +1016,7 @@ impl SetupService {
         }
         let scan = self.launch.finish_preflight_projection(&projection).await;
         enriched.sort_unstable_by_key(|(index, _, _)| *index);
-        enriched.into_iter().map(|(_, instance, preflight)| {
+        Ok(enriched.into_iter().map(|(_, instance, preflight)| {
             let current = scan.clone().and_then(|_| self.launch
                 .validate_projection_target(&projection, &instance));
             let preflight = match &current {
@@ -1020,8 +1029,8 @@ impl SetupService {
                 ),
                 Err(_) => preflight,
             };
-            self.enrich_preflight(instance, versions, preflight)
-        }).collect()
+            self.enrich_preflight(instance, projection.versions(), preflight)
+        }).collect())
     }
 
     fn enrich_preflight(
