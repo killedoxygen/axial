@@ -126,7 +126,8 @@ async fn update(
         .instances
         .update_with_sessions(&identity(&id)?, patch, &services.sessions)
         .map_err(error)?;
-    let versions = services.setup.installed().await.map_err(error)?;
+    // Display inspection cannot turn a committed write into a refusal.
+    let versions = services.setup.installed().await.unwrap_or_default();
     Ok(Json(json!(
         services.setup.enrich(instance, &versions).await
     )))
@@ -150,7 +151,7 @@ async fn duplicate(
         .await
         .map_err(|_| error(InstanceError::SettlementRequired))?
         .map_err(error)?;
-    let versions = services.setup.installed().await.map_err(error)?;
+    let versions = services.setup.installed().await.unwrap_or_default();
     Ok(Json(json!(
         services.setup.enrich(instance, &versions).await
     )))

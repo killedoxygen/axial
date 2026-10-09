@@ -3410,6 +3410,33 @@ async fn publication_preflight(retain_runtime: &mut bool) {
         let restored = api.get(&preflight).await;
         let restored_detail = read_projection(&detail_path).await;
         let restored_list = read_projection("/api/v1/instances").await;
+        let publication =
+            axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
+        let update = api
+            .client
+            .put(format!("{}{detail_path}", api.base))
+            .header(transport::CAPABILITY_HEADER, &api.capability)
+            .json(&json!({
+                "expected_revision":created["revision"],
+                "name":"Publication updated"
+            }))
+            .send()
+            .await
+            .unwrap();
+        let updated = (update.status(), update.json::<Value>().await.unwrap());
+        let duplicate = api
+            .client
+            .post(format!("{}{detail_path}/duplicate", api.base))
+            .header(transport::CAPABILITY_HEADER, &api.capability)
+            .json(&json!({"name":"Publication duplicate"}))
+            .send()
+            .await
+            .unwrap();
+        let duplicated = (duplicate.status(), duplicate.json::<Value>().await.unwrap());
+        drop(publication);
+        let committed_detail = read_projection(&detail_path).await;
+        let committed_list = read_projection("/api/v1/instances").await;
+        let pending = api.get("/api/v1/instances/pending").await;
         let requests_after = provider.state.requests.lock().unwrap().clone();
         let queue_after = api.get("/api/v1/install/queue").await;
         let sessions = api.get("/api/v1/launch/sessions").await;
@@ -3427,6 +3454,46 @@ async fn publication_preflight(retain_runtime: &mut bool) {
                 assert_eq!(after, before);
             }
             assert_eq!(conflict_after, conflict);
+            assert_eq!(committed_detail.0, StatusCode::OK);
+            assert_eq!(committed_detail.1["id"], instance);
+            assert_eq!(committed_detail.1["name"], "Publication updated");
+            assert_eq!(
+                committed_detail.1["revision"].as_u64().unwrap(),
+                created["revision"].as_u64().unwrap() + 1
+            );
+            assert_eq!(committed_list.0, StatusCode::OK);
+            let committed_rows = committed_list.1["instances"].as_array().unwrap();
+            assert_eq!(committed_rows.len(), 3, "{committed_rows:?}");
+            let copy = committed_rows
+                .iter()
+                .find(|row| row["name"] == "Publication duplicate")
+                .unwrap();
+            assert_ne!(copy["id"], instance);
+            assert_ne!(copy["id"], sibling);
+            assert_eq!(pending, json!({"creations":[],"deletions":[]}));
+            assert_eq!(
+                updated.0,
+                StatusCode::OK,
+                "update: {updated:?}; duplicate: {duplicated:?}"
+            );
+            assert_eq!(duplicated.0, StatusCode::OK, "{duplicated:?}");
+            assert_eq!(updated.1["id"], instance);
+            assert_eq!(updated.1["revision"], committed_detail.1["revision"]);
+            assert_eq!(updated.1["name"], "Publication updated");
+            assert_eq!(duplicated.1["id"], copy["id"]);
+            assert_eq!(duplicated.1["name"], copy["name"]);
+            for response in [&updated.1, &duplicated.1] {
+                assert_eq!(response["launch_action"]["launchable"], false, "{response}");
+                assert_eq!(
+                    response["launch_action"]["primary_action"], "blocked",
+                    "{response}"
+                );
+                assert_eq!(response["needs_install"], "", "{response}");
+            }
+            for response in std::iter::once(&committed_detail.1).chain(committed_rows) {
+                assert_eq!(response["launch_action"]["launchable"], true, "{response}");
+                assert_eq!(response["needs_install"], "", "{response}");
+            }
             for ((detail_status, detail), (list_status, list), launchable, action) in [
                 (ready_detail, ready_list, true, "launch"),
                 (busy_detail, busy_list, false, "blocked"),
