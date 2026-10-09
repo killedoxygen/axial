@@ -4,6 +4,7 @@ import { stripTypeScriptTypes } from 'node:module';
 import { resolve, dirname, basename } from 'node:path';
 import { createContext, SourceTextModule, SyntheticModule } from 'node:vm';
 import test from 'node:test';
+import * as ui from '../../src/ui-state';
 
 /**
  * @typedef {{
@@ -186,10 +187,125 @@ async function actionHarness(planResponse = { ...conflictPlan, conflicts: [] }, 
     },
     'toast.ts': { toast: (/** @type {Parameters<typeof import('../../src/toast').toast>} */ ...args) => notices.push(args) },
     'utils.ts': { errMessage: (/** @type {unknown} */ error) => error instanceof Error ? error.message : String(error) },
-    'ui-state.ts': { openCreateModpack: () => { throw new Error('Unexpected create navigation'); } },
+    'ui-state.ts': ui,
   });
   return { actions, requests, applied, notices };
 }
+
+async function setupHarness() {
+  /** @type {Array<{ args: ApiCall, response: ReturnType<typeof deferred<import('../../src/types-content').ModpackTarget>> }>} */
+  const requests = [];
+  /** @type {Parameters<typeof import('../../src/toast').toast>[]} */
+  const notices = [];
+  const actions = await loadSource('views/discover/actions.ts', {
+    'api.ts': {
+      api: (/** @type {ApiCall} */ ...args) => {
+        const response = deferred();
+        requests.push({ args: plain(args), response });
+        return response.promise;
+      },
+    },
+    'machines/downloads.ts': { applyInstallQueueResponse: async () => {}, reconcileUncertainMutation: async () => {} },
+    'toast.ts': {
+      toast: (/** @type {Parameters<typeof import('../../src/toast').toast>} */ ...args) => notices.push(args),
+    },
+    'utils.ts': {
+      errMessage: (/** @type {unknown} */ error) => (error instanceof Error ? error.message : String(error)),
+    },
+    'ui-state.ts': ui,
+  });
+  ui.closeCreate();
+  return { actions, requests, notices };
+}
+
+/** @param {string} id @returns {import('../../src/types-content').ModpackTarget} */
+function packTarget(id) {
+  return {
+    canonical_id: `modrinth:${id}`,
+    version_id: `version-${id}`,
+    name: `Pack ${id}`,
+    minecraft: '1.21.1',
+    loader: 'fabric',
+    loader_label: 'Fabric',
+    selection_id: `selection-${id}`,
+  };
+}
+
+test('late modpack setup cannot reopen a newer closed creation draft', async (t) => {
+  const { actions, requests, notices } = await setupHarness();
+  t.after(() => ui.closeCreate());
+  const older = actions.setUpModpack('modrinth:a');
+  const newer = actions.setUpModpack('modrinth:b', 'version-b', 'pack-b.png');
+  requests[1].response.resolve(packTarget('b'));
+  assert.equal(await newer, true);
+  assert.deepEqual(plain(ui.createModpack.value), { ...packTarget('b'), icon_url: 'pack-b.png' });
+  ui.closeCreate();
+  requests[0].response.resolve(packTarget('a'));
+  const result = await older;
+  assert.equal(ui.createOpen.value, false);
+  assert.equal(ui.createModpack.value, null);
+  assert.equal(result, false);
+  assert.deepEqual(
+    requests.map(({ args }) => args),
+    [
+      ['GET', '/content/modpack/target?id=modrinth%3Aa'],
+      ['GET', '/content/modpack/target?id=modrinth%3Ab&version_id=version-b'],
+    ],
+  );
+  assert.deepEqual(notices, []);
+});
+
+test('newer modpack intent wins even when the older target arrives first', async (t) => {
+  const { actions, requests } = await setupHarness();
+  t.after(() => ui.closeCreate());
+  const older = actions.setUpModpack('modrinth:a');
+  const newer = actions.setUpModpack('modrinth:b');
+  requests[0].response.resolve(packTarget('a'));
+  assert.equal(await older, false);
+  assert.equal(ui.createOpen.value, false);
+  requests[1].response.resolve(packTarget('b'));
+  assert.equal(await newer, true);
+  assert.deepEqual(plain(ui.createModpack.value), packTarget('b'));
+});
+
+test('ordinary and staged Create intents supersede pending modpack targets', async (t) => {
+  const { actions, requests } = await setupHarness();
+  t.after(() => ui.closeCreate());
+  const ordinary = actions.setUpModpack('modrinth:a');
+  ui.openCreate();
+  requests[0].response.resolve(packTarget('a'));
+  assert.equal(await ordinary, false);
+  assert.equal(ui.createOpen.value, true);
+  assert.equal(ui.createModpack.value, null);
+  ui.closeCreate();
+  const staged = actions.setUpModpack('modrinth:b');
+  const draft = [{ canonical_id: 'modrinth:mod', kind: /** @type {const} */ ('mod'), title: 'A mod' }];
+  ui.openCreateDraft(draft);
+  requests[1].response.resolve(packTarget('b'));
+  assert.equal(await staged, false);
+  assert.equal(ui.createOpen.value, true);
+  assert.equal(ui.createModpack.value, null);
+  assert.deepEqual(ui.createDraft.value, draft);
+});
+
+test('stale setup failures are silent while current failures and fresh requests still work', async (t) => {
+  const { actions, requests, notices } = await setupHarness();
+  t.after(() => ui.closeCreate());
+  const stale = actions.setUpModpack('modrinth:a');
+  ui.closeCreate();
+  requests[0].response.reject(new Error('Old target failed'));
+  assert.equal(await stale, false);
+  assert.deepEqual(notices, []);
+  const current = actions.setUpModpack('modrinth:b');
+  requests[1].response.reject(new Error('Target unavailable'));
+  assert.equal(await current, false);
+  assert.deepEqual(notices, [['Target unavailable', 'error']]);
+  ui.closeCreate();
+  const fresh = actions.setUpModpack('modrinth:c');
+  requests[2].response.resolve(packTarget('c'));
+  assert.equal(await fresh, true);
+  assert.deepEqual(plain(ui.createModpack.value), packTarget('c'));
+});
 
 test('an incompatible plan requests confirmation without submitting an installation', async () => {
   const { actions, requests, applied } = await actionHarness(conflictPlan);

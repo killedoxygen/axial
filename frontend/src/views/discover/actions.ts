@@ -3,7 +3,7 @@ import { applyInstallQueueResponse } from '../../machines/downloads';
 import { plural } from '../../format';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
-import { openCreateModpack } from '../../ui-state';
+import { beginCreateIntent, openCreateModpack } from '../../ui-state';
 import type { ContentSelection, ResolutionPlan } from '../../types-content';
 
 export interface AddOutcome {
@@ -56,13 +56,15 @@ export async function commitInstall(
 }
 
 export async function setUpModpack(canonicalId: string, versionId?: string, iconUrl?: string): Promise<boolean> {
+  const isCurrent = beginCreateIntent();
   let target;
   try {
     target = await getModpackTarget(canonicalId, versionId);
   } catch (error) {
-    toast(errMessage(error), 'error');
+    if (isCurrent()) toast(errMessage(error), 'error');
     return false;
   }
+  if (!isCurrent()) return false;
   openCreateModpack({
     canonical_id: canonicalId,
     version_id: target.version_id,

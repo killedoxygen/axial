@@ -278,26 +278,36 @@ export interface CreateModpackDraft {
 }
 
 export const createModpack = signal<CreateModpackDraft | null>(null);
+let createIntent = Symbol();
+
+export function beginCreateIntent(): () => boolean {
+  const intent = (createIntent = Symbol());
+  return () => createIntent === intent;
+}
 
 export function openCreate(): void {
+  createIntent = Symbol();
   createDraft.value = null;
   createModpack.value = null;
   createOpen.value = true;
 }
 
 export function openCreateDraft(draft: CreateDraftItem[]): void {
+  createIntent = Symbol();
   createDraft.value = draft.length > 0 ? draft : null;
   createModpack.value = null;
   createOpen.value = true;
 }
 
 export function openCreateModpack(pack: CreateModpackDraft): void {
+  createIntent = Symbol();
   createDraft.value = null;
   createModpack.value = pack;
   createOpen.value = true;
 }
 
 export function closeCreate(): void {
+  createIntent = Symbol();
   createOpen.value = false;
   createDraft.value = null;
   createModpack.value = null;
