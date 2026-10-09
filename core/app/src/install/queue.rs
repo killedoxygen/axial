@@ -1983,7 +1983,7 @@ impl InstallQueue {
         let storage = self.inner.storage.clone();
         let pin = pin.clone();
         tokio::task::spawn_blocking(move || {
-            let record: Option<String> = storage.read(|db| {
+            let record = storage.read(|db| {
                 let mut statement = db.prepare("SELECT length(CAST(inventory_json AS BLOB)), inventory_json FROM installed_versions WHERE library_id=?1 AND version_id=?2 AND state='ready'")?;
                 let mut rows = statement.query(params![library_id, version_id])?;
                 let Some(row) = rows.next()? else { return Ok(None); };
@@ -1992,11 +1992,17 @@ impl InstallQueue {
                 if let Some(budget) = &budget {
                     budget.lock().unwrap().reserve_record(bytes)?;
                 }
-                row.get(1).map(Some).map_err(InstallError::from)
+                let scratch = axial_resource::process_physical_work()
+                    .try_reserve_scratch(bytes)
+                    .map_err(|_| InstallError::AtCapacity)?;
+                let record: String = row.get(1)?;
+                Ok(Some((record, scratch)))
             })?;
-            let record = record.ok_or(InstallError::NotReady)?;
+            let (record, scratch) = record.ok_or(InstallError::NotReady)?;
             if record.len() > 128 << 20 { return Err(InstallError::NotReady); }
             let activated: ActivatedVersion = serde_json::from_str(&record).map_err(|_| InstallError::NotReady)?;
+            drop(record);
+            drop(scratch);
             if activated.version_id != version_id { return Err(InstallError::NotReady); }
             if let Some(budget) = &budget {
                 budget.lock().unwrap().reserve_inventory(&activated)?;
@@ -3673,7 +3679,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn fixture() -> (
+    pub(crate) fn fixture() -> (
         tempfile::TempDir,
         Arc<MetadataStore>,
         LibraryLifecycle,

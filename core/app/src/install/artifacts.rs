@@ -110,6 +110,7 @@ impl InventoryBudget {
 pub(crate) struct ActivatedVersion {
     pub version_id: String,
     pub contract_id: String,
+    #[serde(deserialize_with = "deserialize_files")]
     pub files: Vec<ActivatedFile>,
 }
 
@@ -119,6 +120,51 @@ pub(crate) struct ActivatedFile {
     pub path: String,
     pub sha1: String,
     pub size: u64,
+}
+
+fn deserialize_files<'de, D>(deserializer: D) -> Result<Vec<ActivatedFile>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Files;
+
+    impl<'de> serde::de::Visitor<'de> for Files {
+        type Value = Vec<ActivatedFile>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded installed-file inventory")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            use serde::de::Error;
+
+            let mut files = Vec::new();
+            while files.len() < MAX_INVENTORY_ENTRIES {
+                if files.len() == files.capacity() {
+                    let additional = files
+                        .capacity()
+                        .max(1)
+                        .min(MAX_INVENTORY_ENTRIES - files.len());
+                    files
+                        .try_reserve_exact(additional)
+                        .map_err(|_| A::Error::custom("installed inventory allocation failed"))?;
+                }
+                let Some(file) = sequence.next_element()? else {
+                    return Ok(files);
+                };
+                files.push(file);
+            }
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(A::Error::custom("installed inventory exceeds entry limit"));
+            }
+            Ok(files)
+        }
+    }
+
+    deserializer.deserialize_seq(Files)
 }
 
 impl ActivatedVersion {
@@ -723,6 +769,123 @@ mod tests {
             "isolated preparation control: observed={observed:?}, joined={joined:?}",
         );
         false
+    }
+
+    #[tokio::test]
+    async fn ready_version_refuses_encoded_inventory_scratch_pressure() {
+        use axial_resource::{PhysicalWorkClass, process_physical_work};
+        use std::time::Duration;
+
+        if !preparation_child(
+            "install::artifacts::tests::ready_version_refuses_encoded_inventory_scratch_pressure",
+        )
+        .await
+        {
+            return;
+        }
+        let (temporary, _storage, library, _exclusions, owner, queue) =
+            super::super::queue::tests::fixture();
+        let version = "inventory-scratch-fixture";
+        super::super::queue::tests::install_ready_fixture(&queue, version).await;
+        let pin = library.admit().unwrap();
+        let work = process_physical_work();
+        let initial = work.snapshot(PhysicalWorkClass::Foreground);
+        let occupied = work.try_reserve_scratch(work.scratch_limit_bytes());
+        let pressure_admitted = matches!(&occupied, Ok(Some(_)));
+        let result = queue.ready_version(&pin, version).await;
+        let refused = matches!(&result, Err(InstallError::AtCapacity));
+        drop(result);
+        let held = work.snapshot(PhysicalWorkClass::Foreground);
+        drop(occupied);
+        let restored = queue.ready_version(&pin, version).await;
+        let ready = restored
+            .as_ref()
+            .is_ok_and(|receipt| receipt.version().id == version && receipt.revalidate().is_ok());
+        drop((restored, pin));
+        queue.close_admission();
+        let shutdown = owner.shutdown(Duration::from_secs(3)).await;
+        let observers = queue.join_observers().await;
+        let queue_settled = queue.shutdown_queued();
+        let runtime = queue.runtime_cache().clone();
+        drop(queue);
+        let runtime_settled = runtime.settle();
+        let preserved = library.try_preserve();
+        let final_state = work.snapshot(PhysicalWorkClass::Foreground);
+        let healthy = initial.available_scratch_bytes == work.scratch_limit_bytes()
+            && initial.active_admissions == 0
+            && initial.running_workers == 0
+            && pressure_admitted
+            && ready
+            && shutdown.is_ok()
+            && observers.is_ok()
+            && queue_settled.is_ok()
+            && runtime_settled.is_ok()
+            && preserved.is_ok()
+            && held.available_scratch_bytes == 0
+            && held.active_admissions == 0
+            && held.running_workers == 0
+            && final_state.available_scratch_bytes == work.scratch_limit_bytes()
+            && final_state.active_admissions == 0
+            && final_state.running_workers == 0;
+        if !healthy || !refused {
+            eprintln!(
+                "inventory scratch fixture retained at {}",
+                temporary.keep().display()
+            );
+        }
+        assert!(
+            healthy,
+            "scratch refusal must restore readiness and settle all owners"
+        );
+        assert!(
+            refused,
+            "encoded inventory must refuse occupied scratch before decoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_inventory_preserves_entry_limit_during_decode() {
+        if !preparation_child(
+            "install::artifacts::tests::recorded_inventory_preserves_entry_limit_during_decode",
+        )
+        .await
+        {
+            return;
+        }
+        let entry = r#"{"path":"","sha1":"","size":0}"#;
+        let mut record = String::with_capacity(1_000_000 * (entry.len() + 1) + 100);
+        record.push_str(r#"{"version_id":"fixture","contract_id":"fixture","files":["#);
+        for index in 0..1_000_000 {
+            if index != 0 {
+                record.push(',');
+            }
+            record.push_str(entry);
+        }
+        record.push_str("]}");
+        let accepted: ActivatedVersion = serde_json::from_str(&record).unwrap();
+        assert_eq!(accepted.files.len(), 1_000_000);
+        drop(accepted);
+        record.truncate(record.len() - 2);
+        record.push(',');
+        record.push_str(entry);
+        record.push_str("]}");
+        assert!(
+            serde_json::from_str::<ActivatedVersion>(&record).is_err(),
+            "overflow must refuse during decoding, not after allocating every entry"
+        );
+    }
+
+    #[test]
+    fn recorded_inventory_rejects_malformed_file_records() {
+        for file in [
+            r#"{"path":[],"sha1":"","size":0}"#,
+            r#"{"path":"","path":"other","sha1":"","size":0}"#,
+            r#"{"path":"","sha1":"","size":0,"extra":true}"#,
+        ] {
+            let record =
+                format!(r#"{{"version_id":"fixture","contract_id":"fixture","files":[{file}]}}"#);
+            assert!(serde_json::from_str::<ActivatedVersion>(&record).is_err());
+        }
     }
 
     fn historical_fixture() -> (tempfile::TempDir, LibraryLifecycle, ActivatedVersion) {
