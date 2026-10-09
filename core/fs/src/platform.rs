@@ -2654,8 +2654,7 @@ mod native {
     }
 
     pub(crate) fn file_identity(file: &File) -> io::Result<Identity> {
-        require_regular_file(file)?;
-        let stat = rfs::fstat(file)?;
+        let stat = require_regular_file(file)?;
         Ok(identity_from_stat(stat))
     }
 
@@ -3915,10 +3914,8 @@ mod native {
         name_class_revision: &RwLock<Option<DirectoryStamp>>,
     ) -> io::Result<()> {
         validate_root(root)?;
-        require_regular_file(handle)?;
-        let (identity, links) = retained_file_identity(handle)?;
+        let identity = file_identity(handle)?;
         if identity != expected
-            || links != 1
             || file_binding_state(&root.handle, name, expected)? != BindingState::Exact
         {
             return Err(binding_changed("application root lease binding changed"));
@@ -4321,7 +4318,7 @@ mod native {
         Ok(())
     }
 
-    fn require_regular_file(handle: &impl std::os::fd::AsFd) -> io::Result<()> {
+    fn require_regular_file(handle: &impl std::os::fd::AsFd) -> io::Result<rfs::Stat> {
         let stat = rfs::fstat(handle)?;
         if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_nlink != 1 {
             return Err(io::Error::new(
@@ -4329,7 +4326,7 @@ mod native {
                 "filesystem capability is not an exact single-link regular file",
             ));
         }
-        Ok(())
+        Ok(stat)
     }
 
     fn retained_file_identity(handle: &impl std::os::fd::AsFd) -> io::Result<(Identity, u64)> {

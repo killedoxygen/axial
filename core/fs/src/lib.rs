@@ -20732,6 +20732,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn retained_root_lease_rejects_a_new_hardlink_before_identity_read() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        let canary = temporary.path().join("canary.bin");
+        std::fs::write(&canary, b"preserve me").expect("canary");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let identity = root.identity().expect("original root identity");
+        let alias = temporary.path().join("lease-hardlink");
+        std::fs::hard_link(temporary.path().join(ROOT_LEASE_NAME), &alias)
+            .expect("retained lease hardlink");
+        let error = root.identity().expect_err("linked lease must refuse reads");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "filesystem capability is not an exact single-link regular file"
+        );
+        assert_eq!(
+            std::fs::read(&canary).expect("canary after refusal"),
+            b"preserve me"
+        );
+        std::fs::remove_file(alias).expect("remove disposable hardlink");
+        assert_eq!(root.identity().expect("restored lease read"), identity);
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn root_lease_is_a_retained_single_link_file_and_serializes_sessions() {
         use std::os::unix::fs::MetadataExt;
 
