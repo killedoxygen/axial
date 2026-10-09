@@ -110,7 +110,10 @@ pub(super) fn observe_kill_router(router: Router) -> Router {
     let Some(capture) = capture else {
         return router;
     };
-    router.layer(axum::middleware::from_fn_with_state(capture, observe_kill_request))
+    router.layer(axum::middleware::from_fn_with_state(
+        capture,
+        observe_kill_request,
+    ))
 }
 
 async fn observe_kill_request(
@@ -119,28 +122,54 @@ async fn observe_kill_request(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let session = (request.method() == Method::POST)
-        .then(|| request.uri().path().strip_prefix("/api/v1/launch/")?.strip_suffix("/kill"))
+        .then(|| {
+            request
+                .uri()
+                .path()
+                .strip_prefix("/api/v1/launch/")?
+                .strip_suffix("/kill")
+        })
         .flatten()
-        .filter(|id| uuid::Uuid::parse_str(id)
-            .is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == *id))
+        .filter(|id| {
+            uuid::Uuid::parse_str(id).is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == *id)
+        })
         .map(str::to_owned);
-    let tls_matches = KILL_ACK_CAPTURE.with(|slot| slot.borrow().as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, &capture)));
+    let tls_matches = KILL_ACK_CAPTURE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &capture))
+    });
     if let Some(id) = &session {
         capture.record(KillAckStage::Ingress, id, None, false, false, tls_matches);
     }
     let response = next.run(request).await;
     if let Some(id) = &session {
-        capture.record(KillAckStage::Response, id, Some(response.status().as_u16()), false, false,
-            KILL_ACK_CAPTURE.with(|slot| slot.borrow().as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, &capture))));
+        capture.record(
+            KillAckStage::Response,
+            id,
+            Some(response.status().as_u16()),
+            false,
+            false,
+            KILL_ACK_CAPTURE.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &capture))
+            }),
+        );
     }
     response
 }
 
 impl KillAckCapture {
-    fn record(&self, stage: KillAckStage, session_id: &str, status: Option<u16>, timeout: bool,
-        connect: bool, tls_matches: bool) {
+    fn record(
+        &self,
+        stage: KillAckStage,
+        session_id: &str,
+        status: Option<u16>,
+        timeout: bool,
+        connect: bool,
+        tls_matches: bool,
+    ) {
         let Ok(mut events) = self.events.try_lock() else {
             self.incomplete
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5248,18 +5277,22 @@ async fn preflight_reports_missing_java_override_without_launching() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_offline_vanilla_install_launch_stop_and_restart() {
-    offline_vanilla_journey(false).await;
+#[test]
+fn real_offline_vanilla_install_launch_stop_and_restart() {
+    run_with_kill_capture(offline_vanilla_journey(false));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_external_offline_vanilla_install_launch_stop_and_restart() {
-    offline_vanilla_journey(true).await;
+#[test]
+fn real_external_offline_vanilla_install_launch_stop_and_restart() {
+    run_with_kill_capture(offline_vanilla_journey(true));
 }
 
 #[test]
 fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
+    run_with_kill_capture(missing_default_runtime_after_reopen());
+}
+
+fn run_with_kill_capture(journey: impl std::future::Future<Output = ()>) {
     let capture = Arc::new(KillAckCapture {
         started: std::time::Instant::now(),
         events: Mutex::new(Vec::with_capacity(32)),
@@ -5268,8 +5301,13 @@ fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
     KILL_ACK_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&capture)));
     let _capture_scope = KillAckScope;
     let (runtime, _diagnostics) = diagnostic_runtime(Some(Arc::clone(&capture)));
-    runtime.block_on(missing_default_runtime_after_reopen());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(journey);
+    }));
     capture.dump(None);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 async fn missing_default_runtime_after_reopen() {
@@ -5688,9 +5726,12 @@ async fn missing_default_runtime_after_reopen() {
 }
 
 async fn offline_vanilla_journey(existing: bool) {
+    use futures_util::FutureExt;
+
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
+    let result = std::panic::AssertUnwindSafe(async {
     let external = existing.then(|| configure_external(&profile));
     let provider = Provider::start(false).await;
     let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
@@ -5882,6 +5923,22 @@ async fn offline_vanilla_journey(existing: bool) {
                 }),
             "command inspection must contain only the retained redacted contract"
         );
+    }
+    })
+    .catch_unwind()
+    .await;
+    if let Err(panic) = result {
+        let retained = temporary.keep();
+        KILL_ACK_CAPTURE.with(|slot| {
+            if let Some(capture) = slot.borrow().as_ref() {
+                capture.dump(Some(&retained));
+            }
+        });
+        eprintln!(
+            "[DEBUG-kill-ack] Retained Vanilla fixture: {}; process/tree settlement is unknown",
+            retained.display()
+        );
+        std::panic::resume_unwind(panic);
     }
 }
 
