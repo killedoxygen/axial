@@ -407,7 +407,7 @@ test('bulk deletion stops at Aborted and keeps the remaining selection callback 
     ['b', 'c'],
   );
   assert.equal(h.calls.filter((call) => call.method === 'DELETE').length, 2);
-  assert.match(h.notices[h.notices.length - 1]!, /Removed 1 of 3.*aborted/);
+  assert.match(h.notices[h.notices.length - 1]!, /Removal confirmed for 1 of 3.*aborted/);
 });
 
 test('concurrent new requests cannot mint two destructive operations for one instance', async () => {

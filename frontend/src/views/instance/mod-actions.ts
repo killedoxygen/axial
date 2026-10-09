@@ -167,7 +167,7 @@ export async function setModsEnabled(
       items: changed,
       action: (mod) => updateModEnabled(inst, mod.name, enabled),
       success: (count) => (enabled ? `${count} mods enabled` : `${count} mods disabled`),
-      partial: (done, total, err) => partialFailureMessage('Updated', done, total, err),
+      partial: (done, total, err) => partialFailureMessage('Update', done, total, err),
       onDone,
       onFailure,
     }),
@@ -212,7 +212,7 @@ export async function deleteMods(
       toast(started === 1 ? 'Mod removal started' : `${started} mod removals started`);
     } catch (err) {
       onFailure?.();
-      throw new Error(partialFailureMessage('Started removal for', started, mods.length, err));
+      throw new Error(partialFailureMessage('Removal request', started, mods.length, err));
     }
     onDone();
   });

@@ -163,7 +163,7 @@ export async function deleteInstancesFlow(selected: Instance[], onDone?: () => v
         if (result.status !== 'removed') throw new Error(removalResultMessage(result));
       },
       success: (count) => (keepFiles ? `${count} instances removed; files kept on disk` : `${count} instances deleted`),
-      partial: (done, total, err) => partialFailureMessage('Removed', done, total, err),
+      partial: (done, total, err) => partialFailureMessage('Removal', done, total, err),
       onDone: () => onDone?.(),
     });
   } catch (error) {

@@ -88,5 +88,5 @@ export async function runBulkMutation<T>({
 }
 
 export function partialFailureMessage(action: string, done: number, total: number, err: unknown): string {
-  return `${action} ${done} of ${total}. Last error: ${errMessage(err)}`;
+  return `${action} confirmed for ${done} of ${total}. Refresh the list before trying again. Last error: ${errMessage(err)}`;
 }

@@ -82,7 +82,7 @@ export async function deleteScreenshots(
       items: shots,
       action: (shot) => removeScreenshot(inst, shot.name),
       success: (count) => (count === 1 ? 'Screenshot deleted' : `${count} screenshots deleted`),
-      partial: (done, total, err) => partialFailureMessage('Deleted', done, total, err),
+      partial: (done, total, err) => partialFailureMessage('Deletion', done, total, err),
       onDone,
       onFailure,
     });

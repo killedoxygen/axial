@@ -219,7 +219,7 @@ test('backend refusal preserves screenshot selection and lightbox success callba
   assert.equal(done, 0);
   assert.equal(refreshed, 1);
   assert.equal(actions.resourceMutationState(instance.id).status, 'error');
-  assert.match(mutationError(actions), /Deleted 0 of 1.*Instance is running/);
+  assert.match(mutationError(actions), /Deletion confirmed for 0 of 1.*Instance is running/);
   assert.equal(
     io.notices.some(([message]) => message === 'Screenshot deleted'),
     false,
@@ -247,7 +247,41 @@ test('partial world deletion stops at first failure and refreshes without cleari
   assert.equal(done, 0);
   assert.equal(refreshed, 1);
   assert.equal(calls.length, 2);
-  assert.match(mutationError(actions), /Deleted 1 of 3.*Disk unavailable/);
+  assert.match(mutationError(actions), /Deletion confirmed for 1 of 3.*Disk unavailable/);
+});
+
+test('lost bulk deletion responses report only confirmed outcomes without replaying', async () => {
+  for (const lostResponseAt of [0, 1]) {
+    const worlds = new Set(['first', 'second', 'third']);
+    /** @type {ApiCall[]} */
+    const calls = [];
+    const { actions, io } = setup({
+      api: async (...args) => {
+        calls.push(args);
+        assert.equal(args[0], 'DELETE');
+        const name = args[1].split('/').pop();
+        assert.ok(name && worlds.delete(name));
+        if (calls.length === lostResponseAt + 1) throw new TypeError('Response lost');
+        return { status: 'ok' };
+      },
+    });
+    let completed = 0;
+    let refreshed = 0;
+    await actions.deleteWorlds(
+      instance,
+      ['first', 'second', 'third'],
+      () => completed++,
+      () => refreshed++,
+    );
+    assert.deepEqual([...worlds], lostResponseAt === 0 ? ['second', 'third'] : ['third']);
+    assert.equal(calls.length, lostResponseAt + 1);
+    assert.equal(completed, 0);
+    assert.equal(refreshed, 1);
+    assert.match(mutationError(actions), new RegExp(`Deletion confirmed for ${lostResponseAt} of 3\\.`));
+    assert.match(mutationError(actions), /Refresh the list before trying again.*Response lost/);
+    assert.equal(io.notices.length, 1);
+    assert.equal(io.notices[0][1], 'error');
+  }
 });
 
 test('successful bulk deletion submits exact encoded names and clears selection once', async () => {

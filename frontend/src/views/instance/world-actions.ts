@@ -75,7 +75,7 @@ export async function deleteWorlds(
         requireResourceCommandSuccess(res, 'World deletion');
       },
       success: (count) => (count === 1 ? 'World deleted' : `${count} worlds deleted`),
-      partial: (done, total, err) => partialFailureMessage('Deleted', done, total, err),
+      partial: (done, total, err) => partialFailureMessage('Deletion', done, total, err),
       onDone,
       onFailure,
     });
