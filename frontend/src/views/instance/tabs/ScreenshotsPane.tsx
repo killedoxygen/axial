@@ -39,7 +39,7 @@ export function ScreenshotsPane({
   const rawScreenshots = resources.data?.screenshots ?? [];
   const busy = resourceMutationState(inst.id).status === 'pending';
   const [sort, setSort] = useState<ScreenshotSort>('newest');
-  const [viewer, setViewer] = useState<string>('');
+  const [viewer, setViewer] = useState<{ name: string } | null>(null);
   const [optimisticRename, setOptimisticRename] = useState<OptimisticScreenshotRename | null>(null);
   const screenshots = useMemo(() => {
     if (!optimisticRename) return rawScreenshots;
@@ -80,7 +80,7 @@ export function ScreenshotsPane({
       inst,
       shot,
       selectionItem: selectionMenuItem(selection, shot.name),
-      onView: () => setViewer(shot.name),
+      onView: () => setViewer({ name: shot.name }),
       onRefresh,
     });
   const deleteSelected = async (): Promise<void> => {
@@ -92,7 +92,7 @@ export function ScreenshotsPane({
   };
   const handleLightboxRename = (shot: InstanceScreenshot, newName: string): void => {
     setOptimisticRename({ previousName: shot.name, shot: { ...shot, name: newName } });
-    setViewer(newName);
+    setViewer((current) => (current === viewer && current?.name === shot.name ? { name: newName } : current));
     onRefresh();
   };
 
@@ -105,7 +105,7 @@ export function ScreenshotsPane({
 
   useEffect(() => {
     if (!viewer || resources.status === 'loading') return;
-    if (!screenshots.some((shot) => shot.name === viewer)) setViewer('');
+    if (!screenshots.some((shot) => shot.name === viewer.name)) setViewer(null);
   }, [screenshots, viewer, resources.status]);
 
   return (
@@ -185,7 +185,7 @@ export function ScreenshotsPane({
                       class="cp-screenshot-thumb"
                       type="button"
                       aria-label={`View ${shot.name}`}
-                      onClick={() => setViewer(shot.name)}
+                      onClick={() => setViewer({ name: shot.name })}
                     >
                       <img src={screenshotFileUrl(inst, shot.name)} alt="" loading="lazy" />
                     </button>
@@ -219,9 +219,9 @@ export function ScreenshotsPane({
         <ScreenshotLightbox
           inst={inst}
           shots={sortedScreenshots}
-          name={viewer}
-          onSelect={setViewer}
-          onClose={() => setViewer('')}
+          name={viewer.name}
+          onSelect={(name) => setViewer({ name })}
+          onClose={() => setViewer(null)}
           onRename={handleLightboxRename}
           onRefresh={onRefresh}
         />

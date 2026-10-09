@@ -78,15 +78,27 @@ function hooks() {
       values[index] ??= { current: initial };
       return values[index] as { current: T };
     },
-    useState<T>(initial: T): [T, (next: T) => void] {
+    useState<T>(initial: T | (() => T)): [T, (next: T | ((previous: T) => T)) => void] {
       const index = cursor++;
-      if (!(index in values)) values[index] = initial;
+      if (!(index in values)) values[index] = typeof initial === 'function' ? (initial as () => T)() : initial;
       return [
         values[index] as T,
         (next) => {
-          values[index] = next;
+          values[index] = typeof next === 'function' ? (next as (previous: T) => T)(values[index] as T) : next;
         },
       ];
+    },
+    useMemo<T>(compute: () => T) {
+      return compute();
+    },
+    useCallback<T>(callback: T) {
+      return callback;
+    },
+    unmount() {
+      for (const effect of effects.values()) effect.cleanup?.();
+      effects.clear();
+      values.length = 0;
+      pending = [];
     },
     useEffect(run: () => void | (() => void), dependencies: unknown[]) {
       const index = cursor++;
@@ -173,7 +185,10 @@ const instance: EnrichedInstance = {
   shader_count: 0,
 };
 
-function harness(apiResult: () => Promise<unknown> = async () => ({ status: 'ok', name: 'after.png' })) {
+function harness(
+  apiResult: () => Promise<unknown> = async () => ({ status: 'ok', name: 'after.png' }),
+  withPane = false,
+) {
   const docListeners = new Map<string, Set<Listener>>();
   let active: Element;
   const element = (name: string): Element =>
@@ -199,6 +214,9 @@ function harness(apiResult: () => Promise<unknown> = async () => ({ status: 'ok'
   let frameId = 0;
   const globals = {
     Error,
+    Image: class {
+      src = '';
+    },
     HTMLElement: Element,
     document: {
       body,
@@ -316,48 +334,109 @@ function harness(apiResult: () => Promise<unknown> = async () => ({ status: 'ok'
     },
     globals,
   );
+  const paneHooks = hooks();
+  const pane = source<typeof import('../../src/views/instance/tabs/ScreenshotsPane')>(
+    'views/instance/tabs/ScreenshotsPane.tsx',
+    {
+      'preact/hooks': paneHooks,
+      '../../../ui/Icons': { Icon: 'Icon' },
+      '../../../ui/Atoms': atoms,
+      '../../../ui/ContextMenu': {},
+      '../../../ui/SelectionActionTray': {
+        SelectionActionTray: 'SelectionActionTray',
+        SelectionCheckbox: 'SelectionCheckbox',
+      },
+      '../../../ui/selection': source('ui/selection.ts', { 'preact/hooks': paneHooks }, globals),
+      '../../../format': source('format.ts', {}, globals),
+      '../instance-actions': {},
+      '../components/resource-bits': {
+        ResourceEmpty: 'ResourceEmpty',
+        ResourceStatus: 'ResourceStatus',
+        ResourceMutationStatus: 'ResourceMutationStatus',
+      },
+      '../components/screenshot-lightbox': lightbox,
+      '../screenshot-actions': actions,
+      '../bulk-actions': mutations,
+    },
+    globals,
+  );
+  let refreshes = 0;
+  let paneTree: Node[] = [];
+  let lightboxTree: Node[] = [];
+  let resourceState: import('../../src/views/instance/resources').ResourceLoadState = {
+    status: 'ready',
+    data: { ...resources.emptyResources(), screenshots: [shot, { ...shot, name: 'neighbor.png' }] },
+  };
   let renameClick: (() => void) | undefined;
   let modalTree: Node[] = [];
   let dialogTree: Node[] = [];
   function render() {
+    if (withPane) {
+      paneHooks.begin();
+      paneTree = nodes(
+        pane.ScreenshotsPane({
+          inst: instance,
+          resources: resourceState,
+          onRefresh: () => {
+            refreshes++;
+            resourceState = { status: 'loading', data: resourceState.data };
+          },
+        }),
+      );
+      paneHooks.flush();
+    }
+    const selectedLightbox = paneTree.find((node) => node.type === lightbox.ScreenshotLightbox);
     lightboxHooks.begin();
     const tree = nodes(
-      lightbox.ScreenshotLightbox({
-        inst: instance,
-        shots: [shot],
-        name: shot.name,
-        onSelect: () => undefined,
-        onClose: () => {
-          closed++;
-        },
-        onRename: (_previous, name) => {
-          renamed.push(name);
-          shot = { ...shot, name };
-        },
-        onRefresh: () => undefined,
-      }),
+      withPane
+        ? selectedLightbox
+          ? lightbox.ScreenshotLightbox(selectedLightbox.props as Parameters<typeof lightbox.ScreenshotLightbox>[0])
+          : null
+        : lightbox.ScreenshotLightbox({
+            inst: instance,
+            shots: [shot],
+            name: shot.name,
+            onSelect: () => undefined,
+            onClose: () => {
+              closed++;
+            },
+            onRename: (_previous, name) => {
+              renamed.push(name);
+              shot = { ...shot, name };
+            },
+            onRefresh: () => undefined,
+          }),
     );
+    lightboxTree = tree;
     lightboxHooks.flush();
-    for (const [label, target] of [
-      ['Rename', opener],
-      ['Delete', remove],
-    ] as const) {
-      const iconButton = tree.find((node) => node.type === atoms.IconButton && node.props.tooltip === label)!;
-      const button = nodes(atoms.IconButton(iconButton.props as Parameters<typeof atoms.IconButton>[0]))[0]!;
-      target.disabled = button.props.disabled === true;
-      if (target === opener) renameClick = button.props.onClick as (() => void) | undefined;
+    if (withPane && tree.length === 0) {
+      if (!selectedLightbox) lightboxHooks.unmount();
+      modalHooks.unmount();
+      modalTree = [];
+      panel.isConnected = false;
+    } else {
+      panel.isConnected = true;
+      for (const [label, target] of [
+        ['Rename', opener],
+        ['Delete', remove],
+      ] as const) {
+        const iconButton = tree.find((node) => node.type === atoms.IconButton && node.props.tooltip === label)!;
+        const button = nodes(atoms.IconButton(iconButton.props as Parameters<typeof atoms.IconButton>[0]))[0]!;
+        target.disabled = button.props.disabled === true;
+        if (target === opener) renameClick = button.props.onClick as (() => void) | undefined;
+      }
+      const modalContent = tree.find((node) => node.type === modal.ModalContent)!;
+      modalHooks.begin();
+      modalTree = nodes(modal.ModalContent(modalContent.props));
+      const content = modalTree.find((node) => node.props['data-slot'] === 'modal-content')!;
+      panel.slot = content.props['data-slot'] as string;
+      panel.tabIndex = content.props.tabIndex as number;
+      panel.inert = content.props.inert === true;
+      if (panel.inert && panel.contains(active)) active = body;
+      assert.ok(content.ref);
+      content.ref.current = panel;
+      modalHooks.flush();
     }
-    const modalContent = tree.find((node) => node.type === modal.ModalContent)!;
-    modalHooks.begin();
-    modalTree = nodes(modal.ModalContent(modalContent.props));
-    const content = modalTree.find((node) => node.props['data-slot'] === 'modal-content')!;
-    panel.slot = content.props['data-slot'] as string;
-    panel.tabIndex = content.props.tabIndex as number;
-    panel.inert = content.props.inert === true;
-    if (panel.inert && panel.contains(active)) active = body;
-    assert.ok(content.ref);
-    content.ref.current = panel;
-    modalHooks.flush();
     // Dialog initializes its input draft in an effect; commit its ensuing render too.
     for (let pass = 0; pass < 2; pass++) {
       dialogHooks.begin();
@@ -431,6 +510,34 @@ function harness(apiResult: () => Promise<unknown> = async () => ({ status: 'ok'
     calls,
     notices,
     renamed,
+    view(name: string) {
+      const button = paneTree.find((node) => node.props['aria-label'] === `View ${name}`);
+      assert.ok(button);
+      (button.props.onClick as () => void)();
+      render();
+    },
+    lightboxAction(label: string) {
+      const button = lightboxTree.find((node) => node.type === atoms.IconButton && node.props.tooltip === label);
+      assert.ok(button);
+      (button.props.onClick as () => void)();
+      render();
+    },
+    viewer: () => lightboxTree.find((node) => node.type === modal.ModalContent)?.props['aria-label'],
+    refreshes: () => refreshes,
+    completeRefresh() {
+      resourceState = {
+        status: 'ready',
+        data: {
+          ...resources.emptyResources(),
+          screenshots: [
+            { ...shot, name: 'after.png' },
+            { ...shot, name: 'neighbor.png' },
+          ],
+        },
+      };
+      render();
+      render();
+    },
     requested: () => requestEntered.promise,
     mutationState: () => mutations.resourceMutationState(instance.id),
     async settled() {
@@ -687,3 +794,35 @@ test('a pending screenshot rename cannot steal intentional focus for its modal f
   assert.equal(h.pendingFrames(), 0);
   assert.equal(h.focusListeners(), 0);
 });
+
+for (const choice of ['unchanged', 'close', 'navigate', 'reopen'] as const) {
+  test(`a completed screenshot rename preserves the pane's ${choice} viewer choice`, async () => {
+    const response = heldResponse();
+    const h = harness(() => response.promise, true);
+    h.view('before.png');
+    submitScreenshotRename(h);
+    await h.requested();
+    h.render();
+    try {
+      if (choice === 'close' || choice === 'reopen') h.lightboxAction('Close');
+      if (choice === 'navigate') h.lightboxAction('Next');
+      if (choice === 'reopen') h.view('before.png');
+    } finally {
+      response.resolve({ status: 'ok', name: 'after.png' });
+      await h.settled();
+      h.frames();
+    }
+    assert.equal(
+      h.viewer(),
+      choice === 'close' || choice === 'reopen' ? undefined : choice === 'navigate' ? 'neighbor.png' : 'after.png',
+    );
+    assert.equal(h.refreshes(), 1, 'the successful rename still refreshes inventory');
+    assert.deepEqual(h.notices, ['Screenshot renamed']);
+    assert.equal(h.calls.length, 1);
+    h.completeRefresh();
+    assert.equal(
+      h.viewer(),
+      choice === 'close' || choice === 'reopen' ? undefined : choice === 'navigate' ? 'neighbor.png' : 'after.png',
+    );
+  });
+}
