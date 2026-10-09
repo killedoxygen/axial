@@ -170,7 +170,16 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
 
   const changeMode = (next: InstancePerformanceMode): void => {
     setMode(next);
-    commit({ performance_mode: next }, { label: 'launch profile', revert: () => setMode(savedMode) });
+    commit(
+      { performance_mode: next },
+      {
+        label: 'launch profile',
+        revert: () =>
+          setMode(
+            instancePerformanceModeFrom(instances.value.find((instance) => instance.id === inst.id)?.performance_mode),
+          ),
+      },
+    );
   };
 
   return (

@@ -7,6 +7,7 @@ import vm from 'node:vm';
 import * as contract from '../../src/dto-contract';
 import * as dto from '../../src/dto-core';
 import * as installDto from '../../src/dto-install';
+import * as performanceDto from '../../src/dto-performance';
 import * as installItems from '../../src/install-item';
 import * as downloadViews from '../../src/machines/download-view-models';
 import * as preferences from '../../src/preferences/local';
@@ -213,7 +214,7 @@ function harness() {
   let reloads = 0;
   let healthReads = 0;
   let listener: ((event: { payload: unknown }) => void) | undefined;
-  let admit: (path: string) => void = () => {};
+  let admit: (path: string) => void | Promise<void> = () => {};
   let respond: (path: string, value: unknown) => Promise<unknown> = async (_path, value) => value;
   let readInstance: (value: EnrichedInstance) => Promise<unknown> = async (value) => value;
   let currentQueue = queue();
@@ -245,7 +246,7 @@ function harness() {
       assert.equal(method, 'PUT');
       assert.ok(body);
       writes.push({ path, patch: structuredClone(body) });
-      admit(path);
+      await admit(path);
       if (path === '/config') {
         const { expected_revision, expected_account_selection_revision: _selection, ...patch } = body;
         assert.equal(expected_revision, storedConfig.revision);
@@ -404,6 +405,10 @@ function harness() {
       saveLocalState() {},
     },
   });
+  const performanceMode = source<typeof import('../../src/views/instance/performance-mode')>(
+    'views/instance/performance-mode.ts',
+    { '../../api': api, '../../store': common.store, '../../dto-performance': performanceDto },
+  );
   const settings = source<typeof import('../../src/views/instance/tabs/SettingsPane')>(
     'views/instance/tabs/SettingsPane.tsx',
     {
@@ -425,13 +430,11 @@ function harness() {
       '../../../dto-core': dto,
       '../../../performance-presenters': { performanceHealthNotice: () => null },
       '../performance-mode': {
+        ...performanceMode,
         fetchPerformanceHealth: async () => {
           healthReads++;
           return null;
         },
-        globalPerformanceMode: () => 'vanilla',
-        performanceModeFrom: () => '',
-        performanceModeLabel: () => 'Vanilla',
       },
     },
     {
@@ -764,6 +767,50 @@ test('a refused older memory control restores the latest acknowledged heap, not 
     assert.equal(h.writes.length, 2, 'a refused edit must not replay');
     assert.ok(h.notices.some((notice) => notice.includes('Could not save memory: The instance changed.')));
   } finally {
+    h.dispose();
+    await tick();
+  }
+});
+
+test('a refused queued launch profile restores the latest acknowledged mode', async () => {
+  const h = harness();
+  const first = deferred<unknown>();
+  const second = deferred<void>();
+  let firstResponse: unknown;
+  h.respond(async (_path, value) => {
+    firstResponse = value;
+    return first.promise;
+  });
+  h.admit(() => {
+    if (h.writes.length === 2) return second.promise;
+  });
+  try {
+    h.render('instance');
+    await tick();
+    h.render('instance');
+    const profile = h.control<{ onChange(value: string): void }>('ChoicePills');
+    profile.onChange('managed');
+    await tick();
+    assert.equal(h.writes.length, 1);
+    assert.equal(h.store.instances.value[0].performance_mode, undefined, 'first acknowledgement remains held');
+    profile.onChange('custom');
+    first.resolve(firstResponse);
+    await tick();
+    h.render('instance');
+    h.render('instance');
+    assert.equal(h.store.instances.value[0].performance_mode, 'managed');
+    second.reject(Object.assign(new Error('Fixture refusal'), { status: 409 }));
+    await tick();
+    h.render('instance');
+    assert.equal(h.writes.length, 2, 'the refused edit must not replay');
+    assert.equal(h.instance().performance_mode, 'managed');
+    assert.equal(h.store.instances.value[0].performance_mode, 'managed');
+    assert.equal(h.control<{ value: string }>('ChoicePills').value, 'managed');
+    assert.ok(h.notices.some((notice) => notice.includes('Could not save launch profile: Fixture refusal')));
+  } finally {
+    first.resolve(firstResponse);
+    second.resolve();
+    await tick();
     h.dispose();
     await tick();
   }
