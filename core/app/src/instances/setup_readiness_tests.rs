@@ -202,6 +202,20 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
     let library = service.instances.directories().library().clone();
     let cache = service.installs.runtime_cache().clone();
     let work = process_physical_work();
+    let pressure = Arc::new(Mutex::new(None));
+    let clear_hooks = || {
+        service
+            .instances
+            .registry()
+            .storage()
+            .transaction(|db| -> Result<(), StorageError> {
+                db.update_hook(
+                    None::<fn(crate::storage::rusqlite::hooks::Action, &str, &str, i64)>,
+                );
+                db.commit_hook(None::<fn() -> bool>);
+                Ok(())
+            })
+    };
     let outcome = runtime.block_on(
         std::panic::AssertUnwindSafe(async {
             crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
@@ -280,6 +294,72 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
                         && matches!(result, Err(InstanceError::VersionUnavailable))),
                 "verification pressure must not select install fallback: {refusals:?}"
             );
+            use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+            use crate::storage::rusqlite::hooks::Action;
+            let row = Arc::new(AtomicI64::new(0));
+            let armed = Arc::new(AtomicBool::new(false));
+            let canary = root.path().join("creation-canary.txt");
+            std::fs::write(&canary, b"preserve publication under pressure").unwrap();
+            service.instances.registry().storage().transaction(|db| -> Result<(), StorageError> {
+                db.update_hook(Some({
+                    let row = row.clone();
+                    let armed = armed.clone();
+                    move |action, database: &str, table: &str, id| {
+                        if database == "main" && table == "instances" {
+                            match action {
+                                Action::SQLITE_INSERT => { row.store(id, Ordering::SeqCst); }
+                                Action::SQLITE_UPDATE if row.load(Ordering::SeqCst) == id => {
+                                    armed.store(true, Ordering::SeqCst);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }));
+                db.commit_hook(Some({
+                    let pressure = pressure.clone();
+                    let work = work.clone();
+                    move || {
+                        if armed.swap(false, Ordering::SeqCst) {
+                            *pressure.lock().unwrap() = Some(work.try_reserve_scratch(work.scratch_limit_bytes()));
+                        }
+                        false
+                    }
+                }));
+                Ok(())
+            }).unwrap();
+            let request = serde_json::from_value(serde_json::json!({
+                "name": "PublishedUnderPressure", "selection_id": selection,
+            })).unwrap();
+            let mut creation = Box::pin(service.create(request));
+            let observed = tokio::time::timeout(Duration::from_secs(2), &mut creation).await;
+            let prompt = observed.is_ok();
+            clear_hooks().unwrap();
+            let occupied = pressure.lock().unwrap().take();
+            let full = matches!(&occupied, Some(Ok(Some(_))));
+            drop(occupied);
+            let created = match observed { Ok(result) => result, Err(_) => creation.await }.unwrap();
+            let record = service.instances.registry().get_live(&created.instance.instance.id).unwrap();
+            assert!(prompt && full && row.load(Ordering::SeqCst) != 0);
+            assert_eq!(created.instance.instance.name, "PublishedUnderPressure");
+            assert_eq!(created.instance.instance, super::super::create::public_instance(record.instance.clone()));
+            let response = serde_json::to_value(created).unwrap();
+            assert_eq!(response["view_model"], serde_json::json!({
+                "state_id": "created_install_unavailable", "tone": "warn", "title": "Instance created",
+                "summary": "Instance created. Installation could not be queued.",
+                "detail": "Use Install on this instance to try again.",
+            }));
+            assert!(response.get("install_queue").is_none());
+            assert!(service.instances.pending().unwrap().is_empty());
+            let admitted = service.instances.directories().admit(&record.instance.id).unwrap();
+            admitted.validate_current().unwrap();
+            for directory in super::super::create::INITIAL_DIRECTORIES {
+                assert!(admitted.game_directory().read_projection().unwrap().join(directory).is_dir());
+            }
+            drop(admitted);
+            assert_eq!(serde_json::to_value(service.installs.snapshot()).unwrap(), queue_before);
+            assert_eq!(std::fs::read(&canary).unwrap(), b"preserve publication under pressure");
+            service.installs.ready_version(&pin, "1.21.4").await.unwrap().revalidate().unwrap();
             accounts.create_offline_account("PressurePlayer").unwrap();
             let instance =
                 super::super::create::tests::create(&service.instances, "Pressure").await;
@@ -421,6 +501,8 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
         })
         .catch_unwind(),
     );
+    let hooks_cleared = clear_hooks().is_ok();
+    drop(pressure.lock().unwrap().take());
     service.installs.close_admission();
     let shutdown = runtime.block_on(service.instances.tasks.shutdown(Duration::from_secs(3)));
     let observers = runtime.block_on(async {
@@ -428,7 +510,8 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
     });
     let queue_settled = service.installs.shutdown_queued();
     let state = work.snapshot(PhysicalWorkClass::Foreground);
-    let quiescent = shutdown.is_ok()
+    let quiescent = hooks_cleared
+        && shutdown.is_ok()
         && matches!(observers, Ok(Ok(())))
         && queue_settled.is_ok()
         && state.available_workers == 4
