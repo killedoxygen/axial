@@ -172,6 +172,9 @@ where
 
             let mut files = Vec::new();
             while files.len() < MAX_INVENTORY_ENTRIES {
+                let Some(file) = sequence.next_element()? else {
+                    return Ok(files);
+                };
                 if files.len() == files.capacity() {
                     let additional = files
                         .capacity()
@@ -181,9 +184,6 @@ where
                         .try_reserve_exact(additional)
                         .map_err(|_| A::Error::custom("installed inventory allocation failed"))?;
                 }
-                let Some(file) = sequence.next_element()? else {
-                    return Ok(files);
-                };
                 files.push(file);
             }
             if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
@@ -886,6 +886,18 @@ pub(crate) mod tests {
             serde_json::from_str::<ActivatedVersion>(&record).is_err(),
             "overflow must refuse during decoding, not after allocating every entry"
         );
+    }
+
+    #[test]
+    fn recorded_inventory_allocates_slots_only_for_present_files() {
+        for (entries, slots) in [(64, 64), (0, 0), (65, 128)] {
+            let files = vec![r#"{"path":"assets/fixture","sha1":"","size":0}"#; entries].join(",");
+            let record =
+                format!(r#"{{"version_id":"fixture","contract_id":"fixture","files":[{files}]}}"#);
+            let activated: ActivatedVersion = serde_json::from_str(&record).unwrap();
+            assert_eq!(activated.files.len(), entries);
+            assert_eq!(activated.files.capacity(), slots, "{entries} entries");
+        }
     }
 
     #[test]
