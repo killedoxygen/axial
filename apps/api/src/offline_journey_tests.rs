@@ -5374,20 +5374,40 @@ async fn preflight_reports_missing_java_override_without_launching() {
 
 #[test]
 fn real_offline_vanilla_install_launch_stop_and_restart() {
-    run_with_kill_capture(offline_vanilla_journey(false));
+    run_with_kill_capture(async {
+        offline_vanilla_journey(false).await;
+        Ok(())
+    });
 }
 
 #[test]
 fn real_external_offline_vanilla_install_launch_stop_and_restart() {
-    run_with_kill_capture(offline_vanilla_journey(true));
+    run_with_kill_capture(async {
+        offline_vanilla_journey(true).await;
+        Ok(())
+    });
 }
 
 #[test]
 fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
-    run_with_kill_capture(missing_default_runtime_after_reopen());
+    run_with_kill_capture(async {
+        missing_default_runtime_after_reopen().await;
+        Ok(())
+    });
 }
 
-fn run_with_kill_capture(journey: impl std::future::Future<Output = ()>) {
+struct RetainedKillJourney {
+    services: Option<DesktopServices>,
+    provider: Option<Provider>,
+    startup: Option<super::StartupError>,
+    temporary: tempfile::TempDir,
+    reason: &'static str,
+    failure: Option<Box<dyn std::any::Any + Send>>,
+}
+
+fn run_with_kill_capture(
+    journey: impl std::future::Future<Output = Result<(), RetainedKillJourney>>,
+) {
     let capture = Arc::new(KillAckCapture {
         started: std::time::Instant::now(),
         events: Mutex::new(Vec::with_capacity(32)),
@@ -5407,9 +5427,8 @@ fn run_with_kill_capture(journey: impl std::future::Future<Output = ()>) {
             .incomplete
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.block_on(journey);
-    }));
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(journey)));
     if let Ok(mut pending) = capture.pending.lock() {
         pending.stopped = true;
     }
@@ -5419,9 +5438,39 @@ fn run_with_kill_capture(journey: impl std::future::Future<Output = ()>) {
             .incomplete
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    capture.dump(None);
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
+    match result {
+        Ok(Err(retained)) => {
+            let parent = retained.temporary.keep();
+            let reason = retained.reason;
+            let failure = retained.failure;
+            std::mem::forget((
+                runtime,
+                retained.services,
+                retained.provider,
+                retained.startup,
+            ));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture.dump(Some(&parent));
+                eprintln!(
+                    "[DEBUG-kill-ack] {reason}; retained runtime and fixture: {}",
+                    parent.display()
+                );
+            }));
+            if let Some(panic) = failure {
+                std::panic::resume_unwind(panic);
+            }
+            panic!(
+                "{reason}; retained runtime and fixture: {}",
+                parent.display()
+            );
+        }
+        Ok(Ok(())) => capture.dump(None),
+        Err(panic) => {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture.dump(None);
+            }));
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 
@@ -6216,144 +6265,309 @@ async fn real_clean_benchmarks_compare_configured_modes_after_reopen() {
     assert!(reopened.server.is_shutdown_settled());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_playing_instance_edits_preserve_active_command_and_next_launch_settings() {
+#[test]
+fn real_playing_instance_edits_preserve_active_command_and_next_launch_settings() {
+    run_with_kill_capture(playing_instance_edits());
+}
+
+async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
+    use futures_util::FutureExt;
+
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
-    let provider = Provider::start(false).await;
-    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
-        .await
-        .unwrap();
-    let api = Api::new(&services);
-    api.post(
-        "/api/v1/accounts/offline",
-        json!({"username":PLAYER,"expected_selection_revision":0}),
-    )
-    .await;
-    api.request(
-        reqwest::Method::PUT,
-        "/api/v1/config",
-        Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
-    )
-    .await;
-    let start = api
-        .post(
-            "/api/v1/install/queue",
-            json!({"kind":"vanilla","version_id":VERSION}),
+    let mut provider = Some(Provider::start(false).await);
+    let mut services: Option<DesktopServices> = None;
+    let mut startup = None;
+    let mut provider_stop = None;
+    let mut processes = BTreeSet::new();
+    let journey = std::panic::AssertUnwindSafe(async {
+        services = Some(
+            match start_profile_with_test_endpoints(
+                profile.clone(),
+                provider.as_ref().unwrap().endpoints(),
+            )
+            .await
+            {
+                Ok(services) => services,
+                Err(failure) => {
+                    startup = Some(failure);
+                    panic!("Playing-edit initial startup was refused");
+                }
+            },
+        );
+        let initial = services.as_ref().unwrap();
+        let api = Api::new(initial);
+        api.post(
+            "/api/v1/accounts/offline",
+            json!({"username":PLAYER,"expected_selection_revision":0}),
         )
         .await;
-    assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
-    let created = api
-        .post(
-            "/api/v1/instances",
-            json!({
-                "name":"Playing edit","selection_id":format!("vanilla|{VERSION}"),
-                "max_memory_mb":768,"min_memory_mb":256
-            }),
-        )
-        .await;
-    let instance = created["id"].as_str().unwrap();
-    wait_launchable(&api, instance).await;
-    let launched = api
-        .post(
-            "/api/v1/launch",
-            json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()}),
-        )
-        .await;
-    let first = launched["session_id"].as_str().unwrap();
-    let (_, processes) = observe_running_session(&api, first).await;
-    let before = api.get(&format!("/api/v1/instances/{instance}")).await;
-    assert!(!before["last_played_at"].as_str().unwrap().is_empty());
-    let rename = api
-        .client
-        .put(format!("{}/api/v1/instances/{instance}", api.base))
-        .header(transport::CAPABILITY_HEADER, &api.capability)
-        .json(&json!({"name":"Renamed while playing","expected_revision":before["revision"]}))
-        .send()
-        .await
-        .unwrap();
-    let rename_status = rename.status();
-    let renamed: Value = rename.json().await.unwrap();
-    if !rename_status.is_success() {
-        // The intended red must still settle the real fixture process and API.
-        observe_and_stop_session(&api, first).await;
-        assert_fixture_processes_gone(&processes).await;
-        services.server.shutdown().await.unwrap();
-        drop(services);
-        provider.shutdown().await;
-        panic!("Playing metadata edit was refused: {rename_status}: {renamed}");
-    }
-    assert_eq!(renamed["name"], "Renamed while playing");
-    let edited = api
-        .request(
+        api.request(
             reqwest::Method::PUT,
-            &format!("/api/v1/instances/{instance}"),
-            Some(json!({"max_memory_mb":1024,"expected_revision":renamed["revision"]})),
+            "/api/v1/config",
+            Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
         )
         .await;
-    assert_eq!(edited["max_memory_mb"], 1024);
-    assert_eq!(edited["last_played_at"], before["last_played_at"]);
-    for patch in [
-        json!({"max_memory_mb":2048,"expected_revision":renamed["revision"]}),
-        json!({"version_id":"another-version","expected_revision":edited["revision"]}),
-    ] {
-        let response = api
+        let start = api
+            .post(
+                "/api/v1/install/queue",
+                json!({"kind":"vanilla","version_id":VERSION}),
+            )
+            .await;
+        assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
+        let created = api
+            .post(
+                "/api/v1/instances",
+                json!({
+                    "name":"Playing edit","selection_id":format!("vanilla|{VERSION}"),
+                    "max_memory_mb":768,"min_memory_mb":256
+                }),
+            )
+            .await;
+        let instance = created["id"].as_str().unwrap();
+        wait_launchable(&api, instance).await;
+        let launched = api
+            .post(
+                "/api/v1/launch",
+                json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()}),
+            )
+            .await;
+        let first = launched["session_id"].as_str().unwrap();
+        let (_, observed) = observe_running_session(&api, first).await;
+        processes.extend(observed);
+        let before = api.get(&format!("/api/v1/instances/{instance}")).await;
+        assert!(!before["last_played_at"].as_str().unwrap().is_empty());
+        let rename = api
             .client
             .put(format!("{}/api/v1/instances/{instance}", api.base))
             .header(transport::CAPABILITY_HEADER, &api.capability)
-            .json(&patch)
+            .json(&json!({"name":"Renamed while playing","expected_revision":before["revision"]}))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-    }
-    let deletion = api
-        .client
-        .delete(format!("{}/api/v1/instances/{instance}", api.base))
-        .header(transport::CAPABILITY_HEADER, &api.capability)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(deletion.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        api.get(&format!("/api/v1/launch/{first}/status")).await["phase"],
-        "running"
-    );
-    observe_and_stop_session(&api, first).await;
-    assert_fixture_processes_gone(&processes).await;
-    let original = services.benchmarks.reports().get(first).unwrap().unwrap();
-    assert_eq!(original.scenario.requested_memory_mb, Some(768));
-    assert!(
-        original
-            .logs
-            .iter()
-            .any(|line| line.text == "Fixture heap MiB 768")
-    );
-    services.server.shutdown().await.unwrap();
-    drop(services);
-    provider.shutdown().await;
+        let rename_status = rename.status();
+        let renamed: Value = rename.json().await.unwrap();
+        if !rename_status.is_success() {
+            // The intended red must still settle the real fixture process and API.
+            observe_and_stop_session(&api, first).await;
+            assert_fixture_processes_gone(&processes).await;
+            panic!("Playing metadata edit was refused: {rename_status}: {renamed}");
+        }
+        assert_eq!(renamed["name"], "Renamed while playing");
+        let edited = api
+            .request(
+                reqwest::Method::PUT,
+                &format!("/api/v1/instances/{instance}"),
+                Some(json!({"max_memory_mb":1024,"expected_revision":renamed["revision"]})),
+            )
+            .await;
+        assert_eq!(edited["max_memory_mb"], 1024);
+        assert_eq!(edited["last_played_at"], before["last_played_at"]);
+        for patch in [
+            json!({"max_memory_mb":2048,"expected_revision":renamed["revision"]}),
+            json!({"version_id":"another-version","expected_revision":edited["revision"]}),
+        ] {
+            let response = api
+                .client
+                .put(format!("{}/api/v1/instances/{instance}", api.base))
+                .header(transport::CAPABILITY_HEADER, &api.capability)
+                .json(&patch)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+        let deletion = api
+            .client
+            .delete(format!("{}/api/v1/instances/{instance}", api.base))
+            .header(transport::CAPABILITY_HEADER, &api.capability)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deletion.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            api.get(&format!("/api/v1/launch/{first}/status")).await["phase"],
+            "running"
+        );
+        observe_and_stop_session(&api, first).await;
+        assert_fixture_processes_gone(&processes).await;
+        let original = initial.benchmarks.reports().get(first).unwrap().unwrap();
+        assert_eq!(original.scenario.requested_memory_mb, Some(768));
+        assert!(
+            original
+                .logs
+                .iter()
+                .any(|line| line.text == "Fixture heap MiB 768")
+        );
+        initial.server.shutdown().await.unwrap();
+        assert!(
+            initial.server.is_shutdown_settled()
+                && initial.tasks.shutdown_receipt().is_some()
+                && initial.tasks.status().is_idle()
+        );
+        drop(services.take());
+        let current = provider.as_mut().unwrap();
+        provider_stop = Some(
+            current
+                .stop
+                .take()
+                .is_some_and(|stop| stop.send(()).is_ok()),
+        );
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut current.task)
+            .await
+            .expect("provider must join before reopen");
+        drop(provider.take());
+        assert_eq!(provider_stop, Some(true));
+        joined.unwrap();
 
-    let reopened = start_in_profile(profile, None).await.unwrap();
-    let api = Api::new(&reopened);
-    let restored = api.get(&format!("/api/v1/instances/{instance}")).await;
-    assert_eq!(restored["name"], "Renamed while playing");
-    assert_eq!(restored["max_memory_mb"], 1024);
-    assert_eq!(restored["revision"], edited["revision"]);
-    let second = launch_and_stop(&api, instance).await;
-    let next = reopened.benchmarks.reports().get(&second).unwrap().unwrap();
-    assert_eq!(next.scenario.requested_memory_mb, Some(1024));
-    assert!(
-        next.logs
-            .iter()
-            .any(|line| line.text == "Fixture heap MiB 1024")
-    );
-    assert_eq!(
-        reopened.benchmarks.reports().get(first).unwrap().unwrap(),
-        original
-    );
-    reopened.server.shutdown().await.unwrap();
-    assert!(reopened.server.is_shutdown_settled());
+        services = Some(match start_in_profile(profile, None).await {
+            Ok(services) => services,
+            Err(failure) => {
+                startup = Some(failure);
+                panic!("Playing-edit reopen was refused");
+            }
+        });
+        let reopened = services.as_ref().unwrap();
+        let api = Api::new(reopened);
+        let restored = api.get(&format!("/api/v1/instances/{instance}")).await;
+        assert_eq!(restored["name"], "Renamed while playing");
+        assert_eq!(restored["max_memory_mb"], 1024);
+        assert_eq!(restored["revision"], edited["revision"]);
+        let second = launch_and_stop(&api, instance).await;
+        let next = reopened.benchmarks.reports().get(&second).unwrap().unwrap();
+        assert_eq!(next.scenario.requested_memory_mb, Some(1024));
+        assert!(
+            next.logs
+                .iter()
+                .any(|line| line.text == "Fixture heap MiB 1024")
+        );
+        assert_eq!(
+            reopened.benchmarks.reports().get(first).unwrap().unwrap(),
+            original
+        );
+        reopened.server.shutdown().await.unwrap();
+        assert!(reopened.server.is_shutdown_settled());
+    })
+    .catch_unwind()
+    .await;
+    if journey.is_err() {
+        KILL_ACK_CAPTURE.with(|slot| {
+            if let Some(capture) = slot.borrow().as_ref() {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    capture.dump(Some(temporary.path()));
+                }))
+                .is_err()
+                {
+                    capture
+                        .incomplete
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    if let Some(failure) = startup.take() {
+        if let Err(failure) = failure.try_preserve() {
+            return Err(RetainedKillJourney {
+                services,
+                provider,
+                temporary,
+                startup: Some(failure),
+                reason: "Playing-edit startup preservation remains unresolved",
+                failure: journey.err(),
+            });
+        }
+    }
+    let shutdown = match &services {
+        Some(services) => {
+            std::panic::AssertUnwindSafe(tokio::time::timeout(
+                Duration::from_secs(60),
+                services.server.shutdown(),
+            ))
+            .catch_unwind()
+            .await
+        }
+        None => Ok(Ok(Ok(()))),
+    };
+    let settled = services.as_ref().is_none_or(|services| {
+        services.server.is_shutdown_settled()
+            && services.tasks.shutdown_receipt().is_some()
+            && services.tasks.status().is_idle()
+    });
+    if !matches!(&shutdown, Ok(Ok(Ok(())))) || !settled {
+        return Err(RetainedKillJourney {
+            services,
+            provider,
+            temporary,
+            startup: None,
+            reason: "Playing-edit API cleanup did not prove settlement",
+            failure: journey.err(),
+        });
+    }
+    let mut provider_stopped = true;
+    let mut provider_joined = true;
+    if let Some(current) = provider.as_mut() {
+        provider_stopped = *provider_stop.get_or_insert_with(|| {
+            current
+                .stop
+                .take()
+                .is_some_and(|stop| stop.send(()).is_ok())
+        });
+        provider_joined =
+            match tokio::time::timeout(Duration::from_secs(5), &mut current.task).await {
+                Ok(result) => result.is_ok(),
+                Err(_) => {
+                    current.task.abort();
+                    match tokio::time::timeout(Duration::from_secs(1), &mut current.task).await {
+                        Ok(_) => false,
+                        Err(_) => {
+                            return Err(RetainedKillJourney {
+                                services,
+                                provider,
+                                temporary,
+                                startup: None,
+                                reason: "Playing-edit provider remained unjoined after abort",
+                                failure: journey.err(),
+                            });
+                        }
+                    }
+                }
+            };
+    }
+    drop(services);
+    drop(provider);
+    let verified = std::panic::AssertUnwindSafe(async {
+        if let Err(panic) = journey {
+            std::panic::resume_unwind(panic);
+        }
+        shutdown
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .expect("playing-edit API cleanup must meet its deadline")
+            .unwrap();
+        assert!(
+            settled && provider_stopped && provider_joined,
+            "all playing-edit owners must join"
+        );
+        assert_fixture_processes_gone(&processes).await;
+    })
+    .catch_unwind()
+    .await;
+    if let Err(panic) = verified {
+        let parent = temporary.keep();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            KILL_ACK_CAPTURE.with(|slot| {
+                if let Some(capture) = slot.borrow().as_ref() {
+                    capture.dump(Some(&parent));
+                }
+            });
+            eprintln!(
+                "[DEBUG-kill-ack] Retained playing-edit fixture: {}",
+                parent.display()
+            );
+        }));
+        std::panic::resume_unwind(panic);
+    }
+    Ok(())
 }
 
 #[test]
