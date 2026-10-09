@@ -8,6 +8,8 @@ This pre-release is intentionally breaking: do not support predecessor-profile i
 
 Agent-created or agent-downloaded artifacts used only for this rewrite's isolated testing are disposable and may be cleaned without asking again. Verify exact targets, preserve unrelated data, and retain needed recovery and acceptance evidence. Snapshot diagnostic state and release locks before assertions so caught failures preserve evidence without poisoning its owner.
 
+Keep only actively needed test processes running. After each check, stop games and quit test apps through their owners, join/reap processes and verify exit. Retain on-disk evidence and unresolved recovery ownership; relaunch for later manual checks instead of leaving idle games running.
+
 ## Architecture quality
 
 - Review each integrated feature and the scheduled review's changed scope for architectural drift, not just test failures.
