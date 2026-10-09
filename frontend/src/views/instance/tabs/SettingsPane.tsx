@@ -11,7 +11,7 @@ import { canAutoSave, useAutoSave } from '../../../hooks/use-autosave';
 import { jvmPresetSelectLabel, normalizeJvmPreset, useJvmPresets } from '../../../hooks/use-jvm-presets';
 import { api } from '../../../api';
 import { refreshInstanceReadiness } from '../../../instance-readiness';
-import { config, systemInfo } from '../../../store';
+import { config, instances, systemInfo } from '../../../store';
 import { updateInstanceInList } from '../../../actions';
 import { fmtMem, memoryGb } from '../../../format';
 import type { InstancePerformanceMode } from '../../../types-performance';
@@ -298,8 +298,9 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
                 {
                   label: 'memory',
                   revert: () => {
-                    setMinGb(savedMinGb);
-                    setMaxGb(savedMaxGb);
+                    const current = instances.value.find((instance) => instance.id === inst.id);
+                    setMinGb(memoryGb(current?.min_memory_mb, config.value?.min_memory_mb ?? 1024));
+                    setMaxGb(memoryGb(current?.max_memory_mb, config.value?.max_memory_mb ?? 4096));
                   },
                   onSuccess: bumpHealth,
                 },

@@ -371,7 +371,7 @@ function harness() {
       fmtMem: (value: number) => String(value),
       memoryGb: (value: number, fallback: number) => (value || fallback) / 1024,
     },
-    store: { config: configState, systemInfo: signals.signal(null) },
+    store: { config: configState, instances, systemInfo: signals.signal(null) },
   };
   const launching = source<typeof import('../../src/views/settings/LaunchingSection')>(
     'views/settings/LaunchingSection.tsx',
@@ -693,6 +693,37 @@ test('native flush joins two rapid instance controls through their own acknowled
   assert.equal(h.store.instances.value[0].window_height, 600);
   assert.equal(h.instance().revision, 8);
   assert.equal(h.timers.size, 0);
+});
+
+test('a refused older memory control restores the latest acknowledged heap, not its captured value', async () => {
+  const h = harness();
+  h.serverInstance({ ...instance, min_memory_mb: 1024, max_memory_mb: 8192 });
+  try {
+    h.render('instance');
+    await tick();
+    h.render('instance');
+    h.render('instance');
+    const memory = h.control<{ onChange(low: number, high: number): void; onCommit(low: number, high: number): void }>(
+      'MemoryField',
+    );
+    memory.onChange(1, 1);
+    memory.onCommit(1, 1);
+    await tick();
+    h.render('instance');
+    h.render('instance');
+    assert.equal(h.control<{ maxGb: number }>('MemoryField').maxGb, 1);
+    memory.onChange(1, 2);
+    memory.onCommit(1, 2);
+    await tick();
+    h.render('instance');
+    assert.equal(h.instance().max_memory_mb, 1024);
+    assert.equal(h.control<{ maxGb: number }>('MemoryField').maxGb, 1);
+    assert.equal(h.writes.length, 2, 'a refused edit must not replay');
+    assert.ok(h.notices.some((notice) => notice.includes('Could not save memory: The instance changed.')));
+  } finally {
+    h.dispose();
+    await tick();
+  }
 });
 
 test('an older rendered control cannot borrow an independently admitted revision chain', async () => {
