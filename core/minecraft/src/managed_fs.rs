@@ -2474,6 +2474,7 @@ impl ManagedDir {
             size,
             _operation_pin: self.inner.operation_pin.clone(),
         };
+        verify_operation_admission(&self.inner.operation_pin)?;
         if !self.file_guard_matches_after_revalidation(name, &guard)? {
             return Err(LoaderError::Verify(
                 "managed file changed during admission".to_string(),
@@ -2529,7 +2530,6 @@ impl ManagedDir {
         name: &str,
         guard: &ManagedFileGuard,
     ) -> Result<bool, LoaderError> {
-        verify_operation_admission(&self.inner.operation_pin)?;
         Ok(self.open_matching_file(name, guard)?.is_some())
     }
 
