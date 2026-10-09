@@ -313,70 +313,149 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
             );
             use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
             use crate::storage::rusqlite::hooks::Action;
-            let row = Arc::new(AtomicI64::new(0));
-            let armed = Arc::new(AtomicBool::new(false));
-            let canary = root.path().join("creation-canary.txt");
-            std::fs::write(&canary, b"preserve publication under pressure").unwrap();
-            service.instances.registry().storage().transaction(|db| -> Result<(), StorageError> {
-                db.update_hook(Some({
-                    let row = row.clone();
-                    let armed = armed.clone();
-                    move |action, database: &str, table: &str, id| {
-                        if database == "main" && table == "instances" {
-                            match action {
-                                Action::SQLITE_INSERT => { row.store(id, Ordering::SeqCst); }
-                                Action::SQLITE_UPDATE if row.load(Ordering::SeqCst) == id => {
-                                    armed.store(true, Ordering::SeqCst);
+            for worker_pressure in [false, true] {
+                let row = Arc::new(AtomicI64::new(0));
+                let armed = Arc::new(AtomicBool::new(false));
+                let canary = root.path().join("creation-canary.txt");
+                std::fs::write(&canary, b"preserve publication under pressure").unwrap();
+                service
+                    .instances
+                    .registry()
+                    .storage()
+                    .transaction(|db| -> Result<(), StorageError> {
+                        db.update_hook(Some({
+                            let row = row.clone();
+                            let armed = armed.clone();
+                            move |action, database: &str, table: &str, id| {
+                                if database == "main" && table == "instances" {
+                                    match action {
+                                        Action::SQLITE_INSERT => {
+                                            row.store(id, Ordering::SeqCst);
+                                        }
+                                        Action::SQLITE_UPDATE if row.load(Ordering::SeqCst) == id => {
+                                            armed.store(true, Ordering::SeqCst);
+                                        }
+                                        _ => {}
+                                    }
                                 }
-                                _ => {}
                             }
-                        }
-                    }
-                }));
-                db.commit_hook(Some({
-                    let pressure = pressure.clone();
-                    let work = work.clone();
-                    move || {
-                        if armed.swap(false, Ordering::SeqCst) {
-                            *pressure.lock().unwrap() = Some(work.try_reserve_scratch(work.scratch_limit_bytes()));
-                        }
-                        false
-                    }
-                }));
-                Ok(())
-            }).unwrap();
-            let request = serde_json::from_value(serde_json::json!({
-                "name": "PublishedUnderPressure", "selection_id": selection,
-            })).unwrap();
-            let mut creation = Box::pin(service.create(request));
-            let observed = tokio::time::timeout(Duration::from_secs(2), &mut creation).await;
-            let prompt = observed.is_ok();
-            clear_hooks().unwrap();
-            let occupied = pressure.lock().unwrap().take();
-            let full = matches!(&occupied, Some(Ok(Some(_))));
-            drop(occupied);
-            let created = match observed { Ok(result) => result, Err(_) => creation.await }.unwrap();
-            let record = service.instances.registry().get_live(&created.instance.instance.id).unwrap();
-            assert!(prompt && full && row.load(Ordering::SeqCst) != 0);
-            assert_eq!(created.instance.instance.name, "PublishedUnderPressure");
-            assert_eq!(created.instance.instance, super::super::create::public_instance(record.instance.clone()));
-            let response = serde_json::to_value(created).unwrap();
-            assert_eq!(response["view_model"], serde_json::json!({
-                "state_id": "created_install_unavailable", "tone": "warn", "title": "Instance created",
-                "summary": "Instance created. Installation could not be queued.",
-                "detail": "Use Install on this instance to try again.",
-            }));
-            assert!(response.get("install_queue").is_none());
-            assert!(service.instances.pending().unwrap().is_empty());
-            let admitted = service.instances.directories().admit(&record.instance.id).unwrap();
-            admitted.validate_current().unwrap();
-            for directory in super::super::create::INITIAL_DIRECTORIES {
-                assert!(admitted.game_directory().read_projection().unwrap().join(directory).is_dir());
+                        }));
+                        db.commit_hook(Some({
+                            let pressure = pressure.clone();
+                            let work = work.clone();
+                            move || {
+                                if armed.swap(false, Ordering::SeqCst) {
+                                    let scratch = work.try_reserve_scratch(if worker_pressure {
+                                        0
+                                    } else {
+                                        work.scratch_limit_bytes()
+                                    });
+                                    let workers = worker_pressure
+                                        .then(|| {
+                                            work.admit(PhysicalWorkRequest::foreground_parallel(
+                                                PhysicalIoClass::Read,
+                                                0,
+                                                4,
+                                            ))
+                                            .now_or_never()
+                                        })
+                                        .flatten();
+                                    *pressure.lock().unwrap() = Some((scratch, workers));
+                                }
+                                false
+                            }
+                        }));
+                        Ok(())
+                    })
+                    .unwrap();
+                let name = if worker_pressure {
+                    "PublishedUnderWorkerPressure"
+                } else {
+                    "PublishedUnderScratchPressure"
+                };
+                let request = serde_json::from_value(serde_json::json!({
+                    "name": name, "selection_id": selection,
+                }))
+                .unwrap();
+                let mut creation = Box::pin(service.create(request));
+                let observed = tokio::time::timeout(Duration::from_secs(2), &mut creation).await;
+                let prompt = observed.is_ok();
+                clear_hooks().unwrap();
+                let held = work.snapshot(PhysicalWorkClass::Foreground);
+                let occupied = pressure.lock().unwrap().take();
+                let full = if worker_pressure {
+                    matches!(&occupied, Some((Ok(None), Some(Ok(_)))))
+                        && held.available_workers == 0
+                        && held.available_scratch_bytes == work.scratch_limit_bytes()
+                } else {
+                    matches!(&occupied, Some((Ok(Some(_)), None)))
+                        && held.available_workers == 4
+                        && held.available_scratch_bytes == 0
+                };
+                drop(occupied);
+                let created = match observed {
+                    Ok(result) => result,
+                    Err(_) => creation.await,
+                }
+                .unwrap();
+                let record = service
+                    .instances
+                    .registry()
+                    .get_live(&created.instance.instance.id)
+                    .unwrap();
+                assert!(
+                    prompt && full && row.load(Ordering::SeqCst) != 0,
+                    "postcommit pressure: workers={worker_pressure}, held={held:?}"
+                );
+                assert_eq!(created.instance.instance.name, name);
+                assert_eq!(
+                    created.instance.instance,
+                    super::super::create::public_instance(record.instance.clone())
+                );
+                let response = serde_json::to_value(created).unwrap();
+                assert_eq!(
+                    response["view_model"],
+                    serde_json::json!({
+                        "state_id": "created_install_unavailable", "tone": "warn", "title": "Instance created",
+                        "summary": "Instance created. Installation could not be queued.",
+                        "detail": "Use Install on this instance to try again.",
+                    })
+                );
+                assert!(response.get("install_queue").is_none());
+                assert!(service.instances.pending().unwrap().is_empty());
+                let admitted = service
+                    .instances
+                    .directories()
+                    .admit(&record.instance.id)
+                    .unwrap();
+                admitted.validate_current().unwrap();
+                for directory in super::super::create::INITIAL_DIRECTORIES {
+                    assert!(
+                        admitted
+                            .game_directory()
+                            .read_projection()
+                            .unwrap()
+                            .join(directory)
+                            .is_dir()
+                    );
+                }
+                drop(admitted);
+                assert_eq!(
+                    serde_json::to_value(service.installs.snapshot()).unwrap(),
+                    queue_before
+                );
+                assert_eq!(
+                    std::fs::read(&canary).unwrap(),
+                    b"preserve publication under pressure"
+                );
+                service
+                    .installs
+                    .ready_version(&pin, "1.21.4")
+                    .await
+                    .unwrap()
+                    .revalidate()
+                    .unwrap();
             }
-            drop(admitted);
-            assert_eq!(serde_json::to_value(service.installs.snapshot()).unwrap(), queue_before);
-            assert_eq!(std::fs::read(&canary).unwrap(), b"preserve publication under pressure");
-            service.installs.ready_version(&pin, "1.21.4").await.unwrap().revalidate().unwrap();
             accounts.create_offline_account("PressurePlayer").unwrap();
             let instance =
                 super::super::create::tests::create(&service.instances, "Pressure").await;
