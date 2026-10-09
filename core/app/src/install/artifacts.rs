@@ -451,11 +451,12 @@ impl ActivatedVersion {
         let receipt = InstalledVersionReceipt {
             evidence: Arc::new(evidence),
             version,
-            exact: self
-                .files
-                .into_iter()
-                .map(|file| (file.path, (file.sha1, file.size)))
-                .collect(),
+            exact: Arc::new(
+                self.files
+                    .into_iter()
+                    .map(|file| (file.path, (file.sha1, file.size)))
+                    .collect(),
+            ),
             virtual_assets,
             client_jar,
         };
@@ -589,7 +590,7 @@ impl InventoryEvidence {
 pub struct InstalledVersionReceipt {
     evidence: Arc<InventoryEvidence>,
     version: VersionJson,
-    exact: BTreeMap<String, (String, u64)>,
+    exact: Arc<BTreeMap<String, (String, u64)>>,
     virtual_assets: bool,
     client_jar: PathBuf,
 }
@@ -1310,6 +1311,149 @@ pub(crate) mod tests {
             transferred,
             "verified inventory must move its owned strings"
         );
+    }
+
+    #[test]
+    fn native_preparation_uses_verified_inventory_without_provider_checksum() {
+        use futures_util::FutureExt;
+        use std::io::Write;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if !runtime.block_on(preparation_child("install::artifacts::tests::native_preparation_uses_verified_inventory_without_provider_checksum")) {
+            return;
+        }
+        let (temporary, library, mut activated) = fixture();
+        let mut receipt = None;
+        let mut natives = None;
+        let observed = runtime.block_on(
+            std::panic::AssertUnwindSafe(async {
+                let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+                archive
+                    .start_file(
+                        "fixture-native.bin",
+                        zip::write::SimpleFileOptions::default(),
+                    )
+                    .unwrap();
+                archive.write_all(b"owned native fixture").unwrap();
+                let archive = archive.finish().unwrap().into_inner();
+                let version = serde_json::to_vec(&serde_json::json!({
+                    "id": "1.21.4", "type": "release", "libraries": [{
+                        "name": "fixture:native:1",
+                        "natives": {
+                            "osx": "fixture-native", "linux": "fixture-native",
+                            "windows": "fixture-native"
+                        },
+                        "downloads": {"classifiers": {"fixture-native": {
+                            "path": "fixture/native.jar", "size": archive.len(),
+                            "url": "https://invalid.example/native.jar"
+                        }}}
+                    }]
+                }))
+                .unwrap();
+                for (path, bytes) in [
+                    ("versions/1.21.4/1.21.4.json", version),
+                    ("libraries/fixture/native.jar", archive),
+                ] {
+                    let target = temporary.path().join(path);
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::fs::write(&target, &bytes).unwrap();
+                    activated.files.retain(|file| file.path != path);
+                    activated.files.push(ActivatedFile {
+                        path: path.into(),
+                        sha1: hex::encode(Sha1::digest(&bytes)),
+                        size: bytes.len() as u64,
+                    });
+                }
+                let inputs = activated
+                    .files
+                    .iter()
+                    .map(|file| {
+                        let path = temporary.path().join(&file.path);
+                        let bytes = std::fs::read(&path).unwrap();
+                        (path, bytes)
+                    })
+                    .collect::<Vec<_>>();
+                receipt = Some(activated.verify(library.admit().unwrap()).unwrap());
+                let verified = receipt.as_ref().unwrap();
+                let pin = library.admit().unwrap();
+                natives = Some(
+                    verified
+                        .prepare_natives(
+                            &pin.managed_library().unwrap(),
+                            temporary.path(),
+                            &axial_minecraft::default_environment(),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+                let prepared = natives.as_ref().unwrap();
+                assert_eq!(
+                    std::fs::read(prepared.path().join("fixture-native.bin")).unwrap(),
+                    b"owned native fixture"
+                );
+                prepared.revalidate().unwrap();
+                verified.revalidate().unwrap();
+                for (path, bytes) in inputs {
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                }
+                prepared.path().to_owned()
+            })
+            .catch_unwind(),
+        );
+        let settled = natives
+            .as_ref()
+            .is_none_or(|prepared| prepared.settle().is_ok());
+        if !settled {
+            let retained = temporary.keep();
+            std::mem::forget((natives, receipt, library, runtime));
+            let _ = writeln!(
+                std::io::stderr(),
+                "native preparation fixture retained at {}",
+                retained.display()
+            );
+            if let Err(panic) = observed {
+                std::panic::resume_unwind(panic);
+            }
+            panic!("native extraction did not settle");
+        }
+        drop((natives, receipt));
+        let preserved = library.try_preserve();
+        if preserved.is_err() {
+            let retained = temporary.keep();
+            std::mem::forget((library, runtime));
+            let _ = writeln!(
+                std::io::stderr(),
+                "native preparation fixture retained at {}",
+                retained.display()
+            );
+            if let Err(panic) = observed {
+                std::panic::resume_unwind(panic);
+            }
+            panic!("native preparation library did not settle");
+        }
+        drop(library);
+        if let Err(panic) = observed {
+            let _ = writeln!(
+                std::io::stderr(),
+                "native preparation fixture retained at {}",
+                temporary.keep().display()
+            );
+            std::panic::resume_unwind(panic);
+        }
+        let path = observed.unwrap();
+        let remaining = path.try_exists();
+        if !matches!(remaining, Ok(false)) {
+            let _ = writeln!(
+                std::io::stderr(),
+                "native preparation fixture retained at {}",
+                temporary.keep().display()
+            );
+        }
+        assert!(!remaining.unwrap());
     }
 
     #[test]

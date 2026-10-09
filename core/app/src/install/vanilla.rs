@@ -170,7 +170,7 @@ pub(crate) async fn prepare_natives_with_exact_files(
     library_root: &Path,
     version: &VersionJson,
     environment: &Environment,
-    exact: BTreeMap<String, (String, u64)>,
+    exact: Arc<BTreeMap<String, (String, u64)>>,
 ) -> Result<Option<PreparedNatives>, NativePreparationError> {
     prepare_natives_retained(
         library,
@@ -189,7 +189,7 @@ async fn prepare_natives_retained(
     version: &VersionJson,
     environment: &Environment,
     inventory: Option<Arc<KnownGoodInventory>>,
-    exact: Option<BTreeMap<String, (String, u64)>>,
+    exact: Option<Arc<BTreeMap<String, (String, u64)>>>,
 ) -> Result<Option<PreparedNatives>, NativePreparationError> {
     library
         .validate_read_projection(library_root)
@@ -205,7 +205,7 @@ async fn prepare_natives_retained(
             &version,
             &environment,
             inventory.as_deref(),
-            exact.as_ref(),
+            exact.as_deref(),
         )
     })
     .await
