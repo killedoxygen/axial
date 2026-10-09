@@ -432,7 +432,7 @@ fn finish_directory_create(
         .ok_or_else(|| io::Error::other("directory create authority is not retained"))?;
     let identity = platform::directory_identity(created)?;
     if platform::directory_binding_state(
-        &guard.record().parent.inner.handle,
+        guard.record().parent.inner.handle(),
         guard.record().name.as_os_str(),
         identity,
     )? != platform::BindingState::Exact
@@ -440,7 +440,7 @@ fn finish_directory_create(
         return Err(identity_changed("created directory binding is not exact"));
     }
     let (ordinary, ordinary_identity) = platform::open_directory(
-        &guard.record().parent.inner.handle,
+        guard.record().parent.inner.handle(),
         guard.record().name.as_os_str(),
     )?;
     if ordinary_identity != identity {
@@ -543,7 +543,7 @@ fn finish_stage_create(
         .ok_or_else(|| io::Error::other("stage create authority is not retained"))?;
     let identity = platform::file_identity(created)?;
     if platform::file_binding_state(
-        &guard.record().parent.inner.handle,
+        guard.record().parent.inner.handle(),
         guard.record().name.as_os_str(),
         identity,
     )? != platform::BindingState::Exact
@@ -551,7 +551,7 @@ fn finish_stage_create(
         return Err(identity_changed("created stage binding is not exact"));
     }
     let cleanup = platform::clone_stage_cleanup(
-        &guard.record().parent.inner.handle,
+        guard.record().parent.inner.handle(),
         guard.record().name.as_os_str(),
         created,
         identity,
@@ -585,7 +585,7 @@ fn execute_stage_create(
     operation: &CapabilityOperation,
     mut reservation: StageCreateToken,
 ) -> FileCreateOutcome {
-    let handle = match platform::create_file(&directory.inner.handle, name.as_os_str()) {
+    let handle = match platform::create_file(directory.inner.handle(), name.as_os_str()) {
         Ok(handle) => handle,
         Err(platform::CreateFileError::NoEffect(error)) => {
             match authority.take_stage_create(operation, &reservation) {
@@ -692,12 +692,12 @@ impl FilePromotionObligation {
             return FilePromotionResolution::Indeterminate(Box::new(self));
         }
         let source = platform::file_binding_state(
-            &self.retained.file.parent.inner.handle,
+            self.retained.file.parent.inner.handle(),
             self.retained.file.name.as_os_str(),
             self.retained.file.identity,
         );
         let destination = platform::file_binding_state(
-            &self.destination.inner.handle,
+            self.destination.inner.handle(),
             self.destination_name.as_os_str(),
             self.retained.file.identity,
         );
@@ -715,9 +715,9 @@ impl FilePromotionObligation {
                     &mut self.receipt,
                     self.attempt_id,
                     &self.retained.file.handle,
-                    &self.retained.file.parent.inner.handle,
+                    self.retained.file.parent.inner.handle(),
                     self.retained.file.name.as_os_str(),
-                    &self.destination.inner.handle,
+                    self.destination.inner.handle(),
                     self.destination_name.as_os_str(),
                 );
                 self.retained
@@ -743,7 +743,7 @@ impl FilePromotionObligation {
                     return FilePromotionResolution::Indeterminate(Box::new(self));
                 }
                 let handle = match platform::open_file(
-                    &self.destination.inner.handle,
+                    self.destination.inner.handle(),
                     self.destination_name.as_os_str(),
                 ) {
                     Ok(handle)
@@ -1313,7 +1313,7 @@ impl FileRemovalObligation {
             Err(_) => return self.retain(parked),
         };
         match platform::settle_removed_file(
-            &guard.record().parent.inner.handle,
+            guard.record().parent.inner.handle(),
             guard.record().name.as_os_str(),
             &guard.record().cleanup,
             guard.record().identity,
@@ -1511,7 +1511,7 @@ impl ParkedFile {
         let removal = {
             let record = guard.record_mut();
             platform::remove_parked_file(
-                &record.parent.inner.handle,
+                record.parent.inner.handle(),
                 record.name.as_os_str(),
                 &mut record.cleanup,
                 record.identity,
@@ -1595,7 +1595,7 @@ impl ParkedFile {
         let removal = {
             let record = guard.record_mut();
             platform::remove_parked_file(
-                &record.parent.inner.handle,
+                record.parent.inner.handle(),
                 record.name.as_os_str(),
                 &mut record.cleanup,
                 record.identity,
@@ -1665,7 +1665,7 @@ impl ParkedFile {
         let restoration = {
             let record = guard.record_mut();
             platform::restore_parked_file(
-                &record.parent.inner.handle,
+                record.parent.inner.handle(),
                 record.name.as_os_str(),
                 &mut record.cleanup,
                 record.identity,
@@ -1754,7 +1754,7 @@ impl ParkedFile {
         let restoration = {
             let record = guard.record_mut();
             platform::restore_parked_file(
-                &record.parent.inner.handle,
+                record.parent.inner.handle(),
                 record.name.as_os_str(),
                 &mut record.cleanup,
                 record.identity,
@@ -1804,7 +1804,7 @@ impl ParkedFile {
 
     fn binding_state(&self) -> io::Result<platform::BindingState> {
         platform::file_binding_state(
-            &self.parent.inner.handle,
+            self.parent.inner.handle(),
             self.park_name.as_os_str(),
             self.identity,
         )
@@ -1852,7 +1852,7 @@ impl ParkedFile {
             || record.original_name != self.original_name
             || platform::parked_file_receipt_fields(&record.cleanup)? != (self.size, self.stamp)
             || platform::file_binding_state(
-                &self.parent.inner.handle,
+                self.parent.inner.handle(),
                 self.park_name.as_os_str(),
                 self.identity,
             )? != platform::BindingState::Exact
@@ -1876,7 +1876,7 @@ fn settle_file_restore_admitted(
         Err(_) => return FileRestoreSettlement::Indeterminate(parked),
     };
     match platform::settle_restored_file(
-        &guard.record().parent.inner.handle,
+        guard.record().parent.inner.handle(),
         guard.record().name.as_os_str(),
         &guard.record().cleanup,
         guard.record().identity,
@@ -2404,7 +2404,7 @@ impl AdmittedRootSession {
     pub fn validate_retained_authority(&self) -> io::Result<()> {
         self.session.validate_retained_authority()?;
         let admitted_identity =
-            platform::directory_identity(&self.admission.directory.inner.handle)?;
+            platform::directory_identity(self.admission.directory.inner.handle())?;
         if admitted_identity != self.admission.directory.inner.identity.physical
             || self
                 .admission
@@ -4601,8 +4601,7 @@ fn directory_has_physical_ancestor(directory: &Directory, ancestor: platform::Id
         }
         if current
             .inner
-            .absolute_ancestry
-            .as_ref()
+            .absolute_ancestry()
             .is_some_and(|guard| platform::absolute_directory_has_ancestor(guard, ancestor))
         {
             return true;
@@ -6914,12 +6913,12 @@ impl CapabilityAuthority {
                     let destination = &promotion.destination;
                     destination.parent.validate(&operation)?;
                     let source = platform::file_binding_state(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         record.identity,
                     )?;
                     let published = platform::file_binding_state(
-                        &destination.parent.inner.handle,
+                        destination.parent.inner.handle(),
                         destination.name.as_os_str(),
                         record.identity,
                     )?;
@@ -6930,7 +6929,7 @@ impl CapabilityAuthority {
                         ) if promotion.receipt.is_attempted() => {
                             expected_recovery = prepare_recovery_stage_removal(self, &record)?;
                             platform::remove_parked_file(
-                                &record.parent.inner.handle,
+                                record.parent.inner.handle(),
                                 record.name.as_os_str(),
                                 record
                                     .cleanup
@@ -6949,9 +6948,9 @@ impl CapabilityAuthority {
                                     .cleanup
                                     .as_ref()
                                     .expect("checked-out stage retains cleanup authority"),
-                                &record.parent.inner.handle,
+                                record.parent.inner.handle(),
                                 record.name.as_os_str(),
-                                &destination.parent.inner.handle,
+                                destination.parent.inner.handle(),
                                 destination.name.as_os_str(),
                             )?;
                             destination.parent.validate(&operation)
@@ -6964,7 +6963,7 @@ impl CapabilityAuthority {
                 StageRegistryPhase::CleanupAttempted => {
                     expected_recovery = prepare_recovery_stage_removal(self, &record)?;
                     if platform::settle_removed_file(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         record
                             .cleanup
@@ -6977,7 +6976,7 @@ impl CapabilityAuthority {
                         Ok(())
                     } else {
                         platform::remove_parked_file(
-                            &record.parent.inner.handle,
+                            record.parent.inner.handle(),
                             record.name.as_os_str(),
                             record
                                 .cleanup
@@ -6990,7 +6989,7 @@ impl CapabilityAuthority {
                 StageRegistryPhase::Writing => {
                     expected_recovery = prepare_recovery_stage_removal(self, &record)?;
                     platform::remove_parked_file(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         record
                             .cleanup
@@ -7002,7 +7001,7 @@ impl CapabilityAuthority {
                 StageRegistryPhase::Sealed => {
                     expected_recovery = prepare_recovery_stage_removal(self, &record)?;
                     platform::remove_parked_file(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         record
                             .cleanup
@@ -7126,7 +7125,7 @@ impl CapabilityAuthority {
                         .expect("abandoned stage create retains its created file");
                     let identity = platform::file_identity(created)?;
                     record.cleanup = Some(platform::clone_stage_cleanup(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         created,
                         identity,
@@ -7143,7 +7142,7 @@ impl CapabilityAuthority {
                     .ok_or_else(|| identity_changed("stage create identity is absent"))?;
                 if record.phase == StageCreatePhase::CleanupAttempted
                     && platform::settle_removed_file(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         cleanup,
                         identity,
@@ -7153,7 +7152,7 @@ impl CapabilityAuthority {
                     Ok(())
                 } else {
                     platform::remove_parked_file(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         cleanup,
                         identity,
@@ -7256,7 +7255,7 @@ impl CapabilityAuthority {
                         .expect("abandoned directory create retains its created directory");
                     let identity = platform::directory_identity(created)?;
                     record.cleanup = Some(platform::open_parked_directory(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         identity,
                     )?);
@@ -7272,7 +7271,7 @@ impl CapabilityAuthority {
                     .ok_or_else(|| identity_changed("directory create identity is absent"))?;
                 if record.phase == DirectoryCreateEffectPhase::CleanupAttempted
                     && platform::settle_removed_directory(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         cleanup,
                         identity,
@@ -7282,7 +7281,7 @@ impl CapabilityAuthority {
                     Ok(())
                 } else {
                     platform::remove_parked_directory(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         cleanup,
                         identity,
@@ -8157,11 +8156,31 @@ impl Drop for DirectoryParkRegistryToken {
 }
 
 struct DirectoryInner {
-    handle: platform::DirectoryHandle,
+    storage: DirectoryStorage,
     identity: DirectoryIdentity,
     authority: Weak<CapabilityAuthority>,
     parent: Option<DirectoryParent>,
-    absolute_ancestry: Option<platform::AbsoluteDirectoryGuard>,
+}
+
+enum DirectoryStorage {
+    Owned(platform::DirectoryHandle),
+    Absolute(platform::AbsoluteDirectoryGuard),
+}
+
+impl DirectoryInner {
+    fn handle(&self) -> &platform::DirectoryHandle {
+        match &self.storage {
+            DirectoryStorage::Owned(handle) => handle,
+            DirectoryStorage::Absolute(guard) => platform::absolute_directory_handle(guard),
+        }
+    }
+
+    fn absolute_ancestry(&self) -> Option<&platform::AbsoluteDirectoryGuard> {
+        match &self.storage {
+            DirectoryStorage::Owned(_) => None,
+            DirectoryStorage::Absolute(guard) => Some(guard),
+        }
+    }
 }
 
 struct DirectoryParent {
@@ -8205,8 +8224,7 @@ impl AdmittedAbsoluteDirectory {
             .inner
             .directory
             .inner
-            .absolute_ancestry
-            .as_ref()
+            .absolute_ancestry()
             .ok_or_else(|| io::Error::other("absolute directory admission lost its ancestry"))?;
         Ok(
             match RootSession::acquire_absolute_directory_guard(ancestry) {
@@ -8371,7 +8389,7 @@ fn settle_removed_recovery(
             Some(_) => return Err(stale_capability()),
         }
         drop(state);
-        platform::sync_publication_directory(&parent.inner.handle)?;
+        platform::sync_publication_directory(parent.inner.handle())?;
         parent.validate(operation)?;
         let mut state = authority
             .operations
@@ -8461,7 +8479,7 @@ fn settle_removed_recovery_stage(
                 .as_ref()
                 == Some(&expected.destination_parent)
             && platform::file_binding_state(
-                &promotion.destination.parent.inner.handle,
+                promotion.destination.parent.inner.handle(),
                 promotion.destination.name.as_os_str(),
                 record.identity,
             )
@@ -8474,11 +8492,11 @@ fn settle_removed_recovery_stage(
             Some((parent, identity)),
         ) => {
             let handle = platform::open_file(
-                &parent.inner.handle,
+                parent.inner.handle(),
                 OsStr::new(expected.destination_leaf.as_str()),
             )?;
             let proof = recovery_runtime::prove_file(
-                &parent.inner.handle,
+                parent.inner.handle(),
                 OsStr::new(expected.destination_leaf.as_str()),
                 &handle,
                 identity,
@@ -8605,7 +8623,7 @@ fn seal_recovery_stage(
         return Ok(());
     };
     let proof = recovery_runtime::prove_file(
-        &file.parent.inner.handle,
+        file.parent.inner.handle(),
         file.name.as_os_str(),
         &file.handle,
         file.identity,
@@ -8718,7 +8736,7 @@ fn validate_recovery_publication(
         ));
     }
     let proof = recovery_runtime::prove_file(
-        &source.inner.handle,
+        source.inner.handle(),
         file.name.as_os_str(),
         &file.handle,
         file.identity,
@@ -8806,7 +8824,7 @@ fn complete_recovery_publication(
         .to_str()
         .ok_or_else(stale_capability)?;
     let proof = recovery_runtime::prove_file(
-        &destination.inner.handle,
+        destination.inner.handle(),
         destination_name.as_os_str(),
         &file.handle,
         file.identity,
@@ -8902,7 +8920,7 @@ fn preflight_recovery_create(
     stage: &LeafName,
     park: Option<&LeafName>,
 ) -> io::Result<()> {
-    let listing = platform::entries(&parent.inner.handle, MAX_DIRECTORY_LIST_ENTRIES)?;
+    let listing = platform::entries(parent.inner.handle(), MAX_DIRECTORY_LIST_ENTRIES)?;
     if !listing.complete {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -9101,7 +9119,7 @@ impl Directory {
             .and_then(|()| destination.file.validate_bound_to(self, &operation))
             .and_then(|()| destination.validate_revision(&operation))?;
         let proof = match recovery_runtime::prove_file(
-            &self.inner.handle,
+            self.inner.handle(),
             destination.file.name.as_os_str(),
             &destination.file.handle,
             destination.file.identity,
@@ -9410,7 +9428,7 @@ impl Directory {
     ) -> io::Result<bool> {
         let mut current = self;
         loop {
-            if let Some(ancestry) = &current.inner.absolute_ancestry {
+            if let Some(ancestry) = current.inner.absolute_ancestry() {
                 return platform::absolute_directory_anchor_is_ancestor(ancestry, ancestor);
             }
             let Some(parent) = &current.inner.parent else {
@@ -9515,11 +9533,11 @@ impl Directory {
             }
         };
         let effect = platform::rename_directory_no_replace(
-            &source_parent.inner.handle,
+            source_parent.inner.handle(),
             source_name.as_os_str(),
-            &self.inner.handle,
+            self.inner.handle(),
             self.inner.identity.physical,
-            &destination.inner.handle,
+            destination.inner.handle(),
             destination_name.as_os_str(),
         );
         let reported_success = effect.is_ok();
@@ -9646,7 +9664,7 @@ impl Directory {
             };
         }
         let cleanup = match platform::open_parked_directory(
-            &parent.inner.handle,
+            parent.inner.handle(),
             original_name.as_os_str(),
             self.inner.identity.physical,
         ) {
@@ -9688,9 +9706,9 @@ impl Directory {
             }
         };
         let effect = platform::park_directory_no_replace(
-            &parent.inner.handle,
+            parent.inner.handle(),
             original_name.as_os_str(),
-            &self.inner.handle,
+            self.inner.handle(),
             self.inner.identity.physical,
             park_name.as_os_str(),
             &guard.record().cleanup,
@@ -9754,17 +9772,20 @@ impl Directory {
             if current.authority.as_ptr() != Arc::as_ptr(authority) {
                 return Err(stale_capability());
             }
-            if platform::directory_identity(&current.handle)? != current.identity.physical {
+            let identity = match &current.storage {
+                DirectoryStorage::Owned(handle) => platform::directory_identity(handle)?,
+                DirectoryStorage::Absolute(guard) => {
+                    platform::validate_absolute_directory_guard(guard)?
+                }
+            };
+            if identity != current.identity.physical {
                 return Err(identity_changed("directory capability changed identity"));
-            }
-            if let Some(ancestry) = &current.absolute_ancestry {
-                platform::validate_absolute_directory_guard(ancestry)?;
             }
             let Some(binding) = &current.parent else {
                 break;
             };
             if platform::directory_binding_state(
-                &binding.directory.inner.handle,
+                binding.directory.inner.handle(),
                 &binding.name,
                 current.identity.physical,
             )? != platform::BindingState::Exact
@@ -9803,12 +9824,12 @@ fn settle_directory_park(
         Err(_) => return DirectoryParkResolution::Indeterminate(obligation),
     };
     let original = platform::directory_binding_state(
-        &guard.record().parent.inner.handle,
+        guard.record().parent.inner.handle(),
         guard.record().original_name.as_os_str(),
         guard.record().identity,
     );
     let parked_state = platform::directory_binding_state(
-        &guard.record().parent.inner.handle,
+        guard.record().parent.inner.handle(),
         guard.record().name.as_os_str(),
         guard.record().identity,
     );
@@ -9824,7 +9845,7 @@ fn settle_directory_park(
                 let restoration = {
                     let record = guard.record_mut();
                     platform::restore_parked_directory(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         &mut record.cleanup,
                         record.identity,
@@ -9905,7 +9926,7 @@ impl ParkedDirectory {
         let removal = {
             let record = guard.record_mut();
             platform::remove_parked_directory(
-                &record.parent.inner.handle,
+                record.parent.inner.handle(),
                 record.name.as_os_str(),
                 &mut record.cleanup,
                 record.identity,
@@ -9983,7 +10004,7 @@ impl ParkedDirectory {
         let removal = {
             let record = guard.record_mut();
             platform::remove_parked_directory(
-                &record.parent.inner.handle,
+                record.parent.inner.handle(),
                 record.name.as_os_str(),
                 &mut record.cleanup,
                 record.identity,
@@ -10070,7 +10091,7 @@ impl ParkedDirectory {
         let removal = {
             let record = guard.record_mut();
             platform::remove_parked_directory_tree(
-                &record.parent.inner.handle,
+                record.parent.inner.handle(),
                 record.name.as_os_str(),
                 &mut record.cleanup,
                 record.identity,
@@ -10131,7 +10152,7 @@ impl ParkedDirectory {
         let restoration = {
             let record = guard.record_mut();
             platform::restore_parked_directory(
-                &record.parent.inner.handle,
+                record.parent.inner.handle(),
                 record.name.as_os_str(),
                 &mut record.cleanup,
                 record.identity,
@@ -10222,7 +10243,7 @@ impl ParkedDirectory {
         let restoration = {
             let record = guard.record_mut();
             platform::restore_parked_directory(
-                &record.parent.inner.handle,
+                record.parent.inner.handle(),
                 record.name.as_os_str(),
                 &mut record.cleanup,
                 record.identity,
@@ -10274,7 +10295,7 @@ impl ParkedDirectory {
 
     fn binding_state(&self) -> io::Result<platform::BindingState> {
         platform::directory_binding_state(
-            &self.parent.inner.handle,
+            self.parent.inner.handle(),
             self.park_name.as_os_str(),
             self.identity.physical,
         )
@@ -10362,7 +10383,7 @@ impl DirectoryRemovalObligation {
             Err(_) => return self.retain(parked),
         };
         match platform::settle_removed_directory(
-            &guard.record().parent.inner.handle,
+            guard.record().parent.inner.handle(),
             guard.record().name.as_os_str(),
             &guard.record().cleanup,
             guard.record().identity,
@@ -10425,7 +10446,7 @@ impl DirectoryTreeRemovalObligation {
             Err(_) => return self.retain(parked),
         };
         let settled = platform::settle_removed_directory(
-            &guard.record().parent.inner.handle,
+            guard.record().parent.inner.handle(),
             guard.record().name.as_os_str(),
             &guard.record().cleanup,
             guard.record().identity,
@@ -10442,7 +10463,7 @@ impl DirectoryTreeRemovalObligation {
         let removal = {
             let record = guard.record_mut();
             platform::remove_parked_directory_tree(
-                &record.parent.inner.handle,
+                record.parent.inner.handle(),
                 record.name.as_os_str(),
                 &mut record.cleanup,
                 record.identity,
@@ -10521,7 +10542,7 @@ impl DirectoryRestoreObligation {
             Err(_) => return self.retain(parked),
         };
         match platform::settle_restored_directory(
-            &guard.record().parent.inner.handle,
+            guard.record().parent.inner.handle(),
             guard.record().name.as_os_str(),
             &guard.record().cleanup,
             guard.record().identity,
@@ -10573,7 +10594,7 @@ impl Directory {
     fn is_managed_root_descendant(&self) -> bool {
         let mut current = self;
         loop {
-            if current.inner.absolute_ancestry.is_some() {
+            if current.inner.absolute_ancestry().is_some() {
                 return false;
             }
             match current.inner.parent.as_ref() {
@@ -10587,7 +10608,7 @@ impl Directory {
         let authority = self.authority()?;
         let operation = authority.enter()?;
         self.validate(&operation)?;
-        let stamp = platform::directory_revision(&self.inner.handle)?;
+        let stamp = platform::directory_revision(self.inner.handle())?;
         self.validate(&operation)?;
         Ok(DirectoryRevision {
             identity: self.inner.identity,
@@ -10658,7 +10679,7 @@ impl Directory {
                 .directory;
             revisions.push(DirectoryRevision {
                 identity: current.inner.identity,
-                stamp: platform::directory_revision(&current.inner.handle)?,
+                stamp: platform::directory_revision(current.inner.handle())?,
             });
         }
         #[cfg(test)]
@@ -10697,7 +10718,7 @@ impl Directory {
         if self.inner.authority.as_ptr() != Arc::as_ptr(&operation.authority) {
             return Err(stale_capability());
         }
-        let stamp = platform::directory_revision(&self.inner.handle)?;
+        let stamp = platform::directory_revision(self.inner.handle())?;
         if expected.identity != self.inner.identity || expected.stamp != stamp {
             return Err(identity_changed("directory revision changed"));
         }
@@ -10720,12 +10741,12 @@ impl Directory {
         let authority = self.authority()?;
         let operation = authority.enter()?;
         self.validate(&operation)?;
-        let created_at_ns = platform::directory_created_at_ns(&self.inner.handle)?;
+        let created_at_ns = platform::directory_created_at_ns(self.inner.handle())?;
         let mut digest = Sha256::new();
         digest.update(b"axial-fs-directory-incarnation-v1");
         digest.update(platform::identity_witness(self.inner.identity.physical));
         digest.update(created_at_ns.to_le_bytes());
-        if platform::directory_created_at_ns(&self.inner.handle)? != created_at_ns {
+        if platform::directory_created_at_ns(self.inner.handle())? != created_at_ns {
             return Err(identity_changed("directory birth time changed"));
         }
         self.validate(&operation)?;
@@ -10739,7 +10760,7 @@ impl Directory {
         authority.ensure_leaf_not_directory_create_reserved(&operation, self, name)?;
         #[cfg(test)]
         authority.pause_directory_open_after_precheck(self, name);
-        let (handle, identity) = platform::open_directory(&self.inner.handle, name.as_os_str())?;
+        let (handle, identity) = platform::open_directory(self.inner.handle(), name.as_os_str())?;
         let opened = Self::from_handle(
             handle,
             authority.identity(identity),
@@ -10775,7 +10796,7 @@ impl Directory {
             Ok(reservation) => reservation,
             Err(error) => return DirectoryCreateOutcome::NoEffect(error),
         };
-        let handle = match platform::create_directory(&self.inner.handle, name.as_os_str()) {
+        let handle = match platform::create_directory(self.inner.handle(), name.as_os_str()) {
             Ok(handle) => handle,
             Err(platform::CreateDirectoryError::NoEffect(error)) => {
                 match authority.take_directory_create(&operation, &reservation) {
@@ -10837,7 +10858,7 @@ impl Directory {
         authority.ensure_leaf_not_root_control(operation, self, name)?;
         authority.ensure_leaf_not_directory_create_reserved(operation, self, name)?;
         authority.ensure_leaf_not_transient_reserved(operation, self, name)?;
-        let handle = platform::open_file(&self.inner.handle, name.as_os_str())?;
+        let handle = platform::open_file(self.inner.handle(), name.as_os_str())?;
         let identity = platform::file_identity(&handle)?;
         Ok(FileCapability::new(
             handle,
@@ -10919,7 +10940,7 @@ impl Directory {
         let authority = self.authority()?;
         let operation = authority.enter()?;
         self.validate(&operation)?;
-        let listing = platform::entries(&self.inner.handle, limit)?;
+        let listing = platform::entries(self.inner.handle(), limit)?;
         self.validate(&operation)?;
         let state = if listing.complete {
             DirectoryListingState::Complete
@@ -10965,8 +10986,10 @@ impl Directory {
             name,
         )?;
         authority.ensure_leaf_not_transient_reserved(&operation, &destination_parent, name)?;
-        let listing =
-            platform::entries(&destination_parent.inner.handle, MAX_DIRECTORY_LIST_ENTRIES)?;
+        let listing = platform::entries(
+            destination_parent.inner.handle(),
+            MAX_DIRECTORY_LIST_ENTRIES,
+        )?;
         if !listing.complete {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -10980,18 +11003,18 @@ impl Directory {
         {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
-        platform::create_symlink(&destination_parent.inner.handle, name.as_os_str(), target)?;
-        let readback = platform::read_symlink(&destination_parent.inner.handle, name.as_os_str())?;
+        platform::create_symlink(destination_parent.inner.handle(), name.as_os_str(), target)?;
+        let readback = platform::read_symlink(destination_parent.inner.handle(), name.as_os_str())?;
         if readback != target {
             return Err(identity_changed(
                 "owned symlink target changed during creation",
             ));
         }
-        platform::sync_directory(&destination_parent.inner.handle)?;
+        platform::sync_directory(destination_parent.inner.handle())?;
         destination_parent.validate(&operation)?;
         self.validate(&operation)?;
         self.validate_owned_symlink_target(&resolved_target)?;
-        if platform::read_symlink(&destination_parent.inner.handle, name.as_os_str())? != target {
+        if platform::read_symlink(destination_parent.inner.handle(), name.as_os_str())? != target {
             return Err(identity_changed(
                 "owned symlink target changed after synchronization",
             ));
@@ -11048,9 +11071,9 @@ impl Directory {
         self.validate(&operation)?;
         authority.ensure_leaf_not_directory_create_reserved(&operation, self, name)?;
         authority.ensure_leaf_not_transient_reserved(&operation, self, name)?;
-        let first = platform::read_symlink(&self.inner.handle, name.as_os_str())?;
+        let first = platform::read_symlink(self.inner.handle(), name.as_os_str())?;
         self.validate(&operation)?;
-        let second = platform::read_symlink(&self.inner.handle, name.as_os_str())?;
+        let second = platform::read_symlink(self.inner.handle(), name.as_os_str())?;
         if first != second {
             return Err(identity_changed(
                 "symlink target changed during observation",
@@ -11077,7 +11100,7 @@ impl Directory {
         #[cfg(test)]
         authority.pause_directory_open_after_precheck(self, &name);
         let (handle, identity) =
-            platform::open_directory(&self.inner.handle, entry.name.as_os_str())?;
+            platform::open_directory(self.inner.handle(), entry.name.as_os_str())?;
         let opened = Self::from_handle(
             handle,
             authority.identity(identity),
@@ -11109,12 +11132,12 @@ impl Directory {
         }
         parked.validate_revision(&operation)?;
         if platform::file_binding_state(
-            &self.inner.handle,
+            self.inner.handle(),
             original_name.as_os_str(),
             parked.file.identity,
         )? != platform::BindingState::Absent
             || platform::file_binding_state(
-                &self.inner.handle,
+                self.inner.handle(),
                 parked.file.name.as_os_str(),
                 parked.file.identity,
             )? != platform::BindingState::Exact
@@ -11129,7 +11152,7 @@ impl Directory {
             None,
         )?;
         let cleanup = platform::open_parked_file(
-            &self.inner.handle,
+            self.inner.handle(),
             parked.file.name.as_os_str(),
             parked.file.identity,
         )?;
@@ -11158,12 +11181,12 @@ impl Directory {
             self.validate(&operation)?;
             parked.validate_revision(&operation)?;
             if platform::file_binding_state(
-                &self.inner.handle,
+                self.inner.handle(),
                 original_name.as_os_str(),
                 identity,
             )? != platform::BindingState::Absent
                 || platform::file_binding_state(
-                    &self.inner.handle,
+                    self.inner.handle(),
                     park_name.as_os_str(),
                     identity,
                 )? != platform::BindingState::Exact
@@ -11235,12 +11258,12 @@ impl Directory {
         }
         parked.validate_revision_in(&operation, expected)?;
         if platform::directory_binding_state(
-            &self.inner.handle,
+            self.inner.handle(),
             original_name.as_os_str(),
             parked.inner.identity.physical,
         )? != platform::BindingState::Absent
             || platform::directory_binding_state(
-                &self.inner.handle,
+                self.inner.handle(),
                 park_name.as_os_str(),
                 parked.inner.identity.physical,
             )? != platform::BindingState::Exact
@@ -11257,7 +11280,7 @@ impl Directory {
             Some(parked.inner.identity.physical),
         )?;
         let cleanup = platform::open_parked_directory(
-            &self.inner.handle,
+            self.inner.handle(),
             park_name.as_os_str(),
             parked.inner.identity.physical,
         )?;
@@ -11279,12 +11302,12 @@ impl Directory {
         let post_registration = (|| {
             self.validate(&operation)?;
             if platform::directory_binding_state(
-                &self.inner.handle,
+                self.inner.handle(),
                 original_name.as_os_str(),
                 identity.physical,
             )? != platform::BindingState::Absent
                 || platform::directory_binding_state(
-                    &self.inner.handle,
+                    self.inner.handle(),
                     park_name.as_os_str(),
                     identity.physical,
                 )? != platform::BindingState::Exact
@@ -11372,7 +11395,7 @@ impl Directory {
             return FileParkOutcome::NoEffect { error, request };
         }
         let cleanup = match platform::open_parked_file(
-            &self.inner.handle,
+            self.inner.handle(),
             request.file.name.as_os_str(),
             request.file.identity,
         ) {
@@ -11400,7 +11423,7 @@ impl Directory {
             }
         };
         let effect = platform::park_file_no_replace(
-            &self.inner.handle,
+            self.inner.handle(),
             request.file.name.as_os_str(),
             &request.file.handle,
             request.file.identity,
@@ -11436,7 +11459,7 @@ impl Directory {
         let authority = self.authority()?;
         let operation = authority.enter()?;
         self.validate(&operation)?;
-        platform::sync_directory(&self.inner.handle)?;
+        platform::sync_directory(self.inner.handle())?;
         self.validate(&operation)
     }
 
@@ -11448,28 +11471,25 @@ impl Directory {
     ) -> Self {
         Self {
             inner: Arc::new(DirectoryInner {
-                handle,
+                storage: DirectoryStorage::Owned(handle),
                 identity,
                 authority,
                 parent,
-                absolute_ancestry: None,
             }),
         }
     }
 
-    fn from_absolute_handle(
-        handle: platform::DirectoryHandle,
-        identity: DirectoryIdentity,
-        authority: Weak<CapabilityAuthority>,
-        absolute_ancestry: platform::AbsoluteDirectoryGuard,
+    fn from_absolute_guard(
+        guard: platform::AbsoluteDirectoryGuard,
+        authority: &Arc<CapabilityAuthority>,
     ) -> Self {
+        let identity = authority.identity(platform::absolute_directory_identity(&guard));
         Self {
             inner: Arc::new(DirectoryInner {
-                handle,
+                storage: DirectoryStorage::Absolute(guard),
                 identity,
-                authority,
+                authority: Arc::downgrade(authority),
                 parent: None,
-                absolute_ancestry: Some(absolute_ancestry),
             }),
         }
     }
@@ -11979,10 +11999,10 @@ impl FileCapability {
             Err(error) => return FileMoveOutcome::NoEffect { error, file: self },
         };
         let effect = platform::move_file_no_replace(
-            &source_parent.inner.handle,
+            source_parent.inner.handle(),
             self.name.as_os_str(),
             &self.handle,
-            &destination.inner.handle,
+            destination.inner.handle(),
             destination_name.as_os_str(),
         );
         let reported_success = effect.is_ok();
@@ -12285,7 +12305,7 @@ impl FileCapability {
         self.parent.validate(operation)?;
         if platform::file_identity(&self.handle)? != self.identity
             || platform::file_binding_state(
-                &self.parent.inner.handle,
+                self.parent.inner.handle(),
                 self.name.as_os_str(),
                 self.identity,
             )? != platform::BindingState::Exact
@@ -12837,9 +12857,9 @@ impl SealedStagedFile {
             &self.file.handle,
             self.revision.size,
             self.revision.stamp,
-            &source_parent.inner.handle,
+            source_parent.inner.handle(),
             self.file.name.as_os_str(),
-            &destination_parent.inner.handle,
+            destination_parent.inner.handle(),
             destination_name.as_os_str(),
         ) {
             Ok(attempt) => attempt,
@@ -12867,10 +12887,10 @@ impl SealedStagedFile {
         let rename = platform::rename_no_replace(
             &mut attempt,
             attempt_id,
-            &source_parent.inner.handle,
+            source_parent.inner.handle(),
             self.file.name.as_os_str(),
             &self.file.handle,
-            &destination_parent.inner.handle,
+            destination_parent.inner.handle(),
             destination_name.as_os_str(),
         );
         let (mut rename_error, mut receipt) = match rename {
@@ -12881,12 +12901,12 @@ impl SealedStagedFile {
             Err(error) => (Some(error), attempt),
         };
         let source = platform::file_binding_state(
-            &source_parent.inner.handle,
+            source_parent.inner.handle(),
             self.file.name.as_os_str(),
             self.file.identity,
         );
         let destination = platform::file_binding_state(
-            &destination_parent.inner.handle,
+            destination_parent.inner.handle(),
             destination_name.as_os_str(),
             self.file.identity,
         );
@@ -12912,9 +12932,9 @@ impl SealedStagedFile {
                     &mut receipt,
                     attempt_id,
                     &self.file.handle,
-                    &source_parent.inner.handle,
+                    source_parent.inner.handle(),
                     self.file.name.as_os_str(),
-                    &destination_parent.inner.handle,
+                    destination_parent.inner.handle(),
                     destination_name.as_os_str(),
                 );
                 self.token.record_publication(attempt_id, receipt.clone());
@@ -12951,7 +12971,7 @@ impl SealedStagedFile {
                     ));
                 }
                 match platform::open_file(
-                    &destination_parent.inner.handle,
+                    destination_parent.inner.handle(),
                     destination_name.as_os_str(),
                 ) {
                     Ok(handle)
@@ -13070,8 +13090,8 @@ fn validate_state_replace_destination(
         }
     };
     parent.validate(operation)?;
-    let before = platform::directory_revision(&parent.inner.handle)?;
-    let listing = platform::entries(&parent.inner.handle, MAX_DIRECTORY_LIST_ENTRIES)?;
+    let before = platform::directory_revision(parent.inner.handle())?;
+    let listing = platform::entries(parent.inner.handle(), MAX_DIRECTORY_LIST_ENTRIES)?;
     if !listing.complete {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -13094,7 +13114,7 @@ fn validate_state_replace_destination(
         (None, None) => {}
         (Some(request), Some((_, EntryKind::File)))
             if platform::file_binding_state(
-                &parent.inner.handle,
+                parent.inner.handle(),
                 name.as_os_str(),
                 request.file.identity,
             )? == platform::BindingState::Exact => {}
@@ -13109,7 +13129,7 @@ fn validate_state_replace_destination(
     let proof = existing
         .map(|request| {
             let observed = recovery_runtime::prove_file(
-                &parent.inner.handle,
+                parent.inner.handle(),
                 name.as_os_str(),
                 &request.file.handle,
                 request.file.identity,
@@ -13123,7 +13143,7 @@ fn validate_state_replace_destination(
             Ok(observed)
         })
         .transpose()?;
-    if platform::directory_revision(&parent.inner.handle)? != before {
+    if platform::directory_revision(parent.inner.handle())? != before {
         return Err(identity_changed(
             "State destination changed during admission",
         ));
@@ -13138,7 +13158,7 @@ fn observe_state_batch_stage(
 ) -> io::Result<(recovery::RecoveryFileProof, (u64, platform::FileStamp))> {
     staged.file.parent.validate_for_authority(authority)?;
     let proof = recovery_runtime::prove_file(
-        &staged.file.parent.inner.handle,
+        staged.file.parent.inner.handle(),
         staged.file.name.as_os_str(),
         &staged.file.handle,
         staged.file.identity,
@@ -13445,7 +13465,7 @@ fn prepare_state_file_batch(
                 || platform::file_identity(&staged.file.handle)? != staged.file.identity
                 || platform::file_receipt_fields(&staged.file.handle)? != observations[index].1
                 || platform::file_binding_state(
-                    &preparation.parent.inner.handle,
+                    preparation.parent.inner.handle(),
                     staged.file.name.as_os_str(),
                     staged.file.identity,
                 )? != platform::BindingState::Exact
@@ -13556,9 +13576,9 @@ fn finalize_state_file_batch(
         platform::validate_lease(&authority.lease)?;
         platform::validate_root(&authority.root)?;
         finalization.parent.validate_for_authority(&authority)?;
-        let directory_stamp = platform::directory_revision(&finalization.parent.inner.handle)?;
+        let directory_stamp = platform::directory_revision(finalization.parent.inner.handle())?;
         let listing = platform::entries(
-            &finalization.parent.inner.handle,
+            finalization.parent.inner.handle(),
             MAX_DIRECTORY_LIST_ENTRIES,
         )?;
         if !listing.complete {
@@ -13584,10 +13604,10 @@ fn finalize_state_file_batch(
                     "settled State batch destination acquired a portable alias",
                 ));
             }
-            let handle = platform::open_file(&finalization.parent.inner.handle, name.as_os_str())?;
+            let handle = platform::open_file(finalization.parent.inner.handle(), name.as_os_str())?;
             let identity = platform::file_identity(&handle)?;
             let proof = recovery_runtime::prove_file(
-                &finalization.parent.inner.handle,
+                finalization.parent.inner.handle(),
                 name.as_os_str(),
                 &handle,
                 identity,
@@ -13607,7 +13627,7 @@ fn finalize_state_file_batch(
             ));
             receipts.push(receipt);
         }
-        if platform::directory_revision(&finalization.parent.inner.handle)? != directory_stamp {
+        if platform::directory_revision(finalization.parent.inner.handle())? != directory_stamp {
             return Err(identity_changed(
                 "settled State batch changed during admission",
             ));
@@ -13618,7 +13638,7 @@ fn finalize_state_file_batch(
             .lock()
             .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
         if operations.phase != AUTHORITY_LIVE
-            || platform::directory_revision(&finalization.parent.inner.handle)? != directory_stamp
+            || platform::directory_revision(finalization.parent.inner.handle())? != directory_stamp
             || operations.state_batch != Some(finalization.id)
         {
             return Err(stale_capability());
@@ -13627,7 +13647,7 @@ fn finalize_state_file_batch(
             if platform::file_identity(&file.handle)? != file.identity
                 || platform::file_receipt_fields(&file.handle)? != receipts[index]
                 || platform::file_binding_state(
-                    &finalization.parent.inner.handle,
+                    finalization.parent.inner.handle(),
                     file.name.as_os_str(),
                     file.identity,
                 )? != platform::BindingState::Exact
@@ -14358,7 +14378,7 @@ impl RootSession {
                 return AbsoluteDirectoryOutsideRootAdmission::Unavailable(error);
             }
         };
-        let Some(guard) = admitted.inner.directory.inner.absolute_ancestry.as_ref() else {
+        let Some(guard) = admitted.inner.directory.inner.absolute_ancestry() else {
             return AbsoluteDirectoryOutsideRootAdmission::Unavailable(io::Error::other(
                 "absolute directory admission lost its ancestry",
             ));
@@ -14381,18 +14401,12 @@ impl RootSession {
         let ancestry = platform::absolute_directory_guard_from_root_child(
             &self.authority.root,
             name.as_os_str(),
-            &directory.inner.handle,
+            directory.inner.handle(),
             identity.physical,
         )?;
-        let handle = platform::clone_absolute_directory_guard(&ancestry)?;
         let admitted = AdmittedAbsoluteDirectory {
             inner: Arc::new(AdmittedAbsoluteDirectoryInner {
-                directory: Directory::from_absolute_handle(
-                    handle,
-                    identity,
-                    Arc::downgrade(&self.authority),
-                    ancestry,
-                ),
+                directory: Directory::from_absolute_guard(ancestry, &self.authority),
             }),
         };
         admitted.revalidate()?;
@@ -14413,14 +14427,7 @@ impl RootSession {
         let operation = self.authority.enter()?;
         let ancestry: platform::AbsoluteDirectoryGuard =
             platform::open_absolute_directory_guard(path)?;
-        let identity = platform::absolute_directory_identity(&ancestry);
-        let handle = platform::clone_absolute_directory_guard(&ancestry)?;
-        let directory = Directory::from_absolute_handle(
-            handle,
-            self.authority.identity(identity),
-            Arc::downgrade(&self.authority),
-            ancestry,
-        );
+        let directory = Directory::from_absolute_guard(ancestry, &self.authority);
         directory.validate(&operation)?;
         Ok(directory)
     }
@@ -15279,12 +15286,12 @@ fn settle_file_move(
         return Err(file);
     }
     let source = platform::file_binding_state(
-        &file.parent.inner.handle,
+        file.parent.inner.handle(),
         file.name.as_os_str(),
         file.identity,
     );
     let target = platform::file_binding_state(
-        &destination.inner.handle,
+        destination.inner.handle(),
         destination_name.as_os_str(),
         file.identity,
     );
@@ -15295,15 +15302,14 @@ fn settle_file_move(
             {
                 return Err(file);
             }
-            let handle = match platform::open_file(
-                &destination.inner.handle,
-                destination_name.as_os_str(),
-            ) {
-                Ok(handle) if platform::file_identity(&handle).ok() == Some(file.identity) => {
-                    handle
-                }
-                _ => return Err(file),
-            };
+            let handle =
+                match platform::open_file(destination.inner.handle(), destination_name.as_os_str())
+                {
+                    Ok(handle) if platform::file_identity(&handle).ok() == Some(file.identity) => {
+                        handle
+                    }
+                    _ => return Err(file),
+                };
             let moved = FileCapability::new(
                 handle,
                 file.identity,
@@ -15348,18 +15354,18 @@ fn settle_directory_move(
     };
     if destination.validate(&operation).is_err()
         || !Weak::ptr_eq(&source_parent.inner.authority, &destination.inner.authority)
-        || platform::directory_identity(&directory.inner.handle).ok()
+        || platform::directory_identity(directory.inner.handle()).ok()
             != Some(directory.inner.identity.physical)
     {
         return Err(directory);
     }
     let source = platform::directory_binding_state(
-        &source_parent.inner.handle,
+        source_parent.inner.handle(),
         &source_name,
         directory.inner.identity.physical,
     );
     let target = platform::directory_binding_state(
-        &destination.inner.handle,
+        destination.inner.handle(),
         destination_name.as_os_str(),
         directory.inner.identity.physical,
     );
@@ -15371,7 +15377,7 @@ fn settle_directory_move(
                 return Err(directory);
             }
             let (handle, identity) = match platform::open_directory(
-                &destination.inner.handle,
+                destination.inner.handle(),
                 destination_name.as_os_str(),
             ) {
                 Ok(opened) if opened.1 == directory.inner.identity.physical => opened,
@@ -15425,9 +15431,9 @@ fn classify_move_topology(
 }
 
 fn sync_rename_parents(source: &Directory, destination: &Directory) -> io::Result<()> {
-    platform::sync_directory(&destination.inner.handle)?;
+    platform::sync_directory(destination.inner.handle())?;
     if !Arc::ptr_eq(&source.inner, &destination.inner) {
-        platform::sync_directory(&source.inner.handle)?;
+        platform::sync_directory(source.inner.handle())?;
     }
     Ok(())
 }
@@ -15523,7 +15529,7 @@ fn observe_parked_revision(
     identity: platform::Identity,
 ) -> io::Result<(u64, platform::FileStamp)> {
     let receipt = platform::parked_file_receipt_fields(parked)?;
-    if platform::file_binding_state(&parent.inner.handle, park_name.as_os_str(), identity)?
+    if platform::file_binding_state(parent.inner.handle(), park_name.as_os_str(), identity)?
         != platform::BindingState::Exact
     {
         return Err(identity_changed("parked file binding changed"));
@@ -15655,7 +15661,7 @@ fn finish_new_file_park(
             let restoration = {
                 let record = guard.record_mut();
                 platform::restore_parked_file(
-                    &record.parent.inner.handle,
+                    record.parent.inner.handle(),
                     record.name.as_os_str(),
                     &mut record.cleanup,
                     record.identity,
@@ -15736,12 +15742,12 @@ fn settle_file_park(mut obligation: FileParkObligation, force_restore: bool) -> 
         Err(_) => return FileParkResolution::Indeterminate(obligation),
     };
     let original = platform::file_binding_state(
-        &guard.record().parent.inner.handle,
+        guard.record().parent.inner.handle(),
         guard.record().original_name.as_os_str(),
         guard.record().identity,
     );
     let parked_state = platform::file_binding_state(
-        &guard.record().parent.inner.handle,
+        guard.record().parent.inner.handle(),
         guard.record().name.as_os_str(),
         guard.record().identity,
     );
@@ -15795,7 +15801,7 @@ fn settle_file_park(mut obligation: FileParkObligation, force_restore: bool) -> 
                 let restoration = {
                     let record = guard.record_mut();
                     platform::restore_parked_file(
-                        &record.parent.inner.handle,
+                        record.parent.inner.handle(),
                         record.name.as_os_str(),
                         &mut record.cleanup,
                         record.identity,
@@ -16798,9 +16804,9 @@ mod tests {
             &staged.file.handle,
             staged.revision.size,
             staged.revision.stamp,
-            &root.inner.handle,
+            root.inner.handle(),
             source_name.as_os_str(),
-            &root.inner.handle,
+            root.inner.handle(),
             destination_name.as_os_str(),
         )
         .expect("prepare replacement publication");
@@ -16903,9 +16909,9 @@ mod tests {
             &staged.file.handle,
             staged.revision.size,
             staged.revision.stamp,
-            &root.inner.handle,
+            root.inner.handle(),
             staged_name.as_os_str(),
-            &root.inner.handle,
+            root.inner.handle(),
             destination_name.as_os_str(),
         )
         .expect("prepare replacement publication");
@@ -17170,7 +17176,7 @@ mod tests {
         let mut token = authority
             .reserve_directory_create(&operation, &root, &name)
             .expect("directory create reservation");
-        let created = match platform::create_directory(&root.inner.handle, name.as_os_str()) {
+        let created = match platform::create_directory(root.inner.handle(), name.as_os_str()) {
             Ok(created) => created,
             Err(_) => panic!("native directory creation failed"),
         };
@@ -17218,7 +17224,7 @@ mod tests {
         let mut token = authority
             .reserve_directory_create(&operation, &root, &name)
             .expect("directory create reservation");
-        let created = match platform::create_directory(&root.inner.handle, name.as_os_str()) {
+        let created = match platform::create_directory(root.inner.handle(), name.as_os_str()) {
             Ok(created) => created,
             Err(_) => panic!("native directory creation failed"),
         };
@@ -17263,7 +17269,7 @@ mod tests {
         let mut token = authority
             .reserve_directory_create(&operation, &runtime, &name)
             .expect("directory create reservation");
-        let created = match platform::create_directory(&runtime.inner.handle, name.as_os_str()) {
+        let created = match platform::create_directory(runtime.inner.handle(), name.as_os_str()) {
             Ok(created) => created,
             Err(_) => panic!("native directory creation failed"),
         };
@@ -17312,7 +17318,7 @@ mod tests {
         let mut token = authority
             .reserve_directory_create(&operation, &root, &name)
             .expect("directory create reservation");
-        let created = match platform::create_directory(&root.inner.handle, name.as_os_str()) {
+        let created = match platform::create_directory(root.inner.handle(), name.as_os_str()) {
             Ok(created) => created,
             Err(_) => panic!("native directory creation failed"),
         };
@@ -17394,9 +17400,9 @@ mod tests {
             &staged_file,
             sealed_size,
             sealed_stamp,
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("observed-stage.bin"),
-            &destination.inner.handle,
+            destination.inner.handle(),
             OsStr::new("observed-publication.bin"),
         )
         .expect("prepare observed publication");
@@ -17405,9 +17411,9 @@ mod tests {
             &mut attempt,
             attempt_id,
             &staged_file,
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("observed-stage.bin"),
-            &destination.inner.handle,
+            destination.inner.handle(),
             OsStr::new("observed-publication.bin"),
         )
         .expect("settle observed publication");
@@ -17434,19 +17440,19 @@ mod tests {
             &staged_file,
             sealed_size,
             sealed_stamp,
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("stage.bin"),
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("published.bin"),
         )
         .expect("prepare publication");
         platform::rename_no_replace(
             &mut receipt,
             attempt_id,
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("stage.bin"),
             &staged_file,
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("published.bin"),
         )
         .expect("apply publication");
@@ -17460,9 +17466,9 @@ mod tests {
                     &mut receipt,
                     attempt_id,
                     &staged_file,
-                    &root.inner.handle,
+                    root.inner.handle(),
                     OsStr::new("stage.bin"),
-                    &root.inner.handle,
+                    root.inner.handle(),
                     OsStr::new("published.bin"),
                 )
                 .is_err()
@@ -17476,9 +17482,9 @@ mod tests {
                     &mut receipt,
                     attempt_id,
                     &staged_file,
-                    &root.inner.handle,
+                    root.inner.handle(),
                     OsStr::new("stage.bin"),
-                    &root.inner.handle,
+                    root.inner.handle(),
                     OsStr::new("published.bin"),
                 )
                 .is_err(),
@@ -17511,19 +17517,19 @@ mod tests {
             &staged_file,
             sealed_size,
             sealed_stamp,
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("stage.bin"),
-            &destination.inner.handle,
+            destination.inner.handle(),
             OsStr::new("published.bin"),
         )
         .expect("prepare publication");
         platform::rename_no_replace(
             &mut receipt,
             attempt_id,
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("stage.bin"),
             &staged_file,
-            &destination.inner.handle,
+            destination.inner.handle(),
             OsStr::new("published.bin"),
         )
         .expect("apply publication");
@@ -17538,9 +17544,9 @@ mod tests {
                     &mut receipt,
                     attempt_id,
                     &staged_file,
-                    &root.inner.handle,
+                    root.inner.handle(),
                     OsStr::new("stage.bin"),
-                    &destination.inner.handle,
+                    destination.inner.handle(),
                     OsStr::new("published.bin"),
                 )
                 .is_err()
@@ -17554,9 +17560,9 @@ mod tests {
                     &mut receipt,
                     attempt_id,
                     &staged_file,
-                    &root.inner.handle,
+                    root.inner.handle(),
                     OsStr::new("stage.bin"),
-                    &destination.inner.handle,
+                    destination.inner.handle(),
                     OsStr::new("published.bin"),
                 )
                 .is_err(),
@@ -17592,19 +17598,19 @@ mod tests {
             &staged_file,
             sealed_size,
             sealed_stamp,
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("stage.bin"),
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("published.bin"),
         )
         .expect("prepare reported publication");
         platform::rename_no_replace(
             &mut attempt,
             attempt_id,
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("stage.bin"),
             &staged_file,
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("published.bin"),
         )
         .expect("reported publication");
@@ -17614,9 +17620,9 @@ mod tests {
                 &mut receipt,
                 attempt_id,
                 &other_file,
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("stage.bin"),
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("published.bin"),
             )
             .is_err()
@@ -17626,9 +17632,9 @@ mod tests {
                 &mut receipt,
                 attempt_id + 1,
                 &staged_file,
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("stage.bin"),
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("published.bin"),
             )
             .is_err()
@@ -17638,9 +17644,9 @@ mod tests {
                 &mut receipt,
                 attempt_id,
                 &staged_file,
-                &other_parent.inner.handle,
+                other_parent.inner.handle(),
                 OsStr::new("stage.bin"),
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("published.bin"),
             )
             .is_err()
@@ -17650,9 +17656,9 @@ mod tests {
                 &mut receipt,
                 attempt_id,
                 &staged_file,
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("stage.bin"),
-                &other_parent.inner.handle,
+                other_parent.inner.handle(),
                 OsStr::new("published.bin"),
             )
             .is_err()
@@ -17662,9 +17668,9 @@ mod tests {
                 &mut receipt,
                 attempt_id,
                 &staged_file,
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("other-stage.bin"),
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("published.bin"),
             )
             .is_err()
@@ -17674,9 +17680,9 @@ mod tests {
                 &mut receipt,
                 attempt_id,
                 &staged_file,
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("stage.bin"),
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("other.bin"),
             )
             .is_err()
@@ -17686,9 +17692,9 @@ mod tests {
                 &mut receipt,
                 attempt_id,
                 &staged_file,
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("stage.bin"),
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("published.bin"),
             )
             .is_ok()
@@ -17714,9 +17720,9 @@ mod tests {
             &staged.file.handle,
             staged.revision.size,
             staged.revision.stamp,
-            &root.inner.handle,
+            root.inner.handle(),
             staged.file.name.as_os_str(),
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("unreported.bin"),
         )
         .expect("prepare unreported publication");
@@ -17726,9 +17732,9 @@ mod tests {
                 &mut attempt,
                 attempt_id,
                 &staged.file.handle,
-                &root.inner.handle,
+                root.inner.handle(),
                 staged.file.name.as_os_str(),
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("unreported.bin"),
             )
             .is_err()
@@ -17772,9 +17778,9 @@ mod tests {
             &staged.file.handle,
             staged.revision.size,
             staged.revision.stamp,
-            &root.inner.handle,
+            root.inner.handle(),
             source_name.as_os_str(),
-            &root.inner.handle,
+            root.inner.handle(),
             destination_name.as_os_str(),
         )
         .expect("prepare publication");
@@ -17792,10 +17798,10 @@ mod tests {
         platform::rename_no_replace(
             &mut attempt,
             attempt_id,
-            &root.inner.handle,
+            root.inner.handle(),
             source_name.as_os_str(),
             &staged.file.handle,
-            &root.inner.handle,
+            root.inner.handle(),
             destination_name.as_os_str(),
         )
         .expect("report publication");
@@ -17809,9 +17815,9 @@ mod tests {
             &mut committed,
             attempt_id,
             &staged.file.handle,
-            &root.inner.handle,
+            root.inner.handle(),
             source_name.as_os_str(),
-            &root.inner.handle,
+            root.inner.handle(),
             destination_name.as_os_str(),
         )
         .expect("commit publication");
@@ -17822,9 +17828,9 @@ mod tests {
             &mut committed,
             attempt_id,
             &staged.file.handle,
-            &root.inner.handle,
+            root.inner.handle(),
             source_name.as_os_str(),
-            &root.inner.handle,
+            root.inner.handle(),
             destination_name.as_os_str(),
         )
         .expect("revalidate committed publication");
@@ -17836,54 +17842,54 @@ mod tests {
                 "attempt",
                 attempt_id + 1,
                 &staged.file.handle,
-                &root.inner.handle,
+                root.inner.handle(),
                 source_name.as_os_str(),
-                &root.inner.handle,
+                root.inner.handle(),
                 destination_name.as_os_str(),
             ),
             (
                 "staged file",
                 attempt_id,
                 &other.file.handle,
-                &root.inner.handle,
+                root.inner.handle(),
                 source_name.as_os_str(),
-                &root.inner.handle,
+                root.inner.handle(),
                 destination_name.as_os_str(),
             ),
             (
                 "source parent",
                 attempt_id,
                 &staged.file.handle,
-                &other_parent.inner.handle,
+                other_parent.inner.handle(),
                 source_name.as_os_str(),
-                &root.inner.handle,
+                root.inner.handle(),
                 destination_name.as_os_str(),
             ),
             (
                 "destination parent",
                 attempt_id,
                 &staged.file.handle,
-                &root.inner.handle,
+                root.inner.handle(),
                 source_name.as_os_str(),
-                &other_parent.inner.handle,
+                other_parent.inner.handle(),
                 destination_name.as_os_str(),
             ),
             (
                 "source leaf",
                 attempt_id,
                 &staged.file.handle,
-                &root.inner.handle,
+                root.inner.handle(),
                 other.file.name.as_os_str(),
-                &root.inner.handle,
+                root.inner.handle(),
                 destination_name.as_os_str(),
             ),
             (
                 "destination leaf",
                 attempt_id,
                 &staged.file.handle,
-                &root.inner.handle,
+                root.inner.handle(),
                 source_name.as_os_str(),
-                &root.inner.handle,
+                root.inner.handle(),
                 wrong_destination.as_os_str(),
             ),
         ];
@@ -17920,19 +17926,19 @@ mod tests {
             &staged.file.handle,
             restore_size,
             restore_stamp,
-            &root.inner.handle,
+            root.inner.handle(),
             destination_name.as_os_str(),
-            &root.inner.handle,
+            root.inner.handle(),
             source_name.as_os_str(),
         )
         .expect("prepare stage-binding restoration");
         platform::rename_no_replace(
             &mut restore,
             restore_attempt_id,
-            &root.inner.handle,
+            root.inner.handle(),
             destination_name.as_os_str(),
             &staged.file.handle,
-            &root.inner.handle,
+            root.inner.handle(),
             source_name.as_os_str(),
         )
         .expect("restore stage binding through retained handle");
@@ -18212,9 +18218,12 @@ mod tests {
         let request = file.park_request(ExpectedFileContent::new(revision, digest));
         let authority = root.authority().expect("root authority");
         let operation = authority.enter().expect("park operation");
-        let cleanup =
-            platform::open_parked_file(&root.inner.handle, name.as_os_str(), request.file.identity)
-                .expect("retained cleanup handle");
+        let cleanup = platform::open_parked_file(
+            root.inner.handle(),
+            name.as_os_str(),
+            request.file.identity,
+        )
+        .expect("retained cleanup handle");
         let token = authority
             .reserve_file_park(&operation, &request, park_name.clone(), cleanup)
             .expect("park reservation");
@@ -18222,7 +18231,7 @@ mod tests {
             .take_file_park(&operation, &token)
             .expect("park record");
         match platform::park_file_no_replace(
-            &root.inner.handle,
+            root.inner.handle(),
             name.as_os_str(),
             &request.file.handle,
             request.file.identity,
@@ -18240,7 +18249,7 @@ mod tests {
         {
             let record = guard.record_mut();
             platform::restore_parked_file(
-                &record.parent.inner.handle,
+                record.parent.inner.handle(),
                 record.name.as_os_str(),
                 &mut record.cleanup,
                 record.identity,
@@ -18804,9 +18813,9 @@ mod tests {
             &staged.file.handle,
             staged.revision.size,
             staged.revision.stamp,
-            &staged.file.parent.inner.handle,
+            staged.file.parent.inner.handle(),
             staged.file.name.as_os_str(),
-            &destination.inner.handle,
+            destination.inner.handle(),
             destination_name.as_os_str(),
         )
         .expect("publication attempt");
@@ -19688,7 +19697,7 @@ mod tests {
         let token = authority
             .reserve_directory_create(&operation, &root, &name)
             .expect("directory create reservation");
-        let created = match platform::create_directory(&root.inner.handle, name.as_os_str()) {
+        let created = match platform::create_directory(root.inner.handle(), name.as_os_str()) {
             Ok(created) => created,
             Err(_) => panic!("native directory creation failed"),
         };
@@ -19766,7 +19775,7 @@ mod tests {
         let token = authority
             .reserve_directory_create(&operation, &root, &name)
             .expect("directory create reservation");
-        let created = match platform::create_directory(&root.inner.handle, name.as_os_str()) {
+        let created = match platform::create_directory(root.inner.handle(), name.as_os_str()) {
             Ok(created) => created,
             Err(_) => panic!("native directory creation failed"),
         };
@@ -20826,12 +20835,12 @@ mod tests {
 
         let root = session.root().expect("root revision capability");
         let cached_revision =
-            platform::directory_revision(&root.inner.handle).expect("direct cached root revision");
+            platform::directory_revision(root.inner.handle()).expect("direct cached root revision");
         std::fs::remove_file(sibling).expect("remove cooperative sibling");
         let revision_witnesses = {
             let mut witnesses = Vec::new();
             for attempt in 0..32 {
-                if platform::directory_revision(&root.inner.handle)
+                if platform::directory_revision(root.inner.handle())
                     .expect("direct changed root revision")
                     != cached_revision
                 {
@@ -20843,7 +20852,7 @@ mod tests {
                 witnesses.push(witness);
             }
             assert!(
-                platform::directory_revision(&root.inner.handle)
+                platform::directory_revision(root.inner.handle())
                     .expect("direct observed root revision")
                     != cached_revision,
                 "must observe a real root revision change before cache invalidation",
@@ -21955,10 +21964,10 @@ mod tests {
         platform::rename_no_replace(
             &mut receipt,
             attempt_id,
-            &root.inner.handle,
+            root.inner.handle(),
             staged.file.name.as_os_str(),
             &staged.file.handle,
-            &root.inner.handle,
+            root.inner.handle(),
             target.as_os_str(),
         )
         .expect("apply publication before reconciliation");
@@ -24012,16 +24021,43 @@ mod tests {
         (ready, release, observing)
     }
 
+    fn observation_fixture(
+        external: bool,
+    ) -> (
+        tempfile::TempDir,
+        RootSession,
+        Directory,
+        std::path::PathBuf,
+    ) {
+        let temporary = crate::test_tempdir().unwrap();
+        let app = temporary.path().join("app");
+        std::fs::create_dir(&app).unwrap();
+        let session = acquire_test_root(&app);
+        let (directory, path) = if external {
+            let library = temporary.path().join("outer/library");
+            std::fs::create_dir_all(&library).unwrap();
+            (session.admit_absolute_directory(&library).unwrap(), library)
+        } else {
+            (session.root().unwrap(), app)
+        };
+        std::fs::write(path.join("sample.bin"), b"sample").unwrap();
+        (temporary, session, directory, path)
+    }
+
     #[cfg(unix)]
     #[test]
     fn file_revision_observation_refuses_displaced_bindings_after_open() {
-        for binding in ["file", "lease", "root"] {
-            let temporary = crate::test_tempdir().unwrap();
-            let root_path = temporary.path().join("root");
-            std::fs::create_dir(&root_path).unwrap();
-            std::fs::write(root_path.join("sample.bin"), b"sample").unwrap();
-            let session = acquire_test_root(&root_path);
-            let root = session.root().unwrap();
+        for (external, binding) in [
+            (false, "file"),
+            (false, "lease"),
+            (false, "root"),
+            (true, "file"),
+            (true, "lease"),
+            (true, "root"),
+            (true, "library"),
+            (true, "ancestor"),
+        ] {
+            let (temporary, session, root, root_path) = observation_fixture(external);
             let name = LeafName::new("sample.bin").unwrap();
             let file = root.open_file(&name).unwrap();
             let expected = file.revision().unwrap().observation();
@@ -24029,17 +24065,20 @@ mod tests {
             let opened = ready.recv_timeout(std::time::Duration::from_secs(5));
             let path = match binding {
                 "file" => root_path.join("sample.bin"),
-                "lease" => root_path.join(ROOT_LEASE_NAME),
-                "root" => root_path.clone(),
+                "lease" => temporary.path().join("app").join(ROOT_LEASE_NAME),
+                "root" => temporary.path().join("app"),
+                "library" => root_path.clone(),
+                "ancestor" => root_path.parent().unwrap().to_path_buf(),
                 _ => unreachable!(),
             };
             let displaced = temporary.path().join("displaced");
+            let directory_binding = path.is_dir();
             let mut moved = false;
             let mutation = if opened.is_ok() {
                 (|| -> io::Result<()> {
                     std::fs::rename(&path, &displaced)?;
                     moved = true;
-                    if binding == "root" {
+                    if directory_binding {
                         std::fs::create_dir(&path)
                     } else {
                         std::fs::write(&path, b"sample")
@@ -24052,7 +24091,7 @@ mod tests {
             let observed = observing.join();
             if moved {
                 if path.exists() {
-                    if binding == "root" {
+                    if directory_binding {
                         std::fs::remove_dir(&path).unwrap();
                     } else {
                         std::fs::remove_file(&path).unwrap();
@@ -24071,18 +24110,18 @@ mod tests {
 
     #[test]
     fn file_revision_observation_refuses_original_proof_after_file_changes() {
-        for change in [
-            "replacement",
-            "missing",
-            "hardlink",
-            "directory",
-            "restored bytes",
-        ] {
-            let temporary = crate::test_tempdir().unwrap();
-            let path = temporary.path().join("sample.bin");
-            std::fs::write(&path, b"sample").unwrap();
-            let session = acquire_test_root(temporary.path());
-            let root = session.root().unwrap();
+        for (external, change) in [false, true].into_iter().flat_map(|external| {
+            [
+                "replacement",
+                "missing",
+                "hardlink",
+                "directory",
+                "restored bytes",
+            ]
+            .map(|change| (external, change))
+        }) {
+            let (temporary, session, root, root_path) = observation_fixture(external);
+            let path = root_path.join("sample.bin");
             let name = LeafName::new("sample.bin").unwrap();
             let file = root.open_file(&name).unwrap();
             let expected = file.revision().unwrap().observation();
@@ -24180,67 +24219,75 @@ mod tests {
 
     #[test]
     fn file_revision_observation_holds_admission_until_joined() {
-        let temporary = crate::test_tempdir().unwrap();
-        std::fs::write(temporary.path().join("sample.bin"), b"sample").unwrap();
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().unwrap();
-        let name = LeafName::new("sample.bin").unwrap();
-        let expected = root
-            .open_file(&name)
-            .unwrap()
-            .revision()
-            .unwrap()
-            .observation();
-        let (ready, release, observing) = paused_file_observation(&root, &name, &expected);
-        let opened = ready.recv_timeout(std::time::Duration::from_secs(5));
-        let outcome = session.revoke();
-        let _ = release.try_send(());
-        let observed = observing.join();
-        let refusal = match outcome {
-            RootRevokeOutcome::Refused(refusal) => refusal,
-            other => panic!("live observation did not retain revocation: {other:?}"),
-        };
-        let kind = refusal.error().kind();
-        drop(root);
-        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
-        opened.unwrap();
-        observed.unwrap().unwrap();
-        assert_eq!(kind, io::ErrorKind::WouldBlock);
+        for external in [false, true] {
+            let (_temporary, session, root, root_path) = observation_fixture(external);
+            let name = LeafName::new("sample.bin").unwrap();
+            let expected = root
+                .open_file(&name)
+                .unwrap()
+                .revision()
+                .unwrap()
+                .observation();
+            let (ready, release, observing) = paused_file_observation(&root, &name, &expected);
+            let opened = ready.recv_timeout(std::time::Duration::from_secs(5));
+            let outcome = session.revoke();
+            let _ = release.try_send(());
+            let observed = observing.join();
+            let refusal = match outcome {
+                RootRevokeOutcome::Refused(refusal) => refusal,
+                other => panic!("live observation did not retain revocation: {other:?}"),
+            };
+            let kind = refusal.error().kind();
+            let retired = root.clone();
+            drop(root);
+            assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+            opened.unwrap();
+            observed.unwrap().unwrap();
+            assert_eq!(kind, io::ErrorKind::WouldBlock);
+            assert!(
+                retired
+                    .validate_file_revision_observation(&name, &expected)
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(root_path.join("sample.bin")).unwrap(),
+                b"sample"
+            );
+        }
     }
 
     #[test]
     fn file_revision_observation_blocks_reset_until_joined() {
-        let temporary = crate::test_tempdir().unwrap();
-        std::fs::write(temporary.path().join("sample.bin"), b"sample").unwrap();
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().unwrap();
-        let name = LeafName::new("sample.bin").unwrap();
-        let expected = root
-            .open_file(&name)
-            .unwrap()
-            .revision()
-            .unwrap()
-            .observation();
-        let (ready, release, observing) = paused_file_observation(&root, &name, &expected);
-        let opened = ready.recv_timeout(std::time::Duration::from_secs(5));
-        let outcome = session.begin_reset();
-        let _ = release.try_send(());
-        let observed = observing.join();
-        let refusal = match outcome {
-            ResetStartOutcome::Refused(refusal) => refusal,
-            other => panic!("live observation did not retain reset: {other:?}"),
-        };
-        let kind = refusal.error().kind();
-        let session = refusal.cancel_reset();
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-        opened.unwrap();
-        observed.unwrap().unwrap();
-        assert_eq!(kind, io::ErrorKind::WouldBlock);
-        assert_eq!(
-            std::fs::read(temporary.path().join("sample.bin")).unwrap(),
-            b"sample"
-        );
+        for external in [false, true] {
+            let (_temporary, session, root, root_path) = observation_fixture(external);
+            let name = LeafName::new("sample.bin").unwrap();
+            let expected = root
+                .open_file(&name)
+                .unwrap()
+                .revision()
+                .unwrap()
+                .observation();
+            let (ready, release, observing) = paused_file_observation(&root, &name, &expected);
+            let opened = ready.recv_timeout(std::time::Duration::from_secs(5));
+            let outcome = session.begin_reset();
+            let _ = release.try_send(());
+            let observed = observing.join();
+            let refusal = match outcome {
+                ResetStartOutcome::Refused(refusal) => refusal,
+                other => panic!("live observation did not retain reset: {other:?}"),
+            };
+            let kind = refusal.error().kind();
+            let session = refusal.cancel_reset();
+            drop(root);
+            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+            opened.unwrap();
+            observed.unwrap().unwrap();
+            assert_eq!(kind, io::ErrorKind::WouldBlock);
+            assert_eq!(
+                std::fs::read(root_path.join("sample.bin")).unwrap(),
+                b"sample"
+            );
+        }
     }
 
     #[test]

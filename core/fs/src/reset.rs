@@ -294,7 +294,7 @@ impl PendingRootReset {
         // not a content proof: revalidate it even after the tree has cleared.
         // Only absence is delegated to the native retained-unlinked proof.
         if platform::file_binding_state(
-            &intent.parent.inner.handle,
+            intent.parent.inner.handle(),
             intent.name.as_os_str(),
             intent.identity,
         )? != platform::BindingState::Absent

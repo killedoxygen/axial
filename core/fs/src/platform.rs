@@ -995,11 +995,8 @@ mod native {
         Ok(guard)
     }
 
-    pub(crate) fn clone_absolute_directory_guard(
-        guard: &AbsoluteDirectoryGuard,
-    ) -> io::Result<DirectoryHandle> {
-        validate_absolute_directory_guard(guard)?;
-        clone_directory_handle(&guard.handle)
+    pub(crate) fn absolute_directory_handle(guard: &AbsoluteDirectoryGuard) -> &DirectoryHandle {
+        &guard.handle
     }
 
     pub(crate) fn root_construction_from_absolute_directory_guard(
@@ -1122,8 +1119,9 @@ mod native {
 
     pub(crate) fn validate_absolute_directory_guard(
         guard: &AbsoluteDirectoryGuard,
-    ) -> io::Result<()> {
-        if directory_identity(&guard.handle)? != guard.identity {
+    ) -> io::Result<Identity> {
+        let identity = directory_identity(&guard.handle)?;
+        if identity != guard.identity {
             return Err(binding_changed("external directory changed identity"));
         }
         for binding in &guard.bindings {
@@ -1143,15 +1141,16 @@ mod native {
                 ));
             }
         }
-        Ok(())
+        Ok(identity)
     }
 
     #[cfg(target_os = "linux")]
     pub(crate) fn validate_absolute_directory_guard_preallocated(
         guard: &AbsoluteDirectoryGuard,
         buffer: &mut [std::mem::MaybeUninit<u8>],
-    ) -> io::Result<()> {
-        if directory_identity_preallocated(&guard.handle)? != guard.identity {
+    ) -> io::Result<Identity> {
+        let identity = directory_identity_preallocated(&guard.handle)?;
+        if identity != guard.identity {
             return Err(io::ErrorKind::InvalidData.into());
         }
         for binding in &guard.bindings {
@@ -1169,7 +1168,7 @@ mod native {
                 return Err(io::ErrorKind::InvalidData.into());
             }
         }
-        Ok(())
+        Ok(identity)
     }
 
     pub(crate) fn validate_absolute_directory_outside_root(
@@ -4862,11 +4861,8 @@ mod native {
         Ok(guard)
     }
 
-    pub(crate) fn clone_absolute_directory_guard(
-        guard: &AbsoluteDirectoryGuard,
-    ) -> io::Result<DirectoryHandle> {
-        validate_absolute_directory_guard(guard)?;
-        clone_directory_handle(&guard.handle)
+    pub(crate) fn absolute_directory_handle(guard: &AbsoluteDirectoryGuard) -> &DirectoryHandle {
+        &guard.handle
     }
 
     pub(crate) fn root_construction_from_absolute_directory_guard(
@@ -4988,8 +4984,9 @@ mod native {
 
     pub(crate) fn validate_absolute_directory_guard(
         guard: &AbsoluteDirectoryGuard,
-    ) -> io::Result<()> {
-        if directory_identity(&guard.handle)? != guard.identity {
+    ) -> io::Result<Identity> {
+        let identity = directory_identity(&guard.handle)?;
+        if identity != guard.identity {
             return Err(binding_changed("external directory changed identity"));
         }
         for binding in &guard.bindings {
@@ -5004,7 +5001,7 @@ mod native {
                 ));
             }
         }
-        Ok(())
+        Ok(identity)
     }
 
     pub(crate) fn validate_absolute_directory_outside_root(

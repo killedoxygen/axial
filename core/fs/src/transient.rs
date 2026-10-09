@@ -689,7 +689,7 @@ fn validate_terminal_publication(
         record.directory.validate(operation)?;
         if transient_file_evidence(retained)? != (identity, 1)
             || platform::file_binding_state(
-                &record.directory.inner.handle,
+                record.directory.inner.handle(),
                 record.destination.as_os_str(),
                 identity,
             )? != platform::BindingState::Exact
@@ -703,7 +703,7 @@ fn validate_terminal_publication(
         Ok(())
     };
     validate()?;
-    platform::sync_directory(&record.directory.inner.handle)?;
+    platform::sync_directory(record.directory.inner.handle())?;
     validate()
 }
 
@@ -765,7 +765,7 @@ impl TransientDestination {
         #[cfg(target_os = "linux")]
         let mut destination = self;
         #[cfg(target_os = "linux")]
-        match platform::create_transient_file(&destination.directory.inner.handle) {
+        match platform::create_transient_file(destination.directory.inner.handle()) {
             Ok((file, identity)) => {
                 let token = destination
                     .token
@@ -1190,7 +1190,7 @@ impl Drop for TransientStage {
         let destination = self.destination();
         let topology = transient_publication_state_for_publication(
             &file,
-            &destination.directory.inner.handle,
+            destination.directory.inner.handle(),
             destination.name.as_os_str(),
             self.identity,
         );
@@ -1373,7 +1373,7 @@ fn validate_exact_destination_binding(
     )?;
     if transient_file_evidence_for_publication(retained)? != (identity, 1)
         || platform::file_binding_state(
-            &destination.directory.inner.handle,
+            destination.directory.inner.handle(),
             destination.name.as_os_str(),
             identity,
         )? != platform::BindingState::Exact
@@ -1397,7 +1397,7 @@ fn validate_unpublished_destination(
         directory_buffer.as_deref_mut(),
     )?;
     let binding = platform::file_binding_state(
-        &destination.directory.inner.handle,
+        destination.directory.inner.handle(),
         destination.name.as_os_str(),
         identity,
     )?;
@@ -1423,19 +1423,22 @@ fn validate_publication_directory(
             if current.authority.as_ptr() != Arc::as_ptr(&operation.authority) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            if platform::directory_identity_preallocated(&current.handle)?
-                != current.identity.physical
-            {
+            let identity = match &current.storage {
+                crate::DirectoryStorage::Owned(handle) => {
+                    platform::directory_identity_preallocated(handle)?
+                }
+                crate::DirectoryStorage::Absolute(guard) => {
+                    platform::validate_absolute_directory_guard_preallocated(guard, buffer)?
+                }
+            };
+            if identity != current.identity.physical {
                 return Err(io::ErrorKind::InvalidData.into());
-            }
-            if let Some(ancestry) = &current.absolute_ancestry {
-                platform::validate_absolute_directory_guard_preallocated(ancestry, buffer)?;
             }
             let Some(binding) = &current.parent else {
                 break;
             };
             if platform::directory_binding_state(
-                &binding.directory.inner.handle,
+                binding.directory.inner.handle(),
                 &binding.name,
                 current.identity.physical,
             )? != platform::BindingState::Exact
@@ -1457,11 +1460,11 @@ fn directory_revision_for_publication(
 ) -> io::Result<platform::DirectoryStamp> {
     #[cfg(target_os = "linux")]
     if directory_buffer.is_some() {
-        return platform::directory_revision_preallocated(&directory.inner.handle);
+        return platform::directory_revision_preallocated(directory.inner.handle());
     }
     #[cfg(not(target_os = "linux"))]
     debug_assert!(directory_buffer.is_none());
-    platform::directory_revision(&directory.inner.handle)
+    platform::directory_revision(directory.inner.handle())
 }
 
 fn transient_publication_state_for_publication(
@@ -1647,13 +1650,13 @@ fn observe_destination_inventory(
     #[cfg(target_os = "linux")]
     let visit = match directory_buffer.as_deref_mut() {
         Some(buffer) => platform::visit_entries_preallocated(
-            &directory.inner.handle,
+            directory.inner.handle(),
             buffer,
             MAX_DIRECTORY_LIST_ENTRIES,
             &mut visit_entry,
         ),
         None => platform::visit_entries(
-            &directory.inner.handle,
+            directory.inner.handle(),
             MAX_DIRECTORY_LIST_ENTRIES,
             &mut visit_entry,
         ),
@@ -1662,7 +1665,7 @@ fn observe_destination_inventory(
     let visit = {
         debug_assert!(directory_buffer.is_none());
         platform::visit_entries(
-            &directory.inner.handle,
+            directory.inner.handle(),
             MAX_DIRECTORY_LIST_ENTRIES,
             &mut visit_entry,
         )
@@ -2147,12 +2150,12 @@ impl TransientPublicationBatch {
                 .expect("sealed transient stage retains its file");
             let link = link_transient_file(
                 file,
-                &destination.directory.inner.handle,
+                destination.directory.inner.handle(),
                 destination.name.as_os_str(),
             );
             let state = transient_publication_state_for_publication(
                 file,
-                &destination.directory.inner.handle,
+                destination.directory.inner.handle(),
                 destination.name.as_os_str(),
                 *identity,
             );
@@ -2190,7 +2193,7 @@ fn classify_publication_batch(
         let destination = stage.stage.destination();
         match transient_publication_state_for_publication(
             file,
-            &destination.directory.inner.handle,
+            destination.directory.inner.handle(),
             destination.name.as_os_str(),
             stage.stage.identity,
         ) {
@@ -2223,7 +2226,7 @@ fn classify_publication_batch(
     if let Err(proof) = member_proof {
         return pending_publication(proof, batch);
     }
-    if let Err(sync) = platform::sync_directory(&batch.directory.inner.handle) {
+    if let Err(sync) = platform::sync_directory(batch.directory.inner.handle()) {
         return pending_publication(sync, batch);
     }
     #[cfg(target_os = "linux")]
@@ -3155,7 +3158,7 @@ mod tests {
                 .file
                 .as_mut()
                 .expect("sealed stage retains native file"),
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new(name),
         )
         .expect("linked transient stage");
@@ -3282,7 +3285,7 @@ mod tests {
         );
         assert_eq!(
             platform::exact_file_link_count(
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new("published.bin"),
                 published.identity,
             )
@@ -3372,7 +3375,7 @@ mod tests {
                 .file
                 .as_mut()
                 .expect("first stage retains its native file"),
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("partial-first.bin"),
         )
         .expect("partial grouped publication");
@@ -3490,7 +3493,7 @@ mod tests {
                     .file
                     .as_mut()
                     .expect("first stage native file"),
-                &root.inner.handle,
+                root.inner.handle(),
                 OsStr::new(first_name.as_str()),
             )
             .expect("published prefix");
@@ -3587,7 +3590,7 @@ mod tests {
                 .file
                 .as_mut()
                 .expect("first stage native file"),
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("pending-first.bin"),
         )
         .expect("published prefix");
@@ -3819,7 +3822,7 @@ mod tests {
                 .file
                 .as_mut()
                 .expect("sealed stage retains native file"),
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("aba.bin"),
         )
         .expect("initial original link");
@@ -3844,7 +3847,7 @@ mod tests {
                 .file
                 .as_mut()
                 .expect("held original remains available"),
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("aba.bin"),
         );
         assert_eq!(

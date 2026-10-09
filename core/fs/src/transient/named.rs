@@ -660,7 +660,7 @@ mod tests {
         let second = second.seal().unwrap();
         link_transient_file(
             first.stage.file.as_mut().unwrap(),
-            &root.inner.handle,
+            root.inner.handle(),
             OsStr::new("first.bin"),
         )
         .unwrap();
