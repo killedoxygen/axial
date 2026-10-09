@@ -313,6 +313,111 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
                 prompt && matches!(result, Err(LaunchError::AtCapacity)),
                 "Play must preserve verification capacity refusal: {result:?}"
             );
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let client = ProviderClient::new(ClientConfig::default()).unwrap();
+            let content = Arc::new(ContentService::with_base_url(
+                client.clone(), &origin,
+                crate::network::OriginPolicy::loopback_for_tests([&origin], 0).unwrap(),
+            ).unwrap());
+            let mutations = Arc::new(ContentMutations::new(
+                service.instances.directories().clone(), client, service.instances.tasks.clone(),
+            ));
+            let queued_work = super::tests::pending_content_work(
+                service.instances.clone(), content.clone(), mutations.clone(),
+            ).await;
+            let queue = service.installs.as_ref().clone().with_content(content, mutations);
+            let record = queued_work.instance().record().clone();
+            let directory = queued_work.instance().game_directory().read_projection().unwrap();
+            let StoredSetupIntent::Content(stored) = &queued_work.stored else { unreachable!() };
+            let mut manifest = crate::content::provenance::ContentManifest::default();
+            let mut paths = Vec::new();
+            for artifact in stored.artifacts.as_ref().unwrap() {
+                manifest.try_upsert(crate::content::provenance::ManifestEntry::managed(
+                    artifact.canonical_id.clone(), artifact.provider, artifact.project_id.clone(),
+                    artifact.version_id.clone(), artifact.kind, &artifact.file,
+                    artifact.dependencies.clone(), artifact.title.clone(),
+                ).unwrap()).unwrap();
+                let path = directory.join("resourcepacks").join(&artifact.file.filename);
+                std::fs::write(&path, b"fixture").unwrap();
+                paths.push(path);
+            }
+            let manifest_path = directory.join(crate::content::provenance::MANIFEST_FILE);
+            std::fs::write(&manifest_path, manifest.encode_managed().unwrap()).unwrap();
+            paths.push(manifest_path);
+            let canary = directory.join("notes.txt");
+            std::fs::write(&canary, b"preserve accepted setup files").unwrap();
+            paths.push(canary);
+            let contents = paths.iter().map(|path| std::fs::read(path).unwrap()).collect::<Vec<_>>();
+            let blocker = service.instances.directories().exclusions().try_acquire(
+                std::iter::empty::<String>(),
+                [crate::install::queue::library_artifact(&pin.library_id().to_string())],
+            ).unwrap();
+            let accepted = queue.enqueue_setup_content(
+                queued_work.request(), queued_work.prerequisite(), queued_work.clone(),
+            ).await.unwrap();
+            let started = accepted.started_install.unwrap();
+            assert_eq!(accepted.items.len(), 1);
+            assert_eq!(accepted.items[0].kind, "content");
+            assert!(accepted.active.is_none());
+            let (_, mut updates) = queue.subscribe();
+            let workers = work.admit(PhysicalWorkRequest::foreground_parallel(
+                PhysicalIoClass::Read, 0, 4,
+            )).await.unwrap();
+            drop(blocker);
+            queue.resume_queued();
+            let refused = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let status = queue.status(&started.install_id).unwrap();
+                    if status.done { break status; }
+                    updates.changed().await.unwrap();
+                }
+            }).await;
+            let pending_after_refusal = super::has_pending(
+                service.instances.registry().storage(), &record.instance.id,
+            ).unwrap();
+            let preserved_after_refusal = paths.iter().map(|path| std::fs::read(path).unwrap()).collect::<Vec<_>>();
+            let mut before_retry = serde_json::to_value(queue.snapshot()).unwrap();
+            let pressured_retry = queue.retry_setup_content(
+                queued_work.request(), queued_work.prerequisite(), queued_work.clone(),
+            ).await;
+            let mut after_retry = serde_json::to_value(queue.snapshot()).unwrap();
+            for snapshot in [&mut before_retry, &mut after_retry] {
+                let fields = snapshot.as_object_mut().unwrap();
+                fields.remove("revision");
+                fields.remove("registry_revision");
+            }
+            let retry_unchanged = after_retry == before_retry;
+            drop(workers);
+            let refused = refused.expect("accepted setup must refuse worker pressure promptly");
+            let retried = queue.retry_setup_content(
+                queued_work.request(), queued_work.prerequisite(), queued_work.clone(),
+            ).await.unwrap().started_install.unwrap();
+            let restored = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let status = queue.status(&retried.install_id).unwrap();
+                    if status.done { break status; }
+                    updates.changed().await.unwrap();
+                }
+            }).await.unwrap();
+            assert_eq!(refused.operation_id, started.operation_id);
+            assert_eq!(restored.operation_id, retried.operation_id);
+            assert_ne!(retried.install_id, started.install_id);
+            assert_ne!(retried.operation_id, started.operation_id);
+            assert_eq!(queue.status(&started.install_id).unwrap(), refused);
+            assert_eq!(refused.outcome, Some(crate::install::model::InstallOutcome::Failed));
+            assert!(pending_after_refusal);
+            assert_eq!(preserved_after_refusal, contents);
+            assert!(matches!(pressured_retry, Err(InstallError::AtCapacity)) && retry_unchanged);
+            assert_eq!(restored.outcome, Some(crate::install::model::InstallOutcome::Succeeded));
+            assert!(!super::has_pending(service.instances.registry().storage(), &record.instance.id).unwrap());
+            assert_eq!(service.instances.registry().get_live(&record.instance.id).unwrap(), record);
+            assert_eq!(paths.iter().map(|path| std::fs::read(path).unwrap()).collect::<Vec<_>>(), contents);
+            assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+            assert_eq!(refused.failure_view_model.unwrap().summary,
+                "The install queue is full. Wait for an installation to finish.");
         })
         .catch_unwind(),
     );

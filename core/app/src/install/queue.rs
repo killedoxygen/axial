@@ -2396,7 +2396,7 @@ impl InstallQueue {
                 &work.instance().record().instance.version_id,
             )
             .await
-            .map_err(|_| WorkFailure::Failed(InstallError::NotReady))?;
+            .map_err(WorkFailure::Failed)?;
             return match work.execute(cancel, progress).await {
                 Ok(()) => Ok(InstallOutcome::Succeeded),
                 Err(crate::instances::model::InstanceError::Cancelled) => {
