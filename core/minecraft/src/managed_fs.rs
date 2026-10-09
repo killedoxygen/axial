@@ -188,13 +188,6 @@ impl ManagedRootSession {
             Self::Direct(session) => session.validate_retained_authority(),
         }
     }
-
-    fn admit_absolute_directory(&self, path: &Path) -> io::Result<Directory> {
-        match self {
-            Self::Admitted(session) => session.admit_absolute_directory(path),
-            Self::Direct(session) => session.admit_absolute_directory(path),
-        }
-    }
 }
 
 struct ManagedEffectContinuations {
