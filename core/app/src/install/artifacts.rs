@@ -268,9 +268,8 @@ impl ActivatedVersion {
         let mut missing = Vec::new();
         let mut reasons = Vec::new();
         let mut version = None;
-        let mut exact = BTreeMap::new();
         let mut asset_flags = BTreeMap::new();
-        for expected in &self.files {
+        for (index, expected) in self.files.iter().enumerate() {
             if expected.size > 2 * 1024 * 1024 * 1024 {
                 return Err(InstallError::NotReady);
             }
@@ -284,12 +283,7 @@ impl ActivatedVersion {
                 .map_err(|_| InstallError::NotReady)?;
             let root = expected.path.split('/').next();
             if !matches!(root, Some("versions" | "libraries" | "assets"))
-                || exact
-                    .insert(
-                        expected.path.clone(),
-                        (expected.sha1.clone(), expected.size),
-                    )
-                    .is_some()
+                || (index > 0 && self.files[index - 1].path == expected.path)
             {
                 return Err(InstallError::NotReady);
             }
@@ -385,7 +379,12 @@ impl ActivatedVersion {
             // every asset object. Re-observation below is bounded to one file.
             guards.push((path, file.revision_observation()));
         }
-        if !exact.contains_key(&client) || !exact.contains_key(&metadata_path) {
+        let contains = |path: &str| {
+            self.files
+                .binary_search_by(|file| file.path.as_str().cmp(path))
+                .is_ok()
+        };
+        if !contains(&client) || !contains(&metadata_path) {
             return Err(InstallError::NotReady);
         }
         let virtual_assets = if let Some(version) = version.as_mut() {
@@ -408,7 +407,7 @@ impl ActivatedVersion {
                 PortableFileName::new_exact(&version.asset_index.id)
                     .map_err(|_| InstallError::NotReady)?;
                 let index = format!("assets/indexes/{}.json", version.asset_index.id);
-                if !exact.contains_key(&index) {
+                if !contains(&index) {
                     return Err(InstallError::NotReady);
                 }
                 if inspection == Inspection::Summary {
@@ -452,7 +451,11 @@ impl ActivatedVersion {
         let receipt = InstalledVersionReceipt {
             evidence: Arc::new(evidence),
             version,
-            exact,
+            exact: self
+                .files
+                .into_iter()
+                .map(|file| (file.path, (file.sha1, file.size)))
+                .collect(),
             virtual_assets,
             client_jar,
         };
@@ -1252,6 +1255,48 @@ pub(crate) mod tests {
         assert_eq!(
             charges, [once; 3],
             "one charge survives until the last reader"
+        );
+    }
+
+    #[test]
+    fn integrity_transfers_inventory_strings_without_cloning() {
+        let (temporary, library, activated) = fixture();
+        let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let strings: Vec<_> = activated
+                .files
+                .iter()
+                .map(|file| (file.path.clone(), file.path.as_ptr(), file.sha1.as_ptr()))
+                .collect();
+            let receipt = activated.verify(library.admit().unwrap()).unwrap();
+            let transferred = strings.iter().all(|(path, path_ptr, sha1_ptr)| {
+                receipt
+                    .exact
+                    .get_key_value(path)
+                    .is_some_and(|(key, value)| {
+                        key.as_ptr() == *path_ptr && value.0.as_ptr() == *sha1_ptr
+                    })
+            });
+            (transferred, receipt.revalidate().is_ok())
+        }));
+        let settled = library.try_preserve();
+        if settled.is_err() {
+            std::mem::forget(library);
+        } else {
+            drop(library);
+        }
+        if !matches!(&observed, Ok((true, true))) || settled.is_err() {
+            eprintln!(
+                "inventory fixture retained at {}",
+                temporary.keep().display()
+            );
+        }
+        settled.unwrap();
+        let (transferred, valid) =
+            observed.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        assert!(valid);
+        assert!(
+            transferred,
+            "verified inventory must move its owned strings"
         );
     }
 
