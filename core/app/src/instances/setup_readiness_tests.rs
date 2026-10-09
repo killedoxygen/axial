@@ -46,6 +46,13 @@ fn open_fixture(
         crate::library::LibraryOpenOutcome::Ready(library) => library,
         other => panic!("isolated test library did not open: {other:?}"),
     };
+    compose_fixture(root, library)
+}
+
+fn compose_fixture(
+    root: &std::path::Path,
+    library: crate::library::LibraryLifecycle,
+) -> (SetupService, Arc<AccountDirectory>) {
     let storage = Arc::new(MetadataStore::open(root.join("metadata.sqlite")).unwrap());
     storage
         .migrate(&[
@@ -203,6 +210,7 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
     service.loader_catalog_fixture = Some(catalog);
     let service = Arc::new(service);
     let library = service.instances.directories().library().clone();
+    let library_id = library.snapshot().current.unwrap().library_id;
     let cache = service.installs.runtime_cache().clone();
     let work = process_physical_work();
     let pressure = Arc::new(Mutex::new(None));
@@ -594,6 +602,7 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
             assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
             assert_eq!(refused.failure_view_model.unwrap().summary,
                 "The install queue is full. Wait for an installation to finish.");
+            service.instances.registry().list().unwrap()
         })
         .catch_unwind(),
     );
@@ -634,12 +643,156 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
         );
         panic!("selection pressure roots did not settle");
     }
-    if let Err(panic) = outcome {
-        eprintln!(
-            "selection pressure fixture retained: {}",
-            root.keep().display()
+    let records = match outcome {
+        Ok(records) => records,
+        Err(panic) => {
+            let retained = root.keep();
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "selection pressure fixture retained: {}",
+                retained.display()
+            );
+            std::panic::resume_unwind(panic);
+        }
+    };
+    drop((library, cache));
+    let library = match crate::library::LibraryLifecycle::open_with_id(root.path(), library_id) {
+        crate::library::LibraryOpenOutcome::Ready(library) => library,
+        refused => {
+            let retained = root.keep();
+            std::mem::forget((refused, runtime));
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "pressure reopen refused; retained: {}",
+                retained.display()
+            );
+            panic!("pressure library did not reopen");
+        }
+    };
+    let reopened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async { compose_fixture(root.path(), library.clone()) })
+    }));
+    let (reopened, accounts) = match reopened {
+        Ok(owners) => owners,
+        Err(panic) => {
+            let retained = root.keep();
+            std::mem::forget((library, runtime));
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "pressure composition refused; retained: {}",
+                retained.display()
+            );
+            std::panic::resume_unwind(panic);
+        }
+    };
+    let cache = reopened.installs.runtime_cache().clone();
+    let outcome = runtime.block_on(
+        std::panic::AssertUnwindSafe(async {
+            assert_eq!(reopened.instances.registry().list().unwrap(), records);
+            assert!(reopened.instances.pending().unwrap().is_empty());
+            let public = reopened.list().await.unwrap();
+            assert_eq!(
+                public
+                    .instances
+                    .iter()
+                    .map(|instance| instance.instance.clone())
+                    .collect::<Vec<_>>(),
+                records
+                    .iter()
+                    .map(|record| super::super::create::public_instance(record.instance.clone()))
+                    .collect::<Vec<_>>()
+            );
+            let queue = reopened.installs.snapshot();
+            assert!(
+                queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none()
+            );
+            let published = records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.instance.name.as_str(),
+                        "PublishedUnderScratchPressure" | "PublishedUnderWorkerPressure"
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(published.len(), 2);
+            for record in published {
+                let admitted = reopened
+                    .instances
+                    .directories()
+                    .admit(&record.instance.id)
+                    .unwrap();
+                admitted.validate_current().unwrap();
+                let directory = admitted.game_directory().read_projection().unwrap();
+                for name in super::super::create::INITIAL_DIRECTORIES {
+                    assert!(
+                        std::fs::read_dir(directory.join(name))
+                            .unwrap()
+                            .next()
+                            .is_none()
+                    );
+                }
+            }
+            assert_eq!(
+                std::fs::read(root.path().join("creation-canary.txt")).unwrap(),
+                b"preserve publication under pressure"
+            );
+            let pin = library.admit().unwrap();
+            for version in ["1.21.4", installed.version_id.as_str()] {
+                reopened
+                    .installs
+                    .ready_version(&pin, version)
+                    .await
+                    .unwrap()
+                    .revalidate()
+                    .unwrap();
+            }
+        })
+        .catch_unwind(),
+    );
+    reopened.installs.close_admission();
+    let shutdown = runtime.block_on(reopened.instances.tasks.shutdown(Duration::from_secs(3)));
+    let observers = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), reopened.installs.join_observers()).await
+    });
+    let queue_settled = reopened.installs.shutdown_queued();
+    if shutdown.is_err() || !matches!(observers, Ok(Ok(()))) || queue_settled.is_err() {
+        let retained = root.keep();
+        std::mem::forget((reopened, accounts, library, cache, runtime));
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "reopened pressure owners retained: {}",
+            retained.display()
         );
-        std::panic::resume_unwind(panic);
+        std::panic::resume_unwind(
+            outcome
+                .err()
+                .unwrap_or_else(|| Box::new("reopened owners did not settle")),
+        );
+    }
+    drop((reopened, accounts));
+    let runtime_settled = cache.settle();
+    let preserved = library.try_preserve();
+    if runtime_settled.is_err() || preserved.is_err() || outcome.is_err() {
+        let retained = root.keep();
+        if runtime_settled.is_err() || preserved.is_err() {
+            std::mem::forget((library, cache, runtime));
+        }
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "reopened pressure fixture retained: {}",
+            retained.display()
+        );
+        std::panic::resume_unwind(
+            outcome
+                .err()
+                .unwrap_or_else(|| Box::new("reopened roots did not settle")),
+        );
     }
 }
 
