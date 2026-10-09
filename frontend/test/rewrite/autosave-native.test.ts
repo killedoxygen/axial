@@ -205,6 +205,7 @@ function harness() {
   };
   let storedConfig = config();
   let storedInstance = structuredClone(instance);
+  const publicInstance = (): EnrichedInstance => ({ ...structuredClone(storedInstance), java_path: '', extra_jvm_args: '' });
   const writes: Array<{ path: string; patch: Record<string, unknown> }> = [];
   const reads: string[] = [];
   const notices: string[] = [];
@@ -234,14 +235,14 @@ function harness() {
         if (path === '/java') return { runtimes: [] };
         if (path === '/install/queue') return currentQueue;
         if (path === '/versions') return { versions: [] };
-        if (path === '/instances') return { instances: [structuredClone(storedInstance)], last_instance_id: instance.id };
+        if (path === '/instances') return { instances: [publicInstance()], last_instance_id: instance.id };
         if (path === '/config/interface-preferences')
           return {
             revision: 0,
             value: { version: 1, preferences: preferences.defaultLocalPreferences(), route: null },
           };
         if (path === '/config') return structuredClone(storedConfig);
-        if (path === `/instances/${instance.id}`) return readInstance(structuredClone(storedInstance));
+        if (path === `/instances/${instance.id}`) return readInstance(publicInstance());
       }
       assert.equal(method, 'PUT');
       assert.ok(body);
@@ -259,7 +260,7 @@ function harness() {
         throw Object.assign(new Error('The instance changed. Refresh and try again.'), { name: 'ApiError', status: 409 });
       }
       storedInstance = { ...storedInstance, ...patch, revision: storedInstance.revision + 1 };
-      return respond(path, structuredClone(storedInstance));
+      return respond(path, publicInstance());
     },
     isApiError: (error: unknown) => error instanceof Error && 'status' in error,
   };
@@ -772,47 +773,73 @@ test('a refused older memory control restores the latest acknowledged heap, not 
   }
 });
 
-test('a refused queued launch profile restores the latest acknowledged mode', async () => {
-  const h = harness();
-  const first = deferred<unknown>();
-  const second = deferred<void>();
-  let firstResponse: unknown;
-  h.respond(async (_path, value) => {
-    firstResponse = value;
-    return first.promise;
-  });
-  h.admit(() => {
-    if (h.writes.length === 2) return second.promise;
-  });
-  try {
-    h.render('instance');
-    await tick();
-    h.render('instance');
-    const profile = h.control<{ onChange(value: string): void }>('ChoicePills');
-    profile.onChange('managed');
-    await tick();
-    assert.equal(h.writes.length, 1);
-    assert.equal(h.store.instances.value[0].performance_mode, undefined, 'first acknowledgement remains held');
-    profile.onChange('custom');
-    first.resolve(firstResponse);
-    await tick();
-    h.render('instance');
-    h.render('instance');
-    assert.equal(h.store.instances.value[0].performance_mode, 'managed');
-    second.reject(Object.assign(new Error('Fixture refusal'), { status: 409 }));
-    await tick();
-    h.render('instance');
-    assert.equal(h.writes.length, 2, 'the refused edit must not replay');
-    assert.equal(h.instance().performance_mode, 'managed');
-    assert.equal(h.store.instances.value[0].performance_mode, 'managed');
-    assert.equal(h.control<{ value: string }>('ChoicePills').value, 'managed');
-    assert.ok(h.notices.some((notice) => notice.includes('Could not save launch profile: Fixture refusal')));
-  } finally {
-    first.resolve(firstResponse);
-    second.resolve();
-    await tick();
-    h.dispose();
-    await tick();
+test('a refused queued launch preference restores the latest acknowledged value', async (context) => {
+  for (const { field, control, firstValue, secondValue, acknowledgedValue, label, debounce } of [
+    {
+      field: 'performance_mode',
+      control: 'ChoicePills',
+      firstValue: 'managed',
+      secondValue: 'custom',
+      acknowledgedValue: 'managed',
+      label: 'launch profile',
+      debounce: false,
+    },
+    {
+      field: 'extra_jvm_args',
+      control: 'JvmArgsInput',
+      firstValue: '-Daxial.first=true',
+      secondValue: '-Daxial.second=true',
+      acknowledgedValue: '',
+      label: 'JVM arguments',
+      debounce: true,
+    },
+  ] as const) {
+    await context.test(label, async () => {
+      const h = harness();
+      const first = deferred<unknown>();
+      const second = deferred<void>();
+      let firstResponse: unknown;
+      h.respond(async (_path, value) => {
+        firstResponse = value;
+        return first.promise;
+      });
+      h.admit(() => {
+        if (h.writes.length === 2) return second.promise;
+      });
+      try {
+        h.render('instance');
+        await tick();
+        h.render('instance');
+        const before = h.store.instances.value[0][field];
+        const preference = h.control<{ onChange(value: string): void }>(control);
+        preference.onChange(firstValue);
+        if (debounce) h.timersRun();
+        await tick();
+        assert.equal(h.writes.length, 1);
+        assert.equal(h.store.instances.value[0][field], before, 'first acknowledgement remains held');
+        preference.onChange(secondValue);
+        if (debounce) h.timersRun();
+        first.resolve(firstResponse);
+        await tick();
+        h.render('instance');
+        h.render('instance');
+        assert.equal(h.store.instances.value[0][field], acknowledgedValue);
+        second.reject(Object.assign(new Error('Fixture refusal'), { status: 409 }));
+        await tick();
+        h.render('instance');
+        assert.equal(h.writes.length, 2, 'the refused edit must not replay');
+        assert.equal(h.instance()[field], firstValue);
+        assert.equal(h.store.instances.value[0][field], acknowledgedValue);
+        assert.equal(h.control<{ value: string }>(control).value, acknowledgedValue);
+        assert.ok(h.notices.some((notice) => notice.includes(`Could not save ${label}: Fixture refusal`)));
+      } finally {
+        first.resolve(firstResponse);
+        second.resolve();
+        await tick();
+        h.dispose();
+        await tick();
+      }
+    });
   }
 });
 
