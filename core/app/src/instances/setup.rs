@@ -1038,10 +1038,12 @@ impl SetupService {
         instances: Vec<Instance>,
         budget: crate::install::artifacts::InventoryBudget,
     ) -> InstanceResult<Vec<EnrichedInstance>> {
-        let scan = self.installed_snapshot().await?;
-        let mut projection = self
-            .launch
-            .preflight_projection(Some(Arc::new(scan)), budget);
+        let scan = match self.installed_snapshot().await {
+            Ok(scan) => Some(Arc::new(scan)),
+            Err(InstanceError::VersionUnavailable) => None,
+            Err(failure) => return Err(failure),
+        };
+        let mut projection = self.launch.preflight_projection(scan, budget);
         projection.inspection = crate::install::artifacts::Inspection::Summary;
         let mut pending = instances.into_iter().enumerate().collect::<Vec<_>>();
         // Registry version strings only schedule adjacent work. Launch admission

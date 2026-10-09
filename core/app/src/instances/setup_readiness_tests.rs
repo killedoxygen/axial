@@ -5072,7 +5072,7 @@ async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
 }
 
 #[tokio::test]
-async fn grouped_readiness_scans_empty_and_busy_lists_and_preserves_scan_refusal() {
+async fn grouped_readiness_scans_empty_and_busy_lists_without_erasing_rows() {
     use std::sync::atomic::Ordering;
 
     let (_root, service, _) = fixture();
@@ -5102,7 +5102,7 @@ async fn grouped_readiness_scans_empty_and_busy_lists_and_preserves_scan_refusal
     let operation = pin.managed_library().unwrap();
     let publishing =
         axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
-    let refused = service.enrich_all(Vec::new()).await;
+    let unavailable = service.enrich_all(Vec::new()).await;
     drop((publishing, operation, blocker, pin));
     service
         .instances
@@ -5122,7 +5122,7 @@ async fn grouped_readiness_scans_empty_and_busy_lists_and_preserves_scan_refusal
     assert!(!rows[0].launchable);
     assert_eq!(rows[0].launch_action.primary_action, "blocked");
     assert!(rows[0].needs_install.is_empty());
-    assert!(matches!(refused, Err(InstanceError::VersionUnavailable)));
+    assert!(unavailable.unwrap().is_empty());
 }
 
 #[tokio::test]

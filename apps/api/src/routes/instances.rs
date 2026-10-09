@@ -80,7 +80,11 @@ async fn detail(
         .registry()
         .get_live(&identity(&id)?)
         .map_err(error)?;
-    let versions = services.setup.installed().await.map_err(error)?;
+    let versions = match services.setup.installed().await {
+        Ok(versions) => versions,
+        Err(InstanceError::VersionUnavailable) => Vec::new(),
+        Err(failure) => return Err(error(failure)),
+    };
     Ok(Json(json!(
         services.setup.enrich(record.instance, &versions).await
     )))

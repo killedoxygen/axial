@@ -3269,17 +3269,46 @@ async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn preflight_reports_publication_contention_without_waiting_or_launching() {
+#[test]
+fn preflight_reports_publication_contention_without_waiting_or_launching() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut retain_runtime = false;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(publication_preflight(&mut retain_runtime));
+    }));
+    if retain_runtime {
+        std::mem::forget(runtime);
+    } else {
+        drop(runtime);
+    }
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn publication_preflight(retain_runtime: &mut bool) {
     use futures_util::FutureExt;
 
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
-    let provider = Provider::start(false).await;
-    let services = start_profile_with_test_endpoints(profile, provider.endpoints())
-        .await
-        .unwrap();
+    let mut provider = Provider::start(false).await;
+    let services = match start_profile_with_test_endpoints(profile, provider.endpoints()).await {
+        Ok(services) => services,
+        Err(failure) => {
+            *retain_runtime = true;
+            let parent = temporary.keep();
+            std::mem::forget((provider, failure));
+            panic!(
+                "Publication fixture startup refused; retained {}",
+                parent.display()
+            );
+        }
+    };
     let api = Api::new(&services);
     let journey = std::panic::AssertUnwindSafe(async {
         api.post(
@@ -3313,7 +3342,28 @@ async fn preflight_reports_publication_contention_without_waiting_or_launching()
             "/api/v1/launch/preflight/{}",
             created["id"].as_str().unwrap()
         );
+        let second = api
+            .post(
+                "/api/v1/instances",
+                json!({"name":"Publication sibling","selection_id":format!("vanilla|{VERSION}")}),
+            )
+            .await;
+        let instance = created["id"].as_str().unwrap().to_owned();
+        let sibling = second["id"].as_str().unwrap().to_owned();
+        let detail_path = format!("/api/v1/instances/{instance}");
+        let read_projection = |path: &str| {
+            let request = api
+                .client
+                .get(format!("{}{path}", api.base))
+                .header(transport::CAPABILITY_HEADER, &api.capability);
+            async move {
+                let response = request.send().await.unwrap();
+                (response.status(), response.json::<Value>().await.unwrap())
+            }
+        };
         assert_eq!(api.get(&preflight).await["launchable"], true);
+        let ready_detail = read_projection(&detail_path).await;
+        let ready_list = read_projection("/api/v1/instances").await;
         let pin = services.library.admit().unwrap();
         let operation = pin.managed_library().unwrap();
         let root = pin.read_projection().unwrap();
@@ -3331,9 +3381,13 @@ async fn preflight_reports_publication_contention_without_waiting_or_launching()
             axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
         let started = std::time::Instant::now();
         let busy = api.get(&preflight).await;
+        let busy_detail = read_projection(&detail_path).await;
+        let busy_list = read_projection("/api/v1/instances").await;
         let elapsed = started.elapsed();
         drop(publication);
         let recovered = api.get(&preflight).await;
+        let recovered_detail = read_projection(&detail_path).await;
+        let recovered_list = read_projection("/api/v1/instances").await;
         let target_busy_guard = services
             .instances
             .directories()
@@ -3348,10 +3402,14 @@ async fn preflight_reports_publication_contention_without_waiting_or_launching()
         let conflict = b"non-directory publication lane";
         std::fs::write(&lane, conflict).unwrap();
         let unsafe_lane = api.get(&preflight).await;
+        let unsafe_detail = read_projection(&detail_path).await;
+        let unsafe_list = read_projection("/api/v1/instances").await;
         let conflict_after = std::fs::read(&lane).unwrap();
         std::fs::remove_file(&lane).unwrap();
         std::fs::rename(&retained_lane, &lane).unwrap();
         let restored = api.get(&preflight).await;
+        let restored_detail = read_projection(&detail_path).await;
+        let restored_list = read_projection("/api/v1/instances").await;
         let requests_after = provider.state.requests.lock().unwrap().clone();
         let queue_after = api.get("/api/v1/install/queue").await;
         let sessions = api.get("/api/v1/launch/sessions").await;
@@ -3369,6 +3427,36 @@ async fn preflight_reports_publication_contention_without_waiting_or_launching()
                 assert_eq!(after, before);
             }
             assert_eq!(conflict_after, conflict);
+            for ((detail_status, detail), (list_status, list), launchable, action) in [
+                (ready_detail, ready_list, true, "launch"),
+                (busy_detail, busy_list, false, "blocked"),
+                (recovered_detail, recovered_list, true, "launch"),
+                (unsafe_detail, unsafe_list, false, "blocked"),
+                (restored_detail, restored_list, true, "launch"),
+            ] {
+                assert_eq!(
+                    detail_status,
+                    StatusCode::OK,
+                    "detail: {detail}; list: {list}"
+                );
+                assert_eq!(list_status, StatusCode::OK, "{list}");
+                let rows = list["instances"].as_array().unwrap();
+                assert_eq!(rows.len(), 2, "{list}");
+                assert_eq!(detail["id"], instance);
+                let ids: BTreeSet<_> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+                assert_eq!(ids, BTreeSet::from([instance.as_str(), sibling.as_str()]));
+                for observed in std::iter::once(&detail).chain(rows) {
+                    assert_eq!(
+                        observed["launch_action"]["launchable"], launchable,
+                        "{observed}"
+                    );
+                    assert_eq!(
+                        observed["launch_action"]["primary_action"], action,
+                        "{observed}"
+                    );
+                    assert_eq!(observed["needs_install"], "", "{observed}");
+                }
+            }
             for ready in [recovered, restored] {
                 assert_eq!(ready["launchable"], true, "{ready}");
                 assert_eq!(ready["readiness"], json!({"launchable":true,"reasons":[]}));
@@ -3413,30 +3501,75 @@ async fn preflight_reports_publication_contention_without_waiting_or_launching()
         .catch_unwind()
         .await;
     let settled = services.server.is_shutdown_settled();
+    if !settled {
+        *retain_runtime = true;
+        let parent = temporary.keep();
+        std::mem::forget((services, provider));
+        let _ = std::panic::catch_unwind(|| {
+            eprintln!(
+                "Retained unsettled publication fixture: {}",
+                parent.display()
+            );
+        });
+        if let Err(panic) = journey {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = shutdown {
+            std::panic::resume_unwind(panic);
+        }
+        panic!("Publication fixture shutdown did not settle");
+    }
     drop(services);
-    let provider_join = std::panic::AssertUnwindSafe(provider.shutdown())
-        .catch_unwind()
-        .await;
+    let provider_join = std::panic::AssertUnwindSafe(async {
+        let stop = provider.stop.take().map(|stop| stop.send(()));
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut provider.task).await;
+        (stop, joined)
+    })
+    .catch_unwind()
+    .await;
+    if !provider_join
+        .as_ref()
+        .is_ok_and(|(_, joined)| joined.is_ok())
+    {
+        *retain_runtime = true;
+        let parent = temporary.keep();
+        std::mem::forget(provider);
+        let _ = std::panic::catch_unwind(|| {
+            eprintln!(
+                "Retained unjoined publication provider: {}",
+                parent.display()
+            );
+        });
+        if let Err(panic) = journey {
+            std::panic::resume_unwind(panic);
+        }
+        if let Err(panic) = provider_join {
+            std::panic::resume_unwind(panic);
+        }
+        panic!("Publication fixture provider did not join");
+    }
+    drop(provider);
     let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let verify = journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         let shutdown = match shutdown {
             Ok(result) => result,
             Err(panic) => std::panic::resume_unwind(panic),
         };
         assert!(shutdown.is_ok(), "{shutdown:?}");
         assert!(settled);
-        if let Err(panic) = provider_join {
-            std::panic::resume_unwind(panic);
-        }
-        match journey {
-            Ok(verify) => verify(),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+        let (stop, joined) = provider_join.unwrap();
+        assert!(stop.is_some_and(|result| result.is_ok()));
+        joined.unwrap().unwrap();
+        verify();
     }));
     if let Err(panic) = verification {
-        eprintln!(
-            "Retained publication preflight fixture: {}",
-            temporary.keep().display()
-        );
+        let parent = temporary.keep();
+        let _ = std::panic::catch_unwind(|| {
+            eprintln!(
+                "Retained publication preflight fixture: {}",
+                parent.display()
+            );
+        });
         std::panic::resume_unwind(panic);
     }
 }
