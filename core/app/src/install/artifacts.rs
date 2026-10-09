@@ -27,6 +27,29 @@ use std::{
 
 const MAX_INVENTORY_ENTRIES: usize = 1_000_000;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Inspection {
+    Summary,
+    Integrity,
+}
+
+impl Inspection {
+    fn observes(self, path: &str) -> bool {
+        self == Self::Integrity
+            || !path.starts_with("assets/")
+            || is_asset_index(path)
+            || path
+                .strip_prefix("assets/log_configs/")
+                .is_some_and(|id| PortableFileName::new_exact(id).is_ok())
+    }
+}
+
+fn is_asset_index(path: &str) -> bool {
+    path.strip_prefix("assets/indexes/")
+        .and_then(|path| path.strip_suffix(".json"))
+        .is_some_and(|id| PortableFileName::new_exact(id).is_ok())
+}
+
 /// One grouped projection's cumulative dependency checks and declared read bytes.
 pub(crate) struct InventoryBudget {
     remaining_checks: u64,
@@ -55,10 +78,17 @@ impl InventoryBudget {
     pub(crate) fn reserve_inventory(
         &mut self,
         inventory: &ActivatedVersion,
+        inspection: Inspection,
     ) -> Result<(), super::queue::InstallError> {
         use super::queue::InstallError;
         let checks = (inventory.files.len() as u64)
-            .checked_mul(2)
+            .checked_add(
+                inventory
+                    .files
+                    .iter()
+                    .filter(|file| inspection.observes(&file.path))
+                    .count() as u64,
+            )
             .ok_or(InstallError::AtCapacity)?;
         if checks > self.remaining_checks {
             return Err(InstallError::AtCapacity);
@@ -66,16 +96,15 @@ impl InventoryBudget {
         let metadata = format!("versions/{0}/{0}.json", inventory.version_id);
         let mut bytes = 0_u64;
         for file in &inventory.files {
-            bytes = bytes
-                .checked_add(file.size)
-                .and_then(|bytes| bytes.checked_add(2))
-                .ok_or(InstallError::AtCapacity)?;
-            let asset_index = file
-                .path
-                .strip_prefix("assets/indexes/")
-                .and_then(|path| path.strip_suffix(".json"))
-                .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
-            if file.path == metadata || asset_index {
+            if inspection == Inspection::Integrity || file.path == metadata {
+                bytes = bytes
+                    .checked_add(file.size)
+                    .and_then(|bytes| bytes.checked_add(2))
+                    .ok_or(InstallError::AtCapacity)?;
+            }
+            if file.path == metadata
+                || (inspection == Inspection::Integrity && is_asset_index(&file.path))
+            {
                 // Bounded JSON reads also perform EOF and completion probes.
                 bytes = bytes
                     .checked_add(file.size)
@@ -103,8 +132,8 @@ impl InventoryBudget {
 }
 
 /// Private durable projection, produced exclusively by verified activation. A
-/// serialized record is never itself filesystem authority: every use observes
-/// and verifies its exact files through the current retained generation.
+/// serialized record is never itself filesystem authority. Summary observations
+/// are distinct from the complete verified receipts required for launch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ActivatedVersion {
@@ -204,12 +233,14 @@ impl ActivatedVersion {
         self,
         pin: GenerationPin,
     ) -> Result<InstalledVersionReceipt, super::queue::InstallError> {
-        self.inspect(pin, false)?.into_ready()
+        self.inspect(pin, Inspection::Integrity, false)?
+            .into_ready()
     }
 
     pub(crate) fn inspect(
         mut self,
         pin: GenerationPin,
+        inspection: Inspection,
         diagnostics: bool,
     ) -> Result<VersionInspection, super::queue::InstallError> {
         use super::queue::InstallError;
@@ -228,7 +259,12 @@ impl ActivatedVersion {
         let client = format!("versions/{0}/{0}.jar", self.version_id);
         let client_path =
             PortableRelativePath::new_exact(&client).map_err(|_| InstallError::NotReady)?;
-        let mut guards = Vec::with_capacity(self.files.len());
+        let mut guards = Vec::with_capacity(
+            self.files
+                .iter()
+                .filter(|file| inspection.observes(&file.path))
+                .count(),
+        );
         let mut missing = Vec::new();
         let mut reasons = Vec::new();
         let mut version = None;
@@ -257,16 +293,15 @@ impl ActivatedVersion {
             {
                 return Err(InstallError::NotReady);
             }
-            let is_asset_index = expected
-                .path
-                .strip_prefix("assets/indexes/")
-                .and_then(|path| path.strip_suffix(".json"))
-                .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
+            let is_asset_index = is_asset_index(&expected.path);
             let is_required_library = root == Some("libraries")
                 || expected
                     .path
                     .strip_prefix("assets/log_configs/")
                     .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
+            if !inspection.observes(&expected.path) {
+                continue;
+            }
             let file = match batch
                 .observe_file_with_absence(&path)
                 .map_err(|_| InstallError::NotReady)?
@@ -295,10 +330,11 @@ impl ActivatedVersion {
                 }
             };
             if file.size() != expected.size
-                || file
-                    .sha1_bounded(expected.size)
-                    .map_err(|_| InstallError::NotReady)?
-                    != expected_digest
+                || ((inspection == Inspection::Integrity || expected.path == metadata_path)
+                    && file
+                        .sha1_bounded(expected.size)
+                        .map_err(|_| InstallError::NotReady)?
+                        != expected_digest)
             {
                 let reason = if path == client_path {
                     InstallError::ClientJarCorrupt
@@ -327,7 +363,7 @@ impl ActivatedVersion {
                         .map_err(|_| InstallError::NotReady)?,
                 );
             }
-            if is_asset_index {
+            if is_asset_index && inspection == Inspection::Integrity {
                 #[derive(Deserialize)]
                 struct AssetFlags {
                     #[serde(default, rename = "virtual")]
@@ -375,7 +411,11 @@ impl ActivatedVersion {
                 if !exact.contains_key(&index) {
                     return Err(InstallError::NotReady);
                 }
-                asset_flags.get(&index).copied()
+                if inspection == Inspection::Summary {
+                    Some(false)
+                } else {
+                    asset_flags.get(&index).copied()
+                }
             }
         } else {
             None
@@ -395,6 +435,13 @@ impl ActivatedVersion {
             }));
         }
         let version = version.ok_or(InstallError::NotReady)?;
+        if inspection == Inspection::Summary {
+            evidence.revalidate()?;
+            return Ok(VersionInspection::Summary(VersionSummary {
+                evidence: Arc::new(evidence),
+                version,
+            }));
+        }
         let virtual_assets = virtual_assets.ok_or(InstallError::NotReady)?;
         let client_jar = client_path.join_under(
             &evidence
@@ -416,6 +463,7 @@ impl ActivatedVersion {
 
 pub(crate) enum VersionInspection {
     Ready(InstalledVersionReceipt),
+    Summary(VersionSummary),
     Damaged(ObservedDamage),
 }
 
@@ -423,6 +471,7 @@ impl VersionInspection {
     pub(crate) fn into_ready(self) -> Result<InstalledVersionReceipt, super::queue::InstallError> {
         match self {
             Self::Ready(receipt) => Ok(receipt),
+            Self::Summary(_) => Err(super::queue::InstallError::NotReady),
             Self::Damaged(damage) => Err(damage
                 .reasons
                 .first()
@@ -432,6 +481,11 @@ impl VersionInspection {
     }
 }
 
+pub(crate) struct VersionSummary {
+    pub(crate) version: VersionJson,
+    pub(crate) evidence: Arc<InventoryEvidence>,
+}
+
 pub(crate) struct ObservedDamage {
     evidence: InventoryEvidence,
     // Distinct supported reasons, not an enumeration of every damaged file.
@@ -439,6 +493,12 @@ pub(crate) struct ObservedDamage {
 }
 
 impl ObservedDamage {
+    pub(crate) fn retain_inventory(
+        self,
+    ) -> Result<Arc<InventoryEvidence>, super::queue::InstallError> {
+        InventoryEvidence::retain(&mut Arc::new(self.evidence))
+    }
+
     pub(crate) fn reasons(&self) -> &[super::queue::InstallError] {
         &self.reasons
     }
@@ -461,6 +521,47 @@ pub(crate) struct InventoryEvidence {
 }
 
 impl InventoryEvidence {
+    pub(crate) fn retain(
+        evidence: &mut Arc<Self>,
+    ) -> Result<Arc<Self>, super::queue::InstallError> {
+        use super::queue::InstallError;
+        if evidence.scratch.is_some() {
+            return Ok(evidence.clone());
+        }
+        let retained = Arc::get_mut(evidence).ok_or(InstallError::NotReady)?;
+        // Shared holders only, not transient decoding or shared native authority.
+        let missing_bytes = retained.missing.iter().try_fold(0_u64, |bytes, absence| {
+            bytes
+                .checked_add(
+                    absence
+                        .retained_storage_bytes()
+                        .map_err(|_| InstallError::AtCapacity)?,
+                )
+                .ok_or(InstallError::AtCapacity)
+        })?;
+        let missing_spare = ((retained.missing.capacity() - retained.missing.len()) as u64)
+            .checked_mul(std::mem::size_of::<FileAbsence>() as u64)
+            .ok_or(InstallError::AtCapacity)?;
+        let path_bytes = (retained.guards.len() as u64)
+            .checked_mul(axial_minecraft::portable_path::MAX_PORTABLE_RELATIVE_PATH_BYTES as u64)
+            .ok_or(InstallError::AtCapacity)?;
+        let bytes = (retained.guards.capacity() as u64)
+            .checked_mul(std::mem::size_of::<(
+                PortableRelativePath,
+                axial_fs::FileRevisionObservation,
+            )>() as u64)
+            .and_then(|bytes| bytes.checked_add(path_bytes))
+            .and_then(|bytes| bytes.checked_add(missing_bytes))
+            .and_then(|bytes| bytes.checked_add(missing_spare))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<InventoryEvidence>() as u64))
+            .and_then(|bytes| bytes.checked_add(1024))
+            .ok_or(InstallError::AtCapacity)?;
+        retained.scratch = axial_resource::process_physical_work()
+            .try_reserve_scratch(bytes)
+            .map_err(|_| InstallError::AtCapacity)?;
+        Ok(evidence.clone())
+    }
+
     pub(crate) fn entry_count(&self) -> u64 {
         self.guards.len() as u64 + self.missing.len() as u64
     }
@@ -513,29 +614,10 @@ impl InstalledVersionReceipt {
     pub(crate) fn retain_inventory(
         &mut self,
     ) -> Result<Arc<InventoryEvidence>, super::queue::InstallError> {
-        use super::queue::InstallError;
         if !self.evidence.missing.is_empty() {
-            return Err(InstallError::NotReady);
+            return Err(super::queue::InstallError::NotReady);
         }
-        if self.evidence.scratch.is_some() {
-            return Ok(self.evidence.clone());
-        }
-        let evidence = Arc::get_mut(&mut self.evidence).ok_or(InstallError::NotReady)?;
-        // Account for shared retained evidence and its compact holder, not
-        // initial construction or transient decoding heap.
-        let per_entry =
-            std::mem::size_of::<(PortableRelativePath, axial_fs::FileRevisionObservation)>() as u64
-                + axial_minecraft::portable_path::MAX_PORTABLE_RELATIVE_PATH_BYTES as u64;
-        let bytes = evidence
-            .entry_count()
-            .checked_mul(per_entry)
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<InventoryEvidence>() as u64))
-            .and_then(|bytes| bytes.checked_add(1024))
-            .ok_or(InstallError::AtCapacity)?;
-        evidence.scratch = axial_resource::process_physical_work()
-            .try_reserve_scratch(bytes)
-            .map_err(|_| InstallError::AtCapacity)?;
-        Ok(self.evidence.clone())
+        InventoryEvidence::retain(&mut self.evidence)
     }
 
     pub fn version(&self) -> &VersionJson {
@@ -932,7 +1014,9 @@ pub(crate) mod tests {
         let mut budget = InventoryBudget::projection();
         // Four payloads total 73 bytes; checksum probes add 8, metadata reread 34.
         budget.reserve_record((16_u64 << 30) - 115).unwrap();
-        budget.reserve_inventory(&activated).unwrap();
+        budget
+            .reserve_inventory(&activated, Inspection::Integrity)
+            .unwrap();
         let receipt = activated.verify(library.admit().unwrap()).unwrap();
         receipt.revalidate().unwrap();
         drop(receipt);
@@ -1265,6 +1349,158 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn summary_observes_metadata_but_never_confers_integrity() {
+        let (temporary, library, mut activated) = fixture();
+        for (path, bytes) in [
+            ("libraries/fixture.jar", &b"library"[..]),
+            ("assets/indexes/fixture.json", &br#"{"objects":{}}"#[..]),
+        ] {
+            let target = temporary.path().join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, bytes).unwrap();
+            activated.files.push(ActivatedFile {
+                path: path.into(),
+                sha1: hex::encode(Sha1::digest(bytes)),
+                size: bytes.len() as u64,
+            });
+        }
+        let pin = library.admit().unwrap();
+        activated.clone().verify(pin.clone()).unwrap();
+        assert!(
+            activated
+                .clone()
+                .inspect(pin.clone(), Inspection::Summary, true)
+                .unwrap()
+                .into_ready()
+                .is_err()
+        );
+        for (path, missing, ready) in [
+            ("versions/1.21.4/1.21.4.jar", false, true),
+            ("libraries/fixture.jar", false, true),
+            ("assets/indexes/fixture.json", false, true),
+            ("assets/objects/aa/first", true, true),
+            ("libraries/fixture.jar", true, false),
+            ("assets/indexes/fixture.json", true, false),
+        ] {
+            let target = temporary.path().join(path);
+            let original = std::fs::read(&target).unwrap();
+            if missing {
+                std::fs::remove_file(&target).unwrap();
+            } else {
+                std::fs::write(&target, vec![b'x'; original.len()]).unwrap();
+            }
+            let observed = activated
+                .clone()
+                .inspect(pin.clone(), Inspection::Summary, true)
+                .unwrap();
+            let strict_refused = activated.clone().verify(pin.clone()).is_err();
+            let summary_ready = match &observed {
+                VersionInspection::Summary(summary) => {
+                    summary.evidence.revalidate().unwrap();
+                    true
+                }
+                VersionInspection::Damaged(damage) => {
+                    damage.revalidate().unwrap();
+                    false
+                }
+                VersionInspection::Ready(_) => panic!("summary produced launch authority"),
+            };
+            std::fs::write(&target, original).unwrap();
+            activated.clone().verify(pin.clone()).unwrap();
+            assert_eq!(summary_ready, ready, "{path}, missing={missing}");
+            assert!(strict_refused, "{path}, missing={missing}");
+        }
+    }
+
+    #[test]
+    fn summary_validates_skipped_records_and_reserves_only_observed_reads() {
+        let (_temporary, library, activated) = fixture();
+        let pin = library.admit().unwrap();
+        let mut budget = InventoryBudget::projection();
+        // Four record entries, two observations, and two 32-byte metadata reads plus probes.
+        budget.reserve_checks(1_000_000 - 6).unwrap();
+        budget.reserve_record((16_u64 << 30) - 68).unwrap();
+        budget
+            .reserve_inventory(&activated, Inspection::Summary)
+            .unwrap();
+        assert!(budget.reserve_checks(1).is_err());
+        assert!(budget.reserve_record(1).is_err());
+        for malformed in ["digest", "duplicate", "path"] {
+            let mut changed = activated.clone();
+            let asset = changed
+                .files
+                .iter_mut()
+                .find(|file| file.path.ends_with("/second"))
+                .unwrap();
+            match malformed {
+                "digest" => asset.sha1 = "X".repeat(40),
+                "path" => asset.path = "assets/objects/../second".into(),
+                _ => {
+                    let duplicate = asset.clone();
+                    changed.files.push(duplicate);
+                }
+            }
+            assert!(
+                changed
+                    .inspect(pin.clone(), Inspection::Summary, true)
+                    .is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn negative_inventory_retention_charges_unused_capacity() {
+        if !preparation_child(
+            "install::artifacts::tests::negative_inventory_retention_charges_unused_capacity",
+        )
+        .await
+        {
+            return;
+        }
+        let (temporary, library, mut activated) = fixture();
+        for index in 0..64 {
+            activated.files.push(ActivatedFile {
+                path: format!("libraries/missing-{index}.jar"),
+                sha1: "a".repeat(40),
+                size: 1,
+            });
+        }
+        let VersionInspection::Damaged(damage) = activated
+            .inspect(library.admit().unwrap(), Inspection::Summary, true)
+            .unwrap()
+        else {
+            panic!("missing libraries must retain their observation");
+        };
+        let work = axial_resource::process_physical_work();
+        let class = axial_resource::PhysicalWorkClass::Foreground;
+        let before = work.snapshot(class).available_scratch_bytes;
+        let evidence = damage.retain_inventory().unwrap();
+        let charge = before - work.snapshot(class).available_scratch_bytes;
+        let observed = evidence.revalidate();
+        let minimum = 66
+            * std::mem::size_of::<(PortableRelativePath, axial_fs::FileRevisionObservation)>()
+                as u64
+            + 2 * axial_minecraft::portable_path::MAX_PORTABLE_RELATIVE_PATH_BYTES as u64
+            + std::mem::size_of::<InventoryEvidence>() as u64
+            + 1024;
+        drop(evidence);
+        let restored = work.snapshot(class).available_scratch_bytes == before;
+        let settled = library.try_preserve();
+        if settled.is_err() {
+            std::mem::forget(library);
+            eprintln!(
+                "negative retention retained: {}",
+                temporary.keep().display()
+            );
+        }
+        settled.unwrap();
+        observed.unwrap();
+        assert!(charge >= minimum, "charge={charge}, minimum={minimum}");
+        assert!(restored);
+    }
+
+    #[test]
     fn missing_client_observation_refuses_restored_file() {
         let (temporary, library, activated) = fixture();
         let pin = library.admit().unwrap();
@@ -1272,8 +1508,10 @@ pub(crate) mod tests {
         let client = temporary.path().join("versions/1.21.4/1.21.4.jar");
         let original = std::fs::read(&client).unwrap();
         std::fs::remove_file(&client).unwrap();
-        let VersionInspection::Damaged(damage) =
-            activated.clone().inspect(pin.clone(), true).unwrap()
+        let VersionInspection::Damaged(damage) = activated
+            .clone()
+            .inspect(pin.clone(), Inspection::Integrity, true)
+            .unwrap()
         else {
             panic!("missing client must retain observed damage");
         };
@@ -1282,7 +1520,9 @@ pub(crate) mod tests {
 
         std::fs::write(&client, &original).unwrap();
         assert!(matches!(damage.revalidate(), Err(InstallError::NotReady)));
-        let VersionInspection::Ready(receipt) = activated.inspect(pin, true).unwrap() else {
+        let VersionInspection::Ready(receipt) =
+            activated.inspect(pin, Inspection::Integrity, true).unwrap()
+        else {
             panic!("fresh inspection must admit the restored client");
         };
         receipt.revalidate().unwrap();
@@ -1298,8 +1538,10 @@ pub(crate) mod tests {
         let corrupt = b"corrupt client";
         assert_eq!(std::fs::read(&client).unwrap().len(), corrupt.len());
         std::fs::write(&client, corrupt).unwrap();
-        let VersionInspection::Damaged(damage) =
-            activated.clone().inspect(pin.clone(), true).unwrap()
+        let VersionInspection::Damaged(damage) = activated
+            .clone()
+            .inspect(pin.clone(), Inspection::Integrity, true)
+            .unwrap()
         else {
             panic!("corrupt client must retain observed damage");
         };
@@ -1310,7 +1552,9 @@ pub(crate) mod tests {
         std::fs::rename(&client, &previous).unwrap();
         std::fs::write(&client, corrupt).unwrap();
         assert!(matches!(damage.revalidate(), Err(InstallError::NotReady)));
-        let VersionInspection::Damaged(fresh) = activated.inspect(pin, true).unwrap() else {
+        let VersionInspection::Damaged(fresh) =
+            activated.inspect(pin, Inspection::Integrity, true).unwrap()
+        else {
             panic!("replacement client must remain corrupt");
         };
         assert_eq!(fresh.reasons(), &[InstallError::ClientJarCorrupt]);
@@ -1331,11 +1575,13 @@ pub(crate) mod tests {
             size: 0,
         });
         assert!(matches!(
-            activated.clone().inspect(pin.clone(), false),
+            activated
+                .clone()
+                .inspect(pin.clone(), Inspection::Integrity, false),
             Err(InstallError::ClientJarMissing)
         ));
         assert!(matches!(
-            activated.inspect(pin, true),
+            activated.inspect(pin, Inspection::Integrity, true),
             Err(InstallError::NotReady)
         ));
     }

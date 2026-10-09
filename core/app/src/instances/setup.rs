@@ -1041,6 +1041,7 @@ impl SetupService {
         let mut projection = self
             .launch
             .preflight_projection(Some(Arc::new(scan)), budget);
+        projection.inspection = crate::install::artifacts::Inspection::Summary;
         let mut pending = instances.into_iter().enumerate().collect::<Vec<_>>();
         // Registry version strings only schedule adjacent work. Launch admission
         // checks the actual generation, library and version before sharing proof.

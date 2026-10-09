@@ -3337,6 +3337,101 @@ async fn scanner_ready_artifact_drift_offers_install_without_masking_transient_b
     assert!(drifted.install_target.is_some());
 }
 
+#[cfg(unix)]
+#[test]
+fn list_summary_leaves_content_integrity_to_strict_preflight() {
+    use futures_util::FutureExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (root, service, accounts) = runtime.block_on(async { fixture() });
+    let outcome = runtime.block_on(std::panic::AssertUnwindSafe(async {
+    crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+    accounts.create_offline_account("SummaryPlayer").unwrap();
+    let java = root.path().join("java");
+    std::fs::write(&java, format!(
+        "#!/bin/sh\nprintf 'java.version = 21.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
+        std::env::consts::ARCH,
+    )).unwrap();
+    std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+    service
+        .settings
+        .update(
+            serde_json::from_value(serde_json::json!({
+                "expected_revision": service.settings.current().unwrap().revision,
+                "java_path_override": java.to_str().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let instance = super::super::create::tests::create(&service.instances, "Summary").await;
+    let healthy = service.list().await;
+    let strict_healthy = service.launch.preflight(instance.id.clone()).await;
+    let client = root.path().join("versions/1.21.4/1.21.4.jar");
+    let mut observations = Vec::new();
+    for (case, change) in [
+        ("same-size client", 0),
+        ("missing client", 1),
+        ("client size drift", 2),
+    ] {
+        let original = std::fs::read(&client).unwrap();
+        match change {
+            0 => std::fs::write(&client, vec![b'x'; original.len()]).unwrap(),
+            1 => std::fs::remove_file(&client).unwrap(),
+            _ => std::fs::write(&client, b"different size").unwrap(),
+        }
+        let rows = service.list().await;
+        let strict = service.launch.preflight(instance.id.clone()).await;
+        std::fs::write(&client, original).unwrap();
+        observations.push((case, rows, strict, change == 0));
+    }
+    let strict_restored = service.launch.preflight(instance.id.clone()).await;
+    let healthy = healthy.unwrap();
+    assert_eq!(healthy.instances.len(), 1);
+    assert!(healthy.instances[0].launchable);
+    assert!(strict_healthy.launchable, "{strict_healthy:?}");
+    assert!(strict_restored.launchable, "{strict_restored:?}");
+    for (case, rows, strict, summary_ready) in observations {
+        let rows = rows.unwrap();
+        assert_eq!(rows.instances.len(), 1, "{case}");
+        let row = &rows.instances[0];
+        assert_eq!(row.instance.id, instance.id, "{case}");
+        assert_eq!(row.launchable, summary_ready, "{case}: {row:?}");
+        assert_eq!(
+            row.launch_action.primary_action,
+            if summary_ready { "launch" } else { "install" },
+            "{case}"
+        );
+        assert!(!strict.launchable, "{case}: {strict:?}");
+        assert_eq!(
+            strict.error.unwrap().code,
+            LaunchError::InstallUnavailable,
+            "{case}"
+        );
+    }
+    }).catch_unwind());
+    let stopped = runtime.block_on(
+        service
+            .instances
+            .tasks
+            .shutdown(std::time::Duration::from_secs(5)),
+    );
+    if outcome.is_err() || stopped.is_err() {
+        let retained = root.keep();
+        if stopped.is_err() {
+            std::mem::forget((service, accounts, runtime));
+        }
+        eprintln!("summary fixture retained: {}", retained.display());
+    }
+    stopped.unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn unready_catalogs(versions: &[VersionEntry]) -> [Vec<VersionEntry>; 3] {
     let mut not_installed = versions.to_vec();
     for version in &mut not_installed {

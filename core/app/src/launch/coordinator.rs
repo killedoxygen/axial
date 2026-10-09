@@ -44,8 +44,8 @@ use crate::{
         session::AuthService,
     },
     install::{
-        artifacts::{InventoryBudget, InventoryEvidence, VersionInspection},
-        queue::{InstallError, InstallQueue, InstalledVersionReceipt},
+        artifacts::{Inspection, InventoryBudget, InventoryEvidence, VersionInspection},
+        queue::{InstallError, InstallQueue},
     },
     instances::{
         directory::{InstanceDirectories, ReadInstance, RegisteredInstance},
@@ -83,13 +83,14 @@ pub struct LaunchCoordinator {
 
 pub(crate) struct PreflightProjection {
     current: Option<Arc<PreflightArtifacts>>,
-    inventories: Vec<Arc<PreflightInventory>>,
+    inventories: Option<Arc<Mutex<Vec<Arc<PreflightInventory>>>>>,
     budget: Arc<Mutex<InventoryBudget>>,
     scan: Option<Result<Arc<crate::catalog::InstalledSnapshot>, LaunchError>>,
     finalize_scan: bool,
     context: Result<(CapturedSelection, u64), LaunchError>,
     host: Arc<super::resources::HostResources>,
     diagnostics: bool,
+    pub(crate) inspection: Inspection,
     installs: InstallQueue,
 }
 
@@ -106,7 +107,7 @@ impl PreflightProjection {
 impl Drop for PreflightProjection {
     fn drop(&mut self) {
         drop(self.current.take());
-        self.inventories.clear();
+        drop(self.inventories.take());
         drop(self.scan.take());
         // Admission refusal can release proof without a task-completion wake.
         self.installs.resume_queued();
@@ -115,7 +116,7 @@ impl Drop for PreflightProjection {
 
 struct PreflightArtifacts {
     inventory: Arc<PreflightInventory>,
-    installed: InstalledVersionReceipt,
+    version: axial_minecraft::VersionJson,
 }
 
 struct PreflightInventory {
@@ -582,7 +583,7 @@ impl LaunchCoordinator {
     ) -> PreflightProjection {
         PreflightProjection {
             current: None,
-            inventories: Vec::new(),
+            inventories: Some(Arc::new(Mutex::new(Vec::new()))),
             budget: Arc::new(Mutex::new(budget)),
             scan: scan.map(Ok),
             finalize_scan: false,
@@ -598,6 +599,7 @@ impl LaunchCoordinator {
             })(),
             host: Arc::new(super::resources::capture_host()),
             diagnostics: false,
+            inspection: Inspection::Integrity,
             installs: self.installs.clone(),
         }
     }
@@ -620,7 +622,13 @@ impl LaunchCoordinator {
             return Ok(());
         };
         let scan = scan?;
-        let inventories = projection.inventories.clone();
+        let inventories = projection
+            .inventories
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clone();
         let checks = inventories
             .iter()
             .try_fold(scan.entry_count(), |sum, inventory| {
@@ -646,7 +654,9 @@ impl LaunchCoordinator {
                     .map_err(|_| LaunchError::AtCapacity)?
                     .run(move |_| {
                         for inventory in inventories {
-                            inventory.revalidate()?;
+                            inventory
+                                .revalidate()
+                                .map_err(|_| LaunchError::LibraryUnavailable)?;
                         }
                         Ok::<_, LaunchError>(())
                     })
@@ -780,7 +790,7 @@ impl LaunchCoordinator {
         if projection.current.as_ref().is_some_and(|proof| {
             proof.inventory.pin.generation() != pin.generation()
                 || proof.inventory.pin.library_id() != pin.library_id()
-                || proof.installed.version().id != admitted.record().instance.version_id
+                || proof.version.id != admitted.record().instance.version_id
         }) {
             projection.current = None;
         }
@@ -797,13 +807,21 @@ impl LaunchCoordinator {
                 )],
             )
             .map_err(|_| LaunchError::InstanceBusy)?;
-        let retained = (admitted.clone(), artifacts.clone(), proof_slot.clone());
+        let inventories = projection.inventories.as_ref().unwrap().clone();
+        let damage_lease = artifacts.clone();
+        let retained = (
+            admitted.clone(),
+            artifacts.clone(),
+            proof_slot.clone(),
+            inventories.clone(),
+        );
         let owned_proof = proof_slot.clone();
         let scan_slot = Arc::new(Mutex::new(projection.scan.clone()));
         let owned_scan = scan_slot.clone();
         let coordinator = self.clone();
         let host = projection.host.clone();
         let diagnostics = projection.diagnostics;
+        let inspection = projection.inspection;
         let finalize_scan = projection.finalize_scan;
         let budget = projection.budget.clone();
         let task = self
@@ -877,14 +895,24 @@ impl LaunchCoordinator {
                         coordinator
                             .fresh_install_checks
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let collect_damage = diagnostics || scan.is_degraded();
-                        let installed = match coordinator
+                        let collect_damage = diagnostics || scan.is_degraded() || inspection == Inspection::Summary;
+                        let (version, evidence) = match coordinator
                             .installs
                             .inspect_version(&pin, &admitted.record().instance.version_id,
-                                collect_damage, Some(budget.clone()))
+                                inspection, collect_damage, Some(budget.clone()))
                             .await
                         {
-                            Ok(VersionInspection::Ready(installed)) => installed,
+                            Ok(VersionInspection::Ready(installed)) => {
+                                let (mut installed, _) = installed
+                                    .prepare_game_libraries(Some(budget.clone()))
+                                    .await.map_err(game_libraries_error)?;
+                                let evidence = installed.retain_inventory().map_err(install_read_error)?;
+                                (installed.version().clone(), evidence)
+                            }
+                            Ok(VersionInspection::Summary(mut summary)) => {
+                                let evidence = InventoryEvidence::retain(&mut summary.evidence).map_err(install_read_error)?;
+                                (summary.version, evidence)
+                            }
                             Ok(VersionInspection::Damaged(damage)) => {
                                 observed_damage = Some(damage);
                                 return Ok(LaunchPreflight::refused(
@@ -894,24 +922,20 @@ impl LaunchCoordinator {
                             }
                             Err(error) => return Err(install_read_error(error)),
                         };
-                        let (mut installed, _) = installed
-                            .prepare_game_libraries(Some(budget.clone()))
-                            .await
-                            .map_err(game_libraries_error)?;
                         let inventory = Arc::new(PreflightInventory {
                             pin,
                             _lease: artifacts,
                             bundle: bundle_guard.take().unwrap(),
-                            evidence: installed.retain_inventory().map_err(install_read_error)?,
+                            evidence,
                         });
                         let proof = Arc::new(PreflightArtifacts {
                             inventory,
-                            installed,
+                            version,
                         });
                         *owned_proof.lock().unwrap() = Some(proof.clone());
                         proof
                     };
-                    let version = proof.installed.version();
+                    let version = &proof.version;
                     let (selection, settings, _) =
                         coordinator.capture(&admitted.record().instance, None)?;
                     captured_context = Some((selection.clone(), settings.global_config_revision));
@@ -1156,6 +1180,13 @@ impl LaunchCoordinator {
                             message,
                         })
                     }).collect::<Result<Vec<_>, _>>()?);
+                    let evidence = damage.retain_inventory().map_err(install_read_error)?;
+                    inventories.lock().unwrap().push(Arc::new(PreflightInventory {
+                        pin: admitted.game_directory().pin().clone(),
+                        _lease: damage_lease,
+                        bundle: bundle_guard.take().unwrap(),
+                        evidence,
+                    }));
                 }
                 if diagnostics && let Some(reasons) = refused_reasons {
                     let target = &admitted.record().instance;
@@ -1201,13 +1232,13 @@ impl LaunchCoordinator {
         projection.scan = scan_slot.lock().unwrap().clone();
         if result.is_ok() {
             projection.current = proof_slot.lock().unwrap().take();
+            let mut inventories = projection.inventories.as_ref().unwrap().lock().unwrap();
             if let Some(proof) = &projection.current
-                && !projection
-                    .inventories
+                && !inventories
                     .iter()
                     .any(|inventory| Arc::ptr_eq(inventory, &proof.inventory))
             {
-                projection.inventories.push(proof.inventory.clone());
+                inventories.push(proof.inventory.clone());
             }
         }
         result.map_err(|_| LaunchError::PreparationFailed)?
@@ -3735,6 +3766,73 @@ mod tests {
                     .load(std::sync::atomic::Ordering::Relaxed),
                 2
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn summary_projection_rejects_repaired_negative_evidence_before_publication() {
+        use futures_util::FutureExt;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (root, coordinator, id) = runtime.block_on(preflight_fixture());
+        let outcome = runtime.block_on(
+            std::panic::AssertUnwindSafe(async {
+                std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+                let asset = root
+                    .path()
+                    .join("assets/log_configs/guardian-version-bundle.xml");
+                let original = std::fs::read(&asset).unwrap();
+                for missing in [true, false] {
+                    let healthy = coordinator.preflight(id.clone()).await;
+                    assert!(healthy.launchable, "{healthy:?}");
+                    if missing {
+                        std::fs::remove_file(&asset).unwrap();
+                    } else {
+                        std::fs::write(&asset, b"size drift").unwrap();
+                    }
+                    let mut projection =
+                        coordinator.preflight_projection(None, InventoryBudget::projection());
+                    projection.inspection = Inspection::Summary;
+                    let earlier = coordinator
+                        .preflight_with_projection(id.clone(), &mut projection)
+                        .await;
+                    let unchanged = coordinator.finish_preflight_projection(&projection).await;
+                    std::fs::write(&asset, &original).unwrap();
+                    let later = coordinator
+                        .preflight_with_projection(id.clone(), &mut projection)
+                        .await;
+                    let final_result = coordinator.finish_preflight_projection(&projection).await;
+                    drop(projection);
+                    assert_eq!(earlier.error.unwrap().code, LaunchError::InstallUnavailable);
+                    assert_eq!(unchanged, Ok(()));
+                    assert!(later.launchable, "{later:?}");
+                    assert_eq!(
+                        final_result,
+                        Err(LaunchError::LibraryUnavailable),
+                        "missing={missing}"
+                    );
+                }
+            })
+            .catch_unwind(),
+        );
+        let stopped = runtime.block_on(
+            coordinator
+                .tasks
+                .shutdown(std::time::Duration::from_secs(5)),
+        );
+        if outcome.is_err() || stopped.is_err() {
+            let retained = root.keep();
+            if stopped.is_err() {
+                std::mem::forget((coordinator, runtime));
+            }
+            eprintln!("negative summary fixture retained: {}", retained.display());
+        }
+        stopped.unwrap();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
         }
     }
 

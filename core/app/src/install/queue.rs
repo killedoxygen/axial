@@ -1975,15 +1975,22 @@ impl InstallQueue {
         pin: &GenerationPin,
         version_id: &str,
     ) -> Result<InstalledVersionReceipt, InstallError> {
-        self.inspect_version(pin, version_id, false, None)
-            .await?
-            .into_ready()
+        self.inspect_version(
+            pin,
+            version_id,
+            artifacts::Inspection::Integrity,
+            false,
+            None,
+        )
+        .await?
+        .into_ready()
     }
 
     pub(crate) async fn inspect_version(
         &self,
         pin: &GenerationPin,
         version_id: &str,
+        inspection: artifacts::Inspection,
         diagnostics: bool,
         budget: Option<Arc<Mutex<artifacts::InventoryBudget>>>,
     ) -> Result<VersionInspection, InstallError> {
@@ -2014,9 +2021,9 @@ impl InstallQueue {
             drop(scratch);
             if activated.version_id != version_id { return Err(InstallError::NotReady); }
             if let Some(budget) = &budget {
-                budget.lock().unwrap().reserve_inventory(&activated)?;
+                budget.lock().unwrap().reserve_inventory(&activated, inspection)?;
             }
-            activated.inspect(pin, diagnostics)
+            activated.inspect(pin, inspection, diagnostics)
         }).await.map_err(|_| InstallError::NotReady)?
     }
 

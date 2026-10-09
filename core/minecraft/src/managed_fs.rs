@@ -5417,6 +5417,19 @@ pub struct FileAbsence {
 }
 
 impl FileAbsence {
+    /// Owned observation storage, excluding shared filesystem authority.
+    pub fn retained_storage_bytes(&self) -> io::Result<u64> {
+        self.parent
+            .revisions
+            .capacity()
+            .checked_mul(std::mem::size_of::<(ManagedDir, DirectoryRevision)>())
+            .and_then(|bytes| bytes.checked_add(self.parent.relative.capacity()))
+            .and_then(|bytes| bytes.checked_add(self.name.capacity()))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| io::Error::other("absence storage exceeds capacity"))
+    }
+
     pub fn revalidate(&self) -> io::Result<()> {
         self.operation.revalidate()?;
         // Cursor refreshes authenticate the retained children, never replace
