@@ -584,6 +584,93 @@ mod tests {
         files
     }
 
+    #[test]
+    fn performance_health_reserves_the_instance_until_its_inspection_finishes() {
+        use futures_util::FutureExt;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cleanup = runtime.block_on(async {
+            let fixture = ProjectionFixture::new().await;
+            let body = std::panic::AssertUnwindSafe(async {
+                let instance = fixture
+                    .services
+                    .instances
+                    .registry()
+                    .get_live(&fixture.instance)
+                    .unwrap()
+                    .instance;
+                let health_path = format!(
+                    "/api/v1/performance/health?instance_id={}",
+                    fixture.instance
+                );
+                let mut health = Box::pin(get_json(fixture.router(), &health_path));
+                let waiting = futures_util::poll!(health.as_mut()).is_pending();
+                let refused = fixture.services.instances.update_with_sessions(
+                    &fixture.instance,
+                    InstancePatch {
+                        expected_revision: Some(instance.revision),
+                        max_memory_mb: Some(2048),
+                        ..Default::default()
+                    },
+                    &fixture.services.sessions,
+                );
+                let result = health.await;
+                let saved = fixture.services.instances.update_with_sessions(
+                    &fixture.instance,
+                    InstancePatch {
+                        expected_revision: Some(instance.revision),
+                        max_memory_mb: Some(2048),
+                        ..Default::default()
+                    },
+                    &fixture.services.sessions,
+                );
+                move || {
+                    assert!(waiting);
+                    assert!(matches!(
+                        refused,
+                        Err(axial_app::instances::model::InstanceError::Busy)
+                    ));
+                    assert_eq!(result.0, StatusCode::OK, "{}", result.1);
+                    assert_eq!(saved.unwrap().settings.max_memory_mb, 2048);
+                }
+            })
+            .catch_unwind()
+            .await;
+            let shutdown = std::panic::AssertUnwindSafe(tokio::time::timeout(
+                Duration::from_secs(30),
+                fixture.services.server.shutdown(),
+            ))
+            .catch_unwind()
+            .await;
+            let settled = fixture.services.server.is_shutdown_settled()
+                && fixture.services.tasks.shutdown_receipt().is_some()
+                && fixture.services.tasks.status().is_idle();
+            if !matches!(shutdown, Ok(Ok(Ok(())))) || !settled {
+                return Err(fixture);
+            }
+            drop(fixture.services);
+            let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                body.unwrap_or_else(|panic| std::panic::resume_unwind(panic))();
+            }));
+            if let Err(panic) = verified {
+                eprintln!("Retained health fixture: {}", fixture.root.keep().display());
+                std::panic::resume_unwind(panic);
+            }
+            Ok(())
+        });
+        if let Err(fixture) = cleanup {
+            let retained = fixture.root.path().to_owned();
+            std::mem::forget((runtime, fixture));
+            panic!(
+                "Health cleanup did not prove settlement; retained owners and fixture: {}",
+                retained.display()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn performance_projection_instance_plan_uses_admitted_installed_mods() {
         let fixture = ProjectionFixture::new().await;

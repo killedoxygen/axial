@@ -55,8 +55,6 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
     flushPending: () => flushArgs.current(),
   });
 
-  const [healthRefreshKey, setHealthRefreshKey] = useState(0);
-  const bumpHealth = (): void => setHealthRefreshKey((current) => current + 1);
   const [healthNotice, setHealthNotice] = useState<ReturnType<typeof performanceHealthNotice>>(null);
 
   const memoryOverridden = (inst.max_memory_mb ?? 0) > 0 || (inst.min_memory_mb ?? 0) > 0;
@@ -127,16 +125,13 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
     return () => {
       cancelled = true;
     };
-  }, [inst.id, inst.performance_mode, globalMode, healthRefreshKey]);
+  }, [inst.id, inst.performance_mode, globalMode]);
 
   const commitArgs = (next: string): void => {
     if (!canAutoSave()) return;
     pendingArgs.current = null;
     if (next === savedArgs) return;
-    commit(
-      { extra_jvm_args: next },
-      { label: 'JVM arguments', revert: () => setJvmArgs(savedArgs), onSuccess: bumpHealth },
-    );
+    commit({ extra_jvm_args: next }, { label: 'JVM arguments', revert: () => setJvmArgs(savedArgs) });
   };
 
   const onArgsChange = (next: string): void => {
@@ -175,10 +170,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
 
   const changeMode = (next: InstancePerformanceMode): void => {
     setMode(next);
-    commit(
-      { performance_mode: next },
-      { label: 'launch profile', revert: () => setMode(savedMode), onSuccess: bumpHealth },
-    );
+    commit({ performance_mode: next }, { label: 'launch profile', revert: () => setMode(savedMode) });
   };
 
   return (
@@ -227,10 +219,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
               <OverrideChip
                 onReset={() => {
                   setJavaPath('');
-                  commit(
-                    { jvm_preset: '', java_path: '' },
-                    { label: 'runtime', revert: () => setJavaPath(''), onSuccess: bumpHealth },
-                  );
+                  commit({ jvm_preset: '', java_path: '' }, { label: 'runtime', revert: () => setJavaPath('') });
                 }}
               />
             )
@@ -242,7 +231,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
               <SelectField<string>
                 value={savedPreset}
                 ariaLabel="JVM preset"
-                onChange={(next) => commit({ jvm_preset: next }, { label: 'JVM preset', onSuccess: bumpHealth })}
+                onChange={(next) => commit({ jvm_preset: next }, { label: 'JVM preset' })}
                 disabled={selectablePresets.length === 0}
                 placeholder="Loading"
                 options={presetOptions.map((preset) => ({
@@ -258,10 +247,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
               onChange={setJavaPath}
               onCommit={(next) => {
                 if ((next === '' && javaSelection.kind === 'inherited') || next === savedJavaComponent) return;
-                commit(
-                  { java_path: next },
-                  { label: 'Java runtime', revert: () => setJavaPath(''), onSuccess: bumpHealth },
-                );
+                commit({ java_path: next }, { label: 'Java runtime', revert: () => setJavaPath('') });
               }}
             />
             <JvmArgsInput value={jvmArgs} onChange={onArgsChange} />
@@ -273,11 +259,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
           description={`${memoryOverridden ? '' : 'Inherits the global default. '}Recommended ${fmtMem(recMin)} to ${fmtMem(recMax)} for this system.`}
           aside={
             memoryOverridden && (
-              <OverrideChip
-                onReset={() =>
-                  commit({ min_memory_mb: 0, max_memory_mb: 0 }, { label: 'memory', onSuccess: bumpHealth })
-                }
-              />
+              <OverrideChip onReset={() => commit({ min_memory_mb: 0, max_memory_mb: 0 }, { label: 'memory' })} />
             )
           }
         >
@@ -302,7 +284,6 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
                     setMinGb(memoryGb(current?.min_memory_mb, config.value?.min_memory_mb ?? 1024));
                     setMaxGb(memoryGb(current?.max_memory_mb, config.value?.max_memory_mb ?? 4096));
                   },
-                  onSuccess: bumpHealth,
                 },
               )
             }
@@ -314,11 +295,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
           description="Game window size when this instance launches."
           aside={
             windowOverridden && (
-              <OverrideChip
-                onReset={() =>
-                  commit({ window_width: 0, window_height: 0 }, { label: 'window size', onSuccess: bumpHealth })
-                }
-              />
+              <OverrideChip onReset={() => commit({ window_width: 0, window_height: 0 }, { label: 'window size' })} />
             )
           }
         >
@@ -330,9 +307,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
                 ? undefined
                 : { active: true, label: `Inherits global (${globalWidth} × ${globalHeight})` }
             }
-            onCommit={(w, h) =>
-              commit({ window_width: w, window_height: h }, { label: 'window size', onSuccess: bumpHealth })
-            }
+            onCommit={(w, h) => commit({ window_width: w, window_height: h }, { label: 'window size' })}
           />
         </SettingRow>
       </SettingsSection>

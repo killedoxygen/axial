@@ -211,6 +211,7 @@ function harness() {
   const timers = new Map<number, () => void>();
   let nextTimer = 0;
   let reloads = 0;
+  let healthReads = 0;
   let listener: ((event: { payload: unknown }) => void) | undefined;
   let admit: (path: string) => void = () => {};
   let respond: (path: string, value: unknown) => Promise<unknown> = async (_path, value) => value;
@@ -424,7 +425,10 @@ function harness() {
       '../../../dto-core': dto,
       '../../../performance-presenters': { performanceHealthNotice: () => null },
       '../performance-mode': {
-        fetchPerformanceHealth: async () => null,
+        fetchPerformanceHealth: async () => {
+          healthReads++;
+          return null;
+        },
         globalPerformanceMode: () => 'vanilla',
         performanceModeFrom: () => '',
         performanceModeLabel: () => 'Vanilla',
@@ -460,6 +464,7 @@ function harness() {
     instance: () => storedInstance,
     serverInstance(value: EnrichedInstance) { storedInstance = structuredClone(value); },
     reloads: () => reloads,
+    healthReads: () => healthReads,
     respond(next: typeof respond) {
       respond = next;
     },
@@ -693,6 +698,44 @@ test('native flush joins two rapid instance controls through their own acknowled
   assert.equal(h.store.instances.value[0].window_height, 600);
   assert.equal(h.instance().revision, 8);
   assert.equal(h.timers.size, 0);
+});
+
+test('launch metadata saves leave managed-file health inspection to mode changes', async () => {
+  const h = harness();
+  try {
+    h.render('instance');
+    await tick();
+    h.render('instance');
+    assert.equal(h.healthReads(), 1);
+    h.control<{ onCommit(low: number, high: number): void }>('MemoryField').onCommit(1, 2);
+    await tick();
+    h.render('instance');
+    await tick();
+    assert.equal(h.instance().max_memory_mb, 2048);
+    assert.equal(h.healthReads(), 1);
+    assert.equal(h.writes.length, 1);
+    h.control<{ onCommit(width: number, height: number): void }>('WindowField').onCommit(1000, 600);
+    await tick();
+    h.render('instance');
+    h.control<{ onChange(value: string): void }>('JvmArgsInput').onChange('-Daxial.fixture=true');
+    h.timersRun();
+    await tick();
+    h.render('instance');
+    await tick();
+    assert.equal(h.healthReads(), 1);
+    assert.equal(h.instance().window_width, 1000);
+    assert.equal(h.instance().extra_jvm_args, '-Daxial.fixture=true');
+    h.control<{ onChange(value: string): void }>('ChoicePills').onChange('custom');
+    await tick();
+    h.render('instance');
+    await tick();
+    assert.equal(h.instance().performance_mode, 'custom');
+    assert.equal(h.healthReads(), 2);
+    assert.equal(h.writes.length, 4);
+  } finally {
+    h.dispose();
+    await tick();
+  }
 });
 
 test('a refused older memory control restores the latest acknowledged heap, not its captured value', async () => {
