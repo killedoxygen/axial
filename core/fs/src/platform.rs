@@ -2679,8 +2679,7 @@ mod native {
     }
 
     pub(crate) fn file_receipt_fields(file: &File) -> io::Result<(u64, FileStamp)> {
-        require_regular_file(file)?;
-        let stat = rfs::fstat(file)?;
+        let stat = require_regular_file(file)?;
         let size = u64::try_from(stat.st_size)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file size is negative"))?;
         let modified_nanos = i64::try_from(stat.st_mtime_nsec)
