@@ -5796,7 +5796,8 @@ pub(crate) mod tests {
                 |_, _, _| async { panic!("vanilla recovery must not continue a loader") },
             )
             .await;
-        let pressure_supplied = pressure_received.try_recv().unwrap_or(false);
+        let pressure_recorded = pressure_received.try_recv();
+        let pressure_supplied = matches!(&pressure_recorded, Ok(true));
         let unchanged: (String, String, String) = storage
             .read(|db| {
                 db.query_row(
@@ -5897,7 +5898,10 @@ pub(crate) mod tests {
             && final_state.active_admissions == 0
             && final_state.running_workers == 0;
         let refused = pressure_result == Err(InstallError::SettlementRequired)
-            && !pressure_supplied
+            && matches!(
+                pressure_recorded,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            )
             && retry_supplied
             && unchanged == original
             && retained
