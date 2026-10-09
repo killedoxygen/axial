@@ -1123,6 +1123,51 @@ test('remounting settings replaces an abandoned read without letting its cleanup
   }
 });
 
+test('a refused queued global Java path retains the latest acknowledged path', async () => {
+  const h = harness();
+  const first = deferred<unknown>();
+  const second = deferred<void>();
+  let firstResponse: unknown;
+  h.respond(async (_path, value) => {
+    firstResponse = value;
+    return first.promise;
+  });
+  h.admit(() => {
+    if (h.writes.length === 2) return second.promise;
+  });
+  try {
+    h.render('global');
+    const java = h.control<{ onChange(value: string): void; onCommit(value: string): void }>('JavaPathField');
+    java.onChange('/fixture/acknowledged-java');
+    java.onCommit('/fixture/acknowledged-java');
+    await tick();
+    assert.equal(h.writes.length, 1);
+    assert.equal(h.store.config.value.java_path_override, '', 'first acknowledgement remains held');
+    java.onChange('/fixture/refused-java');
+    java.onCommit('/fixture/refused-java');
+    first.resolve(firstResponse);
+    await tick();
+    h.render('global');
+    h.render('global');
+    assert.equal(h.control<{ value: string }>('JavaPathField').value, '/fixture/acknowledged-java');
+    second.reject(Object.assign(new Error('Fixture refusal'), { status: 400 }));
+    await tick();
+    h.render('global');
+    assert.equal(h.config().java_path_override, '/fixture/acknowledged-java');
+    assert.equal(h.store.config.value.java_path_override, '/fixture/acknowledged-java');
+    assert.equal(h.control<{ value: string }>('JavaPathField').value, '/fixture/acknowledged-java');
+    assert.deepEqual(h.writes.map((write) => write.patch.expected_revision), [4, 5]);
+    assert.deepEqual(h.reads, ['/config']);
+    assert.deepEqual(h.notices, ['Saved', 'Could not save runtime defaults: Fixture refusal']);
+  } finally {
+    first.resolve(firstResponse);
+    second.resolve();
+    await tick();
+    h.dispose();
+    await tick();
+  }
+});
+
 test('native flush joins a committed settings reply and the next queued real control before acknowledging', async () => {
   const h = harness();
   await h.hydrate();

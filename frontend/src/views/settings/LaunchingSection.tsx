@@ -124,7 +124,7 @@ export function LaunchingSection(): JSX.Element {
                 if (next === savedJavaPath) return;
                 commit(
                   { java_path_override: next },
-                  { label: 'runtime defaults', revert: () => setJavaPath(savedJavaPath) },
+                  { label: 'runtime defaults', revert: () => setJavaPath(config.value?.java_path_override ?? '') },
                 );
               }}
             />
