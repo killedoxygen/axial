@@ -5589,7 +5589,6 @@ impl ManagedLibraryFileBatch {
         expected: &axial_fs::FileRevisionObservation,
     ) -> io::Result<()> {
         let result = (|| {
-            self.operation.revalidate()?;
             let (parent_path, name) = relative
                 .as_str()
                 .rsplit_once('/')
@@ -5632,7 +5631,6 @@ impl ManagedLibraryFileBatch {
     }
 
     fn observe(&mut self, relative: &PortableRelativePath) -> io::Result<FileObservation> {
-        self.operation.revalidate()?;
         let (parent_path, name) = relative
             .as_str()
             .rsplit_once('/')
@@ -5720,6 +5718,8 @@ impl ManagedLibraryFileBatch {
                 directory,
                 revisions,
             });
+        } else {
+            self.operation.revalidate()?;
         }
         Ok(None)
     }
