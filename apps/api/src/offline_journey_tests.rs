@@ -686,7 +686,7 @@ fn provider_routes(
         );
         routes.insert(
             "GET /artifacts/intermediary.jar".to_owned(),
-            b"fixture unavailable".to_vec(),
+            archive("fixture-intermediary.txt", b"fixture intermediary"),
         );
     }
     routes
@@ -695,7 +695,7 @@ fn provider_routes(
 #[derive(Clone)]
 struct ProviderState {
     routes: Arc<BTreeMap<String, Vec<u8>>>,
-    fabric_artifact_failure: bool,
+    fabric_artifact_failure: Arc<std::sync::atomic::AtomicBool>,
     requests: Arc<Mutex<Vec<String>>>,
     client_hold: tokio::sync::watch::Sender<bool>,
     client_held: Arc<tokio::sync::Notify>,
@@ -734,7 +734,9 @@ impl Provider {
                 natural_exit,
                 fabric_artifact_failure,
             )),
-            fabric_artifact_failure,
+            fabric_artifact_failure: Arc::new(std::sync::atomic::AtomicBool::new(
+                fabric_artifact_failure,
+            )),
             requests: Arc::new(Mutex::new(Vec::new())),
             client_hold: tokio::sync::watch::channel(false).0,
             client_held: Arc::new(tokio::sync::Notify::new()),
@@ -749,8 +751,9 @@ impl Provider {
 
                     let key = format!("{method} {uri}");
                     state.requests.lock().unwrap().push(key.clone());
-                    if state.fabric_artifact_failure && key == "GET /artifacts/intermediary.jar" {
-                        return (StatusCode::SERVICE_UNAVAILABLE, state.routes[&key].clone()).into_response();
+                    if key == "GET /artifacts/intermediary.jar"
+                        && state.fabric_artifact_failure.load(std::sync::atomic::Ordering::SeqCst) {
+                        return (StatusCode::SERVICE_UNAVAILABLE, b"fixture unavailable".to_vec()).into_response();
                     }
                     if key == "GET /artifacts/client.jar" && *state.client_hold.borrow() {
                         let bytes = state.routes[&key].clone();
@@ -7185,10 +7188,11 @@ fn queued_fabric_artifact_failure_preserves_safe_provider_diagnostic() {
             drop(pin);
             let canary = library.join("artifact-failure-canary.bin");
             std::fs::write(&canary, EXTERNAL_CANARY).unwrap();
-            let start = api.post("/api/v1/install/queue", json!({
+            let request = json!({
                 "kind":"loader","component_id":"net.fabricmc.fabric-loader",
                 "build_id":build_id_for(LoaderComponentId::Fabric, VERSION, "0.16.14")
-            })).await;
+            });
+            let start = api.post("/api/v1/install/queue", request.clone()).await;
             let terminal = install_terminal(&api, &start).await;
             let queue = api.get("/api/v1/install/queue").await;
             let pin = initial.library.admit().unwrap();
@@ -7196,9 +7200,111 @@ fn queued_fabric_artifact_failure_preserves_safe_provider_diagnostic() {
             let loader_id = installed_version_id_for(LoaderComponentId::Fabric, VERSION, "0.16.14").unwrap();
             let loader_ready = initial.installs.ready_version(&pin, &loader_id).await.is_ok();
             drop(pin);
-            let runtime_ready = initial.installs.runtime_cache().admit_component(COMPONENT)
-                .unwrap().is_some_and(|component| component.contents_verified());
-            (terminal, queue, base_ready, loader_ready, runtime_ready, canary)
+            let runtime_component = initial.installs.runtime_cache().admit_component(COMPONENT)
+                .unwrap().unwrap();
+            let runtime_ready = runtime_component.contents_verified();
+            assert!(base_ready && runtime_ready && !loader_ready);
+            assert_eq!(terminal["outcome"], "failed");
+            assert_eq!(terminal["view_model"]["failed"], true);
+            let failed_id = terminal["install_id"].as_str().unwrap();
+            let retained_bytes: Vec<_> = [
+                library.join(format!("versions/{VERSION}/{VERSION}.jar")),
+                library.join(format!("assets/objects/{}/{}", &sha1(ASSET)[..2], sha1(ASSET))),
+                runtime_component.java_executable_path(),
+            ].into_iter().map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            }).collect();
+            drop(runtime_component);
+            let failed_requests = provider.state.requests.lock().unwrap().clone();
+            let mut succeeded = None;
+            for reopen in 0..2 {
+                let current = services.as_ref().unwrap();
+                tokio::time::timeout(Duration::from_secs(60), current.server.shutdown())
+                    .await.expect("shutdown must finish before reopening").unwrap();
+                assert!(current.server.is_shutdown_settled()
+                    && current.tasks.shutdown_receipt().is_some()
+                    && current.tasks.status().is_idle());
+                drop(services.take());
+                let before_reopen = provider.state.requests.lock().unwrap().clone();
+                services = Some(start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+                    .await.unwrap());
+                let current = services.as_ref().unwrap();
+                let api = Api::new(current);
+                assert_eq!(api.get(&format!("/api/v1/install/{failed_id}/status")).await, terminal);
+                let observed = provider.state.requests.lock().unwrap().clone();
+                assert_eq!(observed, before_reopen,
+                    "reopen must not reacquire or replay settled work");
+                let restored = api.get("/api/v1/install/queue").await;
+                assert_eq!(restored["items"], json!([]));
+                assert!(restored["active"].is_null());
+                if reopen == 0 {
+                    provider.state.fabric_artifact_failure.store(false, Ordering::SeqCst);
+                    let retry = api.post("/api/v1/install/queue/retry", request.clone()).await;
+                    let success = install_terminal(&api, &retry).await;
+                    assert_eq!(success["outcome"], "succeeded");
+                    assert_ne!(success["install_id"], terminal["install_id"]);
+                    assert_ne!(success["operation_id"], terminal["operation_id"]);
+                    succeeded = Some(success);
+                } else {
+                    let success = succeeded.as_ref().unwrap();
+                    let id = success["install_id"].as_str().unwrap();
+                    assert_eq!(api.get(&format!("/api/v1/install/{id}/status")).await, *success);
+                }
+                let pin = current.library.admit().unwrap();
+                assert!(current.installs.ready_version(&pin, VERSION).await.is_ok());
+                assert!(current.installs.ready_version(&pin, &loader_id).await.is_ok());
+                drop(pin);
+                assert!(current.installs.runtime_cache().admit_component(COMPONENT)
+                    .unwrap().unwrap().contents_verified());
+                for (path, bytes) in &retained_bytes {
+                    assert_eq!(std::fs::read(path).unwrap(), *bytes);
+                }
+                assert_eq!(std::fs::read(&canary).unwrap(), EXTERNAL_CANARY);
+                assert_eq!(std::fs::read(library.join(format!(
+                    "libraries/net/fabricmc/intermediary/{VERSION}/intermediary-{VERSION}.jar"
+                ))).unwrap(), provider.state.routes["GET /artifacts/intermediary.jar"]);
+                if reopen == 1 {
+                    let observed = provider.state.requests.lock().unwrap().clone();
+                    assert_eq!(observed, before_reopen,
+                        "cold status/readiness reads must not replay provider work");
+                }
+            }
+            let current = services.as_ref().unwrap();
+            tokio::time::timeout(Duration::from_secs(60), current.server.shutdown())
+                .await.expect("final shutdown must join before census").unwrap();
+            assert!(current.server.is_shutdown_settled()
+                && current.tasks.shutdown_receipt().is_some()
+                && current.tasks.status().is_idle());
+            let rows = current.instances.registry().storage().read(|db| {
+                let mut statement = db.prepare("SELECT id, operation_id, request_json, target_json, status_json, phase FROM install_queue ORDER BY accepted_at, rowid")?;
+                statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?)))?
+                    .collect::<Result<Vec<_>, axial_app::storage::rusqlite::Error>>()
+                    .map_err(axial_app::storage::StorageError::from)
+            }).unwrap();
+            assert_eq!(rows.len(), 2, "one Retry must create exactly one attempt");
+            for (row, status) in rows.iter().zip([&terminal, succeeded.as_ref().unwrap()]) {
+                assert_eq!(row.0, status["install_id"].as_str().unwrap());
+                assert_eq!(row.1, status["operation_id"].as_str().unwrap());
+                assert_eq!(serde_json::from_str::<Value>(&row.2).unwrap(), request);
+                assert_eq!(serde_json::from_str::<Value>(&row.3).unwrap(), json!({
+                    "version_id":loader_id,
+                    "loader":{
+                        "component_id":"net.fabricmc.fabric-loader",
+                        "build_id":request["build_id"],
+                        "minecraft_version":VERSION,
+                        "loader_version":"0.16.14"
+                    }
+                }));
+                assert_eq!(serde_json::from_str::<Value>(&row.4).unwrap(), *status);
+                assert_eq!(row.5, "terminal");
+            }
+            let requests = provider.state.requests.lock().unwrap().clone();
+            for artifact in ["GET /artifacts/intermediary.jar", "GET /artifacts/fabric-loader.jar"] {
+                assert_eq!(requests.iter().filter(|key| key.as_str() == artifact).count(),
+                    failed_requests.iter().filter(|key| key.as_str() == artifact).count() + 1);
+            }
+            (terminal, queue, base_ready, loader_ready, runtime_ready, canary, requests)
         }).catch_unwind().await;
 
         let shutdown = match &services {
@@ -7237,8 +7343,10 @@ fn queued_fabric_artifact_failure_preserves_safe_provider_diagnostic() {
             shutdown.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                 .expect("API cleanup must finish within its deadline").unwrap();
             assert!(settled && provider_stop && provider_joined, "all fixture owners must join");
-            let (terminal, queue, base_ready, loader_ready, runtime_ready, canary) =
+            let (terminal, queue, base_ready, loader_ready, runtime_ready, canary, settled_requests) =
                 journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            assert_eq!(requests, settled_requests,
+                "joined provider must contain no late request, including repeated URLs");
             assert_eq!(requests.iter().cloned().collect::<BTreeSet<_>>(), expected_requests,
                 "real base, Java, exact Fabric proof/profile and both artifacts must be requested");
             assert!(requests.iter().any(|request| request == "GET /artifacts/intermediary.jar"),

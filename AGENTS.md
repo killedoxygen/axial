@@ -6,7 +6,7 @@ Active rewrite development is on `main`. Preserve existing commit history; the e
 
 This pre-release is intentionally breaking: do not support predecessor-profile import or old application schema upgrades. Remove compatibility-only code and tests. Retain recovery for operations performed by the new application, current-app persistence/reopen, and supported Minecraft/loader versions. Keep `legacy/` as reference, not a production dependency.
 
-Agent-created or agent-downloaded artifacts used only for this rewrite's isolated testing are disposable and may be cleaned without asking again. Verify exact targets, preserve unrelated data, and retain needed recovery and acceptance evidence.
+Agent-created or agent-downloaded artifacts used only for this rewrite's isolated testing are disposable and may be cleaned without asking again. Verify exact targets, preserve unrelated data, and retain needed recovery and acceptance evidence. Snapshot diagnostic state and release locks before assertions so caught failures preserve evidence without poisoning its owner.
 
 ## Architecture quality
 
