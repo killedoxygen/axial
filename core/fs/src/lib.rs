@@ -8212,7 +8212,6 @@ impl AdmittedAbsoluteDirectory {
     }
 
     pub fn filesystem_identity(&self) -> io::Result<DirectoryFilesystemIdentity> {
-        self.revalidate()?;
         let identity = self.inner.directory.identity()?.filesystem_identity();
         self.revalidate()?;
         Ok(identity)
@@ -18075,6 +18074,7 @@ mod tests {
         admitted
             .revalidate()
             .expect_err("case alias must invalidate the refreshed exact proof");
+        assert!(admitted.filesystem_identity().is_err());
 
         drop(admitted);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
@@ -18097,8 +18097,67 @@ mod tests {
             std::fs::rename(&library, &displaced).expect("displace admitted library");
             std::fs::create_dir(&library).expect("create replacement library");
             assert!(admitted.revalidate().is_err());
+            assert!(admitted.filesystem_identity().is_err());
         }
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_identity_refuses_displaced_ancestry_and_root_authority() {
+        for binding in ["ancestor", "root", "lease"] {
+            let temporary = crate::test_tempdir().unwrap();
+            let app = temporary.path().join("app");
+            let parent = temporary.path().join("external");
+            let library = parent.join("library");
+            std::fs::create_dir(&app).unwrap();
+            std::fs::create_dir_all(&library).unwrap();
+            std::fs::write(library.join("payload"), b"original").unwrap();
+            let session = acquire_test_root(&app);
+            let admitted = session
+                .admit_absolute_directory_authority(&library)
+                .unwrap();
+            let expected = admitted.filesystem_identity().unwrap();
+            let target = match binding {
+                "ancestor" => parent.clone(),
+                "root" => app.clone(),
+                "lease" => app.join(ROOT_LEASE_NAME),
+                _ => unreachable!(),
+            };
+            let displaced = temporary.path().join("displaced");
+            std::fs::rename(&target, &displaced).unwrap();
+            if binding == "lease" {
+                std::fs::write(&target, b"replacement").unwrap();
+            } else {
+                std::fs::create_dir(&target).unwrap();
+            }
+            let result = admitted.filesystem_identity();
+            if binding == "lease" {
+                assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+                std::fs::remove_file(&target).unwrap();
+            } else {
+                std::fs::remove_dir(&target).unwrap();
+            }
+            std::fs::rename(&displaced, &target).unwrap();
+            assert_eq!(std::fs::read(library.join("payload")).unwrap(), b"original");
+            let restored = admitted.filesystem_identity();
+            drop(admitted);
+            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+            assert!(result.is_err(), "accepted displaced {binding}");
+            assert_eq!(restored.unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn admitted_identity_refuses_revoked_authority() {
+        let temporary = crate::test_tempdir().unwrap();
+        let session = acquire_test_root(temporary.path());
+        let admitted = session
+            .admit_absolute_directory_authority(temporary.path())
+            .unwrap();
+        admitted.filesystem_identity().unwrap();
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert!(admitted.filesystem_identity().is_err());
     }
 
     #[cfg(unix)]
