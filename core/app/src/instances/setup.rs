@@ -58,6 +58,14 @@ pub struct SetupService {
     loader_manifest_url: Option<url::Url>,
 }
 
+#[derive(Serialize)]
+pub struct ListResponse {
+    instances: Vec<EnrichedInstance>,
+    last_instance_id: Option<InstanceId>,
+    #[serde(skip)]
+    _scratch: Option<axial_resource::PhysicalScratchPermit>,
+}
+
 type QueuedSetup = (Instance, InstallQueueStateResponse, CreateResultView);
 
 /// The queue schedules this accepted setup, while instances retains its exact
@@ -996,12 +1004,43 @@ impl SetupService {
         self.enrich_preflight(instance, versions, preflight)
     }
 
+    pub async fn list(&self) -> InstanceResult<ListResponse> {
+        let mut budget = crate::install::artifacts::InventoryBudget::projection();
+        let (records, scratch) = self.instances.registry().list_admitted(&mut budget)?;
+        let instances = self
+            .enrich_all_with_budget(
+                records.into_iter().map(|record| record.instance).collect(),
+                budget,
+            )
+            .await?;
+        let last_instance_id = self.instances.registry().last_instance_id()?;
+        Ok(ListResponse {
+            instances,
+            last_instance_id,
+            _scratch: scratch,
+        })
+    }
+
     pub async fn enrich_all(
         &self,
         instances: Vec<Instance>,
     ) -> InstanceResult<Vec<EnrichedInstance>> {
+        self.enrich_all_with_budget(
+            instances,
+            crate::install::artifacts::InventoryBudget::projection(),
+        )
+        .await
+    }
+
+    async fn enrich_all_with_budget(
+        &self,
+        instances: Vec<Instance>,
+        budget: crate::install::artifacts::InventoryBudget,
+    ) -> InstanceResult<Vec<EnrichedInstance>> {
         let scan = self.installed_snapshot().await?;
-        let mut projection = self.launch.preflight_projection(Some(Arc::new(scan)));
+        let mut projection = self
+            .launch
+            .preflight_projection(Some(Arc::new(scan)), budget);
         let mut pending = instances.into_iter().enumerate().collect::<Vec<_>>();
         // Registry version strings only schedule adjacent work. Launch admission
         // checks the actual generation, library and version before sharing proof.

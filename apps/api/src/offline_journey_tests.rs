@@ -4117,6 +4117,274 @@ async fn created_instance_survives_install_queue_refusal_and_reopen() {
     }
 }
 
+#[test]
+fn instance_list_refuses_input_scratch_pressure() {
+    use axial_resource::{PhysicalWorkClass, process_physical_work};
+    use futures_util::FutureExt;
+
+    const CHILD: &str = "AXIAL_TEST_LIST_INPUT_SCRATCH_CHILD";
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    if std::env::var_os(CHILD).is_none() {
+        runtime.block_on(async {
+            let mut output = tempfile::tempfile().unwrap();
+            let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "offline_journey_tests::instance_list_refuses_input_scratch_pressure",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::from(output.try_clone().unwrap()))
+                .stderr(std::process::Stdio::from(output.try_clone().unwrap()))
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            assert_fixture_child_exit(child, &mut output, 0).await;
+        });
+        return;
+    }
+
+    let cleanup = runtime.block_on(async {
+        let mut temporary = Some(
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap(),
+        );
+        let profile = temporary.as_ref().unwrap().path().join("profile");
+        let mut provider = Provider::start(false).await;
+        let mut services: Option<DesktopServices> = None;
+        let journey = std::panic::AssertUnwindSafe(async {
+            services = Some(
+                start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
+                    .await
+                    .unwrap(),
+            );
+            let initial = services.as_ref().unwrap();
+            let api = Api::new(initial);
+            api.post(
+                "/api/v1/accounts/offline",
+                json!({"username":PLAYER,"expected_selection_revision":0}),
+            )
+            .await;
+            api.request(
+                reqwest::Method::PUT,
+                "/api/v1/config",
+                Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
+            )
+            .await;
+            let pin = initial.library.admit().unwrap();
+            let operation = pin.managed_library().unwrap();
+            let root = pin.read_projection().unwrap();
+            let manifest = serde_json::to_vec(&json!({
+                "latest":{"release":VERSION,"snapshot":VERSION},
+                "versions":[{
+                    "id":VERSION,"type":"release",
+                    "url":"https://piston-meta.mojang.com/axial-offline-fixture.json",
+                    "sha1":sha1(&provider.state.routes["GET /versions/fixture.json"]),
+                    "time":"2024-01-01T00:00:00Z","releaseTime":"2024-01-01T00:00:00Z"
+                }]
+            }))
+            .unwrap();
+            axial_minecraft::manifest::persist_version_manifest_cache_fixture_for_test(
+                &operation, &manifest,
+            )
+            .unwrap();
+            let target = root.join(format!("versions/{VERSION}"));
+            let protected: Vec<_> = [
+                profile.join(super::PROFILE_MARKER),
+                root.join("cache/version_manifest_v2.json"),
+            ]
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+            drop(operation);
+            drop(pin);
+
+            initial.installs.close_admission();
+            let mut created = Vec::new();
+            for name in ["Zeta input admission", "Alpha input admission"] {
+                created.push(
+                    api.post(
+                        "/api/v1/instances",
+                        json!({"name":name,"selection_id":format!("vanilla|{VERSION}")}),
+                    )
+                    .await,
+                );
+            }
+            let before = api.get("/api/v1/instances").await;
+            let versions_before = api.get("/api/v1/versions").await;
+            let records_before = initial.instances.registry().list().unwrap();
+            let selection_before = initial.instances.registry().last_instance_id().unwrap();
+            let library_before = initial.library.snapshot().current.unwrap();
+            let requests_before = provider.state.requests.lock().unwrap().clone();
+
+            let physical = process_physical_work();
+            let limit = physical.scratch_limit_bytes();
+            let scratch = physical.try_reserve_scratch(limit).unwrap().unwrap();
+            let held = physical.snapshot(PhysicalWorkClass::Foreground);
+            let pressure = async {
+                let mut responses = Vec::new();
+                for path in ["/api/v1/versions", "/api/v1/instances"] {
+                    let response = api
+                        .client
+                        .get(format!("{}{path}", api.base))
+                        .header(transport::CAPABILITY_HEADER, &api.capability)
+                        .send()
+                        .await?;
+                    responses.push((response.status(), response.bytes().await?));
+                }
+                Ok::<_, reqwest::Error>(responses)
+            }
+            .await;
+            drop(scratch);
+            let released = physical.snapshot(PhysicalWorkClass::Foreground);
+            let responses: Vec<_> = pressure
+                .unwrap()
+                .into_iter()
+                .map(|(status, bytes)| (status, serde_json::from_slice::<Value>(&bytes).unwrap()))
+                .collect();
+            let restored = api.get("/api/v1/instances").await;
+            let records_after = initial.instances.registry().list().unwrap();
+            let selection_after = initial.instances.registry().last_instance_id().unwrap();
+            let library_after = initial.library.snapshot().current.unwrap();
+            let requests_after = provider.state.requests.lock().unwrap().clone();
+            let pending = api.get("/api/v1/instances/pending").await;
+            let queue = api.get("/api/v1/install/queue").await;
+            drop(api);
+            move || {
+                assert_eq!(held.available_scratch_bytes, 0);
+                assert_eq!(released.available_scratch_bytes, limit);
+                assert_eq!(records_after, records_before);
+                assert_eq!(records_before.len(), 2);
+                assert_eq!(selection_after, selection_before);
+                assert!(selection_before.is_none());
+                assert_eq!(library_after.generation, library_before.generation);
+                assert_eq!(library_after.library_id, library_before.library_id);
+                assert_eq!(library_after.mode, library_before.mode);
+                assert_eq!(requests_after, requests_before);
+                assert!(requests_before.is_empty());
+                assert_eq!(pending, json!({"creations":[],"deletions":[]}));
+                assert_eq!(queue["items"], json!([]));
+                assert!(queue["active"].is_null());
+                for (path, bytes) in protected {
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                }
+                assert!(
+                    std::fs::symlink_metadata(target)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                );
+                assert_eq!(before["instances"].as_array().unwrap().len(), 2);
+                assert_ne!(created[0]["id"], created[1]["id"]);
+                for (index, name) in ["Zeta input admission", "Alpha input admission"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    assert_eq!(
+                        created[index]["view_model"]["state_id"],
+                        "created_install_unavailable"
+                    );
+                    assert_eq!(before["instances"][index]["id"], created[index]["id"]);
+                    assert_eq!(before["instances"][index]["name"], name);
+                    assert_eq!(before["instances"][index]["version_id"], VERSION);
+                }
+                assert_eq!(before.get("last_instance_id"), Some(&Value::Null));
+                assert_eq!(restored, before);
+                assert_eq!(versions_before["scan_state"]["state_id"], "empty");
+                assert_eq!(versions_before["versions"], json!([]));
+                assert_eq!(responses[0].0, StatusCode::OK, "{}", responses[0].1);
+                assert_eq!(responses[0].1, versions_before);
+                assert_eq!(responses[1].0, StatusCode::CONFLICT, "{}", responses[1].1);
+                assert_eq!(
+                    responses[1].1,
+                    json!({"error":"Instance metadata could not be read or saved."})
+                );
+            }
+        })
+        .catch_unwind()
+        .await;
+        let shutdown = match &services {
+            Some(services) => {
+                std::panic::AssertUnwindSafe(tokio::time::timeout(
+                    Duration::from_secs(60),
+                    services.server.shutdown(),
+                ))
+                .catch_unwind()
+                .await
+            }
+            None => Ok(Ok(Ok(()))),
+        };
+        let settled = services.as_ref().is_none_or(|services| {
+            services.server.is_shutdown_settled()
+                && services.tasks.shutdown_receipt().is_some()
+                && services.tasks.status().is_idle()
+        });
+        if !matches!(&shutdown, Ok(Ok(Ok(())))) || !settled {
+            return Err((
+                services,
+                provider,
+                temporary.take().unwrap(),
+                "API cleanup did not prove settlement; provider remains available",
+            ));
+        }
+        let provider_stop = provider
+            .stop
+            .take()
+            .is_some_and(|stop| stop.send(()).is_ok());
+        let provider_joined =
+            match tokio::time::timeout(Duration::from_secs(5), &mut provider.task).await {
+                Ok(result) => result.is_ok(),
+                Err(_) => {
+                    provider.task.abort();
+                    match tokio::time::timeout(Duration::from_secs(1), &mut provider.task).await {
+                        Ok(Ok(())) | Ok(Err(_)) => false,
+                        Err(_) => {
+                            return Err((
+                                services,
+                                provider,
+                                temporary.take().unwrap(),
+                                "Provider cleanup remained unjoined after abort",
+                            ));
+                        }
+                    }
+                }
+            };
+        drop(services);
+        drop(provider);
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shutdown
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                .expect("cleanup API shutdown must join within the fixture deadline")
+                .unwrap();
+            assert!(
+                settled && provider_stop && provider_joined,
+                "all fixture owners must join"
+            );
+            journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic))();
+        }));
+        if let Err(panic) = verified {
+            eprintln!(
+                "Retained list-input scratch fixture: {}",
+                temporary.take().unwrap().keep().display()
+            );
+            std::panic::resume_unwind(panic);
+        }
+        Ok(())
+    });
+    if let Err((services, provider, temporary, reason)) = cleanup {
+        let retained = temporary.path().to_owned();
+        std::mem::forget((runtime, services, provider, temporary));
+        panic!(
+            "{reason}; retained list-input owners and fixture: {}",
+            retained.display()
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preflight_reports_installed_file_damage_without_launching_or_repairing() {
     use std::os::unix::fs::MetadataExt;

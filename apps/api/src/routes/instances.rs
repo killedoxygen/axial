@@ -4,7 +4,7 @@ use axial_app::instances::{
     duplicate::DuplicateRequest,
     from_pack::CreateFromModpackRequest,
     model::{InstanceError, InstanceId, InstancePatch},
-    setup::{InstanceSetupExecuteRequest, InstanceSetupPlanRequest, SetupService},
+    setup::{InstanceSetupExecuteRequest, InstanceSetupPlanRequest, ListResponse, SetupService},
 };
 use axial_app::launch::session::SessionManager;
 use axum::{
@@ -67,21 +67,8 @@ pub fn router(
         })
 }
 
-async fn list(State(services): State<Services>) -> Result<Json<Value>, ApiError> {
-    let records = services.instances.registry().list().map_err(error)?;
-    let instances = services
-        .setup
-        .enrich_all(records.into_iter().map(|record| record.instance).collect())
-        .await
-        .map_err(error)?;
-    let last_instance_id = services
-        .instances
-        .registry()
-        .last_instance_id()
-        .map_err(error)?;
-    Ok(Json(
-        json!({"instances": instances, "last_instance_id": last_instance_id}),
-    ))
+async fn list(State(services): State<Services>) -> Result<Json<ListResponse>, ApiError> {
+    services.setup.list().await.map(Json).map_err(error)
 }
 
 async fn detail(

@@ -6,7 +6,7 @@ use super::model::{
     InstanceResult, validate_name,
 };
 use crate::storage::{
-    MetadataStore, Migration,
+    MetadataStore, Migration, StorageError,
     rusqlite::{self, OptionalExtension, Transaction, params},
 };
 use crate::{
@@ -346,6 +346,53 @@ impl Registry {
                 .query_map([], |row| row.get::<_, String>(0))?
                 .map(|row| decode(&row?))
                 .collect()
+        })
+    }
+
+    pub(crate) fn list_admitted(
+        &self,
+        budget: &mut crate::install::artifacts::InventoryBudget,
+    ) -> InstanceResult<(
+        Vec<InstanceRecord>,
+        Option<axial_resource::PhysicalScratchPermit>,
+    )> {
+        self.storage.read(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            let (count, bytes): (u64, u64) = transaction.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(CAST(record_json AS BLOB))), 0)
+                 FROM instances WHERE lifecycle = 'live'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            budget
+                .reserve_checks(count)
+                .and_then(|()| budget.reserve_record(bytes))
+                .map_err(|_| StorageError::BudgetExceeded)?;
+            // Charge encoded input, its transient row copy and concrete slots;
+            // serde's decoded heap and SQLite internals are not a hard bound.
+            let scratch_bytes = count
+                .checked_mul(std::mem::size_of::<InstanceRecord>() as u64)
+                .and_then(|slots| bytes.checked_mul(2)?.checked_add(slots))
+                .ok_or(StorageError::BudgetExceeded)?;
+            let scratch = axial_resource::process_physical_work()
+                .try_reserve_scratch(scratch_bytes)
+                .map_err(|_| StorageError::BudgetExceeded)?;
+            let mut records = Vec::new();
+            records
+                .try_reserve_exact(
+                    usize::try_from(count).map_err(|_| StorageError::BudgetExceeded)?,
+                )
+                .map_err(|_| StorageError::BudgetExceeded)?;
+            {
+                let mut statement = transaction.prepare(
+                    "SELECT record_json FROM instances WHERE lifecycle = 'live' ORDER BY rowid",
+                )?;
+                for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                    records.push(decode(&row?)?);
+                }
+            }
+            transaction.commit()?;
+            Ok((records, scratch))
         })
     }
 

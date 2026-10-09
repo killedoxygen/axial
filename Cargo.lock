@@ -276,6 +276,7 @@ dependencies = [
  "axial-fs",
  "axial-minecraft",
  "axial-performance",
+ "axial-resource",
  "axum",
  "dirs",
  "ed25519-dalek",
