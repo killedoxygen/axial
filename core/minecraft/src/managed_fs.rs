@@ -2529,15 +2529,16 @@ impl ManagedDir {
         name: &str,
         guard: &ManagedFileGuard,
     ) -> Result<bool, LoaderError> {
+        verify_operation_admission(&self.inner.operation_pin)?;
         Ok(self.open_matching_file(name, guard)?.is_some())
     }
 
+    // The caller must have just verified the operation admission.
     fn open_matching_file(
         &self,
         name: &str,
         guard: &ManagedFileGuard,
     ) -> Result<Option<FileCapability>, LoaderError> {
-        verify_operation_admission(&self.inner.operation_pin)?;
         let name_leaf = leaf(name)?;
         let file = match self.inner.directory.open_file(&name_leaf) {
             Ok(file) => file,
