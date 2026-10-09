@@ -5232,16 +5232,32 @@ async fn grouped_readiness_refuses_earlier_inventory_drift_during_a_later_probe(
     }
 }
 
-#[tokio::test]
+#[test]
 #[cfg(unix)]
-async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
+fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
+    check_grouped_readiness_invalidated(false);
+}
+
+#[test]
+#[cfg(unix)]
+fn grouped_readiness_blocks_cached_rows_when_publication_starts() {
+    check_grouped_readiness_invalidated(true);
+}
+
+#[cfg(unix)]
+fn check_grouped_readiness_invalidated(publication_starts: bool) {
     use futures_util::FutureExt;
     use std::os::unix::fs::PermissionsExt;
 
-    let (root, service, accounts) = fixture();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (root, service, accounts) = runtime.block_on(async { fixture() });
     let service = Arc::new(service);
     let mut waiter = None;
-    let journey = std::panic::AssertUnwindSafe(async {
+    let mut publication = None;
+    let journey = runtime.block_on(std::panic::AssertUnwindSafe(async {
         crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
         accounts.create_offline_account("GroupedPlayer").unwrap();
         let java = root.path().join("java");
@@ -5259,7 +5275,14 @@ async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
         let first = super::super::create::tests::create(&service.instances, "First healthy").await;
         let last = super::super::create::tests::create(&service.instances, "Last healthy").await;
         let input = vec![first.clone(), last];
+        let lane = root.path().join(".axial-publication");
+        let saved_lane = root.path().join("previous-publication");
+        if publication_starts {
+            std::fs::rename(&lane, &saved_lane).unwrap();
+        }
         let healthy = service.enrich_all(input.clone()).await.unwrap();
+        let lane_absent = std::fs::symlink_metadata(&lane)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
         let protected: Vec<_> = ["json", "jar"].into_iter().map(|extension| {
             let path = root.path().join(format!("versions/1.21.4/1.21.4.{extension}"));
             let bytes = std::fs::read(&path).unwrap();
@@ -5286,25 +5309,45 @@ async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
         let external = versions_root.join("external-degraded-entry");
         let absent_before = std::fs::symlink_metadata(&external)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-        std::fs::create_dir(&external).unwrap();
         let metadata = external.join("external-degraded-entry.json");
         let malformed = b"{not valid external version metadata\n";
-        std::fs::write(&metadata, malformed).unwrap();
+        if publication_starts {
+            std::fs::rename(&saved_lane, &lane).unwrap();
+            let pin = service.instances.directories().library().admit().unwrap();
+            let operation = pin.managed_library().unwrap();
+            let guard = axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
+            publication = Some((guard, operation, pin));
+        } else {
+            std::fs::create_dir(&external).unwrap();
+            std::fs::write(&metadata, malformed).unwrap();
+        }
         let revision_after = std::fs::metadata(&versions_root).unwrap().modified().unwrap();
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
         let rows = waiter.take().unwrap().await.unwrap();
         let degraded = serde_json::to_value(service.launch.preflight(first.id.clone()).await).unwrap();
         let degraded_rows = service.enrich_all(input.clone()).await.unwrap();
-        let preserved = std::fs::read(&metadata).unwrap();
-        std::fs::remove_file(&metadata).unwrap();
-        std::fs::remove_dir(&external).unwrap();
+        let preserved = if publication_starts {
+            drop(publication.take());
+            None
+        } else {
+            let bytes = std::fs::read(&metadata).unwrap();
+            std::fs::remove_file(&metadata).unwrap();
+            std::fs::remove_dir(&external).unwrap();
+            Some(bytes)
+        };
         let restored = service.enrich_all(input.clone()).await.unwrap();
         move || {
             assert!(paused.is_ok() && still_pending, "second probe did not remain pending");
             assert_eq!(probe_count, 2);
             assert!(absent_before);
-            assert_ne!(revision_after, revision_before, "directory revision did not advance");
-            assert_eq!(preserved, malformed);
+            if publication_starts {
+                assert!(lane_absent, "cached rows must capture the absent publication lane");
+                assert_eq!(revision_after, revision_before, "version scan changed during publication control");
+                assert!(preserved.is_none());
+            } else {
+                assert_ne!(revision_after, revision_before, "directory revision did not advance");
+                assert_eq!(preserved.unwrap(), malformed);
+            }
             assert!(std::fs::symlink_metadata(external)
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
             for (path, bytes) in protected {
@@ -5330,10 +5373,14 @@ async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
             }
             assert_eq!(degraded["status"], "ready", "{degraded}");
             assert_eq!(degraded["launchable"], false);
+            let (reason, message) = if publication_starts {
+                ("incomplete_install", "Installation is changing. Wait for it to finish before launching.")
+            } else {
+                ("installed_versions_degraded", "Could not verify installed versions. Check the library folder and try again.")
+            };
             assert_eq!(degraded["readiness"], serde_json::json!({
                 "launchable":false,"reasons":[{
-                    "id":"installed_versions_degraded","severity":"blocking",
-                    "message":"Could not verify installed versions. Check the library folder and try again."
+                    "id":reason,"severity":"blocking","message":message
                 }]
             }));
             assert_eq!(rows.len(), input.len());
@@ -5345,21 +5392,33 @@ async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
                 assert!(row.needs_install.is_empty());
             }
         }
-    }).catch_unwind().await;
+    }).catch_unwind());
     let released = std::fs::write(root.path().join("probe-release"), b"release");
-    let remaining = match waiter.take() {
-        Some(waiter) => Some(waiter.await),
-        None => None,
-    };
-    let shutdown = std::panic::AssertUnwindSafe(
-        service
-            .instances
-            .tasks
-            .shutdown(std::time::Duration::from_secs(5)),
-    )
-    .catch_unwind()
-    .await;
+    let remaining = runtime.block_on(async {
+        match waiter.take() {
+            Some(waiter) => Some(waiter.await),
+            None => None,
+        }
+    });
+    drop(publication.take());
+    let shutdown = runtime.block_on(
+        std::panic::AssertUnwindSafe(
+            service
+                .instances
+                .tasks
+                .shutdown(std::time::Duration::from_secs(5)),
+        )
+        .catch_unwind(),
+    );
+    let settled = matches!(&shutdown, Ok(Ok(()))) && service.instances.tasks.status().is_idle();
+    if !settled {
+        std::mem::forget((service, accounts, runtime));
+    }
     let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let verify = match journey {
+            Ok(verify) => verify,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
         assert!(released.is_ok());
         if let Some(result) = remaining {
             assert!(result.is_ok(), "enrichment waiter did not join");
@@ -5368,14 +5427,17 @@ async fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
             Ok(result) => assert!(result.is_ok(), "{result:?}"),
             Err(panic) => std::panic::resume_unwind(panic),
         }
-        assert!(service.instances.tasks.status().is_idle());
-        match journey {
-            Ok(verify) => verify(),
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+        assert!(settled);
+        verify();
     }));
     if let Err(panic) = verification {
-        eprintln!("Retained grouped scan fixture: {}", root.keep().display());
+        use std::io::Write;
+        let retained = root.keep();
+        let _ = writeln!(
+            std::io::stderr(),
+            "Retained grouped readiness fixture: {}",
+            retained.display()
+        );
         std::panic::resume_unwind(panic);
     }
 }
