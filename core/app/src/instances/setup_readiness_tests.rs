@@ -2714,15 +2714,32 @@ async fn explicit_build_resolution_cancels_without_publishing() {
     }
 }
 
-#[tokio::test]
-async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
+#[test]
+fn loader_picker_retains_owned_fetches_and_rejects_library_drift() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let retain_runtime = std::cell::Cell::new(false);
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(loader_picker_fetches(&retain_runtime))
+    }));
+    if retain_runtime.get() {
+        std::mem::forget(runtime);
+    }
+    if let Err(panic) = checked {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn loader_picker_fetches(retain_runtime: &std::cell::Cell<bool>) {
     use futures_util::FutureExt;
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
-    for cancel_fetch in [false, true] {
+    for (cancel_fetch, drift) in [(false, false), (true, false), (false, true)] {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-        let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
+        let (mut service, accounts) = open_fixture(root.path(), crate::library::LibraryId::new());
         let library = service.instances.directories().library().clone();
         let owner = service.instances.tasks.clone();
         let registry_revision = service.installs.snapshot().registry_revision;
@@ -2815,6 +2832,9 @@ async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
             let original_generation = pin.generation();
             let operation = pin.managed_library().unwrap();
             operation.prepare_layout().unwrap();
+            let versions = pin.directory().unwrap()
+                .open_directory(&axial_fs::LeafName::new("versions").unwrap()).unwrap();
+            let revision_before = versions.revision().unwrap();
             let cache_before = loaders::fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.4").unwrap();
             drop(operation);
             drop(pin);
@@ -2841,7 +2861,24 @@ async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
                 .expect("loader request observer closed");
             let held = !caller.as_ref().unwrap().is_finished() && !server.is_finished();
             let accepted = owner.status();
+            let external = root.path().join("versions/external-degraded-entry");
+            let metadata = external.join("external-degraded-entry.json");
+            let malformed = b"{not valid external version metadata\n";
+            assert!(absent(&external));
+            let changed_revision = if drift {
+                std::fs::create_dir(&external).unwrap();
+                std::fs::write(&metadata, malformed).unwrap();
+                Some(tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let revision = versions.revision().unwrap();
+                        if revision != revision_before { break revision; }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }).await)
+            } else { None };
+            drop(versions);
             let mut view = None;
+            let mut refused = None;
             let mut held_shutdown = None;
             if cancel_fetch {
                 caller.as_ref().unwrap().abort();
@@ -2860,7 +2897,12 @@ async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
                     .await
                     .expect("loader picker did not settle");
                 drop(caller.take());
-                view = Some(joined.unwrap().unwrap());
+                let result = joined.unwrap();
+                if drift {
+                    refused = result.err();
+                } else {
+                    view = Some(result.unwrap());
+                }
             }
             let pin = library.admit().unwrap();
             let final_generation = pin.generation();
@@ -2868,6 +2910,14 @@ async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
             let cache_after = loaders::fetch_cached_builds(&operation, LoaderComponentId::Fabric, "1.21.4").unwrap();
             drop(operation);
             drop(pin);
+            let preserved_external = if drift {
+                let bytes = std::fs::read(&metadata).unwrap();
+                std::fs::remove_file(&metadata).unwrap();
+                std::fs::remove_dir(&external).unwrap();
+                view = Some(tokio::time::timeout(Duration::from_secs(5), service.loader_builds(LoaderComponentId::Fabric.as_str(), "1.21.4"))
+                    .await.expect("restored loader picker did not settle").unwrap());
+                Some(bytes)
+            } else { None };
             let instances_after = service.instances.registry().list().unwrap();
             let pending_after = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
             let queue_after = service.installs.snapshot();
@@ -2876,6 +2926,14 @@ async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
                 assert_eq!(accepted.running.len(), 1);
                 assert!(!accepted.closing && accepted.unsettled.is_empty());
                 assert_eq!(final_generation, original_generation);
+                if drift {
+                    assert_ne!(changed_revision.unwrap().unwrap(), revision_before);
+                    assert!(matches!(refused, Some(InstanceError::VersionUnavailable)), "{refused:?}");
+                    assert_eq!(preserved_external.as_deref(), Some(malformed.as_slice()));
+                } else {
+                    assert!(changed_revision.is_none() && preserved_external.is_none());
+                }
+                assert!(absent(&external));
                 if let Some((caller_cancelled, after_drop, shutdown, receipted, body_held)) = held_shutdown {
                     assert!(caller_cancelled);
                     assert_eq!(after_drop, accepted, "dropping the caller must not cancel accepted work");
@@ -2919,14 +2977,16 @@ async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
         let remaining = match caller.take() {
             Some(mut caller) => {
                 caller.abort();
-                Some(
-                    tokio::time::timeout(Duration::from_secs(1), &mut caller)
-                        .await
-                        .is_ok_and(|joined| match joined {
-                            Ok(_) => true,
-                            Err(error) => error.is_cancelled(),
-                        }),
-                )
+                let joined = tokio::time::timeout(Duration::from_secs(1), &mut caller)
+                    .await
+                    .is_ok_and(|joined| match joined {
+                        Ok(_) => true,
+                        Err(error) => error.is_cancelled(),
+                    });
+                if !joined {
+                    std::mem::forget(caller);
+                }
+                Some(joined)
             }
             None => None,
         };
@@ -2954,23 +3014,41 @@ async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
         let unsettled = service.installs.has_unsettled_effects();
         let runtime_settled = service.installs.runtime_cache().settle();
         drop(receipt);
-        drop(service);
-        drop(owner);
-        let pins = library.wait_for_pins(Duration::from_secs(2)).await;
-        let preserved = if matches!(&shutdown, Ok(Ok(())))
+        let settled = matches!(&shutdown, Ok(Ok(())))
             && matches!(&observers, Ok(Ok(())))
             && matches!(&server, Ok(Ok(Ok(_))))
+            && remaining.is_none_or(|joined| joined)
             && receipted
             && idle
             && !unsettled
-            && runtime_settled.is_ok()
-            && pins.is_ok()
-        {
-            Some(library.try_preserve())
+            && runtime_settled.is_ok();
+        if settled {
+            drop(service);
+            drop(owner);
+            drop(accounts);
+        } else {
+            retain_runtime.set(true);
+            std::mem::forget(service);
+            std::mem::forget(owner);
+            std::mem::forget(accounts);
+        }
+        let pins = if settled {
+            Some(library.wait_for_pins(Duration::from_secs(2)).await)
         } else {
             None
         };
+        let preserved = matches!(&pins, Some(Ok(()))).then(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| library.try_preserve()))
+        });
+        if !matches!(&preserved, Some(Ok(Ok(())))) {
+            retain_runtime.set(true);
+            std::mem::forget(library.clone());
+        }
         let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let verify = match journey {
+                Ok(verify) => verify,
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
             if let Some(released) = released {
                 assert!(released.is_ok(), "loader body gate ended before cleanup");
             }
@@ -2998,13 +3076,14 @@ async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
             }
             assert!(receipted && idle && !unsettled && runtime_settled.is_ok());
             assert!(
-                pins.is_ok(),
+                matches!(pins, Some(Ok(()))),
                 "profile capabilities remained after loader work joined"
             );
-            assert!(
-                matches!(preserved, Some(Ok(()))),
-                "loader fixture root did not preserve"
-            );
+            match preserved {
+                Some(Ok(Ok(()))) => {}
+                Some(Err(panic)) => std::panic::resume_unwind(panic),
+                _ => panic!("loader fixture root did not preserve"),
+            }
             let (records, pending, queue, cache_absent) = final_state.unwrap();
             assert!(records.is_empty() && pending.is_empty());
             assert!(
@@ -3023,16 +3102,14 @@ async fn dropped_loader_picker_caller_keeps_owned_fetch_until_shutdown() {
                 std::fs::read(&canary).unwrap(),
                 b"preserve unrelated user bytes\n"
             );
-            match journey {
-                Ok(verify) => verify(),
-                Err(panic) => std::panic::resume_unwind(panic),
-            }
+            verify();
             assert_eq!(cache_absent, cancel_fetch);
             assert_eq!(absent(&cache), cancel_fetch);
         }));
         if let Err(panic) = verification {
-            eprintln!(
-                "Retained loader cancellation fixture (cancel_fetch={cancel_fetch}): {}",
+            let _ = writeln!(
+                std::io::stderr(),
+                "Retained loader picker fixture (cancel_fetch={cancel_fetch}, drift={drift}): {}",
                 root.keep().display()
             );
             std::panic::resume_unwind(panic);
