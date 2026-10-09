@@ -200,6 +200,98 @@ async fn persist_automatic_restart_fixture(
 }
 
 #[tokio::test]
+async fn refused_resume_preserves_stopped_driver_while_original_task_settles() {
+    let root = fixture_directory();
+    let storage = open_storage(&root.path().join("metadata.sqlite"));
+    let (service, instance) = instance_service(root.path(), storage.clone()).await;
+    let accepted = service
+        .start_driver(
+            serde_json::from_value(serde_json::json!({
+                "instance_id": instance, "suite_mode": "development", "interval_ms": 300_000
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        service.stop_driver(&accepted.id)?;
+        let stopped = service.driver(&accepted.id)?;
+        let records = || {
+            storage.read(|db| {
+            db.query_row(
+                "SELECT d.payload,d.request,s.payload FROM benchmark_drivers d JOIN benchmark_suites s ON s.suite_id=?2 WHERE d.driver_id=?1",
+                params![accepted.id, accepted.suite_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)),
+            ).map_err(BenchmarkError::from)
+        })
+        };
+        let before = records()?;
+        let ownership = || {
+            let cancelled = service
+                .active_drivers
+                .lock()
+                .unwrap()
+                .get(&accepted.id)
+                .map(CancellationToken::is_cancelled);
+            (cancelled, service.tasks.status())
+        };
+        let retained = ownership();
+        let resumed = service.resume_driver(&accepted.id);
+        let remaining = ownership();
+        let after = records()?;
+        let current = service.driver(&accepted.id)?;
+        let sessions = service.sessions.sessions();
+        Ok::<_, BenchmarkError>((
+            stopped, before, retained, resumed, remaining, after, current, sessions,
+        ))
+    }));
+    if service
+        .tasks
+        .shutdown(std::time::Duration::from_secs(2))
+        .await
+        .is_err()
+    {
+        std::mem::forget(service);
+        std::mem::forget(storage);
+        std::mem::forget(root);
+        panic!("benchmark fixture shutdown did not settle");
+    }
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (stopped, before, retained, resumed, remaining, after, current, sessions) =
+            observed.unwrap().unwrap();
+        assert_eq!(stopped.state, "stopped");
+        assert_eq!(retained.0, Some(true));
+        assert_eq!(retained.1.running.len(), 1);
+        assert_eq!(
+            remaining, retained,
+            "refusal must retain the original cancelled task"
+        );
+        assert!(matches!(resumed, Err(BenchmarkError::Busy)));
+        assert_eq!(
+            current, stopped,
+            "a refused resume must not publish running"
+        );
+        assert_eq!(
+            after, before,
+            "refusal must preserve driver, request and suite bytes"
+        );
+        assert!(sessions.is_empty());
+        assert!(service.tasks.status().is_idle());
+        assert!(service.active_drivers.lock().unwrap().is_empty());
+    }));
+    if let Err(failure) = checked {
+        use std::io::Write;
+        let retained = root.keep();
+        let _ = writeln!(
+            std::io::stderr(),
+            "benchmark refusal fixture retained at {}",
+            retained.display()
+        );
+        std::panic::resume_unwind(failure);
+    }
+}
+
+#[tokio::test]
 async fn graceful_driver_shutdown_stops_and_joins_before_reopen() {
     let root = fixture_directory();
     let path = root.path().join("metadata.sqlite");

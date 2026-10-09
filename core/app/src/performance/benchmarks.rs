@@ -1550,6 +1550,14 @@ impl BenchmarkService {
     pub fn resume_driver(&self, id: &str) -> Result<BenchmarkSuiteDriverStatus, BenchmarkError> {
         let mut driver = self.driver(id)?;
         let lease = self.admit_suite(&driver.suite_id)?;
+        if self
+            .active_drivers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id)
+        {
+            return Err(BenchmarkError::Busy);
+        }
         if matches!(driver.state.as_str(), "running" | "waiting" | "complete") {
             return Err(BenchmarkError::Busy);
         }
