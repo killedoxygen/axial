@@ -726,7 +726,7 @@ impl SetupService {
                         .installs
                         .has_ready_version(admission.generation(), version)
                         .await
-                        .map_err(|_| InstanceError::VersionUnavailable)?;
+                        .map_err(|_| InstanceError::Busy)?;
                 if present {
                     verified_target = Some(InstallQueueInstallItemViewModel {
                         version_id: (*version).to_owned(),
@@ -752,7 +752,7 @@ impl SetupService {
                     .installs
                     .has_ready_version(admission.generation(), &target.version_id)
                     .await
-                    .map_err(|_| InstanceError::VersionUnavailable)?
+                    .map_err(|_| InstanceError::Busy)?
                 {
                     verified_target = Some(target);
                 }
@@ -778,7 +778,7 @@ impl SetupService {
                     .installs
                     .has_ready_version(admission.generation(), &target.version_id)
                     .await
-                    .map_err(|_| InstanceError::VersionUnavailable)?
+                    .map_err(|_| InstanceError::Busy)?
                     && (!state.availability.fresh || state.availability.stale)
                 {
                     return Err(InstanceError::VersionUnavailable);

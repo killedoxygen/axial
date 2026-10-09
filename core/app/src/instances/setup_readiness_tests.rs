@@ -197,7 +197,10 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
     )) {
         return;
     }
-    let (root, service, accounts) = runtime.block_on(async { fixture() });
+    let (root, mut service, accounts) = runtime.block_on(async { fixture() });
+    let catalog = stale_loader_catalog();
+    let installed = catalog.builds[0].clone();
+    service.loader_catalog_fixture = Some(catalog);
     let service = Arc::new(service);
     let library = service.instances.directories().library().clone();
     let cache = service.installs.runtime_cache().clone();
@@ -219,65 +222,79 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
     let outcome = runtime.block_on(
         std::panic::AssertUnwindSafe(async {
             crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+            crate::install::queue::tests::install_ready_fixture(&service.installs, &installed.version_id)
+                .await;
             let pin = library.admit().unwrap();
             let selection = "vanilla|1.21.4";
-            assert_eq!(
-                service.resolve(selection).await.unwrap().0.version_id,
-                "1.21.4"
+            let exact = format!(
+                "loader_build|{}|{}",
+                installed.component_id.as_str(),
+                installed.build_id
             );
-            let queue_before = serde_json::to_value(service.installs.snapshot()).unwrap();
-            let mut refusals = Vec::new();
-            for worker_pressure in [false, true] {
-                let scratch = (!worker_pressure)
-                    .then(|| work.try_reserve_scratch(work.scratch_limit_bytes()));
-                let workers = if worker_pressure {
-                    Some(
-                        work.admit(PhysicalWorkRequest::foreground_parallel(
-                            PhysicalIoClass::Read,
-                            0,
-                            4,
-                        ))
-                        .await,
-                    )
-                } else {
-                    None
-                };
-                let occupied = if worker_pressure {
-                    matches!(&workers, Some(Ok(_)))
-                } else {
-                    matches!(&scratch, Some(Ok(Some(_))))
-                };
-                let ready = service
-                    .installs
-                    .ready_version(&pin, "1.21.4")
-                    .await
-                    .map(|_| ());
-                let mut resolution = Box::pin(service.resolve(selection));
-                let observed = tokio::time::timeout(Duration::from_secs(2), &mut resolution).await;
-                let prompt = observed.is_ok();
-                drop((scratch, workers));
-                let result = match observed {
-                    Ok(result) => result,
-                    Err(_) => resolution.await,
-                };
-                refusals.push((
-                    occupied,
-                    prompt,
-                    ready,
-                    result.map(|(target, _, _)| target.version_id),
-                ));
-                let restored = service
-                    .installs
-                    .ready_version(&pin, "1.21.4")
-                    .await
-                    .unwrap();
-                assert_eq!(restored.version().id, "1.21.4");
-                restored.revalidate().unwrap();
-                drop(restored);
+            let automatic = format!("loader_auto|{}|1.21.4", installed.component_id.as_str());
+            let selections = [
+                (selection, "1.21.4"),
+                (exact.as_str(), installed.version_id.as_str()),
+                (automatic.as_str(), installed.version_id.as_str()),
+            ];
+            for (selection, version) in selections {
                 assert_eq!(
                     service.resolve(selection).await.unwrap().0.version_id,
-                    "1.21.4"
+                    version
                 );
+            }
+            let queue_before = serde_json::to_value(service.installs.snapshot()).unwrap();
+            let mut refusals = Vec::new();
+            for (selection, version) in selections {
+                for worker_pressure in [false, true] {
+                    let scratch =
+                        (!worker_pressure).then(|| work.try_reserve_scratch(work.scratch_limit_bytes()));
+                    let workers = if worker_pressure {
+                        Some(
+                            work.admit(PhysicalWorkRequest::foreground_parallel(
+                                PhysicalIoClass::Read,
+                                0,
+                                4,
+                            ))
+                            .await,
+                        )
+                    } else {
+                        None
+                    };
+                    let occupied = if worker_pressure {
+                        matches!(&workers, Some(Ok(_)))
+                    } else {
+                        matches!(&scratch, Some(Ok(Some(_))))
+                    };
+                    let ready = service
+                        .installs
+                        .ready_version(&pin, version)
+                        .await
+                        .map(|_| ());
+                    let mut resolution = Box::pin(service.resolve(selection));
+                    let observed = tokio::time::timeout(Duration::from_secs(2), &mut resolution).await;
+                    let prompt = observed.is_ok();
+                    drop((scratch, workers));
+                    let result = match observed {
+                        Ok(result) => result,
+                        Err(_) => resolution.await,
+                    };
+                    refusals.push((
+                        selection,
+                        occupied,
+                        prompt,
+                        ready,
+                        result.map(|(target, _, _)| target.version_id),
+                    ));
+                    let restored = service.installs.ready_version(&pin, version).await.unwrap();
+                    assert_eq!(restored.version().id, version);
+                    restored.revalidate().unwrap();
+                    drop(restored);
+                    assert_eq!(
+                        service.resolve(selection).await.unwrap().0.version_id,
+                        version
+                    );
+                }
             }
             assert!(service.instances.registry().list().unwrap().is_empty());
             assert!(service.instances.pending().unwrap().is_empty());
@@ -288,11 +305,11 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
             assert!(
                 refusals
                     .iter()
-                    .all(|(occupied, prompt, ready, result)| *occupied
+                    .all(|(_, occupied, prompt, ready, result)| *occupied
                         && *prompt
                         && matches!(ready, Err(InstallError::AtCapacity))
-                        && matches!(result, Err(InstanceError::VersionUnavailable))),
-                "verification pressure must not select install fallback: {refusals:?}"
+                        && matches!(result, Err(InstanceError::Busy))),
+                "verification pressure must remain retryable without install fallback: {refusals:?}"
             );
             use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
             use crate::storage::rusqlite::hooks::Action;
