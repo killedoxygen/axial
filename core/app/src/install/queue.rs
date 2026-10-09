@@ -1718,27 +1718,12 @@ impl InstallQueue {
                 let Some((encoded, scratch)) = encoded else {
                     return Ok(None);
                 };
-                let registered: ActivatedVersion =
-                    serde_json::from_str(&encoded).map_err(|_| InstallError::SettlementRequired)?;
+                let registered = artifacts::DecodedVersion::decode(&encoded)?;
                 drop(encoded);
                 drop(scratch);
-                if registered.version_id != checkpoint.version_id
-                    || registered.contract_id != contract.as_str()
-                    || registered.files.is_empty()
-                    || registered.files.len() > 1_000_000
-                {
-                    return Err(InstallError::SettlementRequired);
-                }
-                let path = format!("versions/{0}/{0}.json", checkpoint.version_id);
-                let mut matching = registered
-                    .files
-                    .into_iter()
-                    .filter(|file| file.path == path);
-                let metadata = matching.next().ok_or(InstallError::SettlementRequired)?;
-                if matching.next().is_some() {
-                    return Err(InstallError::SettlementRequired);
-                }
-                Ok(Some(metadata))
+                registered
+                    .metadata(&checkpoint.version_id, contract.as_str())
+                    .map(Some)
             })();
             match metadata {
                 Ok(Some(metadata)) => {
@@ -2030,14 +2015,10 @@ impl InstallQueue {
             axial_resource::process_physical_work().try_run_inline(
                 axial_resource::PhysicalWorkRequest::foreground(axial_resource::PhysicalIoClass::Read, 0),
                 move || {
-                    let activated: ActivatedVersion = serde_json::from_str(&record).map_err(|_| InstallError::NotReady)?;
+                    let activated = artifacts::DecodedVersion::decode(&record)?;
                     drop(record);
                     drop(scratch);
-                    if activated.version_id != version_id { return Err(InstallError::NotReady); }
-                    if let Some(budget) = &budget {
-                        budget.lock().unwrap().reserve_inventory(&activated, inspection)?;
-                    }
-                    activated.inspect(pin, inspection, diagnostics)
+                    activated.inspect(pin, &version_id, inspection, diagnostics, budget)
                 },
             ).map_err(|_| InstallError::AtCapacity)?
         }).await.map_err(|_| InstallError::NotReady)?
@@ -5806,22 +5787,24 @@ pub(crate) mod tests {
         let no_effect = matches!(classified, ManagedInstallDurableOutcome::NoEffect);
         let work = process_physical_work();
         let initial = work.snapshot(PhysicalWorkClass::Foreground);
-        let occupied = work.try_reserve_scratch(work.scratch_limit_bytes());
-        let pressure_admitted = matches!(&occupied, Ok(Some(_)));
-        let (pressured, mut pressure_received) = tokio::sync::oneshot::channel();
-        let pressure_result = restarted
-            .recover_interrupted_with(
-                &id,
-                move |version, expected, recorded| {
-                    let _ = pressured.send(recorded.is_some());
-                    reconstruct_fixture(version, expected, recorded)
-                },
-                |_, _, _| async { panic!("vanilla recovery must not continue a loader") },
-            )
-            .await;
-        let pressure_recorded = pressure_received.try_recv();
-        let pressure_supplied = matches!(&pressure_recorded, Ok(true));
-        let unchanged: (String, String, String) = storage
+        let mut pressure_valid = true;
+        let mut refusals_preserved = true;
+        for remaining in [0, 1 << 20] {
+            let occupied = work.try_reserve_scratch(work.scratch_limit_bytes() - remaining);
+            let pressure_admitted = matches!(&occupied, Ok(Some(_)));
+            let (pressured, mut pressure_received) = tokio::sync::oneshot::channel();
+            let pressure_result = restarted
+                .recover_interrupted_with(
+                    &id,
+                    move |version, expected, recorded| {
+                        let _ = pressured.send(recorded.is_some());
+                        reconstruct_fixture(version, expected, recorded)
+                    },
+                    |_, _, _| async { panic!("vanilla recovery must not continue a loader") },
+                )
+                .await;
+            let pressure_recorded = pressure_received.try_recv();
+            let unchanged: (String, String, String) = storage
             .read(|db| {
                 db.query_row(
                     "SELECT q.checkpoint_json,v.inventory_json,v.state FROM install_queue q JOIN installed_versions v ON v.install_id=q.id WHERE q.id=?1",
@@ -5831,24 +5814,37 @@ pub(crate) mod tests {
                 .map_err(InstallError::from)
             })
             .unwrap();
-        let retained = {
-            let state = restarted.inner.state.lock().unwrap();
-            let entry = &state.entries[&id];
-            !entry.status.done
-                && entry.status.outcome.is_none()
-                && entry.status.view_model.phase_id == "settlement_required"
-                && entry.pin.is_some()
-                && entry.recovery_lease.is_some()
-                && matches!(entry.retained, Some(RetainedInstall::Retry))
-        };
-        let excluded = exclusions
-            .try_acquire(
-                std::iter::empty::<String>(),
-                [library_artifact(&pin.library_id().to_string())],
-            )
-            .is_err();
-        let held = work.snapshot(PhysicalWorkClass::Foreground);
-        drop(occupied);
+            let retained = {
+                let state = restarted.inner.state.lock().unwrap();
+                let entry = &state.entries[&id];
+                !entry.status.done
+                    && entry.status.outcome.is_none()
+                    && entry.status.view_model.phase_id == "settlement_required"
+                    && entry.pin.is_some()
+                    && entry.recovery_lease.is_some()
+                    && matches!(entry.retained, Some(RetainedInstall::Retry))
+            };
+            let excluded = exclusions
+                .try_acquire(
+                    std::iter::empty::<String>(),
+                    [library_artifact(&pin.library_id().to_string())],
+                )
+                .is_err();
+            let held = work.snapshot(PhysicalWorkClass::Foreground);
+            drop(occupied);
+            pressure_valid &= pressure_admitted
+                && held.available_scratch_bytes == remaining
+                && held.active_admissions == 0
+                && held.running_workers == 0;
+            refusals_preserved &= pressure_result == Err(InstallError::SettlementRequired)
+                && matches!(
+                    pressure_recorded,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                )
+                && unchanged == original
+                && retained
+                && excluded;
+        }
         let (supplied, mut received) = tokio::sync::oneshot::channel();
         let recovered = restarted
             .recover_interrupted_with(
@@ -5895,15 +5891,12 @@ pub(crate) mod tests {
         let final_state = work.snapshot(PhysicalWorkClass::Foreground);
         let healthy = original.2 == "activating"
             && no_effect
-            && pressure_admitted
             && initial.available_scratch_bytes == work.scratch_limit_bytes()
             && initial.active_admissions == 0
             && initial.running_workers == 0
-            && held.available_scratch_bytes == 0
-            && held.active_admissions == 0
-            && held.running_workers == 0
+            && pressure_valid
             && recovered == Ok(())
-            && (pressure_supplied || retry_supplied)
+            && retry_supplied
             && restored == (original.0.clone(), original.1.clone(), "ready".into())
             && ready
             && succeeded
@@ -5920,15 +5913,7 @@ pub(crate) mod tests {
             && final_state.available_scratch_bytes == work.scratch_limit_bytes()
             && final_state.active_admissions == 0
             && final_state.running_workers == 0;
-        let refused = pressure_result == Err(InstallError::SettlementRequired)
-            && matches!(
-                pressure_recorded,
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-            )
-            && retry_supplied
-            && unchanged == original
-            && retained
-            && excluded;
+        let refused = refusals_preserved;
         if !healthy || !refused {
             eprintln!(
                 "settlement scratch fixture retained at {}",
@@ -7347,8 +7332,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn activation_projection_never_confers_filesystem_authority() {
-        let malformed: Value =
-            serde_json::json!({"version_id":"1.0","contract_id":"invalid","files":[],"ready":true});
-        assert!(serde_json::from_value::<ActivatedVersion>(malformed).is_err());
+        let malformed = r#"{"version_id":"1.0","contract_id":"invalid","files":[],"ready":true}"#;
+        assert!(artifacts::DecodedVersion::decode(malformed).is_err());
     }
 }

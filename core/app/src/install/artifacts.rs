@@ -134,12 +134,10 @@ impl InventoryBudget {
 /// Private durable projection, produced exclusively by verified activation. A
 /// serialized record is never itself filesystem authority. Summary observations
 /// are distinct from the complete verified receipts required for launch.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct ActivatedVersion {
     pub version_id: String,
     pub contract_id: String,
-    #[serde(deserialize_with = "deserialize_files")]
     pub files: Vec<ActivatedFile>,
 }
 
@@ -151,49 +149,238 @@ pub(crate) struct ActivatedFile {
     pub size: u64,
 }
 
-fn deserialize_files<'de, D>(deserializer: D) -> Result<Vec<ActivatedFile>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct Files;
+pub(crate) struct DecodedVersion {
+    activated: ActivatedVersion,
+    slots: Option<axial_resource::PhysicalScratchPermit>,
+}
 
-    impl<'de> serde::de::Visitor<'de> for Files {
-        type Value = Vec<ActivatedFile>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a bounded installed-file inventory")
-        }
-
-        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::SeqAccess<'de>,
-        {
-            use serde::de::Error;
-
-            let mut files = Vec::new();
-            while files.len() < MAX_INVENTORY_ENTRIES {
-                let Some(file) = sequence.next_element()? else {
-                    return Ok(files);
-                };
-                if files.len() == files.capacity() {
-                    let additional = files
-                        .capacity()
-                        .max(1)
-                        .min(MAX_INVENTORY_ENTRIES - files.len());
-                    files
-                        .try_reserve_exact(additional)
-                        .map_err(|_| A::Error::custom("installed inventory allocation failed"))?;
+impl DecodedVersion {
+    pub(crate) fn decode(record: &str) -> Result<Self, super::queue::InstallError> {
+        use serde::de::DeserializeSeed;
+        let mut decoder = InventoryDecoder {
+            slots: None,
+            at_capacity: false,
+        };
+        let mut deserializer = serde_json::Deserializer::from_str(record);
+        let activated = (&mut decoder)
+            .deserialize(&mut deserializer)
+            .and_then(|activated| {
+                deserializer.end()?;
+                Ok(activated)
+            })
+            .map_err(|_| {
+                if decoder.at_capacity {
+                    super::queue::InstallError::AtCapacity
+                } else {
+                    super::queue::InstallError::NotReady
                 }
-                files.push(file);
-            }
-            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                return Err(A::Error::custom("installed inventory exceeds entry limit"));
-            }
-            Ok(files)
-        }
+            })?;
+        Ok(Self {
+            activated,
+            slots: decoder.slots,
+        })
     }
 
-    deserializer.deserialize_seq(Files)
+    pub(crate) fn inspect(
+        self,
+        pin: GenerationPin,
+        version_id: &str,
+        inspection: Inspection,
+        diagnostics: bool,
+        budget: Option<Arc<std::sync::Mutex<InventoryBudget>>>,
+    ) -> Result<VersionInspection, super::queue::InstallError> {
+        if self.activated.version_id != version_id {
+            return Err(super::queue::InstallError::NotReady);
+        }
+        if let Some(budget) = budget {
+            budget
+                .lock()
+                .unwrap()
+                .reserve_inventory(&self.activated, inspection)?;
+        }
+        let result = self.activated.inspect(pin, inspection, diagnostics);
+        drop(self.slots);
+        result
+    }
+
+    pub(crate) fn metadata(
+        self,
+        version_id: &str,
+        contract_id: &str,
+    ) -> Result<ActivatedFile, super::queue::InstallError> {
+        use super::queue::InstallError;
+        if self.activated.version_id != version_id
+            || self.activated.contract_id != contract_id
+            || self.activated.files.is_empty()
+        {
+            return Err(InstallError::SettlementRequired);
+        }
+        let path = format!("versions/{version_id}/{version_id}.json");
+        let mut matching = self
+            .activated
+            .files
+            .into_iter()
+            .filter(|file| file.path == path);
+        let metadata = matching.next().ok_or(InstallError::SettlementRequired)?;
+        if matching.next().is_some() {
+            return Err(InstallError::SettlementRequired);
+        }
+        drop(matching);
+        drop(self.slots);
+        Ok(metadata)
+    }
+}
+
+struct InventoryDecoder {
+    slots: Option<axial_resource::PhysicalScratchPermit>,
+    at_capacity: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for &mut InventoryDecoder {
+    type Value = ActivatedVersion;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            VersionId,
+            ContractId,
+            Files,
+        }
+        struct Version<'a>(&'a mut InventoryDecoder);
+        impl<'de> serde::de::Visitor<'de> for Version<'_> {
+            type Value = ActivatedVersion;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an installed-version inventory")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                use serde::de::Error;
+                let (mut version_id, mut contract_id, mut files) = (None, None, None);
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        Field::VersionId => {
+                            if version_id.is_some() {
+                                return Err(A::Error::duplicate_field("version_id"));
+                            }
+                            version_id = Some(map.next_value()?);
+                        }
+                        Field::ContractId => {
+                            if contract_id.is_some() {
+                                return Err(A::Error::duplicate_field("contract_id"));
+                            }
+                            contract_id = Some(map.next_value()?);
+                        }
+                        Field::Files => {
+                            if files.is_some() {
+                                return Err(A::Error::duplicate_field("files"));
+                            }
+                            files = Some(map.next_value_seed(Files(self.0))?);
+                        }
+                    }
+                }
+                Ok(ActivatedVersion {
+                    version_id: version_id.ok_or_else(|| A::Error::missing_field("version_id"))?,
+                    contract_id: contract_id
+                        .ok_or_else(|| A::Error::missing_field("contract_id"))?,
+                    files: files.ok_or_else(|| A::Error::missing_field("files"))?,
+                })
+            }
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                use serde::de::Error;
+                Ok(ActivatedVersion {
+                    version_id: sequence
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(0, &self))?,
+                    contract_id: sequence
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(1, &self))?,
+                    files: sequence
+                        .next_element_seed(Files(self.0))?
+                        .ok_or_else(|| A::Error::custom("missing installed files"))?,
+                })
+            }
+        }
+        deserializer.deserialize_struct(
+            "ActivatedVersion",
+            &["version_id", "contract_id", "files"],
+            Version(self),
+        )
+    }
+}
+
+struct Files<'a>(&'a mut InventoryDecoder);
+
+impl<'de> serde::de::DeserializeSeed<'de> for Files<'_> {
+    type Value = Vec<ActivatedFile>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Files<'_> {
+    type Value = Vec<ActivatedFile>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded installed-file inventory")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        use serde::de::Error;
+
+        let mut files = Vec::new();
+        while files.len() < MAX_INVENTORY_ENTRIES {
+            let Some(file) = sequence.next_element()? else {
+                return Ok(files);
+            };
+            if files.len() == files.capacity() {
+                let additional = files
+                    .capacity()
+                    .max(1)
+                    .min(MAX_INVENTORY_ENTRIES - files.len());
+                let bytes = files
+                    .len()
+                    .checked_add(additional)
+                    .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<ActivatedFile>()))
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .ok_or_else(|| {
+                        self.0.at_capacity = true;
+                        A::Error::custom("installed inventory capacity exceeded")
+                    })?;
+                let slots = axial_resource::process_physical_work()
+                    .try_reserve_scratch(bytes)
+                    .map_err(|_| {
+                        self.0.at_capacity = true;
+                        A::Error::custom("installed inventory capacity exceeded")
+                    })?;
+                files.try_reserve_exact(additional).map_err(|_| {
+                    self.0.at_capacity = true;
+                    A::Error::custom("installed inventory allocation failed")
+                })?;
+                self.0.slots = slots;
+            }
+            files.push(file);
+        }
+        if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(A::Error::custom("installed inventory exceeds entry limit"));
+        }
+        Ok(files)
+    }
 }
 
 impl ActivatedVersion {
@@ -876,28 +1063,69 @@ pub(crate) mod tests {
             record.push_str(entry);
         }
         record.push_str("]}");
-        let accepted: ActivatedVersion = serde_json::from_str(&record).unwrap();
-        assert_eq!(accepted.files.len(), 1_000_000);
+        let accepted = DecodedVersion::decode(&record).unwrap();
+        assert_eq!(accepted.activated.files.len(), 1_000_000);
         drop(accepted);
         record.truncate(record.len() - 2);
         record.push(',');
         record.push_str(entry);
         record.push_str("]}");
         assert!(
-            serde_json::from_str::<ActivatedVersion>(&record).is_err(),
+            DecodedVersion::decode(&record).is_err(),
             "overflow must refuse during decoding, not after allocating every entry"
         );
     }
 
-    #[test]
-    fn recorded_inventory_allocates_slots_only_for_present_files() {
+    #[tokio::test]
+    async fn recorded_inventory_allocates_slots_only_for_present_files() {
+        if !preparation_child(
+            "install::artifacts::tests::recorded_inventory_allocates_slots_only_for_present_files",
+        )
+        .await
+        {
+            return;
+        }
+        let work = axial_resource::process_physical_work();
+        let before = work.snapshot(axial_resource::PhysicalWorkClass::Foreground);
         for (entries, slots) in [(64, 64), (0, 0), (65, 128)] {
             let files = vec![r#"{"path":"assets/fixture","sha1":"","size":0}"#; entries].join(",");
             let record =
                 format!(r#"{{"version_id":"fixture","contract_id":"fixture","files":[{files}]}}"#);
-            let activated: ActivatedVersion = serde_json::from_str(&record).unwrap();
-            assert_eq!(activated.files.len(), entries);
-            assert_eq!(activated.files.capacity(), slots, "{entries} entries");
+            let activated = DecodedVersion::decode(&record).unwrap();
+            assert_eq!(activated.activated.files.len(), entries);
+            assert_eq!(
+                activated.activated.files.capacity(),
+                slots,
+                "{entries} entries"
+            );
+            let held = work.snapshot(axial_resource::PhysicalWorkClass::Foreground);
+            assert_eq!(
+                before.available_scratch_bytes - held.available_scratch_bytes,
+                if entries == 0 { 0 } else { 1 << 20 }
+            );
+            drop(activated);
+            assert_eq!(
+                work.snapshot(axial_resource::PhysicalWorkClass::Foreground),
+                before
+            );
+        }
+        for record in [
+            r#"{"version_id":"fixture","files":[]}"#,
+            r#"{"version_id":"fixture","version_id":"duplicate","contract_id":"fixture","files":[]}"#,
+            r#"{"version_id":"fixture","contract_id":"fixture","contract_id":"duplicate","files":[]}"#,
+            r#"{"version_id":"fixture","contract_id":"fixture","files":[],"files":[]}"#,
+            r#"{"version_id":"fixture","contract_id":"fixture","files":[{"path":"","sha1":"","size":0}],"extra":true}"#,
+            r#"{"version_id":"fixture","contract_id":"fixture","files":[{"path":"","sha1":"","size":0},{}]}"#,
+            r#"{"version_id":"fixture","contract_id":"fixture","files":[{"path":"","sha1":"","size":0}]} trailing"#,
+        ] {
+            assert!(matches!(
+                DecodedVersion::decode(record),
+                Err(super::super::queue::InstallError::NotReady)
+            ));
+            assert_eq!(
+                work.snapshot(axial_resource::PhysicalWorkClass::Foreground),
+                before
+            );
         }
     }
 
@@ -910,7 +1138,7 @@ pub(crate) mod tests {
         ] {
             let record =
                 format!(r#"{{"version_id":"fixture","contract_id":"fixture","files":[{file}]}}"#);
-            assert!(serde_json::from_str::<ActivatedVersion>(&record).is_err());
+            assert!(DecodedVersion::decode(&record).is_err());
         }
     }
 

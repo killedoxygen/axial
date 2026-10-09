@@ -252,6 +252,68 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
                 );
             }
             let queue_before = serde_json::to_value(service.installs.snapshot()).unwrap();
+            let storage = service.instances.registry().storage();
+            let read_inventory = || {
+                storage.read(|db| -> Result<String, StorageError> {
+                        Ok(db.query_row(
+                            "SELECT inventory_json FROM installed_versions WHERE library_id=?1 AND version_id='1.21.4' AND state='ready'",
+                            [library_id.to_string()], |row| row.get(0),
+                        )?)
+                    })
+            };
+            let write_inventory = |record: &str| {
+                storage.transaction(|db| -> Result<_, StorageError> {
+                        Ok(db.execute(
+                            "UPDATE installed_versions SET inventory_json=?1 WHERE library_id=?2 AND version_id='1.21.4' AND state='ready'",
+                            crate::storage::rusqlite::params![record, library_id.to_string()],
+                        )?)
+                    })
+            };
+            let encoded = read_inventory().unwrap();
+            let mut padded = encoded.clone();
+            padded.extend(std::iter::repeat_n(' ', (1 << 20) - padded.len()));
+            assert_eq!(write_inventory(&padded).unwrap(), 1);
+            let slots_pressure = work
+                .try_reserve_scratch(work.scratch_limit_bytes() - (1 << 20))
+                .unwrap();
+            let before_decode = work.snapshot(PhysicalWorkClass::Foreground);
+            let slots_ready = service
+                .installs
+                .ready_version(&pin, "1.21.4")
+                .await
+                .map(|_| ());
+            let slots_resolution = service
+                .resolve(selection)
+                .await
+                .map(|(target, _, _)| target.version_id);
+            let after_decode = work.snapshot(PhysicalWorkClass::Foreground);
+            drop(slots_pressure);
+            let unchanged = read_inventory().unwrap();
+            assert_eq!(write_inventory(&encoded).unwrap(), 1);
+            service
+                .installs
+                .ready_version(&pin, "1.21.4")
+                .await
+                .unwrap()
+                .revalidate()
+                .unwrap();
+            assert_eq!(
+                service.resolve(selection).await.unwrap().0.version_id,
+                "1.21.4"
+            );
+            assert_eq!(unchanged, padded);
+            assert_eq!(
+                serde_json::to_value(service.installs.snapshot()).unwrap(),
+                queue_before
+            );
+            assert_eq!(before_decode, after_decode);
+            assert_eq!(before_decode.available_scratch_bytes, 1 << 20);
+            assert_eq!(before_decode.available_workers, 4);
+            assert!(
+                matches!(slots_ready, Err(InstallError::AtCapacity))
+                    && matches!(slots_resolution, Err(InstanceError::Busy)),
+                "decoded slots must be admitted without install fallback: ready={slots_ready:?}, resolution={slots_resolution:?}"
+            );
             let mut refusals = Vec::new();
             for (selection, version) in selections {
                 for worker_pressure in [false, true] {
