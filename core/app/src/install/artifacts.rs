@@ -696,7 +696,7 @@ impl InstalledVersionReceipt {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::queue::InstallError;
     use super::*;
     use crate::library::{LibraryLifecycle, LibraryOpenOutcome};
@@ -738,7 +738,7 @@ mod tests {
         )
     }
 
-    async fn preparation_child(selector: &str) -> bool {
+    pub(crate) async fn preparation_child(selector: &str) -> bool {
         use std::time::{Duration, Instant};
 
         const CHILD: &str = "AXIAL_INVENTORY_PREPARATION_CHILD";

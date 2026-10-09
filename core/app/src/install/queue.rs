@@ -1701,19 +1701,28 @@ impl InstallQueue {
             }
         } else {
             let metadata = (|| -> Result<Option<super::artifacts::ActivatedFile>, InstallError> {
-                let encoded: Option<Option<String>> = self.inner.storage.read(|db| {
-                    db.query_row(
-                        "SELECT CASE WHEN length(CAST(inventory_json AS BLOB))<=134217728 THEN inventory_json END FROM installed_versions WHERE library_id=?1 AND version_id=?2 AND contract_id=?3 AND install_id=?4 AND state IN ('activating','ready')",
-                        params![pin.library_id().to_string(), checkpoint.version_id, contract.as_str(), id],
-                        |row| row.get(0),
-                    ).optional().map_err(InstallError::from)
+                let encoded = self.inner.storage.read(|db| {
+                    let mut statement = db.prepare(
+                        "SELECT length(CAST(inventory_json AS BLOB)), inventory_json FROM installed_versions WHERE library_id=?1 AND version_id=?2 AND contract_id=?3 AND install_id=?4 AND state IN ('activating','ready')",
+                    )?;
+                    let mut rows = statement.query(params![pin.library_id().to_string(), checkpoint.version_id, contract.as_str(), id])?;
+                    let Some(row) = rows.next()? else { return Ok(None); };
+                    let bytes: Option<u64> = row.get(0)?;
+                    let bytes = bytes.ok_or(InstallError::SettlementRequired)?;
+                    if bytes > 128 << 20 { return Err(InstallError::SettlementRequired); }
+                    let scratch = axial_resource::process_physical_work()
+                        .try_reserve_scratch(bytes)
+                        .map_err(|_| InstallError::AtCapacity)?;
+                    let encoded: String = row.get(1)?;
+                    Ok(Some((encoded, scratch)))
                 })?;
-                let Some(encoded) = encoded else {
+                let Some((encoded, scratch)) = encoded else {
                     return Ok(None);
                 };
                 let registered: ActivatedVersion =
-                    serde_json::from_str(&encoded.ok_or(InstallError::SettlementRequired)?)
-                        .map_err(|_| InstallError::SettlementRequired)?;
+                    serde_json::from_str(&encoded).map_err(|_| InstallError::SettlementRequired)?;
+                drop(encoded);
+                drop(scratch);
                 if registered.version_id != checkpoint.version_id
                     || registered.contract_id != contract.as_str()
                     || registered.files.is_empty()
@@ -5708,7 +5717,16 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn acknowledged_activation_supplies_recorded_metadata_before_ready() {
-        let (_root, storage, library, exclusions, owner, queue) = fixture();
+        use axial_resource::{PhysicalWorkClass, process_physical_work};
+
+        if !super::super::artifacts::tests::preparation_child(
+            "install::queue::tests::acknowledged_activation_supplies_recorded_metadata_before_ready",
+        )
+        .await
+        {
+            return;
+        }
+        let (root, storage, library, exclusions, owner, queue) = fixture();
         let pin = library.admit().unwrap();
         let operation = pin.managed_library().unwrap();
         let writer = exclusions
@@ -5751,12 +5769,62 @@ pub(crate) mod tests {
         drop(writer);
         let restarted = InstallQueue::new(
             storage.clone(),
-            library,
+            library.clone(),
             exclusions.clone(),
             owner.clone(),
             queue.runtime_cache().clone(),
         )
         .unwrap();
+        let classified = axial_minecraft::classify_managed_install_publication_candidates(
+            operation.clone(),
+            axial_minecraft::ManagedInstallPublicationCandidates::one(version).unwrap(),
+        )
+        .await;
+        let no_effect = matches!(classified, ManagedInstallDurableOutcome::NoEffect);
+        let work = process_physical_work();
+        let initial = work.snapshot(PhysicalWorkClass::Foreground);
+        let occupied = work.try_reserve_scratch(work.scratch_limit_bytes());
+        let pressure_admitted = matches!(&occupied, Ok(Some(_)));
+        let (pressured, mut pressure_received) = tokio::sync::oneshot::channel();
+        let pressure_result = restarted
+            .recover_interrupted_with(
+                &id,
+                move |version, expected, recorded| {
+                    let _ = pressured.send(recorded.is_some());
+                    reconstruct_fixture(version, expected, recorded)
+                },
+                |_, _, _| async { panic!("vanilla recovery must not continue a loader") },
+            )
+            .await;
+        let pressure_supplied = pressure_received.try_recv().unwrap_or(false);
+        let unchanged: (String, String, String) = storage
+            .read(|db| {
+                db.query_row(
+                    "SELECT q.checkpoint_json,v.inventory_json,v.state FROM install_queue q JOIN installed_versions v ON v.install_id=q.id WHERE q.id=?1",
+                    [&id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(InstallError::from)
+            })
+            .unwrap();
+        let retained = {
+            let state = restarted.inner.state.lock().unwrap();
+            let entry = &state.entries[&id];
+            !entry.status.done
+                && entry.status.outcome.is_none()
+                && entry.status.view_model.phase_id == "settlement_required"
+                && entry.pin.is_some()
+                && entry.recovery_lease.is_some()
+                && matches!(entry.retained, Some(RetainedInstall::Retry))
+        };
+        let excluded = exclusions
+            .try_acquire(
+                std::iter::empty::<String>(),
+                [library_artifact(&pin.library_id().to_string())],
+            )
+            .is_err();
+        let held = work.snapshot(PhysicalWorkClass::Foreground);
+        drop(occupied);
         let (supplied, mut received) = tokio::sync::oneshot::channel();
         let recovered = restarted
             .recover_interrupted_with(
@@ -5780,34 +5848,73 @@ pub(crate) mod tests {
             .unwrap();
         let ready = restarted.ready_version(&pin, version).await.is_ok();
         restarted.close_admission();
-        owner
-            .shutdown(std::time::Duration::from_secs(3))
-            .await
-            .unwrap();
-        restarted.join_observers().await.unwrap();
-        queue.join_observers().await.unwrap();
-        restarted.shutdown_queued().unwrap();
-
-        assert_eq!(original.2, "activating");
-        assert_eq!(recovered, Ok(()));
+        queue.close_admission();
+        let shutdown = owner.shutdown(std::time::Duration::from_secs(3)).await;
+        let restarted_observers = restarted.join_observers().await;
+        let original_observers = queue.join_observers().await;
+        let restarted_settled = restarted.shutdown_queued();
+        let original_settled = queue.shutdown_queued();
+        let retry_supplied = received.try_recv().unwrap_or(false);
+        let succeeded = restarted.status(&id).unwrap().outcome == Some(InstallOutcome::Succeeded);
+        let settled = !restarted.has_unsettled_effects();
+        let readable = axial_minecraft::VersionBundleReadGuard::acquire(&operation).is_ok();
+        let released = exclusions
+            .try_acquire(
+                std::iter::empty::<String>(),
+                [library_artifact(&pin.library_id().to_string())],
+            )
+            .is_ok();
+        let runtime = queue.runtime_cache().clone();
+        drop((queue, restarted, pin, operation));
+        let runtime_settled = runtime.settle();
+        let preserved = library.try_preserve();
+        let final_state = work.snapshot(PhysicalWorkClass::Foreground);
+        let healthy = original.2 == "activating"
+            && no_effect
+            && pressure_admitted
+            && initial.available_scratch_bytes == work.scratch_limit_bytes()
+            && initial.active_admissions == 0
+            && initial.running_workers == 0
+            && held.available_scratch_bytes == 0
+            && held.active_admissions == 0
+            && held.running_workers == 0
+            && recovered == Ok(())
+            && (pressure_supplied || retry_supplied)
+            && restored == (original.0.clone(), original.1.clone(), "ready".into())
+            && ready
+            && succeeded
+            && settled
+            && readable
+            && released
+            && shutdown.is_ok()
+            && restarted_observers.is_ok()
+            && original_observers.is_ok()
+            && restarted_settled.is_ok()
+            && original_settled.is_ok()
+            && runtime_settled.is_ok()
+            && preserved.is_ok()
+            && final_state.available_scratch_bytes == work.scratch_limit_bytes()
+            && final_state.active_admissions == 0
+            && final_state.running_workers == 0;
+        let refused = pressure_result == Err(InstallError::SettlementRequired)
+            && !pressure_supplied
+            && retry_supplied
+            && unchanged == original
+            && retained
+            && excluded;
+        if !healthy || !refused {
+            eprintln!(
+                "settlement scratch fixture retained at {}",
+                root.keep().display()
+            );
+        }
         assert!(
-            received.try_recv().unwrap(),
-            "ACK-before-Ready must authenticate stored metadata"
+            healthy,
+            "recorded recovery must restore readiness and settle every owner"
         );
-        assert_eq!(restored, (original.0, original.1, "ready".into()));
-        assert!(ready && !restarted.has_unsettled_effects());
-        assert_eq!(
-            restarted.status(&id).unwrap().outcome,
-            Some(InstallOutcome::Succeeded)
-        );
-        assert!(axial_minecraft::VersionBundleReadGuard::acquire(&operation).is_ok());
         assert!(
-            exclusions
-                .try_acquire(
-                    std::iter::empty::<String>(),
-                    [library_artifact(&pin.library_id().to_string())],
-                )
-                .is_ok()
+            refused,
+            "ACK-before-Ready must retain recovery before decoding unadmitted input"
         );
     }
 
