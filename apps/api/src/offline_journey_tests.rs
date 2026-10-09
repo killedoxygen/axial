@@ -17,7 +17,7 @@ use sha1::{Digest, Sha1};
 use sha2::Sha512;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Cursor, Write},
+    io::{self, Cursor, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -69,6 +69,30 @@ struct KillAckCapture {
     started: std::time::Instant,
     events: Mutex<Vec<KillAckEvent>>,
     incomplete: std::sync::atomic::AtomicBool,
+    pending: Mutex<KillObservation>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct KillObservation {
+    request: Option<(String, std::net::SocketAddr, std::time::Instant)>,
+    stopped: bool,
+    attempted: bool,
+}
+
+struct PendingKill(Arc<KillAckCapture>);
+
+impl Drop for PendingKill {
+    fn drop(&mut self) {
+        match self.0.pending.lock() {
+            Ok(mut pending) => pending.request = None,
+            Err(_) => self
+                .0
+                .incomplete
+                .store(true, std::sync::atomic::Ordering::Relaxed),
+        }
+        self.0.changed.notify_one();
+    }
 }
 
 thread_local! {
@@ -161,6 +185,61 @@ async fn observe_kill_request(
 }
 
 impl KillAckCapture {
+    fn arm(self: &Arc<Self>, session: &str, base: &str) -> Option<PendingKill> {
+        let url = reqwest::Url::parse(base).ok()?;
+        let listener = std::net::SocketAddr::new(url.host_str()?.parse().ok()?, url.port()?);
+        if !listener.ip().is_loopback() || listener.port() == 0 {
+            return None;
+        }
+        let Ok(mut pending) = self.pending.lock() else {
+            self.incomplete
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        };
+        if pending.request.is_some() {
+            self.incomplete
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        if pending.attempted || pending.stopped {
+            return None;
+        }
+        pending.request = Some((session.to_owned(), listener, std::time::Instant::now()));
+        self.changed.notify_one();
+        Some(PendingKill(Arc::clone(self)))
+    }
+
+    fn observe_pending(&self) -> Result<(), ()> {
+        let mut pending = self.pending.lock().map_err(|_| ())?;
+        loop {
+            if pending.stopped || pending.attempted {
+                return Ok(());
+            }
+            let Some((session, listener, started)) = &pending.request else {
+                pending = self.changed.wait(pending).map_err(|_| ())?;
+                continue;
+            };
+            let remaining = Duration::from_secs(5).saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                let (session, listener, elapsed) = (session.clone(), *listener, started.elapsed());
+                pending.attempted = true;
+                drop(pending);
+                let snapshot = json!({
+                    "pid":std::process::id(),"session_id":session,"listener":listener.to_string(),
+                    "elapsed_ms":elapsed.as_millis(),"capture":self.snapshot(),
+                });
+                // Bypass libtest buffering so the external sampler can observe a live wait.
+                writeln!(io::stderr().lock(), "[DEBUG-kill-pending] {snapshot}").map_err(|_| ())?;
+                return Ok(());
+            }
+            pending = self
+                .changed
+                .wait_timeout(pending, remaining)
+                .map_err(|_| ())?
+                .0;
+        }
+    }
+
     fn record(
         &self,
         stage: KillAckStage,
@@ -190,14 +269,18 @@ impl KillAckCapture {
             tls_matches,
         });
     }
-    fn dump(&self, preserved: Option<&std::path::Path>) {
+    fn snapshot(&self) -> Value {
         let events = self.events.try_lock().ok().map(|events| events.clone());
         let complete =
             events.is_some() && !self.incomplete.load(std::sync::atomic::Ordering::Relaxed);
-        let encoded = serde_json::to_vec(&json!({
+        json!({
             "complete": complete, "events": events.unwrap_or_default(),
-        }))
-        .expect("bounded kill acknowledgement diagnostic serialization");
+        })
+    }
+
+    fn dump(&self, preserved: Option<&std::path::Path>) {
+        let encoded = serde_json::to_vec(&self.snapshot())
+            .expect("bounded kill acknowledgement diagnostic serialization");
         eprintln!(
             "[DEBUG-kill-ack] {}",
             std::str::from_utf8(&encoded).unwrap()
@@ -993,7 +1076,16 @@ impl Api {
         if let Some(id) = kill_session {
             record_kill_ack(KillAckStage::Send, id, None, false, false);
         }
+        let pending = kill_session.and_then(|id| {
+            KILL_ACK_CAPTURE.with(|capture| {
+                capture
+                    .borrow()
+                    .as_ref()
+                    .and_then(|capture| capture.arm(id, &self.base))
+            })
+        });
         let response = request.send().await;
+        drop(pending);
         if let Some(id) = kill_session {
             let (status, timeout, connect) = match &response {
                 Ok(response) => (Some(response.status().as_u16()), false, false),
@@ -5297,13 +5389,33 @@ fn run_with_kill_capture(journey: impl std::future::Future<Output = ()>) {
         started: std::time::Instant::now(),
         events: Mutex::new(Vec::with_capacity(32)),
         incomplete: std::sync::atomic::AtomicBool::new(false),
+        pending: Mutex::new(KillObservation::default()),
+        changed: std::sync::Condvar::new(),
     });
     KILL_ACK_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&capture)));
     let _capture_scope = KillAckScope;
     let (runtime, _diagnostics) = diagnostic_runtime(Some(Arc::clone(&capture)));
+    let observed = Arc::clone(&capture);
+    let observer = std::thread::Builder::new()
+        .name("kill-observer".to_owned())
+        .spawn(move || observed.observe_pending());
+    if observer.is_err() {
+        capture
+            .incomplete
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(journey);
     }));
+    if let Ok(mut pending) = capture.pending.lock() {
+        pending.stopped = true;
+    }
+    capture.changed.notify_one();
+    if !matches!(observer.map(|observer| observer.join()), Ok(Ok(Ok(())))) {
+        capture
+            .incomplete
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     capture.dump(None);
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
