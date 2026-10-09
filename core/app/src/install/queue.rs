@@ -831,13 +831,12 @@ impl InstallQueue {
         if request != work.request() || prerequisite != work.prerequisite() {
             return Err(InstallError::InvalidRequest);
         }
-        let prerequisite_item = if self
-            .ready_version(
+        let prerequisite_item = if !self
+            .has_ready_version(
                 work.instance().generation(),
                 &work.instance().record().instance.version_id,
             )
-            .await
-            .is_err()
+            .await?
         {
             Some(self.resolve_target(&prerequisite).await?)
         } else {
@@ -1986,6 +1985,18 @@ impl InstallQueue {
         .into_ready()
     }
 
+    pub(crate) async fn has_ready_version(
+        &self,
+        pin: &GenerationPin,
+        version_id: &str,
+    ) -> Result<bool, InstallError> {
+        match self.ready_version(pin, version_id).await {
+            Ok(_) => Ok(true),
+            Err(InstallError::AtCapacity) => Err(InstallError::AtCapacity),
+            Err(_) => Ok(false),
+        }
+    }
+
     pub(crate) async fn inspect_version(
         &self,
         pin: &GenerationPin,
@@ -2016,14 +2027,19 @@ impl InstallQueue {
             })?;
             let (record, scratch) = record.ok_or(InstallError::NotReady)?;
             if record.len() > 128 << 20 { return Err(InstallError::NotReady); }
-            let activated: ActivatedVersion = serde_json::from_str(&record).map_err(|_| InstallError::NotReady)?;
-            drop(record);
-            drop(scratch);
-            if activated.version_id != version_id { return Err(InstallError::NotReady); }
-            if let Some(budget) = &budget {
-                budget.lock().unwrap().reserve_inventory(&activated, inspection)?;
-            }
-            activated.inspect(pin, inspection, diagnostics)
+            axial_resource::process_physical_work().try_run_inline(
+                axial_resource::PhysicalWorkRequest::foreground(axial_resource::PhysicalIoClass::Read, 0),
+                move || {
+                    let activated: ActivatedVersion = serde_json::from_str(&record).map_err(|_| InstallError::NotReady)?;
+                    drop(record);
+                    drop(scratch);
+                    if activated.version_id != version_id { return Err(InstallError::NotReady); }
+                    if let Some(budget) = &budget {
+                        budget.lock().unwrap().reserve_inventory(&activated, inspection)?;
+                    }
+                    activated.inspect(pin, inspection, diagnostics)
+                },
+            ).map_err(|_| InstallError::AtCapacity)?
         }).await.map_err(|_| InstallError::NotReady)?
     }
 

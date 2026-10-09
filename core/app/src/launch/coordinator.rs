@@ -1355,7 +1355,7 @@ impl LaunchCoordinator {
             .installs
             .ready_version(admitted.generation(), &instance.version_id)
             .await
-            .map_err(|_| LaunchError::InstallUnavailable)?;
+            .map_err(install_read_error)?;
         let installed_versions = crate::catalog::installed_snapshot(admitted.generation())
             .await
             .map_err(|_| LaunchError::LibraryUnavailable)?;

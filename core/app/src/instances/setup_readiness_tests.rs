@@ -180,6 +180,185 @@ fn select_unowned_microsoft_account(accounts: &AccountDirectory) {
         .unwrap();
 }
 
+#[test]
+fn installed_verification_pressure_does_not_trigger_install_fallback() {
+    use axial_resource::{
+        PhysicalIoClass, PhysicalWorkClass, PhysicalWorkRequest, process_physical_work,
+    };
+    use futures_util::FutureExt;
+    use std::time::Duration;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    if !runtime.block_on(crate::install::artifacts::tests::preparation_child(
+        "instances::setup::readiness_tests::installed_verification_pressure_does_not_trigger_install_fallback",
+    )) {
+        return;
+    }
+    let (root, service, accounts) = runtime.block_on(async { fixture() });
+    let service = Arc::new(service);
+    let library = service.instances.directories().library().clone();
+    let cache = service.installs.runtime_cache().clone();
+    let work = process_physical_work();
+    let outcome = runtime.block_on(
+        std::panic::AssertUnwindSafe(async {
+            crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+            let pin = library.admit().unwrap();
+            let selection = "vanilla|1.21.4";
+            assert_eq!(
+                service.resolve(selection).await.unwrap().0.version_id,
+                "1.21.4"
+            );
+            let queue_before = serde_json::to_value(service.installs.snapshot()).unwrap();
+            let mut refusals = Vec::new();
+            for worker_pressure in [false, true] {
+                let scratch = (!worker_pressure)
+                    .then(|| work.try_reserve_scratch(work.scratch_limit_bytes()));
+                let workers = if worker_pressure {
+                    Some(
+                        work.admit(PhysicalWorkRequest::foreground_parallel(
+                            PhysicalIoClass::Read,
+                            0,
+                            4,
+                        ))
+                        .await,
+                    )
+                } else {
+                    None
+                };
+                let occupied = if worker_pressure {
+                    matches!(&workers, Some(Ok(_)))
+                } else {
+                    matches!(&scratch, Some(Ok(Some(_))))
+                };
+                let ready = service
+                    .installs
+                    .ready_version(&pin, "1.21.4")
+                    .await
+                    .map(|_| ());
+                let mut resolution = Box::pin(service.resolve(selection));
+                let observed = tokio::time::timeout(Duration::from_secs(2), &mut resolution).await;
+                let prompt = observed.is_ok();
+                drop((scratch, workers));
+                let result = match observed {
+                    Ok(result) => result,
+                    Err(_) => resolution.await,
+                };
+                refusals.push((
+                    occupied,
+                    prompt,
+                    ready,
+                    result.map(|(target, _, _)| target.version_id),
+                ));
+                let restored = service
+                    .installs
+                    .ready_version(&pin, "1.21.4")
+                    .await
+                    .unwrap();
+                assert_eq!(restored.version().id, "1.21.4");
+                restored.revalidate().unwrap();
+                drop(restored);
+                assert_eq!(
+                    service.resolve(selection).await.unwrap().0.version_id,
+                    "1.21.4"
+                );
+            }
+            assert!(service.instances.registry().list().unwrap().is_empty());
+            assert!(service.instances.pending().unwrap().is_empty());
+            assert_eq!(
+                serde_json::to_value(service.installs.snapshot()).unwrap(),
+                queue_before
+            );
+            assert!(
+                refusals
+                    .iter()
+                    .all(|(occupied, prompt, ready, result)| *occupied
+                        && *prompt
+                        && matches!(ready, Err(InstallError::AtCapacity))
+                        && matches!(result, Err(InstanceError::VersionUnavailable))),
+                "verification pressure must not select install fallback: {refusals:?}"
+            );
+            accounts.create_offline_account("PressurePlayer").unwrap();
+            let instance =
+                super::super::create::tests::create(&service.instances, "Pressure").await;
+            let request = serde_json::from_value(serde_json::json!({
+                "instance_id": instance.id,
+                "intent_key": uuid::Uuid::new_v4().to_string(),
+            }))
+            .unwrap();
+            let workers = work
+                .admit(PhysicalWorkRequest::foreground_parallel(
+                    PhysicalIoClass::Read,
+                    0,
+                    4,
+                ))
+                .await
+                .unwrap();
+            let mut launch = Box::pin(service.launch.launch(request));
+            let observed = tokio::time::timeout(Duration::from_secs(2), &mut launch).await;
+            let prompt = observed.is_ok();
+            drop(workers);
+            let result = match observed {
+                Ok(result) => result,
+                Err(_) => launch.await,
+            };
+            let restored = service.launch.preflight(instance.id).await;
+            assert!(matches!(
+                restored.error.map(|error| error.code),
+                Some(LaunchError::RuntimeFailure(_)) | Some(LaunchError::RuntimeUnavailable)
+            ));
+            assert!(
+                prompt && matches!(result, Err(LaunchError::AtCapacity)),
+                "Play must preserve verification capacity refusal: {result:?}"
+            );
+        })
+        .catch_unwind(),
+    );
+    service.installs.close_admission();
+    let shutdown = runtime.block_on(service.instances.tasks.shutdown(Duration::from_secs(3)));
+    let observers = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), service.installs.join_observers()).await
+    });
+    let queue_settled = service.installs.shutdown_queued();
+    let state = work.snapshot(PhysicalWorkClass::Foreground);
+    let quiescent = shutdown.is_ok()
+        && matches!(observers, Ok(Ok(())))
+        && queue_settled.is_ok()
+        && state.available_workers == 4
+        && state.running_workers == 0
+        && state.active_admissions == 0
+        && state.available_scratch_bytes == work.scratch_limit_bytes();
+    if !quiescent {
+        let retained = root.keep();
+        std::mem::forget((service, accounts, library, cache, runtime));
+        eprintln!(
+            "selection pressure fixture retained: {}",
+            retained.display()
+        );
+        panic!("selection pressure owners did not settle");
+    }
+    drop((service, accounts));
+    let settled = cache.settle().is_ok() && library.try_preserve().is_ok();
+    if !settled {
+        let retained = root.keep();
+        std::mem::forget((library, cache, runtime));
+        eprintln!(
+            "selection pressure fixture retained: {}",
+            retained.display()
+        );
+        panic!("selection pressure roots did not settle");
+    }
+    if let Err(panic) = outcome {
+        eprintln!(
+            "selection pressure fixture retained: {}",
+            root.keep().display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn profile_build(
     component: LoaderComponentId,
     minecraft: &str,

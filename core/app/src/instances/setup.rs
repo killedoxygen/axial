@@ -724,9 +724,9 @@ impl SetupService {
                 }) && !loaders::is_canonical_installed_loader_id(version)
                     && self
                         .installs
-                        .ready_version(admission.generation(), version)
+                        .has_ready_version(admission.generation(), version)
                         .await
-                        .is_ok();
+                        .map_err(|_| InstanceError::VersionUnavailable)?;
                 if present {
                     verified_target = Some(InstallQueueInstallItemViewModel {
                         version_id: (*version).to_owned(),
@@ -750,9 +750,9 @@ impl SetupService {
                 let target = loader_install_target(component_id, build_id)?;
                 if self
                     .installs
-                    .ready_version(admission.generation(), &target.version_id)
+                    .has_ready_version(admission.generation(), &target.version_id)
                     .await
-                    .is_ok()
+                    .map_err(|_| InstanceError::VersionUnavailable)?
                 {
                     verified_target = Some(target);
                 }
@@ -774,11 +774,11 @@ impl SetupService {
                 if target.version_id != build.version_id {
                     return Err(InstanceError::Conflict);
                 }
-                if self
+                if !self
                     .installs
-                    .ready_version(admission.generation(), &target.version_id)
+                    .has_ready_version(admission.generation(), &target.version_id)
                     .await
-                    .is_err()
+                    .map_err(|_| InstanceError::VersionUnavailable)?
                     && (!state.availability.fresh || state.availability.stale)
                 {
                     return Err(InstanceError::VersionUnavailable);
@@ -843,13 +843,21 @@ impl SetupService {
                     .join()
                     .await
                     .map_err(|_| InstanceError::SettlementRequired)??;
-                let ready = service
+                let install_queue = match service
                     .installs
-                    .ready_version(&pin, &instance.version_id)
+                    .has_ready_version(&pin, &instance.version_id)
                     .await
-                    .is_ok();
-                let (install_queue, view_model) = if ready {
-                    (
+                {
+                    Ok(true) => Ok(None),
+                    Ok(false) => service
+                        .installs
+                        .enqueue_creation(install, &instance.version_id, &admission, &cancel)
+                        .await
+                        .map(Some),
+                    Err(error) => Err(error),
+                };
+                let (install_queue, view_model) = match install_queue {
+                    Ok(None) => (
                         None,
                         CreateResultView {
                             state_id: "created",
@@ -858,34 +866,27 @@ impl SetupService {
                             summary: "Instance created.",
                             detail: None,
                         },
-                    )
-                } else {
-                    match service
-                        .installs
-                        .enqueue_creation(install, &instance.version_id, &admission, &cancel)
-                        .await
-                    {
-                        Ok(queue) => (
-                            Some(queue),
-                            CreateResultView {
-                                state_id: "created",
-                                tone: "success",
-                                title: "Instance created",
-                                summary: "Instance created. Installation is queued.",
-                                detail: None,
-                            },
-                        ),
-                        Err(_) => (
-                            None,
-                            CreateResultView {
-                                state_id: "created_install_unavailable",
-                                tone: "warn",
-                                title: "Instance created",
-                                summary: "Instance created. Installation could not be queued.",
-                                detail: Some("Use Install on this instance to try again."),
-                            },
-                        ),
-                    }
+                    ),
+                    Ok(Some(queue)) => (
+                        Some(queue),
+                        CreateResultView {
+                            state_id: "created",
+                            tone: "success",
+                            title: "Instance created",
+                            summary: "Instance created. Installation is queued.",
+                            detail: None,
+                        },
+                    ),
+                    Err(_) => (
+                        None,
+                        CreateResultView {
+                            state_id: "created_install_unavailable",
+                            tone: "warn",
+                            title: "Instance created",
+                            summary: "Instance created. Installation could not be queued.",
+                            detail: Some("Use Install on this instance to try again."),
+                        },
+                    ),
                 };
                 let versions = service.installed().await.unwrap_or_default();
                 let instance = service.enrich(instance, &versions).await;
