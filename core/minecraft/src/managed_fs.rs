@@ -5603,7 +5603,6 @@ impl ManagedLibraryFileBatch {
                 return Err(io::Error::from(io::ErrorKind::NotFound));
             }
             let parent = self.parent.as_mut().expect("observed parent chain");
-            parent.revalidate()?;
             let revision = parent.directory.inner.directory.revision()?;
             parent.finish_observation(name, &revision, FileCheck::Revision(expected))?;
             self.operation.revalidate()
@@ -7368,15 +7367,23 @@ mod library_lifecycle_tests {
         let path = batch_path("first");
         let file = operation.observe_file(&path).unwrap().unwrap();
         let expected = file.revision_observation();
+        let mut batch = operation.file_batch();
+        batch.validate_revision(&path, &expected).unwrap();
         let comparisons = &root.authority.root.inner.root.file_identity_comparisons;
+        let validations = &root.authority.root.inner.root.directory_revalidations;
         comparisons.store(0, Ordering::Relaxed);
-        operation
-            .file_batch()
-            .validate_revision(&path, &expected)
-            .unwrap();
+        validations.store(0, Ordering::Relaxed);
+        for _ in 0..32 {
+            batch.validate_revision(&path, &expected).unwrap();
+        }
         let observed = comparisons.load(Ordering::Relaxed);
+        let revalidations = validations.load(Ordering::Relaxed);
         assert_eq!(file.read_bounded(32).unwrap(), b"first payload");
         assert_eq!(observed, 0, "Revision validation rebuilt file authority");
+        assert!(
+            revalidations <= 32 * 5,
+            "Repeated parent checks: {revalidations}"
+        );
     }
 
     #[test]
@@ -7618,11 +7625,16 @@ mod library_lifecycle_tests {
     #[test]
     fn file_batch_root_churn_cannot_adopt_a_replaced_ancestor() {
         let (temporary, _root, operation) = file_batch_fixture();
+        std::fs::write(temporary.path().join("unrelated"), b"preserved").unwrap();
+        let unrelated_path = PortableRelativePath::new_exact("unrelated").unwrap();
+        let unrelated = operation.observe_file(&unrelated_path).unwrap().unwrap();
         let mut batch = operation.file_batch();
         let first = batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        let second = batch.observe_file(&batch_path("second")).unwrap().unwrap();
+        let expected = second.revision_observation();
         let mut revision_batch = operation.file_batch();
         revision_batch
-            .validate_revision(&batch_path("first"), &first.revision_observation())
+            .validate_revision(&batch_path("second"), &expected)
             .unwrap();
         let journal = temporary.path().join("metadata.sqlite-journal");
         std::fs::write(&journal, b"unrelated metadata transaction").unwrap();
@@ -7643,10 +7655,14 @@ mod library_lifecycle_tests {
         assert!(first.sha1_bounded(32).is_err());
         assert!(
             revision_batch
-                .validate_revision(&batch_path("first"), &first.revision_observation())
+                .validate_revision(&batch_path("second"), &expected)
                 .is_err()
         );
+        revision_batch
+            .validate_revision(&unrelated_path, &unrelated.revision_observation())
+            .unwrap();
         assert!(batch.observe_file(&batch_path("second")).is_err());
+        assert_eq!(unrelated.read_bounded(32).unwrap(), b"preserved");
         for parent in ["assets", "previous-assets"] {
             assert_eq!(
                 std::fs::read(temporary.path().join(parent).join("objects/aa/second")).unwrap(),
@@ -7836,16 +7852,42 @@ mod library_lifecycle_tests {
     #[test]
     fn file_batch_refuses_renamed_ancestor_alias_on_sensitive_and_insensitive_hosts() {
         let (temporary, _root, operation) = file_batch_fixture();
+        std::fs::write(temporary.path().join("unrelated"), b"preserved").unwrap();
+        let unrelated_path = PortableRelativePath::new_exact("unrelated").unwrap();
+        let unrelated = operation.observe_file(&unrelated_path).unwrap().unwrap();
         let mut batch = operation.file_batch();
         batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        let second = batch.observe_file(&batch_path("second")).unwrap().unwrap();
+        let expected = second.revision_observation();
+        let mut revision_batch = operation.file_batch();
+        revision_batch
+            .validate_revision(&batch_path("second"), &expected)
+            .unwrap();
+        let directory = operation.managed_directory().unwrap();
+        let revision = directory.passive_revision().unwrap();
         std::fs::rename(
             temporary.path().join("assets"),
             temporary.path().join("Assets"),
         )
         .unwrap();
+        require_changed_directory_revision(&directory, revision, temporary.path());
+        assert!(
+            revision_batch
+                .validate_revision(&batch_path("second"), &expected)
+                .is_err()
+        );
+        assert!(
+            revision_batch
+                .validate_revision(&batch_path("second"), &expected)
+                .is_err()
+        );
+        revision_batch
+            .validate_revision(&unrelated_path, &unrelated.revision_observation())
+            .unwrap();
         assert!(batch.observe_file(&batch_path("second")).is_err());
         assert!(batch.observe_file(&batch_path("second")).is_err());
         assert!(operation.observe_file(&batch_path("second")).is_err());
+        assert_eq!(unrelated.read_bounded(32).unwrap(), b"preserved");
         assert_eq!(
             std::fs::read(temporary.path().join("Assets/objects/aa/second")).unwrap(),
             b"second payload"
