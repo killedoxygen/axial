@@ -87,7 +87,8 @@ impl JavaSelectionRequirement {
 
 /// Bounded public failure vocabulary. Raw paths, process output and OS errors
 /// are deliberately excluded from user-facing error text.
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum JavaDiscoveryError {
     #[error("The selected Java executable is missing.")]
     Missing,

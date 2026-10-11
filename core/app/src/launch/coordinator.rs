@@ -1837,7 +1837,7 @@ fn serialize_runtime_failure<S: serde::Serializer>(
     _: &JavaDiscoveryError,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    // Keep code-only persisted refusals compatible; fresh responses retain the cause.
+    // The public code stays fixed; intent persistence retains the typed cause separately.
     LaunchError::RuntimeUnavailable.serialize(serializer)
 }
 
@@ -1863,6 +1863,33 @@ pub enum LaunchIntentStatus {
     Accepted { session: SessionSnapshot },
     Rejected { error: LaunchErrorResponse },
     Interrupted { session_id: String },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum IntentRejection {
+    Runtime { runtime_failure: JavaDiscoveryError },
+    Code(LaunchError),
+}
+
+impl From<&LaunchError> for IntentRejection {
+    fn from(error: &LaunchError) -> Self {
+        match error {
+            LaunchError::RuntimeFailure(cause) => Self::Runtime {
+                runtime_failure: cause.clone(),
+            },
+            code => Self::Code(code.clone()),
+        }
+    }
+}
+
+impl From<IntentRejection> for LaunchError {
+    fn from(error: IntentRejection) -> Self {
+        match error {
+            IntentRejection::Runtime { runtime_failure } => Self::RuntimeFailure(runtime_failure),
+            IntentRejection::Code(code) => code,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2437,10 +2464,12 @@ impl LaunchIntents {
                     }
                 }
                 "rejected" => LaunchIntentStatus::Rejected {
-                    error: serde_json::from_str::<LaunchError>(
-                        &error.ok_or(LaunchError::IntentUnavailable)?,
+                    error: LaunchError::from(
+                        serde_json::from_str::<IntentRejection>(
+                            &error.ok_or(LaunchError::IntentUnavailable)?,
+                        )
+                        .map_err(|_| LaunchError::IntentUnavailable)?,
                     )
-                    .map_err(|_| LaunchError::IntentUnavailable)?
                     .into(),
                 },
                 _ => return Err(LaunchError::IntentUnavailable),
@@ -2574,14 +2603,25 @@ impl LaunchIntents {
 
     fn reject(&self, key: &str, error: &LaunchError) -> Result<(), LaunchError> {
         if let Some(storage) = &self.storage {
-            let error =
-                serde_json::to_string(&error).map_err(|_| LaunchError::IntentUnavailable)?;
+            let error = serde_json::to_string(&IntentRejection::from(error))
+                .map_err(|_| LaunchError::IntentUnavailable)?;
             storage
                 .transaction(|tx| -> Result<(), StorageError> {
-                    tx.execute(
+                    if tx.execute(
                         "UPDATE launch_intents SET state='rejected',error=?2 WHERE intent_key=?1",
                         params![key, error],
+                    )? != 1
+                    {
+                        return Err(StorageError::Corrupt);
+                    }
+                    let saved: (String, String) = tx.query_row(
+                        "SELECT state,error FROM launch_intents WHERE intent_key=?1",
+                        [key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )?;
+                    if saved != ("rejected".into(), error) {
+                        return Err(StorageError::Corrupt);
+                    }
                     Ok(())
                 })
                 .map_err(|_| LaunchError::IntentUnavailable)?;
@@ -3042,6 +3082,44 @@ mod tests {
             wire,
             serde_json::json!({"code":"runtime_unavailable", "error":expected})
         );
+        if missing && launch {
+            let saved: String = storage
+                .read(|db| -> Result<_, StorageError> {
+                    Ok(db.query_row(
+                        "SELECT error FROM launch_intents WHERE intent_key=?1 AND state='rejected'",
+                        [&key],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            drop(installed);
+            drop(pin);
+            drop(coordinator);
+            drop(reports);
+            drop(storage);
+            let storage =
+                Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
+            let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
+            let library = match crate::library::LibraryLifecycle::open(root.path()) {
+                crate::library::LibraryOpenOutcome::Ready(library) => library,
+                other => panic!("reopened fixture root: {other:?}"),
+            };
+            let directories = InstanceDirectories::new(
+                crate::instances::directory::Registry::new(storage.clone()),
+                library,
+                crate::tasks::Exclusions::new(),
+            );
+            let reopened = LaunchIntents::restore(storage, reports, &directories).unwrap();
+            let status = reopened.snapshot(&key).unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&saved).unwrap(),
+                serde_json::json!({"runtime_failure":"missing"})
+            );
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                serde_json::json!({"state":"rejected", "error":wire})
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -3113,7 +3191,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn launch_missing_java_keeps_safe_cause() {
+    async fn launch_missing_custom_java_retains_safe_cause_after_reopen() {
         assert_runtime_failure_keeps_safe_cause(true, true).await;
     }
 
