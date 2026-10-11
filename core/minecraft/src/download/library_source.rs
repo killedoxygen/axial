@@ -1382,7 +1382,7 @@ fn validate_bounded_jar<R: Read + Seek>(
     preflight_zip_central_directory(file, cancellation)?;
     file.seek(SeekFrom::Start(0))?;
     let mut archive = zip::ZipArchive::new(file)?;
-    if archive.is_empty() || archive.len() > usize::from(MAX_JAR_ENTRIES) {
+    if archive.len() > usize::from(MAX_JAR_ENTRIES) {
         return Err(std::io::Error::other(
             "library JAR entry count exceeds the bounded limit",
         ));
@@ -1420,7 +1420,7 @@ fn validate_bounded_jar<R: Read + Seek>(
         }
         has_file |= !entry.is_dir();
     }
-    if !has_file {
+    if !has_file && !archive.is_empty() {
         return Err(std::io::Error::other(
             "library source is not a readable non-empty JAR",
         ));
@@ -1478,7 +1478,11 @@ fn preflight_zip_central_directory<R: Read + Seek>(
         || entries == u16::MAX
         || directory_bytes == u32::MAX
         || directory_offset == u32::MAX
-        || entries == 0
+        || (entries == 0
+            && (length != ZIP_END_OF_CENTRAL_DIRECTORY_BYTES as u64
+                || directory_bytes != 0
+                || directory_offset != 0
+                || comment_bytes != 0))
         || entries > MAX_JAR_ENTRIES
         || directory_bytes > MAX_JAR_CENTRAL_DIRECTORY_BYTES
     {
@@ -2966,6 +2970,74 @@ mod tests {
         );
         assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
         assert_eq!(pool.retained_available_bytes(), MAX_TIER2_AGGREGATE_BYTES);
+    }
+
+    #[test]
+    fn jar_validation_accepts_only_canonical_empty_placeholder() {
+        const EMPTY_ZIP: [u8; 22] = [
+            0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(EMPTY_ZIP.len(), ZIP_END_OF_CENTRAL_DIRECTORY_BYTES);
+        assert_eq!(
+            sha1_hex(&EMPTY_ZIP),
+            "b04f3ee8f5e43fa3b162981b50bb72fe1acabb33"
+        );
+        let cancellation = uncancelled();
+        let mut reader = Cursor::new(EMPTY_ZIP);
+        reader.seek(SeekFrom::End(0)).unwrap();
+        validate_and_rewind_bounded_jar(&mut reader, &cancellation)
+            .expect("canonical empty classpath placeholder");
+        assert_eq!(reader.position(), 0);
+        assert!(zip::ZipArchive::new(reader).unwrap().is_empty());
+
+        let mut prefixed = EMPTY_ZIP.to_vec();
+        prefixed.insert(0, 0);
+        prefixed[17..21].copy_from_slice(&1_u32.to_le_bytes());
+        let mut trailing = EMPTY_ZIP.to_vec();
+        trailing.push(0);
+        let mut commented = EMPTY_ZIP.to_vec();
+        commented[20..22].copy_from_slice(&1_u16.to_le_bytes());
+        commented.push(b'x');
+        let mut nonzero_directory = EMPTY_ZIP.to_vec();
+        nonzero_directory[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        nonzero_directory.insert(0, 0);
+        let mut nonzero_offset = EMPTY_ZIP.to_vec();
+        nonzero_offset[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        let mut rejected = vec![
+            ("prefix with contiguous directory offset", prefixed),
+            ("trailing byte", trailing),
+            ("declared comment", commented),
+            ("nonzero contiguous directory size", nonzero_directory),
+            ("nonzero directory offset", nonzero_offset),
+        ];
+        for (name, offset) in [
+            ("nonzero disk", 4),
+            ("nonzero directory disk", 6),
+            ("mismatched disk entry count", 8),
+        ] {
+            let mut bytes = EMPTY_ZIP.to_vec();
+            bytes[offset..offset + 2].copy_from_slice(&1_u16.to_le_bytes());
+            rejected.push((name, bytes));
+        }
+        for (name, bytes) in rejected {
+            assert!(
+                validate_and_rewind_bounded_jar(&mut Cursor::new(bytes), &cancellation).is_err(),
+                "accepted noncanonical empty ZIP: {name}"
+            );
+        }
+
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .add_directory("empty/", SimpleFileOptions::default())
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        assert_eq!(archive.len(), 1);
+        assert!(archive.by_index(0).unwrap().is_dir());
+        drop(archive);
+        let error = validate_and_rewind_bounded_jar(&mut Cursor::new(bytes), &cancellation)
+            .expect_err("directory-only nonempty archive remains invalid");
+        assert!(error.to_string().contains("not a readable non-empty JAR"));
     }
 
     fn eocd(entries: u16, directory_bytes: u32) -> File {
