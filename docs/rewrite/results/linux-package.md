@@ -1,5 +1,11 @@
 # Linux AppImage build
 
+## Unpublished 0.4.0-rc.1 package
+
+2026-10-11, source `fd36002e`. The normal media-enabled unsigned AppImage build joins0 with version `0.4.0-rc.1` and unchanged verified frontend generation `2d6775382692`. Its222,616,056-byte artifact has SHA256 `47530ba02d84ae9dcd1edfac6f855f281afcae65636e9a7b4335fce3f2263654`; the actual bundled executable is `21c2bd6110f26d6e7f11b25adc59ed1dd71fce702b0698514a3511b86df624d7`.
+
+That exact installed package visibly renders fresh onboarding on the isolated one-output EGL Wayland compositor. Four capability-authorized HTTP reads return200. Its own native Close joins0, with no process, listener or profile holder left; the compositor also joins0 and all its services disappear. Compact evidence is `rc-linux-current/completion.json`, the onboarding capture and closure receipts. This validates the RC package at the affected boot/transport/close boundaries; prior feature and gameplay acceptance retains its recorded artifact scope. No tag admission, signing, updater artifacts or release publication occurs. Windows native acceptance and external account/trusted-update inputs remain open.
+
 ## Current Linux GTK initialization
 
 2026-10-11, a Linux-only correction over `4fc798a0` defaults unset `GDK_GL` to `always` at process entry, before Tokio/native threads start. Explicit values, including an empty value, remain untouched. This creates GTK's paint context before its first frame rather than switching to GL during a shared-memory frame. GL/WebGL remain enabled; no window workflow, capability or host setting changes. The matching [upstream WebKit correction](https://github.com/WebKit/WebKit/commit/48b35bda44fd9316dc4845f4b00506e323026167) moves context creation before painting; the retained local protocol failure has the same missing-acquire-point boundary with a different driver.
