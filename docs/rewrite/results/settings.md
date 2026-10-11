@@ -1,5 +1,9 @@
 # Settings and feature flags
 
+## Current Linux inherited settings presentation
+
+2026-10-11, the normal `716cd9f3` AppImage renders ResourceParity's restored Inherit/global Vanilla selection, inherited Java and2048/512-MB limits without settings writes. Actual ordinary Play uses the authenticated installed Java17, completes pack activation/save, survives exact whole-profile cold reopen and loads the saved textured world. Both games settle naturally0 with terminal acknowledgement; both launchers close/join0 and disappear. Accounts, core config, private settings and prior missing-Java refusals remain exact; only the two expected played revisions7→8→9 and new launch histories publish. [The pack journey](pack-files.md#current-linux-pack-activation-and-saved-world-loading) records artifact, file and process evidence. This corroborates restored native presentation and execution; the precise missing-Java refusal itself remains the earlier frozen API acceptance below.
+
 ## Current missing-Java refusal persistence
 
 2026-10-11, `e8b44c20` plus the typed refusal correction, frozen API SHA256 `a0f2b06ca31bbccbe473a47409996473ee6fe53ed993d76ba9a58e2e8c70757b`. One actual missing-Custom-Java Launch returns409, `runtime_unavailable` and “The selected Java executable is missing.” The existing intent stores the bounded typed cause and returns the same precise public response after ordinary API shutdown/reopen. Exactly two revision-bound saves advance5→7 and restore inherited Java17/Ready; no session is accepted. Current-app code-only refusals retain their original generic cause. No profile migration, schema/table, public contract, UI or security change is introduced.
