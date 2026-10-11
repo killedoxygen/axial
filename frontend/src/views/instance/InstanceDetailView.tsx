@@ -12,6 +12,7 @@ import { handleInstallClick, retryFailedInstall } from '../../machines/downloads
 import { errMessage } from '../../utils';
 import { formatDate, fmtRelative } from '../../format';
 import { instanceInstallStatus } from '../../instance-install-status';
+import { refreshInstanceReadiness } from '../../instance-readiness';
 import { resumeInstanceSetup } from '../../instance-setup';
 import {
   launchActionPresentation,
@@ -85,7 +86,13 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
   const reloadResources = (quiet = false): void => {
     if (!inst) return;
     const request = ++resourceRequest.current;
-    if (!quiet) setResources((current) => ({ status: 'loading', data: current.data ?? null }));
+    if (!quiet) {
+      setResources((current) => ({ status: 'loading', data: current.data ?? null }));
+      void refreshInstanceReadiness(inst.id, {
+        isCurrent: () => request === resourceRequest.current,
+        retry: false,
+      }).catch(() => {});
+    }
     void fetchInstanceResources(inst.id)
       .then((data) => {
         if (request === resourceRequest.current) setResources({ status: 'ready', data });

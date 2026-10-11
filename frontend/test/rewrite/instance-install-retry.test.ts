@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import { enrichedInstanceResponse } from '../../src/dto-core';
+import * as core from '../../src/dto-core';
 import * as installItems from '../../src/install-item';
 import * as launchPresenters from '../../src/launch-presenters';
 import { minecraftVersionLabel } from '../../src/version-display';
@@ -18,6 +18,7 @@ import type { LoaderComponentId } from '../../src/types-loader';
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
 const ts: typeof import('typescript') = requireDependency('typescript');
+const { enrichedInstanceResponse } = core;
 
 function harness() {
   const downloads = {
@@ -220,25 +221,47 @@ test('the instance boundary validates install targets and preserves absent compa
   assert.deepEqual(installItems.installQueueRequestFromItem(item), { kind: 'vanilla', version_id: '1.21.4' });
 });
 
-test('the real instance header follows installation and backend readiness instead of assuming Ready', () => {
+function detailHarness(inst: EnrichedInstance) {
   const h = harness();
-  const installTarget = target('net.fabricmc.fabric-loader');
-  const inst = enrichedInstanceResponse(instance(installTarget));
   const store = {
+    config: { value: null },
     instances: { value: [inst] as EnrichedInstance[] },
     launchSessions: { value: {} as Record<string, LaunchSession> },
     launchNotices: { value: {} },
     launchState: { value: { status: 'idle' } as LaunchState },
     versionById: () => undefined,
   };
+  const reads: string[] = [];
+  let read = async (): Promise<unknown> => inst;
+  const values: unknown[] = [];
+  let cursor = 0;
+  let effects: Array<() => void | (() => void)> = [];
+  const cleanups: Array<() => void> = [];
+  const readinessFile = resolve(frontend, 'src/instance-readiness.ts');
+  const readinessExports = {};
+  vm.runInNewContext(ts.transpileModule(readFileSync(readinessFile, 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
+  }).outputText, {
+    exports: readinessExports,
+    require(id: string): unknown {
+      if (id === './api') return { api: async (_method: string, path: string) => { reads.push(path); return read(); } };
+      if (id === './dto-core') return core;
+      if (id === './store') return store;
+      if (id === './utils') return { showError: assert.fail };
+      throw new Error(`Unreviewed readiness dependency: ${id}`);
+    },
+  }, { filename: readinessFile });
   const imports: Record<string, unknown> = {
     'preact/hooks': {
-      useState: <T>(initial: T | (() => T)) => [
-        typeof initial === 'function' ? (initial as () => T)() : initial,
-        () => {},
-      ],
-      useRef: <T>(value: T) => ({ current: value }),
-      useEffect() {},
+      useState: <T>(initial: T | (() => T)) => {
+        const index = cursor++;
+        if (!(index in values)) values[index] = typeof initial === 'function' ? (initial as () => T)() : initial;
+        return [values[index], (next: T | ((current: T) => T)) => {
+          values[index] = typeof next === 'function' ? (next as (current: T) => T)(values[index] as T) : next;
+        }];
+      },
+      useRef: <T>(value: T) => { const index = cursor++; return values[index] ??= { current: value }; },
+      useEffect(run: () => void | (() => void)) { effects.push(run); },
     },
     'preact/jsx-runtime': requireDependency('preact/jsx-runtime'),
     '../../ui/Icons': { Icon: 'Icon' },
@@ -250,12 +273,13 @@ test('the real instance header follows installation and backend readiness instea
     '../../actions': {},
     '../../launch': {},
     '../../machines/downloads': h.downloads,
-    '../../utils': {},
+    '../../utils': { errMessage: (error: Error) => error.message },
     '../../format': { formatDate: () => 'Today', fmtRelative: () => 'Never' },
     '../../instance-install-status': h,
     '../../instance-setup': {},
+    '../../instance-readiness': readinessExports,
     '../../launch-presenters': launchPresenters,
-    './resources': {},
+    './resources': { fetchInstanceResources: async () => { throw new Error('Resources unavailable'); } },
     './logs': {},
     './instance-actions': {},
     '../../hooks/use-theme': { useTheme: () => ({}) },
@@ -301,15 +325,33 @@ test('the real instance header follows installation and backend readiness instea
     const node = value as Node;
     return [node, ...nodes(node.props.children)];
   }
-  function status(): unknown {
+  function render(): Node[] {
+    cursor = 0;
+    effects = [];
     const root = InstanceDetailView({ id: inst.id });
     assert.equal(typeof root.type, 'function');
     const render = root.type as (props: { id: string }) => unknown;
-    const result = nodes(render({ id: inst.id }));
+    return nodes(render({ id: inst.id }));
+  }
+  function status(): unknown {
+    const result = render();
     const header = result.find((node) => node.props.class === 'cp-instance-status');
     assert.ok(header);
     return header.props.children;
   }
+  return {
+    ...h, store, reads, render, status,
+    respond(next: typeof read) { read = next; },
+    mount() { render(); for (const run of effects) { const cleanup = run(); if (cleanup) cleanups.push(cleanup); } },
+    unmount() { for (const cleanup of cleanups) cleanup(); },
+  };
+}
+
+test('the real instance header follows installation and backend readiness instead of assuming Ready', () => {
+  const installTarget = target('net.fabricmc.fabric-loader');
+  const inst = enrichedInstanceResponse(instance(installTarget));
+  const h = detailHarness(inst);
+  const { status, store } = h;
   assert.equal(status(), 'Install');
   h.downloads.activeDownload.value = {
     queueId: 'queue-1',
@@ -360,4 +402,29 @@ test('the real instance header follows installation and backend readiness instea
     },
   };
   assert.equal(status(), 'Playing');
+});
+
+test('entering instance details and refreshing Mods recover stale availability while retaining resource errors', async () => {
+  const busy = enrichedInstanceResponse(instance(null));
+  const ready: EnrichedInstance = { ...busy, launchable: true,
+    launch_action: { state_id: 'ready', primary_action: 'launch', label: 'Launch', launchable: true, tone: 'ok' } };
+  const h = detailHarness(busy);
+  h.respond(async () => ready);
+  h.mount();
+  await new Promise((done) => setImmediate(done));
+  assert.equal(h.status(), 'Ready');
+  assert.deepEqual(h.reads, [`/instances/${busy.id}`]);
+  h.store.instances.value = [busy];
+  const mods = h.render().find((node) => node.type === 'ModsPane');
+  assert.ok(mods);
+  (mods.props.onRefresh as () => void)();
+  await new Promise((done) => setImmediate(done));
+  assert.equal(h.status(), 'Ready');
+  assert.deepEqual(h.reads, [`/instances/${busy.id}`, `/instances/${busy.id}`]);
+  const resources = h.render().find((node) => node.type === 'ModsPane')?.props.resources as
+    { status: string; data: unknown; error: string };
+  assert.equal(resources.status, 'error');
+  assert.equal(resources.data, null);
+  assert.equal(resources.error, 'Resources unavailable');
+  h.unmount();
 });
