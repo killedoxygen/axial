@@ -1,8 +1,16 @@
 # World resources
 
-Status: ordinary backup, rename and deletion/restart have real-interface evidence; full resource parity remains incomplete.
+Status: ordinary backup, rename and deletion/restart have real-interface evidence, including installed Linux controls on a copy of a playable save; full resource parity remains incomplete.
 
 Production ownership is `core/app/src/resources/{worlds,service}.rs`, with registered-instance authority and retained accepted work. Legacy source remains untouched.
+
+## Current Linux installed world controls
+
+2026-10-11, unchanged normal `716cd9f3` AppImage `3dd2d1d`/bundled executable `06acf17a`. Actual Open saves opens the isolated instance's folder in Dolphin. Ordinary OS Copy/Paste, with a fresh destination name in its collision dialog, creates CurrentNativeWorldResource from the genuine ResourceActivationParity save:23 files/11,174,164bytes. Native Refresh lists both worlds. One actual Back up creates exactly one complete directory under `backups/worlds`, with all payload hashes matching the original. The backup location comes from its admitted directory-tree capture; no visible success-toast claim is made.
+
+The actual Rename dialog changes only the disposable save to CurrentNativeWorldRenamed. Delete Cancel preserves its complete save/backup trees. One confirmed Delete then removes only that copy. Every phase preserves the original file bytes, identities and mtimes; its directory proofs remain exact after copying. The backup remains exact through rename, cancellation, deletion and cold reopen. Complete protected metadata, installed/runtime files, original save, resource packs, screenshots, saved skin, launch/history and music cache remain unchanged. Cold native Worlds lists only ResourceActivationParity; the full deleted/cold snapshots and backup trees match exactly. Evidence is `.rewrite-logs/native-world-linux-current/proof/proof.json` and the actual native trees/screenshots in that directory. This qualifies the recorded installed artifact, not the separate unbuilt PNG-export change.
+
+The first shutdown uses the test helper's `xdo_close_window`, which disassembly confirms directly calls XDestroyWindow. Original75085 joins1 with GDK BadDrawable; this is destructive automation, not application Close or proof of a product defect. Its exact process/group/listener/profile holders disappear. The incorrectly supplied zero-exit receipt is excluded by the final proof; `first-closed-actual.json` retains the actual result. Cold shutdown invokes the visible application Close button: original6963 joins0 and all exact owners disappear. Display5832 joins0; the exact detached Dolphin and its workers disappear after per-PID Qt Quit, without a numeric detached-exit claim. No game, new build, product fix, authenticated account action, interruption/power-loss acceptance or full-parity closure follows.
 
 ## Bulk acknowledgement loss
 
