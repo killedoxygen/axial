@@ -1,5 +1,15 @@
 # Pack files
 
+## Current Linux native folder copy and cold preservation
+
+2026-10-11, the unchanged normal `716cd9f3` AppImage (`3dd2d1d9`, bundled executable `06acf17a`) opens the isolated ResourceParity instance's exact resource-pack directory through native More → Open resource packs folder. With the test process's Qt X11 environment, the new Dolphin window visibly renders both existing packs. Its PID, window, destination and per-process D-Bus owner are bound before interaction. This closes the earlier unobserved Wayland folder-render boundary for this isolated X11 execution.
+
+Ordinary file-manager Copy/Paste adds only `NativeFolderCopyParity.zip`:795bytes, format15, SHA256 `1a6f50c00fc05b52c2b18fcf925bd7d82feea96634ed50fa5952820e080a5bf9`. The three-file destination is visibly verified; no direct destination filesystem copy or upload API substitutes for the gesture. Native Refresh preserves the existing Worlds listing. Vanilla has no resource-pack list in this view, so Refresh is not claimed to list the added pack.
+
+The entire post-copy snapshot survives cold reopening exactly, including the new file's bytes/identity/mtime, both original packs, selected-pack options, saved world, screenshots,3,631 installed files,343 runtime entries, accounts, skin library, launch history and music-cache witnesses. The before/after delta is exactly the new pack plus the ordinary accounts → captured-instance route and interface-preferences revision11→12; config revision10 and all other settings remain unchanged. No game starts and the new copied filename is not claimed activated.
+
+Both native originals13967/36294 and display8056 join0; exact process groups, listeners and profile holders are absent. The detached opener's exact Dolphin PID disappears after its own Quit interface; its numeric child exit is unavailable. Evidence is in `.rewrite-logs/native-resource-folder-{root,prep}/` and the retained `native-skin-root/edit-folder-{before,after,cold}/` snapshots. No product/UI, host graphics/security, signing or release-publication change occurs.
+
 ## Current Linux pack activation and saved-world loading
 
 2026-10-11, the normal `716cd9f3` AppImage SHA256 `3dd2d1d92f3a1f4bb75762493379e80a1697ff35441d0dd007f5f70c95fe3a48`, running bundled executable `06acf17a0325f5bf807036509fbc572d25f261904ef9f541e388dab62e203802`, uses the isolated ResourceParity Vanilla1.20.1 profile and inherited managed Java17. Native Settings renders the saved inheritance, Vanilla mode and2048/512-MB limits without another settings write. The existing resource pack and fixture PNG remain protected. Native Open resource packs folder dispatches an opener, but its Wayland folder window is not visibly verified; the exact new file manager exits through its own Quit interface. An exclusive canonical filesystem fixture copy adds only `ResourceActivationDirt.zip`:795bytes, format15, SHA256 `1a6f50c00fc05b52c2b18fcf925bd7d82feea96634ed50fa5952820e080a5bf9`. No native folder-copy or upload-API claim follows.
