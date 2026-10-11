@@ -1,6 +1,6 @@
 # Forge loader
 
-Status: modern Forge47.4.10/Minecraft1.20.1 completes current Linux installation, visible gameplay/save, exact cold persistence and saved-world loading. Legacy-FML Forge14.23.5.2860/Minecraft1.12.2, earliest client Forge3.4.9.171/Minecraft1.2.5 and earliest universal Forge6.6.2.534/Minecraft1.4.7 retain qualified real install/boot/Stop/reopen evidence; their current Linux gameplay and all-era parity remain open. Earlier details and test counts below are historical; current composed evidence is in [integration](integration.md).
+Status: modern Forge47.4.10/Minecraft1.20.1 and the retained client, universal and FML tuples below complete installed Linux gameplay/save, exact cold persistence and visible saved-world loading at their recorded artifacts. Earlier Close exit143 observations, latency and applicable platform/release gates remain qualified. Earlier details and test counts below are historical; current composed evidence is in [integration](integration.md).
 
 ## Current Linux base-library prerequisite
 
@@ -23,6 +23,20 @@ Committed `716cd9f3` passes [hosted application and delivery verification](https
 FML's corrected attempt succeeds at revision409/Final. Complete Ready/post-preflight/cold snapshots and public Custom Java8/revision3/Ready detail agree exactly; prior failed history remains unchanged. An earlier corrected-candidate helper stops before Retry because it incorrectly requires an installed display label on the uninstalled target. Fix only that reader to authenticate the typed target and opaque selection while allowing the owner's empty preinstallation label; preserve the consumed proof and issue no duplicate mutation. All original installation/cold API owners join0 and their exact processes, listeners and profile holders disappear.
 
 Evidence: `.rewrite-logs/legacy-client-current/privatecoord/root-cold-corrected-proof.json`, `.rewrite-logs/legacy-universal-current/privatecoord/root-ready-cold-proof.json`, `.rewrite-logs/legacy-library-fixed-current/fml-fixed-round-2/handback.json`, `root-cold-worker-i5K6VuMx/handback.json` and `servers-closed.json`. These prove installation and cold persistence; current older-tuple gameplay/save/reload remains a separate acceptance boundary.
+
+### Current retained-strategy gameplay and saved-world loading
+
+The normal `716cd9f3` AppImage SHA256 `3dd2d1d92f3a1f4bb75762493379e80a1697ff35441d0dd007f5f70c95fe3a48`, actual bundled executable `06acf17a0325f5bf807036509fbc572d25f261904ef9f541e388dab62e203802`, completes native Launch on authenticated isolated software X11 for all three installed tuples. Actual menus show client one mod, universal three loaded/active mods and FML four loaded/active mods. Each creative world renders, accepts movement or camera input, produces a genuine F2 PNG, saves and quits naturally. Native world listings, HTTP PNG byte equality and bounded closed SSE pass. Whole postgame metadata, installed/runtime files, saved worlds and complete reports/intent settlement acknowledgements match after ordinary cold reopen; the durable intent restores terminal state when the retired live-session status returns404.
+
+| Tuple | Saved world | Exact first cold save | Visible reload and second save |
+| --- | --- | --- | --- |
+| Client1.2.5 /3.4.9.171 | `ClientSavedParity` | 5 files /2,299,145B | Saved pool/cactus scene and player position restore; 5 files /2,655,496B |
+| Universal1.4.7 /6.6.2.534 | `UniversalSavedParity` | 11 files /2,637,867B | Saved grass/sheep scene and camera restore; 11 files /2,637,866B |
+| FML1.12.2 /14.23.5.2860 | `New WorldFmlSavedParity` | 21 files /3,361,500B | Saved treetop scene and camera restore; 21 files /3,361,516B |
+
+Each fresh reload uses one native Launch; both games per tuple exit0, settle their process trees/output and retain acknowledgement1. Prior serialized launch proofs, accounts/core settings, content and all482/486/1,353 installed files plus305 runtime proofs remain exact. Game-owned options/config/save changes are retained separately. No block-change, audible playback or physical-display claim follows. First client Close joins0; first universal/FML Close joins143 despite complete process/listener/profile-holder absence and subsequent exact cold state. Their cause remains unproved. Final ordinary Close for every tuple joins0; narrow traces independently prove desktop and AppImage exit0, including the shell boundary for universal/FML. These later passes do not explain the initial143 results. A FML detail read exceeds its reader's five-second deadline after settlement/file capture; one bounded retained-state retry proves Ready Custom8 without recapture or game replay. It is not a responsiveness or causal-repair claim.
+
+Evidence: `.rewrite-logs/legacy-client-current/{cold-current/proof.json,reload-direct/proof.json,current-native-final-closed.json}`, `.rewrite-logs/legacy-universal-current/{cold-current/proof.json,reload-current/proof.json,current-native-final-closed.json}`, `.rewrite-logs/legacy-library-fixed-current/fml-fixed-round-2/{cold-current/proof.json,reload-current/handback.json,current-native-final-closed.json}` and `.rewrite-logs/linux-close-exit-diagnosis/diagnosis.md` with the retained final traces. All older-tuple games, launchers, listeners and profile holders are absent; no additional unchanged cold loop is run after the second save.
 
 ## Current Linux compression blocker
 
