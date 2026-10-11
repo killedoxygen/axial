@@ -595,6 +595,7 @@ mod tests {
         let skin_files = crate::native_skin::NativeSkinFiles::new(
             services.library.clone(),
             services.tasks.clone(),
+            services.skins.library.clone(),
         );
         let lifecycle = DesktopLifecycle::new(
             services.tasks.clone(),

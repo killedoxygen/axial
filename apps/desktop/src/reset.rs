@@ -392,7 +392,11 @@ mod tests {
             services.tasks.clone(),
             services.server.clone(),
             PresenceObserver::disabled_for_test(),
-            NativeSkinFiles::new(services.library.clone(), services.tasks.clone()),
+            NativeSkinFiles::new(
+                services.library.clone(),
+                services.tasks.clone(),
+                services.skins.library.clone(),
+            ),
             services.skins.clone(),
         )
     }

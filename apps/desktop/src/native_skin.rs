@@ -2,18 +2,22 @@
 //! and reduced to bounded validated bytes before the frontend can consume them.
 use crate::bootstrap::DesktopBootstrap;
 use axial_app::{
-    library::{LibraryLifecycle, NativeFileAdmission},
+    library::{
+        ApplicationRootPin, LibraryLifecycle, NativeFileAdmission, NativeFileDestination,
+        NativeFilePublishOutcome,
+    },
     media::{
         AdmittedSkinFile, MediaError, NativeSelection, NativeSkinAdmission, NativeSkinScope,
         SKIN_PNG_MAX_BYTES,
     },
+    skins::library::{SavedSkinLibrary, SavedSkinRecord},
     tasks::{CancellationToken, TaskOwner},
 };
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -27,12 +31,47 @@ const CLOSED: &str = "Skin file selection is unavailable while Axial is closing.
 #[derive(Clone)]
 pub struct NativeSkinFiles {
     library: LibraryLifecycle,
+    export: Arc<StdMutex<ExportState>>,
     tasks: TaskOwner,
     admission: NativeSkinAdmission,
     scope: NativeSkinScope,
     picker: Arc<Mutex<()>>,
     drag_eligible: Arc<AtomicBool>,
 }
+
+#[derive(Default)]
+struct ExportState {
+    closed: bool,
+    saved: Option<Arc<SavedSkinLibrary>>,
+    destination: Option<NativeFileDestination>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkinExportResult {
+    Published,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "status", content = "message", rename_all = "snake_case")]
+pub enum SkinExportError {
+    Refused(String),
+    Unknown,
+}
+
+impl SkinExportError {
+    fn from_message(message: String) -> Self {
+        if message == EXPORT_UNKNOWN {
+            Self::Unknown
+        } else {
+            Self::Refused(message)
+        }
+    }
+}
+
+const EXPORT_UNKNOWN: &str =
+    "Skin PNG export outcome is unknown. Check the chosen destination before trying again.";
 
 struct SelectedSkin {
     selection: NativeSelection,
@@ -41,9 +80,13 @@ struct SelectedSkin {
 }
 
 impl NativeSkinFiles {
-    pub fn new(library: LibraryLifecycle, tasks: TaskOwner) -> Self {
+    pub fn new(library: LibraryLifecycle, tasks: TaskOwner, saved: Arc<SavedSkinLibrary>) -> Self {
         Self {
             library,
+            export: Arc::new(StdMutex::new(ExportState {
+                saved: Some(saved),
+                ..ExportState::default()
+            })),
             tasks,
             admission: NativeSkinAdmission::new(),
             scope: NativeSkinScope::for_window(crate::window::MAIN_WINDOW)
@@ -56,10 +99,39 @@ impl NativeSkinFiles {
     pub fn close(&self) {
         self.drag_eligible.store(false, Ordering::Release);
         self.admission.close();
+        self.export
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed = true;
     }
 
-    pub async fn drain(&self) {
+    pub async fn drain(&self) -> Result<(), String> {
         self.admission.drain().await;
+        // The original accepted task retains this lease through the dialog and write.
+        let _picker = self.picker.lock().await;
+        let export = self.export.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut state = export.lock().unwrap_or_else(|error| error.into_inner());
+            if !state.closed {
+                return Err(CLOSED.to_string());
+            }
+            if let Some(destination) = state.destination.as_mut() {
+                let outcome = match destination.reconcile() {
+                    NativeFilePublishOutcome::Pending(_) => destination.preserve(),
+                    outcome => outcome,
+                };
+                if matches!(outcome, NativeFilePublishOutcome::Pending(_)) {
+                    return Err(EXPORT_UNKNOWN.to_string());
+                }
+                state.destination = None;
+            }
+            let saved = state.saved.take();
+            drop(state);
+            drop(saved);
+            Ok(())
+        })
+        .await
+        .map_err(|_| EXPORT_UNKNOWN.to_string())?
     }
 
     fn admit_selection(&self, path: &Path) -> Result<SelectedSkin, String> {
@@ -124,6 +196,83 @@ impl NativeSkinFiles {
         }
         let token = read_selection(selected).await?;
         self.consume(&token).map(Some)
+    }
+
+    async fn export_saved(
+        &self,
+        app: AppHandle,
+        root: ApplicationRootPin,
+        saved: Arc<SavedSkinLibrary>,
+        expected: SavedSkinRecord,
+        cancel: CancellationToken,
+    ) -> Result<SkinExportResult, String> {
+        let captured = tokio::task::spawn_blocking(move || saved.capture_export(&expected))
+            .await
+            .map_err(|_| "Could not capture the saved skin PNG.".to_string())?
+            .map_err(|error| error.to_string())?;
+        if cancel.is_cancelled() {
+            return Ok(SkinExportResult::Cancelled);
+        }
+        let (sender, receiver) = oneshot::channel::<Result<bool, String>>();
+        let export = self.export.clone();
+        let callback_cancel = cancel.clone();
+        app.dialog()
+            .file()
+            .add_filter("PNG skin", &["png"])
+            .set_file_name(download_filename(&captured.skin.record.name))
+            .save_file(move |selected| {
+                let selection = (|| {
+                    if callback_cancel.is_cancelled() {
+                        return Ok(false);
+                    }
+                    let Some(selected) = selected else {
+                        return Ok(false);
+                    };
+                    let path = selected.into_path().map_err(|_| {
+                        "Native save dialog returned an invalid destination.".to_string()
+                    })?;
+                    if !has_png_extension(&path) {
+                        return Err("Choose a destination ending in .png.".into());
+                    }
+                    let mut state = export.lock().unwrap_or_else(|error| error.into_inner());
+                    if state.closed {
+                        return Ok(false);
+                    }
+                    if state.destination.is_some() {
+                        return Err(EXPORT_UNKNOWN.into());
+                    }
+                    let destination = root
+                        .admit_native_destination(&path)
+                        .map_err(export_message)?;
+                    state.destination = Some(destination);
+                    Ok(true)
+                })();
+                let _ = sender.send(selection);
+            });
+        // Cancellation cannot drop a dialog callback retaining the root. Wait for
+        // its actual response before releasing the accepted task's picker lease.
+        let selected = receiver.await.map_err(|_| {
+            "Native save dialog stopped before selecting a destination.".to_string()
+        })??;
+        if !selected {
+            return Ok(SkinExportResult::Cancelled);
+        }
+        let export = self.export.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut state = export.lock().unwrap_or_else(|error| error.into_inner());
+            let destination = state
+                .destination
+                .as_mut()
+                .ok_or_else(|| EXPORT_UNKNOWN.to_string())?;
+            let outcome = if cancel.is_cancelled() {
+                destination.cancel()
+            } else {
+                destination.publish(&captured.png)
+            };
+            finish_export(&mut state, outcome)
+        })
+        .await
+        .map_err(|_| EXPORT_UNKNOWN.to_string())?
     }
 
     fn consume(&self, token: &str) -> Result<AdmittedSkinFile, String> {
@@ -290,6 +439,127 @@ pub async fn pick_skin_file(
 }
 
 #[tauri::command]
+pub async fn export_saved_skin_png(
+    app: AppHandle,
+    window: WebviewWindow,
+    bootstrap: State<'_, DesktopBootstrap>,
+    skin: State<'_, NativeSkinFiles>,
+    expected: SavedSkinRecord,
+) -> Result<SkinExportResult, SkinExportError> {
+    crate::window::require_main_window(&window, &bootstrap).map_err(SkinExportError::Refused)?;
+    let skin = skin.inner().clone();
+    let permit =
+        skin.picker.clone().try_lock_owned().map_err(|_| {
+            SkinExportError::Refused("The skin file dialog is already open.".into())
+        })?;
+    let root = skin
+        .library
+        .admit_application_root()
+        .map_err(|_| SkinExportError::Refused(CLOSED.into()))?;
+    let tasks = skin.tasks.clone();
+    let export = skin.export.clone();
+    let handle = {
+        let state = export.lock().unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            return Err(SkinExportError::Refused(CLOSED.into()));
+        }
+        if state.destination.is_some() {
+            return Err(SkinExportError::Unknown);
+        }
+        let saved = state
+            .saved
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| SkinExportError::Refused(CLOSED.into()))?;
+        tasks
+            .try_spawn((permit, root.clone()), move |cancel| async move {
+                skin.export_saved(app, root, saved, expected, cancel).await
+            })
+            .map_err(|_| SkinExportError::Refused(CLOSED.into()))?
+    };
+    handle
+        .join()
+        .await
+        .map_err(|_| SkinExportError::Unknown)?
+        .map_err(SkinExportError::from_message)
+}
+
+fn finish_export(
+    state: &mut ExportState,
+    outcome: NativeFilePublishOutcome,
+) -> Result<SkinExportResult, String> {
+    match outcome {
+        NativeFilePublishOutcome::Pending(_) => Err(EXPORT_UNKNOWN.into()),
+        NativeFilePublishOutcome::Preserved => {
+            state.destination = None;
+            Err(EXPORT_UNKNOWN.into())
+        }
+        NativeFilePublishOutcome::Published => {
+            state.destination = None;
+            Ok(SkinExportResult::Published)
+        }
+        NativeFilePublishOutcome::Cancelled => {
+            state.destination = None;
+            Ok(SkinExportResult::Cancelled)
+        }
+        NativeFilePublishOutcome::NoEffect(error) => {
+            state.destination = None;
+            Err(export_message(error))
+        }
+    }
+}
+
+fn export_message(error: std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::AlreadyExists => {
+            "A file already exists at that destination. Choose a new filename."
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            "Skin PNG destination access was denied. Choose another destination."
+        }
+        std::io::ErrorKind::StorageFull => {
+            "The skin PNG destination is full. Free space and try again."
+        }
+        std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::NotFound => {
+            "Skin PNG destination changed or is unavailable. Choose it again."
+        }
+        _ => "Could not save skin PNG. No file was published.",
+    }
+    .into()
+}
+
+fn download_filename(name: &str) -> String {
+    let normalized: String = name
+        .trim()
+        .chars()
+        .map(|value| {
+            if matches!(value, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+                || (value as u32) < 32
+            {
+                ' '
+            } else {
+                value
+            }
+        })
+        .collect();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let units: Vec<u16> = normalized.encode_utf16().take(80).collect();
+    let bounded = String::from_utf16_lossy(&units);
+    let mut base = bounded.trim();
+    if base.len() >= 4
+        && base
+            .get(base.len() - 4..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".png"))
+    {
+        base = &base[..base.len() - 4];
+    }
+    base = base.trim_end_matches(['.', ' ']).trim();
+    format!("{}.png", if base.is_empty() { "saved-skin" } else { base })
+}
+
+#[tauri::command]
 pub fn consume_skin_drop(
     window: WebviewWindow,
     bootstrap: State<'_, DesktopBootstrap>,
@@ -403,9 +673,18 @@ mod tests {
                 panic!("fixture acquisition was unresolved")
             }
         };
+        let metadata = Arc::new(axial_app::storage::MetadataStore::in_memory().unwrap());
+        axial_app::accounts::directory::AccountDirectory::new(metadata.clone()).unwrap();
+        metadata
+            .migrate(&[axial_app::skins::store::MIGRATION])
+            .unwrap();
+        let saved = Arc::new(SavedSkinLibrary::new(
+            axial_app::skins::store::SavedSkinStore::new(metadata),
+            library.admit_application_root().unwrap(),
+        ));
         (
             directory,
-            NativeSkinFiles::new(library, TaskOwner::new(4).unwrap()),
+            NativeSkinFiles::new(library, TaskOwner::new(4).unwrap(), saved),
         )
     }
 
@@ -426,8 +705,75 @@ mod tests {
 
     async fn finish(skin: &NativeSkinFiles) {
         skin.close();
-        skin.drain().await;
+        skin.drain().await.unwrap();
         skin.library.try_preserve().unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_export_outlives_its_waiter_and_never_changes_the_library_or_existing_target()
+    {
+        let (_directory, skin) = fixture();
+        let external =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let source = skin.export.lock().unwrap().saved.as_ref().unwrap().clone();
+        let saved = source
+            .save_upload(
+                &png(),
+                axial_app::skins::library::SaveSkinOptions {
+                    name: "Export skin".into(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let captured = source.capture_export(&saved).unwrap();
+        let before = source.get(&saved.texture_key).unwrap();
+        let bytes = captured.png;
+        let path = external.path().join(download_filename(&saved.name));
+        let root = skin.library.admit_application_root().unwrap();
+        skin.export.lock().unwrap().destination =
+            Some(root.admit_native_destination(&path).unwrap());
+        let export = skin.export.clone();
+        let expected = bytes.clone();
+        let permit = skin.picker.clone().try_lock_owned().unwrap();
+        let (start, started) = oneshot::channel();
+        let (settled, result) = oneshot::channel();
+        let handle = skin
+            .tasks
+            .try_spawn((permit, root), move |_cancel| async move {
+                started.await.unwrap();
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut state = export.lock().unwrap();
+                    let outcome = state.destination.as_mut().unwrap().publish(&expected);
+                    finish_export(&mut state, outcome)
+                })
+                .await
+                .unwrap();
+                let _ = settled.send(result);
+            })
+            .unwrap();
+        drop(handle);
+        start.send(()).unwrap();
+        assert_eq!(result.await.unwrap().unwrap(), SkinExportResult::Published);
+        skin.tasks
+            .shutdown(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(source.get(&saved.texture_key).unwrap(), before);
+        let root = skin.library.admit_application_root().unwrap();
+        match root.admit_native_destination(&path) {
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists),
+            Ok(mut destination) => {
+                assert!(matches!(
+                    destination.publish(b"replacement"),
+                    NativeFilePublishOutcome::NoEffect(_)
+                ));
+            }
+        }
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        drop(source);
+        finish(&skin).await;
     }
 
     #[tokio::test]
@@ -503,6 +849,27 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert!(wait_for_picker(receiver, &cancel).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn export_response_encodes_only_settled_success_and_owner_classified_refusal() {
+        assert_eq!(
+            serde_json::to_value(SkinExportResult::Published).unwrap(),
+            serde_json::json!("published")
+        );
+        assert_eq!(
+            serde_json::to_value(SkinExportResult::Cancelled).unwrap(),
+            serde_json::json!("cancelled")
+        );
+        assert_eq!(
+            serde_json::to_value(SkinExportError::Unknown).unwrap(),
+            serde_json::json!({"status": "unknown"})
+        );
+        assert_eq!(
+            serde_json::to_value(SkinExportError::Refused("Destination unavailable.".into()))
+                .unwrap(),
+            serde_json::json!({"status": "refused", "message": "Destination unavailable."})
+        );
     }
 
     #[test]

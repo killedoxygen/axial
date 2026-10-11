@@ -70,6 +70,13 @@ pub struct SavedSkinSnapshot {
     pub revision: u64,
 }
 
+/// Immutable, validated export input captured under library mutation admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavedSkinExport {
+    pub skin: SavedSkinSnapshot,
+    pub png: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SavedSkinDeleteResult {
     Deleted(SavedSkinRecord),
@@ -227,6 +234,36 @@ impl SavedSkinLibrary {
         let texture_key = validate_texture_key(texture_key)?;
         let _guard = self.lock()?;
         self.store.read_png(&texture_key)
+    }
+
+    pub fn capture_export(
+        &self,
+        expected: &SavedSkinRecord,
+    ) -> Result<SavedSkinExport, SkinLibraryError> {
+        let key = validate_texture_key(&expected.texture_key)?;
+        let _guard = self.lock()?;
+        let skin = self.store.get(&key)?.ok_or(SkinLibraryError::Conflict)?;
+        // Applied markers are account projections, not texture authority.
+        let current = &skin.record;
+        if current.texture_key != expected.texture_key
+            || current.name != expected.name
+            || current.variant != expected.variant
+            || current.source != expected.source
+            || current.cape_id != expected.cape_id
+            || current.created_at != expected.created_at
+            || current.updated_at != expected.updated_at
+            || current.byte_size != expected.byte_size
+        {
+            return Err(SkinLibraryError::Conflict);
+        }
+        let png = self
+            .store
+            .read_png(&key)?
+            .ok_or(SkinLibraryError::InvalidData)?;
+        if png.len() != skin.record.byte_size {
+            return Err(SkinLibraryError::InvalidData);
+        }
+        Ok(SavedSkinExport { skin, png })
     }
 
     pub fn save_upload(
@@ -540,6 +577,82 @@ pub(super) fn portable_token(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_captures_verified_png_and_private_revision_but_refuses_stale_same_key_metadata() {
+        use crate::{
+            accounts::directory::AccountDirectory,
+            library::{LibraryLifecycle, LibraryOpenOutcome},
+            skins::{store::MIGRATION, tests::png},
+            storage::MetadataStore,
+        };
+        let directory =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let roots = match LibraryLifecycle::open(directory.path()) {
+            LibraryOpenOutcome::Ready(roots) => roots,
+            _ => panic!("isolated root"),
+        };
+        let metadata = Arc::new(MetadataStore::in_memory().unwrap());
+        let accounts = AccountDirectory::new(metadata.clone()).unwrap();
+        accounts.create_offline_account("Export").unwrap();
+        let account = accounts.capture_selected().unwrap();
+        metadata.migrate(&[MIGRATION]).unwrap();
+        let library = SavedSkinLibrary::new(
+            SavedSkinStore::new(metadata),
+            roots.admit_application_root().unwrap(),
+        );
+        let saved = library
+            .save_upload(
+                &png(37),
+                SaveSkinOptions {
+                    name: "Captured".into(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert!(
+            library
+                .mark_applied(account.account_id(), &saved.texture_key)
+                .unwrap()
+        );
+        let expected = library
+            .list_for_account(account.account_id())
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(expected.applied_at.is_some());
+        let export = library.capture_export(&expected).unwrap();
+        assert_eq!(
+            export.png,
+            library.read_png(&saved.texture_key).unwrap().unwrap()
+        );
+        assert_eq!(
+            export.skin.revision,
+            library.get(&saved.texture_key).unwrap().unwrap().revision
+        );
+        library
+            .update_metadata(
+                &saved.texture_key,
+                UpdateSavedSkinRequest {
+                    name: Some("Renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            library.capture_export(&expected),
+            Err(SkinLibraryError::Conflict)
+        );
+        let current = library.get(&saved.texture_key).unwrap().unwrap();
+        assert!(current.revision > export.skin.revision);
+        assert_eq!(
+            library.capture_export(&current.record).unwrap().png,
+            export.png
+        );
+        drop(library);
+        roots.try_preserve().unwrap();
+    }
 
     #[test]
     fn cape_json_distinguishes_omitted_null_and_selection() {

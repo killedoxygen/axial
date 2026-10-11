@@ -477,6 +477,29 @@ pub(super) fn into_published_file(file: TransientFile) -> File {
     file.handle
 }
 
+pub(super) fn acknowledge_preserved(
+    file: &mut TransientFile,
+    effect: &mut TransientEffectToken,
+) -> io::Result<()> {
+    let mut storage = lock(file)?;
+    match storage
+        .state
+        .as_mut()
+        .ok_or_else(|| io::Error::other("named transient state is unavailable"))?
+    {
+        State::Writing { stage, .. } => effect.preserve_named_stage(&mut stage.token),
+        State::Sealed(stage) => effect.preserve_named_stage(&mut stage.token),
+        State::Promotion(obligation) => effect.preserve_named_stage(&mut obligation.retained.token),
+        State::Discard(obligation) => effect.preserve_named_stage(
+            obligation
+                .token
+                .as_mut()
+                .expect("discard retains stage token"),
+        ),
+        State::Published { .. } | State::Discarded => effect.acknowledge_preserved(),
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -834,5 +857,53 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(before, after);
         assert!(!temp.path().join("never-published.bin").exists());
+    }
+
+    #[test]
+    fn external_named_preservation_keeps_exact_scratch_and_allows_root_drop() {
+        let temp =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let profile = temp.path().join("profile");
+        let parent = temp.path().join("chosen");
+        let displaced = temp.path().join("displaced");
+        std::fs::create_dir(&parent).unwrap();
+        let session = acquire(&profile);
+        let admission = match session.admit_absolute_directory_authority_outside_root(&parent) {
+            crate::AbsoluteDirectoryOutsideRootAdmission::Admitted(admission) => admission,
+            _ => panic!("external parent"),
+        };
+        let destination = admission
+            .admit_transient_destination(LeafName::new("saved.png").unwrap())
+            .unwrap();
+        let TransientStageCreateOutcome::Created(mut stage) = destination.create_stage() else {
+            panic!("named external stage")
+        };
+        stage.write_all(b"preserved scratch bytes").unwrap();
+        let exact_scratch = scratch(&parent, &stage).file_name().unwrap().to_owned();
+        let batch = TransientPublicationBatch::new(vec![stage.seal().unwrap()]).unwrap();
+        std::fs::rename(&parent, &displaced).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("saved.png"), b"replacement").unwrap();
+        let TransientPublicationBatchOutcome::NoEffect { batch, .. } = batch.publish_create_new()
+        else {
+            panic!("displaced stage was not published")
+        };
+        let stage = batch.into_stages().pop().unwrap();
+        let TransientDiscardOutcome::Pending(obligation) = stage.discard() else {
+            panic!("stale ancestry keeps exact cleanup owner")
+        };
+        assert!(obligation.acknowledge_preserved().is_ok());
+        drop(admission);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        let reopened = acquire(&profile);
+        assert!(matches!(reopened.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(
+            std::fs::read(displaced.join(exact_scratch)).unwrap(),
+            b"preserved scratch bytes"
+        );
+        assert_eq!(
+            std::fs::read(parent.join("saved.png")).unwrap(),
+            b"replacement"
+        );
     }
 }

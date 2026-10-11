@@ -90,8 +90,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(std::io::Error::other(message).into());
         }
     };
-    let skin_files =
-        native_skin::NativeSkinFiles::new(services.library.clone(), services.tasks.clone());
+    let skin_files = native_skin::NativeSkinFiles::new(
+        services.library.clone(),
+        services.tasks.clone(),
+        services.skins.library.clone(),
+    );
     let lifecycle = DesktopLifecycle::new(
         services.tasks.clone(),
         services.server.clone(),
@@ -160,6 +163,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             auth::microsoft_sign_in,
             native_skin::pick_skin_file,
             native_skin::consume_skin_drop,
+            native_skin::export_saved_skin_png,
             bootstrap::api_transport_bootstrap,
             window::desktop_chrome,
             window::window_minimize,

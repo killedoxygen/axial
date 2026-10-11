@@ -23,6 +23,7 @@ import {
   defaultSkinTextureKey,
   defaultSkinTextureKeys,
   downloadBlob,
+  exportNativeSavedSkinPng,
   fetchSavedSkinPng,
   isRecord,
   pendingSkinStatus,
@@ -469,7 +470,9 @@ export async function deleteSavedSkin(skin: SavedSkinRecord): Promise<void> {
 
 export async function downloadSavedSkin(skin: SavedSkinRecord): Promise<void> {
   await wardrobeAction({ kind: 'download', key: skin.texture_key }, 'Could not download skin PNG.', async () => {
-    downloadBlob(await fetchSavedSkinPng(skin), savedSkinDownloadFilename(skin));
+    const native = await exportNativeSavedSkinPng(skin);
+    if (native === 'cancelled') return null;
+    if (native === undefined) downloadBlob(await fetchSavedSkinPng(skin), savedSkinDownloadFilename(skin));
     return 'Skin PNG downloaded';
   });
 }

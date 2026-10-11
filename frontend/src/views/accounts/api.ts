@@ -345,6 +345,23 @@ export async function fetchSavedSkinPng(skin: SavedSkinRecord): Promise<Blob> {
   return blob;
 }
 
+export async function exportNativeSavedSkinPng(skin: SavedSkinRecord): Promise<'published' | 'cancelled' | undefined> {
+  const tauri = typeof window === 'undefined' ? undefined : window.__TAURI__;
+  if (!tauri) return undefined;
+  const unknown = 'Skin PNG export outcome is unknown. Check the chosen destination before trying again.';
+  if (!tauri.core) throw new Error(unknown);
+  const payload = await tauri.core
+    .invoke('export_saved_skin_png', { expected: { ...skin } })
+    .catch((reason: unknown) => {
+      if (isRecord(reason) && reason.status === 'refused' && typeof reason.message === 'string') {
+        throw new Error(reason.message);
+      }
+      throw new Error(unknown);
+    });
+  if (payload !== 'published' && payload !== 'cancelled') throw new Error(unknown);
+  return payload;
+}
+
 export function downloadBlob(blob: Blob, filename: string): void {
   const objectUrl = URL.createObjectURL(blob);
   const anchor = document.createElement('a');

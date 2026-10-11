@@ -15,6 +15,7 @@ fn main() {
         "microsoft_sign_in",
         "pick_skin_file",
         "consume_skin_drop",
+        "export_saved_skin_png",
         #[cfg(debug_assertions)]
         "app_reset",
     ];

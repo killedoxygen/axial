@@ -253,6 +253,343 @@ impl NativeFileAdmission {
     }
 }
 
+/// One OS-selected external destination. All pending authority remains here;
+/// callers retain this value before reporting a publication failure.
+pub struct NativeFileDestination {
+    state: NativeDestinationState,
+    failure: Option<io::Error>,
+    pin: Option<ApplicationRootPin>,
+}
+
+#[must_use = "a pending native publication retains its exact filesystem owner"]
+pub enum NativeFilePublishOutcome {
+    Published,
+    Cancelled,
+    NoEffect(io::Error),
+    Pending(io::Error),
+    /// Preservation is terminal but does not prove publication.
+    Preserved,
+}
+
+enum NativeDestinationState {
+    Admitted(axial_fs::TransientDestination),
+    Creation(axial_fs::TransientCreationObligation),
+    Discard(axial_fs::TransientDiscardObligation),
+    Cancellation(axial_fs::TransientDestinationCancelObligation),
+    Publication(axial_fs::TransientPublicationBatchObligation),
+    // Retain an unexpected singleton contract result, including during unwind.
+    Unclassified(Vec<axial_fs::TransientPublicationMember>),
+    Published,
+    Cancelled,
+    NoEffect,
+    Preserved,
+}
+
+const MAX_NATIVE_DESTINATION_BYTES: usize = 32 << 20;
+const NATIVE_VERIFY_BUFFER_BYTES: usize = 8 << 10;
+
+impl NativeFileDestination {
+    /// Accepted publication runs to settlement. Request cancellation must call
+    /// cancel before publication; reconciliation never writes these bytes again.
+    pub fn publish(&mut self, bytes: &[u8]) -> NativeFilePublishOutcome {
+        if !matches!(self.state, NativeDestinationState::Admitted(_)) {
+            return self.reconcile();
+        }
+        let mut buffer = Vec::new();
+        let preparation = if bytes.is_empty() || bytes.len() > MAX_NATIVE_DESTINATION_BYTES {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native publication exceeds its byte bound",
+            ))
+        } else {
+            // Reserve before stage creation. Work is one bounded write, the
+            // filesystem owner's seal verification, and one sealed-byte pass.
+            buffer
+                .try_reserve_exact(NATIVE_VERIFY_BUFFER_BYTES)
+                .map_err(|_| io::Error::other("native publication working capacity is exhausted"))
+                .and_then(|()| {
+                    self.pin
+                        .as_ref()
+                        .expect("admitted destination retains a root pin")
+                        .revalidate()
+                })
+        };
+        if let Err(error) = preparation {
+            self.failure = Some(error);
+            return self.cancel();
+        }
+        buffer.resize(NATIVE_VERIFY_BUFFER_BYTES, 0);
+        let NativeDestinationState::Admitted(destination) = self.take_state() else {
+            unreachable!("publication inspected its admitted state");
+        };
+        let mut stage = match destination.create_stage() {
+            axial_fs::TransientStageCreateOutcome::Created(stage) => stage,
+            axial_fs::TransientStageCreateOutcome::NoEffect { error, destination } => {
+                self.failure = Some(error);
+                return self.finish_cancel(destination.cancel());
+            }
+            axial_fs::TransientStageCreateOutcome::Pending(obligation) => {
+                let kind = obligation.error().kind();
+                self.state = NativeDestinationState::Creation(obligation);
+                self.failure = Some(io::Error::new(kind, "native stage creation is unsettled"));
+                return self.outcome();
+            }
+        };
+        if let Err(error) = stage.write_all(bytes) {
+            self.failure = Some(error);
+            return self.finish_discard(stage.discard());
+        }
+        let mut sealed = match stage.seal() {
+            Ok(sealed) => sealed,
+            Err(failure) => {
+                self.failure = Some(copy_native_error(failure.error()));
+                return self.finish_discard(failure.into_stage().discard());
+            }
+        };
+        let verification = (|| {
+            use std::io::Read;
+            if sealed.size() != bytes.len() as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "native staged file has an unexpected size",
+                ));
+            }
+            for expected in bytes.chunks(NATIVE_VERIFY_BUFFER_BYTES) {
+                let actual = &mut buffer[..expected.len()];
+                sealed.read_exact(actual)?;
+                if actual != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "native staged bytes changed before publication",
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = verification {
+            self.failure = Some(error);
+            return self.finish_discard(sealed.discard());
+        }
+        let batch = match axial_fs::TransientPublicationBatch::new(vec![sealed]) {
+            Ok(batch) => batch,
+            Err(failure) => {
+                self.failure = Some(copy_native_error(failure.error()));
+                return self.discard_singleton(failure.into_stages());
+            }
+        };
+        self.finish_publication(batch.publish_create_new())
+    }
+
+    pub fn cancel(&mut self) -> NativeFilePublishOutcome {
+        match self.take_state() {
+            NativeDestinationState::Admitted(destination) => {
+                self.finish_cancel(destination.cancel())
+            }
+            state => {
+                self.state = state;
+                self.reconcile()
+            }
+        }
+    }
+
+    /// One attempt against captured evidence. It never re-admits a path or
+    /// retries publication after an unknown result.
+    pub fn reconcile(&mut self) -> NativeFilePublishOutcome {
+        match self.take_state() {
+            NativeDestinationState::Admitted(destination) => {
+                self.finish_cancel(destination.cancel())
+            }
+            NativeDestinationState::Creation(obligation) => match obligation.reconcile() {
+                axial_fs::TransientStageCreateOutcome::Created(stage) => {
+                    self.finish_discard(stage.discard())
+                }
+                axial_fs::TransientStageCreateOutcome::NoEffect { destination, .. } => {
+                    self.finish_cancel(destination.cancel())
+                }
+                axial_fs::TransientStageCreateOutcome::Pending(obligation) => {
+                    self.state = NativeDestinationState::Creation(obligation);
+                    self.outcome()
+                }
+            },
+            NativeDestinationState::Discard(obligation) => {
+                self.finish_discard(obligation.reconcile())
+            }
+            NativeDestinationState::Cancellation(obligation) => {
+                self.finish_cancel(obligation.reconcile())
+            }
+            NativeDestinationState::Publication(obligation) => {
+                self.finish_publication(obligation.reconcile())
+            }
+            state => {
+                self.state = state;
+                self.outcome()
+            }
+        }
+    }
+
+    /// Called after accepted producers have joined for preserve-only exit.
+    /// Unknown final bindings and portable scratch are left untouched.
+    pub fn preserve(&mut self) -> NativeFilePublishOutcome {
+        let state = self.take_state();
+        let retained = match state {
+            NativeDestinationState::Creation(obligation) => obligation
+                .acknowledge_preserved()
+                .err()
+                .map(NativeDestinationState::Creation),
+            NativeDestinationState::Discard(obligation) => obligation
+                .acknowledge_preserved()
+                .err()
+                .map(NativeDestinationState::Discard),
+            NativeDestinationState::Cancellation(obligation) => obligation
+                .acknowledge_preserved()
+                .err()
+                .map(NativeDestinationState::Cancellation),
+            NativeDestinationState::Publication(obligation) => obligation
+                .acknowledge_preserved_singleton()
+                .err()
+                .map(NativeDestinationState::Publication),
+            state => {
+                self.state = state;
+                return self.cancel();
+            }
+        };
+        self.state = retained.unwrap_or(NativeDestinationState::Preserved);
+        self.outcome()
+    }
+
+    fn take_state(&mut self) -> NativeDestinationState {
+        std::mem::replace(
+            &mut self.state,
+            NativeDestinationState::Unclassified(Vec::new()),
+        )
+    }
+
+    fn finish_cancel(
+        &mut self,
+        outcome: axial_fs::TransientDestinationCancelOutcome,
+    ) -> NativeFilePublishOutcome {
+        self.state = match outcome {
+            axial_fs::TransientDestinationCancelOutcome::Cancelled if self.failure.is_some() => {
+                NativeDestinationState::NoEffect
+            }
+            axial_fs::TransientDestinationCancelOutcome::Cancelled => {
+                NativeDestinationState::Cancelled
+            }
+            axial_fs::TransientDestinationCancelOutcome::Pending(obligation) => {
+                NativeDestinationState::Cancellation(obligation)
+            }
+        };
+        self.outcome()
+    }
+
+    fn finish_discard(
+        &mut self,
+        outcome: axial_fs::TransientDiscardOutcome,
+    ) -> NativeFilePublishOutcome {
+        match outcome {
+            axial_fs::TransientDiscardOutcome::Discarded(destination) => {
+                self.finish_cancel(destination.cancel())
+            }
+            axial_fs::TransientDiscardOutcome::Pending(obligation) => {
+                self.state = NativeDestinationState::Discard(obligation);
+                self.outcome()
+            }
+        }
+    }
+
+    fn discard_singleton(
+        &mut self,
+        mut stages: Vec<axial_fs::TransientStageSealed>,
+    ) -> NativeFilePublishOutcome {
+        if stages.len() == 1 {
+            return self.finish_discard(stages.pop().expect("checked singleton").discard());
+        }
+        self.state = NativeDestinationState::Unclassified(
+            stages
+                .into_iter()
+                .map(axial_fs::TransientPublicationMember::Unpublished)
+                .collect(),
+        );
+        self.outcome()
+    }
+
+    fn finish_publication(
+        &mut self,
+        outcome: axial_fs::TransientPublicationBatchOutcome,
+    ) -> NativeFilePublishOutcome {
+        match outcome {
+            axial_fs::TransientPublicationBatchOutcome::Published(files) if files.len() == 1 => {
+                // The filesystem owner settled its durable exact binding. The
+                // external artifact now belongs to the user, independently.
+                self.state = NativeDestinationState::Published;
+                self.outcome()
+            }
+            axial_fs::TransientPublicationBatchOutcome::Published(files) => {
+                self.state = NativeDestinationState::Unclassified(
+                    files
+                        .into_iter()
+                        .map(axial_fs::TransientPublicationMember::Published)
+                        .collect(),
+                );
+                self.outcome()
+            }
+            axial_fs::TransientPublicationBatchOutcome::NoEffect { error, batch } => {
+                self.failure = Some(error);
+                self.discard_singleton(batch.into_stages())
+            }
+            axial_fs::TransientPublicationBatchOutcome::Partial { error, members } => {
+                self.failure = Some(error);
+                self.state = NativeDestinationState::Unclassified(members);
+                self.outcome()
+            }
+            axial_fs::TransientPublicationBatchOutcome::Pending(obligation) => {
+                self.state = NativeDestinationState::Publication(obligation);
+                self.outcome()
+            }
+        }
+    }
+
+    fn outcome(&mut self) -> NativeFilePublishOutcome {
+        let outcome = match &self.state {
+            NativeDestinationState::Published => NativeFilePublishOutcome::Published,
+            NativeDestinationState::Cancelled => NativeFilePublishOutcome::Cancelled,
+            NativeDestinationState::NoEffect => {
+                NativeFilePublishOutcome::NoEffect(copy_native_error(
+                    self.failure
+                        .as_ref()
+                        .expect("failed publication retains its cause"),
+                ))
+            }
+            NativeDestinationState::Preserved => NativeFilePublishOutcome::Preserved,
+            NativeDestinationState::Creation(obligation) => {
+                NativeFilePublishOutcome::Pending(copy_native_error(obligation.error()))
+            }
+            NativeDestinationState::Discard(obligation) => {
+                NativeFilePublishOutcome::Pending(copy_native_error(obligation.error()))
+            }
+            NativeDestinationState::Cancellation(obligation) => {
+                NativeFilePublishOutcome::Pending(copy_native_error(obligation.error()))
+            }
+            NativeDestinationState::Publication(obligation) => {
+                NativeFilePublishOutcome::Pending(copy_native_error(obligation.error()))
+            }
+            NativeDestinationState::Admitted(_) | NativeDestinationState::Unclassified(_) => {
+                NativeFilePublishOutcome::Pending(io::Error::other(
+                    "native publication has not settled",
+                ))
+            }
+        };
+        if !matches!(outcome, NativeFilePublishOutcome::Pending(_)) {
+            self.pin.take();
+        }
+        outcome
+    }
+}
+
+fn copy_native_error(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), error.to_string())
+}
+
 impl ApplicationRootPin {
     fn retain(application: Arc<ApplicationRoot>) -> Self {
         application
@@ -306,6 +643,53 @@ impl ApplicationRootPin {
             revision,
             max_bytes,
             pin: self.clone(),
+        })
+    }
+
+    /// The native shell captures OS Save authority synchronously, before the
+    /// retained worker runs. The path never becomes an application wire value.
+    pub fn admit_native_destination(&self, path: &Path) -> io::Result<NativeFileDestination> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native destination is not absolute",
+            ));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native destination has no parent",
+            )
+        })?;
+        let name = axial_fs::LeafName::new(path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native destination has no name",
+            )
+        })?)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native destination name is invalid",
+            )
+        })?;
+        let session = lock(&self.inner.application.session);
+        let session = session.as_ref().ok_or_else(closed_authority)?;
+        session.validate_reset_preflight()?;
+        let admission = match session.admit_absolute_directory_authority_outside_root(parent) {
+            AbsoluteDirectoryOutsideRootAdmission::Admitted(admission) => admission,
+            AbsoluteDirectoryOutsideRootAdmission::InsideRoot => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "native destination is inside the application root",
+                ));
+            }
+            AbsoluteDirectoryOutsideRootAdmission::Unavailable(error) => return Err(error),
+        };
+        Ok(NativeFileDestination {
+            pin: Some(self.clone()),
+            state: NativeDestinationState::Admitted(admission.admit_transient_destination(name)?),
+            failure: None,
         })
     }
 
@@ -1731,5 +2115,160 @@ mod tests {
         assert!(admission.read().is_err());
         owner.try_preserve().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    }
+
+    fn native_export_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 64, 64);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[12, 34, 56, 255].repeat(64 * 64))
+                .unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn native_destination_publishes_exact_png_and_releases_its_pin() {
+        let application = temporary();
+        let external = temporary();
+        let path = external.path().join("saved.png");
+        let owner = open(application.path());
+        let pin = owner.admit_application_root().unwrap();
+        let mut destination = pin.admit_native_destination(&path).unwrap();
+        drop(pin);
+        owner.close_admission();
+        let reset_refused = matches!(
+            owner.begin_root_reset(),
+            Err(LibraryError::RetirementPending)
+        );
+        let png = native_export_png();
+        assert!(matches!(
+            destination.publish(&png),
+            NativeFilePublishOutcome::Published
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), png);
+        assert!(destination.pin.is_none());
+        drop(destination);
+        owner.try_preserve().unwrap();
+        drop(owner);
+        let reopened = open(application.path());
+        revoke(&reopened);
+        assert!(reset_refused);
+        assert_eq!(std::fs::read(&path).unwrap(), png);
+    }
+
+    #[test]
+    fn native_destination_collision_and_cancel_preserve_external_files() {
+        let application = temporary();
+        let external = temporary();
+        let path = external.path().join("saved.png");
+        let owner = open(application.path());
+        let pin = owner.admit_application_root().unwrap();
+        let mut destination = pin.admit_native_destination(&path).unwrap();
+        std::fs::write(&path, b"new occupant").unwrap();
+        assert!(matches!(
+            destination.publish(&native_export_png()),
+            NativeFilePublishOutcome::NoEffect(_)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new occupant");
+        assert!(pin.admit_native_destination(&path).is_err());
+        assert!(
+            pin.admit_native_destination(&application.path().join("internal.png"))
+                .is_err()
+        );
+        let cancelled = external.path().join("cancelled.png");
+        let mut destination = pin.admit_native_destination(&cancelled).unwrap();
+        assert!(matches!(
+            destination.cancel(),
+            NativeFilePublishOutcome::Cancelled
+        ));
+        assert!(!cancelled.exists());
+        drop((pin, destination));
+        owner.try_preserve().unwrap();
+    }
+
+    #[test]
+    fn native_destination_refuses_displaced_parent_before_writing() {
+        let application = temporary();
+        let external = temporary();
+        let parent = external.path().join("chosen");
+        let displaced = external.path().join("displaced");
+        std::fs::create_dir(&parent).unwrap();
+        let owner = open(application.path());
+        let pin = owner.admit_application_root().unwrap();
+        let mut destination = pin
+            .admit_native_destination(&parent.join("saved.png"))
+            .unwrap();
+        drop(pin);
+        std::fs::rename(&parent, &displaced).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        assert!(matches!(
+            destination.publish(&native_export_png()),
+            NativeFilePublishOutcome::NoEffect(_)
+        ));
+        assert!(!parent.join("saved.png").exists());
+        assert!(!displaced.join("saved.png").exists());
+        assert!(destination.pin.is_none());
+        owner.try_preserve().unwrap();
+    }
+
+    #[test]
+    fn native_destination_pending_cleanup_can_preserve_and_drop_the_real_root() {
+        let application = temporary();
+        let external = temporary();
+        let parent = external.path().join("chosen");
+        let displaced = external.path().join("displaced");
+        std::fs::create_dir(&parent).unwrap();
+        let owner = open(application.path());
+        let pin = owner.admit_application_root().unwrap();
+        let mut destination = pin
+            .admit_native_destination(&parent.join("saved.png"))
+            .unwrap();
+        drop(pin);
+        let NativeDestinationState::Admitted(admitted) = destination.take_state() else {
+            panic!("admitted destination")
+        };
+        let axial_fs::TransientStageCreateOutcome::Created(mut stage) = admitted.create_stage()
+        else {
+            panic!("real external stage")
+        };
+        stage.write_all(&native_export_png()).unwrap();
+        let batch = axial_fs::TransientPublicationBatch::new(vec![stage.seal().unwrap()]).unwrap();
+        std::fs::rename(&parent, &displaced).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("saved.png"), b"replacement").unwrap();
+        assert!(matches!(
+            destination.finish_publication(batch.publish_create_new()),
+            NativeFilePublishOutcome::Pending(_)
+        ));
+        owner.close_admission();
+        let reset_refused = matches!(
+            owner.begin_root_reset(),
+            Err(LibraryError::RetirementPending)
+        );
+        assert!(matches!(
+            destination.reconcile(),
+            NativeFilePublishOutcome::Pending(_)
+        ));
+        assert!(matches!(
+            destination.preserve(),
+            NativeFilePublishOutcome::Preserved
+        ));
+        assert!(destination.pin.is_none());
+        drop(destination);
+        owner.try_preserve().unwrap();
+        drop(owner);
+        let reopened = open(application.path());
+        revoke(&reopened);
+        assert!(reset_refused);
+        assert_eq!(
+            std::fs::read(parent.join("saved.png")).unwrap(),
+            b"replacement"
+        );
     }
 }

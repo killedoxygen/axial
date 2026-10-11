@@ -67,6 +67,7 @@ pub(super) struct TransientEffectRecord {
     #[cfg(not(target_os = "linux"))]
     pub(super) stage_id: Option<u64>,
     pub(super) checked_out: bool,
+    preserve_external: bool,
     pub(super) phase: TransientEffectPhase,
     pub(super) disposition: TransientEffectDisposition,
 }
@@ -185,6 +186,7 @@ impl TransientEffectToken {
                 #[cfg(not(target_os = "linux"))]
                 stage_id: None,
                 checked_out: false,
+                preserve_external: false,
                 phase: TransientEffectPhase::Reserved,
                 disposition: TransientEffectDisposition::Reserved,
             });
@@ -608,6 +610,7 @@ impl CapabilityAuthority {
                 #[cfg(not(target_os = "linux"))]
                 stage_id: header.stage_id,
                 checked_out: true,
+                preserve_external: header.preserve_external,
                 phase: header.phase,
                 disposition: header.disposition,
             };
@@ -2496,6 +2499,316 @@ fn restore_discarded_destination(
     }
 }
 
+impl crate::AdmittedAbsoluteDirectory {
+    /// Admit one create-only external artifact with preserve-only settlement.
+    /// The permission is captured while the complete ancestry is still exact.
+    pub fn admit_transient_destination(&self, name: LeafName) -> io::Result<TransientDestination> {
+        let directory = &self.inner.directory;
+        let authority = directory.authority()?;
+        let operation = authority.enter()?;
+        directory.validate(&operation)?;
+        let ancestry = directory
+            .inner
+            .absolute_ancestry()
+            .ok_or_else(|| io::Error::other("external destination has no captured ancestry"))?;
+        if !platform::absolute_directory_is_outside_root(ancestry, &authority.root)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "external destination is inside the owning root",
+            ));
+        }
+        let destination = directory.admit_transient_destination(name)?;
+        let token = destination
+            .token
+            .as_ref()
+            .expect("admitted destination retains reservation")
+            .token
+            .as_ref()
+            .expect("reservation retains effect token");
+        let mut state = authority
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        state
+            .transients
+            .get_mut(&token.id)
+            .ok_or_else(stale_capability)?
+            .preserve_external = true;
+        drop(state);
+        Ok(destination)
+    }
+}
+
+impl TransientEffectToken {
+    fn preservation_operation(&self) -> io::Result<CapabilityOperation> {
+        let operation = self.authority.enter()?;
+        let state =
+            self.authority.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+        let record = state
+            .transients
+            .get(&self.id)
+            .ok_or_else(stale_capability)?;
+        if !self.armed
+            || !record.preserve_external
+            || record.checked_out
+            || record.retained.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "transient effect has no external preservation admission",
+            ));
+        }
+        drop(state);
+        Ok(operation)
+    }
+
+    fn acknowledge_preserved(&mut self) -> io::Result<()> {
+        let operation = self.preservation_operation()?;
+        self.finish_preservation(&operation)
+    }
+
+    fn finish_preservation(&mut self, operation: &CapabilityOperation) -> io::Result<()> {
+        let mut state =
+            self.authority.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+        let record = state
+            .transients
+            .get(&self.id)
+            .ok_or_else(stale_capability)?;
+        if !self.armed
+            || !record.preserve_external
+            || record.checked_out
+            || record.retained.is_some()
+        {
+            return Err(stale_capability());
+        }
+        let removed = state
+            .transients
+            .remove(&self.id)
+            .expect("validated preservation owner");
+        state.release_effect(operation);
+        self.armed = false;
+        drop(state);
+        drop(removed);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn preserve_named_stage(&mut self, token: &mut crate::StageToken) -> io::Result<()> {
+        let operation = self.preservation_operation()?;
+        let mut state =
+            self.authority.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+        let header = state
+            .transients
+            .get(&self.id)
+            .ok_or_else(stale_capability)?;
+        if token.armed {
+            if token.authority.as_ptr() != Arc::as_ptr(&self.authority)
+                || header.stage_id != Some(token.id)
+            {
+                return Err(stale_capability());
+            }
+            let stage = state.stages.get(&token.id).ok_or_else(stale_capability)?;
+            if stage.cleanup.is_none()
+                || stage.recovery.is_some()
+                || stage
+                    .promotion
+                    .as_ref()
+                    .is_some_and(|promotion| promotion.displaced_park.is_some())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "recoverable or replaced state cannot be preserved as an export",
+                ));
+            }
+        }
+        let removed_stage = token.armed.then(|| {
+            state
+                .stages
+                .remove(&token.id)
+                .expect("validated named stage owner")
+        });
+        if removed_stage.is_some() {
+            state.release_effect(&operation);
+        }
+        token.armed = false;
+        let removed = state
+            .transients
+            .remove(&self.id)
+            .expect("validated preservation owner");
+        state.release_effect(&operation);
+        self.armed = false;
+        drop(state);
+        // Cleanup handles are closed; no unlink, restore, or replacement occurs.
+        drop((removed_stage, removed));
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn preserve_named_creation(&mut self, token: &mut crate::StageCreateToken) -> io::Result<()> {
+        let operation = self.preservation_operation()?;
+        let mut state =
+            self.authority.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+        let header = state
+            .transients
+            .get(&self.id)
+            .ok_or_else(stale_capability)?;
+        if !token.armed || token.authority.as_ptr() != Arc::as_ptr(&self.authority) {
+            return Err(stale_capability());
+        }
+        let create = state
+            .stage_creations
+            .get(&token.id)
+            .ok_or_else(stale_capability)?;
+        if create.checked_out
+            || create.parent.inner.identity != header.directory.inner.identity
+            || create.recovery.is_some()
+            || create.recovery_intent.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "creation has no fresh external export ownership",
+            ));
+        }
+        let removed_create = state
+            .stage_creations
+            .remove(&token.id)
+            .expect("validated named creation owner");
+        let removed = state
+            .transients
+            .remove(&self.id)
+            .expect("validated preservation owner");
+        state.release_effect(&operation);
+        state.release_effect(&operation);
+        token.armed = false;
+        self.armed = false;
+        drop(state);
+        drop((removed_create, removed));
+        Ok(())
+    }
+}
+
+impl TransientStage {
+    fn preserve_external(&mut self) -> io::Result<()> {
+        let token = self.token.as_mut().expect("stage retains its effect token");
+        #[cfg(target_os = "linux")]
+        token.acknowledge_preserved()?;
+        #[cfg(not(target_os = "linux"))]
+        named::acknowledge_preserved(self.file.as_mut().expect("stage retains its file"), token)?;
+        // In particular, do not run TransientStage::Drop's discard path.
+        drop(self.file.take());
+        Ok(())
+    }
+}
+
+impl TransientCreationObligation {
+    /// Acknowledge an external fresh artifact as preserved, without asserting
+    /// publication or mutating any captured namespace binding.
+    pub fn acknowledge_preserved(mut self) -> Result<(), Self> {
+        let result = match self.state.as_mut().expect("creation retains its state") {
+            TransientCreationState::Stage(stage) => stage.preserve_external(),
+            #[cfg(not(target_os = "linux"))]
+            TransientCreationState::Named {
+                destination,
+                obligation,
+            } => destination
+                .token
+                .as_mut()
+                .expect("creation retains reservation")
+                .token_mut()
+                .preserve_named_creation(&mut obligation.token),
+        };
+        match result {
+            Ok(()) => {
+                self.state.take();
+                Ok(())
+            }
+            Err(error) => {
+                self.error = error;
+                Err(self)
+            }
+        }
+    }
+}
+
+impl TransientDestinationCancelObligation {
+    pub fn acknowledge_preserved(mut self) -> Result<(), Self> {
+        let destination = self
+            .destination
+            .as_mut()
+            .expect("cancellation retains its destination");
+        match destination
+            .token
+            .as_mut()
+            .expect("cancellation retains reservation")
+            .token_mut()
+            .acknowledge_preserved()
+        {
+            Ok(()) => {
+                self.destination.take();
+                Ok(())
+            }
+            Err(error) => {
+                self.error = error;
+                Err(self)
+            }
+        }
+    }
+}
+
+impl TransientDiscardObligation {
+    pub fn acknowledge_preserved(mut self) -> Result<(), Self> {
+        let result = match self.state.as_mut().expect("discard retains its state") {
+            TransientDiscardState::Stage(stage) => stage.preserve_external(),
+            TransientDiscardState::ReservationRestore { token, .. } => {
+                token.acknowledge_preserved()
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.state.take();
+                Ok(())
+            }
+            Err(error) => {
+                self.error = error;
+                Err(self)
+            }
+        }
+    }
+}
+
+impl TransientPublicationBatchObligation {
+    /// The native Save owner publishes exactly one fresh external artifact.
+    /// Preservation never acknowledges a Published result or deletes a name.
+    pub fn acknowledge_preserved_singleton(mut self) -> Result<(), Self> {
+        let batch = self.batch.as_mut().expect("publication retains its batch");
+        if batch.stages.len() != 1 {
+            self.error = io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "external preservation requires a singleton publication",
+            );
+            return Err(self);
+        }
+        match batch.stages[0].stage.preserve_external() {
+            Ok(()) => {
+                self.batch.take();
+                Ok(())
+            }
+            Err(error) => {
+                self.error = error;
+                Err(self)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3937,6 +4250,99 @@ mod tests {
             std::fs::read(temporary.path().join("COLLISION.BIN")).expect("collision payload read"),
             b"user payload",
         );
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_preservation_keeps_replaced_publication_and_releases_root() {
+        let temporary = crate::test_tempdir().unwrap();
+        let root_path = temporary.path().join("profile");
+        let parent = temporary.path().join("chosen");
+        let displaced = temporary.path().join("displaced");
+        std::fs::create_dir(&parent).unwrap();
+        let session = acquire_test_root(&root_path);
+        let admission = match session.admit_absolute_directory_authority_outside_root(&parent) {
+            crate::AbsoluteDirectoryOutsideRootAdmission::Admitted(admission) => admission,
+            _ => panic!("external exact parent"),
+        };
+        let destination = admission
+            .admit_transient_destination(LeafName::new("saved.png").unwrap())
+            .unwrap();
+        let TransientStageCreateOutcome::Created(mut stage) = destination.create_stage() else {
+            panic!("real transient file")
+        };
+        stage.write_all(b"complete original bytes").unwrap();
+        let mut sealed = stage.seal().unwrap();
+        platform::link_transient_file(
+            sealed.stage.file.as_mut().unwrap(),
+            admission.inner.directory.inner.handle(),
+            OsStr::new("saved.png"),
+        )
+        .unwrap();
+        std::fs::rename(parent.join("saved.png"), parent.join("original.png")).unwrap();
+        std::fs::write(parent.join("saved.png"), b"replacement").unwrap();
+        let batch = TransientPublicationBatch::new(vec![sealed]).unwrap();
+        std::fs::rename(&parent, &displaced).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("saved.png"), b"new parent occupant").unwrap();
+        let operation = session.authority.enter().unwrap();
+        let TransientPublicationBatchOutcome::Pending(obligation) = classify_publication_batch(
+            io::Error::other("publication acknowledgement interrupted after the real native link"),
+            batch,
+            &operation,
+        ) else {
+            panic!("changed binding is unknown")
+        };
+        drop(operation);
+        assert!(obligation.acknowledge_preserved_singleton().is_ok());
+        drop(admission);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        let reopened = acquire_test_root(&root_path);
+        assert!(matches!(reopened.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(
+            std::fs::read(displaced.join("original.png")).unwrap(),
+            b"complete original bytes"
+        );
+        assert_eq!(
+            std::fs::read(displaced.join("saved.png")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(parent.join("saved.png")).unwrap(),
+            b"new parent occupant"
+        );
+    }
+
+    #[test]
+    fn external_preservation_does_not_waive_managed_transient_ownership() {
+        let temporary = crate::test_tempdir().unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let Some(stage) = test_stage(&root, "internal.bin") else {
+            return;
+        };
+        let obligation = TransientPublicationBatchObligation {
+            error: io::Error::other("unclassified fixture"),
+            batch: Some(TransientPublicationBatch::new(vec![stage.seal().unwrap()]).unwrap()),
+        };
+        let obligation = obligation
+            .acknowledge_preserved_singleton()
+            .expect_err("managed effect has no external preservation admission");
+        assert_eq!(obligation.error().kind(), io::ErrorKind::PermissionDenied);
+        let TransientPublicationBatchOutcome::NoEffect { batch, .. } = obligation.reconcile()
+        else {
+            panic!("unpublished managed stage")
+        };
+        let stage = batch.into_stages().pop().unwrap();
+        let TransientDiscardOutcome::Discarded(destination) = stage.discard() else {
+            panic!("exact discard")
+        };
+        assert!(matches!(
+            destination.cancel(),
+            TransientDestinationCancelOutcome::Cancelled
+        ));
         drop(root);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
