@@ -6,9 +6,23 @@ Status: modern Forge47.4.10/Minecraft1.20.1 completes current Linux installation
 
 The current MC1.12.2/Forge14.23.5.2860 Create and one diagnostic Retry settle Failed during base installation. Existing safe diagnostics retain `file_operation`/`Other`, without a target or OS code; concurrent progress counts cannot identify the first selected error. Bounded official acquisition proves that this base plan requires a checksum-correct22-byte canonical empty ZIP as a classpath library, SHA1 `b04f3ee8f5e43fa3b162981b50bb72fe1acabb33`. The real planner selects it, and the current bounded JAR validator deterministically rejects zero entries with the same safe signature. Exact owner reproduction23570 joins101; the historical first selected error remains unproved.
 
-The existing validator now permits only the canonical22-byte single-disk empty ZIP, with zero directory size/offset/comment and exact physical EOF. Directory-only nonempty archives and malformed, prefixed, trailing, multidisk or oversized shapes remain refused. Hash/size authentication, retained capacity, path, runtime-floor, receipt and publication owners stay intact. Original94452 joins0: the authenticated real-plan fixture and existing library-owner guards pass, including the concise normal canonical/malformed regression. The private environment-dependent fixture is removed; subsequent current installed acceptance remains gated. No successful FML install is claimed from the leaf correction.
+The existing validator now permits only the canonical22-byte single-disk empty ZIP, with zero directory size/offset/comment and exact physical EOF. Directory-only nonempty archives and malformed, prefixed, trailing, multidisk or oversized shapes remain refused. Hash/size authentication, retained capacity, path, runtime-floor, receipt and publication owners stay intact. Original94452 joins0: the authenticated real-plan fixture and existing library-owner guards pass, including the concise normal canonical/malformed regression. The private environment-dependent fixture is removed. Subsequent actual FML installation and cold acceptance are recorded separately below.
 
 Evidence: `.rewrite-logs/legacy-linux-current/diagnostic/empty-platform-proof.json`, `owner-fixture-red.log`, `owner-green-and-guards.log` and the retained official leaf receipts. Private acquisition contracts and environment-dependent diagnostic code remain outside committed source.
+
+## Current Linux retained-strategy installation
+
+Committed `716cd9f3` passes [hosted application and delivery verification](https://github.com/mateoltd/axial/actions/runs/38114439546). Its frozen normal API SHA256 is `90333328c72f557a58f7668886018f64461deeeaea49591a79a64d8cd93e5f7f`. The following ordinary workflows use their recorded checkpoints, verified Custom Java8,2048/512MiB and optimization off. Each original acceptance command joins0; each target reaches the exact child Final receipt and Ready, then passes current preflight and exact full-process cold persistence.
+
+| Minecraft / Forge | Actual workflow | Cold protected files |
+| --- | --- | --- |
+| 1.2.5 /3.4.9.171 client | One Create/install at frozen `428f71b0`, one Custom Java8 save | 482 installed files and305 runtime proofs |
+| 1.4.7 /6.6.2.534 universal | One Create/install at `716cd9f3`, one Custom Java8 save | 486 installed files and305 runtime proofs |
+| 1.12.2 /14.23.5.2860 FML | One canonical Retry at `716cd9f3` after the demonstrated validator repair, one Custom Java8 save | 1,353 installed files and305 runtime proofs |
+
+FML's corrected attempt succeeds at revision409/Final. Complete Ready/post-preflight/cold snapshots and public Custom Java8/revision3/Ready detail agree exactly; prior failed history remains unchanged. An earlier corrected-candidate helper stops before Retry because it incorrectly requires an installed display label on the uninstalled target. Fix only that reader to authenticate the typed target and opaque selection while allowing the owner's empty preinstallation label; preserve the consumed proof and issue no duplicate mutation. All original installation/cold API owners join0 and their exact processes, listeners and profile holders disappear.
+
+Evidence: `.rewrite-logs/legacy-client-current/privatecoord/root-cold-corrected-proof.json`, `.rewrite-logs/legacy-universal-current/privatecoord/root-ready-cold-proof.json`, `.rewrite-logs/legacy-library-fixed-current/fml-fixed-round-2/handback.json`, `root-cold-worker-i5K6VuMx/handback.json` and `servers-closed.json`. These prove installation and cold persistence; current older-tuple gameplay/save/reload remains a separate acceptance boundary.
 
 ## Current Linux compression blocker
 
