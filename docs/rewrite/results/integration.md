@@ -4,6 +4,8 @@ Updated 2026-10-11. Implementation is in progress, not release-ready. Passing ch
 
 [Current installed Linux world controls](world-files.md#current-linux-installed-world-controls) complete ordinary folder copy, exact backup, rename, Delete Cancel, disposable-only deletion and whole cold preservation on the normal `716cd9f3` artifact. The genuine original23-file save and its backup remain exact. A destructive XDestroyWindow helper shutdown joins1 and is preserved separately from the actual visible Close control, whose cold original joins0 with strict absence. The new PNG-export implementation remains unbuilt and its scoped native permission approval is pending; this journey does not qualify that change or close the external release gates.
 
+[Current installed Linux screenshot controls](screenshot-files.md#current-linux-installed-screenshot-controls) also complete native folder copy/View, type refusal/Cancel, occupied-name refusal, exact rename, Delete Cancel, copy-only deletion and cold original-image rendering on that same artifact. Whole protected state and the original world/backup remain exact; both actual application Close originals join0 and all test owners disappear. This is ordinary installed resource acceptance, not native held-response race, interruption or new export-candidate acceptance.
+
 ## Execution order
 
 Root owns current native/game execution, runtime restarts and serialized builds. Independent owners complete bounded loader/content, resource/settings and Performance journeys in exclusive fixtures; shared source and build admission stay serialized. Observation's counter-only candidate remains deferred with its RED evidence preserved; do not restart that optimization loop without a named blocker.
