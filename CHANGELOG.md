@@ -11,6 +11,20 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 ### Release integrity
 - Releases are exposed only after their version, notes, complete platform asset set, and checksums agree
 
+## [0.4.0-rc.1] - 2026-10-11
+
+### App
+- Replaced application orchestration with feature-owned install, launch, content, resource, and Performance workflows
+- Preserved current-application operation recovery and profile reopen
+- Restored original loader logos and native skin, screenshot, and world controls
+
+### Breaking changes
+- Start with a fresh application profile; predecessor profiles are not imported or upgraded
+
+### Distribution
+- Candidate packages bind their exact source, version, changelog, platform payloads, and checksums
+- Unpublished release candidate; installed-platform acceptance, publisher trust, and signed installed updates remain release gates
+
 ## [0.4.0-dev.5] - 2026-07-15
 
 ### Distribution
