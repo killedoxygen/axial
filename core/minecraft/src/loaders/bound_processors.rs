@@ -1191,12 +1191,10 @@ async fn run_step(
     }
     match &step.action {
         BoundProcessorAction::Java | BoundProcessorAction::SplitJar => {
-            if matches!(&step.action, BoundProcessorAction::SplitJar) {
-                for output in &step.outputs {
-                    workspace
-                        .ensure_temp_parent(&output.artifact.relative_path)
-                        .map_err(|_| BoundProcessorError::Stage)?;
-                }
+            for output in &step.outputs {
+                workspace
+                    .ensure_temp_parent(&output.artifact.relative_path)
+                    .map_err(|_| BoundProcessorError::Stage)?;
             }
             run_java_step(
                 step,
@@ -1208,9 +1206,7 @@ async fn run_step(
                 cancel,
             )
             .await?;
-            if matches!(&step.action, BoundProcessorAction::SplitJar) {
-                promote_split_outputs(step, workspace, cancel).await?;
-            }
+            promote_java_outputs(step, workspace, &before_root, cancel).await?;
         }
         BoundProcessorAction::ExtractMcpMappings { input } => {
             let archive = staged_artifact_bytes(workspace, input, &authority.libraries)?;
@@ -1329,24 +1325,34 @@ fn settle_step_outputs(
     Ok(outputs)
 }
 
-async fn promote_split_outputs(
+async fn promote_java_outputs(
     step: &BoundProcessorStep,
     workspace: &ProcessorWorkspace,
+    before_root: &ManagedTreeSnapshot,
     cancel: &mut oneshot::Receiver<()>,
 ) -> Result<(), BoundProcessorError> {
+    check_cancel(cancel)?;
     workspace
         .validate_live_bounds()
         .map_err(|_| BoundProcessorError::Stage)?;
-    let before = workspace
+    let after_java = workspace
         .snapshot_root()
         .map_err(|_| BoundProcessorError::Stage)?;
+    if &after_java != before_root {
+        return Err(BoundProcessorError::Stage);
+    }
     let settled = workspace
         .snapshot_stage()
         .map_err(|_| BoundProcessorError::Stage)?;
+    let mut remaining = MAX_JAVA_RECONSTRUCTION_WORK;
+    reserve_java_work(
+        &mut remaining,
+        step.outputs.len() as u64 * std::mem::size_of::<(&PortableRelativePath, Vec<u8>)>() as u64,
+    )?;
     let mut verified = Vec::with_capacity(step.outputs.len());
     for output in &step.outputs {
         check_cancel(cancel)?;
-        validate_fresh_output_target(step, &output.artifact, &before)?;
+        validate_fresh_output_target(step, &output.artifact, before_root)?;
         let temporary_path = PortableRelativePath::new_exact(&format!(
             "tmp/{}",
             output.artifact.relative_path.as_str()
@@ -1360,23 +1366,38 @@ async fn promote_split_outputs(
             BoundProcessorOutputRole::Intermediate => None,
             BoundProcessorOutputRole::Terminal { expected_size } => expected_size,
         };
-        if fact.size() == 0
-            || expected_size.is_some_and(|size| size != fact.size())
-            || matches!(&output.expectation, BoundProcessorOutputExpectation::ProviderSha1(sha1) if fact.sha1() != sha1)
-        {
+        if fact.size() == 0 {
             return Err(BoundProcessorError::Authority);
         }
+        reserve_java_work(&mut remaining, fact.size() * 3 + 1)?;
         // Observed hashes bind the scratch reread, not a provider expectation.
-        let bytes = workspace
+        let mut bytes = workspace
             .read_temp_authenticated(
                 &output.artifact.relative_path,
                 Some(fact.size()),
                 fact.sha1(),
             )
             .map_err(|_| BoundProcessorError::Authority)?;
+        if matches!(&output.expectation, BoundProcessorOutputExpectation::ProviderSha1(sha1) if fact.sha1() != sha1)
+        {
+            bytes = recompress_java_archive(&bytes, &mut remaining, cancel).await?;
+        }
+        reserve_java_work(&mut remaining, bytes.len() as u64 * 3 + 1)?;
+        if expected_size.is_some_and(|size| size != bytes.len() as u64)
+            || matches!(&output.expectation, BoundProcessorOutputExpectation::ProviderSha1(sha1) if <[u8; 20]>::from(Sha1::digest(&bytes)) != *sha1)
+        {
+            return Err(BoundProcessorError::Authority);
+        }
         verified.push((&output.artifact.relative_path, bytes));
     }
     check_cancel(cancel)?;
+    if &workspace
+        .snapshot_root()
+        .map_err(|_| BoundProcessorError::Stage)?
+        != before_root
+    {
+        return Err(BoundProcessorError::Stage);
+    }
     workspace
         .clear_scratch()
         .map_err(|_| BoundProcessorError::Stage)?;
@@ -1388,6 +1409,272 @@ async fn promote_split_outputs(
             .map_err(|_| BoundProcessorError::Stage)?;
     }
     Ok(())
+}
+
+const MAX_JAVA_ARCHIVE_BYTES: usize = 128 << 20;
+const MAX_JAVA_ARCHIVE_ENTRIES: usize = 32_768;
+const MAX_JAVA_ENTRY_BYTES: u64 = 64 << 20;
+const MAX_JAVA_RECONSTRUCTION_WORK: u64 = 512 << 20;
+
+fn reserve_java_work(remaining: &mut u64, bytes: u64) -> Result<(), BoundProcessorError> {
+    *remaining = remaining
+        .checked_sub(bytes)
+        .ok_or(BoundProcessorError::Authority)?;
+    Ok(())
+}
+
+fn zip_part(bytes: &[u8], start: usize, length: usize) -> Result<&[u8], BoundProcessorError> {
+    bytes
+        .get(
+            start
+                ..start
+                    .checked_add(length)
+                    .ok_or(BoundProcessorError::Authority)?,
+        )
+        .ok_or(BoundProcessorError::Authority)
+}
+
+fn zip_u16(bytes: &[u8], start: usize) -> Result<usize, BoundProcessorError> {
+    Ok(u16::from_le_bytes(zip_part(bytes, start, 2)?.try_into().unwrap()) as usize)
+}
+
+fn zip_u32(bytes: &[u8], start: usize) -> Result<usize, BoundProcessorError> {
+    Ok(u32::from_le_bytes(zip_part(bytes, start, 4)?.try_into().unwrap()) as usize)
+}
+
+async fn recompress_java_archive(
+    bytes: &[u8],
+    remaining: &mut u64,
+    cancel: &mut oneshot::Receiver<()>,
+) -> Result<Vec<u8>, BoundProcessorError> {
+    check_cancel(cancel)?;
+    let end = bytes
+        .len()
+        .checked_sub(22)
+        .ok_or(BoundProcessorError::Authority)?;
+    let tail = zip_part(bytes, end, 22)?;
+    let entries = zip_u16(tail, 10)?;
+    let central_size = zip_u32(tail, 12)?;
+    let central_start = zip_u32(tail, 16)?;
+    if bytes.len() > MAX_JAVA_ARCHIVE_BYTES
+        || zip_u32(tail, 0)? != 0x06054b50
+        || zip_u32(tail, 4)? != 0
+        || zip_u16(tail, 8)? != entries
+        || zip_u16(tail, 20)? != 0
+        || entries == 0
+        || entries > MAX_JAVA_ARCHIVE_ENTRIES
+        || central_size > 16 << 20
+        || central_start.checked_add(central_size) != Some(end)
+    {
+        return Err(BoundProcessorError::Authority);
+    }
+    reserve_java_work(remaining, bytes.len() as u64 + entries as u64 * 512)?;
+    let mut central = central_start;
+    let mut names = 0_usize;
+    let mut expanded = 0_u64;
+    let mut compressed_capacity = 0_usize;
+    for _ in 0..entries {
+        let header = zip_part(bytes, central, 46)?;
+        let size = zip_u32(header, 24)? as u64;
+        let name = zip_u16(header, 28)?;
+        names = names
+            .checked_add(name)
+            .ok_or(BoundProcessorError::Authority)?;
+        expanded = expanded
+            .checked_add(size)
+            .ok_or(BoundProcessorError::Authority)?;
+        // deflateBound's conservative raw-stream bound, including its wrapper allowance.
+        let capacity = size + (size >> 12) + (size >> 14) + (size >> 25) + 13;
+        compressed_capacity = compressed_capacity
+            .checked_add(capacity as usize)
+            .ok_or(BoundProcessorError::Authority)?;
+        if zip_u32(header, 0)? != 0x02014b50
+            || zip_u16(header, 8)? != 0x808
+            || zip_u16(header, 10)? != 8
+            || zip_u16(header, 34)? != 0
+            || name == 0
+            || name > 1024
+            || names > 8 << 20
+            || std::str::from_utf8(zip_part(bytes, central + 46, name)?).is_err()
+            || size > MAX_JAVA_ENTRY_BYTES
+            || expanded > MAX_JAVA_ARCHIVE_BYTES as u64
+        {
+            return Err(BoundProcessorError::Authority);
+        }
+        central = central
+            .checked_add(46 + name + zip_u16(header, 30)? + zip_u16(header, 32)?)
+            .ok_or(BoundProcessorError::Authority)?;
+        if central > end {
+            return Err(BoundProcessorError::Authority);
+        }
+    }
+    if central != end {
+        return Err(BoundProcessorError::Authority);
+    }
+    let capacity = bytes
+        .len()
+        .checked_add(compressed_capacity)
+        .ok_or(BoundProcessorError::Authority)?;
+    reserve_java_work(
+        remaining,
+        names as u64 * 3
+            + expanded * 2
+            + compressed_capacity as u64 * 2
+            + capacity as u64
+            + (512 << 10),
+    )?;
+    let mut archive =
+        ZipArchive::new(Cursor::new(bytes)).map_err(|_| BoundProcessorError::Authority)?;
+    if archive.len() != entries {
+        return Err(BoundProcessorError::Authority);
+    }
+    let mut rebuilt = Vec::with_capacity(capacity);
+    let mut revisions = Vec::with_capacity(entries);
+    let mut previous_end = 0;
+    for index in 0..entries {
+        check_cancel(cancel)?;
+        let (payload, header_start, data_start, compressed_size, crc) = {
+            let mut file = archive
+                .by_index(index)
+                .map_err(|_| BoundProcessorError::Authority)?;
+            let size = usize::try_from(file.size()).map_err(|_| BoundProcessorError::Authority)?;
+            if file.encrypted() || file.size() > MAX_JAVA_ENTRY_BYTES {
+                return Err(BoundProcessorError::Authority);
+            }
+            let mut payload = vec![0; size];
+            file.read_exact(&mut payload)
+                .map_err(|_| BoundProcessorError::Authority)?;
+            if file
+                .read(&mut [0])
+                .map_err(|_| BoundProcessorError::Authority)?
+                != 0
+            {
+                return Err(BoundProcessorError::Authority);
+            }
+            (
+                payload,
+                file.header_start() as usize,
+                file.data_start() as usize,
+                file.compressed_size() as usize,
+                file.crc32(),
+            )
+        };
+        let header = zip_part(bytes, header_start, 30)?;
+        let descriptor_start = data_start
+            .checked_add(compressed_size)
+            .ok_or(BoundProcessorError::Authority)?;
+        let descriptor = zip_part(bytes, descriptor_start, 16)?;
+        if header_start != previous_end
+            || zip_u32(header, 0)? != 0x04034b50
+            || zip_u16(header, 6)? != 0x808
+            || zip_u16(header, 8)? != 8
+            || zip_u32(header, 14)? != 0
+            || zip_u32(header, 18)? != 0
+            || zip_u32(header, 22)? != 0
+            || header_start.checked_add(30 + zip_u16(header, 26)? + zip_u16(header, 28)?)
+                != Some(data_start)
+            || zip_u32(descriptor, 0)? != 0x08074b50
+            || zip_u32(descriptor, 4)? != crc as usize
+            || zip_u32(descriptor, 8)? != compressed_size
+            || zip_u32(descriptor, 12)? != payload.len()
+        {
+            return Err(BoundProcessorError::Authority);
+        }
+        let compressed = classic_deflate(&payload)?;
+        let offset = rebuilt.len();
+        rebuilt.extend_from_slice(zip_part(bytes, header_start, data_start - header_start)?);
+        rebuilt.extend_from_slice(&compressed);
+        rebuilt.extend_from_slice(&descriptor[..8]);
+        rebuilt.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        rebuilt.extend_from_slice(&descriptor[12..]);
+        previous_end = descriptor_start + 16;
+        revisions.push((compressed.len() as u32, offset as u32));
+        if rebuilt.len() > MAX_JAVA_ARCHIVE_BYTES {
+            return Err(BoundProcessorError::Authority);
+        }
+        if index % 128 == 127 {
+            tokio::task::yield_now().await;
+        }
+    }
+    if previous_end != central_start {
+        return Err(BoundProcessorError::Authority);
+    }
+    let new_central_start = rebuilt.len();
+    central = central_start;
+    for (size, offset) in revisions {
+        let header = zip_part(bytes, central, 46)?;
+        let length = 46 + zip_u16(header, 28)? + zip_u16(header, 30)? + zip_u16(header, 32)?;
+        let start = rebuilt.len();
+        rebuilt.extend_from_slice(zip_part(bytes, central, length)?);
+        rebuilt[start + 20..start + 24].copy_from_slice(&size.to_le_bytes());
+        rebuilt[start + 42..start + 46].copy_from_slice(&offset.to_le_bytes());
+        central += length;
+    }
+    let new_central_size = rebuilt.len() - new_central_start;
+    rebuilt.extend_from_slice(&tail[..12]);
+    rebuilt.extend_from_slice(&(new_central_size as u32).to_le_bytes());
+    rebuilt.extend_from_slice(&(new_central_start as u32).to_le_bytes());
+    rebuilt.extend_from_slice(&tail[20..]);
+    if rebuilt.len() > MAX_JAVA_ARCHIVE_BYTES || rebuilt.len() > capacity {
+        return Err(BoundProcessorError::Authority);
+    }
+    Ok(rebuilt)
+}
+
+fn classic_deflate(bytes: &[u8]) -> Result<Vec<u8>, BoundProcessorError> {
+    let mut stream = Box::<libz_sys::z_stream>::new_uninit();
+    // C initializes the null callbacks before Rust observes the stream; its address stays fixed.
+    let initialized = unsafe {
+        stream.as_mut_ptr().write_bytes(0, 1);
+        libz_sys::deflateInit2_(
+            stream.as_mut_ptr(),
+            libz_sys::Z_DEFAULT_COMPRESSION,
+            libz_sys::Z_DEFLATED,
+            -15,
+            8,
+            libz_sys::Z_DEFAULT_STRATEGY,
+            libz_sys::zlibVersion(),
+            std::mem::size_of::<libz_sys::z_stream>() as i32,
+        )
+    };
+    if initialized != libz_sys::Z_OK {
+        return Err(BoundProcessorError::Authority);
+    }
+    // Successful deflateInit2 fills every field, including valid allocator function pointers.
+    let mut stream = unsafe { stream.assume_init() };
+    let result = (|| {
+        // The initialized stream is owned here and deflateBound does not retain the input.
+        let capacity =
+            unsafe { libz_sys::deflateBound(&mut *stream, bytes.len() as libz_sys::uLong) };
+        let capacity = usize::try_from(capacity).map_err(|_| BoundProcessorError::Authority)?;
+        let reserved =
+            bytes.len() + (bytes.len() >> 12) + (bytes.len() >> 14) + (bytes.len() >> 25) + 13;
+        if capacity > reserved || bytes.len() > MAX_JAVA_ENTRY_BYTES as usize {
+            return Err(BoundProcessorError::Authority);
+        }
+        let mut compressed = vec![0; capacity];
+        stream.next_in = bytes.as_ptr().cast_mut();
+        stream.avail_in = bytes.len() as libz_sys::uInt;
+        stream.next_out = compressed.as_mut_ptr();
+        stream.avail_out = compressed.len() as libz_sys::uInt;
+        // Both buffers stay live and bounded until deflate finishes using their pointers.
+        let status = unsafe { libz_sys::deflate(&mut *stream, libz_sys::Z_FINISH) };
+        if status != libz_sys::Z_STREAM_END
+            || stream.avail_in != 0
+            || stream.total_in as usize != bytes.len()
+            || stream.total_out as usize > compressed.len()
+        {
+            return Err(BoundProcessorError::Authority);
+        }
+        compressed.truncate(stream.total_out as usize);
+        Ok(compressed)
+    })();
+    // Every initialized stream is released, including failed compression attempts.
+    let ended = unsafe { libz_sys::deflateEnd(&mut *stream) };
+    if ended != libz_sys::Z_OK {
+        return Err(BoundProcessorError::Authority);
+    }
+    result
 }
 
 async fn run_java_step(
@@ -1405,15 +1692,7 @@ async fn run_java_step(
     let arguments = step
         .args
         .iter()
-        .map(|argument| {
-            render_argument(
-                argument,
-                plan,
-                workspace,
-                minecraft_version,
-                matches!(&step.action, BoundProcessorAction::SplitJar),
-            )
-        })
+        .map(|argument| render_argument(argument, plan, workspace, minecraft_version))
         .collect::<Result<Vec<_>, _>>()?;
     let bootstrap_environment = processor_bootstrap_environment()?;
     reauthenticate_step_dependencies(step, plan, workspace, authority, minecraft_version)
@@ -1793,13 +2072,8 @@ fn render_argument(
     plan: &BoundProcessorPlan,
     workspace: &ProcessorWorkspace,
     minecraft_version: &str,
-    temporary_outputs: bool,
 ) -> Result<OsString, BoundProcessorError> {
-    let output_root = if temporary_outputs {
-        workspace.temp_path()
-    } else {
-        workspace.libraries_path()
-    };
+    let output_root = workspace.temp_path();
     match argument {
         BoundProcessorArgument::Artifact(artifact) => Ok(workspace
             .libraries_path()
@@ -2805,6 +3079,153 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn java_outputs_reconstruct_classic_provider_bytes_before_batch_publication() {
+        // Smallest differing entry from authenticated Forge 47.4.10 Java output:
+        // assets/minecraft/font/include/unifont.json (29 bytes; zlib-ng raw DEFLATE).
+        let bytes = b"\x50\x4b\x03\x04\x14\x00\x08\x08\x08\x00\x00\x00\x7a\x13\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+            \x00\x00\x2a\x00\x00\x00\x61\x73\x73\x65\x74\x73\x2f\x6d\x69\x6e\x65\x63\x72\x61\x66\x74\x2f\x66\
+            \x6f\x6e\x74\x2f\x69\x6e\x63\x6c\x75\x64\x65\x2f\x75\x6e\x69\x66\x6f\x6e\x74\x2e\x6a\x73\x6f\x6e\
+            \xab\xe6\x52\x50\x50\x50\x50\x2a\x28\xca\x2f\xcb\x4c\x49\x2d\x2a\x56\xb2\x52\x88\x06\x0b\xc5\x72\
+            \xd5\x72\x01\x00\x50\x4b\x07\x08\x1c\x6d\x4d\x8e\x1c\x00\x00\x00\x1d\x00\x00\x00\x50\x4b\x01\x02\
+            \x14\x00\x14\x00\x08\x08\x08\x00\x00\x00\x7a\x13\x1c\x6d\x4d\x8e\x1c\x00\x00\x00\x1d\x00\x00\x00\
+            \x2a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x61\x73\x73\x65\x74\x73\
+            \x2f\x6d\x69\x6e\x65\x63\x72\x61\x66\x74\x2f\x66\x6f\x6e\x74\x2f\x69\x6e\x63\x6c\x75\x64\x65\x2f\
+            \x75\x6e\x69\x66\x6f\x6e\x74\x2e\x6a\x73\x6f\x6e\x50\x4b\x05\x06\x00\x00\x00\x00\x01\x00\x01\x00\
+            \x58\x00\x00\x00\x74\x00\x00\x00\x00\x00";
+        let provider = [
+            0x03, 0xa2, 0x7b, 0x3e, 0x51, 0xb1, 0xe9, 0x03, 0x40, 0xcd, 0xef, 0x35, 0x57, 0x2c,
+            0x5c, 0x01, 0xc7, 0x7b, 0x88, 0x4e,
+        ];
+        let owner = prepare_ephemeral_processor_workspace("split-classic-test", "1.20.1")
+            .expect("canonical output owner");
+        let base = serde_json::from_value(serde_json::json!({
+            "id": "1.20.1", "javaVersion": {"component": "java-runtime-delta", "majorVersion": 17}
+        }))
+        .expect("runtime fixture version");
+        let runtime = split_test_runtime(&owner, &base).await;
+        let workspace = owner.workspace();
+        let artifact = |name: &str| BoundProcessorArtifact {
+            coordinate: format!("example:{name}:1"),
+            relative_path: PortableRelativePath::new_exact(&format!("example/{name}.jar")).unwrap(),
+        };
+        let input = artifact("input");
+        workspace
+            .write_library_exact(&input.relative_path, bytes)
+            .await
+            .expect("immutable input");
+        let mut step = BoundProcessorStep {
+            action: BoundProcessorAction::Java,
+            jar: input,
+            classpath: Vec::new(),
+            args: Vec::new(),
+            outputs: ["slim", "extra"]
+                .into_iter()
+                .map(|name| BoundProcessorOutput {
+                    artifact: artifact(name),
+                    expectation: BoundProcessorOutputExpectation::ProviderSha1(provider),
+                    role: BoundProcessorOutputRole::Terminal {
+                        expected_size: Some(224),
+                    },
+                })
+                .collect(),
+        };
+        for output in &step.outputs {
+            let path = &output.artifact.relative_path;
+            workspace.ensure_temp_parent(path).expect("scratch parent");
+            workspace
+                .ensure_library_parent(path)
+                .expect("library parent");
+            fs::write(workspace.temp_path().join(path.as_str()), bytes).expect("Java output");
+        }
+        let before = workspace.snapshot_root().expect("immutable input facts");
+        let input_path = workspace
+            .libraries_path()
+            .join(step.jar.relative_path.as_str());
+        let (_cancel_tx, mut cancel) = oneshot::channel();
+        step.outputs[1].expectation = BoundProcessorOutputExpectation::ProviderSha1([0; 20]);
+        let refused = super::promote_java_outputs(&step, workspace, &before, &mut cancel).await;
+        let refused_root = workspace.snapshot_root().expect("refused batch facts");
+        step.outputs[1].expectation = BoundProcessorOutputExpectation::ProviderSha1(provider);
+        let (cancel_tx, mut cancelled) = oneshot::channel();
+        cancel_tx.send(()).expect("cancel promotion");
+        let cancelled_result =
+            super::promote_java_outputs(&step, workspace, &before, &mut cancelled).await;
+        let cancelled_root = workspace.snapshot_root().expect("cancelled batch facts");
+        let mut exhausted = 1;
+        let budget_result =
+            super::recompress_java_archive(bytes, &mut exhausted, &mut cancel).await;
+        step.outputs[1].role = BoundProcessorOutputRole::Terminal {
+            expected_size: Some(225),
+        };
+        let wrong_size = super::promote_java_outputs(&step, workspace, &before, &mut cancel).await;
+        let wrong_size_root = workspace.snapshot_root().expect("wrong size batch facts");
+        step.outputs[1].role = BoundProcessorOutputRole::Terminal {
+            expected_size: Some(224),
+        };
+        fs::write(&input_path, b"changed").expect("changed authenticated input");
+        let changed_input =
+            super::promote_java_outputs(&step, workspace, &before, &mut cancel).await;
+        let changed_root = workspace
+            .snapshot_root()
+            .expect("changed input batch facts");
+        fs::write(&input_path, bytes).expect("restore authenticated input");
+        let result = super::promote_java_outputs(&step, workspace, &before, &mut cancel).await;
+        let after = workspace.snapshot_root().expect("published facts");
+        let scratch_empty = fs::read_dir(workspace.temp_path())
+            .expect("scratch directory")
+            .next()
+            .is_none();
+        let mut retained = after.files().clone();
+        let observed: Vec<_> = step
+            .outputs
+            .iter()
+            .map(|output| {
+                retained.remove(&super::library_root_path(&output.artifact.relative_path).unwrap())
+            })
+            .collect();
+        drop(runtime);
+        let cleanup = owner.cleanup();
+        cleanup.expect("settled owner cleanup");
+        assert_eq!(
+            format!("{:x}", Sha1::digest(bytes)),
+            "4c76f0fc157635dfdda3bce53aac5576e8c996eb"
+        );
+        assert!(matches!(refused, Err(BoundProcessorError::Authority)));
+        assert_eq!(
+            before.files(),
+            refused_root.files(),
+            "bad second hash cannot publish the first"
+        );
+        assert!(matches!(
+            cancelled_result,
+            Err(BoundProcessorError::Cancelled)
+        ));
+        assert_eq!(before.files(), cancelled_root.files());
+        assert!(matches!(budget_result, Err(BoundProcessorError::Authority)));
+        assert!(matches!(wrong_size, Err(BoundProcessorError::Authority)));
+        assert_eq!(before.files(), wrong_size_root.files());
+        assert!(matches!(changed_input, Err(BoundProcessorError::Stage)));
+        assert_eq!(before.files().len(), changed_root.files().len());
+        for output in &step.outputs {
+            let path = super::library_root_path(&output.artifact.relative_path).unwrap();
+            assert!(!changed_root.files().contains_key(&path));
+        }
+        result.expect("correct classic provider reconstruction");
+        assert!(scratch_empty);
+        assert_eq!(
+            before.files(),
+            &retained,
+            "authenticated input remains unchanged"
+        );
+        for output in observed {
+            let output = output.expect("published output");
+            assert_eq!(output.size(), 224);
+            assert_eq!(output.sha1(), &provider);
+        }
+    }
+
+    #[cfg(unix)]
     async fn split_test_runtime(
         owner: &super::ProcessorWorkspaceOwner,
         base: &crate::launch::VersionJson,
@@ -2822,9 +3243,9 @@ if [ "$4" != generic ]; then
   printf 'cache' > "$7.cache"
 fi
 case "$4" in
-  wrong) printf 'invalid' > "$7" ;;
+  wrong|generic-wrong) printf 'invalid' > "$7" ;;
   derived-empty) : > "$7" ;;
-  unexpected|derived-unexpected) printf 'unexpected' > unexpected ;;
+  unexpected|derived-unexpected|generic-unexpected) printf 'unexpected' > unexpected ;;
 esac
 "#
         .to_vec();
@@ -2894,6 +3315,9 @@ esac
             "wrong",
             "unexpected",
             "generic",
+            "generic-wrong",
+            "generic-size",
+            "generic-unexpected",
             "derived",
             "derived-empty",
             "derived-missing",
@@ -2965,7 +3389,7 @@ esac
                 BoundProcessorOutputExpectation::ProviderSha1(sha1)
             };
             let step = BoundProcessorStep {
-                action: if mode == "generic" {
+                action: if mode.starts_with("generic") {
                     BoundProcessorAction::Java
                 } else {
                     BoundProcessorAction::SplitJar
@@ -2992,7 +3416,7 @@ esac
                             BoundProcessorOutputRole::Intermediate
                         } else {
                             BoundProcessorOutputRole::Terminal {
-                                expected_size: if mode == "derived-size" {
+                                expected_size: if matches!(mode, "derived-size" | "generic-size") {
                                     Some(bytes.len() as u64 + 1)
                                 } else {
                                     (!derived).then_some(bytes.len() as u64)
@@ -3016,7 +3440,8 @@ esac
             )
             .await;
             match mode {
-                "wrong" | "derived-empty" | "derived-missing" | "derived-size" => {
+                "wrong" | "generic-wrong" | "generic-size" | "derived-empty"
+                | "derived-missing" | "derived-size" => {
                     assert!(
                         matches!(result, Err(BoundProcessorError::Authority)),
                         "{mode} must refuse before promotion"
@@ -3024,7 +3449,13 @@ esac
                     let (cancel_tx, mut cancelled) = oneshot::channel();
                     cancel_tx.send(()).expect("cancel promotion");
                     assert!(matches!(
-                        super::promote_split_outputs(&step, workspace, &mut cancelled).await,
+                        super::promote_java_outputs(
+                            &step,
+                            workspace,
+                            &workspace.snapshot_root().expect("cancelled root facts"),
+                            &mut cancelled,
+                        )
+                        .await,
                         Err(BoundProcessorError::Cancelled)
                     ));
                     for output in &step.outputs {
@@ -3036,7 +3467,7 @@ esac
                         );
                     }
                 }
-                "unexpected" | "derived-unexpected" => {
+                "unexpected" | "derived-unexpected" | "generic-unexpected" => {
                     assert!(matches!(result, Err(BoundProcessorError::Stage)))
                 }
                 _ => {
