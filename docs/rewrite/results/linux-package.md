@@ -1,5 +1,13 @@
 # Linux AppImage build
 
+## Current compositor-visible onboarding failure
+
+2026-10-11, an active unlocked Wayland desktop provides actual compositor screenshots independently of the native capture helper. The recorded `716cd9f3` AppImage has live Name/Next onboarding accessibility, but its1100×720 compositor window capture is uniformly dark. A monitor capture shows the same dark Axial surface beside painted desktop/file-manager content. This establishes a compositor-visible rendering failure; it does not identify a driver or application cause.
+
+The actually loaded bundled engine is WebKit2.54.0/GTK3. Separate supported process-local shared-memory frame-transfer and CPU-raster controls each retain the dark result; neither is shipped as a remedy. All three originals94068/46022/56344 close through the actual application control and join0, with exact group/listener/profile-holder absence. No host graphics, packages, sandbox or security settings change. The fresh export candidate, AppImage `b78aeb6f177f7731e0b89f6afe5a84f64245e31644cd3c15773ff01a62fa5eeb`/bundled executable `b66eb9e9ddf0b6d62304af77b771ea504d7d4d3f24d1976234bea191e1979d47`, also produces a uniformly dark onboarding capture in the ordinary desktop environment without renderer overrides; actual Close15612 joins0. Its authenticated software-X11 [native export journey](native-skins.md#current-linux-native-png-export) renders correctly and completes, qualifying the display boundary separately.
+
+Evidence: `physical-onboarding-current/{capture-facts,physical-proof,capture-shm-facts,capture-cpu-facts}.json`, compositor window captures and hash-bound owner/closure records; full-monitor diagnostic remains private. Repeated renderer gestures are deferred after the distinct frame-transfer/raster controls. Physical Linux graphics remains a release blocker; isolated X11 outcomes do not waive it.
+
 ## Current installed offline journey
 
 2026-10-11, source `e8b44c20b25a7f4b70c1c1a1839f8a8d00f38aef`. Fresh pinned Node24.13.1/Rust1.93.1 frontend and normal optimized x86_64 AppImage build complete. Frontend generation is `ff71ffab3ae2`; AppImage SHA256 is `118540d3b0de2596a81762b9466426c9a5748d5466be7fc9b75bd9529df23550`. Packaging retries with the actual Fedora GStreamer plugin/helper directories and media-framework bundling; original57796 joins0. The earlier generic bundle failure remains recorded, without an established complete cause. No updater artifacts, signing or publication are produced.

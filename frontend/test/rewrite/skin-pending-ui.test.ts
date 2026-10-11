@@ -56,7 +56,7 @@ const failure = 'Minecraft rejected the skin change.';
 const skin = {
   texture_key: 'texture-a',
   name: 'Saved skin',
-  variant: 'classic',
+  variant: 'classic' as const,
   source: 'local_upload',
   cape_id: null,
   created_at: '2026-09-08T12:00:00Z',
@@ -100,7 +100,7 @@ function nodes(tree: unknown): ViewNode[] {
   return [node, ...nodes(node.props.children)];
 }
 
-function harness() {
+function harness(native = { exportNativeSavedSkinPng: async (_skin: typeof skin): Promise<'published' | 'cancelled' | undefined> => undefined }) {
   let nextTimer = 0;
   const timers = new Map<number, () => void>();
   const calls: [string, string][] = [];
@@ -162,7 +162,7 @@ function harness() {
     {
       '../api': transport,
       '../default-skins': defaults,
-      '../views/accounts/api': api,
+      '../views/accounts/api': { ...api, exportNativeSavedSkinPng: native.exportNativeSavedSkinPng },
       '../toast': { toast: (message: string) => notices.push(message) },
       '../ui/Dialog': { showConfirm: () => confirm() },
       './accounts': {
@@ -276,11 +276,18 @@ function inlineErrors(h: ReturnType<typeof harness>): unknown[] {
 }
 
 function nativeSkinBoundary(invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>) {
-  return source<typeof import('../../src/native')>(
+  const globals = { window: { __TAURI__: { core: { invoke } } }, File };
+  const native = source<typeof import('../../src/native')>(
     'native.ts',
     { './dto-contract': source<typeof import('../../src/dto-contract')>('dto-contract.ts', {}) },
-    { window: { __TAURI__: { core: { invoke } } }, File },
+    globals,
   );
+  const api = source<typeof import('../../src/views/accounts/api')>(
+    'views/accounts/api.ts',
+    { '../../api': {}, '../../default-skins': { DEFAULT_SKINS: [] } },
+    globals,
+  );
+  return { ...native, exportNativeSavedSkinPng: api.exportNativeSavedSkinPng };
 }
 
 test('native picker validation failures reach the upload hook and wardrobe notice unchanged', async () => {
@@ -777,4 +784,53 @@ test('an acknowledged cancellation never rearms the old queue after a status rea
   assert.deepEqual(inlineErrors(h), ['Skin status could not be read.']);
   assert.equal(h.machine.wardrobeData.value.pendingApply, null);
   assert.equal(h.timers.size, 0);
+});
+
+
+test('native Download PNG waits for settled publication and cannot replay or fetch a blob on an unknown response', async () => {
+  const result = deferred<unknown>();
+  const commands: string[] = [];
+  const native = nativeSkinBoundary(async (command, args) => {
+    commands.push(command);
+    assert.equal(JSON.stringify(args?.expected), JSON.stringify(skin));
+    return result.promise;
+  });
+  const h = harness(native);
+  const download = h.machine.downloadSavedSkin(skin);
+  await settle();
+  assert.equal(h.machine.wardrobeOp.value?.kind, 'download');
+  assert.deepEqual(h.notices, []);
+  await h.machine.downloadSavedSkin(skin);
+  assert.deepEqual(commands, ['export_saved_skin_png']);
+  result.resolve('published');
+  await download;
+  assert.deepEqual(h.notices, ['Skin PNG downloaded']);
+  assert.deepEqual(h.calls, []);
+
+  for (const payload of ['cancelled', 'unexpected']) {
+    const unknown = harness(nativeSkinBoundary(async () => payload));
+    await unknown.machine.downloadSavedSkin(skin);
+    assert.deepEqual(unknown.notices, []);
+    assert.deepEqual(unknown.calls, []);
+    if (payload === 'cancelled') assert.equal(unknown.machine.wardrobeNotice.value, null);
+    else assert.match(unknown.machine.wardrobeNotice.value ?? '', /outcome is unknown/);
+  }
+  let attempts = 0;
+  const lost = harness(nativeSkinBoundary(async () => {
+    attempts += 1;
+    throw new Error('transport disappeared');
+  }));
+  await lost.machine.downloadSavedSkin(skin);
+  assert.equal(attempts, 1);
+  assert.deepEqual(lost.calls, []);
+  assert.deepEqual(lost.notices, []);
+  assert.match(lost.machine.wardrobeNotice.value ?? '', /outcome is unknown/);
+  const refused = harness(nativeSkinBoundary(async () => {
+    throw { status: 'refused', message: 'A file already exists at that destination. Choose a new filename.' };
+  }));
+  await refused.machine.downloadSavedSkin(skin);
+  assert.match(refused.machine.wardrobeNotice.value ?? '', /already exists/);
+  const transportString = harness(nativeSkinBoundary(async () => { throw 'channel closed'; }));
+  await transportString.machine.downloadSavedSkin(skin);
+  assert.match(transportString.machine.wardrobeNotice.value ?? '', /outcome is unknown/);
 });

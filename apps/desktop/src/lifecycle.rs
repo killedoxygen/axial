@@ -513,11 +513,15 @@ impl DesktopLifecycle {
         };
         // The API owner asks domain services to stop before joining their work.
         // Both owners survive until their actual shutdown has settled.
-        tokio::join!(
+        let (_, skin_result, _) = tokio::join!(
             presence,
             self.skin_files.drain(),
             shutdown_server_after_failure(&services.server)
         );
+        if let Err(error) = skin_result {
+            tracing::error!(%error, "Native skin publication remains retained after event-loop shutdown");
+            return;
+        }
         self.terminal
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -530,7 +534,7 @@ impl DesktopLifecycle {
             .shutdown(TASK_SHUTDOWN_TIMEOUT)
             .await
             .map_err(|_| SHUTDOWN_INCOMPLETE.to_string())?;
-        self.skin_files.drain().await;
+        self.skin_files.drain().await?;
         self.presence.shutdown().await?;
         if stop_api {
             let result = tokio::time::timeout(API_SHUTDOWN_TIMEOUT, services.server.shutdown())
@@ -625,7 +629,14 @@ pub fn report_window_startup_failure(app: AppHandle, lifecycle: DesktopLifecycle
     show_window_failure(app, lifecycle.clone());
     tokio::spawn(async move {
         lifecycle.shutdown_after_event_loop().await;
-        lifecycle.allow_exit();
+        if lifecycle
+            .terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .event_loop_settled
+        {
+            lifecycle.allow_exit();
+        }
     });
 }
 
@@ -745,7 +756,11 @@ mod tests {
             .unwrap();
         let url = tauri::Url::parse(&services.server.bootstrap().base_url).unwrap();
         let address = std::net::SocketAddr::from(([127, 0, 0, 1], url.port().unwrap()));
-        let skin_files = NativeSkinFiles::new(services.library.clone(), services.tasks.clone());
+        let skin_files = NativeSkinFiles::new(
+            services.library.clone(),
+            services.tasks.clone(),
+            services.skins.library.clone(),
+        );
         let lifecycle = DesktopLifecycle::new(
             services.tasks,
             services.server,
@@ -790,9 +805,11 @@ mod tests {
     async fn service_release_requires_joined_exit_and_preserves_existing_strong_captures() {
         let (_directory, lifecycle, _) = fixture().await;
         let facade = lifecycle.clone();
+        let native_facade = lifecycle.skin_files.clone();
         let retained = lifecycle.retained_services().unwrap();
         let server = Arc::downgrade(&retained.server);
         let skins = Arc::downgrade(&retained.skins);
+        let saved = Arc::downgrade(&retained.skins.library);
         assert!(lifecycle.release_services_after_exit().is_err());
         lifecycle.prepare_exit(TerminalIntent::Close).await.unwrap();
         assert!(retained.server.is_shutdown_settled());
@@ -802,9 +819,13 @@ mod tests {
         assert!(facade.retained_services().is_err());
         assert!(server.upgrade().is_some());
         assert!(skins.upgrade().is_some());
+        assert!(saved.upgrade().is_some());
         drop(retained);
         assert!(server.upgrade().is_none());
         assert!(skins.upgrade().is_none());
+        assert!(saved.upgrade().is_none());
+        native_facade.close();
+        drop(native_facade);
         facade.release_services_after_exit().unwrap();
     }
 
@@ -1150,7 +1171,11 @@ mod tests {
             services.tasks.clone(),
             services.server.clone(),
             PresenceObserver::disabled_for_test(),
-            NativeSkinFiles::new(services.library.clone(), services.tasks.clone()),
+            NativeSkinFiles::new(
+                services.library.clone(),
+                services.tasks.clone(),
+                services.skins.library.clone(),
+            ),
             services.skins.clone(),
         );
         let mut events = lifecycle.interface_preferences_events();
@@ -1350,7 +1375,11 @@ mod tests {
             services.tasks.clone(),
             services.server.clone(),
             PresenceObserver::disabled_for_test(),
-            NativeSkinFiles::new(services.library.clone(), services.tasks.clone()),
+            NativeSkinFiles::new(
+                services.library.clone(),
+                services.tasks.clone(),
+                services.skins.library.clone(),
+            ),
             services.skins.clone(),
         )
         .without_interface_preferences_for_test();
@@ -1414,7 +1443,11 @@ mod tests {
             services.tasks.clone(),
             services.server.clone(),
             PresenceObserver::disabled_for_test(),
-            NativeSkinFiles::new(services.library.clone(), services.tasks.clone()),
+            NativeSkinFiles::new(
+                services.library.clone(),
+                services.tasks.clone(),
+                services.skins.library.clone(),
+            ),
             services.skins.clone(),
         );
         let mut events = lifecycle.interface_preferences_events();
