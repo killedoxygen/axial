@@ -19,6 +19,13 @@ const CLOSE_BLOCKED_EVENT: &str = "axial:desktop:close-blocked";
 const API_STOPPED_EVENT: &str = "axial:desktop:api-stopped";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("GDK_GL").is_none() {
+        // Create GTK's GL context before its first paint, avoiding a SHM commit
+        // after EGL explicit sync is enabled (WebKit bug 324551).
+        // SAFETY: application threads and the native runtime have not started.
+        unsafe { std::env::set_var("GDK_GL", "always") };
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(8 * 1024 * 1024)

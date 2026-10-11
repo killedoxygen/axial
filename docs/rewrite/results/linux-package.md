@@ -1,6 +1,20 @@
 # Linux AppImage build
 
+## Current Linux GTK initialization
+
+2026-10-11, a Linux-only correction over `4fc798a0` defaults unset `GDK_GL` to `always` at process entry, before Tokio/native threads start. Explicit values, including an empty value, remain untouched. This creates GTK's paint context before its first frame rather than switching to GL during a shared-memory frame. GL/WebGL remain enabled; no window workflow, capability or host setting changes. The matching [upstream WebKit correction](https://github.com/WebKit/WebKit/commit/48b35bda44fd9316dc4845f4b00506e323026167) moves context creation before painting; the retained local protocol failure has the same missing-acquire-point boundary with a different driver.
+
+The earlier headless desktop exposes no Wayland outputs and never completes GTK's requested frame callback. A separate one-output compositor redraws the plain GTK control correctly. On its EGL backend, the unchanged installed candidate instead disconnects with explicit-sync error4 when GTK commits its first shared-memory buffer without an acquire point. One process-local `GDK_GL=always` control resolves that exact rejection and visibly renders onboarding and the saved 3D preview. These distinct boundaries supersede the undiagnosed drawing attribution below; repeating software/shared-memory flags is not the next action.
+
+Normal media-enabled build16501 joins0. AppImage SHA256 is `a2803ef70bd6577ebae3c64d119da75f160be346e9c3a09f40a85156aa54b317`,222,611,960 bytes; bundled executable is `30d9d75960ea8dfb0d82d76f310295c7b3bc7c554b945a3100be2e56f76c7c89`. The native-source receipt binds `main.rs` SHA256 `9c77a9d26dde90037d99d196eba934957ad626982f5a53c64f5479425725fa4f`; the unchanged frontend generation `2d6775382692` verifies. No signing, updater artifacts or release publication occurs.
+
+With external renderer overrides removed, the actual installed artifact visibly renders onboarding, the preserved saved-skin card/3D stage and the same view after cold reopen on the one-output EGL Wayland compositor. WebKit children inherit the integrated default. All three protocol traces have matched acquire/release points and no protocol rejection. Independent acceptance joins62267/0: all six public GETs return200, the genuine74,784-byte F2 PNG matches HTTP bytes exactly, and SSE returns200 and closes. The whole protected profile and music cache are identical before startup, during acceptance, after Close and after the same-candidate cold reopen; snapshot SHA256 remains `56d844696acc7f5c979eb916d8fde97ade4e0110fadd00c02821a07591409c92`. No game or export is replayed.
+
+Actual frontend Close originals56756/78754/34914 each join0 with no remaining processes, listeners or profile holders. The isolated compositor82161 joins0 and all its services disappear. Compact evidence: `gtk-startup-current/current-proof.json`, installed captures/closure receipts, and `gtk-startup-acceptance-prep/candidate/proof.json`. This is installed Linux rendering, transport and cold-preservation acceptance; earlier gameplay keeps its recorded artifact scope. Audible output, other artifact architectures, real-account/stable-identity use, Mac menu Quit and trusted installed updates remain release gates.
+
 ## Current compositor-visible onboarding failure
+
+Historical diagnostic evidence, superseded by [the current initialization and output-boundary results](#current-linux-gtk-initialization).
 
 2026-10-11, an active unlocked Wayland desktop provides actual compositor screenshots independently of the native capture helper. The recorded `716cd9f3` AppImage has live Name/Next onboarding accessibility, but its1100×720 compositor window capture is uniformly dark. A monitor capture shows the same dark Axial surface beside painted desktop/file-manager content. This establishes a compositor-visible rendering failure; it does not identify a driver or application cause.
 
