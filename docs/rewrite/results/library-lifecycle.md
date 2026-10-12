@@ -1,5 +1,13 @@
 # Library lifecycle integration
 
+## Current Windows production process containment
+
+2026-10-12 execution, retained2026-10-13: native x86_64 MSVC executes the unchanged production `core/app/src/launch/process.rs`, SHA256 `a4a2e2f1af35145fc782af202f8a223bda107c2e78e5f706bbf822384ac68523`. The standalone fixture authenticates that owner and the existing locked dependency pool before and after its offline build. Rust/Cargo1.93.1 builds in1m06s with one job; the original native command joins0.
+
+Actual Stop terminates the Job's game and inherited descendant, reaps the original game and drains stdout/stderr to EOF. A natural leader exit0 leaves its live descendant unsettled until the retained Job is stopped. Abrupt fixture-owner exit75 bypasses Rust destruction; OS Job closure terminates both retained process identities. Original fixture owners join0/0/75, and each exact creation-time-bound game/descendant handle signals exit. The two ordinary cases retain settled tree and exact stderr evidence.
+
+Evidence is `.rewrite-logs/windows-containment-current/{completion.json,recovery-zvzog48o/recovered/}`. All24 extracted small files match their retained hashes; original reader/exporter joins0 and borrowed read-only descriptors close. Initial CD module-loading, command quoting and copied read-only-controller failures remain qualified; a separate test wrapper corrects quoting without product changes. This proves the production Windows process owner only. Installed Play/Stop/Close refusal, durable session recovery, real Minecraft gameplay, account/signing/update continuity and full release parity remain open.
+
 Status: implemented private boundary. Real-provider external-library installation, Ready, Launch/Stop, ordinary reopen and missing-root preservation pass in the bounded journeys below; native switching, interruption and installed-platform parity remain open.
 
 `LibraryLifecycle` owns the isolated application root, selected library generation, retiring generations and unresolved external root acquisition. New admission closes during selection changes. Accepted generation pins, scoped file outcomes and retained Minecraft operations remain tied to the exact original root through settlement. The native adapter shares application-root authority across managed selections, preventing independent publication coordination for one physical root.

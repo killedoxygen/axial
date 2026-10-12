@@ -1,6 +1,8 @@
 # Current integration status
 
-Updated 2026-10-12. Implementation is in progress, not release-ready. Passing checks apply to their recorded source checkpoint, not to later edits or untested runtime parity. Logs below are under `.rewrite-logs/`.
+Updated 2026-10-13. Implementation is in progress, not release-ready. Passing checks apply to their recorded source checkpoint, not to later edits or untested runtime parity. Logs below are under `.rewrite-logs/`.
+
+[Native Windows production process containment](library-lifecycle.md#current-windows-production-process-containment) now completes actual Stop, natural leader exit with a live descendant, and abrupt-owner kill-on-close through the unchanged production Job owner. Exact native process handles settle, original owners join0/0/75 and the native command joins0; compact evidence is retained locally. Installed launcher/session recovery and real Windows gameplay remain separate gates. No product, signing or publication change follows.
 
 [Unpublished macOS Intel RC packaging](native-auth.md#unpublished-macos-intel-rc-package) now builds the exact `fd36002e` x86_64 app and DMG, verifies architecture/checksum and preserves the [ARM64 package](native-auth.md#unpublished-macos-arm64-rc-package), with original build exits0 and no owned groups or mounts left. Intel code is unsigned; ARM has only a linker-ad-hoc signature with unsealed bundle resources. Native GUI, stable signing and trusted delivery remain open. Windows execution retains priority once guest login is available; no release is published.
 
