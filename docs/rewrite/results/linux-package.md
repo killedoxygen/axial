@@ -4,7 +4,9 @@
 
 2026-10-11, source `fd36002e`. The normal media-enabled unsigned AppImage build joins0 with version `0.4.0-rc.1` and unchanged verified frontend generation `2d6775382692`. Its222,616,056-byte artifact has SHA256 `47530ba02d84ae9dcd1edfac6f855f281afcae65636e9a7b4335fce3f2263654`; the actual bundled executable is `21c2bd6110f26d6e7f11b25adc59ed1dd71fce702b0698514a3511b86df624d7`.
 
-That exact installed package visibly renders fresh onboarding on the isolated one-output EGL Wayland compositor. Four capability-authorized HTTP reads return200. Its own native Close joins0, with no process, listener or profile holder left; the compositor also joins0 and all its services disappear. Compact evidence is `rc-linux-current/completion.json`, the onboarding capture and closure receipts. This validates the RC package at the affected boot/transport/close boundaries; prior feature and gameplay acceptance retains its recorded artifact scope. No tag admission, signing, updater artifacts or release publication occurs. Windows native acceptance and external account/trusted-update inputs remain open.
+That exact installed package visibly renders fresh onboarding on the isolated one-output EGL Wayland compositor. Four capability-authorized HTTP reads return200. Its own native Close joins0, with no process, listener or profile holder left; the compositor also joins0 and all its services disappear. Compact evidence is `rc-linux-current/completion.json`, the onboarding capture and closure receipts. No tag admission, signing, updater artifacts or release publication occurs.
+
+The same RC subsequently completes [full-pack world entry, save, exact cold preservation and saved-world loading](pack-files.md#current-linux-rc-full-pack-saved-world-loading), with HTTP/media/SSE and final visible launcher Close0. Initial GTK Close143, compositor143 and the unaccepted stronger input gestures remain qualified in that record. Other feature acceptance retains its recorded artifact scope. Windows local native acceptance passes; Windows gameplay/containment and external account/trusted-update inputs remain open.
 
 ## Current Linux GTK initialization
 

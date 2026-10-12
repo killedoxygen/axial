@@ -1,5 +1,15 @@
 # Pack files
 
+## Current Linux RC full-pack saved-world loading
+
+2026-10-12, the unchanged installed `0.4.0-rc.1` AppImage from `fd36002e` (SHA256 `47530ba02d84ae9dcd1edfac6f855f281afcae65636e9a7b4335fce3f2263654`, bundled executable `21c2bd61`) opens the retained Optimized+2.0.0 instance without repeating creation or installation. Native Ready/26 mods and ordinary Launch lead to Fabric/135 loaded modules and visible Creative single-player gameplay. The game's ordinary window Close saves `New World` and exits0. Its durable intent/report, terminal acknowledgement, output drainage and process-tree absence pass; Axial visibly lists the34-file,16,051,080-byte save.
+
+The entire released snapshot survives launcher termination and cold reopening exactly, including the save, prior three instances, accounts/settings/history,3,650 installed files and343 runtime files. Another ordinary Launch selects the existing world through Minecraft's own menu and visibly restores its scene and inventory. The second game again saves through its ordinary window Close and exits0 with exact terminal settlement. Its42-file,16,240,067-byte save and protected state match the final closed snapshot. Authorized HTTP reads, SVG head media and SSE return200; the stream closes. No product, profile-migration, host setting or trust change occurs.
+
+The first launcher GTK Close action ends original27124 with143; this remains interrupted shutdown evidence, without a causal diagnosis or clean-exit claim. The final visible launcher Close joins original48823/0, with exact process/listener/profile-holder absence. The isolated compositor's session returns, its original32360 ends143, and three remaining owned services are stopped and independently absent. No test game, launcher or display remains. Distinct placed-block restoration, pause → Save and Quit to Title and Quit Game controls are not accepted from the intermittent isolated input attempts. Their earlier artifact-specific evidence remains separate.
+
+Compact owner/file proofs are under `.rewrite-logs/rc-pack-gameplay-current/`; original closures, native captures and transport receipts are under `.rewrite-logs/rc-pack-root/`. Windows gameplay/containment and external account/signing/trusted-update gates remain open. This is current-RC world/save/load evidence, not full release readiness.
+
 ## Current Linux installed full-pack creation
 
 2026-10-11, integrated product `291d8662`, normal media-enabled AppImage SHA256 `a2803ef70bd6577ebae3c64d119da75f160be346e9c3a09f40a85156aa54b317`, bundled executable `30d9d759`. One ordinary authenticated Create request uses the owner-resolved Modrinth selection for Optimized+2.0.0 (`IKVV6bRy` / `RtdplPot`), Minecraft1.20.1/Fabric0.15.10,2048/512-MB limits and automatic optimization off. Both prerequisite and content queues succeed; setup completes and native selection visibly shows Ready, Launch and26 enabled mods. No install retry or write replay occurs.
