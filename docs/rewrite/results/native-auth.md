@@ -1,5 +1,11 @@
 # Native sign-in
 
+## Unpublished macOS ARM64 RC package
+
+2026-10-12: source `fd36002e` builds the normal `0.4.0-rc.1` app and DMG with pinned Rust1.93.1, Node24.13.1, pnpm11.1.3 and Tauri CLI2.12.0. Original62305 and the native build both join0; the build takes8m17s, and all owned groups, build locks and mounted images are absent afterward. The prior bundle is preserved exactly. The fresh frontend generation `2f4c8673527d` passes generation verification; earlier Linux/Windows generations retain their own scope.
+
+The DMG is27,135,373 bytes, SHA256 `f21dff15bcb60540bd80527e5da8ab79e77185b168991d5c65a5b38a9fe21093`; native checksum verification exits0. The app's70,231,040-byte ARM64 executable is SHA256 `bcfa5d03e2c4cd318a719bdce14d55bd0317f122da5b5e85ac46c3ebd4433281`. Both retained local copies match exactly. Explicit `--no-sign` produces only a linker-ad-hoc executable: raw executable verification exits0, but strict app-bundle verification exits1 because resources are unsealed and Info.plist is unbound. No TeamIdentifier, trusted signing, notarization, GUI launch, installation, menu Quit, current-profile reopen or installed-update acceptance is claimed. Evidence is `.rewrite-logs/rc-macos-current/{completion.json,evidence/}`. No product, signing policy, tag or publication change follows.
+
 ## Current packaged Vanilla save and cold persistence
 
 2026-10-10: ordinary ARM64 release-configuration packaging at `4d5b86bb` joins original21230 with0 after12m54s from an empty Cargo target. The unchanged frontend generation `b6e561241546` verifies all eight budgets. Tauri CLI2.11.4 packages with `--no-sign`; the copied app's executable is SHA256 `cb390b85e189af6a7583e79480e002095d7ed75b062470accd931a436fffa713`, linker-ad-hoc with no TeamIdentifier. This is local packaged acceptance, not trusted signing, clean-machine installation or an installed-update certificate. Previous temporary artifacts/profiles are absent; none is recreated or promoted to current evidence.
