@@ -1,5 +1,11 @@
 # Native sign-in
 
+## Unpublished macOS Intel RC package
+
+2026-10-12: the normal `0.4.0-rc.1` app and DMG build from frozen product source `fd36002e` for `x86_64-apple-darwin`, using a separate target directory and the verified prepared frontend generation `2f4c8673527d`. Original1166 and the native build join0 after12m16s. Both raw and bundled executables are actually x86_64; all five build-stage groups, the build lock and owned mounted images are absent. The existing ARM package remains exact.
+
+The Intel executable is71,933,212 bytes, SHA256 `0de3735b79082b8ef3d9acbb85740c87ce1b224a29d9dc253b0c268f10c2f8f4`. The DMG is27,891,026 bytes, SHA256 `91149aacefaecf2f9ce643a9e06da353179b1487448861f3d77abbddf3c02a1f`; native checksum verification exits0. Both local retained copies match exactly. Explicit `--no-sign` leaves the Intel code entirely unsigned; strict bundle verification exits1. Evidence is `.rewrite-logs/rc-macos-current/{intel-completion.json,intel-evidence/}`. This completes local packaging only: no Intel GUI launch, installation, account continuity, lifecycle, trusted signing or installed-update acceptance is claimed. No product, signing policy, tag or publication change follows.
+
 ## Unpublished macOS ARM64 RC package
 
 2026-10-12: source `fd36002e` builds the normal `0.4.0-rc.1` app and DMG with pinned Rust1.93.1, Node24.13.1, pnpm11.1.3 and Tauri CLI2.12.0. Original62305 and the native build both join0; the build takes8m17s, and all owned groups, build locks and mounted images are absent afterward. The prior bundle is preserved exactly. The fresh frontend generation `2f4c8673527d` passes generation verification; earlier Linux/Windows generations retain their own scope.
