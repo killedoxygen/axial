@@ -1,12 +1,14 @@
 # Architecture review
 
-Updated 2026-10-11. Working branch: `main`. Full non-Guardian parity remains active. Historical checkpoint qualifications, original joins and retained failures remain authoritative in the linked feature evidence and Git; compaction waives none of them.
+Updated 2026-10-12. Working branch: `main`. Full non-Guardian parity remains active. Historical checkpoint qualifications, original joins and retained failures remain authoritative in the linked feature evidence and Git; compaction waives none of them.
 
 ## Scope and ownership
 
 Current scope includes the integrated Linux GTK initialization candidate, native PNG export, the named loader/resource/Performance journeys, precise launch-refusal persistence and demonstrated Forge corrections. Root owns native/game execution, runtime restarts and serialized builds. Exclusive feature owners supply executable outcomes; source admission stays serialized. Keep apps open only for active checks, use one compiler job/two test threads, join originals and independently verify absence. Revision-counter optimization remains deferred. Earlier review remains in linked evidence and Git.
 
 ## Findings and corrections
+
+- [Installed Windows acceptance](native-skins.md#current-windows-installed-native-journey) exercises existing onboarding, account, saved-library, interface-preference, native destination and lifecycle owners without product changes. Exact NSIS marker comparison authenticates the normal installed image; actual picker/export Save, Cancel, collision and cold persistence need no platform-specific state or permission expansion. An OS read-only refusal is kept separate from the later application admission boundary. Both actual native Close originals exit0 with profile-specific children absent; build numeric-exit uncertainty and remaining platform gates stay qualified. Defer console-window polish and the unexplained direct-CD selection refusal instead of weakening filesystem admission.
 
 - [Installed full-pack creation](pack-files.md#current-linux-installed-full-pack-creation) uses the existing selection, creation/setup and queue owners. Exact65-file publication/cold proof and real client menu/Quit need no product change or new coordinator. Receipt renewal, explicit navigation and accepted launch selection are authenticated expected evidence deltas; protected prior files/accounts/settings/history remain exact. An isolated-session audio abort is corrected only in the test environment. The unpublished RC version remains owned by the workspace package and existing delivery contract; no version mirror, signing or trust change.
 
