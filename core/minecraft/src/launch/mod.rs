@@ -505,31 +505,87 @@ pub fn resolve_libraries(
     resolved
 }
 
-pub fn build_classpath(libraries: &[ResolvedLibrary], client_jar_path: Option<&Path>) -> String {
-    let mut seen = HashMap::<String, ()>::new();
-    let mut parts = Vec::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("The filesystem path cannot be represented by Java launch arguments.")]
+pub enum LaunchPathError {
+    Unsupported,
+}
 
-    for lib in libraries {
-        let key = lib.abs_path.to_string_lossy().to_string();
-        if seen.contains_key(&key) {
+pub fn java_path_argument(path: &Path) -> Result<String, LaunchPathError> {
+    #[cfg(windows)]
+    let path = windows_java_path(path)?;
+    path.to_str()
+        .filter(|value| !value.chars().any(char::is_control))
+        .map(str::to_owned)
+        .ok_or(LaunchPathError::Unsupported)
+}
+
+#[cfg(windows)]
+fn windows_java_path(path: &Path) -> Result<PathBuf, LaunchPathError> {
+    use std::path::{Component, Prefix};
+
+    fn validate_name(name: &std::ffi::OsStr) -> Result<(), LaunchPathError> {
+        let name = name.to_str().ok_or(LaunchPathError::Unsupported)?;
+        if crate::portable_path::windows_file_name_is_safe(name) {
+            Ok(())
+        } else {
+            Err(LaunchPathError::Unsupported)
+        }
+    }
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Err(LaunchPathError::Unsupported);
+    };
+    let mut encoded = match prefix.kind() {
+        Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+            PathBuf::from(format!("{}:\\", char::from(drive)))
+        }
+        Prefix::UNC(host, share) | Prefix::VerbatimUNC(host, share) => {
+            validate_name(host)?;
+            validate_name(share)?;
+            let mut encoded = PathBuf::from(r"\\");
+            encoded.push(host);
+            encoded.push(share);
+            encoded
+        }
+        _ => return Err(LaunchPathError::Unsupported),
+    };
+    if components.next() != Some(Component::RootDir) {
+        return Err(LaunchPathError::Unsupported);
+    }
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(LaunchPathError::Unsupported);
+        };
+        validate_name(name)?;
+        encoded.push(name);
+    }
+    Ok(encoded)
+}
+
+pub fn build_classpath(
+    libraries: &[ResolvedLibrary],
+    client_jar_path: Option<&Path>,
+) -> Result<String, LaunchPathError> {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let mut seen = HashSet::<&Path>::new();
+    let mut parts = Vec::new();
+    for path in libraries
+        .iter()
+        .map(|library| library.abs_path.as_path())
+        .chain(client_jar_path)
+    {
+        if !seen.insert(path) {
             continue;
         }
-        seen.insert(key, ());
-        parts.push(lib.abs_path.to_string_lossy().to_string());
-    }
-
-    if let Some(client_jar_path) = client_jar_path {
-        let key = client_jar_path.to_string_lossy().to_string();
-        if !seen.contains_key(&key) {
-            parts.push(key);
+        let encoded = java_path_argument(path)?;
+        if encoded.is_empty() || encoded.contains(separator) {
+            return Err(LaunchPathError::Unsupported);
         }
+        parts.push(encoded);
     }
-
-    parts.join(if cfg!(target_os = "windows") {
-        ";"
-    } else {
-        ":"
-    })
+    Ok(parts.join(&separator.to_string()))
 }
 
 pub fn resolve_arguments(
@@ -1214,6 +1270,138 @@ mod tests {
     use super::*;
     use crate::rules::{Environment, OsRule, Rule, default_environment};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn classpath_preserves_entry_order_and_uses_exact_path_identity() {
+        let root = PathBuf::from(if cfg!(windows) {
+            r"C:\library"
+        } else {
+            "/library"
+        });
+        let first = root.join("café").join("first.jar");
+        let second = root.join("second.jar");
+        let libraries = [
+            ResolvedLibrary {
+                abs_path: first.clone(),
+                is_native: false,
+                name: "first".into(),
+            },
+            ResolvedLibrary {
+                abs_path: second.clone(),
+                is_native: false,
+                name: "second".into(),
+            },
+            ResolvedLibrary {
+                abs_path: first.clone(),
+                is_native: false,
+                name: "first".into(),
+            },
+        ];
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        assert_eq!(
+            build_classpath(&libraries, Some(&second)).unwrap(),
+            [
+                java_path_argument(&first).unwrap(),
+                java_path_argument(&second).unwrap()
+            ]
+            .join(separator),
+        );
+    }
+
+    #[test]
+    fn classpath_refuses_paths_that_encode_additional_entries() {
+        let path = PathBuf::from(if cfg!(windows) {
+            r"C:\library;unverified\client.jar"
+        } else {
+            "/library:unverified/client.jar"
+        });
+        assert_eq!(
+            build_classpath(&[], Some(&path)),
+            Err(LaunchPathError::Unsupported)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classpath_refuses_non_unicode_instead_of_replacing_file_identity() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/library/\xff.jar".to_vec()));
+        assert_eq!(
+            build_classpath(&[], Some(&path)),
+            Err(LaunchPathError::Unsupported)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn java_paths_convert_only_supported_typed_windows_prefixes() {
+        for (original, encoded) in [
+            (
+                r"\\?\C:\library café\client.jar",
+                r"C:\library café\client.jar",
+            ),
+            (r"C:\library café\client.jar", r"C:\library café\client.jar"),
+            (
+                r"\\?\UNC\server\share\café\client.jar",
+                r"\\server\share\café\client.jar",
+            ),
+            (
+                r"\\server\share\café\client.jar",
+                r"\\server\share\café\client.jar",
+            ),
+        ] {
+            assert_eq!(
+                java_path_argument(Path::new(original)).as_deref(),
+                Ok(encoded)
+            );
+        }
+        let decomposed = format!("{}\\client.jar", "C:\\cafe\u{0301}");
+        assert_eq!(
+            java_path_argument(Path::new(&decomposed)).unwrap(),
+            decomposed
+        );
+        let long_name = format!(r"\\?\C:\{}\client.jar", "é".repeat(200));
+        assert!(
+            java_path_argument(Path::new(&long_name)).is_ok(),
+            "external ancestors do not inherit managed UTF-8 byte bounds"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn java_paths_refuse_windows_names_that_change_without_verbatim_semantics() {
+        for original in [
+            r"\\?\C:\library.\client.jar",
+            r"\\?\C:\library \client.jar",
+            r"\\?\C:\NUL\client.jar",
+            r"\\?\C:\COM1.log\client.jar",
+            r"\\?\C:\LPT²\client.jar",
+            r"\\?\C:\library\..\client.jar",
+            r"\\?\C:\library\client.jar:stream",
+            r"\\.\C:\library\client.jar",
+            r"\\?\Volume{identity}\library\client.jar",
+            r"C:library\client.jar",
+        ] {
+            assert_eq!(
+                java_path_argument(Path::new(original)),
+                Err(LaunchPathError::Unsupported)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn java_paths_refuse_unpaired_utf16_instead_of_replacing_file_identity() {
+        use std::os::windows::ffi::OsStringExt;
+        let mut name = "C:\\library\\".encode_utf16().collect::<Vec<_>>();
+        name.push(0xd800);
+        name.extend(".jar".encode_utf16());
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&name));
+        assert_eq!(
+            build_classpath(&[], Some(&path)),
+            Err(LaunchPathError::Unsupported)
+        );
+    }
 
     #[test]
     fn resolve_arguments_strips_demo_from_legacy_versions() {
