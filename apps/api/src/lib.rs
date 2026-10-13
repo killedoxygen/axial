@@ -537,6 +537,25 @@ async fn start_profile_with_performance_test_inputs(
     .await
 }
 
+fn report_unresolved_profile_admission(error: &axial_fs::RootSessionError) {
+    use axial_fs::RootSessionError;
+
+    let (phase, cause) = match error {
+        RootSessionError::ProcessImage(cause) => ("process_image", Some(cause)),
+        RootSessionError::Create(cause) => ("create", Some(cause)),
+        RootSessionError::Open(cause) => ("open", Some(cause)),
+        RootSessionError::Busy => ("busy", None),
+        RootSessionError::Lease(cause) => ("lease", Some(cause)),
+        RootSessionError::Recovery(cause) => ("recovery", Some(cause)),
+    };
+    tracing::error!(
+        phase,
+        io_error_kind = ?cause.map(io::Error::kind),
+        native_code = ?cause.and_then(io::Error::raw_os_error),
+        "Replacement profile admission remains unresolved"
+    );
+}
+
 async fn start_profile_inner(
     profile_root: PathBuf,
     extra_origin: Option<&str>,
@@ -564,12 +583,15 @@ async fn start_profile_inner(
         let library = match LibraryLifecycle::open_with_id(&profile.root, library_id) {
             LibraryOpenOutcome::Ready(library) => library,
             LibraryOpenOutcome::NoEffect(_) => return Err("The replacement profile is already open or unavailable. Existing files have been preserved.".into()),
-            outcome @ LibraryOpenOutcome::Unresolved(_) => return Err(StartupError {
-                message: "Replacement profile admission is unresolved. Startup is blocked while its filesystem obligations remain owned.".into(),
-                root: Some(outcome),
-                runtime: None,
-                interrupted_reset: false,
-            }),
+            LibraryOpenOutcome::Unresolved(obligation) => {
+                report_unresolved_profile_admission(obligation.error());
+                return Err(StartupError {
+                    message: "Replacement profile admission is unresolved. Startup is blocked while its filesystem obligations remain owned.".into(),
+                    root: Some(LibraryOpenOutcome::Unresolved(obligation)),
+                    runtime: None,
+                    interrupted_reset: false,
+                });
+            }
         };
         match library.interrupted_root_reset() {
             Ok(false) => {}
@@ -1173,6 +1195,75 @@ fn admit_profile(requested: &Path) -> Result<AdmittedProfile, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_profile_diagnostic_retains_safe_causes_without_error_payloads() {
+        use axial_fs::RootSessionError;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let mut output = self.0.lock().unwrap();
+                assert!(output.len() + bytes.len() <= 4096);
+                output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let secret = "secret-credential-provider-path-command-payload";
+        let hidden = || io::Error::new(io::ErrorKind::PermissionDenied, secret);
+        let native = io::Error::from_raw_os_error(123456);
+        let native_kind = native.kind();
+        tracing::subscriber::with_default(subscriber, || {
+            for error in [
+                RootSessionError::ProcessImage(hidden()),
+                RootSessionError::Create(hidden()),
+                RootSessionError::Open(hidden()),
+                RootSessionError::Busy,
+                RootSessionError::Lease(hidden()),
+                RootSessionError::Recovery(hidden()),
+                RootSessionError::Recovery(native),
+            ] {
+                report_unresolved_profile_admission(&error);
+            }
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains(secret));
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 7);
+        for (line, phase) in lines.iter().zip([
+            "process_image",
+            "create",
+            "open",
+            "busy",
+            "lease",
+            "recovery",
+            "recovery",
+        ]) {
+            assert!(line.contains(&format!("phase=\"{phase}\"")), "{line}");
+        }
+        for line in [lines[0], lines[1], lines[2], lines[4], lines[5]] {
+            assert!(
+                line.contains("io_error_kind=Some(PermissionDenied)"),
+                "{line}"
+            );
+            assert!(line.contains("native_code=None"), "{line}");
+        }
+        assert!(lines[3].contains("io_error_kind=None"));
+        assert!(lines[3].contains("native_code=None"));
+        assert!(lines[6].contains(&format!("io_error_kind=Some({native_kind:?})")));
+        assert!(lines[6].contains("native_code=Some(123456)"));
+    }
 
     #[tokio::test]
     async fn configured_rules_refreshes_on_startup_without_an_http_command() {
