@@ -1,5 +1,9 @@
 # Linux AppImage build
 
+## Plain f7 candidate protocol and shutdown
+
+2026-10-13, the joined plain `f7e41502` AppImage passes a fresh read-only native journey: Ready preserves the latest closed profile, HTTP serves the retained95,537-byte screenshot exactly, and the initial ticketed queue SSE projection matches its ordinary HTTP response. Both original native child and controller join0 after frontend Close; app/group/profile-holder/listener absence and final protected-profile equality pass. [The detailed outcome record](settings.md#current-linux-candidate-startup-and-stop) retains the same artifact's startup, Stop, black game window, earlier143 and subsequent cold Close0 qualifications. Later stream transitions, audible playback and fresh saved-world rendering remain open.
+
 ## Unpublished 0.4.0-rc.1 package
 
 2026-10-11, source `fd36002e`. The normal media-enabled unsigned AppImage build joins0 with version `0.4.0-rc.1` and unchanged verified frontend generation `2d6775382692`. Its222,616,056-byte artifact has SHA256 `47530ba02d84ae9dcd1edfac6f855f281afcae65636e9a7b4335fce3f2263654`; the actual bundled executable is `21c2bd6110f26d6e7f11b25adc59ed1dd71fce702b0698514a3511b86df624d7`.
