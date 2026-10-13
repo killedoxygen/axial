@@ -53,7 +53,7 @@ impl JavaProbeReceipt {
         self.architecture
     }
     pub fn executable(&self) -> &Path {
-        &self.identity.selected
+        &self.identity.requested
     }
 
     /// Recheck the requested alias, the selected console sibling, metadata and
@@ -112,7 +112,7 @@ async fn probe_with_timeout(
             major,
             update,
             distribution: detect_distribution(&output).into(),
-            path: identity.selected.to_string_lossy().into_owned(),
+            path: identity.requested.to_string_lossy().into_owned(),
         },
         identity,
         architecture,
