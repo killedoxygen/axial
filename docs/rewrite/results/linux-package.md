@@ -1,5 +1,7 @@
 # Linux AppImage build
 
+The same normal `0ca09aeb` package now also completes the [retained full-pack play/save/reopen/load journey](pack-files.md#current-package-full-pack-play-save-and-reload) on isolated X11. Both games and launcher originals settle0, protected state remains exact, and owned processes are absent. This changed-environment outcome preserves the earlier accelerated desktop black-window qualification.
+
 ## Current Vanilla play, save, cold reopen and saved-world load
 
 2026-10-13, the normal unsigned `0ca09aeb` AppImage uses frontend generation `f6df0921bfeb` and the retained Linux-owned current-app profile. Its222,661,112-byte package is SHA256 `3efdbe6c2391a96e5478dd5025bcd6c3fa62180fd24a64de72d7f6146fe65269`; the bundled executable is `11f06b454ceecc6c48f5280947a543657ac9dc3de5a908ca33229e01b7885494`. The normal build and extraction join0. No source overlay or publication is involved.
