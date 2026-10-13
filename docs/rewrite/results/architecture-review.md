@@ -1,12 +1,14 @@
 # Architecture review
 
-Updated 2026-10-12. Working branch: `main`. Full non-Guardian parity remains active. Historical checkpoint qualifications, original joins and retained failures remain authoritative in the linked feature evidence and Git; compaction waives none of them.
+Updated 2026-10-13. Working branch: `main`. Full non-Guardian parity remains active. Historical checkpoint qualifications, original joins and retained failures remain authoritative in the linked feature evidence and Git; compaction waives none of them.
 
 ## Scope and ownership
 
 Current scope includes the integrated Linux GTK initialization candidate, native PNG export, the named loader/resource/Performance journeys, precise launch-refusal persistence and demonstrated Forge corrections. Root owns native/game execution, runtime restarts and serialized builds. Exclusive feature owners supply executable outcomes; source admission stays serialized. Keep apps open only for active checks, use one compiler job/two test threads, join originals and independently verify absence. Revision-counter optimization remains deferred. Earlier review remains in linked evidence and Git.
 
 ## Findings and corrections
+
+- [Windows managed Java identity](settings.md#current-windows-managed-java-launch-identity) keeps the launch executable and diagnostic sibling distinct within the existing probe receipt. Selection and launch consume the requested identity; CLI diagnostics retain the console identity and authenticate both. The composed native fixture uses the real runtime/task/cache owners, settles before assertions and introduces no production state or authority. Native installed gameplay remains the next acceptance boundary.
 
 - [Native Windows containment](library-lifecycle.md#current-windows-production-process-containment) composes the unchanged production process owner with real native game/descendant handles. Job settlement and output draining use the existing owner; no process model, platform flag or fixture endpoint is added to the product. The standalone fixture does not waive installed session, durable acknowledgement or launcher shutdown acceptance. Test-only command quoting is corrected at its existing wrapper, and bounded read-only evidence recovery authenticates all backing nodes without relaxing filesystem guards.
 

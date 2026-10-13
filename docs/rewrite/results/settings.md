@@ -1,5 +1,11 @@
 # Settings and feature flags
 
+## Current Windows managed Java launch identity
+
+2026-10-13, current Windows Vanilla1.20.1 installation completes, but native preflight reports “The selected Java executable changed. Select it again.” The runtime probe returns its diagnostic `java.exe` sibling where managed admission and launch require the selected `javaw.exe`. The correction keeps the requested executable in the existing probe receipt and runtime-info projection; diagnostics continue to use the console sibling, and both executable fingerprints remain mandatory. No selector, filesystem guard, public type, setting or recovery owner changes.
+
+The native composed regression `windows_managed_readiness_retains_javaw_and_authenticates_console_probe` copies a complete installed runtime into an isolated cache, exercises real preflight/preparation, rejects console substitution at managed launch admission and refuses changes to either executable. Its original native command joins0 after the task owner and cache settle; the seven local probe checks also join0. The Windows-only fixture requires an explicit runtime input and is ignored by default. Native packaging is in progress; installed Ready, Play, gameplay/save and saved-world reopen remain unverified on the corrected artifact. These checks do not qualify release delivery or full parity.
+
 ## Current Linux inherited settings presentation
 
 2026-10-11, the normal `716cd9f3` AppImage renders ResourceParity's restored Inherit/global Vanilla selection, inherited Java and2048/512-MB limits without settings writes. Actual ordinary Play uses the authenticated installed Java17, completes pack activation/save, survives exact whole-profile cold reopen and loads the saved textured world. Both games settle naturally0 with terminal acknowledgement; both launchers close/join0 and disappear. Accounts, core config, private settings and prior missing-Java refusals remain exact; only the two expected played revisions7→8→9 and new launch histories publish. [The pack journey](pack-files.md#current-linux-pack-activation-and-saved-world-loading) records artifact, file and process evidence. This corroborates restored native presentation and execution; the precise missing-Java refusal itself remains the earlier frozen API acceptance below.

@@ -227,3 +227,149 @@ fn provision_error(error: axial_minecraft::runtime::JavaRuntimeLookupError) -> J
         _ => JavaDiscoveryError::ManagedNotReady,
     }
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::{fs, time::Duration};
+
+    fn copy_runtime(source: &Path, destination: &Path) -> std::io::Result<()> {
+        let mut directories = vec![(source.to_owned(), destination.to_owned())];
+        let mut entries = 0_usize;
+        let mut bytes = 0_u64;
+        while let Some((source, destination)) = directories.pop() {
+            fs::create_dir(&destination)?;
+            for entry in fs::read_dir(source)? {
+                entries += 1;
+                if entries > 4096 {
+                    return Err(std::io::Error::other("runtime fixture entry limit"));
+                }
+                let entry = entry?;
+                let target = destination.join(entry.file_name());
+                let kind = entry.file_type()?;
+                if kind.is_dir() {
+                    directories.push((entry.path(), target));
+                } else if kind.is_file() {
+                    let size = entry.metadata()?.len();
+                    bytes = bytes
+                        .checked_add(size)
+                        .filter(|total| *total <= 1 << 30)
+                        .ok_or_else(|| std::io::Error::other("runtime fixture byte limit"))?;
+                    if fs::copy(entry.path(), target)? != size {
+                        return Err(std::io::Error::other("runtime fixture changed during copy"));
+                    }
+                } else {
+                    return Err(std::io::Error::other(
+                        "runtime fixture has an unsupported entry",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AXIAL_TEST_WINDOWS_RUNTIME_ROOT pointing to a frozen installed gamma runtime"]
+    async fn windows_managed_readiness_retains_javaw_and_authenticates_console_probe() {
+        let source = fs::canonicalize(
+            std::env::var_os("AXIAL_TEST_WINDOWS_RUNTIME_ROOT")
+                .expect("set the frozen installed java-runtime-gamma root"),
+        )
+        .unwrap();
+        let cache = ManagedRuntimeCache::isolated_for_test().unwrap();
+        let root = cache.root().join("java-runtime-gamma");
+        copy_runtime(&source, &root).unwrap();
+        let tasks = TaskOwner::new(1).unwrap();
+        let discovery = RuntimeDiscovery::new(cache.clone(), tasks.clone());
+        let task = tasks
+            .try_spawn(cache.clone(), move |cancel| async move {
+                let required = JavaVersion {
+                    component: "java-runtime-gamma".into(),
+                    major_version: 17,
+                };
+                let windowed = root.join("bin/javaw.exe");
+                let console = root.join("bin/java.exe");
+                let observed = match discovery
+                    .observe_for_preflight(&required, "", &cancel)
+                    .await?
+                {
+                    RuntimeObservation::Ready(selected) => selected,
+                    RuntimeObservation::Missing(_) => return Err(JavaDiscoveryError::Missing),
+                };
+                let prepared = discovery.prepare_for_launch(&required, "", &cancel).await?;
+                let retained_launch_paths = [&observed, &prepared].into_iter().all(|selected| {
+                    selected.probe.executable() == windowed
+                        && Path::new(&selected.probe.info().path) == windowed
+                        && selected.probe.revalidate_cli_executable().as_deref()
+                            == Ok(console.as_path())
+                        && selected.managed.as_ref().is_some_and(|receipt| {
+                            receipt
+                                .validate_program(selected.probe.executable())
+                                .is_ok()
+                                && receipt.validate_program(&console).is_err()
+                        })
+                });
+
+                let console_bytes = fs::read(&console).map_err(|_| JavaDiscoveryError::Failed)?;
+                let mut changed = console_bytes.clone();
+                changed[0] ^= 1;
+                fs::write(&console, changed).map_err(|_| JavaDiscoveryError::Failed)?;
+                let console_changed = observed.probe.revalidate();
+                let prepared_console_changed = prepared.probe.revalidate();
+                let console_refusal = discovery
+                    .observe_for_preflight(&required, "", &cancel)
+                    .await
+                    .err();
+                fs::write(&console, console_bytes).map_err(|_| JavaDiscoveryError::Failed)?;
+                drop(observed);
+                drop(prepared);
+
+                let selected = discovery.prepare_for_launch(&required, "", &cancel).await?;
+                let windowed_bytes = fs::read(&windowed).map_err(|_| JavaDiscoveryError::Failed)?;
+                let mut changed = windowed_bytes.clone();
+                changed[0] ^= 1;
+                fs::write(&windowed, changed).map_err(|_| JavaDiscoveryError::Failed)?;
+                let windowed_changed = selected.probe.revalidate();
+                let windowed_receipt_refuses = selected
+                    .managed
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.validate_program(&windowed).is_err());
+                let windowed_refusal = discovery
+                    .observe_for_preflight(&required, "", &cancel)
+                    .await
+                    .err();
+                fs::write(&windowed, windowed_bytes).map_err(|_| JavaDiscoveryError::Failed)?;
+                Ok((
+                    retained_launch_paths,
+                    console_changed,
+                    prepared_console_changed,
+                    console_refusal,
+                    windowed_changed,
+                    windowed_receipt_refuses,
+                    windowed_refusal,
+                ))
+            })
+            .unwrap();
+        let result = task.join().await;
+        let shutdown = tasks.shutdown(Duration::from_secs(5)).await;
+        let settled = cache.settle();
+        let (
+            retained,
+            console,
+            prepared_console,
+            console_refusal,
+            windowed,
+            receipt_refuses,
+            windowed_refusal,
+        ) = result.unwrap().unwrap();
+        shutdown.unwrap();
+        settled.unwrap();
+        assert!(retained);
+        assert_eq!(console, Err(JavaDiscoveryError::Replaced));
+        assert_eq!(prepared_console, Err(JavaDiscoveryError::Replaced));
+        assert_eq!(console_refusal, Some(JavaDiscoveryError::Replaced));
+        assert_eq!(windowed, Err(JavaDiscoveryError::Replaced));
+        assert!(receipt_refuses);
+        assert_eq!(windowed_refusal, Some(JavaDiscoveryError::Replaced));
+    }
+}
