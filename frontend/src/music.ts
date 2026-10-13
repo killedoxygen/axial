@@ -14,8 +14,8 @@ type Fade = {
   from: number;
   target: number;
   callback?: () => void;
-  frame: number | null;
-  timer: ReturnType<typeof setTimeout> | null;
+  frame: number;
+  timer: ReturnType<typeof setTimeout>;
 };
 let fade: Fade | null = null;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -50,36 +50,31 @@ function clampTrack(track: number): number {
   return Math.trunc(track);
 }
 
-function finishFade(current: Fade): void {
+function fadeStep(current: Fade, ts?: number): void {
   if (fade !== current || audio !== current.player) return;
-  const callback = current.callback;
-  cancelFade();
-  current.player.volume = current.target;
-  callback?.();
-}
-
-function fadeStep(current: Fade, ts: number): void {
-  if (fade !== current || audio !== current.player) return;
-  const t = Math.max(0, Math.min(1, (ts - current.start) / FADE_MS));
-  current.player.volume = Math.max(0, Math.min(1, current.from + (current.target - current.from) * t));
+  const t = ts === undefined ? 1 : Math.max(0, Math.min(1, (ts - current.start) / FADE_MS));
+  current.player.volume = Math.max(0, Math.min(1, current.from * (1 - t) + current.target * t));
   if (t < 1) {
     current.frame = requestAnimationFrame((time) => fadeStep(current, time));
   } else {
-    finishFade(current);
+    cancelFade();
+    current.callback?.();
   }
 }
 
 function cancelFade(): void {
   const current = fade;
   fade = null;
-  if (current?.frame != null) cancelAnimationFrame(current.frame);
-  if (current?.timer != null) clearTimeout(current.timer);
+  if (current) {
+    cancelAnimationFrame(current.frame);
+    clearTimeout(current.timer);
+  }
 }
 
 function startFade(target: number, cb?: () => void): void {
   cancelFade();
   if (!audio) {
-    if (cb) cb();
+    cb?.();
     return;
   }
   const current: Fade = {
@@ -88,13 +83,11 @@ function startFade(target: number, cb?: () => void): void {
     from: audio.volume,
     target,
     callback: cb,
-    frame: null,
-    timer: null,
+    frame: requestAnimationFrame((time) => fadeStep(current, time)),
+    // Finish playback transitions when animation frames stop.
+    timer: setTimeout(() => fadeStep(current), FADE_MS),
   };
   fade = current;
-  current.frame = requestAnimationFrame((time) => fadeStep(current, time));
-  // Finish playback transitions when animation frames stop.
-  current.timer = setTimeout(() => finishFade(current), FADE_MS);
 }
 
 export const Music = {
