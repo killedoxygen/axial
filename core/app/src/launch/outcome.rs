@@ -13,6 +13,7 @@ pub enum FailureClass {
     JavaRuntimeMismatch,
     RosettaRequired,
     OutOfMemory,
+    GraphicsUnavailable,
     GraphicsDriverCrash,
     MissingDependency,
     ModTransformationFailure,
@@ -98,16 +99,25 @@ impl SessionOutcome {
     }
 
     pub fn summary(&self) -> &'static str {
+        if self.reason == SessionExitReason::StartupFailed
+            && self.failure_class == Some(FailureClass::GraphicsUnavailable)
+        {
+            return "The game could not create a window because OpenGL is unavailable.";
+        }
         match self.reason {
             SessionExitReason::SpawnFailed => "The game process could not be started.",
             SessionExitReason::CleanExit => "The game closed normally.",
-            SessionExitReason::ExternalUserClosed => "The game was closed outside the launcher after startup.",
+            SessionExitReason::ExternalUserClosed => {
+                "The game was closed outside the launcher after startup."
+            }
             SessionExitReason::LauncherStopped => "The game was stopped from the launcher.",
             SessionExitReason::StartupStalled => "Game startup did not complete.",
             SessionExitReason::StartupFailed => "The game could not finish starting.",
             SessionExitReason::CrashedBeforeBoot => "The game exited unexpectedly during startup.",
             SessionExitReason::CrashedAfterBoot => "The game exited unexpectedly after startup.",
-            SessionExitReason::UnknownExit => "The game exited without enough evidence to classify the result.",
+            SessionExitReason::UnknownExit => {
+                "The game exited without enough evidence to classify the result."
+            }
         }
     }
 }
@@ -121,7 +131,9 @@ pub fn classify_session_outcome(
     if !facts.process_exited || !facts.tree_settled || !facts.outputs_drained {
         return None;
     }
-    let stalled = evidence.failure_classes.contains(&FailureClass::StartupStalled);
+    let stalled = evidence
+        .failure_classes
+        .contains(&FailureClass::StartupStalled);
     let failure_class = if stalled {
         Some(FailureClass::StartupStalled)
     } else {
@@ -129,26 +141,51 @@ pub fn classify_session_outcome(
     };
     let abnormal = facts.signal.is_some() || facts.exit_code.is_some_and(|code| code != 0);
     let (kind, reason) = if stalled {
-        (SessionOutcomeKind::Failed, SessionExitReason::StartupStalled)
+        (
+            SessionOutcomeKind::Failed,
+            SessionExitReason::StartupStalled,
+        )
     } else if facts.stop_requested {
-        (SessionOutcomeKind::Stopped, SessionExitReason::LauncherStopped)
+        (
+            SessionOutcomeKind::Stopped,
+            SessionExitReason::LauncherStopped,
+        )
+    } else if failure_class == Some(FailureClass::GraphicsUnavailable) {
+        (SessionOutcomeKind::Failed, SessionExitReason::StartupFailed)
     } else if evidence.boot_observed && facts.exit_code == Some(0) && !abnormal {
-        (SessionOutcomeKind::Clean, if facts.was_running { SessionExitReason::ExternalUserClosed } else { SessionExitReason::CleanExit })
+        (
+            SessionOutcomeKind::Clean,
+            if facts.was_running {
+                SessionExitReason::ExternalUserClosed
+            } else {
+                SessionExitReason::CleanExit
+            },
+        )
     } else if evidence.boot_observed && abnormal {
-        (SessionOutcomeKind::Failed, SessionExitReason::CrashedAfterBoot)
+        (
+            SessionOutcomeKind::Failed,
+            SessionExitReason::CrashedAfterBoot,
+        )
     } else if !evidence.boot_observed
         && failure_class.is_some_and(|class| class != FailureClass::Unknown)
     {
         (SessionOutcomeKind::Failed, SessionExitReason::StartupFailed)
     } else if abnormal {
-        (SessionOutcomeKind::Failed, SessionExitReason::CrashedBeforeBoot)
+        (
+            SessionOutcomeKind::Failed,
+            SessionExitReason::CrashedBeforeBoot,
+        )
     } else {
         (SessionOutcomeKind::Unknown, SessionExitReason::UnknownExit)
     };
     let mut outcome = SessionOutcome {
         kind,
         reason,
-        failure_class: if kind == SessionOutcomeKind::Failed { failure_class } else { None },
+        failure_class: if kind == SessionOutcomeKind::Failed {
+            failure_class
+        } else {
+            None
+        },
         summary: String::new(),
     };
     outcome.summary = outcome.summary().to_owned();
@@ -170,6 +207,9 @@ use super::reports::{
 };
 
 pub fn classify_startup_failure_text(text: &str) -> FailureClass {
+    if is_graphics_unavailable_failure(text) {
+        return FailureClass::GraphicsUnavailable;
+    }
     let lower = text.trim().to_lowercase();
     if lower.is_empty() {
         return FailureClass::Unknown;
@@ -228,13 +268,32 @@ pub fn classify_startup_failure_text(text: &str) -> FailureClass {
     FailureClass::Unknown
 }
 
+fn is_graphics_unavailable_failure(text: &str) -> bool {
+    let Some(throwable) = text.trim().strip_prefix("<log4j:Throwable><![CDATA[") else {
+        return false;
+    };
+    let Some((class, message)) = throwable.split_once(": ") else {
+        return false;
+    };
+    !class.is_empty()
+        && class
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '$' | '_'))
+        && message
+            .strip_suffix("]]></log4j:Throwable>")
+            .unwrap_or(message)
+            == "GLFW error 65542: WGL: The driver does not appear to support OpenGL"
+}
+
 pub fn classify_launch_failure(
     stdout_classes: &[FailureClass],
     exit_code: Option<i32>,
     crash_evidence: Option<&CrashEvidence>,
 ) -> Option<FailureClass> {
     if exit_code == Some(0) {
-        return None;
+        return stdout_classes
+            .contains(&FailureClass::GraphicsUnavailable)
+            .then_some(FailureClass::GraphicsUnavailable);
     }
 
     let stdout_class = stdout_classes
@@ -309,14 +368,15 @@ fn failure_class_precedence(class: FailureClass) -> u8 {
         FailureClass::JavaRuntimeMismatch => 5,
         FailureClass::OutOfMemory => 6,
         FailureClass::LauncherManagedArtifactSignature => 7,
-        FailureClass::GraphicsDriverCrash => 8,
-        FailureClass::MissingDependency => 9,
-        FailureClass::ModTransformationFailure => 10,
-        FailureClass::ModAttributedCrash => 11,
-        FailureClass::ClasspathModuleConflict => 12,
-        FailureClass::LoaderBootstrapFailure => 13,
-        FailureClass::AuthModeIncompatible => 14,
-        FailureClass::Unknown => 15,
+        FailureClass::GraphicsUnavailable => 8,
+        FailureClass::GraphicsDriverCrash => 9,
+        FailureClass::MissingDependency => 10,
+        FailureClass::ModTransformationFailure => 11,
+        FailureClass::ModAttributedCrash => 12,
+        FailureClass::ClasspathModuleConflict => 13,
+        FailureClass::LoaderBootstrapFailure => 14,
+        FailureClass::AuthModeIncompatible => 15,
+        FailureClass::Unknown => 16,
     }
 }
 
@@ -494,7 +554,7 @@ mod tests {
     }
     use super::super::reports::{MAX_CRASH_ARTIFACT_BYTES, parse_crash_evidence};
 
-    const RANKED_FAILURES: [FailureClass; 16] = [
+    const RANKED_FAILURES: [FailureClass; 17] = [
         FailureClass::StartupStalled,
         FailureClass::JvmUnsupportedOption,
         FailureClass::JvmExperimentalUnlock,
@@ -503,6 +563,7 @@ mod tests {
         FailureClass::JavaRuntimeMismatch,
         FailureClass::OutOfMemory,
         FailureClass::LauncherManagedArtifactSignature,
+        FailureClass::GraphicsUnavailable,
         FailureClass::GraphicsDriverCrash,
         FailureClass::MissingDependency,
         FailureClass::ModTransformationFailure,
