@@ -1,5 +1,9 @@
 //! Command construction from verified, retained feature capabilities.
 
+#[cfg(all(test, windows))]
+#[path = "classpath_fixture.rs"]
+mod classpath_fixture;
+
 use super::{
     jvm,
     model::{LaunchOptions, LaunchPlanError, LaunchPlanRequest, ValidatedLaunchCommand},
@@ -7,9 +11,9 @@ use super::{
 use crate::runtime::model::JavaSelectionRequirement;
 use axial_minecraft::{
     LaunchVars, build_classpath, default_environment, effective_java_version_for,
-    resolve_arguments, resolve_libraries,
+    launch::java_path_argument, resolve_arguments, resolve_libraries,
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand, LaunchPlanError> {
     request
@@ -49,11 +53,15 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
     } else if libraries.iter().any(|library| library.is_native) {
         return Err(LaunchPlanError::NativesUnavailable);
     }
-    let classpath = build_classpath(&libraries, Some(request.installed.client_jar()));
+    let classpath = build_classpath(&libraries, Some(request.installed.client_jar()))
+        .map_err(|_| LaunchPlanError::InvalidCommand)?;
+    let encode_path =
+        |path: &Path| java_path_argument(path).map_err(|_| LaunchPlanError::InvalidCommand);
     let natives = request
         .prepared_natives
         .as_ref()
-        .map(|prepared| prepared.path().to_string_lossy().into_owned())
+        .map(|prepared| encode_path(prepared.path()))
+        .transpose()?
         .unwrap_or_default();
     let (width, height) = settings
         .resolution
@@ -64,12 +72,8 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
     let vars = LaunchVars {
         auth_player_name: request.auth.player_name.clone(),
         version_name: version.id.clone(),
-        game_directory: request.game_dir.to_string_lossy().into_owned(),
-        assets_root: request
-            .library_dir
-            .join("assets")
-            .to_string_lossy()
-            .into_owned(),
+        game_directory: encode_path(&request.game_dir)?,
+        assets_root: encode_path(&request.library_dir.join("assets"))?,
         asset_index_name: version.asset_index.id.clone(),
         auth_uuid: request.auth.uuid.clone(),
         auth_access_token: request.auth.access_token.clone(),
@@ -81,20 +85,12 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
         launcher_version: settings.launcher_version.clone(),
         natives_directory: natives.clone(),
         classpath,
-        library_directory: request
-            .library_dir
-            .join("libraries")
-            .to_string_lossy()
-            .into_owned(),
+        library_directory: encode_path(&request.library_dir.join("libraries"))?,
         classpath_separator: if cfg!(windows) { ";" } else { ":" }.into(),
         resolution_width: width,
         resolution_height: height,
         game_assets: if virtual_assets {
-            request
-                .library_dir
-                .join("assets/virtual/legacy")
-                .to_string_lossy()
-                .into_owned()
+            encode_path(&request.library_dir.join("assets/virtual/legacy"))?
         } else {
             String::new()
         },

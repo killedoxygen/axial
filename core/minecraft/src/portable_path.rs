@@ -186,19 +186,23 @@ fn nfc(value: &str) -> String {
 }
 
 fn validate_file_name(value: &str) -> Result<(), PortablePathError> {
-    if value.is_empty()
-        || value == "."
-        || value == ".."
-        || value.len() > MAX_PORTABLE_FILE_NAME_BYTES
+    if value.len() > MAX_PORTABLE_FILE_NAME_BYTES
         || value.encode_utf16().count() > MAX_PORTABLE_FILE_NAME_UTF16_UNITS
-        || value.bytes().any(|byte| b"<>:\"/\\|?*".contains(&byte))
-        || value.chars().any(char::is_control)
-        || value.ends_with(['.', ' '])
-        || windows_device_name(value)
+        || !windows_file_name_is_safe(value)
     {
         return Err(PortablePathError::Unsafe);
     }
     Ok(())
+}
+
+pub(crate) fn windows_file_name_is_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.bytes().any(|byte| b"<>:\"/\\|?*".contains(&byte))
+        && !value.chars().any(char::is_control)
+        && !value.ends_with(['.', ' '])
+        && !windows_device_name(value)
 }
 
 fn validate_relative_path_bound(value: &str) -> Result<(), PortablePathError> {
