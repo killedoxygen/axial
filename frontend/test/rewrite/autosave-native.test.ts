@@ -1441,6 +1441,222 @@ test('a refused JVM draft keeps the existing revert and error behavior without a
   h.dispose();
 });
 
+function musicPlayback() {
+  let now = 0;
+  let nextId = 0;
+  const timers = new Map<number, { at: number; run: () => void }>();
+  const frames = new Map<number, (time: number) => void>();
+  const players: Player[] = [];
+  class Player {
+    volume = 1;
+    paused = true;
+    src = "";
+    loop = false;
+    preload = "";
+    pauses = 0;
+    plays = 0;
+    constructor() {
+      players.push(this);
+    }
+    addEventListener() {}
+    async play() {
+      this.plays += 1;
+      this.paused = false;
+    }
+    pause() {
+      this.pauses += 1;
+      this.paused = true;
+    }
+  }
+  const { Music } = source<typeof import("../../src/music")>(
+    "music.ts",
+    {
+      "./api": { apiResourceUrl: (path: string) => path },
+      "./hooks/use-autosave": {
+        canAutoSave: () => true,
+        registerAutoSaveDraft() {},
+        async saveConfigPatch() {},
+      },
+      "./store": { config: { value: null } },
+      "./toast": { toast() {} },
+    },
+    {
+      Audio: Player,
+      performance: { now: () => now },
+      requestAnimationFrame(run: (time: number) => void) {
+        const id = ++nextId;
+        frames.set(id, run);
+        return id;
+      },
+      cancelAnimationFrame(id: number) {
+        frames.delete(id);
+      },
+      setTimeout(run: () => void, milliseconds: number) {
+        const id = ++nextId;
+        timers.set(id, { at: now + milliseconds, run });
+        return id;
+      },
+      clearTimeout(id: number) {
+        timers.delete(id);
+      },
+    },
+  );
+  return {
+    music: Music,
+    timers,
+    frames,
+    player: () => players[0],
+    async play() {
+      Music.applyConfig({
+        music_enabled: true,
+        music_volume: 5,
+        music_track: 0,
+      });
+      await Music.play();
+      this.frame(800);
+      assert.equal(players[0].volume, 0.05);
+    },
+    frame(time: number) {
+      now = time;
+      const queued = [...frames.values()];
+      frames.clear();
+      queued.forEach((run) => run(now));
+    },
+    advance(milliseconds: number) {
+      now += milliseconds;
+      for (let count = 0; count < 128; count += 1) {
+        const due = [...timers].find(([, timer]) => timer.at <= now);
+        if (!due) return;
+        timers.delete(due[0]);
+        due[1].run();
+      }
+      assert.fail("music timer fixture did not settle");
+    },
+  };
+}
+
+test("game suppression completes with held animation frames and resumes without a toggle", async () => {
+  const h = musicPlayback();
+  await h.play();
+  h.music.suppress();
+  h.advance(799);
+  assert.equal(h.player().paused, false);
+  h.advance(1);
+  assert.equal(h.player().paused, true);
+  assert.equal(h.player().volume, 0);
+  assert.equal(h.music.enabled, true);
+  assert.equal(h.frames.size, 0);
+  h.music.unsuppress();
+  await tick();
+  h.advance(800);
+  assert.equal(h.player().paused, false);
+  assert.equal(h.player().volume, 0.05);
+});
+
+test("native Pause and Next complete when animation frames are held", async () => {
+  const paused = musicPlayback();
+  await paused.play();
+  paused.music.toggle();
+  paused.advance(800);
+  assert.equal(paused.music.enabled, false);
+  assert.equal(paused.player().paused, true);
+  assert.equal(paused.player().volume, 0);
+
+  const next = musicPlayback();
+  await next.play();
+  next.music.nextTrack();
+  next.advance(800);
+  await tick();
+  assert.equal(next.player().src, "/music/track?t=1");
+  assert.equal(next.player().plays, 2);
+  next.advance(800);
+  assert.equal(next.player().paused, false);
+  assert.equal(next.player().volume, 0.05);
+});
+
+test("superseded suppression callbacks cannot pause or change a resumed fade", async () => {
+  const h = musicPlayback();
+  await h.play();
+  h.music.suppress();
+  const staleFrame = [...h.frames.values()][0];
+  const staleDeadline = [...h.timers.values()].find(
+    (timer) => timer.at === 1600,
+  )?.run;
+  assert.ok(staleDeadline);
+  h.advance(200);
+  h.music.unsuppress();
+  assert.equal(h.timers.size, 1);
+  staleFrame(1600);
+  staleDeadline();
+  assert.equal(h.player().paused, false);
+  assert.equal(h.player().volume, 0.05);
+  assert.equal(h.player().pauses, 0);
+  assert.equal(h.frames.size, 1);
+  h.advance(800);
+  assert.equal(h.player().volume, 0.05);
+  assert.equal(h.frames.size, 0);
+  assert.equal(h.timers.size, 0);
+});
+
+test("normal frames retain the fade and completion cancels its queued deadline", async () => {
+  const h = musicPlayback();
+  await h.play();
+  h.music.stop();
+  const staleDeadline = [...h.timers.values()].find(
+    (timer) => timer.at === 1600,
+  )?.run;
+  assert.ok(staleDeadline);
+  h.frame(1200);
+  assert.equal(h.player().volume, 0.025);
+  assert.equal(h.player().paused, false);
+  h.frame(1600);
+  assert.equal(h.player().volume, 0);
+  assert.equal(h.player().pauses, 1);
+  assert.equal(h.timers.size, 0);
+  staleDeadline();
+  assert.equal(h.player().pauses, 1);
+});
+
+test("superseded Next callbacks cannot publish an old track or play twice", async () => {
+  const h = musicPlayback();
+  await h.play();
+  h.music.nextTrack();
+  const staleFrame = [...h.frames.values()][0];
+  const staleDeadline = [...h.timers.values()].find(
+    (timer) => timer.at === 1600,
+  )?.run;
+  assert.ok(staleDeadline);
+  h.music.nextTrack();
+  staleFrame(1600);
+  staleDeadline();
+  assert.equal(h.player().src, "/music/track?t=0");
+  assert.equal(h.player().paused, false);
+  assert.equal(h.player().plays, 1);
+  assert.equal(h.frames.size, 1);
+  h.advance(800);
+  await tick();
+  assert.equal(h.player().src, "/music/track?t=0");
+  assert.equal(h.player().plays, 2);
+  assert.equal(h.player().pauses, 1);
+});
+
+test("volume retargeting restarts the current fade deadline", async () => {
+  const h = musicPlayback();
+  await h.play();
+  h.music.suppress();
+  h.advance(800);
+  h.music.unsuppress();
+  await tick();
+  h.advance(400);
+  h.music.setVolume(70);
+  h.advance(400);
+  assert.equal(h.player().volume, 0);
+  h.advance(400);
+  assert.equal(h.player().volume, 0.7);
+  assert.equal(h.player().paused, false);
+  assert.equal(h.frames.size, 0);
+});
+
 test('native flush submits the real audio slider draft and joins the music settings receipt', async () => {
   const h = harness();
   await h.hydrate();

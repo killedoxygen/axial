@@ -8,11 +8,16 @@ const DEFAULT_TRACK_COUNT = 2;
 let trackCount = DEFAULT_TRACK_COUNT;
 
 let audio: HTMLAudioElement | null = null;
-let fadeRaf: number | null = null;
-let fadeStart = 0;
-let fadeFrom = 0;
-let fadeTarget = 0;
-let fadeCallback: (() => void) | null = null;
+type Fade = {
+  player: HTMLAudioElement;
+  start: number;
+  from: number;
+  target: number;
+  callback?: () => void;
+  frame: number | null;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+let fade: Fade | null = null;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let persistPending = false;
 let suppressed = false;
@@ -45,36 +50,30 @@ function clampTrack(track: number): number {
   return Math.trunc(track);
 }
 
-function fadeStep(ts: number): void {
-  if (!audio) {
-    fadeRaf = null;
-    if (fadeCallback) {
-      const cb = fadeCallback;
-      fadeCallback = null;
-      cb();
-    }
-    return;
-  }
-  const t = Math.min(1, (ts - fadeStart) / FADE_MS);
-  audio.volume = Math.max(0, Math.min(1, fadeFrom + (fadeTarget - fadeFrom) * t));
+function finishFade(current: Fade): void {
+  if (fade !== current || audio !== current.player) return;
+  const callback = current.callback;
+  cancelFade();
+  current.player.volume = current.target;
+  callback?.();
+}
+
+function fadeStep(current: Fade, ts: number): void {
+  if (fade !== current || audio !== current.player) return;
+  const t = Math.max(0, Math.min(1, (ts - current.start) / FADE_MS));
+  current.player.volume = Math.max(0, Math.min(1, current.from + (current.target - current.from) * t));
   if (t < 1) {
-    fadeRaf = requestAnimationFrame(fadeStep);
+    current.frame = requestAnimationFrame((time) => fadeStep(current, time));
   } else {
-    fadeRaf = null;
-    if (fadeCallback) {
-      const cb = fadeCallback;
-      fadeCallback = null;
-      cb();
-    }
+    finishFade(current);
   }
 }
 
 function cancelFade(): void {
-  if (fadeRaf) {
-    cancelAnimationFrame(fadeRaf);
-    fadeRaf = null;
-  }
-  fadeCallback = null;
+  const current = fade;
+  fade = null;
+  if (current?.frame != null) cancelAnimationFrame(current.frame);
+  if (current?.timer != null) clearTimeout(current.timer);
 }
 
 function startFade(target: number, cb?: () => void): void {
@@ -83,11 +82,19 @@ function startFade(target: number, cb?: () => void): void {
     if (cb) cb();
     return;
   }
-  fadeFrom = audio.volume;
-  fadeTarget = target;
-  fadeCallback = cb || null;
-  fadeStart = performance.now();
-  fadeRaf = requestAnimationFrame(fadeStep);
+  const current: Fade = {
+    player: audio,
+    start: performance.now(),
+    from: audio.volume,
+    target,
+    callback: cb,
+    frame: null,
+    timer: null,
+  };
+  fade = current;
+  current.frame = requestAnimationFrame((time) => fadeStep(current, time));
+  // Finish playback transitions when animation frames stop.
+  current.timer = setTimeout(() => finishFade(current), FADE_MS);
 }
 
 export const Music = {
@@ -196,10 +203,8 @@ export const Music = {
     if (!Number.isFinite(v)) return;
     this.volume = Math.max(0, Math.min(100, v));
     if (audio && !suppressed) {
-      if (fadeRaf) {
-        fadeFrom = audio.volume;
-        fadeTarget = this.targetVolume;
-        fadeStart = performance.now();
+      if (fade) {
+        startFade(this.targetVolume, fade.callback);
       } else {
         audio.volume = this.targetVolume;
       }
@@ -259,9 +264,10 @@ export const Music = {
 
   stop(): void {
     playbackVersion += 1;
-    if (!audio || audio.paused) return;
+    const player = audio;
+    if (!player || player.paused) return;
     startFade(0, () => {
-      audio!.pause();
+      player.pause();
       this.syncUI();
     });
   },
@@ -271,10 +277,12 @@ export const Music = {
     playbackVersion += 1;
     this.track = (this.track + 1) % trackCount;
     this.ready = false;
-    if (audio && !audio.paused) {
+    const player = audio;
+    const track = this.track;
+    if (player && !player.paused) {
       startFade(0, () => {
-        audio!.pause();
-        audio!.src = apiResourceUrl(`/music/track?t=${this.track}`);
+        player.pause();
+        player.src = apiResourceUrl(`/music/track?t=${track}`);
         this.ready = true;
         void this.play();
       });
