@@ -80,14 +80,14 @@ async fn detail(
         .registry()
         .get_live(&identity(&id)?)
         .map_err(error)?;
-    let versions = match services.setup.installed().await {
-        Ok(versions) => versions,
-        Err(InstanceError::VersionUnavailable) => Vec::new(),
-        Err(failure) => return Err(error(failure)),
-    };
-    Ok(Json(json!(
-        services.setup.enrich(record.instance, &versions).await
-    )))
+    let instances = services
+        .setup
+        .enrich_all(vec![record.instance])
+        .await
+        .map_err(error)?;
+    let [instance] =
+        <[_; 1]>::try_from(instances).map_err(|_| error(InstanceError::VersionUnavailable))?;
+    Ok(Json(json!(instance)))
 }
 
 async fn create(
