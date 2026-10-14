@@ -1,5 +1,16 @@
 # Settings and feature flags
 
+## Current plain-source Windows RC package
+
+The normal unsigned Windows `0.4.0-rc.1` package completes from plain committed product source `0ca09aeb2cd5c1a802487823964babb9cf71375f`, with no diagnostic overlays. The actual native frontend build and generation verifier produce `3189f35ac288b0284b99c31d0bed7b6264f34b16c1e37384868f740ffd03cf65`. Normal Tauri/MSVC/NSIS packaging uses locked offline inputs and skips signing. All eleven original command results join0 without a signal, overflow or spawn error; the retained build handle and original native caller both acknowledge0. After-join inventory finds none of their twelve recorded process IDs, and the observation handle is disposed after acknowledgement.
+
+| Artifact | Bytes | SHA-256 |
+| --- | ---: | --- |
+| Raw desktop executable | 72,214,016 | `d78c08db7b8390a7d0baa852f425fca94906c439477204ac6d2570e127384246` |
+| NSIS installer | 16,800,759 | `f5aa94dfb83619377ba947e1582070fa94d978bde72ff4ae03af904d3f1c5e52` |
+
+The existing build owner verifies exact source inputs and preserves the earlier artifacts before shared output mutation. Its completion receipt rechecks source and preserved files. Earlier interrupted diagnostic work remains separately qualified; this successful current build does not reinterpret its partial copy or unavailable host join. Current installation, cold startup, visible gameplay/save/reopen and trusted delivery remain unverified for these artifacts. No release, signing or security change follows.
+
 ## Current Windows managed Java launch identity
 
 2026-10-13, the Windows Vanilla1.20.1 installation completes, but native preflight initially reports “The selected Java executable changed. Select it again.” The probe returns its diagnostic `java.exe` sibling where managed admission and launch require the selected `javaw.exe`. The correction keeps the requested executable in the existing receipt and runtime-info projection; diagnostics use the console sibling, and both executable fingerprints remain mandatory. No selector, filesystem guard, public type, setting or recovery owner changes.
