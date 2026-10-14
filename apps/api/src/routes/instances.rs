@@ -124,9 +124,15 @@ async fn update(
     let Json(patch) = body.map_err(|_| invalid())?;
     let instance = services
         .instances
-        .update_with_sessions(&identity(&id)?, patch, &services.sessions)
-        .map_err(error)?;
+        .update_record_with_sessions(&identity(&id)?, patch, &services.sessions)
+        .map_err(error)?
+        .instance;
     // Display inspection cannot turn a committed write into a refusal.
+    if let Ok(projected) = services.setup.enrich_all(vec![instance.clone()]).await
+        && let Ok([enriched]) = <[_; 1]>::try_from(projected)
+    {
+        return Ok(Json(json!(enriched)));
+    }
     let versions = services.setup.installed().await.unwrap_or_default();
     Ok(Json(json!(
         services.setup.enrich(instance, &versions).await

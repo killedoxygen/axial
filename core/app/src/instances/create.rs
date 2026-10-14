@@ -905,19 +905,27 @@ impl InstanceService {
         patch: super::model::InstancePatch,
         sessions: &crate::launch::session::SessionManager,
     ) -> InstanceResult<Instance> {
+        self.update_record_with_sessions(id, patch, sessions)
+            .map(|record| public_instance(record.instance))
+    }
+
+    /// Retain exact committed state for response projection before redaction.
+    pub fn update_record_with_sessions(
+        &self,
+        id: &InstanceId,
+        patch: super::model::InstancePatch,
+        sessions: &crate::launch::session::SessionManager,
+    ) -> InstanceResult<InstanceRecord> {
         match self.directories.admit(id) {
             Ok(admitted) => self
                 .registry()
-                .update(id, admitted.record().revision, patch)
-                .map(|record| public_instance(record.instance)),
+                .update(id, admitted.record().revision, patch),
             Err(InstanceError::Busy) => {
                 if self.tasks.status().closing {
                     return Err(InstanceError::Closed);
                 }
                 let admitted = sessions.running_instance(id).ok_or(InstanceError::Busy)?;
-                self.directories
-                    .update_retained(&admitted, patch)
-                    .map(|record| public_instance(record.instance))
+                self.directories.update_retained(&admitted, patch)
             }
             Err(error) => Err(error),
         }
@@ -1394,6 +1402,7 @@ pub(crate) mod tests {
         let instance = create(&service, "Java selection").await;
         let custom = root.path().join("private-java-canary/bin/java");
         let args = "-Dprivate.arguments.canary=retained";
+        let sessions = crate::launch::session::SessionManager::new(service.tasks.clone());
         let mut revision = instance.revision;
         let mut observations = Vec::new();
         for (java_path, selection) in [
@@ -1418,6 +1427,17 @@ pub(crate) mod tests {
                     },
                 )
                 .unwrap();
+            let initial_public = serde_json::to_value(&response).unwrap();
+            let response = service
+                .update_with_sessions(
+                    &instance.id,
+                    super::super::model::InstancePatch {
+                        expected_revision: Some(response.revision),
+                        ..Default::default()
+                    },
+                    &sessions,
+                )
+                .unwrap();
             revision = response.revision;
             let public = serde_json::to_value(&response).unwrap();
             let repeated = serde_json::to_value(public_instance(response)).unwrap();
@@ -1435,7 +1455,15 @@ pub(crate) mod tests {
                 })
                 .unwrap();
             let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            observations.push((public, repeated, persisted, stored, java_path, selection));
+            observations.push((
+                initial_public,
+                public,
+                repeated,
+                persisted,
+                stored,
+                java_path,
+                selection,
+            ));
         }
         let shutdown = service
             .tasks
@@ -1448,14 +1476,16 @@ pub(crate) mod tests {
         }
         drop(root);
 
-        for (public, repeated, persisted, stored, java_path, selection) in observations {
+        for (initial_public, public, repeated, persisted, stored, java_path, selection) in
+            observations
+        {
             assert!(stored["instance"].get("java_selection").is_none());
             assert_eq!(stored["instance"]["java_path"], java_path);
             assert_eq!(stored["instance"]["extra_jvm_args"], args);
             assert_eq!(persisted["java_path"], java_path);
             assert_eq!(persisted["extra_jvm_args"], args);
             assert!(persisted.get("java_selection").is_none());
-            for projection in [public, repeated] {
+            for projection in [initial_public, public, repeated] {
                 assert_eq!(projection["java_path"], "");
                 assert_eq!(projection["extra_jvm_args"], "");
                 let encoded = projection.to_string();

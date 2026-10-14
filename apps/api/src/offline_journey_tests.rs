@@ -3381,6 +3381,32 @@ async fn publication_preflight(retain_runtime: &mut bool) {
         std::fs::write(client, changed_client).unwrap();
         let summary_detail = read_projection(&detail_path).await;
         let summary_list = read_projection("/api/v1/instances").await;
+        let private_args = "-Dsummary.private.arguments=retained";
+        let summary_update = api
+            .client
+            .put(format!("{}{detail_path}", api.base))
+            .header(transport::CAPABILITY_HEADER, &api.capability)
+            .json(&json!({
+                "expected_revision":created["revision"],
+                "name":"Summary updated",
+                "java_path":COMPONENT,
+                "extra_jvm_args":private_args
+            }))
+            .send()
+            .await
+            .unwrap();
+        let summary_updated = (
+            summary_update.status(),
+            summary_update.json::<Value>().await.unwrap(),
+        );
+        let updated_detail = read_projection(&detail_path).await;
+        let updated_list = read_projection("/api/v1/instances").await;
+        let private_updated = services
+            .instances
+            .registry()
+            .get_live(&instance.parse().unwrap())
+            .unwrap()
+            .instance;
         let strict_corrupt = api.get(&preflight).await;
         std::fs::write(client, original_client).unwrap();
         let strict_restored = api.get(&preflight).await;
@@ -3426,7 +3452,7 @@ async fn publication_preflight(retain_runtime: &mut bool) {
             .put(format!("{}{detail_path}", api.base))
             .header(transport::CAPABILITY_HEADER, &api.capability)
             .json(&json!({
-                "expected_revision":created["revision"],
+                "expected_revision":summary_updated.1["revision"],
                 "name":"Publication updated"
             }))
             .send()
@@ -3469,6 +3495,33 @@ async fn publication_preflight(retain_runtime: &mut bool) {
                 summary_detail.1["launch_action"]["primary_action"],
                 "launch"
             );
+            assert_eq!(summary_updated.0, StatusCode::OK, "{summary_updated:?}");
+            assert_eq!(updated_detail.0, StatusCode::OK, "{updated_detail:?}");
+            assert_eq!(updated_list.0, StatusCode::OK, "{updated_list:?}");
+            let updated_row = updated_list.1["instances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == instance)
+                .unwrap();
+            assert_eq!(summary_updated.1, updated_detail.1);
+            assert_eq!(summary_updated.1, *updated_row);
+            assert_eq!(summary_updated.1["name"], "Summary updated");
+            assert_eq!(private_updated.settings.java_path, COMPONENT);
+            assert_eq!(private_updated.settings.extra_jvm_args, private_args);
+            assert_eq!(summary_updated.1["java_path"], "");
+            assert_eq!(summary_updated.1["extra_jvm_args"], "");
+            assert_eq!(
+                summary_updated.1["java_selection"],
+                json!({
+                    "kind":"component", "component":COMPONENT
+                })
+            );
+            assert!(!summary_updated.1.to_string().contains(private_args));
+            assert_eq!(
+                summary_updated.1["revision"].as_u64().unwrap(),
+                created["revision"].as_u64().unwrap() + 1
+            );
             assert_eq!(strict_corrupt["launchable"], false, "{strict_corrupt}");
             assert_eq!(strict_corrupt["error"]["code"], "install_unavailable");
             assert_eq!(
@@ -3489,7 +3542,7 @@ async fn publication_preflight(retain_runtime: &mut bool) {
             assert_eq!(committed_detail.1["name"], "Publication updated");
             assert_eq!(
                 committed_detail.1["revision"].as_u64().unwrap(),
-                created["revision"].as_u64().unwrap() + 1
+                summary_updated.1["revision"].as_u64().unwrap() + 1
             );
             assert_eq!(committed_list.0, StatusCode::OK);
             let committed_rows = committed_list.1["instances"].as_array().unwrap();
