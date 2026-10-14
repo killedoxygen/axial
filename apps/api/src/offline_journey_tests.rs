@@ -3375,6 +3375,15 @@ async fn publication_preflight(retain_runtime: &mut bool) {
                 (path, bytes)
             })
             .collect();
+        let (client, original_client) = &protected[1];
+        let mut changed_client = original_client.clone();
+        changed_client[0] ^= 0xff;
+        std::fs::write(client, changed_client).unwrap();
+        let summary_detail = read_projection(&detail_path).await;
+        let summary_list = read_projection("/api/v1/instances").await;
+        let strict_corrupt = api.get(&preflight).await;
+        std::fs::write(client, original_client).unwrap();
+        let strict_restored = api.get(&preflight).await;
         let queue_before = api.get("/api/v1/install/queue").await;
         let requests_before = provider.state.requests.lock().unwrap().clone();
         let publication =
@@ -3446,6 +3455,27 @@ async fn publication_preflight(retain_runtime: &mut bool) {
             .map(|(path, _)| std::fs::read(path).unwrap())
             .collect();
         move || {
+            assert_eq!(summary_detail.0, StatusCode::OK, "{summary_detail:?}");
+            assert_eq!(summary_list.0, StatusCode::OK, "{summary_list:?}");
+            let summary_row = summary_list.1["instances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == instance)
+                .unwrap();
+            assert_eq!(summary_detail.1, *summary_row);
+            assert_eq!(summary_detail.1["launchable"], true);
+            assert_eq!(
+                summary_detail.1["launch_action"]["primary_action"],
+                "launch"
+            );
+            assert_eq!(strict_corrupt["launchable"], false, "{strict_corrupt}");
+            assert_eq!(strict_corrupt["error"]["code"], "install_unavailable");
+            assert_eq!(
+                strict_corrupt["readiness"]["reasons"][0]["id"],
+                "client_jar_corrupt"
+            );
+            assert_eq!(strict_restored["launchable"], true, "{strict_restored}");
             assert_eq!(requests_after, requests_before);
             assert_eq!(queue_after, queue_before);
             assert_eq!(sessions, json!({"sessions":[]}));

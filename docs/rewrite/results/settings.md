@@ -31,6 +31,12 @@ The same native fixture now joins0 with both real Java children exiting0, no fai
 
 The subsequent `f7e41502` package with private phase instrumentation completes one ordinary Launch. Its preparation pipeline takes993.314 seconds, including installed-file integrity verification807.616 seconds and command preparation151.781 seconds. Final session validation takes150.502 seconds outside that pipeline; spawning takes46.723 milliseconds. Parent and child durations overlap and must not be added. These observations locate the delay without proving a safe optimization. Bounded review finds no demonstrated redundant verification pass; exact filesystem and mutation-admission guards remain unchanged.
 
+## Instance details reuse display readiness
+
+2026-10-14, a current installed Windows read completes bootstrap and seven transport/history requests, then its instance-detail request exceeds the observer's ten-second idle limit. This does not prove a deadlock or attribute the whole delay. Source inspection finds that details scan installed versions and then start a separate full-integrity preflight, while the instance list uses the existing shared Summary projection.
+
+Details now reuse that projection for the captured instance. Full integrity remains at explicit preflight and launch admission. The existing composed API journey changes a client JAR byte without changing its length: serialized detail and list must agree on display readiness, strict preflight must refuse the corruption, and restoring the original bytes must recover readiness. The original implementation fails detail/list equality; the correction passes all three checks through the real API, after fixture owners join. Installed timing and gameplay validation of the correction remain pending.
+
 ## Fatal graphics startup with a zero exit
 
 2026-10-13, the installed Windows run logs an actual fatal Log4j throwable containing `GLFW error 65542: WGL: The driver does not appear to support OpenGL`, yet reports `clean / external_user_closed` because generic boot evidence and exit0 mask the failure. The installed UI corroborates that misleading notice.
