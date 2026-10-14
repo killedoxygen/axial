@@ -1,12 +1,14 @@
 # Architecture review
 
-Updated 2026-10-13. Working branch: `main`. Full non-Guardian parity remains active. Historical checkpoint qualifications, original joins and retained failures remain authoritative in the linked feature evidence and Git; compaction waives none of them.
+Updated 2026-10-14. Working branch: `main`. Full non-Guardian parity remains active. Historical checkpoint qualifications, original joins and retained failures remain authoritative in the linked feature evidence and Git; compaction waives none of them.
 
 ## Scope and ownership
 
 Current scope includes the integrated Linux GTK initialization candidate, native PNG export, the named loader/resource/Performance journeys, precise launch-refusal persistence and demonstrated Forge corrections. Root owns native/game execution, runtime restarts and serialized builds. Exclusive feature owners supply executable outcomes; source admission stays serialized. Keep apps open only for active checks, use one compiler job/two test threads, join originals and independently verify absence. Revision-counter optimization remains deferred. Earlier review remains in linked evidence and Git.
 
 ## Findings and corrections
+
+- [Same fresh-profile gameplay and reopen](linux-package.md#same-fresh-profile-play-save-reopen-and-saved-world-load) compose existing launch, settlement, world and media owners without product changes. Successful launch owns both recency and exact selected-instance publication; acceptance must check both. Authenticate a genuine new F2 through its retained session/input and exact file witness, then verify cold native rendering and HTTP bytes. Reconcile disappearing-window input failures through production status/report/terminal acknowledgement without replay. Whole snapshots preserve installed inputs, accounts/settings and earlier history. Original game/app joins and display-child exit0 remain distinct from the qualified outer display command143.
 
 - [Current fresh native installation and queue transitions](linux-package.md#current-fresh-onboarding-install-queue-transitions-and-cold-reopen) compose the existing onboarding, account, creation, install, transport and shutdown owners without product changes. Ordinary Create enqueues installation rather than executing a setup plan; acceptance must check its real completed creation/terminal install and absence of unrelated setup obligations. The native instance's zero minimum retains its global-memory inheritance. Preserve the collector's HTTP timeout and reconcile captured terminal stream bytes through existing status/readiness reads, without replay or a client mutation journal. Joined Close/cold equality and process absence keep their named-profile and unavailable-FD qualifications.
 
