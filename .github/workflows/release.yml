@@ -46,7 +46,7 @@ jobs:
           cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
           source_sha=$(git rev-parse HEAD)
           node scripts/release/contract.mjs verify-source --tag "$CANDIDATE_TAG" --sha "$source_sha" --metadata "$RUNNER_TEMP/metadata.json" --output "$RUNNER_TEMP/source.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rewrite-source
           path: ${{ runner.temp }}/source.json
@@ -137,14 +137,14 @@ jobs:
         run: |
           node scripts/release/package.mjs --platform "$CANDIDATE_PLATFORM" --source "$RUNNER_TEMP/rewrite-source/source.json" --binary "target/$CANDIDATE_TARGET/release/$CANDIDATE_BINARY" --bundle-root "target/$CANDIDATE_TARGET/release/bundle" --output "$RUNNER_TEMP/handoff"
           node scripts/release/contract.mjs verify-artifacts --source "$RUNNER_TEMP/rewrite-source/source.json" --assets "$RUNNER_TEMP/handoff" --platform "$CANDIDATE_PLATFORM"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rewrite-assets-${{ matrix.platform }}
           path: ${{ runner.temp }}/handoff
           if-no-files-found: error
       - name: Retain build diagnostics
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rewrite-build-logs-${{ matrix.platform }}
           path: ${{ runner.temp }}/*.log
@@ -179,7 +179,7 @@ jobs:
           node acceptance/native/verify.mjs --source "$RUNNER_TEMP/rewrite-source/source.json" --assets "$RUNNER_TEMP/assets" --evidence acceptance/native/evidence > "$RUNNER_TEMP/readiness.json"
       - name: Retain explicit readiness gaps
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rewrite-readiness
           path: ${{ runner.temp }}/readiness.json
