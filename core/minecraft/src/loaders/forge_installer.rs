@@ -1291,7 +1291,7 @@ pub(crate) fn plan_authenticated_installer(
     let mut source_entry_counts = HashMap::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let name = entry.name().to_string();
+        let name = entry.name()?.to_string();
         *source_entry_counts.entry(name.clone()).or_insert(0_usize) += 1;
         match name.as_str() {
             "version.json" => {
@@ -2906,8 +2906,8 @@ fn extract_authenticated_processor_data(
     let mut located = BTreeMap::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
-        let authored_name = entry.name();
-        let Ok(source_path) = PortableRelativePath::new_exact(authored_name) else {
+        let authored_name = entry.name()?;
+        let Ok(source_path) = PortableRelativePath::new_exact(&authored_name) else {
             continue;
         };
         let portable = portable_path_key(&source_path);
@@ -3344,7 +3344,7 @@ fn strip_signed_metadata_in_memory(
     let mut total = 0_u64;
     for index in 0..source.len() {
         let mut entry = source.by_index(index)?;
-        let entry_name = entry.name().to_string();
+        let entry_name = entry.name()?.to_string();
         if legacy_signed_metadata_entry_is_skipped(&entry_name) {
             continue;
         }
@@ -3378,7 +3378,7 @@ fn legacy_signed_metadata_entry_is_skipped(name: &str) -> bool {
 }
 
 fn read_bounded_entry(
-    file: &mut zip::read::ZipFile<'_>,
+    file: &mut zip::read::ZipFile<'_, std::io::Cursor<&[u8]>>,
     name: &str,
     max_bytes: u64,
 ) -> Result<Vec<u8>, ForgeInstallerError> {
@@ -3399,7 +3399,7 @@ fn read_bounded_entry(
 }
 
 fn read_embedded_entry(
-    file: &mut zip::read::ZipFile<'_>,
+    file: &mut zip::read::ZipFile<'_, std::io::Cursor<&[u8]>>,
     name: &str,
     total: &mut u64,
 ) -> Result<Vec<u8>, ForgeInstallerError> {

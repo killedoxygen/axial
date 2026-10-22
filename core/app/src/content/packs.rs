@@ -205,7 +205,11 @@ impl PackArchive {
             let entry = zip
                 .by_index(position)
                 .map_err(|_| PackError::Invalid("unreadable archive entry"))?;
-            if entry.name() == INDEX_FILE {
+            if entry
+                .name()
+                .map_err(|_| PackError::Invalid("unreadable archive entry"))?
+                == INDEX_FILE
+            {
                 if index_position.replace(position).is_some() || !regular_entry(&entry) {
                     return Err(PackError::Invalid("duplicate or nonregular pack index"));
                 }
@@ -267,7 +271,10 @@ impl PackArchive {
             let entry = zip
                 .by_index(source.archive_index)
                 .map_err(|_| PackError::Invalid("override entry is missing"))?;
-            if entry.name() != source.archive_path || entry.size() != source.size {
+            let name = entry
+                .name()
+                .map_err(|_| PackError::Invalid("override entry is missing"))?;
+            if name != source.archive_path || entry.size() != source.size {
                 return Err(PackError::Integrity);
             }
         }
@@ -836,10 +843,12 @@ fn inspect_overrides<R: Read + std::io::Seek>(
             let entry = zip
                 .by_index(archive_index)
                 .map_err(|_| PackError::Invalid("unreadable override entry"))?;
-            if !entry.name().starts_with(&prefix) {
+            let name = entry
+                .name()
+                .map_err(|_| PackError::Invalid("unreadable override entry"))?;
+            let Some(path) = name.strip_prefix(&prefix).map(str::to_string) else {
                 continue;
-            }
-            let path = entry.name()[prefix.len()..].to_string();
+            };
             if entry.is_dir() {
                 if !path.is_empty() {
                     validate_pack_path(path.trim_end_matches('/'))?;
@@ -850,7 +859,7 @@ fn inspect_overrides<R: Read + std::io::Seek>(
                 return Err(PackError::Invalid("override is not a regular file"));
             }
             validate_pack_path(&path)?;
-            let archive_path = entry.name().to_string();
+            let archive_path = name.into_owned();
             let declared_size = entry.size();
             drop(entry);
             total_files += 1;
@@ -897,7 +906,7 @@ fn inspect_overrides<R: Read + std::io::Seek>(
     Ok(overrides)
 }
 
-fn regular_entry(entry: &zip::read::ZipFile<'_>) -> bool {
+fn regular_entry<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> bool {
     !entry.is_dir()
         && entry
             .unix_mode()

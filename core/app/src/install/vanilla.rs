@@ -440,7 +440,10 @@ fn extract_native_archive(
         let mut entry = archive
             .by_index(index)
             .map_err(|_| NativePreparationError::Archive)?;
-        let spelling = entry.name().replace('\\', "/");
+        let spelling = entry
+            .name()
+            .map_err(|_| NativePreparationError::Archive)?
+            .replace('\\', "/");
         let name = spelling.strip_suffix('/').unwrap_or(&spelling);
         let relative =
             PortableRelativePath::new_exact(name).map_err(|_| NativePreparationError::Archive)?;
