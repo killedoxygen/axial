@@ -1702,7 +1702,7 @@ async fn run_java_step(
     let mut command = Command::new(runtime.cli_executable_path());
     command
         .env_clear()
-        .current_dir(workspace.root_path())
+        .current_dir(java_path(workspace.root_path())?)
         .arg("-cp")
         .arg(classpath)
         .arg(main_class)
@@ -1711,7 +1711,7 @@ async fn run_java_step(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    set_processor_environment(&mut command, workspace, &bootstrap_environment);
+    set_processor_environment(&mut command, workspace, &bootstrap_environment)?;
     check_cancel(cancel)?;
     let mut child = spawn_contained_child(&mut command, Some(runtime)).await?;
     let stdout = match child.child.stdout.take() {
@@ -2061,11 +2061,22 @@ fn render_classpath(
     let paths = std::iter::once(&step.jar)
         .chain(&step.classpath)
         .map(|artifact| {
-            workspace
-                .libraries_path()
-                .join(artifact.relative_path.as_str())
-        });
+            java_path(
+                &workspace
+                    .libraries_path()
+                    .join(artifact.relative_path.as_str()),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     std::env::join_paths(paths).map_err(|_| BoundProcessorError::Authority)
+}
+
+/// Java cannot load classes or resolve files through Windows verbatim (`\\?\`) paths, which
+/// canonicalized workspace roots carry; launch arguments use the same Java path encoding.
+fn java_path(path: &Path) -> Result<OsString, BoundProcessorError> {
+    crate::launch::java_path_argument(path)
+        .map(OsString::from)
+        .map_err(|_| BoundProcessorError::Authority)
 }
 
 fn render_argument(
@@ -2076,13 +2087,14 @@ fn render_argument(
 ) -> Result<OsString, BoundProcessorError> {
     let output_root = workspace.temp_path();
     match argument {
-        BoundProcessorArgument::Artifact(artifact) => Ok(workspace
-            .libraries_path()
-            .join(artifact.relative_path.as_str())
-            .into_os_string()),
-        BoundProcessorArgument::OutputArtifact(artifact) => Ok(output_root
-            .join(artifact.relative_path.as_str())
-            .into_os_string()),
+        BoundProcessorArgument::Artifact(artifact) => java_path(
+            &workspace
+                .libraries_path()
+                .join(artifact.relative_path.as_str()),
+        ),
+        BoundProcessorArgument::OutputArtifact(artifact) => {
+            java_path(&output_root.join(artifact.relative_path.as_str()))
+        }
         BoundProcessorArgument::Template(parts) => {
             let mut rendered = OsString::new();
             for part in parts {
@@ -2096,7 +2108,9 @@ fn render_argument(
                         else {
                             return Err(BoundProcessorError::Authority);
                         };
-                        rendered.push(output_root.join(artifact.relative_path.as_str()));
+                        rendered.push(java_path(
+                            &output_root.join(artifact.relative_path.as_str()),
+                        )?);
                     }
                     BoundProcessorArgumentPart::BuiltinToken(token) => {
                         push_builtin(&mut rendered, *token, workspace, minecraft_version)?;
@@ -2116,14 +2130,16 @@ fn push_data_value(
 ) -> Result<(), BoundProcessorError> {
     match plan.data.get(token).ok_or(BoundProcessorError::Authority)? {
         BoundProcessorData::Artifact(artifact) => {
-            rendered.push(
-                workspace
+            rendered.push(java_path(
+                &workspace
                     .libraries_path()
                     .join(artifact.relative_path.as_str()),
-            );
+            )?);
         }
         BoundProcessorData::InstallerData(path) => {
-            rendered.push(workspace.processor_data_path().join(path.as_str()));
+            rendered.push(java_path(
+                &workspace.processor_data_path().join(path.as_str()),
+            )?);
         }
         BoundProcessorData::Literal(value) => rendered.push(value),
     }
@@ -2138,17 +2154,17 @@ fn push_builtin(
 ) -> Result<(), BoundProcessorError> {
     match token {
         ProcessorBuiltinToken::MinecraftJar => {
-            rendered.push(
-                workspace
+            rendered.push(java_path(
+                &workspace
                     .version_path()
                     .join(format!("{minecraft_version}.jar")),
-            );
+            )?);
         }
         ProcessorBuiltinToken::Side => rendered.push("client"),
         ProcessorBuiltinToken::MinecraftVersion => rendered.push(minecraft_version),
-        ProcessorBuiltinToken::Root => rendered.push(workspace.root_path()),
-        ProcessorBuiltinToken::LibraryDir => rendered.push(workspace.libraries_path()),
-        ProcessorBuiltinToken::Installer => rendered.push(workspace.installer_path()),
+        ProcessorBuiltinToken::Root => rendered.push(java_path(workspace.root_path())?),
+        ProcessorBuiltinToken::LibraryDir => rendered.push(java_path(workspace.libraries_path())?),
+        ProcessorBuiltinToken::Installer => rendered.push(java_path(&workspace.installer_path())?),
     }
     Ok(())
 }
@@ -2263,20 +2279,22 @@ fn set_processor_environment(
     command: &mut Command,
     workspace: &ProcessorWorkspace,
     bootstrap: &ProcessorBootstrapEnvironment,
-) {
+) -> Result<(), BoundProcessorError> {
     #[cfg(not(windows))]
     let _ = bootstrap;
+    let home = java_path(workspace.home_path())?;
+    let temp = java_path(workspace.temp_path())?;
     command
-        .env("HOME", workspace.home_path())
-        .env("TMPDIR", workspace.temp_path())
-        .env("TMP", workspace.temp_path())
-        .env("TEMP", workspace.temp_path())
+        .env("HOME", &home)
+        .env("TMPDIR", &temp)
+        .env("TMP", &temp)
+        .env("TEMP", &temp)
         .env("TZ", "UTC");
     #[cfg(unix)]
     command.env("LC_ALL", "C").env("LANG", "C");
     #[cfg(windows)]
     {
-        command.env("USERPROFILE", workspace.home_path());
+        command.env("USERPROFILE", &home);
         if let Some(value) = &bootstrap.system_root {
             command.env("SystemRoot", value);
         }
@@ -2284,6 +2302,7 @@ fn set_processor_environment(
             command.env("WINDIR", value);
         }
     }
+    Ok(())
 }
 
 enum PipeEvent {
@@ -2991,6 +3010,65 @@ mod tests {
             .expect("unexpected file");
         assert!(super::settle_step_outputs(&step, workspace, &before_root, &before_stage).is_err());
         owner.cleanup().expect("cleanup");
+    }
+
+    #[test]
+    fn java_processor_paths_use_launch_encoding_of_the_canonical_workspace() {
+        let owner =
+            prepare_ephemeral_processor_workspace("forge-test", "1.20.1").expect("workspace");
+        let workspace = owner.workspace();
+        let step = native_mapping_step();
+        let plan = BoundProcessorPlan {
+            steps: Vec::new(),
+            data: BTreeMap::new(),
+            installer_data: BTreeMap::new(),
+            input_artifacts: BTreeMap::new(),
+        };
+        let java = |path: &std::path::Path| {
+            std::ffi::OsString::from(crate::launch::java_path_argument(path).expect("java path"))
+        };
+        let classpath = super::render_classpath(&step, workspace).expect("classpath");
+        assert_eq!(
+            classpath,
+            java(&workspace.libraries_path().join("forge/installertools.jar"))
+        );
+        let root =
+            BoundProcessorArgument::Template(vec![BoundProcessorArgumentPart::BuiltinToken(
+                ProcessorBuiltinToken::Root,
+            )]);
+        let rendered = [&step.args[0], &step.args[1], &root].map(|argument| {
+            super::render_argument(argument, &plan, workspace, "1.20.1").expect("argument")
+        });
+        assert_eq!(
+            rendered,
+            [
+                java(&workspace.libraries_path().join("mcp/config.zip")),
+                java(&workspace.temp_path().join("mcp/mappings.txt")),
+                java(workspace.root_path()),
+            ]
+        );
+        let mut command = Command::new("java");
+        super::set_processor_environment(
+            &mut command,
+            workspace,
+            &super::processor_bootstrap_environment().expect("bootstrap"),
+        )
+        .expect("environment");
+        let temp = java(workspace.temp_path());
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(name, value)| name == "TMP" && value == Some(temp.as_os_str()))
+        );
+        #[cfg(windows)]
+        assert!(
+            workspace.root_path().to_string_lossy().starts_with(r"\\?\")
+                && rendered
+                    .iter()
+                    .chain([&classpath, &temp])
+                    .all(|path| !path.to_string_lossy().starts_with(r"\\?\"))
+        );
     }
 
     #[tokio::test]
