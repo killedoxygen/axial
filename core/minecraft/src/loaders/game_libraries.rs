@@ -103,7 +103,7 @@ pub fn recognize(version_id: &str, bytes: &[u8]) -> Result<Option<Requirements>,
     let mut found = false;
     for index in 0..entries {
         let mut entry = archive.by_index(index).map_err(|_| invalid())?;
-        if entry.name() != DECLARATION {
+        if entry.name().map_err(|_| invalid())? != DECLARATION {
             continue;
         }
         if found || entry.size() != DECLARATION_BYTES as u64 || !entry.is_file() {

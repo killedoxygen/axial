@@ -1689,16 +1689,19 @@ fn legacy_overlay_entry_names<R: std::io::Read + std::io::Seek>(
         if index >= MAX_LEGACY_OVERLAY_ENTRIES {
             return Err(legacy_overlay_limit_error());
         }
+        let name = entry
+            .name()
+            .map_err(|error| legacy_archive_error("Forge", error))?;
         name_bytes = name_bytes
-            .checked_add(entry.name().len())
+            .checked_add(name.len())
             .ok_or_else(legacy_overlay_limit_error)?;
         if name_bytes > MAX_LEGACY_OVERLAY_NAME_BYTES {
             return Err(legacy_overlay_limit_error());
         }
-        if legacy_archive_entry_is_skipped(entry.name()) {
+        if legacy_archive_entry_is_skipped(&name) {
             continue;
         }
-        names.insert(entry.name().to_string());
+        names.insert(name.into_owned());
     }
     Ok(names)
 }
@@ -1761,7 +1764,10 @@ fn copy_legacy_overlay_entries<
         let mut entry = archive
             .by_index(index)
             .map_err(|error| legacy_archive_error("legacy Forge", error))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|error| legacy_archive_error("legacy Forge", error))?
+            .into_owned();
         if legacy_archive_entry_is_skipped(&name)
             || replaced_names.is_some_and(|names| names.contains(&name))
         {

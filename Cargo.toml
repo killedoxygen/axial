@@ -54,7 +54,7 @@ tauri = { version = "=2.11.2" }
 tauri-build = { version = "=2.6.2" }
 tauri-plugin-dialog = "2.4.2"
 tauri-plugin-opener = "2.5.0"
-tauri-plugin-updater = "~2.12.0"
+tauri-plugin-updater = { version = "~2.12.0", default-features = false, features = ["rustls-tls", "system-proxy"] }
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tower = "0.5.2"
@@ -65,7 +65,7 @@ unicode-casefold = "=0.2.0"
 unicode-normalization = "=0.1.25"
 url = "2.5.7"
 uuid = { version = "1.23.0", features = ["v4", "serde"] }
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
 hex = "0.4.3"
 axial-fs = { path = "core/fs" }
 axial-resource = { path = "core/resource" }

@@ -1554,7 +1554,7 @@ async fn recompress_java_archive(
             (
                 payload,
                 file.header_start() as usize,
-                file.data_start() as usize,
+                file.data_start().ok_or(BoundProcessorError::Authority)? as usize,
                 file.compressed_size() as usize,
                 file.crc32(),
             )
@@ -1852,7 +1852,8 @@ fn extract_mcp_mappings(
         let entry = archive
             .by_index(index)
             .map_err(|_| BoundProcessorError::Authority)?;
-        let name = entry.name().strip_suffix('/').unwrap_or(entry.name());
+        let spelling = entry.name().map_err(|_| BoundProcessorError::Authority)?;
+        let name = spelling.strip_suffix('/').unwrap_or(&spelling);
         let path =
             PortableRelativePath::new_exact(name).map_err(|_| BoundProcessorError::Authority)?;
         let kind = entry.unix_mode().unwrap_or_default() & 0o170000;
@@ -2163,8 +2164,9 @@ fn processor_main_class(jar: &[u8]) -> Result<String, BoundProcessorError> {
         let mut entry = archive
             .by_index(index)
             .map_err(|_| BoundProcessorError::Manifest)?;
-        if entry.name().eq_ignore_ascii_case("META-INF/MANIFEST.MF") {
-            if entry.name() != "META-INF/MANIFEST.MF" || manifest.is_some() {
+        let name = entry.name().map_err(|_| BoundProcessorError::Manifest)?;
+        if name.eq_ignore_ascii_case("META-INF/MANIFEST.MF") {
+            if name != "META-INF/MANIFEST.MF" || manifest.is_some() {
                 return Err(BoundProcessorError::Manifest);
             }
             let mut bytes = Vec::new();
