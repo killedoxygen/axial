@@ -1,3 +1,6 @@
+// Release builds are GUI applications; a console subsystem opens an empty terminal window.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod auth;
 mod bootstrap;
 mod discord_presence;

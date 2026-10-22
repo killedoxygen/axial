@@ -19,6 +19,10 @@ fn main() {
         #[cfg(debug_assertions)]
         "app_reset",
     ];
+    // Clean Windows installs lack the VC++ redistributable; tauri-build 2.6 links its runtime
+    // statically only when this variable is set.
+    // SAFETY: the build script is single-threaded and nothing else reads the environment yet.
+    unsafe { std::env::set_var("STATIC_VCRUNTIME", "true") };
     let manifest = tauri_build::AppManifest::new().commands(COMMANDS);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("desktop capability manifest must be valid");
