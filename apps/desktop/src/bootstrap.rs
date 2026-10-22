@@ -22,7 +22,7 @@ pub fn confine_content_policy(
     }
     let origin = url.origin().ascii_serialization();
     config.app.security.csp = Some(tauri::utils::config::Csp::Policy(format!(
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: {origin}; connect-src 'self' data: blob: ipc: http://ipc.localhost {origin}; font-src 'self'; media-src 'self' blob: {origin}; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'"
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: {origin}; connect-src 'self' data: blob: ipc: http://ipc.localhost {origin}; font-src 'self'; media-src 'self' blob: {origin}; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'"
     )));
     Ok(())
 }
