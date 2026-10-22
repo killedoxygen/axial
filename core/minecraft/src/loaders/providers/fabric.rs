@@ -18,6 +18,8 @@ use std::collections::{HashMap, hash_map::Entry};
 use super::{ProfileInstallProof, ProfileLibraryProof};
 
 const MAX_TWEAKER_CLASS_BYTES: usize = 256;
+/// Fabric's intermediary for unobfuscated Minecraft (26.1 onward), which needs no mapping library.
+const UNMAPPED_INTERMEDIARY: &str = "0.0.0";
 
 #[derive(Deserialize)]
 struct FabricGameEntry {
@@ -219,18 +221,17 @@ fn profile_install_proof_from_entry(
             .launcher_meta
             .launchwrapper
             .and_then(|wrapper| wrapper.tweakers.client),
-        required_libraries: vec![
-            ProfileLibraryProof {
-                coordinate: entry.loader.maven,
+        required_libraries: std::iter::once(entry.loader.maven)
+            .chain(
+                (entry.intermediary.version != UNMAPPED_INTERMEDIARY)
+                    .then_some(entry.intermediary.maven),
+            )
+            .map(|coordinate| ProfileLibraryProof {
+                coordinate,
                 sha1: None,
                 size: None,
-            },
-            ProfileLibraryProof {
-                coordinate: entry.intermediary.maven,
-                sha1: None,
-                size: None,
-            },
-        ],
+            })
+            .collect(),
     })
 }
 
@@ -319,14 +320,25 @@ fn compatible_client_main_class<'a>(
     entry: &'a FabricInstallEntry,
     minecraft_version: &str,
 ) -> Option<&'a str> {
+    let client_main_class = entry.launcher_meta.main_class.client.trim();
+    let intermediary = if entry.intermediary.version == UNMAPPED_INTERMEDIARY {
+        // Historical launchwrapper rows also carry the placeholder, but always need mappings.
+        if entry.launcher_meta.launchwrapper.is_some()
+            || client_main_class == "net.minecraft.launchwrapper.Launch"
+        {
+            return None;
+        }
+        UNMAPPED_INTERMEDIARY
+    } else {
+        minecraft_version
+    };
     if entry.loader.maven != format!("net.fabricmc:fabric-loader:{}", entry.loader.version)
-        || entry.intermediary.version != minecraft_version
-        || entry.intermediary.maven != format!("net.fabricmc:intermediary:{minecraft_version}")
+        || entry.intermediary.version != intermediary
+        || entry.intermediary.maven != format!("net.fabricmc:intermediary:{intermediary}")
     {
         return None;
     }
 
-    let client_main_class = entry.launcher_meta.main_class.client.trim();
     if let Some(wrapper) = &entry.launcher_meta.launchwrapper {
         if client_main_class != "net.minecraft.launchwrapper.Launch" {
             return None;
@@ -418,6 +430,46 @@ mod tests {
         let index = build_index_from_entries("26.2", raw).expect("normalized Fabric index");
 
         assert!(index.builds.is_empty());
+    }
+
+    #[test]
+    fn unobfuscated_minecraft_accepts_the_unmapped_intermediary_without_a_mapping_library() {
+        let unmapped = || {
+            let mut entry = compatible_entry(
+                "26.3",
+                "0.19.5",
+                true,
+                "net.fabricmc.loader.impl.launch.knot.KnotClient",
+            );
+            entry.intermediary.version = "0.0.0".to_string();
+            entry.intermediary.maven = "net.fabricmc:intermediary:0.0.0".to_string();
+            entry
+        };
+        let index = build_index_from_entries("26.3", vec![unmapped()]).expect("26.3 index");
+        assert_eq!(index.builds.len(), 1);
+        let proof = profile_install_proof_from_entry(
+            &index.builds[0],
+            "https://meta.fabricmc.net/v2/versions/loader/26.3/0.19.5/profile/json",
+            unmapped(),
+        )
+        .expect("unobfuscated Fabric proof");
+        assert_eq!(
+            proof
+                .required_libraries()
+                .iter()
+                .map(|library| library.coordinate())
+                .collect::<Vec<_>>(),
+            ["net.fabricmc:fabric-loader:0.19.5"]
+        );
+
+        let mut foreign = unmapped();
+        foreign.intermediary.maven = "net.fabricmc:intermediary:26.3".to_string();
+        assert!(
+            build_index_from_entries("26.3", vec![foreign])
+                .unwrap()
+                .builds
+                .is_empty()
+        );
     }
 
     #[test]
