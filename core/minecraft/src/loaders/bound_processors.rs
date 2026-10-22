@@ -418,7 +418,7 @@ fn prepare_process_containment(
         CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, SetInformationJobObject,
     };
-    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
     let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if raw.is_null() {
@@ -438,7 +438,7 @@ fn prepare_process_containment(
     if configured == 0 {
         return Err(BoundProcessorError::Containment);
     }
-    command.creation_flags(CREATE_SUSPENDED);
+    command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
     Ok(PendingProcessContainment { job })
 }
 

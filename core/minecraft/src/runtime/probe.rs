@@ -406,6 +406,11 @@ pub(super) fn java_probe_executable(java_path: &Path) -> PathBuf {
 
 fn command_output_with_timeout(mut command: Command, timeout: Duration) -> std::io::Result<Output> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
     let mut child = command.spawn()?;
     let deadline = Instant::now() + timeout;
 
