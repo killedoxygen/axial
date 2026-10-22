@@ -38,9 +38,10 @@ export function AccentField({
 }: {
   showPresets?: boolean;
 } = {}): JSX.Element {
-  const [hue, setHue] = useState<number>(local.customHue);
+  const initialHue = PRESET_HUES[local.theme] ?? local.customHue;
+  const [hue, setHue] = useState<number>(initialHue);
   const [vibrancy, setVibrancy] = useState<number>(local.customVibrancy);
-  const latest = useRef({ hue: local.customHue, vibrancy: local.customVibrancy });
+  const latest = useRef({ hue: initialHue, vibrancy: local.customVibrancy });
   const previewFrame = useRef<number | null>(null);
 
   useEffect(() => {
