@@ -1031,20 +1031,28 @@ fn execute_component_intent_blocking(
             Err(_) => return ExecutionDisposition::RecoveryRequired(None),
         };
 
-    let execution =
-        create_and_promote_ancestors(published, &ancestor_authority, &created_ancestors, fault)
-            .and_then(|()| {
-                observe_all_rows(published, ComponentRecoveryDecision::Rollback, true)?;
-                execute_rows_forward(published, fault)?;
-                postcheck(
-                    published,
-                    &ancestor_authority,
-                    &created_ancestors,
-                    ComponentRecoveryDecision::Commit,
-                )
-                .map_err(forward_post_effect_error)?;
-                Ok(())
-            });
+    let root = published.lease.root().clone();
+    let execution = root.observe_validated(
+        || {
+            create_and_promote_ancestors(
+                published,
+                &ancestor_authority,
+                &created_ancestors,
+                fault,
+            )?;
+            observe_all_rows(published, ComponentRecoveryDecision::Rollback, true, true)?;
+            execute_rows_forward(published, fault)?;
+            postcheck(
+                published,
+                &ancestor_authority,
+                &created_ancestors,
+                ComponentRecoveryDecision::Commit,
+            )
+            .map_err(forward_post_effect_error)?;
+            Ok(())
+        },
+        forward_post_effect_error,
+    );
 
     let crashed_without_outcome = matches!(
         fault,
@@ -1126,7 +1134,7 @@ fn recover_component_transaction_blocking(
                 return BlockingDisposition::RecoveryRequired(outcome.map(|(_, guard)| guard));
             }
         };
-    let row_plan = match plan_all_rows(published) {
+    let row_plan = match plan_all_rows(published, false) {
         Ok(plan) => plan,
         Err(_) => return BlockingDisposition::RecoveryRequired(outcome.map(|(_, guard)| guard)),
     };
@@ -1222,7 +1230,7 @@ fn recover_component_transaction_blocking(
         return BlockingDisposition::RecoveryRequired(None);
     }
     let rows_rolled_back = rollback_rows(published).is_ok()
-        && matches!(plan_all_rows(published), Ok(plan) if plan.all_pristine);
+        && matches!(plan_all_rows(published, true), Ok(plan) if plan.all_pristine);
     if !row_plan.rollback_reachable
         || !rows_rolled_back
         || rollback_ancestors(published, &ancestor_authority, &created_ancestors).is_err()
@@ -1297,6 +1305,15 @@ fn read_recovery_outcome(
 }
 
 fn validate_published_and_replay(
+    published: &ComponentIntentPublished,
+    outcome_present: bool,
+) -> Result<ComponentTableSummary, ComponentTransactionError> {
+    observe_validated(published.lease.root(), || {
+        validate_published_and_replay_in_window(published, outcome_present)
+    })
+}
+
+fn validate_published_and_replay_in_window(
     published: &ComponentIntentPublished,
     outcome_present: bool,
 ) -> Result<ComponentTableSummary, ComponentTransactionError> {
@@ -1550,6 +1567,7 @@ fn execute_rows_forward(
     fault: ComponentExecutionFault,
 ) -> Result<(), ComponentForwardFailure> {
     let mut parser = ComponentTableParser::new(published.manifest.clone()).map_err(tx)?;
+    let mut parents = ComponentCanonicalParents::default();
     for shard_index in 0..published.manifest.shards.len() {
         let bytes = read_table_shard_bytes(published, shard_index)?;
         let shard = parser.parse_next(&bytes).map_err(tx)?;
@@ -1565,7 +1583,15 @@ fn execute_rows_forward(
             .open_child(&bucket_name)
             .map_err(tx)?;
         for (row_in_shard, row) in shard.rows.iter().enumerate() {
-            let observed = observe_row(published, row, &staging, &quarantine, row_in_shard)?;
+            let observed = observe_row(
+                published,
+                row,
+                &staging,
+                &quarantine,
+                row_in_shard,
+                &mut parents,
+                true,
+            )?;
             match observed.state {
                 ComponentRecoveryEntryState::Exact => {}
                 ComponentRecoveryEntryState::StagedNew => move_staged_to_canonical(
@@ -1574,6 +1600,7 @@ fn execute_rows_forward(
                     &staging,
                     row_in_shard,
                     observed.staging.ok_or(ComponentTransactionError)?,
+                    &mut parents,
                 )?,
                 ComponentRecoveryEntryState::StagedReplacement => {
                     let mut canonical = observed.canonical.ok_or(ComponentTransactionError)?;
@@ -1600,8 +1627,15 @@ fn execute_rows_forward(
                         },
                     )
                     .map_err(forward_post_effect_error)?;
-                    let intermediate =
-                        observe_row(published, row, &staging, &quarantine, row_in_shard)?;
+                    let intermediate = observe_row(
+                        published,
+                        row,
+                        &staging,
+                        &quarantine,
+                        row_in_shard,
+                        &mut parents,
+                        true,
+                    )?;
                     if intermediate.state != ComponentRecoveryEntryState::QuarantinedReplacement {
                         return Err(ComponentForwardFailure::EffectUnsettled);
                     }
@@ -1617,6 +1651,7 @@ fn execute_rows_forward(
                         &staging,
                         row_in_shard,
                         intermediate.staging.ok_or(ComponentTransactionError)?,
+                        &mut parents,
                     )?;
                 }
                 _ => return Err(ComponentTransactionError.into()),
@@ -1650,10 +1685,11 @@ fn move_staged_to_canonical(
     staging: &ManagedDir,
     row_in_shard: usize,
     mut guard: ManagedFileGuard,
+    parents: &mut ComponentCanonicalParents,
 ) -> Result<(), ComponentForwardFailure> {
-    let plan =
-        plan_component_canonical_path(published.lease.root(), published.lane.component, &row.path)
-            .map_err(tx)?;
+    let plan = parents
+        .plan(published.lease.root(), published.lane.component, &row.path)
+        .map_err(tx)?;
     let parent = plan.parent().ok_or(ComponentTransactionError)?;
     let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
     staging
@@ -1680,9 +1716,9 @@ fn rollback_live(
     authority: &ComponentAncestorJournalAuthority<'_>,
     targets: &[ComponentCreatedAncestor],
 ) -> Result<(), ComponentTransactionError> {
-    observe_all_rows(published, ComponentRecoveryDecision::Rollback, false)?;
+    observe_all_rows(published, ComponentRecoveryDecision::Rollback, false, false)?;
     rollback_rows(published)?;
-    observe_all_rows(published, ComponentRecoveryDecision::Rollback, true)?;
+    observe_all_rows(published, ComponentRecoveryDecision::Rollback, true, true)?;
     rollback_ancestors(published, authority, targets)?;
     postcheck(
         published,
@@ -1693,6 +1729,7 @@ fn rollback_live(
 }
 
 fn rollback_rows(published: &ComponentIntentPublished) -> Result<(), ComponentTransactionError> {
+    let mut parents = ComponentCanonicalParents::default();
     for shard_index in (0..published.manifest.shards.len()).rev() {
         let shard = read_authenticated_table_shard(published, shard_index)?;
         let bucket_name = component_bucket_name(shard_index).map_err(tx)?;
@@ -1707,7 +1744,15 @@ fn rollback_rows(published: &ComponentIntentPublished) -> Result<(), ComponentTr
             .open_child(&bucket_name)
             .map_err(tx)?;
         for (row_in_shard, row) in shard.rows.iter().enumerate().rev() {
-            let observed = observe_row(published, row, &staging, &quarantine, row_in_shard)?;
+            let observed = observe_row(
+                published,
+                row,
+                &staging,
+                &quarantine,
+                row_in_shard,
+                &mut parents,
+                true,
+            )?;
             match observed.state {
                 ComponentRecoveryEntryState::Exact
                 | ComponentRecoveryEntryState::StagedNew
@@ -1725,6 +1770,7 @@ fn rollback_rows(published: &ComponentIntentPublished) -> Result<(), ComponentTr
                         &quarantine,
                         row_in_shard,
                         observed.quarantine.ok_or(ComponentTransactionError)?,
+                        &mut parents,
                     )?;
                 }
                 ComponentRecoveryEntryState::CommittedReplacement => {
@@ -1734,8 +1780,15 @@ fn rollback_rows(published: &ComponentIntentPublished) -> Result<(), ComponentTr
                         row_in_shard,
                         observed.canonical.ok_or(ComponentTransactionError)?,
                     )?;
-                    let intermediate =
-                        observe_row(published, row, &staging, &quarantine, row_in_shard)?;
+                    let intermediate = observe_row(
+                        published,
+                        row,
+                        &staging,
+                        &quarantine,
+                        row_in_shard,
+                        &mut parents,
+                        true,
+                    )?;
                     if intermediate.state != ComponentRecoveryEntryState::QuarantinedReplacement {
                         return Err(ComponentTransactionError);
                     }
@@ -1745,6 +1798,7 @@ fn rollback_rows(published: &ComponentIntentPublished) -> Result<(), ComponentTr
                         &quarantine,
                         row_in_shard,
                         intermediate.quarantine.ok_or(ComponentTransactionError)?,
+                        &mut parents,
                     )?;
                 }
             }
@@ -1789,10 +1843,11 @@ fn move_quarantine_to_canonical(
     quarantine: &ManagedDir,
     row_in_shard: usize,
     mut guard: ManagedFileGuard,
+    parents: &mut ComponentCanonicalParents,
 ) -> Result<(), ComponentTransactionError> {
-    let plan =
-        plan_component_canonical_path(published.lease.root(), published.lane.component, &row.path)
-            .map_err(tx)?;
+    let plan = parents
+        .plan(published.lease.root(), published.lane.component, &row.path)
+        .map_err(tx)?;
     let parent = plan.parent().ok_or(ComponentTransactionError)?;
     let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
     let prior = row.prior.as_ref().ok_or(ComponentTransactionError)?;
@@ -1813,12 +1868,17 @@ fn move_quarantine_to_canonical(
     )
 }
 
+/// `reverify` reuses digests of revisions this process already hashed in full;
+/// the first observation of each recovery attempt hashes in full.
 fn observe_all_rows(
     published: &ComponentIntentPublished,
     expected: ComponentRecoveryDecision,
     require_pristine_rollback: bool,
+    reverify: bool,
 ) -> Result<(), ComponentTransactionError> {
-    let plan = plan_all_rows(published)?;
+    let plan = observe_validated(published.lease.root(), || {
+        plan_all_rows(published, reverify)
+    })?;
     if (require_pristine_rollback && !plan.all_pristine)
         || match expected {
             ComponentRecoveryDecision::Commit => plan.decision != ComponentRecoveryDecision::Commit,
@@ -1832,10 +1892,12 @@ fn observe_all_rows(
 
 fn plan_all_rows(
     published: &ComponentIntentPublished,
+    reverify: bool,
 ) -> Result<ComponentRecoveryPlan, ComponentTransactionError> {
     let expected_rows = usize::try_from(published.manifest.total_rows).map_err(tx)?;
     let mut planner = ComponentRecoveryPlanner::new(expected_rows).map_err(tx)?;
     let mut parser = ComponentTableParser::new(published.manifest.clone()).map_err(tx)?;
+    let mut parents = ComponentCanonicalParents::default();
     for shard_index in 0..published.manifest.shards.len() {
         let bytes = read_table_shard_bytes(published, shard_index)?;
         let shard = parser.parse_next(&bytes).map_err(tx)?;
@@ -1853,7 +1915,15 @@ fn plan_all_rows(
         let mut staging_names = BTreeSet::new();
         let mut quarantine_names = BTreeSet::new();
         for (row_in_shard, row) in shard.rows.iter().enumerate() {
-            let observed = observe_row(published, row, &staging, &quarantine, row_in_shard)?;
+            let observed = observe_row(
+                published,
+                row,
+                &staging,
+                &quarantine,
+                row_in_shard,
+                &mut parents,
+                reverify,
+            )?;
             let observation = recovery_observation(row, &observed)?;
             planner.observe(row, observation).map_err(tx)?;
             let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
@@ -1882,12 +1952,42 @@ fn observe_row(
     staging: &ManagedDir,
     quarantine: &ManagedDir,
     row_in_shard: usize,
+    parents: &mut ComponentCanonicalParents,
+    reverify: bool,
+) -> Result<ObservedRow, ComponentTransactionError> {
+    observe_validated(published.lease.root(), || {
+        observe_row_in_window(
+            published,
+            row,
+            staging,
+            quarantine,
+            row_in_shard,
+            parents,
+            reverify,
+        )
+    })
+}
+
+fn observe_row_in_window(
+    published: &ComponentIntentPublished,
+    row: &ComponentTableRow,
+    staging: &ManagedDir,
+    quarantine: &ManagedDir,
+    row_in_shard: usize,
+    parents: &mut ComponentCanonicalParents,
+    reverify: bool,
 ) -> Result<ObservedRow, ComponentTransactionError> {
     let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
-    let staging_guard = exact_file(staging, &slot_name, row.final_size, row.final_sha1)?;
+    let staging_guard = exact_file(
+        staging,
+        &slot_name,
+        row.final_size,
+        row.final_sha1,
+        reverify,
+    )?;
     let quarantine_guard = match &row.prior {
         Some(prior) if !row.prior_is_final() => {
-            exact_file(quarantine, &slot_name, prior.size, prior.sha1)?
+            exact_file(quarantine, &slot_name, prior.size, prior.sha1, reverify)?
         }
         _ => {
             if quarantine
@@ -1900,10 +2000,15 @@ fn observe_row(
             None
         }
     };
-    let canonical_plan =
-        plan_component_canonical_path(published.lease.root(), published.lane.component, &row.path)
-            .map_err(tx)?;
-    let canonical = match canonical_plan.observe().map_err(tx)? {
+    let canonical_plan = parents
+        .plan(published.lease.root(), published.lane.component, &row.path)
+        .map_err(tx)?;
+    let canonical_observation = if reverify {
+        canonical_plan.reobserve()
+    } else {
+        canonical_plan.observe()
+    };
+    let canonical = match canonical_observation.map_err(tx)? {
         ComponentCanonicalObservation::Absent => None,
         ComponentCanonicalObservation::Regular(file) => Some(file),
     };
@@ -1963,21 +2068,26 @@ fn recovery_observation_from_parts(
     }
 }
 
+/// `reverify` reuses a digest of this exact revision already hashed in full.
 fn exact_file(
     directory: &ManagedDir,
     name: &str,
     size: u64,
     sha1: [u8; 20],
+    reverify: bool,
 ) -> Result<Option<ManagedFileGuard>, ComponentTransactionError> {
     let Some(guard) = directory.inspect_regular_file(name).map_err(tx)? else {
         return Ok(None);
     };
-    if guard.size() != size
-        || directory
-            .sha1_guarded_file_bytes(name, &guard, MAX_TIER2_ARTIFACT_BYTES)
-            .map_err(tx)?
-            != sha1
-    {
+    if guard.size() != size {
+        return Err(ComponentTransactionError);
+    }
+    let digest = if reverify {
+        directory.sha1_reverified_file_bytes(name, &guard, MAX_TIER2_ARTIFACT_BYTES)
+    } else {
+        directory.sha1_guarded_file_bytes(name, &guard, MAX_TIER2_ARTIFACT_BYTES)
+    };
+    if digest.map_err(tx)? != sha1 {
         return Err(ComponentTransactionError);
     }
     Ok(Some(guard))
@@ -2483,41 +2593,43 @@ fn open_canonical_ancestor(
     published: &ComponentIntentPublished,
     target: &ComponentCreatedAncestor,
 ) -> Result<Option<ManagedDir>, ComponentTransactionError> {
-    published.lease.revalidate().map_err(tx)?;
-    let root = published.lease.root();
-    let component_root = component_lane_name(published.lane.component);
-    let result = (|| -> Result<Option<ManagedDir>, ComponentTransactionError> {
-        match target {
-            ComponentCreatedAncestor::ComponentRoot => {
-                if root
-                    .has_portably_exact_child_name(component_root)
-                    .map_err(tx)?
-                {
-                    Ok(Some(root.open_child(component_root).map_err(tx)?))
-                } else {
-                    Ok(None)
+    observe_validated(published.lease.root(), || {
+        published.lease.revalidate().map_err(tx)?;
+        let root = published.lease.root();
+        let component_root = component_lane_name(published.lane.component);
+        let result = (|| -> Result<Option<ManagedDir>, ComponentTransactionError> {
+            match target {
+                ComponentCreatedAncestor::ComponentRoot => {
+                    if root
+                        .has_portably_exact_child_name(component_root)
+                        .map_err(tx)?
+                    {
+                        Ok(Some(root.open_child(component_root).map_err(tx)?))
+                    } else {
+                        Ok(None)
+                    }
                 }
-            }
-            ComponentCreatedAncestor::Relative(path) => {
-                if !root
-                    .has_portably_exact_child_name(component_root)
-                    .map_err(tx)?
-                {
-                    return Ok(None);
-                }
-                let mut current = root.open_child(component_root).map_err(tx)?;
-                for segment in path.as_str().split('/') {
-                    if !current.has_portably_exact_child_name(segment).map_err(tx)? {
+                ComponentCreatedAncestor::Relative(path) => {
+                    if !root
+                        .has_portably_exact_child_name(component_root)
+                        .map_err(tx)?
+                    {
                         return Ok(None);
                     }
-                    current = current.open_child(segment).map_err(tx)?;
+                    let mut current = root.open_child(component_root).map_err(tx)?;
+                    for segment in path.as_str().split('/') {
+                        if !current.has_portably_exact_child_name(segment).map_err(tx)? {
+                            return Ok(None);
+                        }
+                        current = current.open_child(segment).map_err(tx)?;
+                    }
+                    Ok(Some(current))
                 }
-                Ok(Some(current))
             }
-        }
-    })()?;
-    published.lease.revalidate().map_err(tx)?;
-    Ok(result)
+        })()?;
+        published.lease.revalidate().map_err(tx)?;
+        Ok(result)
+    })
 }
 
 fn read_ancestor_journal(
@@ -2555,34 +2667,36 @@ fn canonical_ancestor_parent(
     published: &ComponentIntentPublished,
     target: &ComponentCreatedAncestor,
 ) -> Result<(ManagedDir, String), ComponentTransactionError> {
-    published.lease.revalidate().map_err(tx)?;
-    let result = match target {
-        ComponentCreatedAncestor::ComponentRoot => {
-            let root = published.lease.root();
-            let name = component_lane_name(published.lane.component).to_string();
-            let _ = root.has_portably_exact_child_name(&name).map_err(tx)?;
-            Ok((root.clone(), name))
-        }
-        ComponentCreatedAncestor::Relative(path) => {
-            let mut segments = path.as_str().split('/').collect::<Vec<_>>();
-            let name = segments.pop().ok_or(ComponentTransactionError)?.to_string();
-            let mut parent = published
-                .lease
-                .root()
-                .open_child(component_lane_name(published.lane.component))
-                .map_err(tx)?;
-            for segment in segments {
-                if !parent.has_portably_exact_child_name(segment).map_err(tx)? {
-                    return Err(ComponentTransactionError);
-                }
-                parent = parent.open_child(segment).map_err(tx)?;
+    observe_validated(published.lease.root(), || {
+        published.lease.revalidate().map_err(tx)?;
+        let result = match target {
+            ComponentCreatedAncestor::ComponentRoot => {
+                let root = published.lease.root();
+                let name = component_lane_name(published.lane.component).to_string();
+                let _ = root.has_portably_exact_child_name(&name).map_err(tx)?;
+                Ok((root.clone(), name))
             }
-            let _ = parent.has_portably_exact_child_name(&name).map_err(tx)?;
-            Ok((parent, name))
-        }
-    };
-    published.lease.revalidate().map_err(tx)?;
-    result
+            ComponentCreatedAncestor::Relative(path) => {
+                let mut segments = path.as_str().split('/').collect::<Vec<_>>();
+                let name = segments.pop().ok_or(ComponentTransactionError)?.to_string();
+                let mut parent = published
+                    .lease
+                    .root()
+                    .open_child(component_lane_name(published.lane.component))
+                    .map_err(tx)?;
+                for segment in segments {
+                    if !parent.has_portably_exact_child_name(segment).map_err(tx)? {
+                        return Err(ComponentTransactionError);
+                    }
+                    parent = parent.open_child(segment).map_err(tx)?;
+                }
+                let _ = parent.has_portably_exact_child_name(&name).map_err(tx)?;
+                Ok((parent, name))
+            }
+        };
+        published.lease.revalidate().map_err(tx)?;
+        result
+    })
 }
 
 fn postcheck(
@@ -2601,22 +2715,25 @@ fn postcheck_with_outcome(
     expected: ComponentRecoveryDecision,
     outcome_present: bool,
 ) -> Result<(), ComponentTransactionError> {
-    validate_published_marker(published)?;
-    validate_terminal_topology(published, outcome_present)?;
-    observe_all_rows(
-        published,
-        expected,
-        expected == ComponentRecoveryDecision::Rollback,
-    )?;
-    match expected {
-        ComponentRecoveryDecision::Commit => {
-            prove_ancestors_committed(published, authority, targets)?
+    observe_validated(published.lease.root(), || {
+        validate_published_marker(published)?;
+        validate_terminal_topology(published, outcome_present)?;
+        observe_all_rows(
+            published,
+            expected,
+            expected == ComponentRecoveryDecision::Rollback,
+            true,
+        )?;
+        match expected {
+            ComponentRecoveryDecision::Commit => {
+                prove_ancestors_committed(published, authority, targets)?
+            }
+            ComponentRecoveryDecision::Rollback => {
+                prove_ancestors_rolled_back(published, authority, targets)?
+            }
         }
-        ComponentRecoveryDecision::Rollback => {
-            prove_ancestors_rolled_back(published, authority, targets)?
-        }
-    }
-    revalidate_transaction_root(published)
+        revalidate_transaction_root(published)
+    })
 }
 
 fn validate_published_marker(
@@ -2846,20 +2963,31 @@ fn authenticate_file_move(
         expected_size,
         expected_sha1,
     } = file_move;
-    revalidate_transaction_root(published)?;
-    if source.file_guard_matches(source_name, guard).map_err(tx)?
-        || !destination
-            .file_guard_matches(destination_name, guard)
-            .map_err(tx)?
-        || guard.size() != expected_size
-        || destination
-            .sha1_guarded_file_bytes(destination_name, guard, MAX_TIER2_ARTIFACT_BYTES)
-            .map_err(tx)?
-            != expected_sha1
-    {
-        return Err(ComponentTransactionError);
-    }
-    Ok(())
+    observe_validated(published.lease.root(), || {
+        revalidate_transaction_root(published)?;
+        if source.file_guard_matches(source_name, guard).map_err(tx)?
+            || !destination
+                .file_guard_matches(destination_name, guard)
+                .map_err(tx)?
+            || guard.size() != expected_size
+            || destination
+                .sha1_guarded_file_bytes(destination_name, guard, MAX_TIER2_ARTIFACT_BYTES)
+                .map_err(tx)?
+                != expected_sha1
+        {
+            return Err(ComponentTransactionError);
+        }
+        Ok(())
+    })
+}
+
+/// Runs one read-only pass under a single bracketing validation of the
+/// managed root session; effects inside keep their own validation.
+fn observe_validated<T>(
+    root: &ManagedDir,
+    observe: impl FnOnce() -> Result<T, ComponentTransactionError>,
+) -> Result<T, ComponentTransactionError> {
+    root.observe_validated(observe, tx)
 }
 
 fn revalidate_transaction_root(
@@ -3738,16 +3866,18 @@ fn validate_settlement_ancestor_terminal(
     terminal: ComponentTerminalOutcome,
     runtime_ancestors: Option<&ComponentRuntimeAncestorAuthority>,
 ) -> Result<(), ComponentTransactionError> {
-    let canonical = open_settlement_canonical_ancestor(lease, component, record.target())?;
-    match terminal {
-        ComponentTerminalOutcome::Committed => {
-            let canonical = canonical.ok_or(ComponentTransactionError)?;
-            validate_runtime_ancestor_entry(runtime_ancestors, record.ordinal(), &canonical)?;
+    observe_validated(lease.root(), || {
+        let canonical = open_settlement_canonical_ancestor(lease, component, record.target())?;
+        match terminal {
+            ComponentTerminalOutcome::Committed => {
+                let canonical = canonical.ok_or(ComponentTransactionError)?;
+                validate_runtime_ancestor_entry(runtime_ancestors, record.ordinal(), &canonical)?;
+            }
+            ComponentTerminalOutcome::RolledBack if canonical.is_none() => {}
+            ComponentTerminalOutcome::RolledBack => return Err(ComponentTransactionError),
         }
-        ComponentTerminalOutcome::RolledBack if canonical.is_none() => {}
-        ComponentTerminalOutcome::RolledBack => return Err(ComponentTransactionError),
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn open_settlement_canonical_ancestor(
@@ -3755,42 +3885,54 @@ fn open_settlement_canonical_ancestor(
     component: ManagedComponentKind,
     target: &ComponentCreatedAncestor,
 ) -> Result<Option<ManagedDir>, ComponentTransactionError> {
-    lease.revalidate().map_err(tx)?;
-    let root = lease.root();
-    let component_root = component_lane_name(component);
-    let result = (|| match target {
-        ComponentCreatedAncestor::ComponentRoot => {
-            if root
-                .has_portably_exact_child_name(component_root)
-                .map_err(tx)?
-            {
-                Ok(Some(root.open_child(component_root).map_err(tx)?))
-            } else {
-                Ok(None)
+    observe_validated(lease.root(), || {
+        lease.revalidate().map_err(tx)?;
+        let root = lease.root();
+        let component_root = component_lane_name(component);
+        let result = (|| match target {
+            ComponentCreatedAncestor::ComponentRoot => {
+                if root
+                    .has_portably_exact_child_name(component_root)
+                    .map_err(tx)?
+                {
+                    Ok(Some(root.open_child(component_root).map_err(tx)?))
+                } else {
+                    Ok(None)
+                }
             }
-        }
-        ComponentCreatedAncestor::Relative(path) => {
-            if !root
-                .has_portably_exact_child_name(component_root)
-                .map_err(tx)?
-            {
-                return Ok(None);
-            }
-            let mut current = root.open_child(component_root).map_err(tx)?;
-            for segment in path.as_str().split('/') {
-                if !current.has_portably_exact_child_name(segment).map_err(tx)? {
+            ComponentCreatedAncestor::Relative(path) => {
+                if !root
+                    .has_portably_exact_child_name(component_root)
+                    .map_err(tx)?
+                {
                     return Ok(None);
                 }
-                current = current.open_child(segment).map_err(tx)?;
+                let mut current = root.open_child(component_root).map_err(tx)?;
+                for segment in path.as_str().split('/') {
+                    if !current.has_portably_exact_child_name(segment).map_err(tx)? {
+                        return Ok(None);
+                    }
+                    current = current.open_child(segment).map_err(tx)?;
+                }
+                Ok(Some(current))
             }
-            Ok(Some(current))
-        }
-    })()?;
-    lease.revalidate().map_err(tx)?;
-    Ok(result)
+        })()?;
+        lease.revalidate().map_err(tx)?;
+        Ok(result)
+    })
 }
 
 fn admit_settlement_rows(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+    settlement: &ComponentSettlementRecord,
+) -> Result<SettlementRowsPlan, ComponentTransactionError> {
+    observe_validated(lease.root(), || {
+        admit_settlement_rows_in_window(lane, lease, settlement)
+    })
+}
+
+fn admit_settlement_rows_in_window(
     lane: &ComponentLane,
     lease: &ManagedRootPublicationLease,
     settlement: &ComponentSettlementRecord,
@@ -3828,6 +3970,7 @@ fn admit_settlement_rows(
         return Ok(SettlementRowsPlan { table_count: 0 });
     }
 
+    let mut parents = ComponentCanonicalParents::default();
     for shard_index in 0..table_count {
         let (shard, table_guard) =
             read_settlement_table_shard(lane, &settlement.intent, shard_index)?;
@@ -3855,6 +3998,8 @@ fn admit_settlement_rows(
                 lane.component,
                 row,
                 settlement.outcome.terminal,
+                &mut parents,
+                false,
             )?;
             let slot = component_slot_name(row_in_shard).map_err(tx)?;
             match settlement.outcome.terminal {
@@ -3875,11 +4020,13 @@ fn admit_settlement_rows(
             staging_directory.as_ref(),
             &expected_staging,
             is_current,
+            false,
         )?;
         let quarantine_files = validate_settlement_residue_bucket(
             quarantine_directory.as_ref(),
             &expected_quarantine,
             is_current,
+            false,
         )?;
         if !is_current
             && (staging_files != expected_staging.len()
@@ -3912,6 +4059,7 @@ fn validate_settlement_residue_bucket(
     directory: Option<&ManagedDir>,
     expected: &[(String, u64, [u8; 20])],
     allow_partial: bool,
+    reverify: bool,
 ) -> Result<usize, ComponentTransactionError> {
     let Some(directory) = directory else {
         return Ok(0);
@@ -3930,7 +4078,8 @@ fn validate_settlement_residue_bucket(
         return Err(ComponentTransactionError);
     }
     for (name, size, sha1) in expected.iter().take(prefix) {
-        let _ = exact_file(directory, name, *size, *sha1)?.ok_or(ComponentTransactionError)?;
+        let _ = exact_file(directory, name, *size, *sha1, reverify)?
+            .ok_or(ComponentTransactionError)?;
     }
     Ok(prefix)
 }
@@ -3962,22 +4111,33 @@ fn cleanup_one_settlement_row_shard(
     expected_quarantine
         .try_reserve_exact(shard.rows.len())
         .map_err(tx)?;
-    for (row_in_shard, row) in shard.rows.iter().enumerate() {
-        validate_settlement_canonical_row(lease, lane.component, row, settlement.outcome.terminal)?;
-        let slot = component_slot_name(row_in_shard).map_err(tx)?;
-        match settlement.outcome.terminal {
-            ComponentTerminalOutcome::Committed => {
-                if let Some(prior) = row.prior.as_ref().filter(|_| !row.prior_is_final()) {
-                    expected_quarantine.push((slot, prior.size, prior.sha1));
+    let mut parents = ComponentCanonicalParents::default();
+    observe_validated(lease.root(), || {
+        for (row_in_shard, row) in shard.rows.iter().enumerate() {
+            validate_settlement_canonical_row(
+                lease,
+                lane.component,
+                row,
+                settlement.outcome.terminal,
+                &mut parents,
+                true,
+            )?;
+            let slot = component_slot_name(row_in_shard).map_err(tx)?;
+            match settlement.outcome.terminal {
+                ComponentTerminalOutcome::Committed => {
+                    if let Some(prior) = row.prior.as_ref().filter(|_| !row.prior_is_final()) {
+                        expected_quarantine.push((slot, prior.size, prior.sha1));
+                    }
                 }
-            }
-            ComponentTerminalOutcome::RolledBack => {
-                if !row.prior_is_final() {
-                    expected_staging.push((slot, row.final_size, row.final_sha1));
+                ComponentTerminalOutcome::RolledBack => {
+                    if !row.prior_is_final() {
+                        expected_staging.push((slot, row.final_size, row.final_sha1));
+                    }
                 }
             }
         }
-    }
+        Ok(())
+    })?;
     cleanup_one_settlement_residue_bucket(
         &lane.staging,
         settlement.intent.shards.len(),
@@ -4026,10 +4186,10 @@ fn cleanup_one_settlement_residue_bucket(
     }
     if bucket_count == shard_index + 1 {
         let bucket = parent.open_child(bucket_name).map_err(tx)?;
-        let prefix = validate_settlement_residue_bucket(Some(&bucket), expected, true)?;
+        let prefix = validate_settlement_residue_bucket(Some(&bucket), expected, true, true)?;
         for (name, size, sha1) in expected.iter().take(prefix).rev() {
             let guard =
-                exact_file(&bucket, name, *size, *sha1)?.ok_or(ComponentTransactionError)?;
+                exact_file(&bucket, name, *size, *sha1, true)?.ok_or(ComponentTransactionError)?;
             bucket.remove_guarded_file(name, &guard).map_err(tx)?;
         }
         if parent
@@ -4054,14 +4214,40 @@ fn cleanup_one_settlement_residue_bucket(
     Ok(())
 }
 
+/// Admission hashes the canonical file in full; a later recheck of an admitted
+/// row may `reverify` against the admitted exact revision.
 fn validate_settlement_canonical_row(
     lease: &ManagedRootPublicationLease,
     component: ManagedComponentKind,
     row: &ComponentTableRow,
     terminal: ComponentTerminalOutcome,
+    parents: &mut ComponentCanonicalParents,
+    reverify: bool,
 ) -> Result<(), ComponentTransactionError> {
-    let plan = plan_component_canonical_path(lease.root(), component, &row.path).map_err(tx)?;
-    let observed = match plan.observe().map_err(tx)? {
+    observe_validated(lease.root(), || {
+        validate_settlement_canonical_row_in_window(
+            lease, component, row, terminal, parents, reverify,
+        )
+    })
+}
+
+fn validate_settlement_canonical_row_in_window(
+    lease: &ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+    row: &ComponentTableRow,
+    terminal: ComponentTerminalOutcome,
+    parents: &mut ComponentCanonicalParents,
+    reverify: bool,
+) -> Result<(), ComponentTransactionError> {
+    let plan = parents
+        .plan(lease.root(), component, &row.path)
+        .map_err(tx)?;
+    let observation = if reverify {
+        plan.reobserve()
+    } else {
+        plan.observe()
+    };
+    let observed = match observation.map_err(tx)? {
         ComponentCanonicalObservation::Absent => None,
         ComponentCanonicalObservation::Regular(file) => Some(file),
     };

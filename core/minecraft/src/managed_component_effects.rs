@@ -664,35 +664,64 @@ impl ComponentCanonicalPathPlan {
     }
 
     pub(crate) fn observe(&self) -> Result<ComponentCanonicalObservation, ComponentEffectsError> {
-        if let Some(first_missing) = self.remaining_parent_segments.first() {
-            if self
-                .creation_anchor
-                .has_portably_exact_child_name(first_missing)?
-            {
-                return Err(ComponentEffectsError::Topology);
-            }
-            return Ok(ComponentCanonicalObservation::Absent);
-        }
-        let parent = &self.creation_anchor;
-        let _ = parent.has_portably_exact_child_name(&self.file_name)?;
-        let Some(guard) = parent.inspect_regular_file(&self.file_name)? else {
-            return Ok(ComponentCanonicalObservation::Absent);
-        };
-        let size = guard.size();
-        if size > MAX_TIER2_ARTIFACT_BYTES {
-            return Err(ComponentEffectsError::Topology);
-        }
-        let sha1 =
-            parent.sha1_guarded_file_bytes(&self.file_name, &guard, MAX_TIER2_ARTIFACT_BYTES)?;
-        Ok(ComponentCanonicalObservation::Regular(
-            ComponentObservedFile {
-                parent: parent.clone(),
-                file_name: self.file_name.clone(),
-                guard,
-                size,
-                sha1,
+        self.observe_hashing(false)
+    }
+
+    /// Observes the canonical file, reusing this process's earlier full hash
+    /// while the file keeps its exact hashed revision.
+    pub(crate) fn reobserve(&self) -> Result<ComponentCanonicalObservation, ComponentEffectsError> {
+        self.observe_hashing(true)
+    }
+
+    fn observe_hashing(
+        &self,
+        reverify: bool,
+    ) -> Result<ComponentCanonicalObservation, ComponentEffectsError> {
+        self.creation_anchor.observe_validated(
+            || {
+                if let Some(first_missing) = self.remaining_parent_segments.first() {
+                    if self
+                        .creation_anchor
+                        .has_portably_exact_child_name(first_missing)?
+                    {
+                        return Err(ComponentEffectsError::Topology);
+                    }
+                    return Ok(ComponentCanonicalObservation::Absent);
+                }
+                let parent = &self.creation_anchor;
+                let _ = parent.has_portably_exact_child_name(&self.file_name)?;
+                let Some(guard) = parent.inspect_regular_file(&self.file_name)? else {
+                    return Ok(ComponentCanonicalObservation::Absent);
+                };
+                let size = guard.size();
+                if size > MAX_TIER2_ARTIFACT_BYTES {
+                    return Err(ComponentEffectsError::Topology);
+                }
+                let sha1 = if reverify {
+                    parent.sha1_reverified_file_bytes(
+                        &self.file_name,
+                        &guard,
+                        MAX_TIER2_ARTIFACT_BYTES,
+                    )?
+                } else {
+                    parent.sha1_guarded_file_bytes(
+                        &self.file_name,
+                        &guard,
+                        MAX_TIER2_ARTIFACT_BYTES,
+                    )?
+                };
+                Ok(ComponentCanonicalObservation::Regular(
+                    ComponentObservedFile {
+                        parent: parent.clone(),
+                        file_name: self.file_name.clone(),
+                        guard,
+                        size,
+                        sha1,
+                    },
+                ))
             },
-        ))
+            ComponentEffectsError::from,
+        )
     }
 
     pub(crate) fn observe_prepared(
@@ -758,70 +787,123 @@ impl ComponentObservedFile {
     }
 }
 
+/// Plans one pass over path-sorted rows, reusing the previous row's existing
+/// canonical parent instead of reopening and relisting its ancestry. Each
+/// reuse still revalidates the parent's binding and lists it for the leaf's
+/// portable aliases; ancestor alias checks run once per parent per pass.
+/// A pass using it must not create, move or remove canonical directories.
+#[derive(Default)]
+pub(crate) struct ComponentCanonicalParents {
+    last: Option<(String, ManagedDir)>,
+}
+
+impl ComponentCanonicalParents {
+    pub(crate) fn plan(
+        &mut self,
+        root: &ManagedDir,
+        component: ManagedComponentKind,
+        relative: &PortableRelativePath,
+    ) -> Result<ComponentCanonicalPathPlan, ComponentEffectsError> {
+        let (parent_path, file_name) = relative
+            .as_str()
+            .rsplit_once('/')
+            .unwrap_or(("", relative.as_str()));
+        if let Some((last_path, parent)) = &self.last
+            && last_path == parent_path
+        {
+            let file_name = copy_bounded_string(file_name)?;
+            // Reject a portable alias during planning; observation repeats the check.
+            let _ = parent.has_portably_exact_child_name(&file_name)?;
+            return Ok(ComponentCanonicalPathPlan {
+                creation_anchor: parent.clone(),
+                remaining_parent_segments: Vec::new(),
+                file_name,
+                first_created_depth: None,
+            });
+        }
+        self.last = None;
+        let plan = plan_component_canonical_path(root, component, relative)?;
+        if plan.first_created_depth.is_none() {
+            self.last = Some((
+                copy_bounded_string(parent_path)?,
+                plan.creation_anchor.clone(),
+            ));
+        }
+        Ok(plan)
+    }
+}
+
 pub(crate) fn plan_component_canonical_path(
     root: &ManagedDir,
     component: ManagedComponentKind,
     relative: &PortableRelativePath,
 ) -> Result<ComponentCanonicalPathPlan, ComponentEffectsError> {
-    root.revalidate()?;
-    let segment_count = relative.as_str().split('/').count();
-    let mut segments = Vec::new();
-    segments
-        .try_reserve_exact(segment_count)
-        .map_err(|_| ComponentEffectsError::Topology)?;
-    segments.extend(relative.as_str().split('/'));
-    let file_name = copy_bounded_string(segments.pop().ok_or(ComponentEffectsError::Topology)?)?;
-    let component_root_name = component_lane_name(component);
-    if !root.has_portably_exact_child_name(component_root_name)? {
-        let parent_count = segments
-            .len()
-            .checked_add(1)
-            .ok_or(ComponentEffectsError::Topology)?;
-        let mut remaining_parent_segments = Vec::new();
-        remaining_parent_segments
-            .try_reserve_exact(parent_count)
-            .map_err(|_| ComponentEffectsError::Topology)?;
-        remaining_parent_segments.push(copy_bounded_string(component_root_name)?);
-        for segment in segments {
-            remaining_parent_segments.push(copy_bounded_string(segment)?);
-        }
-        return Ok(ComponentCanonicalPathPlan {
-            creation_anchor: root.clone(),
-            remaining_parent_segments,
-            file_name,
-            first_created_depth: Some(0),
-        });
-    }
-
-    let mut parent = root.open_child(component_root_name)?;
-    for (index, segment) in segments.iter().copied().enumerate() {
-        if !parent.has_portably_exact_child_name(segment)? {
-            let mut remaining_parent_segments = Vec::new();
-            remaining_parent_segments
-                .try_reserve_exact(segments.len() - index)
+    root.observe_validated(
+        || {
+            root.revalidate()?;
+            let segment_count = relative.as_str().split('/').count();
+            let mut segments = Vec::new();
+            segments
+                .try_reserve_exact(segment_count)
                 .map_err(|_| ComponentEffectsError::Topology)?;
-            for missing in &segments[index..] {
-                remaining_parent_segments.push(copy_bounded_string(missing)?);
+            segments.extend(relative.as_str().split('/'));
+            let file_name =
+                copy_bounded_string(segments.pop().ok_or(ComponentEffectsError::Topology)?)?;
+            let component_root_name = component_lane_name(component);
+            if !root.has_portably_exact_child_name(component_root_name)? {
+                let parent_count = segments
+                    .len()
+                    .checked_add(1)
+                    .ok_or(ComponentEffectsError::Topology)?;
+                let mut remaining_parent_segments = Vec::new();
+                remaining_parent_segments
+                    .try_reserve_exact(parent_count)
+                    .map_err(|_| ComponentEffectsError::Topology)?;
+                remaining_parent_segments.push(copy_bounded_string(component_root_name)?);
+                for segment in segments {
+                    remaining_parent_segments.push(copy_bounded_string(segment)?);
+                }
+                return Ok(ComponentCanonicalPathPlan {
+                    creation_anchor: root.clone(),
+                    remaining_parent_segments,
+                    file_name,
+                    first_created_depth: Some(0),
+                });
             }
-            return Ok(ComponentCanonicalPathPlan {
+
+            let mut parent = root.open_child(component_root_name)?;
+            for (index, segment) in segments.iter().copied().enumerate() {
+                if !parent.has_portably_exact_child_name(segment)? {
+                    let mut remaining_parent_segments = Vec::new();
+                    remaining_parent_segments
+                        .try_reserve_exact(segments.len() - index)
+                        .map_err(|_| ComponentEffectsError::Topology)?;
+                    for missing in &segments[index..] {
+                        remaining_parent_segments.push(copy_bounded_string(missing)?);
+                    }
+                    return Ok(ComponentCanonicalPathPlan {
+                        creation_anchor: parent,
+                        remaining_parent_segments,
+                        file_name,
+                        first_created_depth: Some(
+                            u16::try_from(index + 1)
+                                .map_err(|_| ComponentEffectsError::Topology)?,
+                        ),
+                    });
+                }
+                parent = parent.open_child(segment)?;
+            }
+            // Reject a portable alias during planning; observation repeats the check.
+            let _ = parent.has_portably_exact_child_name(&file_name)?;
+            Ok(ComponentCanonicalPathPlan {
                 creation_anchor: parent,
-                remaining_parent_segments,
+                remaining_parent_segments: Vec::new(),
                 file_name,
-                first_created_depth: Some(
-                    u16::try_from(index + 1).map_err(|_| ComponentEffectsError::Topology)?,
-                ),
-            });
-        }
-        parent = parent.open_child(segment)?;
-    }
-    // Reject a portable alias during planning; observation repeats the check.
-    let _ = parent.has_portably_exact_child_name(&file_name)?;
-    Ok(ComponentCanonicalPathPlan {
-        creation_anchor: parent,
-        remaining_parent_segments: Vec::new(),
-        file_name,
-        first_created_depth: None,
-    })
+                first_created_depth: None,
+            })
+        },
+        ComponentEffectsError::from,
+    )
 }
 
 fn admit_component_preintent(
@@ -829,118 +911,125 @@ fn admit_component_preintent(
     lease: &ManagedRootPublicationLease,
     manifest: &ComponentIntentManifest,
 ) -> Result<(ComponentTableSummary, ComponentPreintentAuthority), ComponentEffectsError> {
-    lease.revalidate()?;
-    if manifest.component != lane.component {
-        return Err(ComponentEffectsError::Topology);
-    }
-    let expected_lane = BTreeSet::from([
-        COMPONENT_ANCESTORS_DIRECTORY.to_string(),
-        COMPONENT_QUARANTINE_DIRECTORY.to_string(),
-        COMPONENT_STAGING_DIRECTORY.to_string(),
-        COMPONENT_TABLE_DIRECTORY.to_string(),
-    ]);
-    if exact_entry_names(&lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1)? != expected_lane {
-        return Err(ComponentEffectsError::Topology);
-    }
-    validate_empty_ancestor_topology(lane)?;
-    validate_indexed_names(
-        &lane.table,
-        manifest.shards.len(),
-        MAX_COMPONENT_TABLE_SHARDS,
-        component_table_file_name,
-    )?;
-    validate_indexed_names(
-        &lane.staging,
-        manifest.shards.len(),
-        MAX_COMPONENT_TABLE_SHARDS,
-        component_bucket_name,
-    )?;
-    validate_indexed_names(
-        &lane.quarantine,
-        manifest.shards.len(),
-        MAX_COMPONENT_TABLE_SHARDS,
-        component_bucket_name,
-    )?;
-
-    let mut parser = ComponentTableParser::new(manifest.clone())?;
-    let mut shard_authority = Vec::new();
-    shard_authority
-        .try_reserve_exact(manifest.shards.len())
-        .map_err(|_| ComponentEffectsError::Topology)?;
-    for (shard_index, descriptor) in manifest.shards.iter().enumerate() {
-        let table_name = component_table_file_name(shard_index)?;
-        let table_guard = lane
-            .table
-            .inspect_regular_file(&table_name)?
-            .ok_or(ComponentEffectsError::Topology)?;
-        if table_guard.size() != u64::from(descriptor.byte_len)
-            || table_guard.size() > MAX_COMPONENT_TABLE_SHARD_BYTES as u64
-        {
-            return Err(ComponentEffectsError::Topology);
-        }
-        let encoded = lane.table.read_guarded_file_bounded(
-            &table_name,
-            &table_guard,
-            MAX_COMPONENT_TABLE_SHARD_BYTES as u64,
-        )?;
-        let shard = parser.parse_next(&encoded)?;
-        let table_identity = table_guard.passive_revision();
-        drop(table_guard);
-
-        let bucket_name = component_bucket_name(shard_index)?;
-        let staging = lane.staging.open_child(&bucket_name)?;
-        let quarantine = lane.quarantine.open_child(&bucket_name)?;
-        let staging_identity = staging.identity()?;
-        let quarantine_identity = quarantine.identity()?;
-        let staging_names = exact_entry_names(&staging, 257)?;
-        if !exact_entry_names(&quarantine, 1)?.is_empty() {
-            return Err(ComponentEffectsError::Topology);
-        }
-        let mut expected_staged = 0_usize;
-        let mut row_authority = Vec::new();
-        row_authority
-            .try_reserve_exact(shard.rows.len())
-            .map_err(|_| ComponentEffectsError::Topology)?;
-        for (row_index, row) in shard.rows.iter().enumerate() {
-            row_authority.push(admit_component_preintent_row(
-                lease.root(),
-                lane.component,
-                row,
-                &staging,
-                &staging_names,
-                row_index,
-            )?);
-            if !row.prior_is_final() {
-                expected_staged += 1;
+    lease.root().observe_validated(
+        || {
+            lease.revalidate()?;
+            if manifest.component != lane.component {
+                return Err(ComponentEffectsError::Topology);
             }
-        }
-        if staging_names.len() != expected_staged {
-            return Err(ComponentEffectsError::Topology);
-        }
-        shard_authority.push(ComponentPreintentShardAuthority {
-            table: table_identity,
-            staging: staging_identity,
-            quarantine: quarantine_identity,
-            rows: row_authority,
-        });
-    }
-    let summary = parser.finish()?;
-    lease.revalidate()?;
-    Ok((
-        summary,
-        ComponentPreintentAuthority {
-            root: lease.root().identity()?,
-            publication: lease.publication_directory().identity()?,
-            lane: lane.lane.identity()?,
-            table: lane.table.identity()?,
-            staging: lane.staging.identity()?,
-            quarantine: lane.quarantine.identity()?,
-            ancestors: lane.ancestors.identity()?,
-            ancestor_records: lane.ancestor_records.identity()?,
-            ancestor_staging: lane.ancestor_staging.identity()?,
-            shards: shard_authority,
+            let expected_lane = BTreeSet::from([
+                COMPONENT_ANCESTORS_DIRECTORY.to_string(),
+                COMPONENT_QUARANTINE_DIRECTORY.to_string(),
+                COMPONENT_STAGING_DIRECTORY.to_string(),
+                COMPONENT_TABLE_DIRECTORY.to_string(),
+            ]);
+            if exact_entry_names(&lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1)? != expected_lane {
+                return Err(ComponentEffectsError::Topology);
+            }
+            validate_empty_ancestor_topology(lane)?;
+            validate_indexed_names(
+                &lane.table,
+                manifest.shards.len(),
+                MAX_COMPONENT_TABLE_SHARDS,
+                component_table_file_name,
+            )?;
+            validate_indexed_names(
+                &lane.staging,
+                manifest.shards.len(),
+                MAX_COMPONENT_TABLE_SHARDS,
+                component_bucket_name,
+            )?;
+            validate_indexed_names(
+                &lane.quarantine,
+                manifest.shards.len(),
+                MAX_COMPONENT_TABLE_SHARDS,
+                component_bucket_name,
+            )?;
+
+            let mut parser = ComponentTableParser::new(manifest.clone())?;
+            let mut parents = ComponentCanonicalParents::default();
+            let mut shard_authority = Vec::new();
+            shard_authority
+                .try_reserve_exact(manifest.shards.len())
+                .map_err(|_| ComponentEffectsError::Topology)?;
+            for (shard_index, descriptor) in manifest.shards.iter().enumerate() {
+                let table_name = component_table_file_name(shard_index)?;
+                let table_guard = lane
+                    .table
+                    .inspect_regular_file(&table_name)?
+                    .ok_or(ComponentEffectsError::Topology)?;
+                if table_guard.size() != u64::from(descriptor.byte_len)
+                    || table_guard.size() > MAX_COMPONENT_TABLE_SHARD_BYTES as u64
+                {
+                    return Err(ComponentEffectsError::Topology);
+                }
+                let encoded = lane.table.read_guarded_file_bounded(
+                    &table_name,
+                    &table_guard,
+                    MAX_COMPONENT_TABLE_SHARD_BYTES as u64,
+                )?;
+                let shard = parser.parse_next(&encoded)?;
+                let table_identity = table_guard.passive_revision();
+                drop(table_guard);
+
+                let bucket_name = component_bucket_name(shard_index)?;
+                let staging = lane.staging.open_child(&bucket_name)?;
+                let quarantine = lane.quarantine.open_child(&bucket_name)?;
+                let staging_identity = staging.identity()?;
+                let quarantine_identity = quarantine.identity()?;
+                let staging_names = exact_entry_names(&staging, 257)?;
+                if !exact_entry_names(&quarantine, 1)?.is_empty() {
+                    return Err(ComponentEffectsError::Topology);
+                }
+                let mut expected_staged = 0_usize;
+                let mut row_authority = Vec::new();
+                row_authority
+                    .try_reserve_exact(shard.rows.len())
+                    .map_err(|_| ComponentEffectsError::Topology)?;
+                for (row_index, row) in shard.rows.iter().enumerate() {
+                    row_authority.push(admit_component_preintent_row(
+                        lease.root(),
+                        lane.component,
+                        row,
+                        &staging,
+                        &staging_names,
+                        row_index,
+                        &mut parents,
+                    )?);
+                    if !row.prior_is_final() {
+                        expected_staged += 1;
+                    }
+                }
+                if staging_names.len() != expected_staged {
+                    return Err(ComponentEffectsError::Topology);
+                }
+                shard_authority.push(ComponentPreintentShardAuthority {
+                    table: table_identity,
+                    staging: staging_identity,
+                    quarantine: quarantine_identity,
+                    rows: row_authority,
+                });
+            }
+            let summary = parser.finish()?;
+            lease.revalidate()?;
+            Ok((
+                summary,
+                ComponentPreintentAuthority {
+                    root: lease.root().identity()?,
+                    publication: lease.publication_directory().identity()?,
+                    lane: lane.lane.identity()?,
+                    table: lane.table.identity()?,
+                    staging: lane.staging.identity()?,
+                    quarantine: lane.quarantine.identity()?,
+                    ancestors: lane.ancestors.identity()?,
+                    ancestor_records: lane.ancestor_records.identity()?,
+                    ancestor_staging: lane.ancestor_staging.identity()?,
+                    shards: shard_authority,
+                },
+            ))
         },
-    ))
+        ComponentEffectsError::from,
+    )
 }
 
 fn admit_component_preintent_row(
@@ -950,6 +1039,7 @@ fn admit_component_preintent_row(
     staging: &ManagedDir,
     staging_names: &BTreeSet<String>,
     row_index: usize,
+    parents: &mut ComponentCanonicalParents,
 ) -> Result<ComponentPreintentRowAuthority, ComponentEffectsError> {
     let slot_name = component_slot_name(row_index)?;
     let staged = staging_names.contains(&slot_name);
@@ -974,7 +1064,7 @@ fn admit_component_preintent_row(
         staging_identity = Some(guard.passive_revision());
     }
 
-    let canonical = plan_component_canonical_path(root, component, &row.path)?;
+    let canonical = parents.plan(root, component, &row.path)?;
     if canonical.first_created_depth() != row.first_created_depth {
         return Err(ComponentEffectsError::Topology);
     }
