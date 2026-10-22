@@ -6159,20 +6159,30 @@ mod native {
     }
 
     fn opened_file_path(file: &File) -> io::Result<PathBuf> {
+        // Most paths fit the stack buffer; any refusal retries with the full bound.
+        let mut short = [0_u64; 2 * 1024 / size_of::<u64>()];
+        if let Ok(path) = opened_file_path_in(file, &mut short) {
+            return Ok(path);
+        }
+        const BUFFER_BYTES: usize = 128 * 1024;
+        let mut storage = vec![0_u64; BUFFER_BYTES / size_of::<u64>()];
+        opened_file_path_in(file, &mut storage)
+    }
+
+    fn opened_file_path_in(file: &File, storage: &mut [u64]) -> io::Result<PathBuf> {
         #[repr(C)]
         struct FileNameInformation {
             length: u32,
             name: [u16; 1],
         }
 
-        const BUFFER_BYTES: usize = 128 * 1024;
-        let mut storage = vec![0_u64; BUFFER_BYTES / size_of::<u64>()];
+        let buffer_bytes = std::mem::size_of_val(storage);
         let success = unsafe {
             GetFileInformationByHandleEx(
                 file.as_raw_handle(),
                 FileNameInfo,
                 storage.as_mut_ptr().cast(),
-                BUFFER_BYTES as u32,
+                buffer_bytes as u32,
             )
         };
         if success == 0 {
@@ -6184,7 +6194,7 @@ mod native {
         if !name_bytes.is_multiple_of(size_of::<u16>())
             || fixed
                 .checked_add(name_bytes)
-                .is_none_or(|extent| extent > BUFFER_BYTES)
+                .is_none_or(|extent| extent > buffer_bytes)
         {
             return Err(malformed_directory());
         }

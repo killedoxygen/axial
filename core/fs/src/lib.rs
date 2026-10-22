@@ -26,7 +26,7 @@ pub use transient::{
 };
 
 use std::borrow::Borrow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -344,7 +344,7 @@ impl DirectoryCreatePreservation {
             Some(authority) => authority,
             None => return Err(self),
         };
-        let operation = match authority.enter() {
+        let operation = match authority.enter_directory_rebinding() {
             Ok(operation) => operation,
             Err(_) => return Err(self),
         };
@@ -402,7 +402,7 @@ impl DirectoryCreateObligation {
             Some(authority) => authority,
             None => return DirectoryCreateResolution::Indeterminate(self),
         };
-        let operation = match authority.enter() {
+        let operation = match authority.enter_directory_rebinding() {
             Ok(operation) => operation,
             Err(_) => return DirectoryCreateResolution::Indeterminate(self),
         };
@@ -2768,6 +2768,181 @@ const MAX_EFFECTS_PER_OWNER: usize = 256;
 thread_local! {
     static TERMINAL_EFFECT_SETTLEMENT_AUTHORITY: Cell<Option<(usize, u64)>> =
         const { Cell::new(None) };
+}
+
+/// Retained directories validated during one observation window. Bounded so a
+/// window cannot pin unbounded handles; overflow confirms and evicts the cache.
+const MAX_OBSERVATION_WINDOW_DIRECTORIES: usize = 64;
+/// Concurrently open windows per thread, one per authority. Further nested
+/// observations of other authorities keep per-entry validation.
+const MAX_OBSERVATION_WINDOW_AUTHORITIES: usize = 4;
+
+thread_local! {
+    static OBSERVATION_WINDOWS: RefCell<Vec<ObservationWindow>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One thread's bracketed read-only observations of one authority. Every
+/// directory an observation relies on, and the root and lease, are validated
+/// again after that observation: when the window closes, when it overflows and
+/// before any non-observation entry. A cached directory is therefore never
+/// relied on for an effect or a returned result without later revalidation.
+struct ObservationWindow {
+    authority: usize,
+    /// Lease and root were validated since the window opened or was confirmed.
+    root_validated: bool,
+    /// An observation relied on the window since it opened or was confirmed.
+    observed: bool,
+    /// A confirmation refused; the window closes with an error.
+    failed: bool,
+    /// Ancestor-closed: each entry's parent is cached too, or it has none.
+    directories: Vec<ObservedDirectory>,
+}
+
+struct ObservedDirectory {
+    directory: Arc<DirectoryInner>,
+    /// Relied on since the last confirmation, so it must be validated again.
+    observed: bool,
+}
+
+impl ObservationWindow {
+    fn position(&self, directory: &Arc<DirectoryInner>) -> Option<usize> {
+        self.directories
+            .iter()
+            .position(|cached| Arc::ptr_eq(&cached.directory, directory))
+    }
+
+    /// Marks a cached directory and its cached ancestors as relied on.
+    fn observe_cached(&mut self, mut index: usize) {
+        loop {
+            let cached = &mut self.directories[index];
+            if cached.observed {
+                return;
+            }
+            cached.observed = true;
+            let Some(binding) = &cached.directory.parent else {
+                return;
+            };
+            let parent = binding.directory.inner.clone();
+            match self.position(&parent) {
+                Some(next) => index = next,
+                None => return,
+            }
+        }
+    }
+
+    /// Takes the directories that need validation and clears their marks.
+    fn take_observed(&mut self) -> Vec<Arc<DirectoryInner>> {
+        self.observed = false;
+        self.directories
+            .iter_mut()
+            .filter_map(|cached| {
+                std::mem::take(&mut cached.observed).then(|| cached.directory.clone())
+            })
+            .collect()
+    }
+}
+
+struct ObservationWindowScope {
+    authority: usize,
+}
+
+impl Drop for ObservationWindowScope {
+    fn drop(&mut self) {
+        let window = OBSERVATION_WINDOWS.with(|windows| {
+            let mut windows = windows.borrow_mut();
+            windows
+                .iter()
+                .position(|window| window.authority == self.authority)
+                .map(|index| windows.swap_remove(index))
+        });
+        drop(window);
+    }
+}
+
+fn with_observation_window<T>(
+    authority: &Arc<CapabilityAuthority>,
+    use_window: impl FnOnce(&mut ObservationWindow) -> T,
+) -> Option<T> {
+    let key = Arc::as_ptr(authority) as usize;
+    OBSERVATION_WINDOWS.with(|windows| {
+        windows
+            .borrow_mut()
+            .iter_mut()
+            .find(|window| window.authority == key)
+            .map(use_window)
+    })
+}
+
+/// Validates the directories observed since the window's last confirmation.
+/// The caller validates the lease and root itself. Discarding also releases
+/// every cached directory handle.
+fn confirm_observation_window(
+    authority: &Arc<CapabilityAuthority>,
+    discard: bool,
+) -> io::Result<()> {
+    let Some((observed, discarded)) = with_observation_window(authority, |window| {
+        let observed = window.take_observed();
+        window.root_validated = !discard;
+        let discarded = if discard {
+            std::mem::take(&mut window.directories)
+        } else {
+            Vec::new()
+        };
+        (observed, discarded)
+    }) else {
+        return Ok(());
+    };
+    drop(discarded);
+    validate_window_directories(authority, &observed)
+        .inspect_err(|_| fail_observation_window(authority))
+}
+
+/// Records a refused confirmation so the window cannot close as validated.
+fn fail_observation_window(authority: &Arc<CapabilityAuthority>) {
+    with_observation_window(authority, |window| {
+        window.failed = true;
+        window.root_validated = false;
+    });
+}
+
+fn validate_window_directories(
+    authority: &Arc<CapabilityAuthority>,
+    directories: &[Arc<DirectoryInner>],
+) -> io::Result<()> {
+    for directory in directories {
+        validate_directory_level(directory, authority)?;
+    }
+    Ok(())
+}
+
+fn validate_directory_level(
+    directory: &DirectoryInner,
+    authority: &Arc<CapabilityAuthority>,
+) -> io::Result<()> {
+    #[cfg(test)]
+    authority
+        .ancestry_steps
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if directory.authority.as_ptr() != Arc::as_ptr(authority) {
+        return Err(stale_capability());
+    }
+    let identity = match &directory.storage {
+        DirectoryStorage::Owned(handle) => platform::directory_identity(handle)?,
+        DirectoryStorage::Absolute(guard) => platform::validate_absolute_directory_guard(guard)?,
+    };
+    if identity != directory.identity.physical {
+        return Err(identity_changed("directory capability changed identity"));
+    }
+    if let Some(binding) = &directory.parent
+        && platform::directory_binding_state(
+            binding.directory.inner.handle(),
+            &binding.name,
+            directory.identity.physical,
+        )? != platform::BindingState::Exact
+    {
+        return Err(identity_changed("directory capability changed binding"));
+    }
+    Ok(())
 }
 
 struct TerminalEffectSettlementScope {
@@ -5208,6 +5383,59 @@ impl CapabilityAuthority {
     }
 
     fn enter(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
+        let operation = self.admit_operation()?;
+        self.validate_entry(false)?;
+        #[cfg(test)]
+        self.successful_entries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(operation)
+    }
+
+    /// Enters an effect that may move, park, restore or remove a directory.
+    fn enter_directory_rebinding(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
+        let operation = self.admit_operation()?;
+        self.validate_entry(true)?;
+        #[cfg(test)]
+        self.successful_entries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(operation)
+    }
+
+    /// Enters a read-only observation. Inside this thread's observation window
+    /// for this authority, the window's bracketing root and lease validation
+    /// replaces the per-entry validation.
+    fn enter_observation(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
+        let Some(root_validated) = with_observation_window(self, |window| window.root_validated)
+        else {
+            return self.enter();
+        };
+        let mut operation = self.admit_operation()?;
+        if !root_validated {
+            platform::validate_lease(&self.lease)?;
+            platform::validate_root(&self.root)?;
+        }
+        with_observation_window(self, |window| {
+            window.root_validated = true;
+            window.observed = true;
+        });
+        operation.windowed = true;
+        #[cfg(test)]
+        self.successful_entries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(operation)
+    }
+
+    /// Revalidates the lease and root after a sample; a window defers this to
+    /// its closing validation, which follows every observation it admitted.
+    fn validate_after_observation(&self, operation: &CapabilityOperation) -> io::Result<()> {
+        if operation.windowed {
+            return Ok(());
+        }
+        platform::validate_lease(&self.lease)?;
+        platform::validate_root(&self.root)
+    }
+
+    fn admit_operation(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
         let mut state = self
             .operations
             .lock()
@@ -5225,16 +5453,22 @@ impl CapabilityAuthority {
             .active
             .checked_add(1)
             .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
-        let operation = CapabilityOperation {
+        Ok(CapabilityOperation {
             authority: self.clone(),
-        };
-        drop(state);
-        platform::validate_lease(&self.lease)?;
-        platform::validate_root(&self.root)?;
-        #[cfg(test)]
-        self.successful_entries
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(operation)
+            windowed: false,
+        })
+    }
+
+    /// Validates the root and lease for a non-observation entry and confirms
+    /// this thread's observation window before any effect relies on it. File
+    /// effects keep the confirmed directories; a directory rebinding entry
+    /// discards them so the window retains no handle to a moved or removed
+    /// directory.
+    fn validate_entry(self: &Arc<Self>, rebinding: bool) -> io::Result<()> {
+        platform::validate_lease(&self.lease)
+            .and_then(|()| platform::validate_root(&self.root))
+            .and_then(|()| confirm_observation_window(self, rebinding))
+            .inspect_err(|_| fail_observation_window(self))
     }
 
     fn enter_effect_settlement(
@@ -5266,10 +5500,10 @@ impl CapabilityAuthority {
             .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
         let operation = CapabilityOperation {
             authority: self.clone(),
+            windowed: false,
         };
         drop(state);
-        platform::validate_lease(&self.lease)?;
-        platform::validate_root(&self.root)?;
+        self.validate_entry(true)?;
         Ok(operation)
     }
 
@@ -5287,10 +5521,10 @@ impl CapabilityAuthority {
             .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
         let operation = CapabilityOperation {
             authority: self.clone(),
+            windowed: false,
         };
         drop(state);
-        platform::validate_lease(&self.lease)?;
-        platform::validate_root(&self.root)?;
+        self.validate_entry(true)?;
         Ok(operation)
     }
 
@@ -5478,10 +5712,10 @@ impl CapabilityAuthority {
             .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
         let operation = CapabilityOperation {
             authority: self.clone(),
+            windowed: false,
         };
         drop(state);
-        platform::validate_lease(&self.lease)?;
-        platform::validate_root(&self.root)?;
+        self.validate_entry(false)?;
         Ok(operation)
     }
 
@@ -5511,10 +5745,10 @@ impl CapabilityAuthority {
             .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
         let operation = CapabilityOperation {
             authority: self.clone(),
+            windowed: false,
         };
         drop(state);
-        platform::validate_lease(&self.lease)?;
-        platform::validate_root(&self.root)?;
+        self.validate_entry(false)?;
         Ok(operation)
     }
 
@@ -5543,10 +5777,10 @@ impl CapabilityAuthority {
             .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
         let operation = CapabilityOperation {
             authority: self.clone(),
+            windowed: false,
         };
         drop(state);
-        platform::validate_lease(&self.lease)?;
-        platform::validate_root(&self.root)?;
+        self.validate_entry(true)?;
         Ok(operation)
     }
 
@@ -5576,10 +5810,10 @@ impl CapabilityAuthority {
             .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
         let operation = CapabilityOperation {
             authority: self.clone(),
+            windowed: false,
         };
         drop(state);
-        platform::validate_lease(&self.lease)?;
-        platform::validate_root(&self.root)?;
+        self.validate_entry(true)?;
         Ok(operation)
     }
 
@@ -5611,10 +5845,10 @@ impl CapabilityAuthority {
             .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
         let operation = CapabilityOperation {
             authority: self.clone(),
+            windowed: false,
         };
         drop(state);
-        platform::validate_lease(&self.lease)?;
-        platform::validate_root(&self.root)?;
+        self.validate_entry(true)?;
         Ok(operation)
     }
 
@@ -5680,6 +5914,7 @@ impl CapabilityAuthority {
             .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
         Ok(CapabilityOperation {
             authority: self.clone(),
+            windowed: false,
         })
     }
 
@@ -6898,6 +7133,7 @@ impl CapabilityAuthority {
                 record,
                 CapabilityOperation {
                     authority: self.clone(),
+                    windowed: false,
                 },
             )
         };
@@ -7111,6 +7347,7 @@ impl CapabilityAuthority {
                 record,
                 CapabilityOperation {
                     authority: self.clone(),
+                    windowed: false,
                 },
             )
         };
@@ -7241,6 +7478,7 @@ impl CapabilityAuthority {
                 record,
                 CapabilityOperation {
                     authority: self.clone(),
+                    windowed: false,
                 },
             )
         };
@@ -8003,6 +8241,7 @@ impl OperationState {
 
 struct CapabilityOperation {
     authority: Arc<CapabilityAuthority>,
+    windowed: bool,
 }
 
 impl Drop for CapabilityOperation {
@@ -8211,9 +8450,17 @@ impl AdmittedAbsoluteDirectory {
         self.inner.directory.validate(&operation)
     }
 
+    /// Runs `observe` in this admission's observation window; see
+    /// [`Directory::observe_validated`].
+    pub fn observe_validated<T>(&self, observe: impl FnOnce() -> T) -> io::Result<T> {
+        self.inner.directory.observe_validated(observe)
+    }
+
     pub fn filesystem_identity(&self) -> io::Result<DirectoryFilesystemIdentity> {
         let identity = self.inner.directory.identity()?.filesystem_identity();
-        self.revalidate()?;
+        let authority = self.inner.directory.authority()?;
+        let operation = authority.enter_observation()?;
+        self.inner.directory.validate(&operation)?;
         Ok(identity)
     }
 
@@ -9473,7 +9720,7 @@ impl Directory {
                 };
             }
         };
-        let operation = match authority.enter() {
+        let operation = match authority.enter_directory_rebinding() {
             Ok(operation) => operation,
             Err(error) => {
                 return DirectoryMoveOutcome::NoEffect {
@@ -9635,7 +9882,7 @@ impl Directory {
                 };
             }
         };
-        let operation = match authority.enter() {
+        let operation = match authority.enter_directory_rebinding() {
             Ok(operation) => operation,
             Err(error) => {
                 return DirectoryParkOutcome::NoEffect {
@@ -9758,42 +10005,117 @@ impl Directory {
     }
 
     fn validate(&self, operation: &CapabilityOperation) -> io::Result<()> {
+        if operation.windowed
+            && let Some(result) = self.validate_in_observation_window(&operation.authority)
+        {
+            return result;
+        }
         self.validate_for_authority(&operation.authority)
     }
 
     fn validate_for_authority(&self, authority: &Arc<CapabilityAuthority>) -> io::Result<()> {
         let mut current = self.inner.as_ref();
         loop {
-            #[cfg(test)]
-            authority
-                .ancestry_steps
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if current.authority.as_ptr() != Arc::as_ptr(authority) {
-                return Err(stale_capability());
-            }
-            let identity = match &current.storage {
-                DirectoryStorage::Owned(handle) => platform::directory_identity(handle)?,
-                DirectoryStorage::Absolute(guard) => {
-                    platform::validate_absolute_directory_guard(guard)?
-                }
-            };
-            if identity != current.identity.physical {
-                return Err(identity_changed("directory capability changed identity"));
-            }
+            validate_directory_level(current, authority)?;
             let Some(binding) = &current.parent else {
                 break;
             };
-            if platform::directory_binding_state(
-                binding.directory.inner.handle(),
-                &binding.name,
-                current.identity.physical,
-            )? != platform::BindingState::Exact
-            {
-                return Err(identity_changed("directory capability changed binding"));
-            }
             current = binding.directory.inner.as_ref();
         }
         Ok(())
+    }
+
+    /// Validates levels up to the first directory already validated in this
+    /// thread's window, then caches the walked chain when it fits. Returns
+    /// `None` unless this thread's window for `authority` has validated the root.
+    fn validate_in_observation_window(
+        &self,
+        authority: &Arc<CapabilityAuthority>,
+    ) -> Option<io::Result<()>> {
+        let cached = |inner: &Arc<DirectoryInner>| {
+            with_observation_window(authority, |window| {
+                window
+                    .root_validated
+                    .then(|| window.position(inner))
+                    .flatten()
+            })
+            .flatten()
+        };
+        if let Some(index) = cached(&self.inner) {
+            with_observation_window(authority, |window| window.observe_cached(index));
+            return Some(Ok(()));
+        }
+        if with_observation_window(authority, |window| window.root_validated) != Some(true) {
+            return None;
+        }
+        let mut walked = Vec::new();
+        let mut cached_ancestor = None;
+        let mut current = &self.inner;
+        loop {
+            if let Err(error) = validate_directory_level(current, authority) {
+                return Some(Err(error));
+            }
+            walked.push(current.clone());
+            let Some(binding) = &current.parent else {
+                break;
+            };
+            current = &binding.directory.inner;
+            if let Some(index) = cached(current) {
+                cached_ancestor = Some(index);
+                break;
+            }
+        }
+        let full = with_observation_window(authority, |window| {
+            window.directories.len() + walked.len() > MAX_OBSERVATION_WINDOW_DIRECTORIES
+        })
+        .unwrap_or(false);
+        if full {
+            // Confirms observations so far, then keeps only the walk's cached
+            // ancestors so the cache stays ancestor-closed and bounded.
+            let mut retained = Vec::new();
+            if cached_ancestor.is_some() {
+                retained.push(current.clone());
+                let mut ancestor = current.parent.as_ref();
+                while let Some(binding) = ancestor {
+                    retained.push(binding.directory.inner.clone());
+                    ancestor = binding.directory.inner.parent.as_ref();
+                }
+            }
+            if retained.len() + walked.len() > MAX_OBSERVATION_WINDOW_DIRECTORIES {
+                return None;
+            }
+            if let Err(error) = platform::validate_lease(&authority.lease)
+                .and_then(|()| platform::validate_root(&authority.root))
+                .and_then(|()| confirm_observation_window(authority, true))
+            {
+                fail_observation_window(authority);
+                return Some(Err(error));
+            }
+            let retained = retained.into_iter().map(|directory| ObservedDirectory {
+                directory,
+                observed: true,
+            });
+            with_observation_window(authority, |window| {
+                window.root_validated = true;
+                window.observed = true;
+                window.directories.extend(retained);
+            });
+            cached_ancestor = None;
+        }
+        with_observation_window(authority, |window| {
+            if let Some(index) = cached_ancestor {
+                window.observe_cached(index);
+            }
+            if window.directories.len() + walked.len() <= MAX_OBSERVATION_WINDOW_DIRECTORIES {
+                window
+                    .directories
+                    .extend(walked.into_iter().map(|directory| ObservedDirectory {
+                        directory,
+                        observed: true,
+                    }));
+            }
+        });
+        Some(Ok(()))
     }
 }
 
@@ -9811,7 +10133,7 @@ fn settle_directory_park(
         Ok(authority) => authority,
         Err(_) => return DirectoryParkResolution::Indeterminate(obligation),
     };
-    let operation = match authority.enter() {
+    let operation = match authority.enter_directory_rebinding() {
         Ok(operation) => operation,
         Err(_) => return DirectoryParkResolution::Indeterminate(obligation),
     };
@@ -10605,7 +10927,7 @@ impl Directory {
 
     pub fn revision(&self) -> io::Result<DirectoryRevision> {
         let authority = self.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         let stamp = platform::directory_revision(self.inner.handle())?;
         self.validate(&operation)?;
@@ -10617,7 +10939,7 @@ impl Directory {
 
     pub fn validate_revision(&self, expected: &DirectoryRevision) -> io::Result<()> {
         let authority = self.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         self.validate_revision_in(&operation, expected)?;
         self.validate(&operation)
@@ -10666,7 +10988,7 @@ impl Directory {
             .try_reserve_exact(count)
             .map_err(io::Error::other)?;
         let authority = descendant.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         descendant.validate(&operation)?;
         current = descendant;
         for _ in 0..count {
@@ -10702,8 +11024,7 @@ impl Directory {
                 pause.resume.recv().map_err(io::Error::other)?;
             }
         }
-        platform::validate_lease(&authority.lease)?;
-        platform::validate_root(&authority.root)?;
+        authority.validate_after_observation(&operation)?;
         descendant.validate(&operation)?;
         revisions.reverse();
         Ok(Some(revisions))
@@ -10724,9 +11045,61 @@ impl Directory {
         Ok(())
     }
 
+    /// Runs `observe` with this thread's read-only observations of this root
+    /// session sharing one validation of the root, lease and each retained
+    /// directory ancestry, all revalidated before a result is returned. Any
+    /// non-observation entry meanwhile first revalidates the window and keeps
+    /// its own full validation. Nested calls join this authority's open window.
+    pub fn observe_validated<T>(&self, observe: impl FnOnce() -> T) -> io::Result<T> {
+        let authority = self.authority()?;
+        let key = Arc::as_ptr(&authority) as usize;
+        let opened = OBSERVATION_WINDOWS.with(|windows| {
+            let mut windows = windows.borrow_mut();
+            if windows.len() >= MAX_OBSERVATION_WINDOW_AUTHORITIES
+                || windows.iter().any(|window| window.authority == key)
+            {
+                return false;
+            }
+            windows.push(ObservationWindow {
+                authority: key,
+                root_validated: false,
+                observed: false,
+                failed: false,
+                directories: Vec::new(),
+            });
+            true
+        });
+        if !opened {
+            return Ok(observe());
+        }
+        let scope = ObservationWindowScope { authority: key };
+        let value = observe();
+        let closing = with_observation_window(&authority, |window| {
+            (
+                window.failed,
+                window.observed.then(|| window.take_observed()),
+            )
+        });
+        drop(scope);
+        let Some((failed, closing)) = closing else {
+            return Ok(value);
+        };
+        if failed {
+            return Err(identity_changed(
+                "observation window refused a directory it relied on",
+            ));
+        }
+        if let Some(directories) = closing {
+            platform::validate_lease(&authority.lease)?;
+            platform::validate_root(&authority.root)?;
+            validate_window_directories(&authority, &directories)?;
+        }
+        Ok(value)
+    }
+
     pub fn identity(&self) -> io::Result<DirectoryIdentity> {
         let authority = self.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         Ok(self.inner.identity)
     }
@@ -10754,7 +11127,7 @@ impl Directory {
 
     pub fn open_directory(&self, name: &LeafName) -> io::Result<Self> {
         let authority = self.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         authority.ensure_leaf_not_directory_create_reserved(&operation, self, name)?;
         #[cfg(test)]
@@ -10841,7 +11214,7 @@ impl Directory {
 
     pub fn open_file(&self, name: &LeafName) -> io::Result<FileCapability> {
         let authority = self.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         let file = self.open_file_unvalidated_in(name, &operation)?;
         file.validate(&operation)?;
         Ok(file)
@@ -10875,13 +11248,12 @@ impl Directory {
         expected: &FileRevisionObservation,
     ) -> io::Result<()> {
         let authority = self.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         let file = self.open_file_unvalidated_in(name, &operation)?;
         #[cfg(test)]
         authority.pause_file_observation_after_open(self, name)?;
         // Retaining admission does not freeze externally replaceable root bindings.
-        platform::validate_lease(&authority.lease)?;
-        platform::validate_root(&authority.root)?;
+        authority.validate_after_observation(&operation)?;
         file.validate_revision_observation_in(&operation, expected)
     }
 
@@ -10937,7 +11309,7 @@ impl Directory {
             ));
         }
         let authority = self.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         let listing = platform::entries(self.inner.handle(), limit)?;
         self.validate(&operation)?;
@@ -11066,7 +11438,7 @@ impl Directory {
     #[cfg(unix)]
     pub fn read_symlink(&self, name: &LeafName) -> io::Result<OsString> {
         let authority = self.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         authority.ensure_leaf_not_directory_create_reserved(&operation, self, name)?;
         authority.ensure_leaf_not_transient_reserved(&operation, self, name)?;
@@ -11090,7 +11462,7 @@ impl Directory {
             ));
         }
         let authority = self.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         let name = LeafName::new(entry.name.clone()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "observed entry name is invalid")
@@ -11227,7 +11599,7 @@ impl Directory {
         expected: &DirectoryRevision,
     ) -> io::Result<ParkedDirectory> {
         let authority = self.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_directory_rebinding()?;
         self.validate(&operation)?;
         parked.validate(&operation)?;
         let binding = parked.inner.parent.as_ref().ok_or_else(|| {
@@ -11531,6 +11903,14 @@ impl PartialEq for FileRevisionObservation {
 }
 
 impl Eq for FileRevisionObservation {}
+
+impl std::hash::Hash for FileRevisionObservation {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.authority.as_ptr().hash(state);
+        self.identity.hash(state);
+        self.size.hash(state);
+    }
+}
 
 #[must_use = "file revision readers must be explicitly finished or cancelled"]
 pub struct FileRevisionReader {
@@ -11885,7 +12265,7 @@ impl FileCapability {
     #[cfg(unix)]
     pub fn is_executable(&self) -> io::Result<bool> {
         let authority = self.parent.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         let executable = platform::file_is_executable(&self.handle)?;
         self.validate(&operation)?;
@@ -11898,9 +12278,16 @@ impl FileCapability {
         Weak::ptr_eq(&self.authority, &other.authority) && self.identity == other.identity
     }
 
+    /// Hashes exactly the evidence compared by `could_be_same_file`.
+    pub fn hash_captured_identity(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        self.authority.as_ptr().hash(hasher);
+        self.identity.hash(hasher);
+    }
+
     pub fn same_file(&self, other: &Self) -> io::Result<bool> {
         let authority = self.parent.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         other.validate(&operation)?;
         if !Weak::ptr_eq(&self.authority, &other.authority) {
@@ -12034,7 +12421,7 @@ impl FileCapability {
 
     pub fn revision(&self) -> io::Result<FileRevision> {
         let authority = self.parent.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         let (size, stamp) = platform::file_receipt_fields(&self.handle)?;
         self.validate(&operation)?;
@@ -12081,7 +12468,7 @@ impl FileCapability {
 
     pub fn validate_revision(&self, expected: &FileRevision) -> io::Result<()> {
         let authority = self.parent.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         self.validate_revision_in(&operation, expected)?;
         self.validate(&operation)
@@ -12092,7 +12479,7 @@ impl FileCapability {
         expected: &FileRevisionObservation,
     ) -> io::Result<()> {
         let authority = self.parent.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate_revision_observation_in(&operation, expected)
     }
 
@@ -12177,7 +12564,7 @@ impl FileCapability {
         }
 
         let authority = self.parent.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         self.validate_revision_in(&operation, expected)?;
         let mut bytes = vec![0_u8; length];
@@ -12266,7 +12653,7 @@ impl FileCapability {
 
     pub fn reader(&self, max_bytes: u64) -> io::Result<FileReader<'_>> {
         let authority = self.parent.authority()?;
-        let operation = authority.enter()?;
+        let operation = authority.enter_observation()?;
         self.validate(&operation)?;
         Ok(FileReader {
             file: self,
@@ -15347,7 +15734,7 @@ fn settle_directory_move(
         Ok(authority) => authority,
         Err(_) => return Err(directory),
     };
-    let operation = match authority.enter() {
+    let operation = match authority.enter_directory_rebinding() {
         Ok(operation) => operation,
         Err(_) => return Err(directory),
     };
@@ -24048,6 +24435,155 @@ mod tests {
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
         assert_eq!(entries, 1, "Native observation must own one admission");
         assert!(steps <= 12, "Repeated ancestry validation: {steps}");
+    }
+
+    fn observation_window_fixture(
+        temporary: &tempfile::TempDir,
+    ) -> (RootSession, Directory, Directory) {
+        std::fs::create_dir_all(temporary.path().join("assets/objects/aa")).unwrap();
+        std::fs::create_dir_all(temporary.path().join("other/branch")).unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        let mut bucket = root.clone();
+        for name in ["assets", "objects", "aa"] {
+            bucket = bucket
+                .open_directory(&LeafName::new(name).unwrap())
+                .unwrap();
+        }
+        (session, root, bucket)
+    }
+
+    #[test]
+    fn observation_window_validates_each_ancestry_once_and_again_on_close() {
+        use std::sync::atomic::Ordering;
+
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        let authority = root.authority().unwrap();
+        authority.ancestry_steps.store(0, Ordering::Relaxed);
+        root.observe_validated(|| {
+            for _ in 0..32 {
+                bucket.identity().unwrap();
+            }
+        })
+        .unwrap();
+        let windowed = authority.ancestry_steps.swap(0, Ordering::Relaxed);
+        bucket.identity().unwrap();
+        let unwindowed = authority.ancestry_steps.load(Ordering::Relaxed);
+        drop((bucket, root, authority));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(unwindowed, 4);
+        assert_eq!(windowed, 8, "Window must walk once and revalidate once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observation_window_refuses_ancestry_displaced_after_cached_observation() {
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        let assets = temporary.path().join("assets");
+        let mut cached = None;
+        let result = root.observe_validated(|| {
+            bucket.identity().unwrap();
+            std::fs::rename(assets.join("objects"), assets.join("displaced")).unwrap();
+            std::fs::create_dir_all(assets.join("objects/aa")).unwrap();
+            cached = Some(bucket.identity().is_ok());
+        });
+        drop((bucket, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(
+            cached,
+            Some(true),
+            "Cached observation awaits closing validation"
+        );
+        assert!(result.is_err(), "Window returned a displaced observation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_observation_windows_validate_each_authority_on_close() {
+        let first = crate::test_tempdir().unwrap();
+        let second = crate::test_tempdir().unwrap();
+        let (first_session, first_root, first_bucket) = observation_window_fixture(&first);
+        let (second_session, second_root, second_bucket) = observation_window_fixture(&second);
+        let assets = second.path().join("assets");
+        let mut cached = None;
+        let outer = first_root.observe_validated(|| {
+            first_bucket.identity().unwrap();
+            second_root.observe_validated(|| {
+                second_bucket.identity().unwrap();
+                std::fs::rename(assets.join("objects"), assets.join("displaced")).unwrap();
+                std::fs::create_dir_all(assets.join("objects/aa")).unwrap();
+                cached = Some(second_bucket.identity().is_ok());
+            })
+        });
+        drop((first_bucket, first_root, second_bucket, second_root));
+        assert!(matches!(first_session.revoke(), RootRevokeOutcome::Revoked));
+        assert!(matches!(
+            second_session.revoke(),
+            RootRevokeOutcome::Revoked
+        ));
+        assert_eq!(cached, Some(true), "Nested authority shares its own window");
+        assert!(
+            outer.unwrap().is_err(),
+            "Nested window returned a displaced observation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effect_entry_confirms_cached_observations_before_mutating() {
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        let other = root
+            .open_directory(&LeafName::new("other").unwrap())
+            .unwrap();
+        let assets = temporary.path().join("assets");
+        let mut created = None;
+        let closed = root.observe_validated(|| {
+            bucket.identity().unwrap();
+            std::fs::rename(assets.join("objects"), assets.join("displaced")).unwrap();
+            std::fs::create_dir_all(assets.join("objects/aa")).unwrap();
+            created = Some(other.create_directory(&LeafName::new("created").unwrap()));
+        });
+        drop((bucket, other, root));
+        assert!(closed.is_err());
+        assert!(matches!(created, Some(DirectoryCreateOutcome::NoEffect(_))));
+        assert!(!temporary.path().join("other/created").exists());
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn observation_window_survives_file_effects_and_directory_rebinding() {
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        let other = root
+            .open_directory(&LeafName::new("other").unwrap())
+            .unwrap();
+        let result = root.observe_validated(|| {
+            bucket.identity().unwrap();
+            let branch = other
+                .open_directory(&LeafName::new("branch").unwrap())
+                .unwrap();
+            branch.identity().unwrap();
+            let staged = test_sealed_stage(&bucket, b"payload");
+            let name = LeafName::new("file").unwrap();
+            let published = match staged.promote_no_replace(&bucket, &bucket, &name) {
+                FilePromotionOutcome::Applied(file) => file,
+                _ => panic!("promotion had no exact effect"),
+            };
+            bucket.identity().unwrap();
+            let moved = match branch.move_no_replace(&bucket, &LeafName::new("moved").unwrap()) {
+                DirectoryMoveOutcome::Applied(directory) => directory,
+                _ => panic!("directory move had no exact effect"),
+            };
+            moved.identity().unwrap();
+            published.revision().unwrap();
+        });
+        drop((bucket, other, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        result.unwrap();
+        assert!(temporary.path().join("assets/objects/aa/moved").is_dir());
     }
 
     fn paused_file_observation(

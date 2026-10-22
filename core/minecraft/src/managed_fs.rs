@@ -163,7 +163,9 @@ struct ManagedRoot {
     effects: EffectOwner,
     effect_transition: Mutex<()>,
     continuations: Mutex<ManagedEffectContinuations>,
-    file_identities: Mutex<Vec<Weak<ManagedFileProof>>>,
+    file_identities: Mutex<ManagedFileIdentities>,
+    /// Full SHA-1 digests this process computed, keyed by the exact hashed revision.
+    verified_sha1: Mutex<HashMap<axial_fs::FileRevisionObservation, [u8; 20]>>,
     #[cfg(test)]
     file_identity_comparisons: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -260,6 +262,37 @@ impl ManagedClearContentsFrame {
 
 struct ManagedFileProof {
     capability: Mutex<Option<FileCapability>>,
+}
+
+/// Bounds retained digests; clearing only forces later full hashes.
+const MAX_VERIFIED_SHA1_REVISIONS: usize = 1 << 16;
+
+/// Interned proofs keyed by captured file identity; dead entries are swept in amortized passes.
+#[derive(Default)]
+struct ManagedFileIdentities {
+    buckets: HashMap<u64, Vec<Weak<ManagedFileProof>>>,
+    entries: usize,
+    sweep_at: usize,
+}
+
+impl ManagedFileIdentities {
+    fn bucket(&mut self, candidate: &FileCapability) -> &mut Vec<Weak<ManagedFileProof>> {
+        if self.entries >= self.sweep_at {
+            self.buckets.retain(|_, bucket| {
+                bucket.retain(|identity| identity.strong_count() > 0);
+                !bucket.is_empty()
+            });
+            self.entries = self.buckets.values().map(Vec::len).sum();
+            self.sweep_at = self.entries.saturating_mul(2).max(64);
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        candidate.hash_captured_identity(&mut hasher);
+        let bucket = self.buckets.entry(hasher.finish()).or_default();
+        let live = bucket.len();
+        bucket.retain(|identity| identity.strong_count() > 0);
+        self.entries -= live - bucket.len();
+        bucket
+    }
 }
 
 #[derive(Clone)]
@@ -1002,6 +1035,25 @@ impl ManagedRoot {
         final_truth
     }
 
+    fn verified_sha1(&self, revision: &axial_fs::FileRevision) -> Option<[u8; 20]> {
+        self.verified_sha1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&revision.observation())
+            .copied()
+    }
+
+    fn record_verified_sha1(&self, revision: &axial_fs::FileRevision, digest: [u8; 20]) {
+        let mut verified = self
+            .verified_sha1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if verified.len() >= MAX_VERIFIED_SHA1_REVISIONS {
+            verified.clear();
+        }
+        verified.insert(revision.observation(), digest);
+    }
+
     fn intern_file(
         &self,
         candidate: FileCapability,
@@ -1011,8 +1063,8 @@ impl ManagedRoot {
             .file_identities
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        identities.retain(|identity| identity.strong_count() > 0);
-        for retained in identities.iter().filter_map(Weak::upgrade) {
+        let bucket = identities.bucket(&candidate);
+        for retained in bucket.iter().filter_map(Weak::upgrade) {
             let matches = retained
                 .capability
                 .lock()
@@ -1042,7 +1094,8 @@ impl ManagedRoot {
         let proof = Arc::new(ManagedFileProof {
             capability: Mutex::new(Some(candidate)),
         });
-        identities.push(Arc::downgrade(&proof));
+        bucket.push(Arc::downgrade(&proof));
+        identities.entries += 1;
         ManagedFileIdentity {
             proof,
             _operation_pin: operation_pin,
@@ -1587,7 +1640,8 @@ impl ManagedDir {
                 next_id: 1,
                 receipts: BTreeMap::new(),
             }),
-            file_identities: Mutex::new(Vec::new()),
+            file_identities: Mutex::default(),
+            verified_sha1: Mutex::default(),
             #[cfg(test)]
             file_identity_comparisons: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -1639,7 +1693,8 @@ impl ManagedDir {
                 next_id: 1,
                 receipts: BTreeMap::new(),
             }),
-            file_identities: Mutex::new(Vec::new()),
+            file_identities: Mutex::default(),
+            verified_sha1: Mutex::default(),
             #[cfg(test)]
             file_identity_comparisons: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -1729,8 +1784,10 @@ impl ManagedDir {
     }
 
     pub(crate) fn identity(&self) -> Result<ManagedDirectoryIdentity, LoaderError> {
-        self.revalidate()?;
-        Ok(ManagedDirectoryIdentity(self.inner.identity))
+        self.observe(|| {
+            self.revalidate()?;
+            Ok(ManagedDirectoryIdentity(self.inner.identity))
+        })
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
@@ -1744,6 +1801,36 @@ impl ManagedDir {
         self.revalidate_locked_root()?;
         verify_operation_admission(&self.inner.operation_pin)?;
         Ok(())
+    }
+
+    /// Runs read-only observations of this root session in one validation
+    /// window; effects keep their own validation. An observation's own error
+    /// takes precedence over a failed closing validation.
+    pub(crate) fn observe_validated<T, E>(
+        &self,
+        observe: impl FnOnce() -> Result<T, E>,
+        closing_error: impl FnOnce(LoaderError) -> E,
+    ) -> Result<T, E> {
+        let mut observed = None;
+        let closing = self
+            .inner
+            .directory
+            .observe_validated(|| observed = Some(observe()));
+        match (observed, closing) {
+            (Some(Err(error)), _) => Err(error),
+            (Some(Ok(value)), Ok(())) => Ok(value),
+            (_, Err(error)) => Err(closing_error(error.into())),
+            (None, Ok(())) => Err(closing_error(LoaderError::Io(io::Error::other(
+                "managed observation did not run",
+            )))),
+        }
+    }
+
+    fn observe<T>(
+        &self,
+        observe: impl FnOnce() -> Result<T, LoaderError>,
+    ) -> Result<T, LoaderError> {
+        self.observe_validated(observe, |error| error)
     }
 
     pub(crate) fn settle(&self) -> Result<(), LoaderError> {
@@ -1865,10 +1952,12 @@ impl ManagedDir {
     }
 
     pub(crate) fn open_child(&self, name: &str) -> Result<Self, LoaderError> {
-        let name_leaf = leaf(name)?;
-        self.revalidate()?;
-        let directory = self.inner.directory.open_directory(&name_leaf)?;
-        self.child_from_directory(name, directory)
+        self.observe(|| {
+            let name_leaf = leaf(name)?;
+            self.revalidate()?;
+            let directory = self.inner.directory.open_directory(&name_leaf)?;
+            self.child_from_directory(name, directory)
+        })
     }
 
     pub(crate) fn open_child_if_exists(&self, name: &str) -> Result<Option<Self>, LoaderError> {
@@ -1882,9 +1971,11 @@ impl ManagedDir {
     }
 
     pub(crate) fn open_observed_child(&self, entry: &DirectoryEntry) -> Result<Self, LoaderError> {
-        self.revalidate()?;
-        let (name, directory) = self.open_observed_child_parts(entry)?;
-        self.child_from_directory(name, directory)
+        self.observe(|| {
+            self.revalidate()?;
+            let (name, directory) = self.open_observed_child_parts(entry)?;
+            self.child_from_directory(name, directory)
+        })
     }
 
     fn open_observed_child_parts<'a>(
@@ -2105,44 +2196,44 @@ impl ManagedDir {
         ))
     }
 
+    /// Fully hashes `relative` beneath this directory. `parents` reuses the
+    /// directories opened for the previous path from this same directory.
     pub(crate) fn verify_relative_file_sha1(
         &self,
+        parents: &mut ManagedRelativeParents,
         relative: &PortableRelativePath,
         expected_size: u64,
         expected_sha1: &[u8; 20],
         mut check: impl FnMut() -> Result<(), LoaderError>,
     ) -> Result<(), LoaderError> {
-        let mut segments = relative.as_str().split('/').peekable();
-        let mut directory = self.clone();
-        while let Some(segment) = segments.next() {
-            if segments.peek().is_none() {
-                let guard = directory.inspect_regular_file(segment)?.ok_or_else(|| {
-                    LoaderError::Verify("managed runtime file is absent".to_string())
-                })?;
-                if guard.size != expected_size
-                    || directory.sha1_guarded_file_bytes_with_check(
-                        segment,
-                        &guard,
-                        expected_size,
-                        &mut check,
-                    )? != *expected_sha1
-                {
-                    return Err(LoaderError::Verify(
-                        "managed runtime file failed integrity verification".to_string(),
-                    ));
-                }
-                return Ok(());
-            }
-            directory = directory.open_child(segment)?;
+        let (parent_path, name) = relative
+            .as_str()
+            .rsplit_once('/')
+            .unwrap_or(("", relative.as_str()));
+        let directory = parents.open(self, parent_path)?;
+        let guard = directory
+            .inspect_regular_file(name)?
+            .ok_or_else(|| LoaderError::Verify("managed runtime file is absent".to_string()))?;
+        if guard.size != expected_size
+            || directory.sha1_guarded_file_bytes_with_check(
+                name,
+                &guard,
+                expected_size,
+                &mut check,
+            )? != *expected_sha1
+        {
+            return Err(LoaderError::Verify(
+                "managed runtime file failed integrity verification".to_string(),
+            ));
         }
-        Err(LoaderError::Verify(
-            "managed relative path has no file name".to_string(),
-        ))
+        Ok(())
     }
 
     fn listing(&self, limit: usize) -> Result<Vec<DirectoryEntry>, LoaderError> {
-        self.revalidate()?;
-        self.listing_after_revalidation(limit)
+        self.observe(|| {
+            self.revalidate()?;
+            self.listing_after_revalidation(limit)
+        })
     }
 
     fn listing_locked(
@@ -2279,8 +2370,10 @@ impl ManagedDir {
         &self,
         name: &str,
     ) -> Result<Option<ManagedFileGuard>, LoaderError> {
-        self.revalidate()?;
-        self.inspect_regular_file_after_revalidation(name)
+        self.observe(|| {
+            self.revalidate()?;
+            self.inspect_regular_file_after_revalidation(name)
+        })
     }
 
     pub(crate) fn exact_entry_kind(&self, name: &str) -> Result<Option<EntryKind>, LoaderError> {
@@ -2484,8 +2577,10 @@ impl ManagedDir {
         name: &str,
         guard: &ManagedFileGuard,
     ) -> Result<bool, LoaderError> {
-        self.revalidate()?;
-        self.file_guard_matches_after_revalidation(name, guard)
+        self.observe(|| {
+            self.revalidate()?;
+            self.file_guard_matches_after_revalidation(name, guard)
+        })
     }
 
     pub(crate) fn managed_temp_is_orphan(
@@ -2558,28 +2653,30 @@ impl ManagedDir {
         guard: &ManagedFileGuard,
         max_size: u64,
     ) -> Result<Vec<u8>, LoaderError> {
-        if guard.size > max_size || guard.size > MAX_MANAGED_READ_BYTES {
-            return Err(LoaderError::Verify(
-                "managed guarded read exceeds its admitted bound".to_string(),
-            ));
-        }
-        if !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed guarded read source changed".to_string(),
-            ));
-        }
-        let bytes = guard.identity.with_capability(|file| {
-            file.validate_revision(&guard.revision)?;
-            let bytes = file.read_bounded(max_size.min(guard.size))?;
-            file.validate_revision(&guard.revision)?;
+        self.observe(|| {
+            if guard.size > max_size || guard.size > MAX_MANAGED_READ_BYTES {
+                return Err(LoaderError::Verify(
+                    "managed guarded read exceeds its admitted bound".to_string(),
+                ));
+            }
+            if !self.file_guard_matches(name, guard)? {
+                return Err(LoaderError::Verify(
+                    "managed guarded read source changed".to_string(),
+                ));
+            }
+            let bytes = guard.identity.with_capability(|file| {
+                file.validate_revision(&guard.revision)?;
+                let bytes = file.read_bounded(max_size.min(guard.size))?;
+                file.validate_revision(&guard.revision)?;
+                Ok(bytes)
+            })?;
+            if bytes.len() as u64 != guard.size || !self.file_guard_matches(name, guard)? {
+                return Err(LoaderError::Verify(
+                    "managed guarded read source changed during reading".to_string(),
+                ));
+            }
             Ok(bytes)
-        })?;
-        if bytes.len() as u64 != guard.size || !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed guarded read source changed during reading".to_string(),
-            ));
-        }
-        Ok(bytes)
+        })
     }
 
     pub(crate) fn sha1_guarded_file_bytes_with_check(
@@ -2589,60 +2686,65 @@ impl ManagedDir {
         max_size: u64,
         mut check: impl FnMut() -> Result<(), LoaderError>,
     ) -> Result<[u8; 20], LoaderError> {
-        check()?;
-        if guard.size > max_size {
-            return Err(LoaderError::Verify(
-                "managed guarded hash source is invalid or exceeds its bound".to_string(),
-            ));
-        }
-        self.revalidate()?;
-        let file = self.open_matching_file(name, guard)?.ok_or_else(|| {
-            LoaderError::Verify(
-                "managed guarded hash source is invalid or exceeds its bound".to_string(),
-            )
-        })?;
-        // Callbacks may acquire the root transition lock, whose writers also
-        // acquire file-proof locks. Keep this read on its own matched capability.
-        if !guard.identity.matches(&file)? {
-            return Err(LoaderError::Verify(
-                "managed guarded hash source changed before hashing".to_string(),
-            ));
-        }
-        let digest = {
-            file.validate_revision(&guard.revision)?;
-            let mut reader = file.reader(max_size)?;
-            let mut observed = 0_u64;
-            let mut hasher = Sha1::new();
-            let mut chunk = [0_u8; 64 * 1024];
-            loop {
-                check()?;
-                let read = reader.read(&mut chunk)?;
-                if read == 0 {
-                    break;
-                }
-                observed = observed.checked_add(read as u64).ok_or_else(|| {
-                    LoaderError::Verify("managed guarded hash size overflowed".to_string())
-                })?;
-                hasher.update(&chunk[..read]);
-            }
-            reader.finish()?;
-            file.validate_revision(&guard.revision)?;
-            if observed != guard.size {
+        self.observe(|| {
+            check()?;
+            if guard.size > max_size {
                 return Err(LoaderError::Verify(
-                    "managed guarded hash source changed size".to_string(),
+                    "managed guarded hash source is invalid or exceeds its bound".to_string(),
                 ));
             }
-            <[u8; 20]>::from(hasher.finalize())
-        };
-        check()?;
-        if !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed guarded hash source changed during hashing".to_string(),
-            ));
-        }
-        #[cfg(test)]
-        record_sha1_full_read(&self.inner.path, guard.size, digest);
-        Ok(digest)
+            self.revalidate()?;
+            let file = self.open_matching_file(name, guard)?.ok_or_else(|| {
+                LoaderError::Verify(
+                    "managed guarded hash source is invalid or exceeds its bound".to_string(),
+                )
+            })?;
+            // Callbacks may acquire the root transition lock, whose writers also
+            // acquire file-proof locks. Keep this read on its own matched capability.
+            if !guard.identity.matches(&file)? {
+                return Err(LoaderError::Verify(
+                    "managed guarded hash source changed before hashing".to_string(),
+                ));
+            }
+            let digest = {
+                file.validate_revision(&guard.revision)?;
+                let mut reader = file.reader(max_size)?;
+                let mut observed = 0_u64;
+                let mut hasher = Sha1::new();
+                let mut chunk = [0_u8; 64 * 1024];
+                loop {
+                    check()?;
+                    let read = reader.read(&mut chunk)?;
+                    if read == 0 {
+                        break;
+                    }
+                    observed = observed.checked_add(read as u64).ok_or_else(|| {
+                        LoaderError::Verify("managed guarded hash size overflowed".to_string())
+                    })?;
+                    hasher.update(&chunk[..read]);
+                }
+                reader.finish()?;
+                file.validate_revision(&guard.revision)?;
+                if observed != guard.size {
+                    return Err(LoaderError::Verify(
+                        "managed guarded hash source changed size".to_string(),
+                    ));
+                }
+                <[u8; 20]>::from(hasher.finalize())
+            };
+            check()?;
+            if !self.file_guard_matches(name, guard)? {
+                return Err(LoaderError::Verify(
+                    "managed guarded hash source changed during hashing".to_string(),
+                ));
+            }
+            self.inner
+                .root
+                .record_verified_sha1(&guard.revision, digest);
+            #[cfg(test)]
+            record_sha1_full_read(&self.inner.path, guard.size, digest);
+            Ok(digest)
+        })
     }
 
     pub(crate) fn sha1_guarded_file_bytes(
@@ -2652,6 +2754,34 @@ impl ManagedDir {
         max_size: u64,
     ) -> Result<[u8; 20], LoaderError> {
         self.sha1_guarded_file_bytes_with_check(name, guard, max_size, || Ok(()))
+    }
+
+    /// Returns this process's earlier full hash of the guarded file while the
+    /// name still binds it at the exact hashed revision (identity, size and
+    /// change stamps); hashes in full otherwise, including after a restart.
+    /// Admission and durable insertion use `sha1_guarded_file_bytes`.
+    pub(crate) fn sha1_reverified_file_bytes(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+    ) -> Result<[u8; 20], LoaderError> {
+        let Some(digest) = self.inner.root.verified_sha1(&guard.revision) else {
+            return self.sha1_guarded_file_bytes(name, guard, max_size);
+        };
+        self.observe(|| {
+            if guard.size > max_size {
+                return Err(LoaderError::Verify(
+                    "managed guarded hash source is invalid or exceeds its bound".to_string(),
+                ));
+            }
+            if !self.file_guard_matches(name, guard)? {
+                return Err(LoaderError::Verify(
+                    "managed guarded hash source changed before hashing".to_string(),
+                ));
+            }
+            Ok(digest)
+        })
     }
 
     pub(crate) fn sha1_guarded_file(
@@ -2671,20 +2801,22 @@ impl ManagedDir {
         guard: &ManagedFileGuard,
         max_size: u64,
     ) -> Result<[u8; 32], LoaderError> {
-        if guard.size > max_size || !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed guarded hash source is invalid or exceeds its bound".to_string(),
-            ));
-        }
-        let digest = guard
-            .identity
-            .with_capability(|file| sha256_file_revision(file, &guard.revision, max_size))?;
-        if !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed guarded hash source changed during hashing".to_string(),
-            ));
-        }
-        Ok(digest)
+        self.observe(|| {
+            if guard.size > max_size || !self.file_guard_matches(name, guard)? {
+                return Err(LoaderError::Verify(
+                    "managed guarded hash source is invalid or exceeds its bound".to_string(),
+                ));
+            }
+            let digest = guard
+                .identity
+                .with_capability(|file| sha256_file_revision(file, &guard.revision, max_size))?;
+            if !self.file_guard_matches(name, guard)? {
+                return Err(LoaderError::Verify(
+                    "managed guarded hash source changed during hashing".to_string(),
+                ));
+            }
+            Ok(digest)
+        })
     }
 
     pub(crate) fn sha512_guarded_file(
@@ -5126,6 +5258,27 @@ impl ManagedLibraryWitness {
 }
 
 impl ManagedLibraryOperation {
+    /// Runs read-only library observations sharing one validation window for
+    /// the library root and its current admission. Every relied-on directory,
+    /// root and lease is validated again before the result is returned; a
+    /// failed closing validation refuses the result.
+    pub fn observe_validated<T>(&self, observe: impl FnOnce() -> T) -> io::Result<T> {
+        let library = || {
+            self.authority
+                .root
+                .inner
+                .directory
+                .observe_validated(observe)
+        };
+        let admission = self.authority.admission_snapshot()?;
+        match &admission.current {
+            ManagedLibraryAdmission::App(admitted) => admitted.observe_validated(library)?,
+            ManagedLibraryAdmission::Root(root) => root.anchor.observe_validated(library)?,
+            #[cfg(any(test, feature = "test-support"))]
+            ManagedLibraryAdmission::Retained(directory) => directory.observe_validated(library)?,
+        }
+    }
+
     /// Reuse one unchanged parent chain while observing related files. The
     /// cursor owns no file descriptors beyond that chain and each returned file.
     pub fn file_batch(&self) -> ManagedLibraryFileBatch {
@@ -5379,6 +5532,39 @@ impl ManagedLibraryOperation {
             .with_operation_pin(Arc::clone(&self.pin));
         directory.revalidate()?;
         Ok(directory)
+    }
+}
+
+/// Directories opened along the previous relative path, so sorted walks from
+/// one directory reopen only the segments that differ.
+#[derive(Default)]
+pub(crate) struct ManagedRelativeParents {
+    opened: Vec<(String, ManagedDir)>,
+}
+
+impl ManagedRelativeParents {
+    fn open(&mut self, base: &ManagedDir, parent_path: &str) -> Result<ManagedDir, LoaderError> {
+        let segments = parent_path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        let common = self
+            .opened
+            .iter()
+            .zip(&segments)
+            .take_while(|((opened, _), segment)| opened == *segment)
+            .count();
+        self.opened.truncate(common);
+        for segment in &segments[common..] {
+            let parent = self.opened.last().map_or(base, |(_, directory)| directory);
+            let child = parent.open_child(segment)?;
+            self.opened.push(((*segment).to_owned(), child));
+        }
+        Ok(self
+            .opened
+            .last()
+            .map_or(base, |(_, directory)| directory)
+            .clone())
     }
 }
 

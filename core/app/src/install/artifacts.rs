@@ -456,47 +456,74 @@ impl ActivatedVersion {
         let mut reasons = Vec::new();
         let mut version = None;
         let mut asset_flags = BTreeMap::new();
-        for (index, expected) in self.files.iter().enumerate() {
-            if expected.size > 2 * 1024 * 1024 * 1024 {
-                return Err(InstallError::NotReady);
-            }
-            let mut expected_digest = [0; 20];
-            hex::decode_to_slice(&expected.sha1, &mut expected_digest)
-                .map_err(|_| InstallError::NotReady)?;
-            if hex::encode(expected_digest) != expected.sha1 {
-                return Err(InstallError::NotReady);
-            }
-            let path = PortableRelativePath::new_exact(&expected.path)
-                .map_err(|_| InstallError::NotReady)?;
-            let root = expected.path.split('/').next();
-            if !matches!(root, Some("versions" | "libraries" | "assets"))
-                || (index > 0 && self.files[index - 1].path == expected.path)
-            {
-                return Err(InstallError::NotReady);
-            }
-            let is_asset_index = is_asset_index(&expected.path);
-            let is_required_library = root == Some("libraries")
-                || expected
-                    .path
-                    .strip_prefix("assets/log_configs/")
-                    .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
-            if !inspection.observes(&expected.path) {
-                continue;
-            }
-            let file = match batch
-                .observe_file_with_absence(&path)
-                .map_err(|_| InstallError::NotReady)?
-            {
-                FileObservation::Present(file) => file,
-                FileObservation::Missing(absence) => {
+        observe_inventory(&operation, || {
+            for (index, expected) in self.files.iter().enumerate() {
+                if expected.size > 2 * 1024 * 1024 * 1024 {
+                    return Err(InstallError::NotReady);
+                }
+                let mut expected_digest = [0; 20];
+                hex::decode_to_slice(&expected.sha1, &mut expected_digest)
+                    .map_err(|_| InstallError::NotReady)?;
+                if hex::encode(expected_digest) != expected.sha1 {
+                    return Err(InstallError::NotReady);
+                }
+                let path = PortableRelativePath::new_exact(&expected.path)
+                    .map_err(|_| InstallError::NotReady)?;
+                let root = expected.path.split('/').next();
+                if !matches!(root, Some("versions" | "libraries" | "assets"))
+                    || (index > 0 && self.files[index - 1].path == expected.path)
+                {
+                    return Err(InstallError::NotReady);
+                }
+                let is_asset_index = is_asset_index(&expected.path);
+                let is_required_library = root == Some("libraries")
+                    || expected
+                        .path
+                        .strip_prefix("assets/log_configs/")
+                        .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
+                if !inspection.observes(&expected.path) {
+                    continue;
+                }
+                let file = match batch
+                    .observe_file_with_absence(&path)
+                    .map_err(|_| InstallError::NotReady)?
+                {
+                    FileObservation::Present(file) => file,
+                    FileObservation::Missing(absence) => {
+                        let reason = if path == client_path {
+                            InstallError::ClientJarMissing
+                        } else if expected.path == metadata_path {
+                            InstallError::VersionJsonMissing
+                        } else if is_required_library {
+                            InstallError::LibrariesMissing
+                        } else if is_asset_index {
+                            InstallError::AssetIndexMissing
+                        } else {
+                            InstallError::NotReady
+                        };
+                        if !diagnostics || reason == InstallError::NotReady {
+                            return Err(reason);
+                        }
+                        if !reasons.contains(&reason) {
+                            reasons.push(reason);
+                            missing.push(absence);
+                        }
+                        continue;
+                    }
+                };
+                if file.size() != expected.size
+                    || ((inspection == Inspection::Integrity || expected.path == metadata_path)
+                        && file
+                            .sha1_bounded(expected.size)
+                            .map_err(|_| InstallError::NotReady)?
+                            != expected_digest)
+                {
                     let reason = if path == client_path {
-                        InstallError::ClientJarMissing
-                    } else if expected.path == metadata_path {
-                        InstallError::VersionJsonMissing
+                        InstallError::ClientJarCorrupt
                     } else if is_required_library {
-                        InstallError::LibrariesMissing
+                        InstallError::LibrariesCorrupt
                     } else if is_asset_index {
-                        InstallError::AssetIndexMissing
+                        InstallError::AssetIndexCorrupt
                     } else {
                         InstallError::NotReady
                     };
@@ -505,67 +532,43 @@ impl ActivatedVersion {
                     }
                     if !reasons.contains(&reason) {
                         reasons.push(reason);
-                        missing.push(absence);
                     }
+                    guards.push((path, file.revision_observation()));
                     continue;
                 }
-            };
-            if file.size() != expected.size
-                || ((inspection == Inspection::Integrity || expected.path == metadata_path)
-                    && file
-                        .sha1_bounded(expected.size)
-                        .map_err(|_| InstallError::NotReady)?
-                        != expected_digest)
-            {
-                let reason = if path == client_path {
-                    InstallError::ClientJarCorrupt
-                } else if is_required_library {
-                    InstallError::LibrariesCorrupt
-                } else if is_asset_index {
-                    InstallError::AssetIndexCorrupt
-                } else {
-                    InstallError::NotReady
-                };
-                if !diagnostics || reason == InstallError::NotReady {
-                    return Err(reason);
+                if expected.path == metadata_path {
+                    let bytes = file
+                        .read_bounded(16 << 20)
+                        .map_err(|_| InstallError::NotReady)?;
+                    version = Some(
+                        serde_json::from_slice::<VersionJson>(&bytes)
+                            .map_err(|_| InstallError::NotReady)?,
+                    );
                 }
-                if !reasons.contains(&reason) {
-                    reasons.push(reason);
+                if is_asset_index && inspection == Inspection::Integrity {
+                    #[derive(Deserialize)]
+                    struct AssetFlags {
+                        #[serde(default, rename = "virtual")]
+                        virtual_assets: bool,
+                        #[serde(default)]
+                        map_to_resources: bool,
+                    }
+                    let bytes = file
+                        .read_bounded(64 << 20)
+                        .map_err(|_| InstallError::NotReady)?;
+                    let flags: AssetFlags =
+                        serde_json::from_slice(&bytes).map_err(|_| InstallError::NotReady)?;
+                    asset_flags.insert(
+                        expected.path.clone(),
+                        flags.virtual_assets || flags.map_to_resources,
+                    );
                 }
+                // Retain compact revision evidence, not an open descriptor for
+                // every asset object. Re-observation below is bounded to one file.
                 guards.push((path, file.revision_observation()));
-                continue;
             }
-            if expected.path == metadata_path {
-                let bytes = file
-                    .read_bounded(16 << 20)
-                    .map_err(|_| InstallError::NotReady)?;
-                version = Some(
-                    serde_json::from_slice::<VersionJson>(&bytes)
-                        .map_err(|_| InstallError::NotReady)?,
-                );
-            }
-            if is_asset_index && inspection == Inspection::Integrity {
-                #[derive(Deserialize)]
-                struct AssetFlags {
-                    #[serde(default, rename = "virtual")]
-                    virtual_assets: bool,
-                    #[serde(default)]
-                    map_to_resources: bool,
-                }
-                let bytes = file
-                    .read_bounded(64 << 20)
-                    .map_err(|_| InstallError::NotReady)?;
-                let flags: AssetFlags =
-                    serde_json::from_slice(&bytes).map_err(|_| InstallError::NotReady)?;
-                asset_flags.insert(
-                    expected.path.clone(),
-                    flags.virtual_assets || flags.map_to_resources,
-                );
-            }
-            // Retain compact revision evidence, not an open descriptor for
-            // every asset object. Re-observation below is bounded to one file.
-            guards.push((path, file.revision_observation()));
-        }
+            Ok(())
+        })?;
         let contains = |path: &str| {
             self.files
                 .binary_search_by(|file| file.path.as_str().cmp(path))
@@ -759,17 +762,34 @@ impl InventoryEvidence {
 
     pub(crate) fn revalidate(&self) -> Result<(), super::queue::InstallError> {
         use super::queue::InstallError;
-        self.pin.revalidate().map_err(|_| InstallError::NotReady)?;
-        let mut batch = self.operation.file_batch();
-        for (path, expected) in &self.guards {
-            batch
-                .validate_revision(path, expected)
-                .map_err(|_| InstallError::NotReady)?;
-        }
-        for absence in &self.missing {
-            absence.revalidate().map_err(|_| InstallError::NotReady)?;
-        }
-        Ok(())
+        observe_inventory(&self.operation, || {
+            self.pin.revalidate().map_err(|_| InstallError::NotReady)?;
+            let mut batch = self.operation.file_batch();
+            for (path, expected) in &self.guards {
+                batch
+                    .validate_revision(path, expected)
+                    .map_err(|_| InstallError::NotReady)?;
+            }
+            for absence in &self.missing {
+                absence.revalidate().map_err(|_| InstallError::NotReady)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Runs one inventory pass in the library's observation window. The pass's own
+/// refusal takes precedence; a failed closing validation refuses the pass.
+fn observe_inventory<T>(
+    operation: &ManagedLibraryOperation,
+    observe: impl FnOnce() -> Result<T, super::queue::InstallError>,
+) -> Result<T, super::queue::InstallError> {
+    let mut observed = None;
+    let closing = operation.observe_validated(|| observed = Some(observe()));
+    match (observed, closing) {
+        (Some(Err(error)), _) => Err(error),
+        (Some(Ok(value)), Ok(())) => Ok(value),
+        _ => Err(super::queue::InstallError::NotReady),
     }
 }
 
@@ -1682,6 +1702,30 @@ pub(crate) mod tests {
             );
         }
         assert!(!remaining.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_window_refuses_ancestry_replaced_during_the_pass() {
+        let (temporary, library, _) = fixture();
+        let pin = library.admit().unwrap();
+        let operation = pin.managed_library().unwrap();
+        let assets = temporary.path().join("assets");
+        let relative = PortableRelativePath::new_exact("assets/objects/aa/first").unwrap();
+        let mut observed = None;
+        let result = observe_inventory(&operation, || {
+            let mut batch = operation.file_batch();
+            observed = Some(
+                batch
+                    .observe_file(&relative)
+                    .is_ok_and(|file| file.is_some()),
+            );
+            std::fs::rename(assets.join("objects"), assets.join("displaced")).unwrap();
+            std::fs::create_dir_all(assets.join("objects/aa")).unwrap();
+            Ok(())
+        });
+        assert_eq!(observed, Some(true));
+        assert!(matches!(result, Err(InstallError::NotReady)));
     }
 
     #[test]

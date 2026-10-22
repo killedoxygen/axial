@@ -619,6 +619,7 @@ impl CapabilityAuthority {
                 record,
                 CapabilityOperation {
                     authority: self.clone(),
+                    windowed: false,
                 },
             )
         };
@@ -985,11 +986,15 @@ fn enter_publication_reconciliation(
         }
         state.active = state.active.checked_add(1).ok_or(io::ErrorKind::Other)?;
     }
-    let operation = CapabilityOperation { authority };
+    let operation = CapabilityOperation {
+        authority,
+        windowed: false,
+    };
     let directory = &batch.directory;
     let directory_buffer = batch.directory_buffer.as_mut_slice();
     platform::validate_lease_preallocated(&operation.authority.lease, &mut *directory_buffer)?;
     platform::validate_root_preallocated(&operation.authority.root, &mut *directory_buffer)?;
+    crate::confirm_observation_window(&operation.authority, true)?;
     validate_publication_directory(directory, &operation, Some(directory_buffer))?;
     Ok(operation)
 }

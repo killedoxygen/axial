@@ -6,19 +6,20 @@ use crate::known_good::{
 };
 use crate::loaders::types::LoaderError;
 use crate::managed_component_effects::{
-    ComponentCanonicalObservation, ComponentEffectsError, ComponentExecutionResult,
-    ComponentIntentCandidate, ComponentIntentPublicationRecovery, ComponentIntentPublishFailure,
-    ComponentLane, ComponentPreparedCanonicalAuthority, ComponentPriorRecoveryRetryResult,
-    ComponentRecoveryRetryResult, ComponentSettledOutcome, ComponentSettlementResult,
-    ComponentStartupRecoveryResult, component_slot_name, execute_component_intent,
-    plan_component_canonical_path, recover_component_intent_publication,
-    recover_component_transaction, retry_component_recovery, retry_component_settlement,
-    retry_prior_component_recovery, settle_component_transaction,
+    ComponentCanonicalObservation, ComponentCanonicalParents, ComponentEffectsError,
+    ComponentExecutionResult, ComponentIntentCandidate, ComponentIntentPublicationRecovery,
+    ComponentIntentPublishFailure, ComponentLane, ComponentPreparedCanonicalAuthority,
+    ComponentPriorRecoveryRetryResult, ComponentRecoveryRetryResult, ComponentSettledOutcome,
+    ComponentSettlementResult, ComponentStartupRecoveryResult, component_slot_name,
+    execute_component_intent, recover_component_intent_publication, recover_component_transaction,
+    retry_component_recovery, retry_component_settlement, retry_prior_component_recovery,
+    settle_component_transaction,
 };
 #[cfg(test)]
 use crate::managed_component_effects::{
     ComponentExecutionFault, ComponentIntentPublishFault, ComponentSettlementFault,
-    execute_component_intent_with_fault, settle_component_transaction_with_fault,
+    execute_component_intent_with_fault, plan_component_canonical_path,
+    settle_component_transaction_with_fault,
 };
 use crate::managed_component_spool::{ComponentTableSpool, ComponentTableSpoolError};
 use crate::managed_component_table::{
@@ -936,49 +937,56 @@ fn plan_projection(
     component: ManagedComponentKind,
     projection: Vec<ComponentProjectionRow>,
 ) -> Result<PlannedComponentProjection, PrepareComponentIntentError> {
-    let mut rows = Vec::new();
-    let mut authority = Vec::new();
-    rows.try_reserve_exact(projection.len())
-        .map_err(|_| PrepareComponentIntentError::SourceSet)?;
-    authority
-        .try_reserve_exact(projection.len())
-        .map_err(|_| PrepareComponentIntentError::SourceSet)?;
-    let mut all_exact = true;
-    for projected in projection {
-        let path_plan = plan_component_canonical_path(lease.root(), component, &projected.path)?;
-        let first_created_depth = path_plan.first_created_depth();
-        let (observed, prepared) = path_plan.observe_prepared()?;
-        let prior = match observed {
-            ComponentCanonicalObservation::Absent => {
-                all_exact = false;
-                None
-            }
-            ComponentCanonicalObservation::Regular(observed) => {
-                let prior = Some(ComponentPriorFile {
-                    size: observed.size(),
-                    sha1: observed.sha1(),
+    lease.root().observe_validated(
+        || {
+            let mut rows = Vec::new();
+            let mut authority = Vec::new();
+            rows.try_reserve_exact(projection.len())
+                .map_err(|_| PrepareComponentIntentError::SourceSet)?;
+            authority
+                .try_reserve_exact(projection.len())
+                .map_err(|_| PrepareComponentIntentError::SourceSet)?;
+            let mut all_exact = true;
+            let mut parents = ComponentCanonicalParents::default();
+            for projected in projection {
+                let path_plan = parents.plan(lease.root(), component, &projected.path)?;
+                let first_created_depth = path_plan.first_created_depth();
+                let (observed, prepared) = path_plan.observe_prepared()?;
+                let prior = match observed {
+                    ComponentCanonicalObservation::Absent => {
+                        all_exact = false;
+                        None
+                    }
+                    ComponentCanonicalObservation::Regular(observed) => {
+                        let prior = Some(ComponentPriorFile {
+                            size: observed.size(),
+                            sha1: observed.sha1(),
+                        });
+                        all_exact &=
+                            observed.size() == projected.size && observed.sha1() == projected.sha1;
+                        prior
+                    }
+                };
+                rows.push(ComponentTableRow {
+                    inventory_ordinal: projected.inventory_ordinal,
+                    final_size: projected.size,
+                    final_sha1: projected.sha1,
+                    kind: projected.kind,
+                    path: projected.path,
+                    first_created_depth,
+                    prior,
                 });
-                all_exact &= observed.size() == projected.size && observed.sha1() == projected.sha1;
-                prior
+                authority.push(prepared);
             }
-        };
-        rows.push(ComponentTableRow {
-            inventory_ordinal: projected.inventory_ordinal,
-            final_size: projected.size,
-            final_sha1: projected.sha1,
-            kind: projected.kind,
-            path: projected.path,
-            first_created_depth,
-            prior,
-        });
-        authority.push(prepared);
-    }
-    lease.revalidate()?;
-    Ok(PlannedComponentProjection {
-        table_rows: rows,
-        authority,
-        all_exact,
-    })
+            lease.revalidate()?;
+            Ok(PlannedComponentProjection {
+                table_rows: rows,
+                authority,
+                all_exact,
+            })
+        },
+        PrepareComponentIntentError::from,
+    )
 }
 
 async fn revalidate_exact_component_projection(
@@ -988,8 +996,9 @@ async fn revalidate_exact_component_projection(
 ) -> Result<ManagedRootPublicationLease, PrepareComponentIntentError> {
     let lease = run_publication_blocking(move || {
         lease.revalidate()?;
+        let mut parents = ComponentCanonicalParents::default();
         for row in rows {
-            let planned = plan_component_canonical_path(lease.root(), component, &row.path)?;
+            let planned = parents.plan(lease.root(), component, &row.path)?;
             let ComponentCanonicalObservation::Regular(observed) = planned.observe()? else {
                 return Err(PrepareComponentIntentError::CanonicalChanged);
             };
@@ -1017,8 +1026,9 @@ async fn revalidate_component_projection(
     let projection = projection.to_vec();
     let exact = run_publication_blocking(move || {
         root.revalidate()?;
+        let mut parents = ComponentCanonicalParents::default();
         for row in projection {
-            let planned = plan_component_canonical_path(&root, component, &row.path)?;
+            let planned = parents.plan(&root, component, &row.path)?;
             let ComponentCanonicalObservation::Regular(observed) = planned.observe()? else {
                 return Ok::<_, ComponentEffectsError>(false);
             };
@@ -2267,9 +2277,9 @@ mod tests {
         let counts = take_sha1_full_read_counts(temporary.path());
         assert_eq!(
             counts.count(inherited_identity.size, inherited_identity.sha1),
-            8
+            3
         );
-        assert_eq!(counts.count(fresh_identity.size, fresh_identity.sha1), 9);
+        assert_eq!(counts.count(fresh_identity.size, fresh_identity.sha1), 4);
     }
 
     #[tokio::test]
