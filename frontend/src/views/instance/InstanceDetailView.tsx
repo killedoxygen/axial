@@ -107,6 +107,7 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
       });
   };
 
+  // Setup and install hold the instance directory, so reread once the launch state settles.
   useEffect(() => {
     if (!inst) return;
     reloadResources();
@@ -115,7 +116,7 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
       resourceRequest.current += 1;
       if (timer) window.clearInterval(timer);
     };
-  }, [inst?.id, processLive]);
+  }, [inst?.id, processLive, inst?.launch_action.state_id]);
 
   useEffect(() => {
     if (!playing) return;
