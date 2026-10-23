@@ -269,7 +269,18 @@ pub fn classify_startup_failure_text(text: &str) -> FailureClass {
 }
 
 fn is_graphics_unavailable_failure(text: &str) -> bool {
-    let Some(throwable) = text.trim().strip_prefix("<log4j:Throwable><![CDATA[") else {
+    let text = text.trim();
+    // Minecraft 26.x aborts the JVM when its render thread has no usable OpenGL context.
+    if let Some((thread, message)) = text
+        .strip_prefix("FATAL ERROR in native method: [LWJGL] Thread[")
+        .and_then(|rest| rest.split_once("]: "))
+    {
+        return thread.contains("Render thread")
+            && message.starts_with(
+                "No context is current or a function that is not available in the current context was called.",
+            );
+    }
+    let Some(throwable) = text.strip_prefix("<log4j:Throwable><![CDATA[") else {
         return false;
     };
     let Some((class, message)) = throwable.split_once(": ") else {
@@ -623,6 +634,22 @@ mod tests {
             (
                 "java.lang.SecurityException: SHA-256 digest error for net/minecraft/client/Minecraft.class",
                 FailureClass::LauncherManagedArtifactSignature,
+            ),
+            (
+                "FATAL ERROR in native method: [LWJGL] Thread[#3,Render thread,5,main]: No context is current or a function that is not available in the current context was called. The JVM will abort execution.",
+                FailureClass::GraphicsUnavailable,
+            ),
+            (
+                "FATAL ERROR in native method: [LWJGL] Thread[#41,Worker-Main-2,5,main]: No context is current or a function that is not available in the current context was called. The JVM will abort execution.",
+                FailureClass::Unknown,
+            ),
+            (
+                "[LWJGL] No context is current or a function that is not available in the current context was called.",
+                FailureClass::Unknown,
+            ),
+            (
+                "at com.mojang.renderpearl.backend.opengl.GlBackend.createDevice(GlBackend.java:68)",
+                FailureClass::Unknown,
             ),
             (
                 "[main/INFO] [cpw.mods.modlauncher.Launcher/MODLAUNCHER]: ModLauncher running",
