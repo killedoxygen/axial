@@ -235,8 +235,10 @@ function detailHarness(inst: EnrichedInstance) {
   let read = async (): Promise<unknown> => inst;
   const values: unknown[] = [];
   let cursor = 0;
-  let effects: Array<() => void | (() => void)> = [];
+  let effects: Array<{ run: () => void | (() => void); deps?: unknown[] }> = [];
+  let mountedDeps: Array<unknown[] | undefined> = [];
   const cleanups: Array<() => void> = [];
+  let resourceReads = 0;
   const readinessFile = resolve(frontend, 'src/instance-readiness.ts');
   const readinessExports = {};
   vm.runInNewContext(ts.transpileModule(readFileSync(readinessFile, 'utf8'), {
@@ -261,7 +263,7 @@ function detailHarness(inst: EnrichedInstance) {
         }];
       },
       useRef: <T>(value: T) => { const index = cursor++; return values[index] ??= { current: value }; },
-      useEffect(run: () => void | (() => void)) { effects.push(run); },
+      useEffect(run: () => void | (() => void), deps?: unknown[]) { effects.push({ run, deps }); },
     },
     'preact/jsx-runtime': requireDependency('preact/jsx-runtime'),
     '../../ui/Icons': { Icon: 'Icon' },
@@ -279,7 +281,12 @@ function detailHarness(inst: EnrichedInstance) {
     '../../instance-setup': {},
     '../../instance-readiness': readinessExports,
     '../../launch-presenters': launchPresenters,
-    './resources': { fetchInstanceResources: async () => { throw new Error('Resources unavailable'); } },
+    './resources': {
+      fetchInstanceResources: async () => {
+        resourceReads += 1;
+        throw new Error('Resources unavailable');
+      },
+    },
     './logs': {},
     './instance-actions': {},
     '../../hooks/use-theme': { useTheme: () => ({}) },
@@ -342,7 +349,22 @@ function detailHarness(inst: EnrichedInstance) {
   return {
     ...h, store, reads, render, status,
     respond(next: typeof read) { read = next; },
-    mount() { render(); for (const run of effects) { const cleanup = run(); if (cleanup) cleanups.push(cleanup); } },
+    resourceReads: () => resourceReads,
+    mount() {
+      render();
+      mountedDeps = effects.map(({ deps }) => deps);
+      for (const { run } of effects) { const cleanup = run(); if (cleanup) cleanups.push(cleanup); }
+    },
+    update() {
+      render();
+      effects.forEach(({ run, deps }, index) => {
+        const previous = mountedDeps[index];
+        if (deps && previous && deps.every((value, at) => Object.is(value, previous[at]))) return;
+        mountedDeps[index] = deps;
+        const cleanup = run();
+        if (cleanup) cleanups.push(cleanup);
+      });
+    },
     unmount() { for (const cleanup of cleanups) cleanup(); },
   };
 }
@@ -426,5 +448,26 @@ test('entering instance details and refreshing Mods recover stale availability w
   assert.equal(resources.status, 'error');
   assert.equal(resources.data, null);
   assert.equal(resources.error, 'Resources unavailable');
+  h.unmount();
+});
+
+test('instance details reread resources once setup releases the instance', async () => {
+  const pending = enrichedInstanceResponse(instance(null));
+  const settling: EnrichedInstance = { ...pending,
+    launch_action: { ...pending.launch_action, state_id: 'setup_queued' } };
+  const ready: EnrichedInstance = { ...pending, launchable: true,
+    launch_action: { state_id: 'ready', primary_action: 'launch', label: 'Launch', launchable: true, tone: 'ok' } };
+  const h = detailHarness(settling);
+  h.respond(async () => h.store.instances.value[0]);
+  h.mount();
+  await new Promise((done) => setImmediate(done));
+  assert.equal(h.resourceReads(), 1);
+  h.update();
+  await new Promise((done) => setImmediate(done));
+  assert.equal(h.resourceReads(), 1, 'an unchanged projection must not reread resources');
+  h.store.instances.value = [ready];
+  h.update();
+  await new Promise((done) => setImmediate(done));
+  assert.equal(h.resourceReads(), 2);
   h.unmount();
 });
