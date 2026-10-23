@@ -6,9 +6,11 @@
 use super::catalog::ContentService;
 use super::model::{
     CanonicalContent, CanonicalId, ContentKind, ContentVersion, DependencyKind, FileRef,
-    VersionIdentity,
+    LoaderGameFilter, VersionIdentity,
 };
-use super::resolve::{ContentResolution, ResolutionSelection, ResolutionTarget, pick_version};
+use super::resolve::{
+    ContentResolution, ResolutionSelection, ResolutionTarget, pick_filtered_version, pick_version,
+};
 use crate::files::portable::{
     PortableFileName, PortableRelativePath, managed_content_name_is_reserved,
 };
@@ -48,6 +50,8 @@ pub enum PackError {
     TooLarge,
     #[error("the selected modpack files changed; review the pack again")]
     SelectionChanged,
+    #[error("no version of this modpack matches the selected Minecraft version and loader")]
+    NoMatchingVersion,
     #[error("modpack destinations conflict: {0}")]
     Conflict(String),
     #[error("a modpack payload failed integrity verification")]
@@ -303,10 +307,18 @@ pub struct ResolvedPack {
 
 /// Queue admission resolves only bounded provider metadata. Archive transfer
 /// and authenticated planning remain accepted work, not request-owned effects.
+/// Which modpack version to resolve.
+pub enum PackVersion<'a> {
+    /// A version the user or a retained plan already chose.
+    Exact(&'a str),
+    /// The default version among those matching a filter; an empty filter matches every version.
+    Newest(&'a LoaderGameFilter),
+}
+
 pub async fn resolve_pack_version(
     service: &ContentService,
     canonical_id: &CanonicalId,
-    version_id: Option<&str>,
+    version: PackVersion<'_>,
 ) -> PackResult<(CanonicalContent, ContentVersion)> {
     let detail = service
         .detail(canonical_id)
@@ -316,9 +328,15 @@ pub async fn resolve_pack_version(
         return Err(PackError::Unsupported);
     }
     // detail() already validates the canonical project and exact version IDs.
-    let version = pick_version(&detail.versions, version_id)
-        .ok_or(PackError::SelectionChanged)?
-        .clone();
+    let version = match version {
+        PackVersion::Exact(id) => {
+            pick_version(&detail.versions, Some(id)).ok_or(PackError::SelectionChanged)?
+        }
+        PackVersion::Newest(filter) => {
+            pick_filtered_version(&detail.versions, filter).ok_or(PackError::NoMatchingVersion)?
+        }
+    }
+    .clone();
     if version.dependencies.iter().any(|dependency| {
         dependency.kind == DependencyKind::Required
             && dependency.project_id.is_none()
@@ -338,10 +356,10 @@ pub async fn resolve_pack(
     service: &ContentService,
     client: &ProviderClient,
     canonical_id: &CanonicalId,
-    version_id: Option<&str>,
+    version: PackVersion<'_>,
     cancellation: &CancellationToken,
 ) -> PackResult<ResolvedPack> {
-    let (content, version) = resolve_pack_version(service, canonical_id, version_id).await?;
+    let (content, version) = resolve_pack_version(service, canonical_id, version).await?;
     let file = version.primary_file().ok_or(PackError::SelectionChanged)?;
     let url = validate_download_url(&file.url)?;
     let size = file.size;

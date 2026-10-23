@@ -634,7 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn pack_version_refuses_unidentified_required_file_dependencies() {
-        use super::super::packs::{PackError, resolve_pack_version};
+        use super::super::packs::{PackError, PackVersion, resolve_pack_version};
 
         let project = json!({"id":"ch7UHY2J","title":"Sodium Plus","project_type":"modpack"});
         let (service, server) = fixture(vec![
@@ -645,12 +645,12 @@ mod tests {
         ])
         .await;
         let id = CanonicalId("modrinth:ch7UHY2J".into());
-        let (_, version) = resolve_pack_version(&service, &id, Some("7rxdscKW"))
+        let (_, version) = resolve_pack_version(&service, &id, PackVersion::Exact("7rxdscKW"))
             .await
             .unwrap();
         assert_eq!(version.id, "7rxdscKW");
         assert!(matches!(
-            resolve_pack_version(&service, &id, Some("DdnfdzjY")).await,
+            resolve_pack_version(&service, &id, PackVersion::Exact("DdnfdzjY")).await,
             Err(PackError::Invalid(
                 "required dependency could not be identified"
             ))

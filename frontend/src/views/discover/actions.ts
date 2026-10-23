@@ -5,6 +5,7 @@ import { toast } from '../../toast';
 import { errMessage } from '../../utils';
 import { beginCreateIntent, openCreateModpack } from '../../ui-state';
 import type { ContentSelection, ResolutionPlan } from '../../types-content';
+import { gameVersion, loader } from './state';
 
 export interface AddOutcome {
   status: 'queued' | 'needs-confirmation' | 'failed' | 'superseded';
@@ -55,11 +56,12 @@ export async function commitInstall(
   return { status: 'queued', plan };
 }
 
+/** Without an exact version, the native picker chooses among versions matching the Discover filters. */
 export async function setUpModpack(canonicalId: string, versionId?: string, iconUrl?: string): Promise<boolean> {
   const isCurrent = beginCreateIntent();
   let target;
   try {
-    target = await getModpackTarget(canonicalId, versionId);
+    target = await getModpackTarget(canonicalId, versionId, { gameVersion: gameVersion.value, loader: loader.value });
   } catch (error) {
     if (isCurrent()) toast(errMessage(error), 'error');
     return false;

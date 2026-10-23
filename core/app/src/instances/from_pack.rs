@@ -10,7 +10,7 @@ use super::{
 use crate::content::catalog::ContentService;
 use crate::content::install::{ContentMutations, MutationError};
 use crate::content::model::CanonicalId;
-use crate::content::packs::{PackArchive, PackError, PackIndex, PackPlan, PackResult};
+use crate::content::packs::{PackArchive, PackError, PackIndex, PackPlan, PackResult, PackVersion};
 use crate::install::model::{InstallQueueContentActionRequest, InstallQueueRequest};
 use crate::tasks::CancellationToken;
 use axial_minecraft::loaders::{build_id_for, installed_version_id_for};
@@ -268,7 +268,7 @@ impl SetupService {
             .resolve_pack(
                 content,
                 &CanonicalId(request.canonical_id),
-                Some(&request.version_id),
+                PackVersion::Exact(&request.version_id),
             )
             .await
             .map_err(pack_mutation_error)?;
@@ -336,7 +336,11 @@ impl StoredPackSetup {
                 Some(prepared) => prepared,
                 None => {
                     let pack = mutations
-                        .resolve_pack(content, &self.canonical_id, Some(&self.version_id))
+                        .resolve_pack(
+                            content,
+                            &self.canonical_id,
+                            PackVersion::Exact(&self.version_id),
+                        )
                         .await
                         .map_err(pack_mutation_error)?;
                     PreparedPackCreation::new(

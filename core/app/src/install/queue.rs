@@ -2429,7 +2429,11 @@ impl InstallQueue {
                     let canonical_id = CanonicalId(canonical_id);
                     if selected_file_ids.is_empty() {
                         let pack = mutations
-                            .resolve_pack(&service, &canonical_id, Some(&version_id))
+                            .resolve_pack(
+                                &service,
+                                &canonical_id,
+                                crate::content::packs::PackVersion::Exact(&version_id),
+                            )
                             .await?;
                         mutations.install_pack(&service, &instance_id, pack, include_overrides)?
                     } else {

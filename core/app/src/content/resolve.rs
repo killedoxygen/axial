@@ -1394,6 +1394,18 @@ pub fn pick_version<'a>(
         .max_by(|left, right| compare_version_rank(left, right))
 }
 
+/// The version `pick_version` would choose among those matching `filter`.
+pub fn pick_filtered_version<'a>(
+    versions: &'a [ContentVersion],
+    filter: &LoaderGameFilter,
+) -> Option<&'a ContentVersion> {
+    versions
+        .iter()
+        .filter(|version| version_matches_filter(version, filter))
+        .filter(|version| version.primary_file().is_some())
+        .max_by(|left, right| compare_version_rank(left, right))
+}
+
 fn pick_compatible_version<'a>(
     versions: &'a [ContentVersion],
     forced: Option<&str>,
@@ -3031,6 +3043,52 @@ mod tests {
             "beta-1"
         );
         assert!(pick_version(&versions, Some("missing")).is_none());
+    }
+
+    #[test]
+    fn pick_filtered_version_ranks_only_matching_versions() {
+        let mut forge = version(
+            "forge-rel",
+            ReleaseChannel::Release,
+            vec![file("forge.jar", None)],
+        );
+        forge.loaders = vec!["forge".to_string()];
+        forge.game_versions = vec!["1.20.1".to_string()];
+        let versions = vec![
+            forge,
+            version(
+                "fabric-beta",
+                ReleaseChannel::Beta,
+                vec![file("beta.jar", None)],
+            ),
+        ];
+        let fabric = LoaderGameFilter {
+            loader: Some("fabric".to_string()),
+            game_version: None,
+        };
+        let forge_1_20_1 = LoaderGameFilter {
+            loader: Some("forge".to_string()),
+            game_version: Some("1.20.1".to_string()),
+        };
+        let unmatched = LoaderGameFilter {
+            loader: Some("fabric".to_string()),
+            game_version: Some("1.20.1".to_string()),
+        };
+        assert_eq!(
+            pick_filtered_version(&versions, &LoaderGameFilter::default())
+                .unwrap()
+                .id,
+            "forge-rel"
+        );
+        assert_eq!(
+            pick_filtered_version(&versions, &fabric).unwrap().id,
+            "fabric-beta"
+        );
+        assert_eq!(
+            pick_filtered_version(&versions, &forge_1_20_1).unwrap().id,
+            "forge-rel"
+        );
+        assert!(pick_filtered_version(&versions, &unmatched).is_none());
     }
 
     #[test]
