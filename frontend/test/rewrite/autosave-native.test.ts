@@ -557,6 +557,7 @@ test('cold instance Java settings retain redacted selection and explicit edits',
         assert.ok(node, 'the real JavaPathField must render its custom editor');
         return node.props as {
           value: string;
+          placeholder: string;
           onInput(event: { currentTarget: { value: string } }): void;
           onBlur(): void;
         };
@@ -593,6 +594,7 @@ test('cold instance Java settings retain redacted selection and explicit edits',
           assert.equal(select(tree).value, '', 'the acknowledged clear must display inherited selection');
         } else {
           assert.equal(input(tree).value, '', 'saved private paths must not populate the editor');
+          assert.match(input(tree).placeholder, /^Saved custom path/, 'the redacted editor must show that a path is saved');
           input(tree).onBlur();
           await tick();
           assert.equal(h.writes.length, 0, 'an untouched redacted editor must not clear the saved override');

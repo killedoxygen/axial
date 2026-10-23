@@ -132,7 +132,7 @@ export function JavaPathField({
           <input
             type="text"
             value={value}
-            placeholder="/path/to/java"
+            placeholder={savedCustom ? 'Saved custom path (hidden). Type to replace.' : '/path/to/java'}
             autocomplete="off"
             spellcheck={false}
             disabled={disabled}
