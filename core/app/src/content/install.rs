@@ -217,7 +217,7 @@ impl MutationError {
     pub fn status_code(&self) -> u16 {
         match self {
             Self::Changed | Self::Conflict | Self::Pending | Self::Required | Self::Managed => 409,
-            Self::NotFound => 404,
+            Self::NotFound | Self::Pack(super::packs::PackError::NoMatchingVersion) => 404,
             Self::Cancelled => 409,
             Self::Capacity => 413,
             Self::Unavailable => 503,
@@ -445,13 +445,13 @@ impl ContentMutations {
         &self,
         service: &ContentService,
         canonical_id: &CanonicalId,
-        version_id: Option<&str>,
+        version: super::packs::PackVersion<'_>,
     ) -> Result<super::packs::ResolvedPack, MutationError> {
         Ok(super::packs::resolve_pack(
             service,
             &self._client,
             canonical_id,
-            version_id,
+            version,
             &CancellationToken::new(),
         )
         .await?)
@@ -709,7 +709,11 @@ impl ContentMutations {
         canonical_id: &CanonicalId,
         version_id: Option<&str>,
     ) -> Result<super::packs::PackFilePreview, MutationError> {
-        let pack = self.resolve_pack(service, canonical_id, version_id).await?;
+        let any = super::model::LoaderGameFilter::default();
+        let version = version_id.map_or(super::packs::PackVersion::Newest(&any), |id| {
+            super::packs::PackVersion::Exact(id)
+        });
+        let pack = self.resolve_pack(service, canonical_id, version).await?;
         let target = super::resolve::validated_target(
             &instance.record().instance.loader_key,
             &instance.record().instance.minecraft_version,

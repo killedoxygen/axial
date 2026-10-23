@@ -104,10 +104,24 @@ export function contentCompatibility(selections: ContentSelection[]): Promise<Co
   return api('POST', '/content/compatibility', { selections }).then(contentCompatResponse);
 }
 
+/** Narrows the default pack version when no exact version is chosen. */
+export interface ModpackFilter {
+  gameVersion?: string;
+  loader?: string;
+}
+
 /** What a modpack needs, so an instance can be created for it before importing. */
-export function getModpackTarget(canonicalId: string, versionId?: string): Promise<ModpackTarget> {
+export function getModpackTarget(
+  canonicalId: string,
+  versionId?: string,
+  filter: ModpackFilter = {},
+): Promise<ModpackTarget> {
   const params = new URLSearchParams({ id: canonicalId });
   if (versionId) params.set('version_id', versionId);
+  else {
+    if (filter.gameVersion) params.set('game_version', filter.gameVersion);
+    if (filter.loader) params.set('loader', filter.loader);
+  }
   return api('GET', `/content/modpack/target?${params.toString()}`).then(modpackTargetResponse);
 }
 

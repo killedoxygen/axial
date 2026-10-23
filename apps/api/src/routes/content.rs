@@ -6,6 +6,7 @@ use axial_app::{
         compatibility,
         install::{ContentMutations, MutationError},
         model::*,
+        packs::PackVersion,
         resolve::{self, ResolutionSelection},
         view::{self, TargetRef},
     },
@@ -173,19 +174,25 @@ async fn detail(
 struct PackQuery {
     id: String,
     version_id: Option<String>,
+    game_version: Option<String>,
+    loader: Option<String>,
 }
 async fn modpack_target(
     State(state): State<Arc<ContentRoutes>>,
     request: Result<Query<PackQuery>, QueryRejection>,
 ) -> Result<Json<axial_app::instances::from_pack::ModpackTarget>, Error> {
     let query = query(request)?;
+    let filter = LoaderGameFilter {
+        loader: query.loader,
+        game_version: query.game_version,
+    };
+    let version = query
+        .version_id
+        .as_deref()
+        .map_or(PackVersion::Newest(&filter), PackVersion::Exact);
     let pack = state
         .mutations
-        .resolve_pack(
-            &state.service,
-            &CanonicalId(query.id),
-            query.version_id.as_deref(),
-        )
+        .resolve_pack(&state.service, &CanonicalId(query.id), version)
         .await
         .map_err(mutation_error)?;
     Ok(Json(
@@ -249,10 +256,15 @@ async fn modpack_install(
         ));
     }
     let instance = id(&request.instance_id)?;
+    let any = LoaderGameFilter::default();
+    let version = request
+        .version_id
+        .as_deref()
+        .map_or(PackVersion::Newest(&any), PackVersion::Exact);
     let (content, version) = axial_app::content::packs::resolve_pack_version(
         &state.service,
         &CanonicalId(request.canonical_id),
-        request.version_id.as_deref(),
+        version,
     )
     .await
     .map_err(|failure| mutation_error(failure.into()))?;

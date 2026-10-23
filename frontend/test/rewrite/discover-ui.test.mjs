@@ -188,6 +188,7 @@ async function actionHarness(planResponse = { ...conflictPlan, conflicts: [] }, 
     'toast.ts': { toast: (/** @type {Parameters<typeof import('../../src/toast').toast>} */ ...args) => notices.push(args) },
     'utils.ts': { errMessage: (/** @type {unknown} */ error) => error instanceof Error ? error.message : String(error) },
     'ui-state.ts': ui,
+    'views/discover/state.ts': { gameVersion: { value: '' }, loader: { value: '' } },
   });
   return { actions, requests, applied, notices };
 }
@@ -197,6 +198,7 @@ async function setupHarness() {
   const requests = [];
   /** @type {Parameters<typeof import('../../src/toast').toast>[]} */
   const notices = [];
+  const state = { gameVersion: { value: '' }, loader: { value: '' } };
   const actions = await loadSource('views/discover/actions.ts', {
     'api.ts': {
       api: (/** @type {ApiCall} */ ...args) => {
@@ -213,9 +215,10 @@ async function setupHarness() {
       errMessage: (/** @type {unknown} */ error) => (error instanceof Error ? error.message : String(error)),
     },
     'ui-state.ts': ui,
+    'views/discover/state.ts': state,
   });
   ui.closeCreate();
-  return { actions, requests, notices };
+  return { actions, requests, notices, state };
 }
 
 /** @param {string} id @returns {import('../../src/types-content').ModpackTarget} */
@@ -253,6 +256,36 @@ test('late modpack setup cannot reopen a newer closed creation draft', async (t)
     ],
   );
   assert.deepEqual(notices, []);
+});
+
+test('default modpack setup asks the native picker for the active Discover filters', async (t) => {
+  const { actions, requests, state } = await setupHarness();
+  t.after(() => {
+    ui.closeCreate();
+    state.gameVersion.value = '';
+    state.loader.value = '';
+  });
+  state.gameVersion.value = '1.20.1';
+  state.loader.value = 'forge';
+  const filtered = actions.setUpModpack('modrinth:a');
+  requests[0].response.resolve(packTarget('a'));
+  assert.equal(await filtered, true);
+  const exact = actions.setUpModpack('modrinth:c', 'version-c');
+  requests[1].response.resolve(packTarget('c'));
+  assert.equal(await exact, true);
+  state.gameVersion.value = '';
+  state.loader.value = '';
+  const unfiltered = actions.setUpModpack('modrinth:b');
+  requests[2].response.resolve(packTarget('b'));
+  assert.equal(await unfiltered, true);
+  assert.deepEqual(
+    requests.map(({ args }) => args),
+    [
+      ['GET', '/content/modpack/target?id=modrinth%3Aa&game_version=1.20.1&loader=forge'],
+      ['GET', '/content/modpack/target?id=modrinth%3Ac&version_id=version-c'],
+      ['GET', '/content/modpack/target?id=modrinth%3Ab'],
+    ],
+  );
 });
 
 test('newer modpack intent wins even when the older target arrives first', async (t) => {
