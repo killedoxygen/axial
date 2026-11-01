@@ -5,6 +5,7 @@ mod auth;
 mod bootstrap;
 mod discord_presence;
 mod lifecycle;
+mod native_content;
 mod native_skin;
 #[cfg(debug_assertions)]
 mod reset;
@@ -105,6 +106,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         services.tasks.clone(),
         services.skins.library.clone(),
     );
+    let content_files =
+        native_content::NativeContentFiles::new(services.library.clone(), services.tasks.clone());
     let lifecycle = DesktopLifecycle::new(
         services.tasks.clone(),
         services.server.clone(),
@@ -156,6 +159,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let event_lifecycle = lifecycle.clone();
     let event_bootstrap = bootstrap.clone();
     let event_skin_files = skin_files.clone();
+    let event_content_files = content_files.clone();
     let api_observer = std::sync::Arc::new(std::sync::Mutex::new(None));
     let setup_api_observer = api_observer.clone();
     let builder = tauri::Builder::default()
@@ -166,6 +170,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .manage(bootstrap)
         .manage(lifecycle.clone())
         .manage(skin_files)
+        .manage(content_files)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -174,6 +179,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             native_skin::pick_skin_file,
             native_skin::consume_skin_drop,
             native_skin::export_saved_skin_png,
+            native_content::pick_content_files,
+            native_content::take_content_file,
             bootstrap::api_transport_bootstrap,
             window::desktop_chrome,
             window::window_minimize,
@@ -207,6 +214,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     })
                 {
                     event_skin_files.handle_drag(window, event);
+                    event_content_files.handle_drag(window, event);
                 }
             }
         })

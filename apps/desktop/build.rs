@@ -16,6 +16,8 @@ fn main() {
         "pick_skin_file",
         "consume_skin_drop",
         "export_saved_skin_png",
+        "pick_content_files",
+        "take_content_file",
         #[cfg(debug_assertions)]
         "app_reset",
     ];

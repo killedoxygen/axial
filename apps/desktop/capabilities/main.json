@@ -12,6 +12,8 @@
     "allow-pick-skin-file",
     "allow-consume-skin-drop",
     "allow-export-saved-skin-png",
+    "allow-pick-content-files",
+    "allow-take-content-file",
     "allow-api-transport-bootstrap",
     "allow-desktop-chrome",
     "allow-window-minimize",
