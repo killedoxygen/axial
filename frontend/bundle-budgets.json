@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "maximum_bytes": {
-    "initial_javascript": 224726,
+    "initial_javascript": 226000,
     "initial_css": 191681,
     "lazy_total": 1200989,
     "public_assets": 1124651,

@@ -273,6 +273,7 @@ function harness(
     './launch': {},
     './sound': { Sound },
     './state': state,
+    './native': { isMacPlatform: () => false, desktopPlatform: () => 'linux' },
   });
   const skin = source<typeof import('../../src/player-skin')>('player-skin.ts', {
     './api': api,

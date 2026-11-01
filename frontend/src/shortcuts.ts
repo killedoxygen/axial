@@ -6,6 +6,7 @@ import { launchGame } from './launch';
 import { Sound } from './sound';
 import { local, saveLocalState, canEditPreferences } from './state';
 import type { ShortcutBinding } from './types-ui';
+import { desktopPlatform, isMacPlatform } from './native';
 
 export type ShortcutId = 'open-settings' | 'new-instance' | 'command-palette' | 'launch-selected' | 'dismiss';
 
@@ -101,10 +102,17 @@ export function setShortcutOverride(id: ShortcutId, combo: ShortcutBinding | nul
   shortcutsVersion.value += 1;
 }
 
+/** Built-in Ctrl shortcuts use Cmd on macOS; recorded overrides keep their exact keys. */
+function platformDefault(combo: ShortcutBinding): ShortcutBinding {
+  if (!combo.ctrl || combo.meta || !isMacPlatform()) return combo;
+  const { ctrl: _ctrl, ...rest } = combo;
+  return { ...rest, meta: true };
+}
+
 export function effectiveCombos(def: ShortcutDef): ShortcutBinding[] {
   if (def.fixed) return def.defaultCombos;
   const override = shortcutOverride(def.id);
-  return override ? [override] : def.defaultCombos;
+  return override ? [override] : def.defaultCombos.map(platformDefault);
 }
 
 function normalizedKey(key: string): string {
@@ -160,27 +168,28 @@ function displayKey(key: string): string {
   return key.length === 1 ? key.toUpperCase() : key;
 }
 
-export function comboParts(combo: ShortcutBinding): string[] {
+/** Modifier labels in each platform's conventional order (macOS: ⌃ ⌥ ⇧ ⌘). */
+function modifierParts(mods: { ctrl?: boolean; alt?: boolean; shift?: boolean; meta?: boolean }): string[] {
+  const mac = isMacPlatform();
   const parts: string[] = [];
-  if (combo.ctrl) parts.push('Ctrl');
-  if (combo.alt) parts.push('Alt');
-  if (combo.shift) parts.push('Shift');
-  if (combo.meta) parts.push('Cmd');
-  parts.push(displayKey(combo.key));
+  if (mods.ctrl) parts.push(mac ? '⌃' : 'Ctrl');
+  if (mods.alt) parts.push(mac ? '⌥' : 'Alt');
+  if (mods.shift) parts.push(mac ? '⇧' : 'Shift');
+  if (mods.meta) parts.push(mac ? '⌘' : desktopPlatform() === 'windows' ? 'Win' : 'Super');
   return parts;
 }
 
+export function comboParts(combo: ShortcutBinding): string[] {
+  return [...modifierParts(combo), displayKey(combo.key)];
+}
+
 export function eventComboParts(e: KeyboardEvent, includeKey = true): string[] {
-  const parts: string[] = [];
-  if (e.ctrlKey) parts.push('Ctrl');
-  if (e.altKey) parts.push('Alt');
-  if (e.shiftKey) parts.push('Shift');
-  if (e.metaKey) parts.push('Cmd');
+  const parts = modifierParts({ ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey });
   const isModifier = e.key === 'Control' || e.key === 'Alt' || e.key === 'Shift' || e.key === 'Meta';
   if (includeKey && !isModifier) parts.push(displayKey(e.key));
   return parts;
 }
 
-export function shortcutHint(id: ShortcutId, separator = ' '): string {
+export function shortcutHint(id: ShortcutId, separator = isMacPlatform() ? '' : ' '): string {
   return comboParts(effectiveCombos(shortcutById(id))[0]!).join(separator);
 }

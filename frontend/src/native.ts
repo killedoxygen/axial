@@ -92,6 +92,18 @@ async function getNativeDesktopChrome(): Promise<NativeDesktopChrome> {
   return desktopChromeFromPayload(payload);
 }
 
+export function desktopPlatform(): DesktopPlatform {
+  return desktopChrome.platform;
+}
+
+/** macOS desktop, or a browser running on a Mac when no native shell reports a platform. */
+export function isMacPlatform(): boolean {
+  if (desktopChrome.platform !== 'browser' && desktopChrome.platform !== 'unknown') {
+    return desktopChrome.platform === 'macos';
+  }
+  return typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || navigator.userAgent);
+}
+
 export function hasCustomWindowControls(): boolean {
   return desktopChrome.chrome_mode === 'custom-frameless';
 }
