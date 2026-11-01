@@ -4808,7 +4808,7 @@ mod tests {
             serde_json::json!([{
                 "canonical_id":"modrinth:known", "kind":"existing_file",
                 "detail":"A different known.zip is already in the resourcepacks folder.",
-                "path":"resourcepacks/known.zip",
+                "path":"resourcepacks/known.zip", "title":"Known pack",
             }])
         );
         let instance = owner.directories.admit(&id).unwrap();
