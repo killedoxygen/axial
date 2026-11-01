@@ -61,7 +61,7 @@ function instance(launchable = false) {
 }
 
 function queue(revision: number, registryRevision: number): InstallQueueStateResponse {
-  return { queue_epoch: 'setup-queue', revision, registry_revision: registryRevision, active: null, items: [], latest_failure: null,
+  return { queue_epoch: 'setup-queue', revision, registry_revision: registryRevision, active: null, items: [], failures: [],
     view_model: { state_id: 'idle', status_label: 'Idle', title: 'Downloads', summary: 'Ready', queued_count: 0,
       queued_count_label: 'No queued downloads', queued_item_label: 'No items queued', section_title: 'Queue',
       empty_title: 'Nothing downloading', empty_summary: 'Ready' } };

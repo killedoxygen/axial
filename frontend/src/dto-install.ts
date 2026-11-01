@@ -227,7 +227,8 @@ export function installQueueStateResponse(value: unknown): InstallQueueStateResp
     queue_epoch: epoch,
     revision: unsignedInteger(record.revision, 'Install queue revision'),
     registry_revision: unsignedInteger(record.registry_revision, 'Install registry revision'),
-    latest_failure: record.latest_failure == null ? null : queueFailureResponse(record.latest_failure),
+    failures:
+      record.failures == null ? [] : dtoArray(record.failures, 'Install queue failures').map(queueFailureResponse),
     active: record.active == null ? null : activeResponse(record.active),
     items: dtoArray(record.items, 'Install queue items').map(queuedItemResponse),
     view_model: queueViewResponse(record.view_model),

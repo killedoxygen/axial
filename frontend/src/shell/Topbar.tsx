@@ -7,7 +7,7 @@ import { MusicWidget } from './MusicWidget';
 import { UpdateWidget } from './UpdateWidget';
 import { goBack, goForward, navigate, route } from '../ui-state';
 import { launchSessions, instances, versionById, launchState } from '../store';
-import { activeDownload, downloadFailure, downloadQueue } from '../machines/downloads';
+import { activeDownload, downloadFailures, downloadQueue } from '../machines/downloads';
 import { hasVisibleUpdate, updateFlow, updateFlowActive } from '../updater';
 import { minecraftVersionLabel } from '../version-display';
 import { hasCustomDragRegion, windowStartDragging, windowToggleMaximize } from '../native';
@@ -143,7 +143,8 @@ function StatusPill(): JSX.Element {
 
   const launch = launchState.value;
   const queueState = downloadQueue.value;
-  const failure = downloadFailure.value;
+  const failures = downloadFailures.value;
+  const failure = failures[0];
 
   const rawFlowLabel =
     inst && session
@@ -217,7 +218,7 @@ function StatusPill(): JSX.Element {
     mod = ' cp-status-pill--failed';
     onClick = () => navigate({ name: 'downloads' });
     title = `${failure.displayName}: ${failure.viewModel.summary}`;
-    ariaLabel = `Open downloads. Install failed: ${title}`;
+    ariaLabel = `Open downloads. ${failures.length} failed: ${title}`;
     content = <span class="cp-status-pill-label">Failed</span>;
   }
 

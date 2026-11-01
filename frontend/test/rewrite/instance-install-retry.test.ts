@@ -23,7 +23,7 @@ const { enrichedInstanceResponse } = core;
 function harness() {
   const downloads = {
     activeDownload: { value: null as ActiveDownload | null },
-    downloadFailure: { value: null as DownloadFailure | null },
+    downloadFailures: { value: [] as DownloadFailure[] },
     downloadQueue: { value: { items: [] as InstallQueuedItemViewModel[] } },
   };
   const filename = resolve(frontend, 'src/instance-install-status.ts');
@@ -112,8 +112,11 @@ function queued(installTarget: InstallQueueInstallItemViewModel): InstallQueuedI
 
 function failed(installTarget: InstallQueueInstallItemViewModel): DownloadFailure {
   return {
+    operationId: 'failed-operation',
     item: installItems.installItemFromQueueInstallItem(installTarget),
     displayName: 'Loader',
+    instanceId: null,
+    instanceName: null,
     failedAt: 1,
     viewModel: {
       state_id: 'failed',
@@ -140,9 +143,9 @@ for (const component of [
       const h = harness();
       const parsed = enrichedInstanceResponse(wire);
       if (outcome === 'failed') {
-        h.downloads.downloadFailure.value = failed(installTarget);
+        h.downloads.downloadFailures.value = [failed(installTarget)];
         assert.equal(h.instanceInstallStatus(parsed, undefined).state, 'failed');
-        h.downloads.downloadFailure.value = null;
+        h.downloads.downloadFailures.value = [];
       } else {
         h.downloads.downloadQueue.value.items = [queued(installTarget)];
         assert.equal(h.instanceInstallStatus(parsed, undefined).state, 'queued');
@@ -171,7 +174,7 @@ test('an explicit unavailable target cannot become a vanilla install or inherit 
   const wire = instance(null);
   const stale = target('net.fabricmc.fabric-loader');
   stale.version_id = wire.version_id;
-  h.downloads.downloadFailure.value = failed(stale);
+  h.downloads.downloadFailures.value = [failed(stale)];
   h.downloads.downloadQueue.value.items = [queued(stale)];
   const parsed = enrichedInstanceResponse(wire);
   assert.equal(parsed.install_target, null);
@@ -189,7 +192,7 @@ test('an authoritative loader target does not match another build with the same 
   const expected = target('net.fabricmc.fabric-loader');
   const other = structuredClone(expected);
   other.loader!.build_id = 'different-build';
-  h.downloads.downloadFailure.value = failed(other);
+  h.downloads.downloadFailures.value = [failed(other)];
   h.downloads.downloadQueue.value.items = [queued(other)];
   const status = h.instanceInstallStatus(enrichedInstanceResponse(instance(expected)), undefined);
   assert.equal(status.state, 'idle');
@@ -391,7 +394,7 @@ test('the real instance header follows installation and backend readiness instea
   h.downloads.downloadQueue.value.items = [{ ...queued(installTarget), title: 'Queued install' }];
   assert.equal(status(), 'Queued install');
   h.downloads.downloadQueue.value.items = [];
-  h.downloads.downloadFailure.value = failed(installTarget);
+  h.downloads.downloadFailures.value = [failed(installTarget)];
   assert.equal(status(), 'Install failed');
   store.instances.value = [
     { ...inst, launch_action: { ...inst.launch_action, primary_action: 'blocked', label: 'Unavailable' } },

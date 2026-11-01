@@ -35,6 +35,10 @@ pub fn router(queue: Arc<InstallQueue>, setup: Arc<SetupService>) -> Router {
         .route("/api/v1/install/queue", get(snapshot).post(enqueue))
         .route("/api/v1/install/queue/events", get(queue_events))
         .route("/api/v1/install/queue/{id}", delete(remove))
+        .route(
+            "/api/v1/install/queue/failures/{operation_id}",
+            delete(dismiss_failure),
+        )
         .route("/api/v1/install/{id}/status", get(status))
         .route("/api/v1/install/{id}/events", get(install_events))
         .route("/api/v1/install/{id}/cancel", post(cancel))
@@ -89,6 +93,14 @@ async fn remove(
     Path(id): Path<String>,
 ) -> Result<Json<InstallQueueStateResponse>, ApiError> {
     queue.remove(&id).await.map(Json).map_err(failure)
+}
+async fn dismiss_failure(
+    State(queue): State<Arc<InstallQueue>>,
+    Path(operation_id): Path<String>,
+) -> Result<Json<InstallQueueStateResponse>, ApiError> {
+    let operation_id = axial_app::public::OperationId::parse(&operation_id)
+        .map_err(|_| failure(InstallError::InvalidRequest))?;
+    Ok(Json(queue.dismiss_failure(&operation_id)))
 }
 async fn status(
     State(queue): State<Arc<InstallQueue>>,

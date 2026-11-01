@@ -120,7 +120,7 @@ function queue() {
     queue_epoch: 'queue-1',
     revision: 4,
     registry_revision: 0,
-    latest_failure: null,
+    failures: [],
     active: null,
     items: [],
     view_model: {

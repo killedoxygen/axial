@@ -32,7 +32,7 @@ function queue(revision = 1, registryRevision = 0): InstallQueueStateResponse {
     registry_revision: registryRevision,
     active: null,
     items: [],
-    latest_failure: null,
+    failures: [],
     view_model: {
       state_id: 'empty',
       status_label: `Snapshot ${revision}`,

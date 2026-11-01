@@ -65,7 +65,7 @@ function retained(overrides: Partial<InstallQueueActiveViewModel> = {}): Install
 
 function queue(active: InstallQueueActiveViewModel | null = retained(), revision = 1): InstallQueueStateResponse {
   return {
-    queue_epoch: 'current-process', revision, registry_revision: 0, active, items: [],
+    queue_epoch: 'current-process', revision, registry_revision: 0, failures: [], active, items: [],
     view_model: { state_id: active ? 'active' : 'idle', status_label: active ? 'Installing' : 'Idle',
       title: 'Downloads', summary: '', queued_count: 0, queued_count_label: 'No queued downloads',
       queued_item_label: 'No items queued', section_title: 'Queue', empty_title: 'Nothing downloading', empty_summary: '' },
@@ -82,15 +82,17 @@ function harness() {
     versions: signal<unknown[]>([]), instances: signal<unknown[]>([]), lastInstanceId: signal(null),
     config: signal(null), launchSessions: signal({}), launchState: signal({ status: 'idle' }),
   };
+  const api = { api: async (method: string, path: string, body?: unknown) => {
+    calls.push({ method, path, body });
+    if (path === '/versions') return { versions: [] };
+    if (path === '/instances') return { instances: [], last_instance_id: null };
+    return request(method, path);
+  } };
+  const utils = { errMessage: String, showError: (message: string) => errors.push(message) };
   const machine = source<typeof import('../../src/machines/downloads')>('machines/downloads.ts', {
     '@preact/signals': signals,
-    '../api': { api: async (method: string, path: string, body?: unknown) => {
-      calls.push({ method, path, body });
-      if (path === '/versions') return { versions: [] };
-      if (path === '/instances') return { instances: [], last_instance_id: null };
-      return request(method, path);
-    } },
-    '../utils': { errMessage: String, showError: (message: string) => errors.push(message) },
+    '../api': api,
+    '../utils': utils,
     '../toast': { toast() {} },
     '../loaders/api': { connectInstallQueueSSE: (onValue: typeof receive) => {
       receive = onValue; subscriptions++; return () => {};
@@ -106,6 +108,7 @@ function harness() {
     'preact/jsx-runtime': jsx, '../../ui/Atoms': atoms, '../../ui/Icons': { Icon: 'Icon' },
     '../../ui/DownloadFailureNotice': { DownloadFailureNotice: 'DownloadFailureNotice' },
     '../../hooks/use-now': { useNowTicker: () => 0 }, '../../machines/downloads': machine,
+    '../../api': api, '../../dto-install': installContract, '../../store': store, '../../utils': utils,
   });
   return {
     machine, calls, errors, store,
@@ -221,7 +224,7 @@ for (const failure of ['Response lost', 'Install is busy']) {
     await h.machine.retryActiveInstall('install-retained');
     assert.equal(h.machine.activeInstallRetryPending.value, true);
     assert.equal(h.machine.activeDownload.value?.installId, 'install-retained');
-    assert.equal(h.machine.downloadFailure.value, null);
+    assert.deepEqual(h.machine.downloadFailures.value, []);
     assert.equal(h.calls.filter((call) => call.method === 'POST').length, 1);
     assert.equal(h.calls.filter((call) => call.path === '/install/queue').length, 1);
     read.resolve(queue(retained({ retry_action: { action: 'retry', label: 'Retry settlement', enabled: false,
@@ -229,7 +232,7 @@ for (const failure of ['Response lost', 'Install is busy']) {
     await retry;
     assert.equal(h.machine.activeInstallRetryPending.value, false);
     assert.equal(h.retryButton()?.props.disabled, true);
-    assert.equal(h.machine.downloadFailure.value, null);
+    assert.deepEqual(h.machine.downloadFailures.value, []);
     assert.equal(h.errors.length, 1);
     assert.equal(h.subscriptions, 1);
   });
@@ -241,7 +244,7 @@ test('failed mutation and reconciliation reads preserve the active install until
   h.request(async () => { throw new Error('Connection unavailable'); });
   await h.machine.retryActiveInstall('install-retained');
   assert.equal(h.machine.activeDownload.value?.installId, 'install-retained');
-  assert.equal(h.machine.downloadFailure.value, null);
+  assert.deepEqual(h.machine.downloadFailures.value, []);
   assert.equal(h.calls.filter((call) => call.method === 'POST').length, 1);
   assert.equal(h.calls.filter((call) => call.path === '/install/queue').length, 1);
   const settled = { ...queue(null, 3), registry_revision: 1 };
@@ -272,7 +275,7 @@ for (const delivery of ['response', 'reconciliation'] as const) {
       oldReply.resolve({ ...queue(null, 2), registry_revision: 0 });
       await retry;
       assert.equal(h.machine.activeDownload.value?.installId, 'next-install');
-      assert.equal(h.machine.downloadFailure.value, null);
+      assert.deepEqual(h.machine.downloadFailures.value, []);
       assert.equal(h.calls.filter((call) => call.path === '/instances').length, reads);
       assert.equal(h.calls.filter((call) => call.method === 'POST').length, 1);
     }
@@ -282,13 +285,13 @@ for (const delivery of ['response', 'reconciliation'] as const) {
 test('ordinary failure retry and queue removal keep their existing routes and exact items', async () => {
   const h = harness();
   const failed = queue(null);
-  failed.latest_failure = {
+  failed.failures = [{
     failed_at_ms: 1, queue_id: 'failed-queue', install_id: 'failed-install', operation_id: 'failed-operation',
     label: 'Minecraft', install_item: { version_id: '1.20.1' },
     failure_view_model: { state_id: 'failed', title: 'Install failed', tone: 'err', summary: 'Download failed', details: [],
       retry_action: { action: 'retry', label: 'Retry', enabled: true },
       dismiss_action: { action: 'dismiss', label: 'Dismiss', enabled: true } },
-  };
+  }];
   await h.load(failed);
   assert.equal(h.retryButton(), undefined);
   const notice = h.view().find((node) => node.type === 'DownloadFailureNotice');
@@ -298,14 +301,21 @@ test('ordinary failure retry and queue removal keep their existing routes and ex
   assert.deepEqual(h.calls.find((call) => call.method === 'POST'), {
     method: 'POST', path: '/install/queue/retry', body: { kind: 'vanilla', version_id: '1.20.1' },
   });
-  const queued = queue(null, 3);
+  h.request(async () => queue(null, 3));
+  await (notice.props.onDismiss as () => Promise<void>)();
+  await flush();
+  assert.deepEqual(h.calls.filter((call) => call.method === 'DELETE').map((call) => call.path),
+    ['/install/queue/failures/failed-operation']);
+  assert.deepEqual(h.machine.downloadFailures.value, []);
+  const queued = queue(null, 4);
   queued.items = [{ queue_id: 'queued/id', state_id: 'queued', kind: 'vanilla', title: 'Minecraft', label: '1.20.1',
     summary: 'Queued', detail: '', position: 1, total: 1, install_item: { version_id: '1.20.1' },
     remove_action: { action: 'remove_from_queue', label: 'Remove', enabled: true } }];
   await h.load(queued);
-  h.request(async () => queue(null, 4));
+  h.request(async () => queue(null, 5));
   await h.machine.removeQueuedInstall('queued/id');
-  assert.equal(h.calls.find((call) => call.method === 'DELETE')?.path, '/install/queue/queued%2Fid');
+  assert.deepEqual(h.calls.filter((call) => call.method === 'DELETE').map((call) => call.path),
+    ['/install/queue/failures/failed-operation', '/install/queue/queued%2Fid']);
   assert.equal(h.machine.downloadQueue.value.items.length, 0);
   assert.equal(h.errors.length, 0);
 });

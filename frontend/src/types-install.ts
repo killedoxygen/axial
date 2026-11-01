@@ -175,7 +175,7 @@ export interface InstallQueueStateResponse {
   queue_epoch: string;
   revision: number;
   registry_revision: number;
-  latest_failure?: InstallQueueFailureViewModel | null;
+  failures: InstallQueueFailureViewModel[];
   active?: InstallQueueActiveViewModel | null;
   items: InstallQueuedItemViewModel[];
   view_model: InstallQueueViewModel;

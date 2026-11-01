@@ -4290,7 +4290,7 @@ async fn created_instance_survives_install_queue_refusal_and_reopen() {
                     assert_eq!(pending, json!({"creations":[],"deletions":[]}));
                     assert_eq!(queue["items"], json!([]));
                     assert!(queue["active"].is_null());
-                    assert!(queue["latest_failure"].is_null());
+                    assert!(queue["failures"].is_null());
                     assert_eq!(queue["view_model"], queue_before["view_model"]);
                     assert_eq!(sessions, json!({"sessions":[]}));
                     assert_eq!(reports, json!({"reports":[]}));
@@ -7239,7 +7239,7 @@ async fn shutdown_refuses_held_materialization_then_installation_survives_reopen
             assert_eq!(reopened_status, terminal);
             for state in [queue, reopened_queue] {
                 assert_eq!(state["items"], json!([]));
-                assert!(state["active"].is_null() && state["latest_failure"].is_null());
+                assert!(state["active"].is_null() && state["failures"].is_null());
             }
         }
     })
@@ -7585,7 +7585,7 @@ fn queued_fabric_artifact_failure_preserves_safe_provider_diagnostic() {
             assert_eq!(terminal["view_model"]["failed"], true);
             assert_eq!(queue["items"], json!([]));
             assert!(queue["active"].is_null());
-            assert_eq!(queue["latest_failure"]["install_id"], terminal["install_id"]);
+            assert_eq!(queue["failures"][0]["install_id"], terminal["install_id"]);
             assert!(!capture.overflow.load(Ordering::SeqCst), "diagnostic capture must be complete");
             let diagnostic = String::from_utf8(capture.bytes.lock().unwrap().clone()).unwrap();
             assert!(!diagnostic.contains(&provider_base));

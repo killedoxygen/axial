@@ -228,8 +228,9 @@ pub struct InstallQueueStateResponse {
     pub revision: u64,
     /// Changes whenever a completed operation may change installed/instance views.
     pub registry_revision: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest_failure: Option<InstallQueueFailureViewModel>,
+    /// Undismissed failures, newest first. A later success for the same item clears its failure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<InstallQueueFailureViewModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<InstallQueueActiveViewModel>,
     pub items: Vec<InstallQueuedItemViewModel>,

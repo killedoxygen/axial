@@ -756,6 +756,7 @@ function mockEmptyInstallQueue(message?: string, detail?: string): InstallQueueS
     queue_epoch: 'mock-queue',
     revision: 0,
     registry_revision: 0,
+    failures: [],
     active: null,
     items: [],
     view_model: {

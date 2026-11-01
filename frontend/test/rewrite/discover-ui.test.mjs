@@ -79,7 +79,7 @@ const conflictPlan = {
 /** @returns {import('../../src/types-install').InstallQueueStateResponse} */
 function queueResponse() {
   return {
-    queue_epoch: 'queue-1', revision: 1, registry_revision: 0, latest_failure: null,
+    queue_epoch: 'queue-1', revision: 1, registry_revision: 0, failures: [],
     active: null, items: [], notice: null, started_install: null,
     view_model: {
       state_id: 'idle', status_label: 'Idle', title: 'Downloads', summary: '', queued_count: 0,

@@ -799,9 +799,7 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
                     .collect::<Vec<_>>()
             );
             let queue = reopened.installs.snapshot();
-            assert!(
-                queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none()
-            );
+            assert!(queue.items.is_empty() && queue.active.is_none() && queue.failures.is_empty());
             let published = records
                 .iter()
                 .filter(|record| {
@@ -1691,7 +1689,7 @@ async fn dropped_resolution_caller_keeps_owned_fetch_until_shutdown() {
         );
         let (records, pending, queue) = final_state.unwrap();
         assert!(records.is_empty() && pending.is_empty());
-        assert!(queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none());
+        assert!(queue.items.is_empty() && queue.active.is_none() && queue.failures.is_empty());
         assert_eq!(queue.registry_revision, registry_revision);
         assert!(absent(&cache) && absent(&target) && absent(&instances));
         assert_eq!(
@@ -1976,7 +1974,7 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
         );
         let (records, pending, queue, cached) = final_state.unwrap();
         assert!(pending.is_empty());
-        assert!(queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none());
+        assert!(queue.items.is_empty() && queue.active.is_none() && queue.failures.is_empty());
         assert_eq!(queue.registry_revision, registry_revision);
         assert!(absent(&root.path().join("cache/version_manifest_v2.json")));
         assert!(
@@ -2354,7 +2352,7 @@ async fn shutdown_preserves_created_instance_while_install_provider_is_pending()
         assert_eq!(records[0].instance.name, "PendingInstallProvider");
         assert_eq!(records[0].instance.version_id, version_id);
         assert_eq!(queue_at_commit, queue_before);
-        assert!(queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none());
+        assert!(queue.items.is_empty() && queue.active.is_none() && queue.failures.is_empty());
         assert_eq!(queue.registry_revision, queue_before.registry_revision);
         assert_eq!(std::fs::read(&cache).unwrap(), cache_at_commit);
         let (builds, state) = cached.expect("initial real Fabric response was not cached");
@@ -2689,9 +2687,7 @@ async fn explicit_build_resolution_cancels_without_publishing() {
             );
             let (records, pending, queue, cache_absent) = final_state.unwrap();
             assert!(records.is_empty() && pending.is_empty() && cache_absent);
-            assert!(
-                queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none()
-            );
+            assert!(queue.items.is_empty() && queue.active.is_none() && queue.failures.is_empty());
             assert_eq!(queue.registry_revision, queue_before.registry_revision);
             assert!(
                 absent(&cache)
@@ -3099,9 +3095,7 @@ async fn loader_picker_fetches(retain_runtime: &std::cell::Cell<bool>) {
             }
             let (records, pending, queue, cache_absent) = final_state.unwrap();
             assert!(records.is_empty() && pending.is_empty());
-            assert!(
-                queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none()
-            );
+            assert!(queue.items.is_empty() && queue.active.is_none() && queue.failures.is_empty());
             assert_eq!(queue.registry_revision, registry_revision);
             assert!(absent(&root.path().join("instances")));
             assert!(absent(&root.path().join("cache/version_manifest_v2.json")));
@@ -3395,9 +3389,7 @@ async fn dropped_loader_versions_caller_keeps_owned_fetch_until_shutdown() {
             );
             let (records, pending, queue, cached_manifest) = final_state.unwrap();
             assert!(records.is_empty() && pending.is_empty());
-            assert!(
-                queue.items.is_empty() && queue.active.is_none() && queue.latest_failure.is_none()
-            );
+            assert!(queue.items.is_empty() && queue.active.is_none() && queue.failures.is_empty());
             assert_eq!(queue.registry_revision, queue_before.registry_revision);
             if let Some(provider_cache_before) = provider_cache_before {
                 assert_eq!(std::fs::read(&cache).unwrap(), provider_cache_before);

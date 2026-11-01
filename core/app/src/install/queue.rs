@@ -49,6 +49,9 @@ use std::{
 };
 use tokio::{sync::watch, task::JoinSet};
 
+/// Failures retained for display until dismissed or superseded.
+const RETAINED_FAILURES: usize = 8;
+
 pub const MIGRATION: Migration = Migration {
     id: "install.v1",
     sql: "
@@ -192,7 +195,7 @@ struct State {
     queued: VecDeque<String>,
     active: Option<String>,
     entries: BTreeMap<String, Entry>,
-    latest_failure: Option<InstallQueueFailureViewModel>,
+    failures: VecDeque<InstallQueueFailureViewModel>,
     closed: bool,
 }
 struct Entry {
@@ -234,7 +237,7 @@ impl InstallQueue {
             queued: VecDeque::new(),
             active: None,
             entries: BTreeMap::new(),
-            latest_failure: None,
+            failures: VecDeque::new(),
             closed: false,
         };
         let pending: Vec<(String, String, String, String, String, String)> = storage.read(|db| {
@@ -481,6 +484,18 @@ impl InstallQueue {
     }
     pub fn snapshot(&self) -> InstallQueueStateResponse {
         project(&self.inner.state.lock().expect("install queue lock"))
+    }
+    /// Dismissal is shared by every client. An absent failure is already dismissed.
+    pub fn dismiss_failure(&self, operation_id: &OperationId) -> InstallQueueStateResponse {
+        let mut state = self.inner.state.lock().expect("install queue lock");
+        let before = state.failures.len();
+        state
+            .failures
+            .retain(|failure| &failure.operation_id != operation_id);
+        if state.failures.len() != before {
+            publish(&self.inner, &mut state);
+        }
+        project(&state)
     }
     pub(crate) fn active_count(&self) -> usize {
         let state = self.inner.state.lock().expect("install queue lock");
@@ -2881,16 +2896,28 @@ impl InstallQueue {
         entry.recovery_lease = None;
         entry.retained = None;
         entry.setup = None;
-        if let Some(failure) = &entry.status.failure_view_model {
-            state.latest_failure = Some(InstallQueueFailureViewModel {
-                failed_at_ms: now_ms(),
-                queue_id: id.into(),
-                install_id: id.into(),
-                operation_id: entry.status.operation_id.clone(),
-                label: item_label(&entry.item),
-                install_item: entry.item.clone(),
-                failure_view_model: failure.clone(),
-            });
+        let item = entry.item.clone();
+        let failure =
+            entry
+                .status
+                .failure_view_model
+                .clone()
+                .map(|failure| InstallQueueFailureViewModel {
+                    failed_at_ms: now_ms(),
+                    queue_id: id.into(),
+                    install_id: id.into(),
+                    operation_id: entry.status.operation_id.clone(),
+                    label: item_label(&item),
+                    install_item: item.clone(),
+                    failure_view_model: failure,
+                });
+        // A terminal result for an item supersedes its earlier failure.
+        state
+            .failures
+            .retain(|previous| previous.install_item != item);
+        if let Some(failure) = failure {
+            state.failures.push_front(failure);
+            state.failures.truncate(RETAINED_FAILURES);
         }
         state.active = None;
         state.registry_revision = state.registry_revision.saturating_add(1);
@@ -3561,7 +3588,7 @@ fn project(state: &State) -> InstallQueueStateResponse {
         queue_epoch: state.epoch.clone(),
         revision: state.revision,
         registry_revision: state.registry_revision,
-        latest_failure: state.latest_failure.clone(),
+        failures: state.failures.iter().cloned().collect(),
         active,
         items,
         view_model: InstallQueueViewModel {
@@ -4609,6 +4636,82 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn failures_are_listed_newest_first_until_superseded_or_dismissed() {
+        use axial_minecraft::loaders::{build_id_for, installed_version_id_for};
+
+        let (_root, _storage, library, _exclusions, _owner, queue) = fixture();
+        let item = |component: LoaderComponentId| InstallQueueInstallItemViewModel {
+            version_id: installed_version_id_for(component, "1.20.1", "0.19.5").unwrap(),
+            loader: Some(InstallQueueLoaderItemViewModel {
+                component_id: component.as_str().into(),
+                build_id: build_id_for(component, "1.20.1", "0.19.5"),
+                minecraft_version: "1.20.1".into(),
+                loader_version: "0.19.5".into(),
+            }),
+            content: None,
+        };
+        let run = |component: LoaderComponentId, outcome: InstallOutcome| {
+            let item = item(component);
+            let id = {
+                let mut state = queue.inner.state.lock().unwrap();
+                let id = queue
+                    .admit_locked(
+                        &mut state,
+                        InstallQueueRequest::Loader {
+                            component_id: component,
+                            build_id: item.loader.as_ref().unwrap().build_id.clone(),
+                        },
+                        item,
+                        library.admit().unwrap(),
+                        None,
+                        false,
+                    )
+                    .unwrap();
+                state.queued.retain(|queued| queued != &id);
+                state.active = Some(id.clone());
+                id
+            };
+            let error = (outcome == InstallOutcome::Failed).then_some(InstallError::Failed);
+            assert!(queue.complete(&id, outcome, error));
+        };
+        let labels = |queue: &InstallQueue| {
+            queue
+                .snapshot()
+                .failures
+                .into_iter()
+                .map(|failure| failure.label)
+                .collect::<Vec<_>>()
+        };
+        run(LoaderComponentId::Fabric, InstallOutcome::Failed);
+        run(LoaderComponentId::Quilt, InstallOutcome::Failed);
+        run(LoaderComponentId::Fabric, InstallOutcome::Failed);
+        assert_eq!(
+            labels(&queue),
+            [
+                "Fabric 0.19.5 for Minecraft 1.20.1",
+                "Quilt 0.19.5 for Minecraft 1.20.1"
+            ]
+        );
+        run(LoaderComponentId::Fabric, InstallOutcome::Succeeded);
+        assert_eq!(labels(&queue), ["Quilt 0.19.5 for Minecraft 1.20.1"]);
+
+        let failure = queue.snapshot().failures.remove(0);
+        let revision = queue.snapshot().revision;
+        assert!(
+            queue
+                .dismiss_failure(&failure.operation_id)
+                .failures
+                .is_empty()
+        );
+        let dismissed = queue.snapshot();
+        assert!(dismissed.revision > revision);
+        assert_eq!(
+            queue.dismiss_failure(&failure.operation_id).revision,
+            dismissed.revision
+        );
+    }
+
+    #[tokio::test]
     async fn loader_queue_labels_preserve_identity_across_queued_active_and_failed_views() {
         use axial_minecraft::loaders::{build_id_for, installed_version_id_for};
 
@@ -4659,7 +4762,7 @@ pub(crate) mod tests {
                 id
             };
             assert!(queue.complete(&id, InstallOutcome::Failed, Some(InstallError::Failed)));
-            let failure = queue.snapshot().latest_failure.unwrap();
+            let failure = queue.snapshot().failures.remove(0);
             assert_eq!(failure.label, expected);
             assert_eq!(failure.install_item, item);
         }

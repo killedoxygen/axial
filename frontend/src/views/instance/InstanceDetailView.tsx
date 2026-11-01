@@ -344,7 +344,7 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
             installQueuedView={installQueuedView}
             installProgress={installProgress}
             installFailure={matchingInstallFailure}
-            onRetryInstall={retryFailedInstall}
+            onRetryInstall={() => matchingInstallFailure && retryFailedInstall(matchingInstallFailure)}
           />
         )}
         {!installLocked && activeTab === 'mods' && (

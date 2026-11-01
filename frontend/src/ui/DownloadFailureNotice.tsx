@@ -1,19 +1,22 @@
 import type { ComponentChildren, JSX } from 'preact';
-import { Button, IconButton, Pill } from './Atoms';
+import { Button, IconButton } from './Atoms';
 import { Icon } from './Icons';
 import type { DownloadFailure } from '../machines/downloads';
 
 function formatFailureTime(timestamp: number): string {
-  return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return new Date(timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
 export function DownloadFailureNotice({
   failure,
+  instanceName,
   onRetry,
   onDismiss,
   trailing,
 }: {
   failure: DownloadFailure;
+  /** Where a content operation ran, named by the caller. */
+  instanceName?: string;
   onRetry: () => void;
   onDismiss?: () => void;
   trailing?: ComponentChildren;
@@ -30,12 +33,12 @@ export function DownloadFailureNotice({
       </div>
       <div class="cp-notice-copy">
         <div class="cp-dlfail-head">
-          <strong>{view.title || 'Install failed'}</strong>
-          <Pill tone="err" icon="alert">
-            Failed
-          </Pill>
+          <strong>{failure.displayName || view.title || 'Install failed'}</strong>
         </div>
-        <div class="cp-dlfail-name">{failure.displayName}</div>
+        <div class="cp-dlfail-time">
+          {instanceName ? `Failed in ${instanceName} at ` : 'Failed at '}
+          {formatFailureTime(failure.failedAt)}
+        </div>
         <p>{view.summary || 'Install failed.'}</p>
         {view.detail && <p>{view.detail}</p>}
         {extraDetails.length > 0 && (
@@ -47,7 +50,6 @@ export function DownloadFailureNotice({
             </ul>
           </div>
         )}
-        <div class="cp-dlfail-time">Failed at {formatFailureTime(failure.failedAt)}</div>
       </div>
       <div class="cp-dlfail-actions">
         <Button

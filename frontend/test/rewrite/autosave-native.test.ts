@@ -187,7 +187,7 @@ function controls(value: unknown): Node[] {
 function queue(revision = 1): InstallQueueStateResponse {
   return {
     queue_epoch: 'current-process', revision, registry_revision: 2,
-    active: null, items: [], latest_failure: null,
+    active: null, items: [], failures: [],
     view_model: { state_id: 'empty', status_label: 'Idle', title: 'Downloads', summary: '', queued_count: 0,
       queued_count_label: '0', queued_item_label: 'Queued', section_title: 'Queue', empty_title: 'Empty', empty_summary: '' },
   };

@@ -972,26 +972,30 @@ function queue() {
       empty_title: 'No downloads',
       empty_summary: '',
     },
-    latest_failure: {
-      failed_at_ms: 1788854400000,
-      queue_id: 'q1',
-      install_id: 'i1',
-      operation_id: 'o1',
-      label: 'Minecraft',
-      install_item: { version_id: '1.21.1' },
-      failure_view_model: failure,
-    },
+    failures: [
+      {
+        failed_at_ms: 1788854400000,
+        queue_id: 'q1',
+        install_id: 'i1',
+        operation_id: 'o1',
+        label: 'Minecraft',
+        install_item: { version_id: '1.21.1' },
+        failure_view_model: failure,
+      },
+    ],
   };
 }
 
 test('queue decoding preserves producer revision, failure identity, timestamp and action authority', () => {
   const parsed = installs.installQueueStateResponse(queue());
   assert.equal(parsed.revision, 7);
-  assert.ok(parsed.latest_failure);
-  assert.equal(parsed.latest_failure.queue_id, 'q1');
-  assert.equal(parsed.latest_failure.failed_at_ms, 1788854400000);
-  assert.equal(parsed.latest_failure.failure_view_model.retry_action.enabled, false);
-  assert.equal(parsed.latest_failure.failure_view_model.retry_action.disabled_reason, 'Busy');
+  const [failed] = parsed.failures;
+  assert.equal(parsed.failures.length, 1);
+  assert.equal(failed.queue_id, 'q1');
+  assert.equal(failed.failed_at_ms, 1788854400000);
+  assert.equal(failed.failure_view_model.retry_action.enabled, false);
+  assert.equal(failed.failure_view_model.retry_action.disabled_reason, 'Busy');
+  assert.equal(installs.installQueueStateResponse({ ...queue(), failures: undefined }).failures.length, 0);
   for (const revision of [undefined, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
     assert.throws(() => installs.installQueueStateResponse({ ...queue(), revision }));
   }
@@ -1091,7 +1095,7 @@ function bootstrapHarness({ queueFailure = false, registryFailure = false, sessi
     '/instances': { instances: [{ id: 'instance-1', name: 'World' }], last_instance_id: 'instance-1' },
     '/launch/sessions': { sessions: activeSessions },
     '/install/queue': {
-      queue_epoch: 'bootstrap', revision: 1, registry_revision: 0, active: null, items: [], latest_failure: null,
+      queue_epoch: 'bootstrap', revision: 1, registry_revision: 0, active: null, items: [], failures: [],
       view_model: { state_id: 'empty', status_label: 'Idle', title: 'Downloads', summary: '', queued_count: 0,
         queued_count_label: '0', queued_item_label: 'Queued', section_title: 'Queue', empty_title: 'Empty', empty_summary: '' },
     },
@@ -1294,7 +1298,7 @@ test('real Topbar status labels use plain punctuation for downloads, sessions an
       }),
     ),
     downloadQueue: signal({ items: [], view_model: queue().view_model }),
-    downloadFailure: signal(null),
+    downloadFailures: signal([]),
   };
   /** @type {unknown[]} */
   const navigation = [];

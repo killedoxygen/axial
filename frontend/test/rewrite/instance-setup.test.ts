@@ -24,7 +24,7 @@ function response() {
     saves_count: 0, mods_count: 0, resource_count: 0, shader_count: 0,
     view_model: { tone: 'success', summary: 'Setup queued.', detail: null },
     install_queue: {
-      queue_epoch: 'fixture-queue', revision: 3, registry_revision: 0, active: null, items: [], latest_failure: null,
+      queue_epoch: 'fixture-queue', revision: 3, registry_revision: 0, active: null, items: [], failures: [],
       view_model: { state_id: 'idle', status_label: 'Idle', title: 'Downloads', summary: 'Ready', queued_count: 0,
         queued_count_label: 'No queued downloads', queued_item_label: 'No items queued', section_title: 'Queue',
         empty_title: 'Nothing downloading', empty_summary: 'Ready' },

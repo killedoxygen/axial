@@ -2,17 +2,36 @@ import type { JSX } from 'preact';
 import { Button, IconButton, Meter } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { DownloadFailureNotice } from '../../ui/DownloadFailureNotice';
+import { api } from '../../api';
+import { installQueueStateResponse } from '../../dto-install';
+import { instances } from '../../store';
+import { errMessage, showError } from '../../utils';
 import { useNowTicker } from '../../hooks/use-now';
 import {
   activeDownload,
   activeInstallRetryPending,
-  clearDownloadFailure,
-  downloadFailure,
+  applyInstallQueueResponse,
+  downloadFailures,
+  reconcileUncertainMutation,
   downloadQueue,
   removeQueuedInstall,
   retryActiveInstall,
   retryFailedInstall,
+  type DownloadFailure,
 } from '../../machines/downloads';
+
+/** Dismissal belongs to the queue, so it holds across pages, clients and reloads. */
+async function dismissFailure(failure: DownloadFailure): Promise<void> {
+  const action = failure.viewModel.dismiss_action;
+  if (action?.action !== 'dismiss' || action.enabled !== true) return;
+  try {
+    const path = `/install/queue/failures/${encodeURIComponent(failure.operationId)}`;
+    await applyInstallQueueResponse(installQueueStateResponse(await api('DELETE', path)));
+  } catch (error: unknown) {
+    showError('Could not dismiss the failure: ' + errMessage(error));
+    await reconcileUncertainMutation();
+  }
+}
 
 function formatElapsedTime(startedAt: number, now: number): string {
   const elapsedSeconds = Math.max(0, Math.floor((now - startedAt) / 1000));
@@ -33,7 +52,7 @@ function stepRatio(current: number | undefined, total: number | undefined): stri
 export function DownloadsView(): JSX.Element {
   const active = activeDownload.value;
   const { items: queue, view_model: queueView } = downloadQueue.value;
-  const failure = downloadFailure.value;
+  const failures = downloadFailures.value;
   const now = useNowTicker(Boolean(active));
 
   const title = active ? active.displayName || active.item.versionId : '';
@@ -45,7 +64,9 @@ export function DownloadsView(): JSX.Element {
     ? `${queueView.status_label}${queueView.active_queued_count_label || ''}`
     : queueView.queued_count > 0
       ? queueView.queued_count_label
-      : queueView.status_label;
+      : failures.length > 0
+        ? `${failures.length} ${failures.length === 1 ? 'failure' : 'failures'}`
+        : queueView.status_label;
 
   return (
     <div class="cp-view-page cp-downloads-page">
@@ -56,8 +77,21 @@ export function DownloadsView(): JSX.Element {
         </div>
       </div>
 
-      {failure && (
-        <DownloadFailureNotice failure={failure} onRetry={retryFailedInstall} onDismiss={clearDownloadFailure} />
+      {failures.length > 0 && (
+        <div class="cp-dlfail-list">
+          {failures.map((failure) => (
+            <DownloadFailureNotice
+              key={failure.operationId}
+              failure={failure}
+              instanceName={
+                failure.instanceId &&
+                (instances.value.find((instance) => instance.id === failure.instanceId)?.name ?? 'a removed instance')
+              }
+              onRetry={() => retryFailedInstall(failure)}
+              onDismiss={() => void dismissFailure(failure)}
+            />
+          ))}
+        </div>
       )}
 
       {active ? (
@@ -112,7 +146,7 @@ export function DownloadsView(): JSX.Element {
           )}
         </section>
       ) : (
-        !failure && (
+        failures.length === 0 && (
           <div class="cp-empty">
             <Icon name="download" size={36} color="var(--text-mute)" />
             {queue.length > 0 ? (

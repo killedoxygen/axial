@@ -1,4 +1,4 @@
-import { activeDownload, downloadFailure, downloadQueue, type DownloadFailure } from './machines/downloads';
+import { activeDownload, downloadFailures, downloadQueue, type DownloadFailure } from './machines/downloads';
 import { installItemFromQueueInstallItem, installItemFromQueuedViewModel, isSameInstallItem } from './install-item';
 import { minecraftVersionLabel } from './version-display';
 import type { Version } from './types-version';
@@ -73,9 +73,9 @@ export function instanceInstallStatus(
     matchesInstanceInstall(installItemFromQueuedViewModel(candidate), expectedItem, allowVersionOnlyMatch),
   );
   const failure =
-    downloadFailure.value && matchesInstanceInstall(downloadFailure.value.item, expectedItem, allowVersionOnlyMatch)
-      ? downloadFailure.value
-      : null;
+    downloadFailures.value.find((candidate) =>
+      matchesInstanceInstall(candidate.item, expectedItem, allowVersionOnlyMatch),
+    ) ?? null;
   const item =
     activeInstall?.item ??
     (queuedItem ? installItemFromQueuedViewModel(queuedItem) : undefined) ??

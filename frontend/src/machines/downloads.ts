@@ -41,8 +41,11 @@ export type ActiveDownload = {
 };
 
 export type DownloadFailure = {
+  operationId: string;
   item: InstallItem;
   displayName: string;
+  /** The instance a content operation targeted, when it was one. */
+  instanceId?: string;
   viewModel: InstallFailureViewModel;
   failedAt: number;
 };
@@ -73,7 +76,6 @@ export const emptyDownloadQueue: DownloadQueue = {
 
 // Every view derives from the backend's full queue snapshot, including after reload.
 const queueSnapshot = signal<InstallQueueStateResponse | null>(null);
-const dismissedFailureOperation = signal<string | null>(null);
 export const activeInstallRetryPending = signal(false);
 let closeQueueStream: (() => void) | null = null;
 let registryRefreshGeneration = 0;
@@ -94,16 +96,17 @@ export const downloadQueue = computed<DownloadQueue>(() => {
   return snapshot ? { items: snapshot.items, view_model: snapshot.view_model } : emptyDownloadQueue;
 });
 
-export const downloadFailure = computed<DownloadFailure | null>(() => {
-  const failure = queueSnapshot.value?.latest_failure;
-  if (!failure || failure.operation_id === dismissedFailureOperation.value) return null;
-  return {
+/** Undismissed failures, newest first. Dismissal is owned by the queue. */
+export const downloadFailures = computed<DownloadFailure[]>(() =>
+  (queueSnapshot.value?.failures ?? []).map((failure) => ({
+    operationId: failure.operation_id,
     item: cloneInstallItem(installItemFromQueueInstallItem(failure.install_item)),
     displayName: failure.label,
+    instanceId: failure.install_item.content?.instance_id,
     viewModel: failure.failure_view_model,
     failedAt: failure.failed_at_ms,
-  };
-});
+  })),
+);
 
 function activeDownloadFromQueue(active: InstallQueueActiveViewModel): ActiveDownload {
   return {
@@ -125,14 +128,6 @@ function activeDownloadFromQueue(active: InstallQueueActiveViewModel): ActiveDow
 export function isActiveInstallItem(item: InstallItem): boolean {
   const active = activeDownload.value;
   return active !== null && isSameInstallItem(active.item, item);
-}
-
-export function clearDownloadFailure(): void {
-  const failure = queueSnapshot.value?.latest_failure;
-  const action = failure?.failure_view_model.dismiss_action;
-  if (!failure || action?.action !== 'dismiss' || action.enabled !== true) return;
-  // This local notice dismissal applies only to the captured operation.
-  dismissedFailureOperation.value = failure.operation_id;
 }
 
 function ensureQueueSubscription(): void {
@@ -353,10 +348,9 @@ export function installVersion(target: string): void {
   if (target) handleInstallClick({ versionId: target });
 }
 
-export function retryFailedInstall(): void {
-  const failure = downloadFailure.value;
-  const action = failure?.viewModel.retry_action;
-  if (!failure || action?.action !== 'retry' || action.enabled !== true) return;
+export function retryFailedInstall(failure: DownloadFailure): void {
+  const action = failure.viewModel.retry_action;
+  if (action?.action !== 'retry' || action.enabled !== true) return;
   void enqueueBackendInstallItem(failure.item, { retry: true }).catch(showInstallQueueError);
 }
 

@@ -1009,7 +1009,7 @@ test('a newer account readiness read supersedes an older terminal readiness resp
 });
 
 function queue(epoch: string, revision: number, registryRevision: number): InstallQueueStateResponse {
-  return { queue_epoch: epoch, revision, registry_revision: registryRevision, active: null, items: [], latest_failure: null,
+  return { queue_epoch: epoch, revision, registry_revision: registryRevision, active: null, items: [], failures: [],
     view_model: { state_id: 'empty', status_label: epoch, title: 'Downloads', summary: '', queued_count: 0,
       queued_count_label: '0', queued_item_label: 'Queued', section_title: 'Queue', empty_title: 'Empty', empty_summary: '' } };
 }
@@ -1515,28 +1515,25 @@ test('failed registry reads retry without a new queue event and cancellation cle
   assert.equal(harness.clock.timeouts.size, 0);
 });
 
-test('failure dismissal is scoped to an operation and cannot hide the next failed install', async () => {
+test('failures are listed newest first and leave with the queue snapshot that drops them', async () => {
   const harness = downloadsHarness();
-  const failure = () => harness.machine.downloadFailure.value;
-  const first = queue('first', 1, 0);
-  first.latest_failure = {
-    failed_at_ms: 100, queue_id: 'queued-1', install_id: 'install-1', operation_id: 'operation-1',
-    label: 'Minecraft', install_item: { version_id: '1.21.6' },
-    failure_view_model: { state_id: 'failed', title: 'Install failed', tone: 'err', summary: 'Download interrupted', details: [],
-      retry_action: { action: 'retry', label: 'Retry install', enabled: true },
-      dismiss_action: { action: 'dismiss', label: 'Dismiss', enabled: true } },
-  };
-  await harness.machine.applyInstallQueueResponse(first);
-  assert.equal(failure()?.displayName, 'Minecraft');
-  harness.machine.clearDownloadFailure();
-  assert.equal(failure(), null);
-  await harness.machine.applyInstallQueueResponse({ ...first, revision: 2 });
-  assert.equal(failure(), null);
-  await harness.machine.applyInstallQueueResponse({ ...first, revision: 3,
-    latest_failure: { ...first.latest_failure, operation_id: 'operation-2' } });
-  assert.equal(failure()?.displayName, 'Minecraft');
-  await harness.machine.applyInstallQueueResponse(queue('first', 4, 0));
-  assert.equal(failure(), null);
+  const view = { state_id: 'failed', title: 'Install failed', tone: 'err', summary: 'Download interrupted', details: [],
+    retry_action: { action: 'retry', label: 'Retry install', enabled: true },
+    dismiss_action: { action: 'dismiss', label: 'Dismiss', enabled: true } };
+  const failed = (operation: string, label: string) => ({ failed_at_ms: 100, queue_id: operation, install_id: operation,
+    operation_id: operation, label, install_item: { version_id: '1.21.6' }, failure_view_model: view });
+  const names = () => harness.machine.downloadFailures.value.map((failure) => failure.displayName);
+  await harness.machine.applyInstallQueueResponse({ ...queue('first', 1, 0),
+    failures: [failed('operation-2', 'Minecraft 1.21.6'), failed('operation-1', 'Minecraft 1.20.1')] });
+  assert.deepEqual(names(), ['Minecraft 1.21.6', 'Minecraft 1.20.1']);
+  await harness.machine.applyInstallQueueResponse({ ...queue('first', 2, 0),
+    failures: [failed('operation-1', 'Minecraft 1.20.1')] });
+  assert.deepEqual(names(), ['Minecraft 1.20.1']);
+  await harness.machine.applyInstallQueueResponse({ ...queue('first', 1, 0),
+    failures: [failed('operation-2', 'Minecraft 1.21.6')] });
+  assert.deepEqual(names(), ['Minecraft 1.20.1']);
+  await harness.machine.applyInstallQueueResponse(queue('first', 3, 0));
+  assert.deepEqual(names(), []);
 });
 
 test('new event connections deliver their complete snapshot even when revisions restart', async () => {
@@ -1599,6 +1596,10 @@ test('Downloads renders loader labels and Minecraft versions while retaining que
     '../../ui/DownloadFailureNotice': { DownloadFailureNotice: 'DownloadFailureNotice' },
     '../../hooks/use-now': { useNowTicker: () => 0 },
     '../../machines/downloads': { ...h.machine, removeQueuedInstall: (id: string) => removed.push(id) },
+    '../../api': { api: async () => assert.fail('rendering issues no requests') },
+    '../../dto-install': installContract,
+    '../../store': h.store,
+    '../../utils': { errMessage: String, showError: () => undefined },
   };
   const filename = resolve(frontend, 'src/views/downloads/DownloadsView.tsx');
   const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
