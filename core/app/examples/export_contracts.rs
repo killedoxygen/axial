@@ -1,6 +1,7 @@
 //! Export only reviewed public DTOs, never runtime commands or credentials.
 
 use axial_app::{
+    content::provenance::RequiredRefusal,
     instances::{
         delete::DeletionSnapshot,
         model::JavaSelection,
@@ -80,6 +81,7 @@ fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     CreateLoaderBuildsView::export_all(&config)?;
     CreateNotice::export_all(&config)?;
     PreflightDiagnostics::export_all(&config)?;
+    RequiredRefusal::export_all(&config)?;
     Ok(())
 }
 

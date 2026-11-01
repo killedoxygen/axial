@@ -2911,6 +2911,17 @@ impl fmt::Debug for ManagedContentReadyTransaction {
 }
 
 impl ManagedContentReadyTransaction {
+    /// Reads one staged payload so the domain can inspect it before
+    /// publication. The bytes confer no authority; commit still verifies the
+    /// staged guard.
+    pub fn read_staged(&self, id: &ManagedContentPayloadId, max_bytes: u64) -> Option<Vec<u8>> {
+        let payload = self.state.payloads.get(*self.state.staged_by_id.get(id)?)?;
+        self.state
+            .stage
+            .read_guarded_file_bounded(payload.name.as_str(), payload.guard.as_ref()?, max_bytes)
+            .ok()
+    }
+
     pub fn prepare_publication(mut self, binding: [u8; 32]) -> ManagedContentStageOutcome {
         match self.checkpoint(binding) {
             Ok(_)

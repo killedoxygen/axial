@@ -7,6 +7,7 @@ use axial_app::{
         install::{ContentMutations, MutationError},
         model::*,
         packs::PackVersion,
+        provenance::RequiredRefusal,
         resolve::{self, ResolutionSelection},
         view::{self, TargetRef},
     },
@@ -418,6 +419,12 @@ async fn installed(
         "filename":entry.managed_filename().map(|name| name.as_str()).unwrap_or(""),"enabled":entry.enabled(),
         });
         if let Some(title) = entry.title() { value["title"] = json!(title); }
+        let required_by = manifest
+            .dependents(&live, std::slice::from_ref(entry.canonical_id()))
+            .into_iter()
+            .map(|dependent| dependent.canonical_id().clone())
+            .collect::<Vec<_>>();
+        if !required_by.is_empty() { value["required_by"] = json!(required_by); }
         value
     }).collect::<Vec<_>>();
     // Pack provenance owns no file; its recorded paths only mark membership.
@@ -468,6 +475,22 @@ async fn uninstall(
 ) -> Result<Json<axial_app::install::model::InstallQueueStateResponse>, Error> {
     let instance = id(&raw)?;
     let request = body(request)?;
+    // Name the dependents before queueing; the mutation owner still refuses
+    // authoritatively if content changes in between.
+    if let Ok((_, manifest, live)) = state.mutations.instance_context(&instance) {
+        let dependents = manifest.dependents(&live, &request.canonical_ids);
+        if !dependents.is_empty() {
+            let targets = request
+                .canonical_ids
+                .iter()
+                .filter_map(|id| manifest.find(id))
+                .collect::<Vec<_>>();
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!(RequiredRefusal::new(&targets, &dependents))),
+            ));
+        }
+    }
     state
         .queue
         .enqueue(InstallQueueRequest::Content {

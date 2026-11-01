@@ -62,6 +62,9 @@ pub enum ExistingFileState {
 pub struct PlanConflict {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_id: Option<CanonicalId>,
+    /// The project the conflict is about, when its metadata was resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub kind: ResolutionConflictKind,
     pub detail: String,
     /// Instance-relative file a replacement decision names.
@@ -121,6 +124,14 @@ pub fn into_plan(
             .iter()
             .map(|conflict| PlanConflict {
                 canonical_id: conflict.canonical_id.clone(),
+                title: conflict.subject_title.clone().or_else(|| {
+                    let id = conflict.canonical_id.as_ref()?;
+                    resolution
+                        .items
+                        .iter()
+                        .find(|item| &item.canonical_id == id)
+                        .map(|item| item.title.clone())
+                }),
                 kind: conflict.kind(),
                 detail: match conflict.reason {
                     ResolutionConflictReason::NoCompatibleVersion => {
@@ -175,8 +186,10 @@ pub fn into_instance_plan(plan: &TargetedPlan, instance_id: String) -> Resolutio
             .path
             .rsplit_once('/')
             .unwrap_or(("", existing.path.as_str()));
+        let title = Some(item.title.clone());
         view.conflicts.push(PlanConflict {
             canonical_id: Some(existing.canonical_id.clone()),
+            title,
             kind: ResolutionConflictKind::ExistingFile,
             detail: format!("A different {name} is already in the {folder} folder."),
             path: Some(existing.path.clone()),

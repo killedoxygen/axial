@@ -137,6 +137,18 @@ pub enum InstallError {
         "Content changed or conflicts with existing files. Review the selection and try again."
     )]
     ContentConflict,
+    #[error("Other installed content still needs this. Remove it too, or keep this installed.")]
+    ContentRequired,
+    #[error("This would stop the game from loading, so nothing was changed.")]
+    ContentIncompatible,
+    #[error("A downloaded file did not match its published checksum. Try again later.")]
+    ContentIntegrity,
+    #[error("This content is larger than Axial can install safely.")]
+    ContentTooLarge,
+    #[error("The content provider returned files Axial cannot install.")]
+    ContentInvalid,
+    #[error("Content files could not be updated. Check the instance folder and try again.")]
+    ContentFiles,
     #[error("Content installation was interrupted. Review installed content before retrying.")]
     ContentInterrupted,
     #[error(
@@ -1155,7 +1167,7 @@ impl InstallQueue {
             .ok_or(InstallError::NotFound)?;
         let entry = state.entries.get_mut(id).ok_or(InstallError::NotFound)?;
         let mut status = entry.status.clone();
-        finish_status(&mut status, InstallOutcome::Removed, None);
+        finish_status(&mut status, InstallOutcome::Removed, None, None);
         persist_status(&self.inner.storage, &status, "terminal")?;
         entry.status = status;
         entry.pin = None;
@@ -1362,7 +1374,7 @@ impl InstallQueue {
                             {
                                 Ok(())
                             }
-                            Err(WorkFailure::Failed(error))
+                            Err(WorkFailure::Failed(error) | WorkFailure::Explained(error, _))
                                 if queue.complete(
                                     &worker_id,
                                     InstallOutcome::Failed,
@@ -2342,7 +2354,7 @@ impl InstallQueue {
             Err(WorkFailure::Failed(InstallError::Cancelled)) => {
                 self.complete(&id, InstallOutcome::Cancelled, None)
             }
-            Err(WorkFailure::Failed(error)) => {
+            Err(WorkFailure::Failed(error) | WorkFailure::Explained(error, _)) => {
                 self.complete(&id, InstallOutcome::Failed, Some(error))
             }
             Err(WorkFailure::Unsettled(recovery)) => {
@@ -2497,10 +2509,11 @@ impl InstallQueue {
             }
             Err(MutationError::Cancelled) => Ok(InstallOutcome::Cancelled),
             Err(_) if cancel.is_cancelled() => Ok(InstallOutcome::Cancelled),
-            Err(MutationError::Changed | MutationError::Conflict | MutationError::Required) => {
-                Err(WorkFailure::Failed(InstallError::ContentConflict))
-            }
-            Err(_) => Err(WorkFailure::Failed(InstallError::Failed)),
+            Err(MutationError::Incompatible(reasons)) => Err(WorkFailure::Explained(
+                InstallError::ContentIncompatible,
+                reasons.join(" "),
+            )),
+            Err(error) => Err(WorkFailure::Failed(content_failure(&error))),
         }
     }
 
@@ -2510,15 +2523,18 @@ impl InstallQueue {
         lease: ExclusionLease,
         result: Result<InstallOutcome, WorkFailure>,
     ) {
-        let (outcome, error) = match result {
-            Ok(outcome) => (outcome, None),
-            Err(WorkFailure::Failed(error)) => (InstallOutcome::Failed, Some(error)),
+        let (outcome, error, detail) = match result {
+            Ok(outcome) => (outcome, None, None),
+            Err(WorkFailure::Failed(error)) => (InstallOutcome::Failed, Some(error), None),
+            Err(WorkFailure::Explained(error, detail)) => {
+                (InstallOutcome::Failed, Some(error), Some(detail))
+            }
             Err(WorkFailure::Unsettled(retained)) => {
                 self.retain_work(id, lease, retained);
                 return;
             }
         };
-        if !self.complete(id, outcome, error) {
+        if !self.complete_with(id, outcome, error, detail) {
             self.retain_work(id, lease, RetainedInstall::Content(Some((outcome, error))));
         }
     }
@@ -2878,6 +2894,16 @@ impl InstallQueue {
     }
 
     fn complete(&self, id: &str, outcome: InstallOutcome, error: Option<InstallError>) -> bool {
+        self.complete_with(id, outcome, error, None)
+    }
+
+    fn complete_with(
+        &self,
+        id: &str,
+        outcome: InstallOutcome,
+        error: Option<InstallError>,
+        detail: Option<String>,
+    ) -> bool {
         let mut state = self.inner.state.lock().expect("install queue lock");
         let Some(entry) = state.entries.get_mut(id) else {
             return false;
@@ -2886,7 +2912,7 @@ impl InstallQueue {
             return true;
         }
         let mut status = entry.status.clone();
-        finish_status(&mut status, outcome, error);
+        finish_status(&mut status, outcome, error, detail);
         if persist_status(&self.inner.storage, &status, "terminal").is_err() {
             entry.status.view_model = settlement_progress();
             publish(&self.inner, &mut state);
@@ -3015,6 +3041,8 @@ fn preserved_content_instance(state: &State) -> Result<Option<InstanceId>, Insta
 
 enum WorkFailure {
     Failed(InstallError),
+    /// A settled refusal with a player-readable detail.
+    Explained(InstallError, String),
     Unsettled(RetainedInstall),
 }
 
@@ -3492,10 +3520,55 @@ fn settlement_progress() -> InstallProgressViewModel {
         active_step: None,
     }
 }
+/// Classify by the content owner's refusal so local failures never claim the
+/// network was at fault.
+fn content_failure(error: &MutationError) -> InstallError {
+    use crate::content::{catalog::ContentError, packs::PackError};
+    match error {
+        MutationError::Changed
+        | MutationError::Conflict
+        | MutationError::NotFound
+        | MutationError::Managed
+        | MutationError::Duplicate(_)
+        | MutationError::Pack(PackError::SelectionChanged | PackError::Conflict(_)) => {
+            InstallError::ContentConflict
+        }
+        MutationError::Required => InstallError::ContentRequired,
+        MutationError::Incompatible(_) => InstallError::ContentIncompatible,
+        MutationError::Integrity | MutationError::Pack(PackError::Integrity) => {
+            InstallError::ContentIntegrity
+        }
+        MutationError::Capacity | MutationError::Pack(PackError::TooLarge) => {
+            InstallError::ContentTooLarge
+        }
+        MutationError::Files | MutationError::StreamingUnsupported | MutationError::Storage(_) => {
+            InstallError::ContentFiles
+        }
+        MutationError::Content(
+            ContentError::Parse(_) | ContentError::ProviderMetadataInvalid(_),
+        )
+        | MutationError::Pack(PackError::Invalid(_) | PackError::Unsupported) => {
+            InstallError::ContentInvalid
+        }
+        MutationError::Pack(PackError::NoMatchingVersion | PackError::Unpublished)
+        | MutationError::Content(ContentError::Unavailable | ContentError::Invalid(_)) => {
+            InstallError::ContentUnavailable
+        }
+        MutationError::Pending => InstallError::SettlementRequired,
+        MutationError::Cancelled | MutationError::Pack(PackError::Cancelled) => {
+            InstallError::Cancelled
+        }
+        MutationError::Unavailable
+        | MutationError::Content(ContentError::Provider(_))
+        | MutationError::Pack(PackError::Download | PackError::Provider) => InstallError::Failed,
+    }
+}
+
 fn finish_status(
     status: &mut InstallStatusResponse,
     outcome: InstallOutcome,
     error: Option<InstallError>,
+    detail: Option<String>,
 ) {
     status.done = true;
     status.outcome = Some(outcome);
@@ -3525,9 +3598,19 @@ fn finish_status(
             title: "Installation failed".into(),
             tone: "danger".into(),
             summary: error.to_string(),
-            detail: None,
+            detail,
             details: Vec::new(),
-            retry_action: InstallActionViewModel::enabled("retry", "Retry"),
+            retry_action: match error {
+                // Repeating the same request cannot succeed until the instance changes.
+                InstallError::ContentRequired | InstallError::ContentIncompatible => {
+                    InstallActionViewModel {
+                        enabled: false,
+                        disabled_reason: Some("Change the instance's content first.".into()),
+                        ..InstallActionViewModel::enabled("retry", "Retry")
+                    }
+                }
+                _ => InstallActionViewModel::enabled("retry", "Retry"),
+            },
             dismiss_action: InstallActionViewModel::enabled("dismiss", "Dismiss"),
         });
     }
@@ -3642,6 +3725,55 @@ pub(crate) mod tests {
     use super::*;
     use crate::library::LibraryOpenOutcome;
     use serde_json::Value;
+
+    #[test]
+    fn content_refusals_keep_their_cause_and_block_futile_retries() {
+        use crate::content::{catalog::ContentError, packs::PackError};
+        for (error, expected) in [
+            (MutationError::Required, InstallError::ContentRequired),
+            (MutationError::Changed, InstallError::ContentConflict),
+            (MutationError::Files, InstallError::ContentFiles),
+            (MutationError::Integrity, InstallError::ContentIntegrity),
+            (MutationError::Capacity, InstallError::ContentTooLarge),
+            (
+                MutationError::Pack(PackError::Invalid("index")),
+                InstallError::ContentInvalid,
+            ),
+            (
+                MutationError::Content(ContentError::Provider(
+                    crate::network::DownloadError::Network,
+                )),
+                InstallError::Failed,
+            ),
+            (MutationError::Unavailable, InstallError::Failed),
+        ] {
+            assert_eq!(content_failure(&error), expected, "{error:?}");
+        }
+        let mut status = InstallStatusResponse {
+            revision: 1,
+            queue_id: "queue".into(),
+            outcome: None,
+            allowed_actions: Vec::new(),
+            install_id: "queue".into(),
+            operation_id: OperationId::new(),
+            done: false,
+            progress: Vec::new(),
+            view_model: settlement_progress(),
+            failure_view_model: None,
+            failure_point: None,
+        };
+        let detail = "Sodium Extra needs Fabric Loader 0.20.1 or newer. This instance has 0.19.3.";
+        finish_status(
+            &mut status,
+            InstallOutcome::Failed,
+            Some(InstallError::ContentIncompatible),
+            Some(detail.into()),
+        );
+        let failure = status.failure_view_model.unwrap();
+        assert_eq!(failure.detail.as_deref(), Some(detail));
+        assert!(!failure.retry_action.enabled);
+        assert!(!failure.summary.contains("connection"));
+    }
 
     #[test]
     fn download_failure_diagnostics_exclude_native_text() {

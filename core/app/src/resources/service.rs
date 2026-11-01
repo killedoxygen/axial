@@ -2,7 +2,10 @@
 
 use super::{metadata, mods, packs, screenshots, worlds};
 use crate::{
-    content::install::{ContentMutations, MutationError},
+    content::{
+        install::{ContentMutations, MutationError},
+        provenance::RequiredRefusal,
+    },
     files::{PortableName, ScopedDirectory},
     instances::{directory::InstanceDirectories, model::InstanceId},
     tasks::{TaskHandle, TaskOwner},
@@ -33,6 +36,8 @@ pub enum ResourceError {
     Files,
     #[error("resource operation requires settlement before the instance can be used")]
     Pending,
+    #[error("{}", .0.error)]
+    Required(RequiredRefusal),
 }
 
 impl ResourceError {
@@ -40,7 +45,7 @@ impl ResourceError {
         match self {
             Self::InvalidName => 400,
             Self::NotFound => 404,
-            Self::Conflict | Self::Busy | Self::Managed | Self::Pending => 409,
+            Self::Conflict | Self::Busy | Self::Managed | Self::Pending | Self::Required(_) => 409,
             Self::Limit => 413,
             Self::Files => 500,
         }
@@ -364,11 +369,14 @@ impl ResourceService {
         self.delete_file(id, "screenshots", name)
     }
 
+    /// Disabling a managed mod other enabled content needs is refused with
+    /// their names unless `with_dependents` disables them too.
     pub fn set_mod_enabled(
         &self,
         id: &InstanceId,
         name: &str,
         enabled: bool,
+        with_dependents: bool,
     ) -> Result<TaskHandle<Result<ResourceCommand, ResourceError>>, ResourceError> {
         mods::validate_mod_filename(name).map_err(|_| ResourceError::InvalidName)?;
         let read = self
@@ -386,9 +394,19 @@ impl ResourceService {
                     .managed_filename()
                     .is_some_and(|filename| filename.key() == key)
         }) {
+            if !enabled && !with_dependents {
+                let dependents =
+                    manifest.dependents(&live, std::slice::from_ref(entry.canonical_id()));
+                if !dependents.is_empty() {
+                    return Err(ResourceError::Required(RequiredRefusal::new(
+                        &[entry],
+                        &dependents,
+                    )));
+                }
+            }
             let work = self
                 .content
-                .set_enabled(id, entry.canonical_id(), enabled)
+                .set_enabled(id, entry.canonical_id(), enabled, with_dependents)
                 .map_err(|error| match error {
                     MutationError::Unavailable => ResourceError::Busy,
                     _ => ResourceError::Conflict,
@@ -406,7 +424,15 @@ impl ResourceService {
                     work.join()
                         .await
                         .map_err(|_| ResourceError::Pending)?
-                        .map_err(|_| ResourceError::Pending)?;
+                        .map_err(|error| match error {
+                            MutationError::Changed
+                            | MutationError::Conflict
+                            | MutationError::NotFound
+                            | MutationError::Required => ResourceError::Conflict,
+                            MutationError::Unavailable => ResourceError::Busy,
+                            MutationError::Pending => ResourceError::Pending,
+                            _ => ResourceError::Files,
+                        })?;
                     let mut result = ResourceCommand::ok(Some(name));
                     result.enabled = Some(enabled);
                     Ok(result)
@@ -1059,7 +1085,7 @@ mod tests {
                 )
             );
             let result = service
-                .set_mod_enabled(&id, from, !enabled)
+                .set_mod_enabled(&id, from, !enabled, false)
                 .unwrap()
                 .join()
                 .await
@@ -1338,7 +1364,7 @@ mod tests {
         std::fs::write(game.join("mods/recorded.jar"), b"managed").unwrap();
         let launch = service.directories.admit(&id).unwrap();
         assert!(matches!(
-            service.set_mod_enabled(&id, "recorded.jar", false),
+            service.set_mod_enabled(&id, "recorded.jar", false, false),
             Err(ResourceError::Busy)
         ));
         assert_eq!(
@@ -1355,7 +1381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn required_managed_mod_can_be_disabled_and_reenabled_but_not_removed() {
+    async fn required_managed_mod_disables_only_with_its_dependents() {
         use crate::content::{
             model::{CanonicalId, ContentDependency, ContentKind, DependencyKind, ProviderId},
             provenance::{MANIFEST_FILE, ManagedContentFileName, ManifestEntry},
@@ -1385,13 +1411,34 @@ mod tests {
         std::fs::write(game.join(MANIFEST_FILE), manifest.encode_managed().unwrap()).unwrap();
         std::fs::write(game.join("mods/recorded.jar"), b"managed").unwrap();
         std::fs::write(game.join("mods/dependent.jar"), b"dependent").unwrap();
-        for (from, enabled, expected_name) in [
-            ("recorded.jar", false, "recorded.jar.disabled"),
-            ("recorded.jar.disabled", false, "recorded.jar.disabled"),
-            ("recorded.jar.disabled", true, "recorded.jar"),
+        let recorded = CanonicalId::for_project(ProviderId::Modrinth, "recorded");
+        assert!(matches!(
+            service
+                .content
+                .remove(&id, &recorded)
+                .unwrap()
+                .join()
+                .await
+                .unwrap(),
+            Err(MutationError::Required)
+        ));
+        let Err(ResourceError::Required(refusal)) =
+            service.set_mod_enabled(&id, "recorded.jar", false, false)
+        else {
+            panic!("disabling required content must name its dependents");
+        };
+        assert_eq!(refusal.required_by.len(), 1);
+        assert_eq!(refusal.required_by[0].canonical_id, "modrinth:dependent");
+        assert_eq!(
+            std::fs::read(game.join("mods/recorded.jar")).unwrap(),
+            b"managed"
+        );
+        for (from, enabled, expected_name, dependent_enabled) in [
+            ("recorded.jar", false, "recorded.jar.disabled", false),
+            ("recorded.jar.disabled", true, "recorded.jar", false),
         ] {
             let result = service
-                .set_mod_enabled(&id, from, enabled)
+                .set_mod_enabled(&id, from, enabled, true)
                 .unwrap()
                 .join()
                 .await
@@ -1405,35 +1452,19 @@ mod tests {
                 &std::fs::read(game.join(MANIFEST_FILE)).unwrap(),
             ))
             .unwrap();
-            assert_eq!(manifest.find(dependent.canonical_id()), Some(&dependent));
             assert_eq!(
-                manifest
-                    .find(&CanonicalId::for_project(ProviderId::Modrinth, "recorded"))
-                    .unwrap()
-                    .enabled(),
-                enabled
+                manifest.find(dependent.canonical_id()).unwrap().enabled(),
+                dependent_enabled
             );
+            assert_eq!(manifest.find(&recorded).unwrap().enabled(), enabled);
             assert_eq!(
                 std::fs::read(game.join("mods").join(expected_name)).unwrap(),
                 b"managed"
             );
             assert_eq!(
-                std::fs::read(game.join("mods/dependent.jar")).unwrap(),
+                std::fs::read(game.join("mods/dependent.jar.disabled")).unwrap(),
                 b"dependent"
             );
-            assert!(matches!(
-                service
-                    .content
-                    .remove(
-                        &id,
-                        &CanonicalId::for_project(ProviderId::Modrinth, "recorded")
-                    )
-                    .unwrap()
-                    .join()
-                    .await
-                    .unwrap(),
-                Err(MutationError::Required)
-            ));
         }
         assert!(!service.has_unsettled_effects());
     }

@@ -36,6 +36,9 @@ pub struct InstanceModMetadata {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct UpdateModRequest {
     pub enabled: bool,
+    /// Disable the enabled content that needs this mod in the same batch.
+    #[serde(default)]
+    pub with_dependents: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

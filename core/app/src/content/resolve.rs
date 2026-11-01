@@ -1260,6 +1260,17 @@ pub struct AvailableUpdate {
     pub latest_version_number: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The modpack that installed this exact file. Its members are coupled to
+    /// the pack, so bulk updates leave them alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack: Option<UpdatePack>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpdatePack {
+    pub canonical_id: CanonicalId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Provider failure omits that project's update, not other projects' candidates.
@@ -1339,6 +1350,10 @@ pub async fn available_updates(
                 latest_version_id: version.id.clone(),
                 latest_version_number: version.version_number.clone(),
                 title: entry.title().map(str::to_string),
+                pack: manifest.installing_pack(entry).map(|pack| UpdatePack {
+                    canonical_id: pack.canonical_id().clone(),
+                    title: pack.title().map(str::to_string),
+                }),
             });
         }
     }

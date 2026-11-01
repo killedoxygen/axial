@@ -189,6 +189,8 @@ pub enum MutationError {
     Required,
     #[error("{0} is already in this instance")]
     Duplicate(String),
+    #[error("content would stop the game from loading: {}", .0.join(" "))]
+    Incompatible(Vec<String>),
     #[error("content not found")]
     NotFound,
     #[error("managed mods must be removed through content operations")]
@@ -223,7 +225,8 @@ impl MutationError {
             | Self::Pending
             | Self::Required
             | Self::Managed
-            | Self::Duplicate(_) => 409,
+            | Self::Duplicate(_)
+            | Self::Incompatible(_) => 409,
             Self::NotFound | Self::Pack(super::packs::PackError::NoMatchingVersion) => 404,
             Self::Cancelled => 409,
             Self::Capacity => 413,
@@ -326,6 +329,90 @@ struct Receipt {
     /// Adds untracked mod files without changing managed provenance.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     import: bool,
+}
+
+/// Screens downloaded mod jars against the instance's loader and the mods that
+/// stay installed, after staging and before publication. Observed before the
+/// transaction; a refusal rolls the staged batch back without file effects.
+struct JarScreen {
+    target: super::requirements::Target,
+    installed: super::requirements::Inventory,
+    titles: HashMap<String, String>,
+}
+
+impl JarScreen {
+    fn new(instance: &RegisteredInstance, receipt: &Receipt) -> Option<Self> {
+        use super::requirements::{Inventory, Jar, Target};
+        let target =
+            Target::of(&instance.record().instance.version_id).filter(Target::is_checked)?;
+        let after = ContentManifest::decode_managed(Some(&receipt.after_manifest)).ok()?;
+        let titles: HashMap<String, String> = receipt
+            .changes
+            .iter()
+            .filter(|change| change.after.is_some())
+            .filter(|change| matches!(change.source, Some(Source::Download { .. })))
+            .filter(|change| change.path.starts_with("mods/") && change.path.ends_with(".jar"))
+            .map(|change| {
+                let title = after
+                    .entries()
+                    .iter()
+                    .find(|entry| entry_path(entry).is_ok_and(|path| path == change.path))
+                    .and_then(ManifestEntry::title)
+                    .unwrap_or(&change.path["mods/".len()..]);
+                (change.path.clone(), title.to_string())
+            })
+            .collect();
+        if titles.is_empty() {
+            return None;
+        }
+        let mut installed = Inventory::new();
+        match crate::resources::mods::list_mods(instance.game_directory()) {
+            Ok(mods) => {
+                for name in mods.iter().map(|info| format!("mods/{}", info.name)) {
+                    if !name.ends_with(".jar")
+                        || receipt.changes.iter().any(|change| change.path == name)
+                    {
+                        continue;
+                    }
+                    match read_path(instance.game_directory(), &name) {
+                        Ok(Some(bytes)) => installed.add(Jar::read(&target, &bytes)),
+                        _ => installed.mark_incomplete(),
+                    }
+                }
+            }
+            Err(_) => installed.mark_incomplete(),
+        }
+        Some(Self {
+            target,
+            installed,
+            titles,
+        })
+    }
+
+    fn refusals(
+        &self,
+        receipt: &Receipt,
+        ready: &axial_minecraft::managed_path::ManagedContentReadyTransaction,
+    ) -> Vec<String> {
+        use super::requirements::Jar;
+        let candidates: Vec<_> = receipt
+            .changes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, change)| {
+                let title = self.titles.get(&change.path)?;
+                let id = ManagedContentPayloadId::new(&format!("payload-{index}")).ok()?;
+                match Jar::read(
+                    &self.target,
+                    &ready.read_staged(&id, MAX_CONTENT_FILE_BYTES)?,
+                ) {
+                    Jar::Mod(declared) => Some((title.clone(), declared)),
+                    Jar::NotAMod | Jar::Unreadable => None,
+                }
+            })
+            .collect();
+        super::requirements::refusals(&self.target, &candidates, &self.installed)
+    }
 }
 
 fn encoded_receipt(receipt: &Receipt) -> Result<String, MutationError> {
@@ -1012,7 +1099,10 @@ impl ContentMutations {
             .try_spawn(instance.clone(), move |cancel| async move {
                 let receipt =
                     owner.prepare_install(&instance, &plan, allow_incompatible, &replace)?;
-                owner.accept_batch(instance, receipt, &cancel).await
+                let screen = JarScreen::new(&instance, &receipt);
+                owner
+                    .accept_screened(instance, receipt, HashMap::new(), screen.as_ref(), &cancel)
+                    .await
             })
             .map_err(|_| MutationError::Unavailable)
     }
@@ -1117,17 +1207,8 @@ impl ContentMutations {
                     }
                     after.remove(id);
                 }
-                for id in &ids {
-                    let old = before.find(id).ok_or(MutationError::NotFound)?;
-                    if after.entries().iter().any(|entry| {
-                        entry.enabled()
-                            && live.contains(entry)
-                            && entry.dependencies().iter().any(|dependency| {
-                                dependency.requires_project(old.project_id(), old.version_id())
-                            })
-                    }) {
-                        return Err(MutationError::Required);
-                    }
+                if !before.dependents(&live, &ids).is_empty() {
+                    return Err(MutationError::Required);
                 }
                 owner
                     .begin(instance, before, raw, after, HashMap::new(), &cancel)
@@ -1136,20 +1217,14 @@ impl ContentMutations {
             .map_err(|_| MutationError::Unavailable)
     }
 
+    /// Disabling refuses while enabled content still needs this entry, unless
+    /// `with_dependents` disables those dependents in the same batch.
     pub fn set_enabled(
         &self,
         id: &InstanceId,
         content: &CanonicalId,
         enabled: bool,
-    ) -> Result<TaskHandle<Result<MutationReceipt, MutationError>>, MutationError> {
-        self.edit(id, content, Some(enabled))
-    }
-
-    fn edit(
-        &self,
-        id: &InstanceId,
-        content: &CanonicalId,
-        enabled: Option<bool>,
+        with_dependents: bool,
     ) -> Result<TaskHandle<Result<MutationReceipt, MutationError>>, MutationError> {
         let instance = self
             .directories
@@ -1167,22 +1242,31 @@ impl ContentMutations {
                 if !live.contains(old) {
                     return Err(MutationError::Changed);
                 }
+                let mut targets = vec![old];
+                if !enabled {
+                    let dependents = before.dependents(&live, std::slice::from_ref(&content));
+                    if !dependents.is_empty() && !with_dependents {
+                        return Err(MutationError::Required);
+                    }
+                    targets.extend(dependents);
+                }
                 let mut after = before.clone();
                 let mut sources = HashMap::new();
-                if let Some(enabled) = enabled {
-                    after.try_set_enabled(&content, enabled)?;
-                    let new = after.find(&content).ok_or(MutationError::NotFound)?;
-                    if old.enabled() != enabled {
-                        sources.insert(
-                            entry_path(new)?,
-                            Source::Local {
-                                path: entry_path(old)?,
-                                proof: Proof::entry(old)?,
-                            },
-                        );
+                for old in targets {
+                    if old.enabled() == enabled {
+                        continue;
                     }
-                } else {
-                    after.remove(&content);
+                    after.try_set_enabled(old.canonical_id(), enabled)?;
+                    let new = after
+                        .find(old.canonical_id())
+                        .ok_or(MutationError::NotFound)?;
+                    sources.insert(
+                        entry_path(new)?,
+                        Source::Local {
+                            path: entry_path(old)?,
+                            proof: Proof::entry(old)?,
+                        },
+                    );
                 }
                 owner
                     .begin(instance, before, raw, after, sources, &cancel)
@@ -1296,7 +1380,7 @@ impl ContentMutations {
             .try_spawn(instance.clone(), move |cancel| async move {
                 let (receipt, payloads) = owner.prepare_import(&instance, files)?;
                 owner
-                    .accept_batch_with(instance, receipt, payloads, &cancel)
+                    .accept_screened(instance, receipt, payloads, None, &cancel)
                     .await
             })
             .map_err(|_| MutationError::Unavailable)
@@ -1497,15 +1581,16 @@ impl ContentMutations {
         receipt: Receipt,
         cancel: &CancellationToken,
     ) -> Result<MutationReceipt, MutationError> {
-        self.accept_batch_with(instance, receipt, HashMap::new(), cancel)
+        self.accept_screened(instance, receipt, HashMap::new(), None, cancel)
             .await
     }
 
-    async fn accept_batch_with(
+    async fn accept_screened(
         &self,
         instance: RegisteredInstance,
         receipt: Receipt,
         payloads: HashMap<String, Vec<u8>>,
+        screen: Option<&JarScreen>,
         cancel: &CancellationToken,
     ) -> Result<MutationReceipt, MutationError> {
         validate_receipt(&receipt)?;
@@ -1522,7 +1607,8 @@ impl ContentMutations {
             .map_err(|_| MutationError::Changed)?;
         preflight(instance.game_directory(), &receipt, false)?;
         self.persist_receipt(&receipt)?;
-        self.apply(instance, receipt, payloads, cancel).await
+        self.apply_inner(instance, receipt, payloads, None, screen, cancel)
+            .await
     }
 
     fn persist_receipt(&self, receipt: &Receipt) -> Result<(), MutationError> {
@@ -1737,9 +1823,22 @@ impl ContentMutations {
     async fn apply_pack(
         &self,
         instance: RegisteredInstance,
+        receipt: Receipt,
+        payloads: HashMap<String, Vec<u8>>,
+        pack: Option<&PackPlan>,
+        cancel: &CancellationToken,
+    ) -> Result<MutationReceipt, MutationError> {
+        self.apply_inner(instance, receipt, payloads, pack, None, cancel)
+            .await
+    }
+
+    async fn apply_inner(
+        &self,
+        instance: RegisteredInstance,
         mut receipt: Receipt,
         mut payloads: HashMap<String, Vec<u8>>,
         pack: Option<&PackPlan>,
+        screen: Option<&JarScreen>,
         cancel: &CancellationToken,
     ) -> Result<MutationReceipt, MutationError> {
         let mut effects = Vec::new();
@@ -1756,6 +1855,7 @@ impl ContentMutations {
                     &mut effects,
                     cancel,
                     self.progress.as_deref(),
+                    screen,
                 )
                 .await?;
                 effects.push(Effect::Committed);
@@ -2779,6 +2879,7 @@ async fn apply_streamed(
     effects: &mut Vec<Effect>,
     cancel: &CancellationToken,
     progress: Option<&(dyn Fn(DownloadProgress) + Send + Sync)>,
+    screen: Option<&JarScreen>,
 ) -> Result<(), MutationError> {
     // Before native preparation every refusal has no payload effects. Once
     // prepared, all exits below consume the native outcome or retain recovery.
@@ -3089,6 +3190,19 @@ async fn apply_streamed(
                         if cancel.is_cancelled() {
                             return transaction_outcome(ready.cancel(), effects, owner, receipt)
                                 .await;
+                        }
+                        if let Some(screen) = screen {
+                            let refused = screen.refusals(receipt, &ready);
+                            if !refused.is_empty() {
+                                return unwind_outcome(
+                                    ready.cancel(),
+                                    effects,
+                                    MutationError::Incompatible(refused),
+                                    owner,
+                                    receipt,
+                                )
+                                .await;
+                            }
                         }
                         let mut ready = match ready.prepare_publication(checkpoint_binding) {
                             ManagedContentStageOutcome::Ready(ready) => ready,
@@ -3417,6 +3531,18 @@ mod tests {
     }
 
     async fn fixture() -> (tempfile::TempDir, ContentMutations, InstanceId) {
+        fixture_for(CreateTarget {
+            selection_id: "vanilla|1.21.4".into(),
+            version_id: "1.21.4".into(),
+            minecraft_version: "1.21.4".into(),
+            loader_key: "vanilla".into(),
+        })
+        .await
+    }
+
+    async fn fixture_for(
+        target: CreateTarget,
+    ) -> (tempfile::TempDir, ContentMutations, InstanceId) {
         let root = tempfile::tempdir().unwrap();
         let library = match LibraryLifecycle::open(&root.path().canonicalize().unwrap()) {
             LibraryOpenOutcome::Ready(library) => library,
@@ -3441,15 +3567,10 @@ mod tests {
             .create(
                 CreateInstanceRequest {
                     name: "Content fixture".into(),
-                    selection_id: "vanilla|1.21.4".into(),
+                    selection_id: target.selection_id().into(),
                     ..Default::default()
                 },
-                CreateTarget {
-                    selection_id: "vanilla|1.21.4".into(),
-                    version_id: "1.21.4".into(),
-                    minecraft_version: "1.21.4".into(),
-                    loader_key: "vanilla".into(),
-                },
+                target,
                 instances.creation_admission_for_tests().await.unwrap(),
             )
             .unwrap()
@@ -3774,6 +3895,7 @@ mod tests {
                     None,
                     &mut Vec::new(),
                     &CancellationToken::new(),
+                    None,
                     None,
                 )
                 .await
@@ -4110,6 +4232,226 @@ mod tests {
             assert!(owner.has_unsettled_effects());
             assert!(owner.directories.admit(&id).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn disabling_or_removing_required_content_names_and_takes_its_dependents() {
+        let (root, owner, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        let needed = entry(b"needed");
+        let dependent = ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, "dependent"),
+            ProviderId::Modrinth,
+            "dependent".into(),
+            "d1".into(),
+            ContentKind::ResourcePack,
+            &FileRef {
+                url: "https://example.invalid/dependent.zip".into(),
+                filename: "dependent.zip".into(),
+                sha512: Some(Proof::bytes(b"dependent").sha512),
+                sha1: None,
+                size: Some(9),
+                primary: true,
+            },
+            vec![ContentDependency {
+                project_id: Some("pack".into()),
+                version_id: None,
+                kind: crate::content::model::DependencyKind::Required,
+            }],
+            Some("Dependent".into()),
+        )
+        .unwrap();
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert_batch(vec![needed.clone(), dependent.clone()])
+            .unwrap();
+        std::fs::write(game.join(MANIFEST_FILE), manifest.encode_managed().unwrap()).unwrap();
+        std::fs::write(game.join("resourcepacks/pack.zip"), b"needed").unwrap();
+        std::fs::write(game.join("resourcepacks/dependent.zip"), b"dependent").unwrap();
+        let (_, observed, live) = owner.instance_context(&id).unwrap();
+        let dependents = observed.dependents(&live, std::slice::from_ref(needed.canonical_id()));
+        assert_eq!(dependents, [&dependent]);
+        let refusal = super::super::provenance::RequiredRefusal::new(&[&needed], &dependents);
+        assert_eq!(refusal.error, "Dependent needs pack.zip.");
+        assert_eq!(
+            serde_json::to_value(&refusal).unwrap(),
+            serde_json::json!({"error":"Dependent needs pack.zip.",
+                "required_by":[{"canonical_id":"modrinth:dependent","title":"Dependent"}]})
+        );
+
+        assert!(matches!(
+            owner
+                .set_enabled(&id, needed.canonical_id(), false, false)
+                .unwrap()
+                .join()
+                .await
+                .unwrap(),
+            Err(MutationError::Required)
+        ));
+        assert!(matches!(
+            owner
+                .remove(&id, needed.canonical_id())
+                .unwrap()
+                .join()
+                .await
+                .unwrap(),
+            Err(MutationError::Required)
+        ));
+        assert!(game.join("resourcepacks/pack.zip").exists());
+        owner
+            .set_enabled(&id, needed.canonical_id(), false, true)
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        for name in ["pack.zip", "dependent.zip"] {
+            assert!(game.join(format!("resourcepacks/{name}.disabled")).exists());
+            assert!(!game.join(format!("resourcepacks/{name}")).exists());
+        }
+        assert!(
+            owner
+                .installed(&id)
+                .unwrap()
+                .entries()
+                .iter()
+                .all(|entry| !entry.enabled())
+        );
+        assert!(!owner.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn staged_mods_needing_a_newer_loader_or_a_missing_mod_are_refused_before_publication() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (root, mut owner, id) = fixture_for(
+            CreateTarget::loader_for_tests(
+                axial_minecraft::LoaderComponentId::Fabric,
+                "1.21.4",
+                "0.19.3",
+            )
+            .unwrap(),
+        )
+        .await;
+        let game = root.path().join("instances").join(id.as_str());
+        let jar = |depends: serde_json::Value| {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            writer
+                .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer
+                .write_all(
+                    serde_json::json!({"schemaVersion":1,"id":"extra","version":"1.0.0",
+                        "name":"Extra","depends":depends})
+                    .to_string()
+                    .as_bytes(),
+                )
+                .unwrap();
+            writer.finish().unwrap().into_inner()
+        };
+        let refused = [
+            (
+                jar(serde_json::json!({"fabricloader":">=0.20.1"})),
+                "Extra needs Fabric Loader 0.20.1 or newer. This instance has 0.19.3.",
+            ),
+            (
+                jar(serde_json::json!({"fabricloader":">=0.15","nuit":"1.0.0"})),
+                "Extra needs nuit 1.0.0, which isn't installed.",
+            ),
+        ];
+        let accepted = jar(serde_json::json!({"fabricloader":">=0.15","minecraft":"1.21.4"}));
+        let payloads: Vec<Vec<u8>> = refused
+            .iter()
+            .map(|(bytes, _)| bytes.clone())
+            .chain([accepted.clone()])
+            .collect();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = reqwest::Url::parse(&format!(
+            "http://{}/extra.jar",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let served = payloads.clone();
+        let transport = tokio::spawn(async move {
+            for bytes in served {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0; 1024];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            bytes.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.write_all(&bytes).await.unwrap();
+            }
+        });
+        let client = axial_minecraft::download::TransferClient::build(
+            axial_minecraft::download::TransferClientConfig::bounded(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+                vec![TransferOrigin::from_loopback_http_for_test_support(&url).unwrap()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        owner.transfer_fixture = Some((url.clone(), client));
+        for (index, bytes) in payloads.iter().enumerate() {
+            let version = format!("v{index}");
+            let (service, provider) = metadata_provider(vec![
+                serde_json::json!([{"id":"extra", "title":"Extra", "project_type":"mod"}]).to_string(),
+                serde_json::json!([{
+                    "project_id":"extra", "id":version, "name":version, "version_number":version,
+                    "version_type":"release", "loaders":["fabric"], "game_versions":["1.21.4"],
+                    "files":[{"filename":"extra.jar", "url":url.as_str(), "size":bytes.len(),
+                        "primary":true, "hashes":{"sha512":Proof::bytes(bytes).sha512}}], "dependencies":[],
+                }]).to_string(),
+            ])
+            .await;
+            let plan = owner
+                .plan(
+                    &service,
+                    &id,
+                    &[ResolutionSelection {
+                        canonical_id: "modrinth:extra".into(),
+                        kind: ContentKind::Mod,
+                        version_id: Some(version),
+                    }],
+                )
+                .await
+                .unwrap();
+            provider.await.unwrap();
+            let result = owner.install(plan, false).unwrap().join().await.unwrap();
+            match refused.get(index) {
+                Some((_, reason)) => {
+                    assert!(
+                        matches!(&result, Err(MutationError::Incompatible(reasons)) if reasons == &[reason.to_string()]),
+                        "{result:?}"
+                    );
+                    assert!(!game.join("mods/extra.jar").exists());
+                    assert!(owner.installed(&id).unwrap().is_empty());
+                }
+                None => {
+                    result.unwrap();
+                    assert_eq!(
+                        std::fs::read(game.join("mods/extra.jar")).unwrap(),
+                        accepted
+                    );
+                }
+            }
+            assert!(!owner.has_unsettled_effects());
+            assert!(!has_pending(owner.directories.registry().storage(), &id).unwrap());
+        }
+        transport.await.unwrap();
     }
 
     #[tokio::test]
@@ -7595,6 +7937,7 @@ mod tests {
                 None,
                 &mut effects,
                 &CancellationToken::new(),
+                None,
                 None,
             )
             .await

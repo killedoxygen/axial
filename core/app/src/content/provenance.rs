@@ -379,6 +379,57 @@ impl ManifestEntry {
     }
 }
 
+/// Public refusal naming the enabled content that still needs the target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
+pub struct RequiredRefusal {
+    pub error: String,
+    pub required_by: Vec<RequiredContent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
+pub struct RequiredContent {
+    pub canonical_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub title: Option<String>,
+}
+
+impl RequiredRefusal {
+    pub fn new(targets: &[&ManifestEntry], dependents: &[&ManifestEntry]) -> Self {
+        fn name(entry: &ManifestEntry) -> &str {
+            entry
+                .title
+                .as_deref()
+                .or(entry.filename.as_ref().map(ManagedContentFileName::as_str))
+                .unwrap_or(&entry.project_id)
+        }
+        fn names(entries: &[&ManifestEntry]) -> String {
+            let shown: Vec<&str> = entries.iter().take(3).map(|entry| name(entry)).collect();
+            match (shown.as_slice(), entries.len()) {
+                ([only], 1) => (*only).to_string(),
+                (_, count) if count > 3 => format!("{} and {} more", shown.join(", "), count - 3),
+                ([init @ .., last], _) => format!("{} and {last}", init.join(", ")),
+                ([], _) => String::new(),
+            }
+        }
+        let verb = if dependents.len() == 1 {
+            "needs"
+        } else {
+            "need"
+        };
+        Self {
+            error: format!("{} {verb} {}.", names(dependents), names(targets)),
+            required_by: dependents
+                .iter()
+                .map(|entry| RequiredContent {
+                    canonical_id: entry.canonical_id.0.clone(),
+                    title: entry.title.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContentManifest {
     schema_version: u32,
@@ -443,6 +494,60 @@ impl ContentManifest {
     }
     pub fn find(&self, id: &CanonicalId) -> Option<&ManifestEntry> {
         self.entries.iter().find(|entry| &entry.canonical_id == id)
+    }
+
+    /// The modpack whose recorded installation placed this exact file.
+    pub fn installing_pack(&self, entry: &ManifestEntry) -> Option<&ManifestEntry> {
+        let path = format!(
+            "{}/{}",
+            entry.kind.install_subdir()?,
+            entry.filename.as_ref()?.as_str()
+        );
+        let sha512 = entry.sha512.as_deref()?;
+        self.entries.iter().find(|pack| {
+            pack.pack_installation.as_ref().is_some_and(|installation| {
+                installation
+                    .files
+                    .iter()
+                    .any(|file| file.path == path && file.sha512 == sha512)
+            })
+        })
+    }
+
+    /// Enabled live entries that need any of `ids`, directly or through one
+    /// another, excluding `ids` themselves.
+    pub fn dependents(
+        &self,
+        live: &LiveManagedContent,
+        ids: &[CanonicalId],
+    ) -> Vec<&ManifestEntry> {
+        let mut needed: Vec<&ManifestEntry> = ids.iter().filter_map(|id| self.find(id)).collect();
+        let mut found = Vec::new();
+        loop {
+            let next: Vec<&ManifestEntry> = self
+                .entries
+                .iter()
+                .filter(|entry| entry.enabled && live.contains(entry))
+                .filter(|entry| !ids.contains(&entry.canonical_id))
+                .filter(|entry| {
+                    !found
+                        .iter()
+                        .any(|known: &&ManifestEntry| known.canonical_id == entry.canonical_id)
+                })
+                .filter(|entry| {
+                    entry.dependencies.iter().any(|dependency| {
+                        needed.iter().any(|target| {
+                            dependency.requires_project(&target.project_id, &target.version_id)
+                        })
+                    })
+                })
+                .collect();
+            if next.is_empty() {
+                return found;
+            }
+            needed.extend(next.iter().copied());
+            found.extend(next);
+        }
     }
 
     pub fn try_upsert(&mut self, entry: ManifestEntry) -> ContentResult<Option<ManifestEntry>> {

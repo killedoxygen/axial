@@ -156,10 +156,12 @@ async fn open_folder(
 }
 
 fn error(value: ResourceError) -> Error {
-    (
-        StatusCode::from_u16(value.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        Json(json!({"error":value.to_string()})),
-    )
+    let status =
+        StatusCode::from_u16(value.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    match value {
+        ResourceError::Required(refusal) => (status, Json(json!(refusal))),
+        value => (status, Json(json!({"error":value.to_string()}))),
+    }
 }
 fn id(raw: &str) -> Result<InstanceId, Error> {
     raw.parse().map_err(|_| error(ResourceError::InvalidName))
@@ -367,7 +369,9 @@ async fn toggle_mod(
     Path((raw, name)): Path<(String, String)>,
     request: Result<Json<UpdateModRequest>, JsonRejection>,
 ) -> Result<Json<ResourceCommand>, Error> {
-    command(state.set_mod_enabled(&id(&raw)?, &name, body(request)?.enabled)).await
+    let request = body(request)?;
+    command(state.set_mod_enabled(&id(&raw)?, &name, request.enabled, request.with_dependents))
+        .await
 }
 async fn delete_mod(
     State(state): State<Arc<ResourceService>>,
