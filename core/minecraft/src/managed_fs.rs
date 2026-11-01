@@ -517,6 +517,21 @@ impl ManagedOperationPin {
     }
 }
 
+/// Runs `work` in an observation window of the admitted library directory, so
+/// its repeated admission checks share one validation.
+fn observe_operation_admission<T>(
+    pin: &Option<Arc<ManagedOperationPin>>,
+    work: impl FnOnce() -> T,
+) -> io::Result<T> {
+    let Some(admission) = pin.as_ref().and_then(|pin| pin.admission.as_ref()) else {
+        return Ok(work());
+    };
+    match &admission.snapshot()?.current {
+        ManagedLibraryAdmission::App(directory) => directory.observe_validated(work),
+        _ => Ok(work()),
+    }
+}
+
 impl ManagedAuthorityLifecycle {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -880,6 +895,43 @@ pub(crate) enum ManagedGuardedFileMoveFailure {
     NoEffect,
     AppliedUnsettled,
     Indeterminate,
+}
+
+/// Directories changed by moves that deferred parent sync. Each is synced once, before
+/// the batch is reported durable; the retained handle count stays bounded.
+#[derive(Default)]
+pub(crate) struct ManagedDeferredDirectorySyncs {
+    directories: Vec<ManagedDir>,
+}
+
+impl ManagedDeferredDirectorySyncs {
+    const MAX_RETAINED: usize = 64;
+
+    fn record(&mut self, directory: &ManagedDir) {
+        if !self
+            .directories
+            .iter()
+            .any(|retained| retained.inner.path == directory.inner.path)
+        {
+            self.directories.push(directory.clone());
+        }
+    }
+
+    /// Bounds retained directory handles; call outside any root transition.
+    pub(crate) fn sync_when_full(&mut self) -> Result<(), LoaderError> {
+        if self.directories.len() >= Self::MAX_RETAINED {
+            self.sync()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sync(&mut self) -> Result<(), LoaderError> {
+        for directory in &self.directories {
+            directory.sync()?;
+        }
+        self.directories.clear();
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1811,11 +1863,36 @@ impl ManagedDir {
         observe: impl FnOnce() -> Result<T, E>,
         closing_error: impl FnOnce(LoaderError) -> E,
     ) -> Result<T, E> {
+        self.validation_window(false, observe, closing_error)
+    }
+
+    /// Runs file effects and observations of this root session in one batch
+    /// validation window; a displacement fails the batch when it closes.
+    /// Directory rebinding effects keep their own validation.
+    pub(crate) fn batch_validated<T, E>(
+        &self,
+        work: impl FnOnce() -> Result<T, E>,
+        closing_error: impl FnOnce(LoaderError) -> E,
+    ) -> Result<T, E> {
+        self.validation_window(true, work, closing_error)
+    }
+
+    fn validation_window<T, E>(
+        &self,
+        batch: bool,
+        observe: impl FnOnce() -> Result<T, E>,
+        closing_error: impl FnOnce(LoaderError) -> E,
+    ) -> Result<T, E> {
         let mut observed = None;
-        let closing = self
-            .inner
-            .directory
-            .observe_validated(|| observed = Some(observe()));
+        let directory = &self.inner.directory;
+        let closing = observe_operation_admission(&self.inner.operation_pin, || {
+            if batch {
+                directory.batch_validated(|| observed = Some(observe()))
+            } else {
+                directory.observe_validated(|| observed = Some(observe()))
+            }
+        })
+        .and_then(|closing| closing);
         match (observed, closing) {
             (Some(Err(error)), _) => Err(error),
             (Some(Ok(value)), Ok(())) => Ok(value),
@@ -2562,13 +2639,16 @@ impl ManagedDir {
             size,
             _operation_pin: self.inner.operation_pin.clone(),
         };
-        verify_operation_admission(&self.inner.operation_pin)?;
-        if !self.file_guard_matches_after_revalidation(name, &guard)? {
+        // The open bound the name; validating the interned capability rechecks
+        // that binding, immediately or before the window returns.
+        if !guard
+            .identity
+            .with_capability(|file| Ok(file.validate_revision(&guard.revision).is_ok()))?
+        {
             return Err(LoaderError::Verify(
                 "managed file changed during admission".to_string(),
             ));
         }
-        verify_operation_admission(&self.inner.operation_pin)?;
         Ok(Some(guard))
     }
 
@@ -2733,7 +2813,9 @@ impl ManagedDir {
                 <[u8; 20]>::from(hasher.finalize())
             };
             check()?;
-            if !self.file_guard_matches(name, guard)? {
+            self.revalidate()?;
+            // `file` was opened at `name`, so validating it rechecks that binding.
+            if !guard.identity.matches(&file)? || file.validate_revision(&guard.revision).is_err() {
                 return Err(LoaderError::Verify(
                     "managed guarded hash source changed during hashing".to_string(),
                 ));
@@ -2766,8 +2848,18 @@ impl ManagedDir {
         guard: &ManagedFileGuard,
         max_size: u64,
     ) -> Result<[u8; 20], LoaderError> {
+        self.sha1_reverified_file_bytes_with_check(name, guard, max_size, || Ok(()))
+    }
+
+    fn sha1_reverified_file_bytes_with_check(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+        check: impl FnMut() -> Result<(), LoaderError>,
+    ) -> Result<[u8; 20], LoaderError> {
         let Some(digest) = self.inner.root.verified_sha1(&guard.revision) else {
-            return self.sha1_guarded_file_bytes(name, guard, max_size);
+            return self.sha1_guarded_file_bytes_with_check(name, guard, max_size, check);
         };
         self.observe(|| {
             if guard.size > max_size {
@@ -2934,12 +3026,19 @@ impl ManagedDir {
         &self,
         name: LeafName,
         sealed: SealedStagedFile,
+        sync_parent: bool,
     ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
         let root = self.inner.root.clone();
         let transition = root.transition();
         root.settle_locked(&transition)
             .map_err(|_| ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None })?;
-        match sealed.promote_no_replace(&self.inner.directory, &self.inner.directory, &name) {
+        let directory = &self.inner.directory;
+        let promoted = if sync_parent {
+            sealed.promote_no_replace(directory, directory, &name)
+        } else {
+            sealed.promote_no_replace_deferring_parent_sync(directory, directory, &name)
+        };
+        match promoted {
             FilePromotionOutcome::Applied(file) => self.guard_from_file(name, file).map_err(|_| {
                 ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None }
             }),
@@ -3063,7 +3162,7 @@ impl ManagedDir {
         let sealed = self
             .seal_stage(staged)
             .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-        let guard = self.promote_create_new(name_leaf, sealed)?;
+        let guard = self.promote_create_new(name_leaf, sealed, true)?;
         #[cfg(test)]
         if fault == Some(ManagedCreateOnlyWriteFault::Promotion) {
             return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
@@ -3328,6 +3427,29 @@ impl ManagedDir {
         destination: &ManagedDir,
         destination_name: &str,
     ) -> Result<(), ManagedGuardedFileMoveFailure> {
+        self.rename_guarded_file(name, guard, destination, destination_name, None)
+    }
+
+    /// An applied move becomes durable once `syncs` is synced.
+    pub(crate) fn rename_guarded_file_no_replace_deferring_sync(
+        &self,
+        name: &str,
+        guard: &mut ManagedFileGuard,
+        destination: &ManagedDir,
+        destination_name: &str,
+        syncs: &mut ManagedDeferredDirectorySyncs,
+    ) -> Result<(), ManagedGuardedFileMoveFailure> {
+        self.rename_guarded_file(name, guard, destination, destination_name, Some(syncs))
+    }
+
+    fn rename_guarded_file(
+        &self,
+        name: &str,
+        guard: &mut ManagedFileGuard,
+        destination: &ManagedDir,
+        destination_name: &str,
+        mut deferred: Option<&mut ManagedDeferredDirectorySyncs>,
+    ) -> Result<(), ManagedGuardedFileMoveFailure> {
         let source_name = leaf(name).map_err(|_| ManagedGuardedFileMoveFailure::NoEffect)?;
         let destination_name =
             leaf(destination_name).map_err(|_| ManagedGuardedFileMoveFailure::NoEffect)?;
@@ -3358,8 +3480,20 @@ impl ManagedDir {
         {
             return Err(ManagedGuardedFileMoveFailure::NoEffect);
         }
-        match file.move_no_replace(&destination.inner.directory, &destination_name) {
+        let outcome = if deferred.is_some() {
+            file.move_no_replace_deferring_parent_sync(
+                &destination.inner.directory,
+                &destination_name,
+            )
+        } else {
+            file.move_no_replace(&destination.inner.directory, &destination_name)
+        };
+        match outcome {
             FileMoveOutcome::Applied(file) => {
+                if let Some(syncs) = deferred.as_deref_mut() {
+                    syncs.record(self);
+                    syncs.record(destination);
+                }
                 refresh_moved_file_guard(guard, destination, destination_name.clone(), file)
                     .map_err(|()| ManagedGuardedFileMoveFailure::AppliedUnsettled)?;
             }
@@ -4175,18 +4309,26 @@ impl ManagedDir {
         }
         let (parent, name) = self.open_or_create_relative_parent(relative)?;
         let directory = parent.clone();
-        let (import, discard) =
-            run_managed_import("managed verified-source import worker stopped", move || {
-                let import = directory.import_authenticated(
-                    &name,
-                    &mut source,
-                    expected_size,
-                    expected_sha1,
-                    true,
+        let (import, discard) = run_managed_import(
+            MANAGED_IMPORT,
+            "managed verified-source import worker stopped",
+            move || {
+                let import = directory.batch_validated(
+                    || {
+                        directory.import_authenticated(
+                            &name,
+                            &mut source,
+                            expected_size,
+                            expected_sha1,
+                            true,
+                        )
+                    },
+                    |error| error,
                 );
                 (import, source.discard())
-            })
-            .await?;
+            },
+        )
+        .await?;
         match discard {
             crate::download::VerifiedTransferDiscardOutcome::Discarded {
                 authority: terminal,
@@ -4209,6 +4351,7 @@ impl ManagedDir {
         import.map(drop)
     }
 
+    /// The caller must `sync` this directory before relying on the import being durable.
     pub(crate) async fn import_authenticated_create_new<R, G>(
         &self,
         name: &str,
@@ -4280,20 +4423,29 @@ impl ManagedDir {
             ));
         }
         let directory = self.clone();
-        run_managed_import("managed authenticated import worker stopped", move || {
-            let _lifetime_guard = lifetime_guard;
-            #[cfg(test)]
-            if let Some(hook) = blocking_hook {
-                hook();
-            }
-            directory.import_authenticated(
-                &name,
-                source,
-                expected_size,
-                expected_sha1,
-                replace_existing,
-            )
-        })
+        run_managed_import(
+            MANAGED_IMPORT,
+            "managed authenticated import worker stopped",
+            move || {
+                let _lifetime_guard = lifetime_guard;
+                #[cfg(test)]
+                if let Some(hook) = blocking_hook {
+                    hook();
+                }
+                directory.batch_validated(
+                    || {
+                        directory.import_authenticated(
+                            &name,
+                            source,
+                            expected_size,
+                            expected_sha1,
+                            replace_existing,
+                        )
+                    },
+                    |error| error,
+                )
+            },
+        )
         .await?
     }
 
@@ -4354,7 +4506,8 @@ impl ManagedDir {
         let guard = if replace_existing {
             self.replace_or_promote(name_leaf, sealed)?
         } else {
-            self.promote_create_new(name_leaf, sealed)
+            // Create-only imports fill component staging buckets, which their publisher syncs.
+            self.promote_create_new(name_leaf, sealed, false)
                 .map_err(|failure| match failure {
                     ManagedCreateOnlyWriteFailure::BeforePromotion(error) => error,
                     ManagedCreateOnlyWriteFailure::PromotionAttempted { .. } => unsettled(
@@ -4425,7 +4578,8 @@ impl ManagedDir {
         allow_links: bool,
     ) -> Result<ManagedTreeUsage, LoaderError> {
         let mut state = ManagedTreeCaptureState::new(limits);
-        self.capture_tree_directory(None, 0, &mut state, None, allow_links)?;
+        // One observation window validates each directory once per walk.
+        self.observe(|| self.capture_tree_directory(None, 0, &mut state, None, allow_links))?;
         Ok(ManagedTreeUsage {
             entries: limits.max_entries - state.remaining_entries,
             bytes: limits.max_total_bytes - state.remaining_bytes,
@@ -4436,8 +4590,8 @@ impl ManagedDir {
         &self,
         limits: ManagedTreeLimits,
     ) -> Result<ManagedTreeSnapshot, LoaderError> {
-        let first = self.capture_tree(limits)?;
-        let second = self.capture_tree(limits)?;
+        let (first, second) =
+            self.observe(|| Ok((self.capture_tree(limits)?, self.capture_tree(limits)?)))?;
         if first != second {
             return Err(LoaderError::Verify(
                 "managed tree changed during snapshot".to_string(),
@@ -4513,7 +4667,8 @@ impl ManagedDir {
                     }
                     state.remaining_bytes -= size;
                     if let (Some(snapshot), Some(guard)) = (snapshot.as_deref_mut(), guard) {
-                        let sha1 = self.sha1_guarded_file_bytes(
+                        // Repeated snapshots hash each changed revision once.
+                        let sha1 = self.sha1_reverified_file_bytes(
                             name,
                             &guard,
                             state.limits.max_file_bytes,
@@ -4553,16 +4708,21 @@ impl ManagedDir {
     }
 }
 
-async fn run_managed_import<T, Work>(stopped: &'static str, work: Work) -> Result<T, LoaderError>
+/// Imports overlap their per-file durability barriers within the worker limit.
+const MANAGED_IMPORT: PhysicalWorkRequest =
+    PhysicalWorkRequest::foreground(PhysicalIoClass::Write, MANAGED_IMPORT_SCRATCH_BYTES);
+
+async fn run_managed_import<T, Work>(
+    request: PhysicalWorkRequest,
+    stopped: &'static str,
+    work: Work,
+) -> Result<T, LoaderError>
 where
     T: Send + 'static,
     Work: FnOnce() -> T + Send + 'static,
 {
     let admission = process_physical_work()
-        .admit(PhysicalWorkRequest::background(
-            PhysicalIoClass::Heavy,
-            MANAGED_IMPORT_SCRATCH_BYTES,
-        ))
+        .admit(request)
         .await
         .map_err(|_| LoaderError::Verify(stopped.to_string()))?;
     tokio::spawn(admission.run(move |_| work()))
@@ -6135,6 +6295,19 @@ impl ManagedLibraryFile {
         let digest = self
             .directory
             .sha1_guarded_file_bytes_with_check(&self.name, &self.guard, max_size, || {
+                self.operation.revalidate().map_err(LoaderError::Io)
+            })
+            .map_err(loader_io)?;
+        self.operation.revalidate()?;
+        Ok(digest)
+    }
+
+    /// Like `sha1_bounded`, but reuses this process's earlier full hash while the file keeps
+    /// the hashed revision. Activation and other durable insertion use `sha1_bounded`.
+    pub fn sha1_reverified(&self, max_size: u64) -> io::Result<[u8; 20]> {
+        let digest = self
+            .directory
+            .sha1_reverified_file_bytes_with_check(&self.name, &self.guard, max_size, || {
                 self.operation.revalidate().map_err(LoaderError::Io)
             })
             .map_err(loader_io)?;

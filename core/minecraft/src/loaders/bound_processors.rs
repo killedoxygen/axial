@@ -52,6 +52,7 @@ const PROCESS_REAP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 #[cfg(not(target_os = "linux"))]
 const PROCESS_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STAGE_WATCH_INTERVAL: Duration = Duration::from_millis(100);
+const STAGE_WATCH_COST_RATIO: u32 = 4;
 
 #[cfg(unix)]
 struct PendingProcessContainment;
@@ -2377,19 +2378,28 @@ async fn wait_for_contained_child(
             },
             _ = &mut *cancel => Err(BoundProcessorError::Cancelled),
             _ = &mut deadline => Err(BoundProcessorError::Timeout),
-            _ = stage_watch.tick(), if workspace.is_some() => match workspace
-                .expect("guarded processor workspace")
-                .validate_live_bounds()
-            {
-                Ok(()) => continue,
-                Err(source) => {
-                    let io_kind = match source {
-                        super::types::LoaderError::Io(error) => Some(error.kind()),
-                        _ => None,
-                    };
-                    tracing::warn!(stage = "step_live_bounds", ?io_kind, error = %BoundProcessorError::Stage, "Forge processor execution failed");
-                    Err(BoundProcessorError::Stage)
-                },
+            _ = stage_watch.tick(), if workspace.is_some() => {
+                let started = std::time::Instant::now();
+                match workspace
+                    .expect("guarded processor workspace")
+                    .validate_live_bounds()
+                {
+                    Ok(()) => {
+                        // Keeps the watch to a bounded share of this worker.
+                        stage_watch.reset_after(
+                            STAGE_WATCH_INTERVAL.max(started.elapsed() * STAGE_WATCH_COST_RATIO),
+                        );
+                        continue;
+                    }
+                    Err(source) => {
+                        let io_kind = match source {
+                            super::types::LoaderError::Io(error) => Some(error.kind()),
+                            _ => None,
+                        };
+                        tracing::warn!(stage = "step_live_bounds", ?io_kind, error = %BoundProcessorError::Stage, "Forge processor execution failed");
+                        Err(BoundProcessorError::Stage)
+                    },
+                }
             },
             status = child.child.wait() => match status {
                 Ok(status) if status.success() => Ok(()),

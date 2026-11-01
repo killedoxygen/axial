@@ -1962,7 +1962,7 @@ impl InstallQueue {
         self.inspect_version(
             pin,
             version_id,
-            artifacts::Inspection::Integrity,
+            artifacts::Inspection::Reverified,
             false,
             None,
         )

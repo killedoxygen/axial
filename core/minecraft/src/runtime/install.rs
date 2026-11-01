@@ -44,8 +44,10 @@ const MAX_RUNTIME_LINK_TARGET_BYTES: usize = 4096;
 const MAX_RUNTIME_FILE_BYTES: u64 = 128 << 20;
 const MAX_RUNTIME_TREE_TOTAL_BYTES: u64 = 512 << 20;
 const RUNTIME_LZMA_DICTIONARY_BYTES: usize = 128 << 20;
+// Each sealed-source read revalidates its binding, so reads are kept large.
+const RUNTIME_LZMA_INPUT_BYTES: usize = 256 << 10;
 const RUNTIME_LZMA_SCRATCH_BYTES: u64 =
-    MAX_RUNTIME_FILE_BYTES + RUNTIME_LZMA_DICTIONARY_BYTES as u64;
+    MAX_RUNTIME_FILE_BYTES + RUNTIME_LZMA_DICTIONARY_BYTES as u64 + RUNTIME_LZMA_INPUT_BYTES as u64;
 const RUNTIME_TREE_VERIFY_SCRATCH_BYTES: u64 = 64 << 10;
 
 fn runtime_source_failure(
@@ -2317,7 +2319,7 @@ fn validate_ephemeral_processor_manifest(
         source.bytes().len() as u64,
         max_entries.min(MAX_RUNTIME_TREE_ENTRIES),
         max_bytes.min(MAX_RUNTIME_TREE_TOTAL_BYTES),
-        1,
+        runtime_file_download_concurrency(),
     )
 }
 
@@ -3357,7 +3359,7 @@ async fn decompress_lzma_runtime_source(
                             return (Err(runtime_materialization_cancelled()), source.discard());
                         }
                         let mut input = RuntimeInstallReader::with_cancellation(
-                            BufReader::new(source),
+                            BufReader::with_capacity(RUNTIME_LZMA_INPUT_BYTES, source),
                             cancellation.clone(),
                         );
                         let capacity = expected

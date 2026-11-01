@@ -30,12 +30,19 @@ const MAX_INVENTORY_ENTRIES: usize = 1_000_000;
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Inspection {
     Summary,
+    /// Hashes every file in full.
     Integrity,
+    /// Integrity that reuses this process's full hashes of unchanged file revisions.
+    Reverified,
 }
 
 impl Inspection {
+    fn hashes(self) -> bool {
+        self != Self::Summary
+    }
+
     fn observes(self, path: &str) -> bool {
-        self == Self::Integrity
+        self.hashes()
             || !path.starts_with("assets/")
             || is_asset_index(path)
             || path
@@ -96,15 +103,13 @@ impl InventoryBudget {
         let metadata = format!("versions/{0}/{0}.json", inventory.version_id);
         let mut bytes = 0_u64;
         for file in &inventory.files {
-            if inspection == Inspection::Integrity || file.path == metadata {
+            if inspection.hashes() || file.path == metadata {
                 bytes = bytes
                     .checked_add(file.size)
                     .and_then(|bytes| bytes.checked_add(2))
                     .ok_or(InstallError::AtCapacity)?;
             }
-            if file.path == metadata
-                || (inspection == Inspection::Integrity && is_asset_index(&file.path))
-            {
+            if file.path == metadata || (inspection.hashes() && is_asset_index(&file.path)) {
                 // Bounded JSON reads also perform EOF and completion probes.
                 bytes = bytes
                     .checked_add(file.size)
@@ -441,134 +446,165 @@ impl ActivatedVersion {
             .map_err(|_| InstallError::LibraryUnavailable)?;
         self.files
             .sort_unstable_by(|left, right| left.path.cmp(&right.path));
-        let mut batch = operation.file_batch();
         let metadata_path = format!("versions/{0}/{0}.json", self.version_id);
         let client = format!("versions/{0}/{0}.jar", self.version_id);
         let client_path =
             PortableRelativePath::new_exact(&client).map_err(|_| InstallError::NotReady)?;
-        let mut guards = Vec::with_capacity(
-            self.files
-                .iter()
-                .filter(|file| inspection.observes(&file.path))
-                .count(),
-        );
-        let mut missing = Vec::new();
-        let mut reasons = Vec::new();
-        let mut version = None;
-        let mut asset_flags = BTreeMap::new();
-        observe_inventory(&operation, || {
-            for (index, expected) in self.files.iter().enumerate() {
-                if expected.size > 2 * 1024 * 1024 * 1024 {
-                    return Err(InstallError::NotReady);
-                }
-                let mut expected_digest = [0; 20];
-                hex::decode_to_slice(&expected.sha1, &mut expected_digest)
-                    .map_err(|_| InstallError::NotReady)?;
-                if hex::encode(expected_digest) != expected.sha1 {
-                    return Err(InstallError::NotReady);
-                }
-                let path = PortableRelativePath::new_exact(&expected.path)
-                    .map_err(|_| InstallError::NotReady)?;
-                let root = expected.path.split('/').next();
-                if !matches!(root, Some("versions" | "libraries" | "assets"))
-                    || (index > 0 && self.files[index - 1].path == expected.path)
-                {
-                    return Err(InstallError::NotReady);
-                }
-                let is_asset_index = is_asset_index(&expected.path);
-                let is_required_library = root == Some("libraries")
-                    || expected
-                        .path
-                        .strip_prefix("assets/log_configs/")
-                        .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
-                if !inspection.observes(&expected.path) {
-                    continue;
-                }
-                let file = match batch
-                    .observe_file_with_absence(&path)
-                    .map_err(|_| InstallError::NotReady)?
-                {
-                    FileObservation::Present(file) => file,
-                    FileObservation::Missing(absence) => {
+        #[derive(Default)]
+        struct InspectedRange {
+            guards: Vec<(PortableRelativePath, axial_fs::FileRevisionObservation)>,
+            // The first damage of each reason, with its absence when missing.
+            damage: Vec<(InstallError, Option<FileAbsence>)>,
+            version: Option<VersionJson>,
+            asset_flags: BTreeMap<String, bool>,
+        }
+        let files = &self.files;
+        let inspect_range = |range: std::ops::Range<usize>| {
+            let mut inspected = InspectedRange {
+                guards: Vec::with_capacity(
+                    files[range.clone()]
+                        .iter()
+                        .filter(|file| inspection.observes(&file.path))
+                        .count(),
+                ),
+                ..InspectedRange::default()
+            };
+            let mut batch = operation.file_batch();
+            observe_inventory(&operation, || {
+                for index in range {
+                    let expected = &files[index];
+                    if expected.size > 2 * 1024 * 1024 * 1024 {
+                        return Err(InstallError::NotReady);
+                    }
+                    let mut expected_digest = [0; 20];
+                    hex::decode_to_slice(&expected.sha1, &mut expected_digest)
+                        .map_err(|_| InstallError::NotReady)?;
+                    if hex::encode(expected_digest) != expected.sha1 {
+                        return Err(InstallError::NotReady);
+                    }
+                    let path = PortableRelativePath::new_exact(&expected.path)
+                        .map_err(|_| InstallError::NotReady)?;
+                    let root = expected.path.split('/').next();
+                    if !matches!(root, Some("versions" | "libraries" | "assets"))
+                        || (index > 0 && files[index - 1].path == expected.path)
+                    {
+                        return Err(InstallError::NotReady);
+                    }
+                    let is_asset_index = is_asset_index(&expected.path);
+                    let is_required_library = root == Some("libraries")
+                        || expected
+                            .path
+                            .strip_prefix("assets/log_configs/")
+                            .is_some_and(|id| PortableFileName::new_exact(id).is_ok());
+                    if !inspection.observes(&expected.path) {
+                        continue;
+                    }
+                    let file = match batch
+                        .observe_file_with_absence(&path)
+                        .map_err(|_| InstallError::NotReady)?
+                    {
+                        FileObservation::Present(file) => file,
+                        FileObservation::Missing(absence) => {
+                            let reason = if path == client_path {
+                                InstallError::ClientJarMissing
+                            } else if expected.path == metadata_path {
+                                InstallError::VersionJsonMissing
+                            } else if is_required_library {
+                                InstallError::LibrariesMissing
+                            } else if is_asset_index {
+                                InstallError::AssetIndexMissing
+                            } else {
+                                InstallError::NotReady
+                            };
+                            if !diagnostics || reason == InstallError::NotReady {
+                                return Err(reason);
+                            }
+                            if !inspected.damage.iter().any(|(seen, _)| *seen == reason) {
+                                inspected.damage.push((reason, Some(absence)));
+                            }
+                            continue;
+                        }
+                    };
+                    if file.size() != expected.size
+                        || ((inspection.hashes() || expected.path == metadata_path)
+                            && if inspection == Inspection::Reverified {
+                                file.sha1_reverified(expected.size)
+                            } else {
+                                file.sha1_bounded(expected.size)
+                            }
+                            .map_err(|_| InstallError::NotReady)?
+                                != expected_digest)
+                    {
                         let reason = if path == client_path {
-                            InstallError::ClientJarMissing
-                        } else if expected.path == metadata_path {
-                            InstallError::VersionJsonMissing
+                            InstallError::ClientJarCorrupt
                         } else if is_required_library {
-                            InstallError::LibrariesMissing
+                            InstallError::LibrariesCorrupt
                         } else if is_asset_index {
-                            InstallError::AssetIndexMissing
+                            InstallError::AssetIndexCorrupt
                         } else {
                             InstallError::NotReady
                         };
                         if !diagnostics || reason == InstallError::NotReady {
                             return Err(reason);
                         }
-                        if !reasons.contains(&reason) {
-                            reasons.push(reason);
-                            missing.push(absence);
+                        if !inspected.damage.iter().any(|(seen, _)| *seen == reason) {
+                            inspected.damage.push((reason, None));
                         }
+                        inspected.guards.push((path, file.revision_observation()));
                         continue;
                     }
-                };
-                if file.size() != expected.size
-                    || ((inspection == Inspection::Integrity || expected.path == metadata_path)
-                        && file
-                            .sha1_bounded(expected.size)
-                            .map_err(|_| InstallError::NotReady)?
-                            != expected_digest)
-                {
-                    let reason = if path == client_path {
-                        InstallError::ClientJarCorrupt
-                    } else if is_required_library {
-                        InstallError::LibrariesCorrupt
-                    } else if is_asset_index {
-                        InstallError::AssetIndexCorrupt
-                    } else {
-                        InstallError::NotReady
-                    };
-                    if !diagnostics || reason == InstallError::NotReady {
-                        return Err(reason);
+                    if expected.path == metadata_path {
+                        let bytes = file
+                            .read_bounded(16 << 20)
+                            .map_err(|_| InstallError::NotReady)?;
+                        inspected.version = Some(
+                            serde_json::from_slice::<VersionJson>(&bytes)
+                                .map_err(|_| InstallError::NotReady)?,
+                        );
                     }
-                    if !reasons.contains(&reason) {
-                        reasons.push(reason);
+                    if is_asset_index && inspection.hashes() {
+                        #[derive(Deserialize)]
+                        struct AssetFlags {
+                            #[serde(default, rename = "virtual")]
+                            virtual_assets: bool,
+                            #[serde(default)]
+                            map_to_resources: bool,
+                        }
+                        let bytes = file
+                            .read_bounded(64 << 20)
+                            .map_err(|_| InstallError::NotReady)?;
+                        let flags: AssetFlags =
+                            serde_json::from_slice(&bytes).map_err(|_| InstallError::NotReady)?;
+                        inspected.asset_flags.insert(
+                            expected.path.clone(),
+                            flags.virtual_assets || flags.map_to_resources,
+                        );
                     }
-                    guards.push((path, file.revision_observation()));
-                    continue;
+                    // Retain compact revision evidence, not an open descriptor for
+                    // every asset object. Re-observation below is bounded to one file.
+                    inspected.guards.push((path, file.revision_observation()));
                 }
-                if expected.path == metadata_path {
-                    let bytes = file
-                        .read_bounded(16 << 20)
-                        .map_err(|_| InstallError::NotReady)?;
-                    version = Some(
-                        serde_json::from_slice::<VersionJson>(&bytes)
-                            .map_err(|_| InstallError::NotReady)?,
-                    );
+                Ok(())
+            })?;
+            Ok(inspected)
+        };
+        let ranges = inventory_ranges(files.len(), inspect_range)?;
+        let mut guards = Vec::with_capacity(ranges.iter().map(|range| range.guards.len()).sum());
+        let mut missing = Vec::new();
+        let mut reasons = Vec::new();
+        let mut version = None;
+        let mut asset_flags = BTreeMap::new();
+        for range in ranges {
+            guards.extend(range.guards);
+            for (reason, absence) in range.damage {
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                    missing.extend(absence);
                 }
-                if is_asset_index && inspection == Inspection::Integrity {
-                    #[derive(Deserialize)]
-                    struct AssetFlags {
-                        #[serde(default, rename = "virtual")]
-                        virtual_assets: bool,
-                        #[serde(default)]
-                        map_to_resources: bool,
-                    }
-                    let bytes = file
-                        .read_bounded(64 << 20)
-                        .map_err(|_| InstallError::NotReady)?;
-                    let flags: AssetFlags =
-                        serde_json::from_slice(&bytes).map_err(|_| InstallError::NotReady)?;
-                    asset_flags.insert(
-                        expected.path.clone(),
-                        flags.virtual_assets || flags.map_to_resources,
-                    );
-                }
-                // Retain compact revision evidence, not an open descriptor for
-                // every asset object. Re-observation below is bounded to one file.
-                guards.push((path, file.revision_observation()));
             }
-            Ok(())
-        })?;
+            version = version.or(range.version);
+            asset_flags.extend(range.asset_flags);
+        }
         let contains = |path: &str| {
             self.files
                 .binary_search_by(|file| file.path.as_str().cmp(path))
@@ -764,18 +800,45 @@ impl InventoryEvidence {
         use super::queue::InstallError;
         observe_inventory(&self.operation, || {
             self.pin.revalidate().map_err(|_| InstallError::NotReady)?;
-            let mut batch = self.operation.file_batch();
-            for (path, expected) in &self.guards {
-                batch
-                    .validate_revision(path, expected)
-                    .map_err(|_| InstallError::NotReady)?;
-            }
             for absence in &self.missing {
                 absence.revalidate().map_err(|_| InstallError::NotReady)?;
             }
             Ok(())
-        })
+        })?;
+        inventory_ranges(self.guards.len(), |range| {
+            observe_inventory(&self.operation, || {
+                let mut batch = self.operation.file_batch();
+                for (path, expected) in &self.guards[range] {
+                    batch
+                        .validate_revision(path, expected)
+                        .map_err(|_| InstallError::NotReady)?;
+                }
+                Ok(())
+            })
+        })?;
+        Ok(())
     }
+}
+
+/// Inventories at least this large are split across available physical workers.
+const PARALLEL_INVENTORY_ENTRIES: usize = 512;
+const MAX_INVENTORY_WORKERS: usize = 4;
+
+/// Runs read-only `job` over contiguous ranges of `len` sorted inventory
+/// entries. The earliest range's refusal is returned, as a single pass would.
+fn inventory_ranges<T: Send>(
+    len: usize,
+    job: impl Fn(std::ops::Range<usize>) -> Result<T, super::queue::InstallError> + Sync,
+) -> Result<Vec<T>, super::queue::InstallError> {
+    let workers = if len >= PARALLEL_INVENTORY_ENTRIES {
+        MAX_INVENTORY_WORKERS
+    } else {
+        1
+    };
+    axial_resource::process_physical_work()
+        .run_ranges(axial_resource::PhysicalIoClass::Read, len, workers, job)
+        .into_iter()
+        .collect()
 }
 
 /// Runs one inventory pass in the library's observation window. The pass's own

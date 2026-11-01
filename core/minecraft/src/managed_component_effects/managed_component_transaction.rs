@@ -17,8 +17,8 @@ use crate::managed_component_table::{
     decode_component_table_shard,
 };
 use crate::managed_fs::{
-    ManagedCreateOnlyWriteFailure, ManagedDirectoryMoveFailure, ManagedFileGuard,
-    ManagedGuardedFileMoveFailure,
+    ManagedCreateOnlyWriteFailure, ManagedDeferredDirectorySyncs, ManagedDirectoryMoveFailure,
+    ManagedFileGuard, ManagedGuardedFileMoveFailure,
 };
 use crate::managed_publication::run_publication_blocking;
 use sha2::{Digest as _, Sha256};
@@ -1032,7 +1032,7 @@ fn execute_component_intent_blocking(
         };
 
     let root = published.lease.root().clone();
-    let execution = root.observe_validated(
+    let execution = root.batch_validated(
         || {
             create_and_promote_ancestors(
                 published,
@@ -1568,6 +1568,9 @@ fn execute_rows_forward(
 ) -> Result<(), ComponentForwardFailure> {
     let mut parser = ComponentTableParser::new(published.manifest.clone()).map_err(tx)?;
     let mut parents = ComponentCanonicalParents::default();
+    // Rows recover from any per-row state, so canonical moves are made durable together
+    // before the committed outcome can be published.
+    let mut syncs = ManagedDeferredDirectorySyncs::default();
     for shard_index in 0..published.manifest.shards.len() {
         let bytes = read_table_shard_bytes(published, shard_index)?;
         let shard = parser.parse_next(&bytes).map_err(tx)?;
@@ -1601,6 +1604,7 @@ fn execute_rows_forward(
                     row_in_shard,
                     observed.staging.ok_or(ComponentTransactionError)?,
                     &mut parents,
+                    &mut syncs,
                 )?,
                 ComponentRecoveryEntryState::StagedReplacement => {
                     let mut canonical = observed.canonical.ok_or(ComponentTransactionError)?;
@@ -1652,6 +1656,7 @@ fn execute_rows_forward(
                         row_in_shard,
                         intermediate.staging.ok_or(ComponentTransactionError)?,
                         &mut parents,
+                        &mut syncs,
                     )?;
                 }
                 _ => return Err(ComponentTransactionError.into()),
@@ -1676,7 +1681,7 @@ fn execute_rows_forward(
         }
     }
     parser.finish().map_err(tx)?;
-    Ok(())
+    syncs.sync().map_err(forward_post_effect_error)
 }
 
 fn move_staged_to_canonical(
@@ -1686,6 +1691,7 @@ fn move_staged_to_canonical(
     row_in_shard: usize,
     mut guard: ManagedFileGuard,
     parents: &mut ComponentCanonicalParents,
+    syncs: &mut ManagedDeferredDirectorySyncs,
 ) -> Result<(), ComponentForwardFailure> {
     let plan = parents
         .plan(published.lease.root(), published.lane.component, &row.path)
@@ -1693,8 +1699,15 @@ fn move_staged_to_canonical(
     let parent = plan.parent().ok_or(ComponentTransactionError)?;
     let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
     staging
-        .rename_guarded_file_no_replace(&slot_name, &mut guard, parent, plan.file_name())
+        .rename_guarded_file_no_replace_deferring_sync(
+            &slot_name,
+            &mut guard,
+            parent,
+            plan.file_name(),
+            syncs,
+        )
         .map_err(forward_file_move_error)?;
+    syncs.sync_when_full().map_err(forward_post_effect_error)?;
     authenticate_file_move(
         published,
         ComponentFileMove {
@@ -3007,6 +3020,14 @@ fn settle_component_transaction_blocking(
 }
 
 fn settle_component_transaction_attempt(
+    authority: &mut ComponentSettlementAuthority,
+    fault: ComponentSettlementFault,
+) -> Result<(), ComponentTransactionError> {
+    let root = authority.context.lease.root().clone();
+    root.batch_validated(|| settle_component_transaction_rows(authority, fault), tx)
+}
+
+fn settle_component_transaction_rows(
     authority: &mut ComponentSettlementAuthority,
     fault: ComponentSettlementFault,
 ) -> Result<(), ComponentTransactionError> {

@@ -35,6 +35,7 @@ use crate::managed_publication::{
     run_publication_blocking,
 };
 use crate::portable_path::PortableRelativePath;
+use futures_util::StreamExt as _;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
@@ -701,6 +702,9 @@ where
     .await?
 }
 
+/// Bounded by the process worker limit; overlaps per-file durability barriers.
+const COMPONENT_STAGING_CONCURRENCY: usize = 4;
+
 async fn prepare_component_intent_from_plan<S>(
     lease: ManagedRootPublicationLease,
     component: ManagedComponentKind,
@@ -772,39 +776,86 @@ where
         prepared_rows
             .try_reserve_exact(shard_len)
             .map_err(|_| PrepareComponentIntentError::SourceSet)?;
-        for (row_in_shard, (row, authority)) in
-            shard_rows.into_iter().zip(shard_authority).enumerate()
-        {
+        let mut stages = Vec::new();
+        stages
+            .try_reserve_exact(shard_len)
+            .map_err(|_| PrepareComponentIntentError::SourceSet)?;
+        for (row_in_shard, row) in shard_rows.iter().enumerate() {
             let source = sources.remove(&row.path);
-            let staging = if row.prior_is_final() {
-                if let Some(source) = source {
-                    drop(source);
+            let stage = if row.prior_is_final() {
+                if source.is_some() {
                     dropped_exact_sources += 1;
                 }
                 None
             } else {
-                let staged = source
-                    .ok_or(PrepareComponentIntentError::SourceSet)?
-                    .stage_create_new(
-                        buckets.staging(),
-                        &component_slot_name(row_in_shard)?,
-                        lease.lifetime_guard(),
-                    )
-                    .await?;
+                let source = source.ok_or(PrepareComponentIntentError::SourceSet)?;
+                Some((
+                    source,
+                    component_slot_name(row_in_shard)?,
+                    lease.lifetime_guard(),
+                ))
+            };
+            stages.push(stage);
+        }
+        // Every started stage settles before any failure is reported.
+        let bucket = buckets.staging();
+        let staged: Vec<_> = futures_util::stream::iter(stages)
+            .map(move |stage| async move {
+                match stage {
+                    Some((source, slot, guard)) => source
+                        .stage_create_new(bucket, &slot, guard)
+                        .await
+                        .map(Some),
+                    None => Ok(None),
+                }
+            })
+            .buffered(COMPONENT_STAGING_CONCURRENCY)
+            .collect()
+            .await;
+        let mut staged_shard = Vec::new();
+        staged_shard
+            .try_reserve_exact(shard_len)
+            .map_err(|_| PrepareComponentIntentError::SourceSet)?;
+        for staged in staged {
+            staged_shard.push(staged?);
+        }
+        let bucket = bucket.clone();
+        let (staged_shard, revisions) = run_publication_blocking(move || {
+            bucket.sync()?;
+            let mut revisions = Vec::new();
+            revisions
+                .try_reserve_exact(staged_shard.len())
+                .map_err(|_| PrepareComponentIntentError::SourceSet)?;
+            // One window shares the bucket's validation across the shard.
+            bucket.observe_validated(
+                || {
+                    for staged in &staged_shard {
+                        revisions.push(
+                            staged
+                                .as_ref()
+                                .map(StagedComponentPublicationSource::passive_revision)
+                                .transpose()?,
+                        );
+                    }
+                    Ok::<_, PrepareComponentIntentError>(())
+                },
+                PrepareComponentIntentError::from,
+            )?;
+            Ok::<_, PrepareComponentIntentError>((staged_shard, revisions))
+        })
+        .await??;
+        let shard = shard_rows
+            .into_iter()
+            .zip(shard_authority)
+            .zip(staged_shard.iter().zip(revisions));
+        for ((row, authority), (staging, revision)) in shard {
+            if let Some(staged) = staging {
                 if !staged.matches(&row.path, row.kind, row.final_size, row.final_sha1) {
                     return Err(PrepareComponentIntentError::SourceSet);
                 }
                 staged_sources += 1;
-                Some(staged)
-            };
-            prepared_rows.push(
-                authority.with_staging(
-                    staging
-                        .as_ref()
-                        .map(StagedComponentPublicationSource::passive_revision)
-                        .transpose()?,
-                ),
-            );
+            }
+            prepared_rows.push(authority.with_staging(revision));
             table_rows.push(row);
         }
         prepared_shards.push(buckets.prepared_authority(prepared_rows)?);
@@ -996,16 +1047,23 @@ async fn revalidate_exact_component_projection(
 ) -> Result<ManagedRootPublicationLease, PrepareComponentIntentError> {
     let lease = run_publication_blocking(move || {
         lease.revalidate()?;
-        let mut parents = ComponentCanonicalParents::default();
-        for row in rows {
-            let planned = parents.plan(lease.root(), component, &row.path)?;
-            let ComponentCanonicalObservation::Regular(observed) = planned.observe()? else {
-                return Err(PrepareComponentIntentError::CanonicalChanged);
-            };
-            if observed.size() != row.final_size || observed.sha1() != row.final_sha1 {
-                return Err(PrepareComponentIntentError::CanonicalChanged);
-            }
-        }
+        lease.root().observe_validated(
+            || {
+                let mut parents = ComponentCanonicalParents::default();
+                for row in rows {
+                    let planned = parents.plan(lease.root(), component, &row.path)?;
+                    let ComponentCanonicalObservation::Regular(observed) = planned.observe()?
+                    else {
+                        return Err(PrepareComponentIntentError::CanonicalChanged);
+                    };
+                    if observed.size() != row.final_size || observed.sha1() != row.final_sha1 {
+                        return Err(PrepareComponentIntentError::CanonicalChanged);
+                    }
+                }
+                Ok(())
+            },
+            PrepareComponentIntentError::from,
+        )?;
         lease.revalidate()?;
         Ok::<_, PrepareComponentIntentError>(lease)
     })
@@ -1026,18 +1084,25 @@ async fn revalidate_component_projection(
     let projection = projection.to_vec();
     let exact = run_publication_blocking(move || {
         root.revalidate()?;
-        let mut parents = ComponentCanonicalParents::default();
-        for row in projection {
-            let planned = parents.plan(&root, component, &row.path)?;
-            let ComponentCanonicalObservation::Regular(observed) = planned.observe()? else {
-                return Ok::<_, ComponentEffectsError>(false);
-            };
-            if observed.size() != row.size || observed.sha1() != row.sha1 {
-                return Ok(false);
-            }
-        }
+        let exact = root.observe_validated(
+            || {
+                let mut parents = ComponentCanonicalParents::default();
+                for row in projection {
+                    let planned = parents.plan(&root, component, &row.path)?;
+                    let ComponentCanonicalObservation::Regular(observed) = planned.observe()?
+                    else {
+                        return Ok::<_, ComponentEffectsError>(false);
+                    };
+                    if observed.size() != row.size || observed.sha1() != row.sha1 {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            },
+            ComponentEffectsError::from,
+        )?;
         root.revalidate()?;
-        Ok(true)
+        Ok::<_, ComponentEffectsError>(exact)
     })
     .await;
     matches!(exact, Ok(Ok(true))) && lease.revalidate().is_ok()

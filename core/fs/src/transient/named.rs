@@ -202,7 +202,7 @@ pub(super) fn seal_transient_file(
         else {
             unreachable!()
         };
-        match stage.seal() {
+        match stage.seal_scratch() {
             Ok(stage) => {
                 storage.digest = Some(hasher.finalize().into());
                 storage.state = Some(State::Sealed(stage));
