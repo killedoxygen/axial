@@ -75,6 +75,9 @@ pub struct ManifestEntry {
     title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pack_installation: Option<PackInstallation>,
+    /// Display version of a modpack, recorded from its index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version_number: Option<String>,
 }
 
 /// Evidence for an idempotent creation handoff, not permission to overwrite or
@@ -192,6 +195,7 @@ impl ManifestEntry {
             installed_at: chrono::Utc::now().to_rfc3339(),
             title,
             pack_installation: None,
+            version_number: None,
         };
         entry.validate().map_err(|_| {
             ContentError::ProviderMetadataInvalid("invalid content ownership metadata".into())
@@ -220,6 +224,7 @@ impl ManifestEntry {
             installed_at: chrono::Utc::now().to_rfc3339(),
             title,
             pack_installation: None,
+            version_number: None,
         };
         entry.validate()?;
         Ok(entry)
@@ -264,6 +269,25 @@ impl ManifestEntry {
 
     pub(crate) fn pack_installation(&self) -> Option<&PackInstallation> {
         self.pack_installation.as_ref()
+    }
+
+    /// Instance paths a modpack placed, for display membership only.
+    pub fn pack_paths(&self) -> impl Iterator<Item = &str> {
+        self.pack_installation
+            .iter()
+            .flat_map(|proof| proof.files.iter().map(|file| file.path.as_str()))
+    }
+
+    pub fn version_number(&self) -> Option<&str> {
+        self.version_number.as_deref()
+    }
+
+    /// Display text only; an empty or oversized version is not recorded.
+    pub(crate) fn record_version_number(&mut self, version: &str) {
+        let version = version.trim();
+        self.version_number =
+            (!version.is_empty() && version.len() <= 128 && !version.contains('\0'))
+                .then(|| version.to_string());
     }
 
     pub(crate) fn record_pack_installation(

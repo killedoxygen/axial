@@ -252,6 +252,17 @@ export function instanceContentResponse(value: unknown): InstanceContentResponse
         enabled: dtoBoolean(entry.enabled, 'Instance content enabled'),
       };
     }),
+    packs: dtoArray(record.packs ?? [], 'Instance modpacks').map((value) => {
+      const pack = dtoRecord(value, 'Instance modpack');
+      return {
+        canonical_id: dtoString(pack.canonical_id, 'Instance modpack id'),
+        project_id: dtoString(pack.project_id, 'Instance modpack project'),
+        title: dtoOptionalString(pack.title, 'Instance modpack title'),
+        version_id: dtoString(pack.version_id, 'Instance modpack version'),
+        version_number: dtoOptionalString(pack.version_number, 'Instance modpack version number'),
+        paths: dtoArray(pack.paths, 'Instance modpack paths').map((path) => dtoString(path, 'Instance modpack path')),
+      };
+    }),
   };
 }
 

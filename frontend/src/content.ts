@@ -85,16 +85,19 @@ export function planInstanceSetup(
   }).then(instanceSetupPlanResponse);
 }
 
+/** `label` names the queue entry for display; recorded content is labelled by the backend. */
 export function installContent(
   instanceId: string,
   selections: ContentSelection[],
   allowIncompatible = false,
+  label?: string,
 ): Promise<InstallQueueStateResponse> {
   return queueResponse(
     api('POST', '/content/install', {
       instance_id: instanceId,
       selections,
       allow_incompatible: allowIncompatible,
+      ...(label ? { label } : {}),
     }),
   );
 }

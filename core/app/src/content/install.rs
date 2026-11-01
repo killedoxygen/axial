@@ -619,6 +619,7 @@ impl ContentMutations {
             version_id,
             Some(plan.index().name.clone()),
         )?;
+        entry.record_version_number(&plan.index().version);
         entry.record_pack_installation(PackInstallation {
             fingerprint: plan.fingerprint().into(),
             files: changes

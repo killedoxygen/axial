@@ -42,7 +42,7 @@ export async function commitInstall(
   allowIncompatible = false,
 ): Promise<AddOutcome> {
   try {
-    const queue = await installContent(instanceId, selections, allowIncompatible);
+    const queue = await installContent(instanceId, selections, allowIncompatible, label);
     await applyInstallQueueResponse(queue, { showNotice: true, connectActive: true });
   } catch (error) {
     const message = errMessage(error);

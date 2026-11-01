@@ -192,8 +192,19 @@ export interface InstanceContentEntry {
   enabled: boolean;
 }
 
+/** Modpack provenance. Its paths mark which instance files the pack placed. */
+export interface InstanceContentPack {
+  canonical_id: string;
+  project_id: string;
+  title?: string;
+  version_id: string;
+  version_number?: string;
+  paths: string[];
+}
+
 export interface InstanceContentResponse {
   entries: InstanceContentEntry[];
+  packs: InstanceContentPack[];
 }
 
 export interface ContentUpdate {

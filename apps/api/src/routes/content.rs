@@ -343,6 +343,9 @@ struct InstallRequest {
     selections: Vec<ResolutionSelection>,
     #[serde(default)]
     allow_incompatible: bool,
+    /// Display name for the queue entry; it carries no install authority.
+    #[serde(default)]
+    label: Option<String>,
 }
 async fn install(
     State(state): State<Arc<ContentRoutes>>,
@@ -354,7 +357,7 @@ async fn install(
         .queue
         .enqueue(InstallQueueRequest::Content {
             instance_id: instance.to_string(),
-            label: "Install content".into(),
+            label: install_label(&state, &instance, &request),
             action: InstallQueueContentActionRequest::Install {
                 selections: request.selections,
                 allow_incompatible: request.allow_incompatible,
@@ -384,7 +387,26 @@ async fn installed(
         if let Some(title) = entry.title() { value["title"] = json!(title); }
         value
     }).collect::<Vec<_>>();
-    Ok(Json(json!({"entries":entries})))
+    // Pack provenance owns no file; its recorded paths only mark membership.
+    let packs = manifest
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind() == ContentKind::Modpack)
+        .map(|entry| {
+            let mut value = json!({
+                "canonical_id":entry.canonical_id(),"project_id":entry.project_id(),
+                "version_id":entry.version_id(),"paths":entry.pack_paths().collect::<Vec<_>>(),
+            });
+            if let Some(title) = entry.title() {
+                value["title"] = json!(title);
+            }
+            if let Some(version) = entry.version_number() {
+                value["version_number"] = json!(version);
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"entries":entries,"packs":packs})))
 }
 
 async fn updates(
@@ -417,7 +439,15 @@ async fn uninstall(
         .queue
         .enqueue(InstallQueueRequest::Content {
             instance_id: instance.to_string(),
-            label: "Remove content".into(),
+            label: queue_label(
+                "Remove",
+                &recorded_titles(
+                    &state,
+                    &instance,
+                    request.canonical_ids.iter().map(|id| id.0.as_str()),
+                ),
+                "Remove content",
+            ),
             action: InstallQueueContentActionRequest::Uninstall {
                 canonical_ids: request.canonical_ids.into_iter().map(|id| id.0).collect(),
             },
@@ -425,6 +455,52 @@ async fn uninstall(
         .await
         .map(Json)
         .map_err(super::install::failure)
+}
+
+/// Queue labels name what changes. Selections already recorded are updates.
+fn install_label(state: &ContentRoutes, instance: &InstanceId, request: &InstallRequest) -> String {
+    let ids = request
+        .selections
+        .iter()
+        .map(|selection| selection.canonical_id.as_str());
+    let recorded = recorded_titles(state, instance, ids);
+    if !recorded.is_empty() && recorded.len() == request.selections.len() {
+        return queue_label("Update", &recorded, "Update content");
+    }
+    let label = request.label.as_deref().and_then(display_text);
+    queue_label("Install", label.as_slice(), "Install content")
+}
+fn recorded_titles<'a>(
+    state: &ContentRoutes,
+    instance: &InstanceId,
+    ids: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let Ok(manifest) = state.mutations.installed(instance) else {
+        return Vec::new();
+    };
+    ids.filter_map(|id| {
+        manifest
+            .find(&CanonicalId(id.into()))?
+            .title()
+            .and_then(display_text)
+    })
+    .collect()
+}
+fn queue_label(verb: &str, names: &[String], fallback: &str) -> String {
+    match names {
+        [] => fallback.into(),
+        [name] => format!("{verb} {name}"),
+        [name, rest @ ..] => format!("{verb} {name} and {} more", rest.len()),
+    }
+}
+fn display_text(value: &str) -> Option<String> {
+    let text = value
+        .split(char::is_control)
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = text.chars().take(96).collect::<String>();
+    (!text.is_empty()).then_some(text)
 }
 
 async fn settle(
@@ -706,13 +782,14 @@ mod tests {
             let (status, value) = self
                 .post(
                     "/api/v1/content/install",
-                    json!({"instance_id":self.id,"selections":[{
+                    json!({"instance_id":self.id,"label":" Blocked\n pack ","selections":[{
                         "canonical_id":"modrinth:blocked", "kind":"resource_pack"
                     }]}),
                 )
                 .await;
             assert_eq!(status, StatusCode::OK, "{value}");
             let response: InstallQueueStateResponse = serde_json::from_value(value).unwrap();
+            assert_eq!(queued_label(&response), "Install Blocked pack");
             assert!(response.started_install.is_some());
             assert!(response.notice.is_none());
             tokio::time::timeout(Duration::from_secs(3), self.requested.acquire())
@@ -1102,7 +1179,7 @@ mod tests {
                         primary: true,
                     },
                     Vec::new(),
-                    None,
+                    Some("Owned pack".into()),
                 )
                 .unwrap(),
             )
@@ -1123,6 +1200,7 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK, "{value}");
         let accepted: InstallQueueStateResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(queued_label(&accepted), "Remove Owned pack");
         let id = accepted.started_install.unwrap().install_id;
         assert_eq!(fixture.terminal(&id).await, InstallOutcome::Succeeded);
         assert!(fixture.queue.snapshot().registry_revision > before);
@@ -1140,6 +1218,15 @@ mod tests {
         );
         assert!(fixture.paths.lock().unwrap().is_empty());
         fixture.close().await;
+    }
+
+    fn queued_label(response: &InstallQueueStateResponse) -> &str {
+        response
+            .active
+            .as_ref()
+            .map(|active| active.label.as_str())
+            .or_else(|| response.items.first().map(|item| item.label.as_str()))
+            .expect("accepted content work is visible in the queue")
     }
 
     #[tokio::test]
