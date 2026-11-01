@@ -65,7 +65,11 @@ function ConflictSheet({
   onConfirm: () => void;
 }): JSX.Element {
   const toInstall = plan.items.filter((item) => !item.already_installed || item.update);
-  const overridable = toInstall.length > 0 && plan.conflicts.every((conflict) => conflict.kind === 'incompatible');
+  const overridable =
+    toInstall.length > 0 &&
+    plan.conflicts.every((conflict) => conflict.kind === 'incompatible' || conflict.kind === 'existing_file');
+  const replacing = plan.conflicts.filter((conflict) => conflict.kind === 'existing_file').length;
+  const onlyReplacing = replacing > 0 && replacing === plan.conflicts.length;
   return (
     <Modal open onOpenChange={(next) => !next && onCancel()}>
       <ModalContent className="cp-discover-dialog" aria-label="Resolve conflicts">
@@ -76,19 +80,29 @@ function ConflictSheet({
           </div>
         ))}
         <p class="cp-discover-dialog-sub">
-          {overridable
-            ? `Installing anyway may crash the game. ${plural(toInstall.length, 'file', 'files')} would be installed${
-                plan.total_download_bytes > 0 ? ` (${formatBytes(plan.total_download_bytes)})` : ''
-              }.`
-            : 'Nothing can be installed until this is resolved.'}
+          {!overridable
+            ? 'Nothing can be installed until this is resolved.'
+            : onlyReplacing
+              ? `Replacing overwrites ${plural(replacing, 'file', 'files')} in this instance.`
+              : `Installing anyway may crash the game${
+                  replacing > 0 ? ` and replaces ${plural(replacing, 'existing file', 'existing files')}` : ''
+                }. ${plural(toInstall.length, 'file', 'files')} would be installed${
+                  plan.total_download_bytes > 0 ? ` (${formatBytes(plan.total_download_bytes)})` : ''
+                }.`}
         </p>
         <div class="cp-discover-dialog-actions">
           <Button variant={overridable ? 'ghost' : 'primary'} onClick={onCancel} disabled={busy}>
             {overridable ? 'Cancel' : 'Close'}
           </Button>
           {overridable && (
-            <Button onClick={onConfirm} disabled={busy}>
-              {busy ? 'Installing…' : 'Install anyway'}
+            <Button variant={onlyReplacing ? 'danger' : 'primary'} onClick={onConfirm} disabled={busy}>
+              {busy
+                ? 'Installing…'
+                : onlyReplacing
+                  ? replacing === 1
+                    ? 'Replace file'
+                    : 'Replace files'
+                  : 'Install anyway'}
             </Button>
           )}
         </div>

@@ -41,8 +41,15 @@ export async function commitInstall(
   plan?: ResolutionPlan,
   allowIncompatible = false,
 ): Promise<AddOutcome> {
+  // Confirming a reviewed plan replaces exactly the existing files it named.
+  const replaceFiles =
+    allowIncompatible && plan
+      ? plan.conflicts.flatMap((conflict) =>
+          conflict.kind === 'existing_file' && conflict.path ? [conflict.path] : [],
+        )
+      : [];
   try {
-    const queue = await installContent(instanceId, selections, allowIncompatible, label);
+    const queue = await installContent(instanceId, selections, allowIncompatible, replaceFiles, label);
     await applyInstallQueueResponse(queue, { showNotice: true, connectActive: true });
   } catch (error) {
     const message = errMessage(error);

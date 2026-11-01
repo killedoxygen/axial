@@ -148,14 +148,19 @@ export function resolutionPlanResponse(value: unknown): ResolutionPlan {
         reason: dtoEnum(entry.reason, 'Content plan reason', ['selected', 'dependency'] as const),
         already_installed: dtoBoolean(entry.already_installed, 'Content already installed'),
         update: dtoBoolean(entry.update, 'Content update'),
+        existing_file:
+          entry.existing_file === undefined
+            ? undefined
+            : dtoEnum(entry.existing_file, 'Content existing file', ['identical', 'different'] as const),
       };
     }),
     conflicts: dtoArray(record.conflicts, 'Content conflicts').map((conflict) => {
       const entry = dtoRecord(conflict, 'Content conflict');
       return {
         canonical_id: dtoOptionalString(entry.canonical_id, 'Content conflict id'),
-        kind: dtoEnum(entry.kind, 'Content conflict kind', ['unavailable', 'incompatible'] as const),
+        kind: dtoEnum(entry.kind, 'Content conflict kind', ['unavailable', 'incompatible', 'existing_file'] as const),
         detail: dtoString(entry.detail, 'Content conflict detail'),
+        path: dtoOptionalString(entry.path, 'Content conflict path'),
       };
     }),
     total_download_bytes: dtoNumber(record.total_download_bytes, 'Content download bytes'),
@@ -231,6 +236,7 @@ export function modpackFilesResponse(value: unknown): ModpackFilesPlan {
         identified: dtoBoolean(entry.identified, 'Modpack file identified'),
         compatible: dtoBoolean(entry.compatible, 'Modpack file compatible'),
         installed: dtoBoolean(entry.installed, 'Modpack file installed'),
+        installed_version_id: dtoOptionalString(entry.installed_version_id, 'Modpack file installed version'),
       };
     }),
   };

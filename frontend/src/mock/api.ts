@@ -826,17 +826,52 @@ function mockResolvePlan(instanceId: string | undefined, selections: ContentSele
   const totalBytes = items
     .filter((item) => !item.already_installed || item.update)
     .reduce((sum, item) => sum + (item.size ?? 0), 0);
+  // A hand-added jar with the planned filename is a file the person must choose to replace.
+  const local = instanceId ? (mockLocalMods[instanceId] ?? []) : [];
+  const existing = items.filter((item) => !item.already_installed && local.some((mod) => mod.name === item.filename));
   return {
     instance_id: instanceId,
     loader: 'fabric',
     game_version: '1.21.6',
-    items,
-    conflicts: mockConflictsFor(
-      items.map((item) => item.canonical_id),
-      installed,
-    ),
+    items: items.map((item) => (existing.includes(item) ? { ...item, existing_file: 'different' as const } : item)),
+    conflicts: [
+      ...mockConflictsFor(
+        items.map((item) => item.canonical_id),
+        installed,
+      ),
+      ...existing.map((item) => ({
+        canonical_id: item.canonical_id,
+        kind: 'existing_file' as const,
+        detail: `A different ${item.filename} is already in the mods folder.`,
+        path: `mods/${item.filename}`,
+      })),
+    ],
     total_download_bytes: totalBytes,
   };
+}
+
+function mockImportMod(instanceId: string, name: string, body: unknown): unknown {
+  findInstance(instanceId);
+  if (!name.toLowerCase().endsWith('.jar')) {
+    throw apiError(400, 'Bad Request', { error: 'Only .jar files can be added as mods.' });
+  }
+  const local = mockLocalMods[instanceId] ?? (mockLocalMods[instanceId] = []);
+  const taken = [
+    ...local.map((mod) => modBaseName(mod.name)),
+    ...(mockInstanceContent[instanceId] ?? []).map((e) => e.filename),
+  ];
+  if (taken.some((existing) => existing.toLowerCase() === name.toLowerCase())) {
+    throw apiError(409, 'Conflict', { error: `${name} is already in this instance.` });
+  }
+  local.push({ name, size: body instanceof Blob ? body.size : 0, modified_at: daysAgo(0), enabled: true });
+  return { imported: [name] };
+}
+
+function mockModpackFile(body: unknown): ModpackTarget {
+  if (!(body instanceof File) || !body.name.toLowerCase().endsWith('.mrpack')) {
+    throw apiError(400, 'Bad Request', { error: 'This file is not a readable Modrinth modpack (.mrpack).' });
+  }
+  return mockModpackTarget('modrinth:1KVo5zza');
 }
 
 function mockContentCompatibility(selections: ContentSelection[]): ContentCompatResponse {
@@ -910,13 +945,18 @@ function mockContentInstall(body: unknown): InstallQueueStateResponse {
   }
   const instanceId = body.instance_id;
   const plan = mockResolvePlan(instanceId, body.selections as ContentSelection[]);
+  const replace = Array.isArray(body.replace_files) ? body.replace_files : [];
   const hasUnavailable = plan.conflicts.some((conflict) => conflict.kind === 'unavailable');
-  if (plan.conflicts.length > 0 && (hasUnavailable || body.allow_incompatible !== true)) {
+  const unresolved = plan.conflicts.filter(
+    (conflict) => conflict.kind !== 'existing_file' || !replace.includes(conflict.path),
+  );
+  if (unresolved.length > 0 && (hasUnavailable || body.allow_incompatible !== true)) {
     throw apiError(409, 'Conflict', {
       error: plan.conflicts.map((conflict) => conflict.detail).join('; '),
       conflicts: plan.conflicts,
     });
   }
+  mockLocalMods[instanceId] = (mockLocalMods[instanceId] ?? []).filter((mod) => !replace.includes(`mods/${mod.name}`));
   const current = mockInstanceContent[instanceId] ?? (mockInstanceContent[instanceId] = []);
   for (const item of plan.items) {
     const existing = current.find((entry) => entry.canonical_id === item.canonical_id);
@@ -1010,6 +1050,7 @@ function mockModpackFiles(_instanceId: string, canonicalId: string): ModpackFile
         identified: true,
         compatible: true,
         installed: false,
+        installed_version_id: 'lithium-0.13.0',
       },
     ],
   };
@@ -1216,6 +1257,9 @@ const handlers: Record<string, Handler> = {
   'GET /content/modpack/files': (_body, _path, request) =>
     mockModpackFiles(request?.searchParams.get('instance_id') ?? '', request?.searchParams.get('id') ?? ''),
   'POST /content/modpack/install': (body) => mockModpackInstall(body),
+  'POST /content/modpack/file': (body) => mockModpackFile(body),
+  'POST /instances/{id}/mods/import': (body, path, request) =>
+    mockImportMod(instanceIdFromSubPath(path), request?.searchParams.get('name') ?? '', body),
   'GET /instances/{id}/content': (_body, path) => mockInstanceContentList(instanceIdFromContentPath(path)),
   'GET /instances/{id}/content/updates': (_body, path) => mockContentUpdates(instanceIdFromSubPath(path)),
   'GET /instances/{id}/resources': (_body, path) => mockInstanceResources(instanceIdFromSubPath(path)),
@@ -1430,6 +1474,7 @@ function handlerKey(method: string, path: string): string {
   if (/^\/instances\/[^/]+\/content\/updates$/.test(path)) return `${method} /instances/{id}/content/updates`;
   if (/^\/instances\/[^/]+\/resources$/.test(path)) return `${method} /instances/{id}/resources`;
   if (/^\/instances\/[^/]+\/mods\/metadata$/.test(path)) return `${method} /instances/{id}/mods/metadata`;
+  if (/^\/instances\/[^/]+\/mods\/import$/.test(path)) return `${method} /instances/{id}/mods/import`;
   if (/^\/instances\/[^/]+\/mods\/[^/]+$/.test(path)) return `${method} /instances/{id}/mods/{name}`;
   if (/^\/instances\/[^/]+\/(resourcepacks|shaderpacks)$/.test(path)) {
     return `${method} /instances/{id}/${path.split('/')[3]}`;

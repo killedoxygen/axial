@@ -98,14 +98,18 @@ export interface PlanItem {
   reason: PlanReason;
   already_installed: boolean;
   update: boolean;
+  /** A file Axial does not track already sits at this item's destination. */
+  existing_file?: 'identical' | 'different';
 }
 
-export type ConflictKind = 'unavailable' | 'incompatible';
+export type ConflictKind = 'unavailable' | 'incompatible' | 'existing_file';
 
 export interface PlanConflict {
   canonical_id?: string;
   kind: ConflictKind;
   detail: string;
+  /** Instance-relative file an `existing_file` replacement names. */
+  path?: string;
 }
 
 export interface ResolutionPlan {
@@ -170,6 +174,8 @@ export interface ModpackFileOption {
   identified: boolean;
   compatible: boolean;
   installed: boolean;
+  /** The installed version of the same project, when it differs from the pack's. */
+  installed_version_id?: string;
 }
 
 export interface ModpackFilesPlan {

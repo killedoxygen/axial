@@ -778,6 +778,12 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   background: var(--surface);
   box-shadow: var(--shadow-raised);
 }
+.cp-content-list[data-drop-state='active'] {
+  background: var(--accent-softer);
+  box-shadow:
+    var(--shadow-raised),
+    0 0 0 1px var(--accent);
+}
 .cp-content-row {
   display: grid;
   grid-template-columns: 24px 32px minmax(0, 1fr) 84px 72px 24px;

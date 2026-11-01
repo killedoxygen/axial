@@ -90,6 +90,7 @@ export function installContent(
   instanceId: string,
   selections: ContentSelection[],
   allowIncompatible = false,
+  replaceFiles: string[] = [],
   label?: string,
 ): Promise<InstallQueueStateResponse> {
   return queueResponse(
@@ -97,6 +98,7 @@ export function installContent(
       instance_id: instanceId,
       selections,
       allow_incompatible: allowIncompatible,
+      ...(replaceFiles.length > 0 ? { replace_files: replaceFiles } : {}),
       ...(label ? { label } : {}),
     }),
   );

@@ -87,7 +87,13 @@ export function ModpackPicker({
           (previous) =>
             new Set(
               next.files
-                .filter((file) => file.compatible && !file.installed && (initial || previous.has(file.selection_id)))
+                .filter(
+                  (file) =>
+                    file.compatible &&
+                    !file.installed &&
+                    // Updating a project at another version is a deliberate choice.
+                    (initial ? !file.installed_version_id : previous.has(file.selection_id)),
+                )
                 .map((file) => file.selection_id),
             ),
         );
@@ -106,6 +112,7 @@ export function ModpackPicker({
     (total, file) => total + (selected.has(file.selection_id) ? (file.size ?? 0) : 0),
     0,
   );
+  const selectedUpdates = files.filter((file) => file.installed_version_id && selected.has(file.selection_id)).length;
 
   if (!open) return null;
   const submit = async (): Promise<void> => {
@@ -193,7 +200,13 @@ export function ModpackPicker({
               </span>
               <span class="cp-pack-picker-copy">
                 <strong>{file.title}</strong>
-                <small>{file.identified ? file.filename : `${file.filename}, not recognized by the provider`}</small>
+                <small>
+                  {!file.identified
+                    ? `${file.filename}, not recognized by the provider`
+                    : file.installed_version_id
+                      ? `${file.filename} · Installed (other version)`
+                      : file.filename}
+                </small>
               </span>
               {file.size != null && <span class="cp-pack-picker-size">{formatBytes(file.size)}</span>}
             </label>
@@ -208,6 +221,7 @@ export function ModpackPicker({
         <div class="cp-discover-dialog-actions">
           <span class="cp-pack-picker-summary">
             {plural(selected.size, 'file', 'files')}
+            {selectedUpdates > 0 ? `, ${plural(selectedUpdates, 'update', 'updates')}` : ''}
             {selectedBytes > 0 ? `, ${formatBytes(selectedBytes)}` : ''}
           </span>
           <Button variant="ghost" onClick={onClose} disabled={busy}>

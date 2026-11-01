@@ -34,6 +34,7 @@ import {
   type LoaderKey,
 } from './defaults';
 import { LoaderLogo } from './loader-logos';
+import { useModpackFileImport } from './modpack-file';
 import { Modal, ModalContent } from '../../ui/Modal';
 import { CHANNEL_ORDER, CHANNEL_LABEL, type VersionDownloadState, type VersionRowModel } from './view-model';
 import {
@@ -76,7 +77,10 @@ export function CreateView(): JSX.Element {
         aria-describedby={undefined}
         showCloseButton={false}
       >
-        <CreateCard />
+        {/* An identified modpack file reopens the card in its setup mode. */}
+        <CreateCard
+          key={createModpack.value ? `${createModpack.value.canonical_id}:${createModpack.value.version_id}` : 'new'}
+        />
       </ModalContent>
     </Modal>
   );
@@ -279,6 +283,8 @@ function CreateCard(): JSX.Element {
   const loadRequestRef = useRef(0);
   const loadedCreateViewSourceRef = useRef<string | null>(null);
   const versionListKey = `${sourceId}:${channel}:${query.trim().toLowerCase()}`;
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const packFile = useModpackFileImport(bodyRef, step === 'version' && !pack);
 
   const totalGB = systemInfo.value?.total_memory_mb ? Math.floor(systemInfo.value.total_memory_mb / 1024) : 16;
   const memoryRec = getMemoryRecommendation(totalGB);
@@ -838,7 +844,14 @@ function CreateCard(): JSX.Element {
         )}
       </header>
 
-      <div class="cp-cr-card-body" data-step={step}>
+      <div
+        class="cp-cr-card-body"
+        data-step={step}
+        ref={bodyRef}
+        data-drop-state={packFile.dropActive ? 'active' : 'idle'}
+        {...packFile.dropHandlers}
+      >
+        {packFile.input}
         {step === 'version' ? (
           <section class="cp-cr-pick" aria-label="Version">
             <div class="cp-seg cp-cr-sources" role="radiogroup" aria-label="Instance source">
@@ -871,7 +884,25 @@ function CreateCard(): JSX.Element {
                   </button>
                 );
               })}
+              {!pack && !draft && (
+                <button
+                  type="button"
+                  class="cp-cr-source"
+                  title="Set up an instance from a .mrpack file"
+                  disabled={packFile.busy}
+                  onClick={packFile.pick}
+                >
+                  <Icon name="folder" size={14} />
+                  <span>Modpack file</span>
+                </button>
+              )}
             </div>
+
+            {packFile.error && (
+              <div class="cp-resource-note cp-resource-note--error" role="alert">
+                {packFile.error}
+              </div>
+            )}
 
             {draft &&
               (() => {
@@ -1248,15 +1279,17 @@ function CreateCard(): JSX.Element {
             ? canCreate
               ? `${pack.name} installs right after.`
               : 'Name your instance to create it.'
-            : step === 'version'
-              ? !versionReady
-                ? 'Pick a Minecraft version to continue.'
-                : 'Continue to name and settings.'
-              : !versionReady
-                ? 'Pick a Minecraft version to continue.'
-                : canCreate
-                  ? 'Enter creates the instance.'
-                  : 'Name your instance to create it.'}
+            : packFile.busy
+              ? 'Reading modpack…'
+              : step === 'version'
+                ? !versionReady
+                  ? 'Pick a Minecraft version to continue.'
+                  : 'Continue to name and settings.'
+                : !versionReady
+                  ? 'Pick a Minecraft version to continue.'
+                  : canCreate
+                    ? 'Enter creates the instance.'
+                    : 'Name your instance to create it.'}
         </span>
         <div class="cp-cr-foot-actions">
           {step === 'version' ? (

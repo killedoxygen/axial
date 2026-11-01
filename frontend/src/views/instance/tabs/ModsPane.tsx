@@ -22,6 +22,7 @@ import {
   type ContentRowView,
 } from '../components/content-row';
 import { PackOrigin, packMembership } from '../components/pack-origin';
+import { useModImport } from '../components/mod-import';
 import { resourceMutationState } from '../bulk-actions';
 import {
   applyModUpdates,
@@ -52,6 +53,8 @@ export function ModsPane({
   const [provenanceStamp, setProvenanceStamp] = useState(0);
   const [metadata, setMetadata] = useState<Map<string, ContentFileMetadata>>(() => new Map());
   const resourceRevision = useRef({ instanceId: inst.id, revision: contentRevision.value });
+  const dropSurfaceRef = useRef<HTMLDivElement | null>(null);
+  const modImport = useModImport(inst.id, dropSurfaceRef, onRefresh);
 
   // Jar metadata is best-effort display text; rows fall back to filenames without it.
   useEffect(() => {
@@ -149,7 +152,13 @@ export function ModsPane({
   };
 
   return (
-    <div class="cp-instance-body">
+    <div
+      class="cp-instance-body"
+      ref={dropSurfaceRef}
+      data-drop-state={modImport.dropActive ? 'active' : 'idle'}
+      {...modImport.dropHandlers}
+    >
+      {modImport.input}
       <div class="cp-resource-toolbar">
         <div>
           <strong>
@@ -180,6 +189,9 @@ export function ModsPane({
           </Button>
           <Button variant="secondary" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'mods')}>
             Open folder
+          </Button>
+          <Button variant="secondary" size="sm" icon="plus" disabled={modImport.busy} onClick={modImport.pick}>
+            Add jar files
           </Button>
           <Button
             variant="soft"
@@ -212,17 +224,21 @@ export function ModsPane({
           {provenanceError || provenance?.updateError}
         </div>
       ) : null}
-      <div class="cp-content-list">
+      <div class="cp-content-list" data-drop-state={modImport.dropActive ? 'active' : 'idle'}>
         {resources.status === 'ready' && filteredRows.length === 0 ? (
           <div class="cp-mods-empty-row">
             <strong>{mods.length === 0 ? 'No mods installed in this instance' : 'No mods match this filter'}</strong>
             {mods.length === 0 ? (
               <>
-                Browse Discover to add mods that fit {inst.version_display.summary_label}, or drop jar files straight
-                into the mods folder.
+                {modImport.dropActive
+                  ? 'Drop to add.'
+                  : `Browse Discover to add mods that fit ${inst.version_display.summary_label}, or add jar files from your computer.`}
                 <div class="cp-mods-empty-actions">
                   <Button size="sm" icon="compass" onClick={() => navigate({ name: 'discover', target: inst.id })}>
                     Browse Discover
+                  </Button>
+                  <Button variant="secondary" size="sm" icon="plus" disabled={modImport.busy} onClick={modImport.pick}>
+                    Add jar files
                   </Button>
                 </div>
               </>
