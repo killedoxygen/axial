@@ -10,7 +10,9 @@ use super::{
 use crate::content::catalog::ContentService;
 use crate::content::install::{ContentMutations, MutationError};
 use crate::content::model::CanonicalId;
-use crate::content::packs::{PackArchive, PackError, PackIndex, PackPlan, PackResult, PackVersion};
+use crate::content::packs::{
+    PackArchive, PackError, PackIndex, PackPlan, PackResult, PackVersion, resolve_pack_version,
+};
 use crate::install::model::{InstallQueueContentActionRequest, InstallQueueRequest};
 use crate::tasks::CancellationToken;
 use axial_minecraft::loaders::{build_id_for, installed_version_id_for};
@@ -60,6 +62,44 @@ pub fn target_from_pack_index(
         loader_label,
         selection_id,
     }
+}
+
+/// A local `.mrpack` is accepted as the exact primary file of a published
+/// Modrinth pack version. Creation, setup resume and updates then use that
+/// provider identity through the ordinary modpack path.
+pub async fn modpack_file_target(
+    service: &ContentService,
+    bytes: Vec<u8>,
+) -> PackResult<ModpackTarget> {
+    use sha2::{Digest, Sha512};
+    let hash = format!("{:x}", Sha512::digest(&bytes));
+    let archive = PackArchive::read(bytes)?;
+    let identity = service
+        .identify(std::slice::from_ref(&hash))
+        .await
+        .map_err(|_| PackError::Provider)?
+        .remove(&hash)
+        .ok_or(PackError::Unpublished)?;
+    let canonical_id = CanonicalId::for_project(identity.provider, &identity.project_id);
+    let (content, version) = resolve_pack_version(
+        service,
+        &canonical_id,
+        PackVersion::Exact(&identity.version_id),
+    )
+    .await?;
+    if version
+        .primary_file()
+        .and_then(|file| file.sha512.as_deref())
+        != Some(hash.as_str())
+    {
+        return Err(PackError::Unpublished);
+    }
+    Ok(target_from_pack_index(
+        content.canonical_id,
+        version.id,
+        content.title,
+        archive.index(),
+    ))
 }
 
 /// Private retained creation input. The client selection is only a consistency

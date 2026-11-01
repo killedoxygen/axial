@@ -426,6 +426,55 @@ impl ResourceService {
         self.move_file(id, "mods", from, to, Some(enabled))
     }
 
+    /// Add jars as untracked local mods through the content transaction owner.
+    pub fn import_mods(
+        &self,
+        id: &InstanceId,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> Result<
+        TaskHandle<Result<mods::ModImportResponse, mods::ModImportError>>,
+        mods::ModImportError,
+    > {
+        use mods::ModImportError;
+        if files.is_empty() || files.len() > mods::MOD_IMPORT_MAX_FILES {
+            return Err(ModImportError::Count);
+        }
+        let mut admitted = Vec::with_capacity(files.len());
+        let mut keys = std::collections::HashSet::new();
+        let mut digests = std::collections::HashSet::new();
+        for (name, bytes) in files {
+            let name = mods::validate_import(&name, &bytes)?;
+            if !keys.insert(crate::files::portable::managed_content_name_key(&name))
+                || !digests.insert(Sha256::digest(&bytes))
+            {
+                return Err(ModImportError::Repeated(name.as_str().into()));
+            }
+            admitted.push((name, bytes));
+        }
+        let imported = admitted
+            .iter()
+            .map(|(name, _)| name.as_str().to_string())
+            .collect::<Vec<_>>();
+        let work = self
+            .content
+            .import_local_mods(id, admitted)
+            .map_err(|_| ModImportError::Busy)?;
+        self.tasks
+            .try_spawn((), move |_cancel| async move {
+                match work.join().await.map_err(|_| ModImportError::Pending)? {
+                    Ok(_) => Ok(mods::ModImportResponse { imported }),
+                    Err(MutationError::Duplicate(name)) => Err(ModImportError::Duplicate(name)),
+                    Err(MutationError::Pending) => Err(ModImportError::Pending),
+                    Err(MutationError::Changed | MutationError::Conflict) => {
+                        Err(ModImportError::Changed)
+                    }
+                    Err(MutationError::Unavailable) => Err(ModImportError::Busy),
+                    Err(_) => Err(ModImportError::Files),
+                }
+            })
+            .map_err(|_| ModImportError::Busy)
+    }
+
     pub fn delete_mod(
         &self,
         id: &InstanceId,
@@ -1046,6 +1095,141 @@ mod tests {
             assert!(!service.has_unsettled_effects());
             assert!(service.directories.admit(&id).is_ok());
         }
+    }
+
+    fn jar(marker: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        zip.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(marker).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[tokio::test]
+    async fn imported_jars_become_local_mods_and_refuse_invalid_or_duplicate_files() {
+        use mods::ModImportError;
+        let (root, service, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        let raw = recorded_mod(&game, true);
+        std::fs::write(game.join("mods/present.jar"), jar(b"present")).unwrap();
+        let refused = |files: Vec<(&str, Vec<u8>)>| {
+            service
+                .import_mods(
+                    &id,
+                    files
+                        .into_iter()
+                        .map(|(name, bytes)| (name.to_string(), bytes))
+                        .collect(),
+                )
+                .err()
+        };
+        assert_eq!(refused(vec![]), Some(ModImportError::Count));
+        assert_eq!(
+            refused(vec![("notes.txt", jar(b"a"))]),
+            Some(ModImportError::NotJar)
+        );
+        assert_eq!(
+            refused(vec![("off.jar.disabled", jar(b"a"))]),
+            Some(ModImportError::NotJar)
+        );
+        assert_eq!(
+            refused(vec![("../escape.jar", jar(b"a"))]),
+            Some(ModImportError::NotJar)
+        );
+        assert_eq!(
+            refused(vec![("broken.jar", b"not a zip".to_vec())]),
+            Some(ModImportError::InvalidArchive("broken.jar".into()))
+        );
+        assert_eq!(
+            refused(vec![("a.jar", jar(b"a")), ("A.JAR", jar(b"b"))]),
+            Some(ModImportError::Repeated("A.JAR".into()))
+        );
+        assert_eq!(
+            refused(vec![("a.jar", jar(b"a")), ("b.jar", jar(b"a"))]),
+            Some(ModImportError::Repeated("b.jar".into()))
+        );
+        for (name, bytes) in [
+            ("PRESENT.JAR", jar(b"other")),
+            ("copy.jar", jar(b"present")),
+            ("Recorded.jar", jar(b"other")),
+        ] {
+            assert_eq!(
+                service
+                    .import_mods(&id, vec![(name.into(), bytes)])
+                    .unwrap()
+                    .join()
+                    .await
+                    .unwrap(),
+                Err(ModImportError::Duplicate(name.into()))
+            );
+        }
+        let imported = service
+            .import_mods(
+                &id,
+                vec![
+                    ("new.jar".into(), jar(b"new")),
+                    ("other.jar".into(), jar(b"other")),
+                ],
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&imported).unwrap(),
+            serde_json::json!({"imported":["new.jar","other.jar"]})
+        );
+        assert_eq!(
+            std::fs::read(game.join("mods/new.jar")).unwrap(),
+            jar(b"new")
+        );
+        assert_eq!(
+            std::fs::read(game.join(crate::content::provenance::MANIFEST_FILE)).unwrap(),
+            raw
+        );
+        let listed = service.mods(&id).unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry.name == "other.jar" && entry.enabled)
+        );
+        service
+            .delete_mod(&id, "new.jar")
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!game.join("mods/new.jar").exists());
+        assert!(!service.has_unsettled_effects());
+        assert!(!service.content.has_unsettled_effects());
+        assert!(service.directories.admit(&id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn first_imported_jar_creates_the_mods_folder_and_empty_provenance() {
+        let (root, service, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        std::fs::remove_dir(game.join("mods")).unwrap();
+        let result = service
+            .content
+            .import_local_mods(
+                &id,
+                vec![(PortableName::new_exact("first.jar").unwrap(), jar(b"first"))],
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read(game.join("mods/first.jar")).unwrap(),
+            jar(b"first")
+        );
+        assert!(service.content.installed(&id).unwrap().is_empty());
+        assert!(!service.content.has_unsettled_effects());
     }
 
     #[tokio::test]

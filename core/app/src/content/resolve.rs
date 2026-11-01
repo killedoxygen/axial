@@ -37,6 +37,8 @@ pub enum ResolutionReason {
 pub enum ResolutionConflictKind {
     Unavailable,
     Incompatible,
+    /// A file the content owner does not track already occupies a destination.
+    ExistingFile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -289,6 +291,17 @@ impl ContentPlanState {
     }
 }
 
+/// An untracked file observed at a planned destination while planning. It is
+/// advisory: the mutation owner observes destinations again before publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExistingFile {
+    pub canonical_id: CanonicalId,
+    /// Instance-relative destination, for example `mods/sodium.jar`.
+    pub path: String,
+    /// The existing bytes equal the planned artifact, so it can be adopted.
+    pub identical: bool,
+}
+
 /// Bound dependency closure. There is deliberately no deserializer: clients
 /// cannot reconstruct authority by returning a serialized preview.
 pub struct TargetedPlan {
@@ -296,6 +309,7 @@ pub struct TargetedPlan {
     resolution: ContentResolution,
     expires_at: std::time::Instant,
     selected_pack: bool,
+    existing_files: Vec<ExistingFile>,
 }
 
 impl TargetedPlan {
@@ -315,6 +329,7 @@ impl TargetedPlan {
             resolution,
             expires_at,
             selected_pack: false,
+            existing_files: Vec::new(),
         })
     }
 
@@ -341,6 +356,7 @@ impl TargetedPlan {
             resolution,
             expires_at,
             selected_pack: true,
+            existing_files: Vec::new(),
         })
     }
 
@@ -350,6 +366,12 @@ impl TargetedPlan {
 
     pub fn resolution(&self) -> &ContentResolution {
         &self.resolution
+    }
+    pub fn existing_files(&self) -> &[ExistingFile] {
+        &self.existing_files
+    }
+    pub(crate) fn set_existing_files(&mut self, files: Vec<ExistingFile>) {
+        self.existing_files = files;
     }
     pub fn state(&self) -> &ContentPlanState {
         &self.state
@@ -389,7 +411,13 @@ impl TargetedPlan {
         {
             return Err(PlanValidationError::Unavailable);
         }
-        if !allow_incompatible && !self.resolution.conflicts.is_empty() {
+        if !allow_incompatible
+            && self
+                .resolution
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.kind() == ResolutionConflictKind::Incompatible)
+        {
             return Err(PlanValidationError::IncompatibilityDecisionRequired);
         }
         Ok(self.resolution.to_install()?)
@@ -2855,6 +2883,7 @@ mod tests {
             },
             expires_at: now + std::time::Duration::from_secs(60),
             selected_pack: false,
+            existing_files: Vec::new(),
         };
         assert!(plan.validate_at(&state, now).is_ok());
         let mut replacements = vec![state.clone(); 5];
@@ -2892,6 +2921,7 @@ mod tests {
             },
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
             selected_pack: false,
+            existing_files: Vec::new(),
         };
         assert!(matches!(
             plan.authorized_files(&state, false),

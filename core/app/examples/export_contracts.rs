@@ -9,7 +9,8 @@ use axial_app::{
     launch::coordinator::PreflightDiagnostics,
     public::{ErrorResponse, OperationId},
     resources::{
-        InstanceLogTailResponse, InstanceResourcesResponse, mods::InstanceModMetadata,
+        InstanceLogTailResponse, InstanceResourcesResponse,
+        mods::{InstanceModMetadata, ModImportResponse},
         packs::InstancePackInfo,
     },
     settings::{
@@ -72,6 +73,7 @@ fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     InstanceLogTailResponse::export_all(&config)?;
     InstanceModMetadata::export_all(&config)?;
     InstancePackInfo::export_all(&config)?;
+    ModImportResponse::export_all(&config)?;
     PendingSkinStatus::export_all(&config)?;
     DeletionSnapshot::export_all(&config)?;
     JavaSelection::export_all(&config)?;

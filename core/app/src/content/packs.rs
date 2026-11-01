@@ -62,6 +62,8 @@ pub enum PackError {
     Download,
     #[error("modpack provider metadata could not be resolved")]
     Provider,
+    #[error("this modpack file is not a published Modrinth modpack version")]
+    Unpublished,
 }
 
 pub type PackResult<T> = Result<T, PackError>;
@@ -414,7 +416,12 @@ pub struct ModpackFileOption {
     pub title: String,
     pub identified: bool,
     pub compatible: bool,
+    /// The destination is occupied, or this exact project version is managed.
     pub installed: bool,
+    /// The managed version of the same project when it differs from the pack's.
+    /// Choosing the file then updates that project deliberately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -602,11 +609,14 @@ impl PackFileSelection {
 
 /// `occupied_paths` comes from the admitted instance inventory. It includes
 /// enabled, disabled and alias variants; missing ownership never means absent.
+/// `installed` maps live managed projects to their version, so a pack member
+/// is recognised by project identity even under another filename.
 pub async fn preview_files(
     service: &ContentService,
     pack: ResolvedPack,
     target: &ResolutionTarget,
     occupied_paths: &[String],
+    installed: &HashMap<CanonicalId, String>,
 ) -> PackResult<PackFilePreview> {
     let index = pack.archive.index();
     if index.files.iter().filter(|f| f.kind().is_some()).count() > MAX_SELECTION_FILES {
@@ -661,6 +671,10 @@ pub async fn preview_files(
             .map(|metadata| metadata.title.as_str())
             .or_else(|| identity.and_then(|identity| identity.title.as_deref()))
             .unwrap_or(&filename);
+        let managed_version = project.as_ref().and_then(|project| installed.get(project));
+        let same_version = managed_version
+            .zip(identity)
+            .is_some_and(|(managed, identity)| managed == &identity.version_id);
         files.push(PreviewFile {
             option: ModpackFileOption {
                 selection_id: file_selection_id(
@@ -675,7 +689,8 @@ pub async fn preview_files(
                 title: bounded_text(title, "Pack file"),
                 identified: identity.is_some(),
                 compatible,
-                installed: occupied.contains(&path_key(&file.path)),
+                installed: same_version || occupied.contains(&path_key(&file.path)),
+                installed_version_id: managed_version.filter(|_| !same_version).cloned(),
             },
             file: file.clone(),
             identity: identity.cloned(),

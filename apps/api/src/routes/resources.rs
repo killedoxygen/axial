@@ -5,7 +5,10 @@ use axial_app::{
     resources::{
         InstanceLogInfo, ResourceCommand, ResourceError, ResourceService,
         folders::{FolderError, FolderService},
-        mods::{InstanceModInfo, InstanceModMetadata, UpdateModRequest},
+        mods::{
+            InstanceModInfo, InstanceModMetadata, MOD_IMPORT_MAX_BYTES, ModImportError,
+            ModImportResponse, UpdateModRequest,
+        },
         packs::{InstancePackInfo, PackFolder},
         screenshots::{InstanceScreenshotInfo, RenameScreenshotRequest},
         worlds::{InstanceWorldInfo, RenameWorldRequest},
@@ -72,7 +75,48 @@ pub fn router(state: Arc<ResourceService>) -> Router {
         )
         .route("/api/v1/instances/{id}/worlds/{name}/icon", get(world_icon))
         .layer(DefaultBodyLimit::max(4096))
+        // The jar body is bounded by the handler's own read limit.
+        .route("/api/v1/instances/{id}/mods/import", post(import_mod))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportQuery {
+    name: String,
+}
+
+fn import_error(value: ModImportError) -> Error {
+    (
+        StatusCode::from_u16(value.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(json!({"error": value.to_string()})),
+    )
+}
+
+/// One jar per request: the body is the file and `name` its filename.
+async fn import_mod(
+    State(state): State<Arc<ResourceService>>,
+    Path(raw): Path<String>,
+    query: Result<Query<ImportQuery>, QueryRejection>,
+    body: axum::body::Body,
+) -> Result<Json<ModImportResponse>, Error> {
+    let id = id(&raw)?;
+    let Query(query) = query.map_err(|_| import_error(ModImportError::NotJar))?;
+    let bytes = axum::body::to_bytes(body, MOD_IMPORT_MAX_BYTES)
+        .await
+        .map_err(|_| {
+            import_error(ModImportError::TooLarge(
+                query.name.chars().take(255).collect(),
+            ))
+        })?;
+    state
+        .import_mods(&id, vec![(query.name, bytes.to_vec())])
+        .map_err(import_error)?
+        .join()
+        .await
+        .map_err(|_| import_error(ModImportError::Pending))?
+        .map(Json)
+        .map_err(import_error)
 }
 
 type Error = (StatusCode, Json<Value>);
@@ -461,6 +505,7 @@ mod tests {
                     axial_app::instances::delete::MIGRATION,
                     axial_app::content::install::MIGRATION,
                     axial_app::performance::mutation::MIGRATION,
+                    axial_app::performance::rules::MIGRATION,
                 ])
                 .unwrap();
             let registry = Registry::new(metadata.clone());
@@ -494,11 +539,17 @@ mod tests {
                 tasks.clone(),
             ));
             let directories = instances.directories().clone();
-            let content = ContentMutations::new(
+            let client = ProviderClient::new(ClientConfig::default()).unwrap();
+            let performance = axial_app::performance::PerformanceService::new(
+                metadata.clone(),
                 directories.clone(),
-                ProviderClient::new(ClientConfig::default()).unwrap(),
                 tasks.clone(),
-            );
+                Arc::new(axial_app::content::catalog::ContentService::new(client.clone()).unwrap()),
+                axial_app::performance::public_transfer_resolver(),
+            )
+            .unwrap();
+            let content = ContentMutations::new(directories.clone(), client, tasks.clone())
+                .with_performance(performance);
             let opener = Arc::new(RecordingOpener::default());
             let app = folders_router(Arc::new(FolderService::new(
                 instances,
@@ -546,6 +597,27 @@ mod tests {
             (status, serde_json::from_slice(&body).unwrap())
         }
 
+        async fn import(&self, name: &str, bytes: Vec<u8>) -> (StatusCode, Value) {
+            let response = self
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/api/v1/instances/{}/mods/import?name={name}",
+                            self.id
+                        ))
+                        .body(Body::from(bytes))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&body).unwrap())
+        }
+
         async fn resource(&self, name: &str) -> (StatusCode, Value) {
             let response = self
                 .app
@@ -562,6 +634,50 @@ mod tests {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             (status, serde_json::from_slice(&body).unwrap())
         }
+    }
+
+    #[tokio::test]
+    async fn mod_import_route_adds_a_jar_above_the_json_body_limit_and_names_refusals() {
+        use std::io::Write;
+        let fixture = FolderFixture::new();
+        let mut zip = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        zip.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        // Larger than the router's 4 KiB JSON limit; the handler owns this bound.
+        zip.write_all(&vec![7; 64 * 1024]).unwrap();
+        let jar = zip.finish().unwrap().into_inner();
+        assert_eq!(
+            fixture.import("local.jar", jar.clone()).await,
+            (StatusCode::OK, json!({"imported":["local.jar"]}))
+        );
+        assert_eq!(
+            std::fs::read(fixture.game.join("mods/local.jar")).unwrap(),
+            jar
+        );
+        assert_eq!(
+            fixture.import("again.jar", jar.clone()).await,
+            (
+                StatusCode::CONFLICT,
+                json!({"error":"again.jar is already in this instance."})
+            )
+        );
+        assert_eq!(
+            fixture.import("notes.txt", jar).await,
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error":"Only .jar files can be added as mods."})
+            )
+        );
+        assert_eq!(
+            fixture.import("broken.jar", b"plain text".to_vec()).await,
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error":"broken.jar is not a readable mod archive."})
+            )
+        );
+        let listed = fixture.resource("mods").await;
+        assert_eq!(listed.1.as_array().unwrap().len(), 1);
+        assert!(!fixture.game.join("mods/again.jar").exists());
     }
 
     #[cfg(unix)]

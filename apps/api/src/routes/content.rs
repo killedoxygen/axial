@@ -63,7 +63,37 @@ pub fn router(state: Arc<ContentRoutes>) -> Router {
         .route("/api/v1/instances/{id}/content/uninstall", post(uninstall))
         .route("/api/v1/instances/{id}/content/settle", post(settle))
         .layer(DefaultBodyLimit::max(256 * 1024))
+        // The archive body is bounded by the handler's own read limit.
+        .route("/api/v1/content/modpack/file", post(modpack_file))
         .with_state(state)
+}
+
+const MAX_MODPACK_FILE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Identify a local `.mrpack`; creation then uses the ordinary modpack route.
+async fn modpack_file(
+    State(state): State<Arc<ContentRoutes>>,
+    body: axum::body::Body,
+) -> Result<Json<axial_app::instances::from_pack::ModpackTarget>, Error> {
+    use axial_app::content::packs::PackError;
+    let bytes = axum::body::to_bytes(body, MAX_MODPACK_FILE_BYTES)
+        .await
+        .map_err(|_| error(413, "This modpack is larger than the 128 MB import limit."))?;
+    axial_app::instances::from_pack::modpack_file_target(&state.service, bytes.to_vec())
+        .await
+        .map(Json)
+        .map_err(|failure| match failure {
+            PackError::Unpublished => error(
+                422,
+                "This modpack isn't published on Modrinth, so it can't be imported yet.",
+            ),
+            PackError::Provider | PackError::Download => unavailable(),
+            PackError::TooLarge => error(413, "This modpack exceeds the supported size limit."),
+            _ => error(
+                400,
+                "This file is not a readable Modrinth modpack (.mrpack).",
+            ),
+        })
 }
 
 type Error = (StatusCode, Json<Value>);
@@ -318,7 +348,7 @@ async fn plan(
                 .plan(&state.service, &id(&instance_id)?, &request.selections)
                 .await
                 .map_err(mutation_error)?;
-            view::into_plan(plan.resolution(), Some(instance_id), plan.state().target())
+            view::into_instance_plan(&plan, instance_id)
         }
         TargetRef::Draft {
             loader,
@@ -346,6 +376,8 @@ struct InstallRequest {
     /// Display name for the queue entry; it carries no install authority.
     #[serde(default)]
     label: Option<String>,
+    #[serde(default)]
+    replace_files: Vec<String>,
 }
 async fn install(
     State(state): State<Arc<ContentRoutes>>,
@@ -361,6 +393,7 @@ async fn install(
             action: InstallQueueContentActionRequest::Install {
                 selections: request.selections,
                 allow_incompatible: request.allow_incompatible,
+                replace_files: request.replace_files,
             },
         })
         .await

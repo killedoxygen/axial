@@ -157,7 +157,7 @@ impl SetupWork {
                         return Err(InstanceError::Conflict);
                     }
                     mutations
-                        .install_admitted(self.admitted.clone(), plan, false)
+                        .install_admitted(self.admitted.clone(), plan, false, Vec::new())
                         .map_err(|_| InstanceError::SetupUnavailable)?
                         .join()
                         .await
@@ -1927,6 +1927,7 @@ impl StoredSetupIntent {
                 action: InstallQueueContentActionRequest::Install {
                     selections: stored.selections.clone(),
                     allow_incompatible: false,
+                    replace_files: Vec::new(),
                 },
             },
             Self::Modpack(stored) => stored.queue_request(instance),
@@ -2609,6 +2610,7 @@ pub(crate) mod tests {
             InstallQueueContentActionRequest::Install {
                 selections: stored.selections,
                 allow_incompatible: false,
+                replace_files: Vec::new(),
             }
         );
     }

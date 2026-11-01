@@ -13,7 +13,7 @@ use super::{
         ContentManifest, LiveManagedContent, MANIFEST_FILE, MAX_MANIFEST_BYTES,
         ManagedContentFileName, ManifestEntry, PackInstallation, PackInstalledFile,
     },
-    resolve::{ContentPlanState, ResolutionSelection, TargetedPlan},
+    resolve::{ContentPlanState, ExistingFile, ResolutionSelection, TargetedPlan},
 };
 use crate::{
     files::{PortableName, ScopedDirectory, ScopedPath},
@@ -187,6 +187,8 @@ pub enum MutationError {
     Capacity,
     #[error("content is still required by another installed project")]
     Required,
+    #[error("{0} is already in this instance")]
+    Duplicate(String),
     #[error("content not found")]
     NotFound,
     #[error("managed mods must be removed through content operations")]
@@ -216,7 +218,12 @@ impl From<rusqlite::Error> for MutationError {
 impl MutationError {
     pub fn status_code(&self) -> u16 {
         match self {
-            Self::Changed | Self::Conflict | Self::Pending | Self::Required | Self::Managed => 409,
+            Self::Changed
+            | Self::Conflict
+            | Self::Pending
+            | Self::Required
+            | Self::Managed
+            | Self::Duplicate(_) => 409,
             Self::NotFound | Self::Pack(super::packs::PackError::NoMatchingVersion) => 404,
             Self::Cancelled => 409,
             Self::Capacity => 413,
@@ -275,10 +282,20 @@ struct Change {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Source {
-    Download { file: FileRef },
-    Local { path: String, proof: Proof },
-    PackDownload { file: FileRef },
+    Download {
+        file: FileRef,
+    },
+    Local {
+        path: String,
+        proof: Proof,
+    },
+    PackDownload {
+        file: FileRef,
+    },
     PackOverride,
+    /// Bytes supplied by the person. They are not durable, so an interrupted
+    /// import rolls back instead of resuming.
+    Import,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -300,6 +317,15 @@ struct Receipt {
     local_mod: Option<LocalModIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ready_checkpoint: Option<String>,
+    /// Untracked files whose exact bytes became managed without a payload write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    adopted: Vec<String>,
+    /// Untracked files the person chose to replace; their bytes are change preconditions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    displaced: Vec<String>,
+    /// Adds untracked mod files without changing managed provenance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    import: bool,
 }
 
 fn encoded_receipt(receipt: &Receipt) -> Result<String, MutationError> {
@@ -674,6 +700,9 @@ impl ContentMutations {
             pack: Some(canonical_id),
             local_mod: None,
             ready_checkpoint: None,
+            adopted: Vec::new(),
+            displaced: Vec::new(),
+            import: false,
         };
         validate_receipt(&receipt)?;
         if cancel.is_cancelled() {
@@ -739,7 +768,14 @@ impl ContentMutations {
                 occupied.push(format!("{name}/{filename}"));
             }
         }
-        Ok(super::packs::preview_files(service, pack, &target, &occupied).await?)
+        let (manifest, live, _) = observe(instance.game_directory())?;
+        let installed = manifest
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind() != ContentKind::Modpack && live.contains(entry))
+            .map(|entry| (entry.canonical_id().clone(), entry.version_id().to_owned()))
+            .collect();
+        Ok(super::packs::preview_files(service, pack, &target, &occupied, &installed).await?)
     }
 
     /// Selected imports retain the same admission through archive identity,
@@ -764,7 +800,7 @@ impl ContentMutations {
         let plan = self
             .plan_selected_pack_admitted(service, &instance, selection)
             .await?;
-        self.install_admitted(instance, plan, false)
+        self.install_admitted(instance, plan, false, Vec::new())
     }
 
     async fn plan_selected_pack_admitted(
@@ -940,9 +976,11 @@ impl ContentMutations {
         let (manifest, live, _) = observe(instance.game_directory())?;
         let state = ContentPlanState::from_instance(instance.record(), &manifest, &live)
             .map_err(|_| MutationError::Changed)?;
-        TargetedPlan::resolve(service, state, selections, &manifest, &live)
+        let mut plan = TargetedPlan::resolve(service, state, selections, &manifest, &live)
             .await
-            .map_err(|_| MutationError::Unavailable)
+            .map_err(|_| MutationError::Unavailable)?;
+        plan.set_existing_files(existing_files(instance.game_directory(), &manifest, &plan)?);
+        Ok(plan)
     }
 
     pub fn install(
@@ -954,22 +992,26 @@ impl ContentMutations {
             .directories
             .admit(plan.state().instance_id())
             .map_err(|_| MutationError::Unavailable)?;
-        self.install_admitted(instance, plan, allow_incompatible)
+        self.install_admitted(instance, plan, allow_incompatible, Vec::new())
     }
 
+    /// `replace` names untracked destination files the person chose to
+    /// replace. Untracked files with the planned bytes are adopted either way.
     pub fn install_admitted(
         &self,
         instance: RegisteredInstance,
         plan: TargetedPlan,
         allow_incompatible: bool,
+        replace: Vec<String>,
     ) -> Result<TaskHandle<Result<MutationReceipt, MutationError>>, MutationError> {
-        if &instance.record().instance.id != plan.state().instance_id() {
+        if &instance.record().instance.id != plan.state().instance_id() || replace.len() > 256 {
             return Err(MutationError::Changed);
         }
         let owner = self.clone();
         self.tasks
             .try_spawn(instance.clone(), move |cancel| async move {
-                let receipt = owner.prepare_install(&instance, &plan, allow_incompatible)?;
+                let receipt =
+                    owner.prepare_install(&instance, &plan, allow_incompatible, &replace)?;
                 owner.accept_batch(instance, receipt, &cancel).await
             })
             .map_err(|_| MutationError::Unavailable)
@@ -980,8 +1022,10 @@ impl ContentMutations {
         instance: &RegisteredInstance,
         plan: &TargetedPlan,
         allow_incompatible: bool,
+        replace: &[String],
     ) -> Result<Receipt, MutationError> {
-        let (before, live, raw) = observe(instance.game_directory())?;
+        let game = instance.game_directory();
+        let (before, live, raw) = observe(game)?;
         let current = ContentPlanState::from_instance(instance.record(), &before, &live)
             .map_err(|_| MutationError::Changed)?;
         let files = plan
@@ -1001,6 +1045,23 @@ impl ContentMutations {
                 }
             }
         }
+        // An exact untracked copy kept under its disabled name stays disabled.
+        let owned = manifest_paths(&before)?;
+        for file in &files {
+            let entry = after
+                .find(&file.canonical_id)
+                .ok_or(MutationError::Changed)?;
+            let path = entry_path(entry)?;
+            let disabled = format!("{path}.disabled");
+            if entry.enabled()
+                && !owned.contains_key(&path)
+                && !owned.contains_key(&disabled)
+                && observe_path(game, &path)?.is_none()
+                && observe_path(game, &disabled)? == Some(Proof::entry(entry)?)
+            {
+                after.try_set_enabled(&file.canonical_id, false)?;
+            }
+        }
         let sources = files
             .into_iter()
             .map(|file| {
@@ -1014,7 +1075,7 @@ impl ContentMutations {
                 ))
             })
             .collect::<Result<HashMap<_, _>, MutationError>>()?;
-        self.prepare_batch(instance, before, raw, after, sources)
+        self.prepare_batch(instance, before, raw, after, sources, Some(replace))
     }
 
     pub fn remove(
@@ -1211,9 +1272,115 @@ impl ContentMutations {
             pack: None,
             local_mod: Some(intent),
             ready_checkpoint: None,
+            adopted: Vec::new(),
+            displaced: Vec::new(),
+            import: false,
         };
         validate_receipt(&receipt)?;
         Ok(Some(receipt))
+    }
+
+    /// Add untracked jars beside managed content. Names must be free in both
+    /// enabled and disabled spellings and bytes must not repeat an installed mod.
+    pub(crate) fn import_local_mods(
+        &self,
+        id: &InstanceId,
+        files: Vec<(PortableName, Vec<u8>)>,
+    ) -> Result<TaskHandle<Result<MutationReceipt, MutationError>>, MutationError> {
+        let instance = self
+            .directories
+            .admit(id)
+            .map_err(|_| MutationError::Unavailable)?;
+        let owner = self.clone();
+        self.tasks
+            .try_spawn(instance.clone(), move |cancel| async move {
+                let (receipt, payloads) = owner.prepare_import(&instance, files)?;
+                owner
+                    .accept_batch_with(instance, receipt, payloads, &cancel)
+                    .await
+            })
+            .map_err(|_| MutationError::Unavailable)
+    }
+
+    fn prepare_import(
+        &self,
+        instance: &RegisteredInstance,
+        files: Vec<(PortableName, Vec<u8>)>,
+    ) -> Result<(Receipt, HashMap<String, Vec<u8>>), MutationError> {
+        let game = instance.game_directory();
+        let raw = read_path(game, MANIFEST_FILE)?;
+        let before = ContentManifest::decode_managed(raw.as_deref())?;
+        let present = crate::resources::mods::list_mods(game).map_err(|error| match error {
+            crate::resources::mods::ModFilesError::ScanLimit => MutationError::Capacity,
+            _ => MutationError::Files,
+        })?;
+        let mut taken = present
+            .iter()
+            .map(|listed| {
+                Ok(
+                    crate::files::portable::managed_content_name_key(&portable(&listed.name)?)
+                        .as_str()
+                        .to_owned(),
+                )
+            })
+            .collect::<Result<HashSet<_>, MutationError>>()?;
+        taken.extend(
+            before
+                .entries()
+                .iter()
+                .filter_map(|entry| entry.managed_filename())
+                .map(|name| name.key().as_str().to_owned()),
+        );
+        let mut changes = Vec::new();
+        let mut payloads = HashMap::new();
+        for (name, bytes) in files {
+            let proof = Proof::bytes(&bytes);
+            let repeats_installed = before.entries().iter().any(|entry| {
+                entry.kind() == ContentKind::Mod && entry.sha512() == Some(proof.sha512.as_str())
+            });
+            let mut repeats_present = false;
+            for listed in present.iter().filter(|listed| listed.size == proof.size) {
+                if observe_path(game, &format!("mods/{}", listed.name))?.as_ref() == Some(&proof) {
+                    repeats_present = true;
+                    break;
+                }
+            }
+            if taken.contains(crate::files::portable::managed_content_name_key(&name).as_str())
+                || repeats_installed
+                || repeats_present
+            {
+                return Err(MutationError::Duplicate(name.as_str().into()));
+            }
+            let path = format!("mods/{}", name.as_str());
+            payloads.insert(path.clone(), bytes);
+            changes.push(Change {
+                path,
+                before: None,
+                after: Some(proof),
+                source: Some(Source::Import),
+            });
+        }
+        let encoded = before.encode_managed()?;
+        let receipt = Receipt {
+            schema: 1,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: instance.record().instance.id.clone(),
+            instance_revision: instance.record().revision,
+            directory_receipt: game.receipt().map_err(|_| MutationError::Changed)?,
+            after_manifest: raw.clone().unwrap_or_else(|| encoded.clone()),
+            before_manifest: raw,
+            before_observed_manifest: encoded,
+            changes,
+            native_settled: false,
+            pack: None,
+            local_mod: None,
+            ready_checkpoint: None,
+            adopted: Vec::new(),
+            displaced: Vec::new(),
+            import: true,
+        };
+        validate_receipt(&receipt)?;
+        Ok((receipt, payloads))
     }
 
     async fn begin(
@@ -1225,10 +1392,12 @@ impl ContentMutations {
         sources: HashMap<String, Source>,
         cancel: &CancellationToken,
     ) -> Result<MutationReceipt, MutationError> {
-        let receipt = self.prepare_batch(&instance, before, raw, after, sources)?;
+        let receipt = self.prepare_batch(&instance, before, raw, after, sources, None)?;
         self.accept_batch(instance, receipt, cancel).await
     }
 
+    /// Only installs pass `untracked`: equal untracked bytes are adopted and
+    /// listed different files are replaced. Every other batch refuses them.
     fn prepare_batch(
         &self,
         instance: &RegisteredInstance,
@@ -1236,20 +1405,34 @@ impl ContentMutations {
         raw: Option<Vec<u8>>,
         after: ContentManifest,
         sources: HashMap<String, Source>,
+        untracked: Option<&[String]>,
     ) -> Result<Receipt, MutationError> {
+        let game = instance.game_directory();
         let old = manifest_paths(&before)?;
         let new = manifest_paths(&after)?;
         let mut paths: Vec<_> = old.keys().chain(new.keys()).cloned().collect();
         paths.sort();
         paths.dedup();
         let mut changes = Vec::new();
+        let mut adopted = Vec::new();
+        let mut displaced = Vec::new();
         for path in paths {
             if old.get(&path) == new.get(&path) {
                 continue;
             }
-            let before = observe_path(instance.game_directory(), &path)?;
+            let before = observe_path(game, &path)?;
             if before.is_some() && before.as_ref() != old.get(&path) {
-                return Err(MutationError::Changed);
+                let Some(replace) = untracked.filter(|_| !old.contains_key(&path)) else {
+                    return Err(MutationError::Changed);
+                };
+                if before.as_ref() == new.get(&path) {
+                    adopted.push(path);
+                    continue;
+                }
+                if !replace.contains(&path) {
+                    return Err(MutationError::Conflict);
+                }
+                displaced.push(path.clone());
             }
             let after = new.get(&path).cloned();
             if before != after {
@@ -1258,6 +1441,27 @@ impl ContentMutations {
                     after,
                     source: sources.get(&path).cloned(),
                     path,
+                });
+            }
+        }
+        if let Some(replace) = untracked {
+            for path in new.keys().filter(|path| !old.contains_key(*path)) {
+                let alternate = alternate_path(path);
+                if old.contains_key(&alternate) || new.contains_key(&alternate) {
+                    continue;
+                }
+                let Some(proof) = observe_path(game, &alternate)? else {
+                    continue;
+                };
+                if !replace.contains(&alternate) {
+                    return Err(MutationError::Conflict);
+                }
+                displaced.push(alternate.clone());
+                changes.push(Change {
+                    path: alternate,
+                    before: Some(proof),
+                    after: None,
+                    source: None,
                 });
             }
         }
@@ -1280,6 +1484,9 @@ impl ContentMutations {
             pack: None,
             local_mod: None,
             ready_checkpoint: None,
+            adopted,
+            displaced,
+            import: false,
         };
         Ok(receipt)
     }
@@ -1288,6 +1495,17 @@ impl ContentMutations {
         &self,
         instance: RegisteredInstance,
         receipt: Receipt,
+        cancel: &CancellationToken,
+    ) -> Result<MutationReceipt, MutationError> {
+        self.accept_batch_with(instance, receipt, HashMap::new(), cancel)
+            .await
+    }
+
+    async fn accept_batch_with(
+        &self,
+        instance: RegisteredInstance,
+        receipt: Receipt,
+        payloads: HashMap<String, Vec<u8>>,
         cancel: &CancellationToken,
     ) -> Result<MutationReceipt, MutationError> {
         validate_receipt(&receipt)?;
@@ -1304,7 +1522,7 @@ impl ContentMutations {
             .map_err(|_| MutationError::Changed)?;
         preflight(instance.game_directory(), &receipt, false)?;
         self.persist_receipt(&receipt)?;
-        self.apply(instance, receipt, HashMap::new(), cancel).await
+        self.apply(instance, receipt, payloads, cancel).await
     }
 
     fn persist_receipt(&self, receipt: &Receipt) -> Result<(), MutationError> {
@@ -1485,7 +1703,7 @@ impl ContentMutations {
                 let recovery = (|| {
                     let checkpoint = receipt.ready_checkpoint.as_deref().ok_or(MutationError::Pending)?;
                     let checkpoint = ManagedContentStagingCheckpoint::decode(checkpoint).map_err(|_| MutationError::Pending)?;
-                    transaction_root(&instance, receipt.pack.is_some())?
+                    transaction_root(&instance, creates_parents(&receipt))?
                         .restore_staging_checkpoint(checkpoint, checkpoint_binding(&receipt)?)
                         .map_err(|_| MutationError::Pending)
                 })();
@@ -1548,6 +1766,11 @@ impl ContentMutations {
             // Verify the actual filesystem before discarding the settlement fence.
             for change in &receipt.changes {
                 if observe_path(instance.game_directory(), &change.path)? != change.after {
+                    return Err(MutationError::Changed);
+                }
+            }
+            for (path, proof) in adopted_proofs(&receipt)? {
+                if observe_path(instance.game_directory(), &path)? != Some(proof) {
                     return Err(MutationError::Changed);
                 }
             }
@@ -1807,6 +2030,49 @@ fn entry_path(entry: &ManifestEntry) -> Result<String, MutationError> {
     ))
 }
 
+fn alternate_path(path: &str) -> String {
+    path.strip_suffix(".disabled")
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{path}.disabled"))
+}
+
+/// Untracked files at either spelling of each planned destination. Paths the
+/// manifest already owns stay with the ordinary managed-file preconditions.
+fn existing_files(
+    game: &ScopedDirectory,
+    manifest: &ContentManifest,
+    plan: &TargetedPlan,
+) -> Result<Vec<ExistingFile>, MutationError> {
+    let owned = manifest_paths(manifest)?;
+    let mut existing = Vec::new();
+    for item in &plan.resolution().items {
+        if item.already_installed && !item.update {
+            continue;
+        }
+        let Some(directory) = item.kind.install_subdir() else {
+            continue;
+        };
+        let planned = Proof {
+            size: item.file.size.ok_or(MutationError::Changed)?,
+            sha512: item.file.sha512.clone().ok_or(MutationError::Changed)?,
+        };
+        let path = format!("{directory}/{}", item.file.filename);
+        for path in [alternate_path(&path), path] {
+            if owned.contains_key(&path) {
+                continue;
+            }
+            if let Some(proof) = observe_path(game, &path)? {
+                existing.push(ExistingFile {
+                    canonical_id: item.canonical_id.clone(),
+                    identical: proof == planned,
+                    path,
+                });
+            }
+        }
+    }
+    Ok(existing)
+}
+
 fn portable(name: &str) -> Result<PortableName, MutationError> {
     PortableName::new_exact(name).map_err(|_| MutationError::Changed)
 }
@@ -1903,10 +2169,20 @@ fn validate_receipt(receipt: &Receipt) -> Result<(), MutationError> {
     {
         return Err(MutationError::Changed);
     }
+    let untracked = !receipt.adopted.is_empty() || !receipt.displaced.is_empty();
+    if untracked && (receipt.pack.is_some() || receipt.local_mod.is_some()) {
+        return Err(MutationError::Changed);
+    }
     let mut recorded = ContentManifest::decode_managed(receipt.before_manifest.as_deref())?;
     let before = ContentManifest::decode_managed(Some(&receipt.before_observed_manifest))?;
     if let Some(intent) = &receipt.local_mod {
+        if receipt.import {
+            return Err(MutationError::Changed);
+        }
         return validate_local_mod_receipt(receipt, intent, &recorded, &before);
+    }
+    if receipt.import {
+        return validate_import_receipt(receipt, &recorded, &before);
     }
     // Observation may correct only enabled/disabled spelling. It cannot invent
     // provenance or change a provider identity, digest, dependency, or filename.
@@ -1922,14 +2198,38 @@ fn validate_receipt(receipt: &Receipt) -> Result<(), MutationError> {
     }
     let before = manifest_paths(&before)?;
     let after = manifest_paths(&after)?;
+    let adopted = receipt.adopted.iter().collect::<HashSet<_>>();
+    let displaced = receipt.displaced.iter().collect::<HashSet<_>>();
+    if adopted.len() != receipt.adopted.len()
+        || displaced.len() != receipt.displaced.len()
+        || receipt
+            .adopted
+            .iter()
+            .chain(&receipt.displaced)
+            .any(|path| {
+                before.contains_key(path)
+                    || !direct_managed_path(path)
+                    || adopted.contains(path) && displaced.contains(path)
+            })
+        || receipt.adopted.iter().any(|path| {
+            !after.contains_key(path) || receipt.changes.iter().any(|change| &change.path == path)
+        })
+        || receipt.displaced.iter().any(|path| {
+            !receipt
+                .changes
+                .iter()
+                .any(|change| &change.path == path && change.before.is_some())
+        })
+    {
+        return Err(MutationError::Changed);
+    }
     let mut paths = HashSet::new();
     let mut bytes = 0_u64;
     for change in &receipt.changes {
         if !paths.insert(&change.path)
-            || change
-                .before
-                .as_ref()
-                .is_some_and(|proof| before.get(&change.path) != Some(proof))
+            || change.before.as_ref().is_some_and(|proof| {
+                before.get(&change.path) != Some(proof) && !displaced.contains(&change.path)
+            })
             || change.after != after.get(&change.path).cloned()
             || change.before == change.after
         {
@@ -1963,7 +2263,7 @@ fn validate_receipt(receipt: &Receipt) -> Result<(), MutationError> {
                         return Err(MutationError::Changed);
                     }
                 }
-                Source::PackDownload { .. } | Source::PackOverride => {
+                Source::PackDownload { .. } | Source::PackOverride | Source::Import => {
                     return Err(MutationError::Changed);
                 }
             }
@@ -1972,10 +2272,68 @@ fn validate_receipt(receipt: &Receipt) -> Result<(), MutationError> {
         }
     }
     for path in before.keys().chain(after.keys()) {
-        if before.get(path) != after.get(path) && after.contains_key(path) && !paths.contains(path)
+        if before.get(path) != after.get(path)
+            && after.contains_key(path)
+            && !paths.contains(path)
+            && !adopted.contains(path)
         {
             return Err(MutationError::Changed);
         }
+    }
+    Ok(())
+}
+
+fn validate_import_receipt(
+    receipt: &Receipt,
+    recorded: &ContentManifest,
+    before: &ContentManifest,
+) -> Result<(), MutationError> {
+    let after = ContentManifest::decode_managed(Some(&receipt.after_manifest))?;
+    if receipt.pack.is_some()
+        || recorded != before
+        || &after != before
+        || receipt
+            .before_manifest
+            .as_ref()
+            .is_some_and(|raw| raw != &receipt.after_manifest)
+        || receipt.changes.is_empty()
+        || receipt.changes.len() > crate::resources::mods::MOD_IMPORT_MAX_FILES
+    {
+        return Err(MutationError::Changed);
+    }
+    let mut owned = HashSet::new();
+    for entry in before.entries() {
+        if let Some(name) = entry.managed_filename() {
+            owned.insert(name.key().as_str().to_owned());
+        }
+    }
+    let mut names = HashSet::new();
+    let mut bytes = 0_u64;
+    for change in &receipt.changes {
+        let name = portable(
+            change
+                .path
+                .strip_prefix("mods/")
+                .ok_or(MutationError::Changed)?,
+        )?;
+        let key = crate::files::portable::managed_content_name_key(&name);
+        let proof = change.after.as_ref().ok_or(MutationError::Changed)?;
+        if !name.key().as_str().ends_with(".jar")
+            || crate::files::portable::managed_content_name_is_reserved(&name)
+            || owned.contains(key.as_str())
+            || !names.insert(key)
+            || change.before.is_some()
+            || !matches!(change.source, Some(Source::Import))
+            || proof.size == 0
+            || proof.size > MAX_CONTENT_FILE_BYTES
+            || !super::provenance::valid_sha512(&proof.sha512)
+        {
+            return Err(MutationError::Changed);
+        }
+        bytes = bytes
+            .checked_add(proof.size)
+            .filter(|bytes| *bytes <= MAX_BATCH_BYTES)
+            .ok_or(MutationError::Capacity)?;
     }
     Ok(())
 }
@@ -2219,6 +2577,13 @@ fn preflight(game: &ScopedDirectory, receipt: &Receipt, resume: bool) -> Result<
             return Err(MutationError::Conflict);
         }
     }
+    for (path, proof) in adopted_proofs(receipt)? {
+        if observe_path(game, &path)? != Some(proof)
+            || observe_path(game, &alternate_path(&path))?.is_some()
+        {
+            return Err(MutationError::Conflict);
+        }
+    }
     for change in &receipt.changes {
         let current = observe_path(game, &change.path)?;
         if current != change.before && (!resume || current != change.after) {
@@ -2242,6 +2607,25 @@ fn preflight(game: &ScopedDirectory, receipt: &Receipt, resume: bool) -> Result<
         }
     }
     Ok(())
+}
+
+fn adopted_proofs(receipt: &Receipt) -> Result<Vec<(String, Proof)>, MutationError> {
+    if receipt.adopted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let after = manifest_paths(&ContentManifest::decode_managed(Some(
+        &receipt.after_manifest,
+    ))?)?;
+    receipt
+        .adopted
+        .iter()
+        .map(|path| {
+            Ok((
+                path.clone(),
+                after.get(path).cloned().ok_or(MutationError::Changed)?,
+            ))
+        })
+        .collect()
 }
 
 fn direct_managed_path(path: &str) -> bool {
@@ -2280,6 +2664,11 @@ fn removed_absence_preconditions(receipt: &Receipt) -> Result<Vec<String>, Mutat
 struct ContentAuthority {
     _instance: RegisteredInstance,
     tree: ManagedTreeRoot,
+}
+
+/// Packs and imports may publish into a content folder that does not exist yet.
+fn creates_parents(receipt: &Receipt) -> bool {
+    receipt.pack.is_some() || receipt.import
 }
 
 fn transaction_root(
@@ -2395,7 +2784,7 @@ async fn apply_streamed(
     // prepared, all exits below consume the native outcome or retain recovery.
     effects.push(Effect::RolledBack);
     let checkpoint_binding = checkpoint_binding(receipt)?;
-    let root = transaction_root(instance, receipt.pack.is_some())?;
+    let root = transaction_root(instance, creates_parents(receipt))?;
     let planning = root
         .observe_manifest()
         .map_err(|_| MutationError::Changed)?;
@@ -2412,7 +2801,11 @@ async fn apply_streamed(
         .collect::<Result<Vec<_>, _>>()?;
     let mut observed_paths = paths.clone();
     let absent_paths = removed_absence_preconditions(receipt)?;
-    for path in &absent_paths {
+    let adopted = adopted_proofs(receipt)?;
+    for path in absent_paths
+        .iter()
+        .chain(adopted.iter().map(|(path, _)| path))
+    {
         let path = axial_minecraft::portable_path::PortableRelativePath::new_exact(path)
             .map_err(|_| MutationError::Changed)?;
         if !observed_paths.contains(&path) {
@@ -2430,10 +2823,12 @@ async fn apply_streamed(
             .map_err(|_| MutationError::Changed)?
     };
     if planning.observations().iter().any(|observation| {
-        absent_paths
-            .iter()
-            .any(|path| path == observation.path().as_str())
+        let path = observation.path().as_str();
+        absent_paths.iter().any(|absent| absent == path)
             && observation.state() != &ManagedContentObservedState::Absent
+            || adopted.iter().any(|(adopted, proof)| {
+                adopted == path && observation.state() != &observed(Some(proof))
+            })
     }) {
         return Err(MutationError::Changed);
     }
@@ -2498,6 +2893,8 @@ async fn apply_streamed(
                         ));
                         override_paths.insert(id.as_str().to_owned(), change.path.clone());
                     }
+                    // The supplied bytes did not survive; nothing has been prepared yet.
+                    Source::Import => return Err(MutationError::Changed),
                 }
             }
             ManagedContentPathResult::Download(id)
@@ -2977,6 +3374,9 @@ mod tests {
             pack: Some(pack.canonical_id.clone()),
             local_mod: None,
             ready_checkpoint: None,
+            adopted: Vec::new(),
+            displaced: Vec::new(),
+            import: false,
         };
         validate_receipt(&receipt).unwrap();
         receipt
@@ -3109,6 +3509,9 @@ mod tests {
             pack: None,
             local_mod: None,
             ready_checkpoint: None,
+            adopted: Vec::new(),
+            displaced: Vec::new(),
+            import: false,
             changes: vec![Change {
                 path,
                 before: before
@@ -3822,7 +4225,9 @@ mod tests {
     #[tokio::test]
     async fn selected_pack_nonprimary_member_preserves_the_reviewed_payload() {
         let (root, owner, id) = fixture().await;
-        let plan = selected_pack_plan(&owner, &id, false).await.unwrap();
+        let plan = selected_pack_plan(&owner, &id, false, &HashMap::new())
+            .await
+            .unwrap();
         assert!(plan.resolution().conflicts.is_empty());
         assert_eq!(plan.resolution().items.len(), 1);
         let selected = &plan.resolution().items[0];
@@ -3837,7 +4242,7 @@ mod tests {
             Some(Proof::bytes(b"known").sha512.as_str())
         );
         let instance = owner.directories.admit(&id).unwrap();
-        let receipt = owner.prepare_install(&instance, &plan, false).unwrap();
+        let receipt = owner.prepare_install(&instance, &plan, false, &[]).unwrap();
         assert_eq!(receipt.changes.len(), 1);
         assert_eq!(receipt.changes[0].path, "resourcepacks/chosen.zip");
         validate_receipt(&receipt).unwrap();
@@ -3914,11 +4319,13 @@ mod tests {
         )
         .unwrap();
         std::fs::write(directory.join("resourcepacks/user.zip"), b"user bytes").unwrap();
-        let plan = selected_pack_plan(&owner, &id, false).await.unwrap();
+        let plan = selected_pack_plan(&owner, &id, false, &HashMap::new())
+            .await
+            .unwrap();
         let selected = &plan.resolution().items[0];
         assert!(selected.already_installed && selected.update);
         let instance = owner.directories.admit(&id).unwrap();
-        let receipt = owner.prepare_install(&instance, &plan, false).unwrap();
+        let receipt = owner.prepare_install(&instance, &plan, false, &[]).unwrap();
         assert_eq!(receipt.changes.len(), 2);
         let after = ContentManifest::decode_managed(Some(&receipt.after_manifest)).unwrap();
         assert!(after.find(&member_id).unwrap().enabled());
@@ -3960,11 +4367,328 @@ mod tests {
         assert!(!owner.has_unsettled_effects());
     }
 
+    async fn known_pack_plan(owner: &ContentMutations, id: &InstanceId) -> TargetedPlan {
+        let version = serde_json::json!({
+            "project_id":"known", "id":"known-v1", "name":"Known version", "version_number":"1",
+            "version_type":"release", "loaders":["minecraft"], "game_versions":["1.21.4"],
+            "files":[{"filename":"known.zip", "url":"https://cdn.example.com/known.zip",
+                "size":5, "primary":true, "hashes":{"sha512":Proof::bytes(b"known").sha512}}],
+            "dependencies":[],
+        });
+        let metadata = serde_json::json!([{
+            "id":"known", "title":"Known pack", "project_type":"resourcepack",
+        }]);
+        let (service, provider) = metadata_provider(vec![
+            metadata.to_string(),
+            serde_json::json!([version]).to_string(),
+        ])
+        .await;
+        let instance = owner.directories.admit(id).unwrap();
+        let plan = owner
+            .plan_admitted(
+                &service,
+                &instance,
+                &[ResolutionSelection {
+                    canonical_id: "modrinth:known".into(),
+                    kind: ContentKind::ResourcePack,
+                    version_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        provider.await.unwrap();
+        plan
+    }
+
+    #[tokio::test]
+    async fn identical_untracked_file_is_adopted_without_a_payload_write() {
+        let (root, owner, id) = fixture().await;
+        let directory = root.path().join("instances").join(id.as_str());
+        std::fs::write(directory.join("resourcepacks/known.zip"), b"known").unwrap();
+        let plan = known_pack_plan(&owner, &id).await;
+        let view = super::super::view::into_instance_plan(&plan, id.to_string());
+        assert!(view.conflicts.is_empty());
+        assert_eq!(view.total_download_bytes, 0);
+        assert_eq!(
+            serde_json::to_value(&view.items[0]).unwrap()["existing_file"],
+            "identical"
+        );
+        let instance = owner.directories.admit(&id).unwrap();
+        let receipt = owner.prepare_install(&instance, &plan, false, &[]).unwrap();
+        assert!(receipt.changes.is_empty());
+        assert_eq!(receipt.adopted, vec!["resourcepacks/known.zip".to_string()]);
+        validate_receipt(&receipt).unwrap();
+        let mut forged = receipt.clone();
+        forged.adopted.push("resourcepacks/other.zip".into());
+        assert!(matches!(
+            validate_receipt(&forged),
+            Err(MutationError::Changed)
+        ));
+        std::fs::write(directory.join("resourcepacks/known.zip"), b"later").unwrap();
+        assert!(matches!(
+            preflight(instance.game_directory(), &receipt, false),
+            Err(MutationError::Conflict)
+        ));
+        std::fs::write(directory.join("resourcepacks/known.zip"), b"known").unwrap();
+        owner.persist_receipt(&receipt).unwrap();
+        // No payload is supplied: any download attempt would fail this apply.
+        owner
+            .apply(instance, receipt, HashMap::new(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(directory.join("resourcepacks/known.zip")).unwrap(),
+            b"known"
+        );
+        let installed = owner.installed(&id).unwrap();
+        let entry = installed
+            .find(&CanonicalId("modrinth:known".into()))
+            .unwrap();
+        assert_eq!(entry.version_id(), "known-v1");
+        assert!(entry.enabled());
+        assert!(!owner.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn different_untracked_file_is_a_named_conflict_until_replacement_is_chosen() {
+        let (root, owner, id) = fixture().await;
+        let directory = root.path().join("instances").join(id.as_str());
+        std::fs::write(directory.join("resourcepacks/known.zip"), b"mine!").unwrap();
+        let plan = known_pack_plan(&owner, &id).await;
+        let view = serde_json::to_value(super::super::view::into_instance_plan(
+            &plan,
+            id.to_string(),
+        ))
+        .unwrap();
+        assert_eq!(view["items"][0]["existing_file"], "different");
+        assert_eq!(
+            view["conflicts"],
+            serde_json::json!([{
+                "canonical_id":"modrinth:known", "kind":"existing_file",
+                "detail":"A different known.zip is already in the resourcepacks folder.",
+                "path":"resourcepacks/known.zip",
+            }])
+        );
+        let instance = owner.directories.admit(&id).unwrap();
+        assert!(matches!(
+            owner.prepare_install(&instance, &plan, false, &[]),
+            Err(MutationError::Conflict)
+        ));
+        assert!(matches!(
+            owner.prepare_install(&instance, &plan, false, &["resourcepacks/other.zip".into()]),
+            Err(MutationError::Conflict)
+        ));
+        let receipt = owner
+            .prepare_install(&instance, &plan, false, &["resourcepacks/known.zip".into()])
+            .unwrap();
+        assert_eq!(
+            receipt.displaced,
+            vec!["resourcepacks/known.zip".to_string()]
+        );
+        assert_eq!(receipt.changes[0].before, Some(Proof::bytes(b"mine!")));
+        validate_receipt(&receipt).unwrap();
+        let mut forged = receipt.clone();
+        forged.displaced.clear();
+        assert!(matches!(
+            validate_receipt(&forged),
+            Err(MutationError::Changed)
+        ));
+        std::fs::write(directory.join("resourcepacks/known.zip"), b"edit!").unwrap();
+        assert!(matches!(
+            preflight(instance.game_directory(), &receipt, false),
+            Err(MutationError::Conflict)
+        ));
+        std::fs::write(directory.join("resourcepacks/known.zip"), b"mine!").unwrap();
+        owner.persist_receipt(&receipt).unwrap();
+        owner
+            .apply(
+                instance,
+                receipt,
+                HashMap::from([("resourcepacks/known.zip".into(), b"known".to_vec())]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(directory.join("resourcepacks/known.zip")).unwrap(),
+            b"known"
+        );
+        assert!(
+            owner
+                .installed(&id)
+                .unwrap()
+                .find(&CanonicalId("modrinth:known".into()))
+                .is_some()
+        );
+        assert!(!owner.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn exact_disabled_untracked_copy_is_adopted_disabled() {
+        let (root, owner, id) = fixture().await;
+        let directory = root.path().join("instances").join(id.as_str());
+        std::fs::write(directory.join("resourcepacks/known.zip.disabled"), b"known").unwrap();
+        let plan = known_pack_plan(&owner, &id).await;
+        let instance = owner.directories.admit(&id).unwrap();
+        let receipt = owner.prepare_install(&instance, &plan, false, &[]).unwrap();
+        assert_eq!(
+            receipt.adopted,
+            vec!["resourcepacks/known.zip.disabled".to_string()]
+        );
+        owner.persist_receipt(&receipt).unwrap();
+        owner
+            .apply(instance, receipt, HashMap::new(), &CancellationToken::new())
+            .await
+            .unwrap();
+        let installed = owner.installed(&id).unwrap();
+        assert!(
+            !installed
+                .find(&CanonicalId("modrinth:known".into()))
+                .unwrap()
+                .enabled()
+        );
+        assert!(!directory.join("resourcepacks/known.zip").exists());
+    }
+
+    #[tokio::test]
+    async fn selected_pack_member_updates_the_same_project_at_another_version() {
+        let (root, owner, id) = fixture().await;
+        let directory = root.path().join("instances").join(id.as_str());
+        let member_id = CanonicalId("modrinth:known".into());
+        let mut before = ContentManifest::default();
+        before
+            .try_upsert(
+                ManifestEntry::managed(
+                    member_id.clone(),
+                    ProviderId::Modrinth,
+                    "known".into(),
+                    "known-v0".into(),
+                    ContentKind::ResourcePack,
+                    &FileRef {
+                        filename: "known-old.zip".into(),
+                        url: "https://cdn.example.com/known-old.zip".into(),
+                        size: Some(3),
+                        sha512: Some(Proof::bytes(b"old").sha512),
+                        sha1: None,
+                        primary: true,
+                    },
+                    Vec::new(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        std::fs::write(
+            directory.join(MANIFEST_FILE),
+            before.encode_managed().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("resourcepacks/known-old.zip"), b"old").unwrap();
+        let installed = HashMap::from([(member_id.clone(), "known-v0".to_string())]);
+        let plan = selected_pack_plan(&owner, &id, false, &installed)
+            .await
+            .unwrap();
+        let selected = &plan.resolution().items[0];
+        assert!(selected.already_installed && selected.update);
+        let instance = owner.directories.admit(&id).unwrap();
+        let receipt = owner.prepare_install(&instance, &plan, false, &[]).unwrap();
+        owner.persist_receipt(&receipt).unwrap();
+        owner
+            .apply(
+                instance,
+                receipt,
+                HashMap::from([("resourcepacks/chosen.zip".into(), b"known".to_vec())]),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!directory.join("resourcepacks/known-old.zip").exists());
+        assert_eq!(
+            std::fs::read(directory.join("resourcepacks/chosen.zip")).unwrap(),
+            b"known"
+        );
+        let installed = owner.installed(&id).unwrap();
+        assert_eq!(installed.find(&member_id).unwrap().version_id(), "known-v1");
+        assert!(!owner.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn local_modpack_file_resolves_only_to_its_published_provider_version() {
+        let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "modrinth.index.json",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer
+            .write_all(
+                &serde_json::to_vec(&serde_json::json!({"name":"Fixture pack",
+                    "dependencies":{"minecraft":"1.21.4", "fabric-loader":"0.16.10"}, "files":[]}))
+                .unwrap(),
+            )
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let archive = super::super::packs::PackArchive::read(bytes.clone()).unwrap();
+        let hash = Proof::bytes(&bytes).sha512;
+        let version = serde_json::json!({
+            "project_id":"fixture-pack", "id":"pack-v1", "name":"Pack v1", "version_number":"1",
+            "version_type":"release", "loaders":["fabric"], "game_versions":["1.21.4"],
+            "files":[{"filename":"fixture.mrpack", "url":"https://cdn.example.com/fixture.mrpack",
+                "size":bytes.len(), "primary":true, "hashes":{"sha512":hash}}],
+            "dependencies":[],
+        });
+        let (service, provider) = metadata_provider(vec![
+            serde_json::json!({hash.clone(): version.clone()}).to_string(),
+            serde_json::json!({"id":"fixture-pack", "title":"Fixture pack", "project_type":"modpack"})
+                .to_string(),
+            serde_json::json!([version]).to_string(),
+        ])
+        .await;
+        let target = crate::instances::from_pack::modpack_file_target(&service, bytes.clone())
+            .await
+            .unwrap();
+        provider.await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&target).unwrap(),
+            serde_json::to_value(crate::instances::from_pack::target_from_pack_index(
+                CanonicalId("modrinth:fixture-pack".into()),
+                "pack-v1".into(),
+                "Fixture pack".into(),
+                archive.index(),
+            ))
+            .unwrap()
+        );
+        assert_eq!(target.loader.as_deref(), Some("fabric"));
+
+        let (service, provider) = metadata_provider(vec!["{}".into()]).await;
+        assert!(matches!(
+            crate::instances::from_pack::modpack_file_target(&service, bytes).await,
+            Err(super::super::packs::PackError::Unpublished)
+        ));
+        provider.await.unwrap();
+        // A jar is not a pack; it is refused before any provider request.
+        let (service, provider) = metadata_provider(Vec::new()).await;
+        let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        writer
+            .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        assert!(matches!(
+            crate::instances::from_pack::modpack_file_target(
+                &service,
+                writer.finish().unwrap().into_inner()
+            )
+            .await,
+            Err(super::super::packs::PackError::Unsupported)
+        ));
+        provider.await.unwrap();
+    }
+
     #[tokio::test]
     async fn selected_pack_member_refuses_an_unselected_dependency() {
         let (_root, owner, id) = fixture().await;
         assert!(matches!(
-            selected_pack_plan(&owner, &id, true).await,
+            selected_pack_plan(&owner, &id, true, &HashMap::new()).await,
             Err(MutationError::Pack(
                 super::super::packs::PackError::SelectionChanged
             ))
@@ -3977,6 +4701,7 @@ mod tests {
         owner: &ContentMutations,
         id: &InstanceId,
         requires_dependency: bool,
+        installed: &HashMap<CanonicalId, String>,
     ) -> Result<TargetedPlan, MutationError> {
         let hash = Proof::bytes(b"known").sha512;
         let published_file = |name: &str, bytes: &[u8], primary: bool| {
@@ -4027,13 +4752,19 @@ mod tests {
             &[("overrides/config/settings.txt", b"must not copy")],
         );
         let target = super::super::resolve::validated_target("vanilla", "1.21.4").unwrap();
-        let preview = super::super::packs::preview_files(&service, pack, &target, &[])
+        let preview = super::super::packs::preview_files(&service, pack, &target, &[], installed)
             .await
             .unwrap();
         let shown = preview.snapshot();
         assert_eq!(shown.files.len(), 1);
         assert!(
             shown.files[0].identified && shown.files[0].compatible && !shown.files[0].installed
+        );
+        assert_eq!(
+            serde_json::to_value(&shown.files[0]).unwrap()["installed_version_id"].as_str(),
+            installed
+                .get(&CanonicalId("modrinth:known".into()))
+                .map(String::as_str)
         );
         let selection = preview
             .select(&[shown.files[0].selection_id.clone()])

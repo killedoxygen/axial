@@ -120,6 +120,9 @@ pub enum InstallQueueContentActionRequest {
         selections: Vec<InstallQueueContentSelection>,
         #[serde(default)]
         allow_incompatible: bool,
+        /// Untracked destination files the person chose to replace.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replace_files: Vec<String>,
     },
     Uninstall {
         canonical_ids: Vec<String>,

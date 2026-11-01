@@ -2414,6 +2414,7 @@ impl InstallQueue {
                 InstallQueueContentActionRequest::Install {
                     selections,
                     allow_incompatible,
+                    replace_files,
                 } => {
                     let admitted = mutations
                         .directories()
@@ -2425,7 +2426,7 @@ impl InstallQueue {
                     let plan = mutations
                         .plan_admitted(&service, &admitted, &selections)
                         .await?;
-                    mutations.install_admitted(admitted, plan, allow_incompatible)?
+                    mutations.install_admitted(admitted, plan, allow_incompatible, replace_files)?
                 }
                 InstallQueueContentActionRequest::Uninstall { canonical_ids } => mutations
                     .remove_many(
@@ -3336,9 +3337,15 @@ fn validate_content_request(
         return Err(InstallError::InvalidRequest);
     }
     let valid = match action {
-        InstallQueueContentActionRequest::Install { selections, .. } => {
+        InstallQueueContentActionRequest::Install {
+            selections,
+            replace_files,
+            ..
+        } => {
             !selections.is_empty()
                 && selections.len() <= 256
+                && replace_files.len() <= 256
+                && replace_files.iter().all(|path| text(path, 512))
                 && selections.iter().all(|selection| {
                     selection.kind != ContentKind::Modpack
                         && canonical(&selection.canonical_id)

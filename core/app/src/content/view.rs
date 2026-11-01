@@ -6,7 +6,7 @@ use super::{
     provenance::{ContentManifest, LiveManagedContent},
     resolve::{
         self, ContentResolution, ResolutionConflictKind, ResolutionConflictReason, ResolutionError,
-        ResolutionReason, ResolutionSelection, ResolutionTarget,
+        ResolutionReason, ResolutionSelection, ResolutionTarget, TargetedPlan,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,18 @@ pub struct PlanItem {
     pub reason: ResolutionReason,
     pub already_installed: bool,
     pub update: bool,
+    /// An untracked file already at this destination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub existing_file: Option<ExistingFileState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExistingFileState {
+    /// Same bytes as the planned file; it is adopted without downloading.
+    Identical,
+    /// Different bytes; installing requires replacing it.
+    Different,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -52,6 +64,9 @@ pub struct PlanConflict {
     pub canonical_id: Option<CanonicalId>,
     pub kind: ResolutionConflictKind,
     pub detail: String,
+    /// Instance-relative file a replacement decision names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -98,6 +113,7 @@ pub fn into_plan(
                 reason: item.reason,
                 already_installed: item.already_installed,
                 update: item.update,
+                existing_file: None,
             })
             .collect(),
         conflicts: resolution
@@ -127,9 +143,46 @@ pub fn into_plan(
                     }
                 }
                 .into(),
+                path: None,
             })
             .collect(),
     }
+}
+
+/// An instance plan also reports untracked files at its destinations: equal
+/// bytes are adopted, different bytes need an explicit replacement choice.
+pub fn into_instance_plan(plan: &TargetedPlan, instance_id: String) -> ResolutionPlan {
+    let mut view = into_plan(plan.resolution(), Some(instance_id), plan.state().target());
+    for existing in plan.existing_files() {
+        let Some(item) = view
+            .items
+            .iter_mut()
+            .find(|item| item.canonical_id == existing.canonical_id)
+        else {
+            continue;
+        };
+        if existing.identical {
+            if item.existing_file.is_none() {
+                item.existing_file = Some(ExistingFileState::Identical);
+                view.total_download_bytes = view
+                    .total_download_bytes
+                    .saturating_sub(item.size.unwrap_or(0));
+            }
+            continue;
+        }
+        item.existing_file = Some(ExistingFileState::Different);
+        let (folder, name) = existing
+            .path
+            .rsplit_once('/')
+            .unwrap_or(("", existing.path.as_str()));
+        view.conflicts.push(PlanConflict {
+            canonical_id: Some(existing.canonical_id.clone()),
+            kind: ResolutionConflictKind::ExistingFile,
+            detail: format!("A different {name} is already in the {folder} folder."),
+            path: Some(existing.path.clone()),
+        });
+    }
+    view
 }
 
 pub async fn preview_draft(

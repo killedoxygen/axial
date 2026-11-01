@@ -13,6 +13,9 @@ use ts_rs::TS;
 
 pub const MOD_SCAN_MAX_ENTRIES: usize = 50_000;
 pub const MOD_SCAN_MAX_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+/// Per-file bound for imported jars; the request body is held in memory.
+pub const MOD_IMPORT_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const MOD_IMPORT_MAX_FILES: usize = 64;
 
 /// The retained resource-list wire shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -45,6 +48,68 @@ pub struct UpdateModResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct DeleteModResponse {
     pub status: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+pub struct ModImportResponse {
+    /// Filenames added to the instance's mods folder.
+    pub imported: Vec<String>,
+}
+
+/// Import refusals name the person's own file; they never contain native paths.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ModImportError {
+    #[error("Choose between 1 and {MOD_IMPORT_MAX_FILES} mod files.")]
+    Count,
+    #[error("Only .jar files can be added as mods.")]
+    NotJar,
+    #[error("{0} is not a readable mod archive.")]
+    InvalidArchive(String),
+    #[error("{0} is larger than the 64 MB import limit.")]
+    TooLarge(String),
+    #[error("{0} was chosen more than once.")]
+    Repeated(String),
+    #[error("{0} is already in this instance.")]
+    Duplicate(String),
+    #[error("Another launch or content operation is using this instance.")]
+    Busy,
+    #[error("Mod changes require settlement before another operation can proceed.")]
+    Pending,
+    #[error("Mod files changed; refresh and try again.")]
+    Changed,
+    #[error("Could not add mod files; check instance folder permissions and try again.")]
+    Files,
+}
+
+impl ModImportError {
+    pub fn status_code(&self) -> u16 {
+        match self {
+            Self::Count | Self::NotJar | Self::InvalidArchive(_) => 400,
+            Self::TooLarge(_) => 413,
+            Self::Repeated(_) | Self::Duplicate(_) | Self::Busy | Self::Pending | Self::Changed => {
+                409
+            }
+            Self::Files => 500,
+        }
+    }
+}
+
+/// An enabled `.jar` selector whose bytes are a readable zip archive.
+pub fn validate_import(name: &str, bytes: &[u8]) -> Result<PortableFileName, ModImportError> {
+    let portable = listed_mod_name(name)
+        .filter(|name| name.key().as_str().ends_with(".jar"))
+        .filter(|name| !managed_content_name_is_reserved(name))
+        .ok_or(ModImportError::NotJar)?;
+    let shown = || portable.as_str().to_string();
+    if bytes.len() > MOD_IMPORT_MAX_BYTES {
+        return Err(ModImportError::TooLarge(shown()));
+    }
+    let readable =
+        zip::ZipArchive::new(io::Cursor::new(bytes)).is_ok_and(|archive| !archive.is_empty());
+    if !readable {
+        return Err(ModImportError::InvalidArchive(shown()));
+    }
+    Ok(portable)
 }
 
 /// Public failures contain no native paths or provider diagnostic text.
