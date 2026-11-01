@@ -1,7 +1,9 @@
 //! User-owned instance resources. File selectors never confer root authority.
 
 pub mod folders;
+pub mod metadata;
 pub mod mods;
+pub mod packs;
 pub mod screenshots;
 mod service;
 pub mod worlds;

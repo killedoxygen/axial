@@ -1,6 +1,6 @@
 //! Registered-instance resource commands and retained native effect ownership.
 
-use super::{mods, screenshots, worlds};
+use super::{metadata, mods, packs, screenshots, worlds};
 use crate::{
     content::install::{ContentMutations, MutationError},
     files::{PortableName, ScopedDirectory},
@@ -27,7 +27,7 @@ pub enum ResourceError {
     Busy,
     #[error("resource exceeds safe filesystem limits")]
     Limit,
-    #[error("managed mods must be removed through content operations")]
+    #[error("managed content must be removed through content operations")]
     Managed,
     #[error("resource files could not be read or updated")]
     Files,
@@ -220,6 +220,73 @@ impl ResourceService {
             .validate_current()
             .map_err(|_| ResourceError::Busy)?;
         Ok(media)
+    }
+
+    /// Display metadata for listed mod jars. Unreadable jars are undescribed.
+    pub fn mod_metadata(
+        &self,
+        id: &InstanceId,
+    ) -> Result<Vec<mods::InstanceModMetadata>, ResourceError> {
+        self.read_list(id, |game| {
+            let listed = mods::list_mods(game).map_err(|_| ResourceError::Files)?;
+            if listed.is_empty() {
+                return Ok(Vec::new());
+            }
+            let folder = child(game, "mods")?;
+            let mut budget = metadata::ReadBudget::listing();
+            Ok(listed
+                .into_iter()
+                .map(|listed| {
+                    let metadata = portable(&listed.name)
+                        .ok()
+                        .and_then(|name| folder.open_file(&name).ok())
+                        .map(|file| {
+                            metadata::archive_metadata(
+                                &file,
+                                metadata::ArchiveKind::Mod,
+                                &mut budget,
+                            )
+                        })
+                        .unwrap_or_default();
+                    mods::InstanceModMetadata {
+                        name: listed.name,
+                        metadata,
+                    }
+                })
+                .collect())
+        })
+    }
+
+    pub fn mod_icon(&self, id: &InstanceId, name: &str) -> Result<Vec<u8>, ResourceError> {
+        mods::validate_mod_filename(name).map_err(|_| ResourceError::InvalidName)?;
+        let name = portable(name)?;
+        self.read_list(id, |game| {
+            let file = child(game, "mods")?.open_file(&name).map_err(read_error)?;
+            metadata::archive_icon(&file, metadata::ArchiveKind::Mod).ok_or(ResourceError::NotFound)
+        })
+    }
+
+    pub fn packs(
+        &self,
+        id: &InstanceId,
+        folder: packs::PackFolder,
+    ) -> Result<Vec<packs::InstancePackInfo>, ResourceError> {
+        self.read_list(id, |game| packs::list_packs(game, folder))
+    }
+
+    pub fn pack_icon(&self, id: &InstanceId, name: &str) -> Result<Vec<u8>, ResourceError> {
+        self.read_list(id, |game| packs::pack_icon(game, name))
+    }
+
+    /// Deletes an unmanaged pack archive; managed packs leave through content operations.
+    pub fn delete_pack(
+        &self,
+        id: &InstanceId,
+        folder: packs::PackFolder,
+        name: &str,
+    ) -> Result<TaskHandle<Result<ResourceCommand, ResourceError>>, ResourceError> {
+        let name = packs::archive_name(name)?;
+        self.delete_file(id, folder.directory(), name)
     }
 
     pub fn world_icon(
@@ -455,14 +522,28 @@ impl ResourceService {
                         return Ok(ResourceCommand::ok(None));
                     }
                 }
+                if let Some(kind) = managed_kind(folder) {
+                    let (manifest, _, _) =
+                        crate::content::install::observe(instance.game_directory())
+                            .map_err(|_| ResourceError::Busy)?;
+                    let key = crate::files::portable::managed_content_name_key(&name);
+                    if manifest.entries().iter().any(|entry| {
+                        entry.kind() == kind
+                            && entry
+                                .managed_filename()
+                                .is_some_and(|filename| filename.key() == key)
+                    }) {
+                        return Err(ResourceError::Managed);
+                    }
+                }
                 let parent = child(instance.game_directory(), folder)?;
                 let file = parent.open_file(&name).map_err(read_error)?;
                 let revision = file.revision().map_err(read_error)?;
                 let mut reader = file
-                    .reader(if folder == "mods" {
-                        512 * 1024 * 1024
-                    } else {
+                    .reader(if folder == "screenshots" {
                         screenshots::SCREENSHOT_FILE_MAX_BYTES
+                    } else {
+                        512 * 1024 * 1024
                     })
                     .map_err(read_error)?;
                 let mut digest = Sha256::new();
@@ -699,6 +780,15 @@ impl ResourceService {
     }
 }
 
+fn managed_kind(folder: &str) -> Option<crate::content::model::ContentKind> {
+    [
+        packs::PackFolder::ResourcePacks,
+        packs::PackFolder::ShaderPacks,
+    ]
+    .into_iter()
+    .find(|pack| pack.directory() == folder)
+    .map(packs::PackFolder::content_kind)
+}
 fn portable(name: &str) -> Result<PortableName, ResourceError> {
     PortableName::new_exact(name).map_err(|_| ResourceError::InvalidName)
 }
@@ -980,6 +1070,78 @@ mod tests {
         assert_eq!(
             std::fs::read(game.join(crate::content::provenance::MANIFEST_FILE)).unwrap(),
             raw
+        );
+        assert!(!service.has_unsettled_effects());
+    }
+
+    #[tokio::test]
+    async fn pack_deletion_removes_local_archives_and_refuses_recorded_packs() {
+        use crate::content::{
+            model::{CanonicalId, ContentKind, ProviderId},
+            provenance::{MANIFEST_FILE, ManagedContentFileName, ManifestEntry},
+        };
+        let (root, service, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        let packs = game.join("resourcepacks");
+        std::fs::create_dir_all(&packs).unwrap();
+        std::fs::write(packs.join("recorded.zip"), b"managed").unwrap();
+        std::fs::write(packs.join("local.zip"), b"local").unwrap();
+        let mut manifest = ContentManifest::default();
+        manifest
+            .try_upsert(
+                ManifestEntry::managed_file(
+                    CanonicalId::for_project(ProviderId::Modrinth, "recorded"),
+                    ProviderId::Modrinth,
+                    "recorded".into(),
+                    "v1".into(),
+                    ContentKind::ResourcePack,
+                    ManagedContentFileName::new_exact("recorded.zip").unwrap(),
+                    Some(format!("{:x}", sha2::Sha512::digest(b"managed"))),
+                    Some(7),
+                    vec![],
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let raw = manifest.encode_managed().unwrap();
+        std::fs::write(game.join(MANIFEST_FILE), &raw).unwrap();
+
+        let folder = packs::PackFolder::ResourcePacks;
+        assert!(matches!(
+            service
+                .delete_pack(&id, folder, "recorded.zip")
+                .unwrap()
+                .join()
+                .await
+                .unwrap(),
+            Err(ResourceError::Managed)
+        ));
+        assert!(matches!(
+            service.delete_pack(&id, folder, "notes.txt"),
+            Err(ResourceError::InvalidName)
+        ));
+        service
+            .delete_pack(&id, folder, "local.zip")
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!packs.join("local.zip").exists());
+        assert_eq!(
+            std::fs::read(packs.join("recorded.zip")).unwrap(),
+            b"managed"
+        );
+        assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).unwrap(), raw);
+        assert_eq!(
+            service
+                .packs(&id, folder)
+                .unwrap()
+                .iter()
+                .map(|pack| pack.name.as_str())
+                .collect::<Vec<_>>(),
+            ["recorded.zip"]
         );
         assert!(!service.has_unsettled_effects());
     }

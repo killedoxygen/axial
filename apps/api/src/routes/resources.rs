@@ -5,7 +5,8 @@ use axial_app::{
     resources::{
         InstanceLogInfo, ResourceCommand, ResourceError, ResourceService,
         folders::{FolderError, FolderService},
-        mods::{InstanceModInfo, UpdateModRequest},
+        mods::{InstanceModInfo, InstanceModMetadata, UpdateModRequest},
+        packs::{InstancePackInfo, PackFolder},
         screenshots::{InstanceScreenshotInfo, RenameScreenshotRequest},
         worlds::{InstanceWorldInfo, RenameWorldRequest},
     },
@@ -29,6 +30,22 @@ pub fn router(state: Arc<ResourceService>) -> Router {
     Router::new()
         .route("/api/v1/instances/{id}/resources", get(resources))
         .route("/api/v1/instances/{id}/mods", get(mods))
+        .route("/api/v1/instances/{id}/mods/metadata", get(mod_metadata))
+        .route("/api/v1/instances/{id}/mods/{name}/icon", get(mod_icon))
+        .route("/api/v1/instances/{id}/resourcepacks", get(resource_packs))
+        .route(
+            "/api/v1/instances/{id}/resourcepacks/{name}",
+            axum::routing::delete(delete_resource_pack),
+        )
+        .route(
+            "/api/v1/instances/{id}/resourcepacks/{name}/icon",
+            get(resource_pack_icon),
+        )
+        .route("/api/v1/instances/{id}/shaderpacks", get(shader_packs))
+        .route(
+            "/api/v1/instances/{id}/shaderpacks/{name}",
+            axum::routing::delete(delete_shader_pack),
+        )
         .route("/api/v1/instances/{id}/worlds", get(worlds))
         .route("/api/v1/instances/{id}/screenshots", get(screenshots))
         .route("/api/v1/instances/{id}/logs", get(logs))
@@ -140,6 +157,83 @@ async fn mods(
         .map_err(|_| error(ResourceError::Files))?
         .map(Json)
         .map_err(error)
+}
+async fn mod_metadata(
+    State(state): State<Arc<ResourceService>>,
+    Path(raw): Path<String>,
+) -> Result<Json<Vec<InstanceModMetadata>>, Error> {
+    let id = id(&raw)?;
+    tokio::task::spawn_blocking(move || state.mod_metadata(&id))
+        .await
+        .map_err(|_| error(ResourceError::Files))?
+        .map(Json)
+        .map_err(error)
+}
+async fn mod_icon(
+    State(state): State<Arc<ResourceService>>,
+    Path((raw, name)): Path<(String, String)>,
+) -> Result<Response, Error> {
+    let id = id(&raw)?;
+    png(tokio::task::spawn_blocking(move || state.mod_icon(&id, &name)).await)
+}
+async fn resource_packs(
+    State(state): State<Arc<ResourceService>>,
+    Path(raw): Path<String>,
+) -> Result<Json<Vec<InstancePackInfo>>, Error> {
+    packs(state, &raw, PackFolder::ResourcePacks).await
+}
+async fn shader_packs(
+    State(state): State<Arc<ResourceService>>,
+    Path(raw): Path<String>,
+) -> Result<Json<Vec<InstancePackInfo>>, Error> {
+    packs(state, &raw, PackFolder::ShaderPacks).await
+}
+async fn packs(
+    state: Arc<ResourceService>,
+    raw: &str,
+    folder: PackFolder,
+) -> Result<Json<Vec<InstancePackInfo>>, Error> {
+    let id = id(raw)?;
+    tokio::task::spawn_blocking(move || state.packs(&id, folder))
+        .await
+        .map_err(|_| error(ResourceError::Files))?
+        .map(Json)
+        .map_err(error)
+}
+async fn resource_pack_icon(
+    State(state): State<Arc<ResourceService>>,
+    Path((raw, name)): Path<(String, String)>,
+) -> Result<Response, Error> {
+    let id = id(&raw)?;
+    png(tokio::task::spawn_blocking(move || state.pack_icon(&id, &name)).await)
+}
+async fn delete_resource_pack(
+    State(state): State<Arc<ResourceService>>,
+    Path((raw, name)): Path<(String, String)>,
+) -> Result<Json<ResourceCommand>, Error> {
+    command(state.delete_pack(&id(&raw)?, PackFolder::ResourcePacks, &name)).await
+}
+async fn delete_shader_pack(
+    State(state): State<Arc<ResourceService>>,
+    Path((raw, name)): Path<(String, String)>,
+) -> Result<Json<ResourceCommand>, Error> {
+    command(state.delete_pack(&id(&raw)?, PackFolder::ShaderPacks, &name)).await
+}
+fn png(
+    result: Result<Result<Vec<u8>, ResourceError>, tokio::task::JoinError>,
+) -> Result<Response, Error> {
+    let bytes = result
+        .map_err(|_| error(ResourceError::Files))?
+        .map_err(error)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 async fn worlds(
     State(state): State<Arc<ResourceService>>,

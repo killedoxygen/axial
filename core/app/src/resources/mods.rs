@@ -24,6 +24,12 @@ pub struct InstanceModInfo {
     pub enabled: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+pub struct InstanceModMetadata {
+    pub name: String,
+    pub metadata: super::metadata::ContentFileMetadata,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct UpdateModRequest {
     pub enabled: bool,
