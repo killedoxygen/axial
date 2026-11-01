@@ -599,7 +599,7 @@ impl LaunchCoordinator {
             })(),
             host: Arc::new(super::resources::capture_host()),
             diagnostics: false,
-            inspection: Inspection::Integrity,
+            inspection: Inspection::Reverified,
             installs: self.installs.clone(),
         }
     }

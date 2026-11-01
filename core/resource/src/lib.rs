@@ -313,10 +313,60 @@ impl PhysicalWorkOwner {
     where
         Work: FnOnce() -> T,
     {
+        self.try_run_inline_parallel(request, |_| work())
+    }
+
+    /// Runs `work` on the calling thread with the admitted workers available
+    /// to its scoped jobs.
+    pub fn try_run_inline_parallel<T, Work>(
+        &self,
+        request: PhysicalWorkRequest,
+        work: Work,
+    ) -> Result<T, PhysicalWorkError>
+    where
+        Work: FnOnce(&PhysicalWorkParallelism) -> T,
+    {
         let admission = self.try_admit(request)?;
         let _running = RunningWorker::new(&admission);
+        let parallelism = PhysicalWorkParallelism {
+            workers: admission.parallelism,
+            _not_send: std::marker::PhantomData,
+        };
         let _admission = admission;
-        Ok(work())
+        Ok(work(&parallelism))
+    }
+
+    /// Runs `job` over contiguous ranges covering `0..len` on up to
+    /// `max_workers` foreground workers available now, or as one range on the
+    /// calling thread, and returns the results in range order. A job may run
+    /// again inline after a worker fails, so it must not apply effects.
+    pub fn run_ranges<T, Job>(
+        &self,
+        io: PhysicalIoClass,
+        len: usize,
+        max_workers: usize,
+        job: Job,
+    ) -> Vec<T>
+    where
+        T: Send,
+        Job: Fn(std::ops::Range<usize>) -> T + Sync,
+    {
+        for workers in (2..=max_workers.min(len)).rev() {
+            let span = len.div_ceil(workers);
+            let job = &job;
+            let jobs = (0..workers)
+                .map(|index| move || job(index * span..((index + 1) * span).min(len)))
+                .collect();
+            match self.try_run_inline_parallel(
+                PhysicalWorkRequest::foreground_parallel(io, 0, workers),
+                |parallelism| parallelism.run_scoped(jobs),
+            ) {
+                Ok(Ok(results)) => return results,
+                Err(PhysicalWorkError::Unavailable | PhysicalWorkError::WorkerLimit) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        vec![job(0..len)]
     }
 
     fn try_admit(
@@ -1068,6 +1118,61 @@ mod tests {
         assert_eq!(snapshot.active_admissions, 0);
         assert_eq!(snapshot.running_workers, 0);
         assert_eq!(snapshot.available_workers, 3);
+    }
+
+    #[test]
+    fn inline_parallel_work_lends_every_admitted_worker() {
+        let owner = test_owner();
+        let observed_owner = owner.clone();
+        let results = owner
+            .try_run_inline_parallel(
+                PhysicalWorkRequest::foreground_parallel(PhysicalIoClass::Read, 0, 3),
+                move |parallelism| {
+                    assert_eq!(parallelism.workers(), 3);
+                    let snapshot = observed_owner.snapshot(PhysicalWorkClass::Foreground);
+                    assert_eq!(snapshot.running_workers, 3);
+                    assert_eq!(
+                        observed_owner.try_run_inline(
+                            PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
+                            || (),
+                        ),
+                        Err(PhysicalWorkError::Unavailable)
+                    );
+                    parallelism.run_scoped((0..3).map(|index| move || index).collect())
+                },
+            )
+            .expect("inline parallel admission")
+            .expect("scoped jobs");
+        assert_eq!(results, vec![0, 1, 2]);
+        let snapshot = owner.snapshot(PhysicalWorkClass::Foreground);
+        assert_eq!(snapshot.running_workers, 0);
+        assert_eq!(snapshot.available_workers, 3);
+    }
+
+    #[test]
+    fn ranges_cover_inputs_in_order_and_fall_back_inline_without_workers() {
+        let owner = test_owner();
+        let ranges = owner.run_ranges(PhysicalIoClass::Read, 10, 4, |range| range);
+        assert_eq!(ranges, vec![0..4, 4..8, 8..10]);
+        let held = owner
+            .try_admit(PhysicalWorkRequest::foreground_parallel(
+                PhysicalIoClass::Read,
+                0,
+                2,
+            ))
+            .expect("held workers");
+        let inline = std::thread::current().id();
+        let ranges = owner.run_ranges(PhysicalIoClass::Read, 10, 4, |range| {
+            (range, std::thread::current().id() == inline)
+        });
+        drop(held);
+        assert_eq!(ranges, vec![(0..10, true)]);
+        assert_eq!(
+            owner
+                .snapshot(PhysicalWorkClass::Foreground)
+                .available_workers,
+            3
+        );
     }
 
     #[tokio::test]

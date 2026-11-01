@@ -32,6 +32,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::ControlFlow;
 #[cfg(unix)]
 use std::path::Component;
 use std::path::Path;
@@ -851,6 +852,7 @@ impl FileMoveObligation {
             &self.destination_name,
             self.reported_success,
             &mut self.token,
+            true,
         ) {
             Ok((true, file)) => FileMoveResolution::Applied(file),
             Ok((false, file)) => FileMoveResolution::NoEffect(file),
@@ -2770,9 +2772,16 @@ thread_local! {
         const { Cell::new(None) };
 }
 
-/// Retained directories validated during one observation window. Bounded so a
-/// window cannot pin unbounded handles; overflow confirms and evicts the cache.
-const MAX_OBSERVATION_WINDOW_DIRECTORIES: usize = 64;
+/// Directories retained by every thread's observation windows together, so
+/// concurrent windows cannot multiply pinned handles; overflow confirms and
+/// evicts the overflowing window's cache. Sized below a 128-descriptor limit
+/// with room for each concurrent window's own root ancestry.
+const MAX_OBSERVATION_WINDOW_DIRECTORIES: usize = 40;
+static WINDOW_RETAINED_DIRECTORIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Exact file bindings an observation window remembers; overflow confirms
+/// and forgets the remembered bindings.
+const MAX_OBSERVATION_WINDOW_FILES: usize = 256;
 /// Concurrently open windows per thread, one per authority. Further nested
 /// observations of other authorities keep per-entry validation.
 const MAX_OBSERVATION_WINDOW_AUTHORITIES: usize = 4;
@@ -2786,8 +2795,13 @@ thread_local! {
 /// again after that observation: when the window closes, when it overflows and
 /// before any non-observation entry. A cached directory is therefore never
 /// relied on for an effect or a returned result without later revalidation.
+/// A batch window also admits file effects as observations; see
+/// [`Directory::batch_validated`]. Exact file bindings observed in the window
+/// are remembered too; they are validated again at close, and before any
+/// effect entry, which then forgets them because effects may rebind files.
 struct ObservationWindow {
     authority: usize,
+    batch: bool,
     /// Lease and root were validated since the window opened or was confirmed.
     root_validated: bool,
     /// An observation relied on the window since it opened or was confirmed.
@@ -2795,13 +2809,66 @@ struct ObservationWindow {
     /// A confirmation refused; the window closes with an error.
     failed: bool,
     /// Ancestor-closed: each entry's parent is cached too, or it has none.
-    directories: Vec<ObservedDirectory>,
+    directories: WindowDirectories,
+    files: Vec<ObservedFile>,
+    /// Live effect operations, during which no file binding is remembered.
+    effects: usize,
+}
+
+struct ObservedFile {
+    parent: Arc<DirectoryInner>,
+    name: LeafName,
+    identity: platform::Identity,
+    /// Relied on since it was last validated.
+    observed: bool,
 }
 
 struct ObservedDirectory {
     directory: Arc<DirectoryInner>,
     /// Relied on since the last confirmation, so it must be validated again.
     observed: bool,
+}
+
+/// A window's cached directories, charged to the process-wide budget.
+#[derive(Default)]
+struct WindowDirectories(Vec<ObservedDirectory>);
+
+impl WindowDirectories {
+    /// Caches every directory, or none when the budget lacks room for all.
+    fn try_extend(&mut self, directories: &mut Vec<ObservedDirectory>) -> bool {
+        let count = directories.len();
+        let reserved = WINDOW_RETAINED_DIRECTORIES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
+                retained
+                    .checked_add(count)
+                    .filter(|total| *total <= MAX_OBSERVATION_WINDOW_DIRECTORIES)
+            })
+            .is_ok();
+        if reserved {
+            self.0.append(directories);
+        }
+        reserved
+    }
+}
+
+impl std::ops::Deref for WindowDirectories {
+    type Target = [ObservedDirectory];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for WindowDirectories {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for WindowDirectories {
+    fn drop(&mut self) {
+        WINDOW_RETAINED_DIRECTORIES.fetch_sub(self.0.len(), Ordering::AcqRel);
+    }
 }
 
 impl ObservationWindow {
@@ -2880,20 +2947,25 @@ fn confirm_observation_window(
     authority: &Arc<CapabilityAuthority>,
     discard: bool,
 ) -> io::Result<()> {
-    let Some((observed, discarded)) = with_observation_window(authority, |window| {
+    let Some((observed, discarded, files)) = with_observation_window(authority, |window| {
         let observed = window.take_observed();
         window.root_validated = !discard;
-        let discarded = if discard {
-            std::mem::take(&mut window.directories)
+        // Discarding the directory cache also forgets the file bindings under it.
+        let (discarded, files) = if discard {
+            (
+                std::mem::take(&mut window.directories),
+                std::mem::take(&mut window.files),
+            )
         } else {
-            Vec::new()
+            (WindowDirectories::default(), Vec::new())
         };
-        (observed, discarded)
+        (observed, discarded, files)
     }) else {
         return Ok(());
     };
     drop(discarded);
     validate_window_directories(authority, &observed)
+        .and_then(|()| validate_window_files(files.iter().filter(|file| file.observed)))
         .inspect_err(|_| fail_observation_window(authority))
 }
 
@@ -2903,6 +2975,43 @@ fn fail_observation_window(authority: &Arc<CapabilityAuthority>) {
         window.failed = true;
         window.root_validated = false;
     });
+}
+
+/// Counts a non-observation operation in this thread's window, if any.
+fn note_window_effect(authority: &Arc<CapabilityAuthority>) -> bool {
+    with_observation_window(authority, |window| window.effects += 1).is_some()
+}
+
+/// Validates the remembered file bindings the window relied on, then forgets
+/// them all before an effect that may rebind them.
+fn forget_window_files(authority: &Arc<CapabilityAuthority>) -> io::Result<()> {
+    let Some(files) =
+        with_observation_window(authority, |window| std::mem::take(&mut window.files))
+    else {
+        return Ok(());
+    };
+    validate_window_files(files.iter().filter(|file| file.observed))
+}
+
+/// Like [`forget_window_files`] for cleanup that must proceed regardless; a
+/// refusal fails the window instead.
+fn forget_window_files_or_fail(authority: &Arc<CapabilityAuthority>) {
+    if forget_window_files(authority).is_err() {
+        fail_observation_window(authority);
+    }
+}
+
+fn validate_window_files<'a>(files: impl Iterator<Item = &'a ObservedFile>) -> io::Result<()> {
+    for file in files {
+        if !platform::exact_file_binding(
+            file.parent.handle(),
+            file.name.as_os_str(),
+            file.identity,
+        )? {
+            return Err(identity_changed("file capability changed binding"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_window_directories(
@@ -4682,6 +4791,8 @@ struct CapabilityAuthority {
     #[cfg(test)]
     ancestry_steps: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
+    file_binding_checks: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     directory_open_pause: Mutex<Option<DirectoryOpenReservationPause>>,
     #[cfg(test)]
     file_observation_pause: Mutex<Option<FileObservationPause>>,
@@ -5383,7 +5494,14 @@ impl CapabilityAuthority {
     }
 
     fn enter(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
-        let operation = self.admit_operation()?;
+        if with_observation_window(self, |window| window.batch) == Some(true) {
+            forget_window_files(self).inspect_err(|_| fail_observation_window(self))?;
+            let mut operation = self.enter_windowed(false)?;
+            operation.window_effect = note_window_effect(self);
+            return Ok(operation);
+        }
+        let mut operation = self.admit_operation()?;
+        operation.window_effect = note_window_effect(self);
         self.validate_entry(false)?;
         #[cfg(test)]
         self.successful_entries
@@ -5393,7 +5511,8 @@ impl CapabilityAuthority {
 
     /// Enters an effect that may move, park, restore or remove a directory.
     fn enter_directory_rebinding(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
-        let operation = self.admit_operation()?;
+        let mut operation = self.admit_operation()?;
+        operation.window_effect = note_window_effect(self);
         self.validate_entry(true)?;
         #[cfg(test)]
         self.successful_entries
@@ -5405,6 +5524,12 @@ impl CapabilityAuthority {
     /// for this authority, the window's bracketing root and lease validation
     /// replaces the per-entry validation.
     fn enter_observation(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
+        self.enter_windowed(true)
+    }
+
+    /// Enters within this thread's window, if any; only an `observation` may
+    /// remember the exact file bindings it validates.
+    fn enter_windowed(self: &Arc<Self>, observation: bool) -> io::Result<CapabilityOperation> {
         let Some(root_validated) = with_observation_window(self, |window| window.root_validated)
         else {
             return self.enter();
@@ -5419,6 +5544,7 @@ impl CapabilityAuthority {
             window.observed = true;
         });
         operation.windowed = true;
+        operation.remembers_files = observation;
         #[cfg(test)]
         self.successful_entries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5456,6 +5582,8 @@ impl CapabilityAuthority {
         Ok(CapabilityOperation {
             authority: self.clone(),
             windowed: false,
+            remembers_files: false,
+            window_effect: false,
         })
     }
 
@@ -5467,6 +5595,7 @@ impl CapabilityAuthority {
     fn validate_entry(self: &Arc<Self>, rebinding: bool) -> io::Result<()> {
         platform::validate_lease(&self.lease)
             .and_then(|()| platform::validate_root(&self.root))
+            .and_then(|()| forget_window_files(self))
             .and_then(|()| confirm_observation_window(self, rebinding))
             .inspect_err(|_| fail_observation_window(self))
     }
@@ -5501,6 +5630,8 @@ impl CapabilityAuthority {
         let operation = CapabilityOperation {
             authority: self.clone(),
             windowed: false,
+            remembers_files: false,
+            window_effect: note_window_effect(self),
         };
         drop(state);
         self.validate_entry(true)?;
@@ -5522,6 +5653,8 @@ impl CapabilityAuthority {
         let operation = CapabilityOperation {
             authority: self.clone(),
             windowed: false,
+            remembers_files: false,
+            window_effect: note_window_effect(self),
         };
         drop(state);
         self.validate_entry(true)?;
@@ -5713,6 +5846,8 @@ impl CapabilityAuthority {
         let operation = CapabilityOperation {
             authority: self.clone(),
             windowed: false,
+            remembers_files: false,
+            window_effect: note_window_effect(self),
         };
         drop(state);
         self.validate_entry(false)?;
@@ -5746,6 +5881,8 @@ impl CapabilityAuthority {
         let operation = CapabilityOperation {
             authority: self.clone(),
             windowed: false,
+            remembers_files: false,
+            window_effect: note_window_effect(self),
         };
         drop(state);
         self.validate_entry(false)?;
@@ -5778,6 +5915,8 @@ impl CapabilityAuthority {
         let operation = CapabilityOperation {
             authority: self.clone(),
             windowed: false,
+            remembers_files: false,
+            window_effect: note_window_effect(self),
         };
         drop(state);
         self.validate_entry(true)?;
@@ -5811,6 +5950,8 @@ impl CapabilityAuthority {
         let operation = CapabilityOperation {
             authority: self.clone(),
             windowed: false,
+            remembers_files: false,
+            window_effect: note_window_effect(self),
         };
         drop(state);
         self.validate_entry(true)?;
@@ -5846,6 +5987,8 @@ impl CapabilityAuthority {
         let operation = CapabilityOperation {
             authority: self.clone(),
             windowed: false,
+            remembers_files: false,
+            window_effect: note_window_effect(self),
         };
         drop(state);
         self.validate_entry(true)?;
@@ -5912,10 +6055,15 @@ impl CapabilityAuthority {
             .active
             .checked_add(1)
             .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
-        Ok(CapabilityOperation {
+        let operation = CapabilityOperation {
             authority: self.clone(),
             windowed: false,
-        })
+            remembers_files: false,
+            window_effect: note_window_effect(self),
+        };
+        drop(state);
+        forget_window_files_or_fail(self);
+        Ok(operation)
     }
 
     fn has_reset_pending_directory_creates(&self) -> bool {
@@ -7134,9 +7282,12 @@ impl CapabilityAuthority {
                 CapabilityOperation {
                     authority: self.clone(),
                     windowed: false,
+                    remembers_files: false,
+                    window_effect: note_window_effect(self),
                 },
             )
         };
+        forget_window_files_or_fail(self);
         let mut expected_recovery = None;
         let result = platform::validate_lease(&self.lease)
             .and_then(|()| platform::validate_root(&self.root))
@@ -7348,9 +7499,12 @@ impl CapabilityAuthority {
                 CapabilityOperation {
                     authority: self.clone(),
                     windowed: false,
+                    remembers_files: false,
+                    window_effect: note_window_effect(self),
                 },
             )
         };
+        forget_window_files_or_fail(self);
         let result = platform::validate_lease(&self.lease)
             .and_then(|()| platform::validate_root(&self.root))
             .and_then(|()| record.parent.validate(&operation))
@@ -7479,9 +7633,12 @@ impl CapabilityAuthority {
                 CapabilityOperation {
                     authority: self.clone(),
                     windowed: false,
+                    remembers_files: false,
+                    window_effect: note_window_effect(self),
                 },
             )
         };
+        forget_window_files_or_fail(self);
         let result = platform::validate_lease(&self.lease)
             .and_then(|()| platform::validate_root(&self.root))
             .and_then(|()| record.parent.validate(&operation))
@@ -8242,6 +8399,9 @@ impl OperationState {
 struct CapabilityOperation {
     authority: Arc<CapabilityAuthority>,
     windowed: bool,
+    remembers_files: bool,
+    /// Counted in this thread's window as a live effect, which may rebind files.
+    window_effect: bool,
 }
 
 impl Drop for CapabilityOperation {
@@ -8256,6 +8416,19 @@ impl Drop for CapabilityOperation {
             "filesystem capability operation count underflowed"
         );
         state.active -= 1;
+        drop(state);
+        if self.window_effect {
+            let key = Arc::as_ptr(&self.authority) as usize;
+            let _ = OBSERVATION_WINDOWS.try_with(|windows| {
+                if let Some(window) = windows
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|window| window.authority == key)
+                {
+                    window.effects = window.effects.saturating_sub(1);
+                }
+            });
+        }
     }
 }
 
@@ -8457,11 +8630,7 @@ impl AdmittedAbsoluteDirectory {
     }
 
     pub fn filesystem_identity(&self) -> io::Result<DirectoryFilesystemIdentity> {
-        let identity = self.inner.directory.identity()?.filesystem_identity();
-        let authority = self.inner.directory.authority()?;
-        let operation = authority.enter_observation()?;
-        self.inner.directory.validate(&operation)?;
-        Ok(identity)
+        Ok(self.inner.directory.identity()?.filesystem_identity())
     }
 
     pub fn acquire_root_session(&self) -> io::Result<AdmittedRootSessionAcquireOutcome> {
@@ -8834,6 +9003,35 @@ fn validate_recovery_stage_writable(
         ));
     }
     Ok(())
+}
+
+fn stage_has_recovery(
+    authority: &Arc<CapabilityAuthority>,
+    token: &StageToken,
+) -> io::Result<bool> {
+    let state = authority
+        .operations
+        .lock()
+        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+    Ok(state
+        .stages
+        .get(&token.id)
+        .ok_or_else(stale_capability)?
+        .recovery
+        .is_some())
+}
+
+/// Makes staged bytes durable and opens the shared read handle that becomes the
+/// promoted capability, so on-access scanning stays out of serialized promotion.
+fn admit_publication_bytes(file: &FileCapability) -> io::Result<File> {
+    platform::sync_publication_file(&file.handle)?;
+    let handle = platform::open_file(file.parent.inner.handle(), file.name.as_os_str())?;
+    if platform::file_identity(&handle)? != file.identity {
+        return Err(identity_changed(
+            "staged file changed before read capability admission",
+        ));
+    }
+    Ok(handle)
 }
 
 fn seal_recovery_stage(
@@ -10065,57 +10263,64 @@ impl Directory {
                 break;
             }
         }
-        let full = with_observation_window(authority, |window| {
-            window.directories.len() + walked.len() > MAX_OBSERVATION_WINDOW_DIRECTORIES
-        })
-        .unwrap_or(false);
-        if full {
-            // Confirms observations so far, then keeps only the walk's cached
-            // ancestors so the cache stays ancestor-closed and bounded.
-            let mut retained = Vec::new();
-            if cached_ancestor.is_some() {
-                retained.push(current.clone());
-                let mut ancestor = current.parent.as_ref();
-                while let Some(binding) = ancestor {
-                    retained.push(binding.directory.inner.clone());
-                    ancestor = binding.directory.inner.parent.as_ref();
-                }
-            }
-            if retained.len() + walked.len() > MAX_OBSERVATION_WINDOW_DIRECTORIES {
-                return None;
-            }
-            if let Err(error) = platform::validate_lease(&authority.lease)
-                .and_then(|()| platform::validate_root(&authority.root))
-                .and_then(|()| confirm_observation_window(authority, true))
-            {
-                fail_observation_window(authority);
-                return Some(Err(error));
-            }
-            let retained = retained.into_iter().map(|directory| ObservedDirectory {
+        let mut walked: Vec<_> = walked
+            .into_iter()
+            .map(|directory| ObservedDirectory {
                 directory,
                 observed: true,
-            });
-            with_observation_window(authority, |window| {
-                window.root_validated = true;
-                window.observed = true;
-                window.directories.extend(retained);
-            });
-            cached_ancestor = None;
-        }
-        with_observation_window(authority, |window| {
+            })
+            .collect();
+        let cached_walk = with_observation_window(authority, |window| {
+            if !window.directories.try_extend(&mut walked) {
+                return (false, window.directories.is_empty());
+            }
             if let Some(index) = cached_ancestor {
                 window.observe_cached(index);
             }
-            if window.directories.len() + walked.len() <= MAX_OBSERVATION_WINDOW_DIRECTORIES {
-                window
-                    .directories
-                    .extend(walked.into_iter().map(|directory| ObservedDirectory {
-                        directory,
-                        observed: true,
-                    }));
-            }
+            (true, false)
         });
-        Some(Ok(()))
+        match cached_walk {
+            Some((true, _)) => return Some(Ok(())),
+            // Other windows hold the budget; this observation validates fully.
+            Some((false, true)) | None => return None,
+            Some((false, false)) => {}
+        }
+        // Confirms observations so far, then keeps only the walk's cached
+        // ancestors so the cache stays ancestor-closed and bounded.
+        let mut retained = Vec::new();
+        if cached_ancestor.is_some() {
+            retained.push(current.clone());
+            let mut ancestor = current.parent.as_ref();
+            while let Some(binding) = ancestor {
+                retained.push(binding.directory.inner.clone());
+                ancestor = binding.directory.inner.parent.as_ref();
+            }
+        }
+        if retained.len() + walked.len() > MAX_OBSERVATION_WINDOW_DIRECTORIES {
+            return None;
+        }
+        if let Err(error) = platform::validate_lease(&authority.lease)
+            .and_then(|()| platform::validate_root(&authority.root))
+            .and_then(|()| confirm_observation_window(authority, true))
+        {
+            fail_observation_window(authority);
+            return Some(Err(error));
+        }
+        let mut cache: Vec<_> = retained
+            .into_iter()
+            .map(|directory| ObservedDirectory {
+                directory,
+                observed: true,
+            })
+            .chain(walked)
+            .collect();
+        let cached = with_observation_window(authority, |window| {
+            window.root_validated = true;
+            window.observed = true;
+            window.directories.try_extend(&mut cache)
+        });
+        // Uncached, the chain this observation relied on is validated in full.
+        cached.unwrap_or(false).then_some(Ok(()))
     }
 }
 
@@ -11051,6 +11256,20 @@ impl Directory {
     /// non-observation entry meanwhile first revalidates the window and keeps
     /// its own full validation. Nested calls join this authority's open window.
     pub fn observe_validated<T>(&self, observe: impl FnOnce() -> T) -> io::Result<T> {
+        self.validation_window(false, observe)
+    }
+
+    /// Runs `work` like [`Self::observe_validated`], except that its file
+    /// effects share the window's validation too. Directory rebinding entries
+    /// keep their full validation and discard the window's directories. A
+    /// displacement is reported when the window closes, after effects already
+    /// applied through the retained handles. Nested calls join an open window
+    /// without changing its kind.
+    pub fn batch_validated<T>(&self, work: impl FnOnce() -> T) -> io::Result<T> {
+        self.validation_window(true, work)
+    }
+
+    fn validation_window<T>(&self, batch: bool, observe: impl FnOnce() -> T) -> io::Result<T> {
         let authority = self.authority()?;
         let key = Arc::as_ptr(&authority) as usize;
         let opened = OBSERVATION_WINDOWS.with(|windows| {
@@ -11062,10 +11281,13 @@ impl Directory {
             }
             windows.push(ObservationWindow {
                 authority: key,
+                batch,
                 root_validated: false,
                 observed: false,
                 failed: false,
-                directories: Vec::new(),
+                directories: WindowDirectories::default(),
+                files: Vec::new(),
+                effects: 0,
             });
             true
         });
@@ -11075,9 +11297,10 @@ impl Directory {
         let scope = ObservationWindowScope { authority: key };
         let value = observe();
         let closing = with_observation_window(&authority, |window| {
+            let files = std::mem::take(&mut window.files);
             (
                 window.failed,
-                window.observed.then(|| window.take_observed()),
+                window.observed.then(|| (window.take_observed(), files)),
             )
         });
         drop(scope);
@@ -11089,10 +11312,11 @@ impl Directory {
                 "observation window refused a directory it relied on",
             ));
         }
-        if let Some(directories) = closing {
+        if let Some((directories, files)) = closing {
             platform::validate_lease(&authority.lease)?;
             platform::validate_root(&authority.root)?;
             validate_window_directories(&authority, &directories)?;
+            validate_window_files(files.iter().filter(|file| file.observed))?;
         }
         Ok(value)
     }
@@ -11216,7 +11440,10 @@ impl Directory {
         let authority = self.authority()?;
         let operation = authority.enter_observation()?;
         let file = self.open_file_unvalidated_in(name, &operation)?;
-        file.validate(&operation)?;
+        // The open just bound the name; a window revalidates the binding later.
+        if !(operation.remembers_files && file.remember_binding(&authority)?) {
+            file.validate(&operation)?;
+        }
         Ok(file)
     }
 
@@ -11904,6 +12131,34 @@ impl PartialEq for FileRevisionObservation {
 
 impl Eq for FileRevisionObservation {}
 
+impl FileRevisionObservation {
+    /// Durable comparison evidence for this exact revision, never filesystem authority.
+    /// Matches `FileCapability::revision_witness` for the same physical revision.
+    pub fn witness(&self) -> io::Result<[u8; 32]> {
+        revision_witness(self.identity, self.size, self.stamp)
+    }
+}
+
+fn revision_witness(
+    identity: platform::Identity,
+    size: u64,
+    stamp: platform::FileStamp,
+) -> io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    let modified_at_ns = platform::file_modified_at_ns(stamp)
+        .map_err(|_| io::Error::from(io::ErrorKind::Unsupported))?;
+    let changed_at_ns = platform::file_changed_at_ns(stamp)
+        .map_err(|_| io::Error::from(io::ErrorKind::Unsupported))?;
+    let mut digest = Sha256::new();
+    digest.update(b"axial-fs-file-revision-v1");
+    digest.update(platform::identity_witness(identity));
+    digest.update(size.to_le_bytes());
+    digest.update(modified_at_ns.to_le_bytes());
+    digest.update(changed_at_ns.to_le_bytes());
+    Ok(digest.finalize().into())
+}
+
 impl std::hash::Hash for FileRevisionObservation {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.authority.as_ptr().hash(state);
@@ -12301,7 +12556,18 @@ impl FileCapability {
         destination: &Directory,
         destination_name: &LeafName,
     ) -> FileMoveOutcome {
-        self.move_no_replace_internal(destination, destination_name, None)
+        self.move_no_replace_internal(destination, destination_name, None, true)
+    }
+
+    /// Like `move_no_replace`, but an applied move is not yet durable: the caller must
+    /// `Directory::sync` both parents before treating it as durable. Batched publication
+    /// uses this to sync each touched directory once instead of after every move.
+    pub fn move_no_replace_deferring_parent_sync(
+        self,
+        destination: &Directory,
+        destination_name: &LeafName,
+    ) -> FileMoveOutcome {
+        self.move_no_replace_internal(destination, destination_name, None, false)
     }
 
     pub fn move_no_replace_after_park(
@@ -12310,7 +12576,7 @@ impl FileCapability {
         destination_name: &LeafName,
         displaced: ParkedFile,
     ) -> FileMoveAfterParkOutcome {
-        match self.move_no_replace_internal(destination, destination_name, Some(&displaced)) {
+        match self.move_no_replace_internal(destination, destination_name, Some(&displaced), true) {
             FileMoveOutcome::Applied(current) => {
                 FileMoveAfterParkOutcome::Applied { current, displaced }
             }
@@ -12333,6 +12599,7 @@ impl FileCapability {
         destination: &Directory,
         destination_name: &LeafName,
         displaced: Option<&ParkedFile>,
+        sync_parents: bool,
     ) -> FileMoveOutcome {
         let source_parent = self.parent.clone();
         let authority = match source_parent.authority() {
@@ -12398,6 +12665,7 @@ impl FileCapability {
             destination_name,
             reported_success,
             &mut token,
+            sync_parents,
         ) {
             Ok((true, file)) => FileMoveOutcome::Applied(file),
             Ok((false, file)) => FileMoveOutcome::NoEffect {
@@ -12436,27 +12704,16 @@ impl FileCapability {
     /// Comparison evidence for a freshly admitted file, never filesystem authority.
     /// Includes physical identity, size and revision, but not the root session.
     pub fn revision_witness(&self) -> io::Result<[u8; 32]> {
-        use sha2::{Digest, Sha256};
-
         let authority = self.parent.authority()?;
         let operation = authority.enter()?;
         self.validate(&operation)?;
         let (size, stamp) = platform::file_receipt_fields(&self.handle)?;
-        let mut digest = Sha256::new();
-        digest.update(b"axial-fs-file-revision-v1");
-        digest.update(platform::identity_witness(self.identity));
-        digest.update(size.to_le_bytes());
-        let modified_at_ns = platform::file_modified_at_ns(stamp)
-            .map_err(|_| io::Error::from(io::ErrorKind::Unsupported))?;
-        let changed_at_ns = platform::file_changed_at_ns(stamp)
-            .map_err(|_| io::Error::from(io::ErrorKind::Unsupported))?;
-        digest.update(modified_at_ns.to_le_bytes());
-        digest.update(changed_at_ns.to_le_bytes());
+        let witness = revision_witness(self.identity, size, stamp)?;
         if platform::file_receipt_fields(&self.handle)? != (size, stamp) {
             return Err(identity_changed("file revision changed"));
         }
         self.validate(&operation)?;
-        Ok(digest.finalize().into())
+        Ok(witness)
     }
 
     pub fn park_request(self, expected: ExpectedFileContent) -> FileParkRequest {
@@ -12689,16 +12946,82 @@ impl FileCapability {
 
     fn validate(&self, operation: &CapabilityOperation) -> io::Result<()> {
         self.parent.validate(operation)?;
-        if platform::file_identity(&self.handle)? != self.identity
-            || platform::file_binding_state(
-                self.parent.inner.handle(),
-                self.name.as_os_str(),
-                self.identity,
-            )? != platform::BindingState::Exact
+        // An observation defers a remembered file to the window's revalidation
+        // of its single-link binding.
+        let remembered =
+            operation.windowed && self.observe_remembered_binding(&operation.authority);
+        if remembered && operation.remembers_files {
+            return Ok(());
+        }
+        if platform::file_identity(&self.handle)? != self.identity {
+            return Err(identity_changed("file capability changed binding"));
+        }
+        if remembered {
+            return Ok(());
+        }
+        #[cfg(test)]
+        operation
+            .authority
+            .file_binding_checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if platform::file_binding_state(
+            self.parent.inner.handle(),
+            self.name.as_os_str(),
+            self.identity,
+        )? != platform::BindingState::Exact
         {
             return Err(identity_changed("file capability changed binding"));
         }
+        if operation.remembers_files {
+            self.remember_binding(&operation.authority)?;
+        }
         Ok(())
+    }
+
+    /// Relies on an exact binding this thread's window remembers, if any.
+    fn observe_remembered_binding(&self, authority: &Arc<CapabilityAuthority>) -> bool {
+        with_observation_window(authority, |window| {
+            let remembered = window.files.iter_mut().find(|file| {
+                Arc::ptr_eq(&file.parent, &self.parent.inner)
+                    && file.identity == self.identity
+                    && file.name == self.name
+            });
+            remembered.map(|file| file.observed = true).is_some()
+        })
+        .unwrap_or(false)
+    }
+
+    /// Returns whether the window remembers the binding; it does not during effects.
+    fn remember_binding(&self, authority: &Arc<CapabilityAuthority>) -> io::Result<bool> {
+        if self.observe_remembered_binding(authority) {
+            return Ok(true);
+        }
+        let binding = || ObservedFile {
+            parent: self.parent.inner.clone(),
+            name: self.name.clone(),
+            identity: self.identity,
+            observed: true,
+        };
+        let full = with_observation_window(authority, |window| {
+            // Remembered bindings pin only parents the bounded directory cache pins.
+            if window.effects != 0 || window.position(&self.parent.inner).is_none() {
+                return ControlFlow::Break(false);
+            }
+            if window.files.len() < MAX_OBSERVATION_WINDOW_FILES {
+                window.files.push(binding());
+                return ControlFlow::Break(true);
+            }
+            ControlFlow::Continue(std::mem::take(&mut window.files))
+        });
+        let full = match full {
+            Some(ControlFlow::Continue(full)) => full,
+            Some(ControlFlow::Break(remembered)) => return Ok(remembered),
+            None => return Ok(false),
+        };
+        validate_window_files(full.iter().filter(|file| file.observed))
+            .inspect_err(|_| fail_observation_window(authority))?;
+        with_observation_window(authority, |window| window.files.push(binding()));
+        Ok(true)
     }
 
     fn validate_bound_to(
@@ -12938,6 +13261,16 @@ impl StagedFile {
 
     /// Makes the staged bytes durable and advances the file to sealed authority.
     pub fn seal(self) -> Result<SealedStagedFile, StageSealFailure> {
+        self.seal_inner(true)
+    }
+
+    /// Seals scratch bytes whose durability is deferred until promotion.
+    /// Recoverable stages journal their sealed proof and stay durable at seal.
+    pub fn seal_scratch(self) -> Result<SealedStagedFile, StageSealFailure> {
+        self.seal_inner(false)
+    }
+
+    fn seal_inner(self, durable: bool) -> Result<SealedStagedFile, StageSealFailure> {
         let authority = match self.file.parent.authority() {
             Ok(authority) => authority,
             Err(error) => return Err(StageSealFailure::new(error, self)),
@@ -12959,9 +13292,22 @@ impl StagedFile {
             size,
             stamp,
         };
-        if let Err(error) = platform::sync_publication_file(&self.file.handle) {
-            return Err(StageSealFailure::new(error, self));
-        }
+        let durable = match if durable {
+            Ok(true)
+        } else {
+            stage_has_recovery(&authority, &self.token)
+        } {
+            Ok(durable) => durable,
+            Err(error) => return Err(StageSealFailure::new(error, self)),
+        };
+        let published = if durable {
+            match admit_publication_bytes(&self.file) {
+                Ok(handle) => Some(handle),
+                Err(error) => return Err(StageSealFailure::new(error, self)),
+            }
+        } else {
+            None
+        };
         if let Err(error) = self.file.validate_revision_in(&operation, &revision) {
             return Err(StageSealFailure::new(error, self));
         }
@@ -12977,6 +13323,7 @@ impl StagedFile {
             file: self.file,
             token: self.token,
             revision,
+            published,
         })
     }
 
@@ -13029,6 +13376,9 @@ pub struct SealedStagedFile {
     file: FileCapability,
     token: StageToken,
     revision: FileRevision,
+    /// Shared read handle that becomes the promoted file's capability; absent
+    /// until scratch-sealed bytes are made durable for promotion.
+    published: Option<File>,
 }
 
 impl fmt::Debug for SealedStagedFile {
@@ -13045,7 +13395,9 @@ impl SealedStagedFile {
             file,
             token,
             revision: _,
+            published,
         } = self;
+        drop(published);
         StagedFile { file, token }.discard()
     }
 }
@@ -13155,7 +13507,30 @@ impl SealedStagedFile {
         destination_parent: &Directory,
         destination_name: &LeafName,
     ) -> FilePromotionOutcome {
-        self.promote_no_replace_internal(source_parent, destination_parent, destination_name, None)
+        self.promote_no_replace_internal(
+            source_parent,
+            destination_parent,
+            destination_name,
+            None,
+            true,
+        )
+    }
+
+    /// Like `promote_no_replace`, but the caller must `Directory::sync` both parents before
+    /// relying on the publication being durable.
+    pub fn promote_no_replace_deferring_parent_sync(
+        self,
+        source_parent: &Directory,
+        destination_parent: &Directory,
+        destination_name: &LeafName,
+    ) -> FilePromotionOutcome {
+        self.promote_no_replace_internal(
+            source_parent,
+            destination_parent,
+            destination_name,
+            None,
+            false,
+        )
     }
 
     fn promote_no_replace_internal(
@@ -13164,6 +13539,7 @@ impl SealedStagedFile {
         destination_parent: &Directory,
         destination_name: &LeafName,
         displaced: Option<&ParkedFile>,
+        sync_parents: bool,
     ) -> FilePromotionOutcome {
         let authority = match source_parent.authority() {
             Ok(authority) => authority,
@@ -13188,6 +13564,17 @@ impl SealedStagedFile {
                 error,
                 staged: self,
             };
+        }
+        if self.published.is_none() {
+            match admit_publication_bytes(&self.file) {
+                Ok(handle) => self.published = Some(handle),
+                Err(error) => {
+                    return FilePromotionOutcome::NoEffect {
+                        error,
+                        staged: self,
+                    };
+                }
+            }
         }
         if let Err(error) = self.file.validate_revision_in(&operation, &self.revision) {
             return FilePromotionOutcome::NoEffect {
@@ -13314,7 +13701,12 @@ impl SealedStagedFile {
                         },
                     ));
                 }
-                let settlement = platform::settle_publication(
+                let settle = if sync_parents {
+                    platform::settle_publication
+                } else {
+                    platform::settle_publication_deferring_parent_sync
+                };
+                let settlement = settle(
                     &mut receipt,
                     attempt_id,
                     &self.file.handle,
@@ -13356,10 +13748,12 @@ impl SealedStagedFile {
                         },
                     ));
                 }
-                match platform::open_file(
-                    destination_parent.inner.handle(),
-                    destination_name.as_os_str(),
-                ) {
+                match self
+                    .published
+                    .as_ref()
+                    .ok_or_else(|| identity_changed("promoted file lost its read capability"))
+                    .and_then(File::try_clone)
+                {
                     Ok(handle)
                         if platform::file_identity(&handle).ok() == Some(self.file.identity) =>
                     {
@@ -13875,6 +14269,7 @@ fn prepare_state_file_batch(
                 file,
                 mut token,
                 revision: _,
+                published: _,
             } = staged;
             cleanup.push(
                 state
@@ -14151,7 +14546,7 @@ fn continue_file_replace(
     receipt: Option<ExpectedContentReceipt>,
 ) -> FileReplaceOutcome {
     let source = staged.file.parent.clone();
-    match staged.promote_no_replace_internal(&source, parent, name, displaced.as_ref()) {
+    match staged.promote_no_replace_internal(&source, parent, name, displaced.as_ref(), true) {
         FilePromotionOutcome::Applied(current) => {
             FileReplaceOutcome::Replaced { current, displaced }
         }
@@ -15012,6 +15407,8 @@ fn finish_root_session_with_recovery(
             successful_entries: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             ancestry_steps: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            file_binding_checks: std::sync::atomic::AtomicUsize::new(0),
             operations: Mutex::new(OperationState {
                 phase: AUTHORITY_LIVE,
                 root_identity: identity,
@@ -15656,6 +16053,7 @@ fn settle_file_move(
     destination_name: &LeafName,
     reported_success: bool,
     token: &mut MoveEffectToken,
+    sync_parents: bool,
 ) -> Result<(bool, FileCapability), FileCapability> {
     let authority = match file.parent.authority() {
         Ok(authority) => authority,
@@ -15683,7 +16081,7 @@ fn settle_file_move(
     );
     match classify_move_topology(reported_success, source.ok(), target.ok()) {
         MoveTopology::Applied => {
-            if sync_rename_parents(&file.parent, destination).is_err()
+            if (sync_parents && sync_rename_parents(&file.parent, destination).is_err())
                 || destination.validate(&operation).is_err()
             {
                 return Err(file);
@@ -16621,6 +17019,35 @@ mod tests {
             b"managed payload"
         );
         drop(admitted);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    #[test]
+    fn scratch_sealed_stage_admits_durable_read_capability_at_promotion() {
+        let temporary = crate::test_tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        let mut staged = match root.create_stage() {
+            FileCreateOutcome::Created(staged) => staged,
+            FileCreateOutcome::NoEffect(error) => panic!("stage creation failed: {error}"),
+            FileCreateOutcome::AppliedUnverified(obligation) => {
+                panic!("stage creation was not verified: {}", obligation.error())
+            }
+        };
+        staged.write_all(b"scratch payload").expect("stage bytes");
+        let sealed = staged.seal_scratch().expect("scratch seal");
+        assert!(sealed.published.is_none());
+
+        let name = LeafName::new("published.bin").expect("published leaf");
+        let published = require_test_promotion(sealed.promote_no_replace(&root, &root, &name));
+        assert_eq!(
+            published
+                .read_bounded(64)
+                .expect("promoted capability reads"),
+            b"scratch payload"
+        );
+        drop(published);
+        drop(root);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
@@ -24554,6 +24981,64 @@ mod tests {
     }
 
     #[test]
+    fn batch_window_shares_one_validation_across_file_effects() {
+        use std::sync::atomic::Ordering;
+
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        let authority = root.authority().unwrap();
+        let publish = |index: usize| {
+            let staged = test_sealed_stage(&bucket, b"payload");
+            let name = LeafName::new(format!("file-{index}")).unwrap();
+            assert!(matches!(
+                staged.promote_no_replace(&bucket, &bucket, &name),
+                FilePromotionOutcome::Applied(_)
+            ));
+        };
+        publish(0);
+        authority.ancestry_steps.store(0, Ordering::Relaxed);
+        publish(1);
+        let unbatched = authority.ancestry_steps.swap(0, Ordering::Relaxed);
+        root.batch_validated(|| (2..10).for_each(publish)).unwrap();
+        let batched = authority.ancestry_steps.load(Ordering::Relaxed);
+        drop((bucket, root, authority));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert!(unbatched > 8, "Each unbatched effect walks the ancestry");
+        assert_eq!(batched, 8, "Batch must walk once and revalidate once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_window_reports_ancestry_displaced_after_file_effects() {
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        let assets = temporary.path().join("assets");
+        let mut published = None;
+        let result = root.batch_validated(|| {
+            bucket.identity().unwrap();
+            std::fs::rename(assets.join("objects"), assets.join("displaced")).unwrap();
+            std::fs::create_dir_all(assets.join("objects/aa")).unwrap();
+            let staged = test_sealed_stage(&bucket, b"payload");
+            published = Some(matches!(
+                staged.promote_no_replace(&bucket, &bucket, &LeafName::new("file").unwrap()),
+                FilePromotionOutcome::Applied(_)
+            ));
+        });
+        drop((bucket, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(
+            published,
+            Some(true),
+            "Batched effect awaits closing validation"
+        );
+        assert!(
+            result.is_err(),
+            "Batch returned effects in a displaced directory"
+        );
+        assert!(assets.join("displaced/aa/file").is_file());
+    }
+
+    #[test]
     fn observation_window_survives_file_effects_and_directory_rebinding() {
         let temporary = crate::test_tempdir().unwrap();
         let (session, root, bucket) = observation_window_fixture(&temporary);
@@ -24584,6 +25069,196 @@ mod tests {
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
         result.unwrap();
         assert!(temporary.path().join("assets/objects/aa/moved").is_dir());
+    }
+
+    #[test]
+    fn observation_window_remembers_exact_file_bindings_until_close() {
+        use std::sync::atomic::Ordering;
+
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        std::fs::write(temporary.path().join("assets/objects/aa/file"), b"file").unwrap();
+        let file = bucket.open_file(&LeafName::new("file").unwrap()).unwrap();
+        let authority = root.authority().unwrap();
+        authority.file_binding_checks.store(0, Ordering::Relaxed);
+        root.observe_validated(|| {
+            for _ in 0..32 {
+                file.revision().unwrap();
+            }
+        })
+        .unwrap();
+        let windowed = authority.file_binding_checks.swap(0, Ordering::Relaxed);
+        file.revision().unwrap();
+        let unwindowed = authority.file_binding_checks.load(Ordering::Relaxed);
+        drop((file, bucket, root, authority));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(unwindowed, 2);
+        assert_eq!(
+            windowed, 1,
+            "Window must check each binding once before close"
+        );
+    }
+
+    #[test]
+    fn observation_window_confirms_full_file_memory_and_keeps_remembering() {
+        use std::sync::atomic::Ordering;
+
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        let files = (0..=MAX_OBSERVATION_WINDOW_FILES)
+            .map(|index| {
+                let name = format!("file{index}");
+                std::fs::write(
+                    temporary.path().join("assets/objects/aa").join(&name),
+                    b"file",
+                )
+                .unwrap();
+                bucket.open_file(&LeafName::new(&name).unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let authority = root.authority().unwrap();
+        authority.file_binding_checks.store(0, Ordering::Relaxed);
+        root.observe_validated(|| {
+            for file in &files {
+                file.revision().unwrap();
+                file.revision().unwrap();
+            }
+        })
+        .unwrap();
+        let checks = authority.file_binding_checks.load(Ordering::Relaxed);
+        drop((files, bucket, root, authority));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(checks, MAX_OBSERVATION_WINDOW_FILES + 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observation_window_refuses_file_rebound_after_remembered_observation() {
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        let parent = temporary.path().join("assets/objects/aa");
+        std::fs::write(parent.join("file"), b"file").unwrap();
+        let file = bucket.open_file(&LeafName::new("file").unwrap()).unwrap();
+        let mut cached = None;
+        let result = root.observe_validated(|| {
+            file.revision().unwrap();
+            std::fs::rename(parent.join("file"), parent.join("displaced")).unwrap();
+            std::fs::write(parent.join("file"), b"other").unwrap();
+            cached = Some(file.revision().is_ok());
+        });
+        drop((file, bucket, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(
+            cached,
+            Some(true),
+            "Remembered binding awaits closing validation"
+        );
+        assert!(
+            result.is_err(),
+            "Window returned a rebound file observation"
+        );
+    }
+
+    #[test]
+    fn observation_window_remembers_opened_file_without_rechecking_its_binding() {
+        use std::sync::atomic::Ordering;
+
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        std::fs::write(temporary.path().join("assets/objects/aa/file"), b"file").unwrap();
+        let name = LeafName::new("file").unwrap();
+        let authority = root.authority().unwrap();
+        authority.file_binding_checks.store(0, Ordering::Relaxed);
+        root.observe_validated(|| {
+            bucket.open_file(&name).unwrap().revision().unwrap();
+        })
+        .unwrap();
+        let windowed = authority.file_binding_checks.swap(0, Ordering::Relaxed);
+        bucket.open_file(&name).unwrap();
+        let unwindowed = authority.file_binding_checks.load(Ordering::Relaxed);
+        drop((bucket, root, authority));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(windowed, 0);
+        assert_eq!(unwindowed, 1);
+    }
+
+    #[test]
+    fn observation_window_remembers_reopened_file_once() {
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        std::fs::write(temporary.path().join("assets/objects/aa/file"), b"file").unwrap();
+        let name = LeafName::new("file").unwrap();
+        let authority = root.authority().unwrap();
+        let remembered = root
+            .observe_validated(|| {
+                for _ in 0..=MAX_OBSERVATION_WINDOW_FILES {
+                    bucket.open_file(&name).unwrap();
+                }
+                with_observation_window(&authority, |window| window.files.len())
+            })
+            .unwrap();
+        drop((bucket, root, authority));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(remembered, Some(1));
+    }
+
+    #[test]
+    fn observation_window_refuses_file_linked_after_remembered_observation() {
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        let parent = temporary.path().join("assets/objects/aa");
+        std::fs::write(parent.join("file"), b"file").unwrap();
+        let file = bucket.open_file(&LeafName::new("file").unwrap()).unwrap();
+        let mut cached = None;
+        let result = root.observe_validated(|| {
+            file.revision().unwrap();
+            std::fs::hard_link(parent.join("file"), parent.join("alias")).unwrap();
+            cached = Some(file.same_file(&file).is_ok());
+        });
+        let unwindowed = file.same_file(&file);
+        drop((file, bucket, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(
+            cached,
+            Some(true),
+            "Remembered binding awaits closing validation"
+        );
+        assert!(
+            result.is_err(),
+            "Window returned a multiply linked file observation"
+        );
+        assert!(unwindowed.is_err());
+    }
+
+    #[test]
+    fn effects_forget_remembered_file_bindings() {
+        let temporary = crate::test_tempdir().unwrap();
+        let (session, root, bucket) = observation_window_fixture(&temporary);
+        std::fs::write(temporary.path().join("assets/objects/aa/file"), b"file").unwrap();
+        for batch in [false, true] {
+            let name = LeafName::new("file").unwrap();
+            let file = bucket.open_file(&name).unwrap();
+            let moved = LeafName::new("moved").unwrap();
+            let work = || {
+                file.revision().unwrap();
+                let FileMoveOutcome::Applied(file) = file.move_no_replace(&bucket, &moved) else {
+                    panic!("file move had no exact effect");
+                };
+                file.revision().unwrap();
+                let FileMoveOutcome::Applied(_) = file.move_no_replace(&bucket, &name) else {
+                    panic!("file move had no exact effect");
+                };
+            };
+            let result = if batch {
+                root.batch_validated(work)
+            } else {
+                root.observe_validated(work)
+            };
+            result.unwrap();
+        }
+        drop((bucket, root));
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert!(temporary.path().join("assets/objects/aa/file").is_file());
     }
 
     fn paused_file_observation(

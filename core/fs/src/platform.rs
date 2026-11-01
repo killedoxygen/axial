@@ -2444,7 +2444,6 @@ mod native {
         expected: Identity,
         size: u64,
     ) -> io::Result<()> {
-        transient.file.sync_all()?;
         let (identity, links) = retained_file_identity(&transient.file)?;
         if identity != expected || links != 0 || transient.file.metadata()?.len() != size {
             return Err(binding_changed(
@@ -2464,6 +2463,8 @@ mod native {
         if links != 0 {
             return Err(io::ErrorKind::InvalidData.into());
         }
+        // Scratch bytes become durable only when they are published.
+        transient.file.sync_all()?;
         rfs::linkat(
             rfs::CWD,
             &transient.proc_path,
@@ -2868,6 +2869,23 @@ mod native {
         }
     }
 
+    /// Whether `name` binds `expected` as an exact single-link regular file.
+    pub(crate) fn exact_file_binding(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<bool> {
+        match rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(
+                FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+                    && stat.st_nlink == 1
+                    && identity_from_stat(stat) == expected,
+            ),
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn exact_file_link_count(
         parent: &DirectoryHandle,
@@ -3211,6 +3229,33 @@ mod native {
             destination_parent,
             destination_name,
             false,
+            true,
+        )
+    }
+
+    pub(crate) fn settle_publication_deferring_parent_sync(
+        receipt: &mut PublicationReceipt,
+        attempt_id: u64,
+        staged_file: &File,
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        let staged_identity = file_identity(staged_file)?;
+        let (staged_size, staged_stamp) = file_receipt_fields(staged_file)?;
+        settle_publication_observation(
+            receipt,
+            attempt_id,
+            staged_identity,
+            staged_size,
+            staged_stamp,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+            false,
+            false,
         )
     }
 
@@ -3234,6 +3279,7 @@ mod native {
             source_name,
             parent,
             destination_name,
+            true,
             true,
         )
     }
@@ -3260,6 +3306,7 @@ mod native {
             destination_parent,
             destination_name,
             false,
+            true,
         )
     }
 
@@ -3274,6 +3321,7 @@ mod native {
         destination_parent: &DirectoryHandle,
         destination_name: &OsStr,
         retry_poisoned: bool,
+        sync_parents: bool,
     ) -> io::Result<()> {
         PublicationReceipt::validate_content_observation(
             receipt.binding(),
@@ -3301,7 +3349,7 @@ mod native {
                 "named publication parent barrier previously failed",
             ));
         }
-        if !matches!(receipt.state, PublicationReceiptState::Committed) {
+        if sync_parents && !matches!(receipt.state, PublicationReceiptState::Committed) {
             if let Err(error) = sync_publication_directory(destination_parent) {
                 receipt.mark_poisoned();
                 return Err(error);
@@ -6439,9 +6487,7 @@ mod native {
     }
 
     pub(crate) fn file_receipt_fields(file: &File) -> io::Result<(u64, FileStamp)> {
-        require_file(file)?;
-        let basic = query_basic(file)?;
-        let standard = query_standard(file)?;
+        let (basic, standard) = require_file(file)?;
         let size = u64::try_from(standard.EndOfFile)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file size is negative"))?;
         Ok((
@@ -6667,6 +6713,29 @@ mod native {
         }
     }
 
+    /// Whether `name` binds `expected` as an exact single-link regular file.
+    pub(crate) fn exact_file_binding(
+        parent: &DirectoryHandle,
+        name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<bool> {
+        let handle = match nt_open_relative(
+            parent,
+            name,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE_ACCESS,
+            ntapi::ntioapi::FILE_OPEN,
+            ntapi::ntioapi::FILE_OPEN_REPARSE_POINT | ntapi::ntioapi::FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        ) {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let basic = query_basic(&handle)?;
+        let standard = query_standard(&handle)?;
+        Ok(is_single_link_file(&basic, &standard) && object_identity(&handle)? == expected)
+    }
+
     pub(crate) fn directory_binding_state(
         parent: &DirectoryHandle,
         name: &OsStr,
@@ -6776,6 +6845,27 @@ mod native {
             staged_identity,
             staged_size,
             staged_stamp,
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
+    }
+
+    /// NTFS write-through renames carry their own barrier.
+    pub(crate) fn settle_publication_deferring_parent_sync(
+        receipt: &mut PublicationReceipt,
+        attempt_id: u64,
+        staged_file: &File,
+        source_parent: &DirectoryHandle,
+        source_name: &OsStr,
+        destination_parent: &DirectoryHandle,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        settle_publication(
+            receipt,
+            attempt_id,
+            staged_file,
             source_parent,
             source_name,
             destination_parent,
@@ -8357,19 +8447,22 @@ mod native {
         Ok(())
     }
 
-    fn require_file(handle: &File) -> io::Result<()> {
+    fn require_file(handle: &File) -> io::Result<(FILE_BASIC_INFO, FILE_STANDARD_INFO)> {
         let basic = query_basic(handle)?;
         let standard = query_standard(handle)?;
-        if basic.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
-            || standard.Directory
-            || standard.NumberOfLinks != 1
-        {
+        if !is_single_link_file(&basic, &standard) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "filesystem capability is not an exact single-link regular file",
             ));
         }
-        Ok(())
+        Ok((basic, standard))
+    }
+
+    fn is_single_link_file(basic: &FILE_BASIC_INFO, standard: &FILE_STANDARD_INFO) -> bool {
+        basic.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) == 0
+            && !standard.Directory
+            && standard.NumberOfLinks == 1
     }
 
     fn retained_file_identity(handle: &File) -> io::Result<(Identity, u32)> {

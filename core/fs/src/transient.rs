@@ -620,9 +620,12 @@ impl CapabilityAuthority {
                 CapabilityOperation {
                     authority: self.clone(),
                     windowed: false,
+                    remembers_files: false,
+                    window_effect: crate::note_window_effect(self),
                 },
             )
         };
+        crate::forget_window_files_or_fail(self);
         #[cfg(not(target_os = "linux"))]
         let mut record = record;
         #[cfg(not(target_os = "linux"))]
@@ -987,13 +990,16 @@ fn enter_publication_reconciliation(
         state.active = state.active.checked_add(1).ok_or(io::ErrorKind::Other)?;
     }
     let operation = CapabilityOperation {
+        window_effect: crate::note_window_effect(&authority),
         authority,
         windowed: false,
+        remembers_files: false,
     };
     let directory = &batch.directory;
     let directory_buffer = batch.directory_buffer.as_mut_slice();
     platform::validate_lease_preallocated(&operation.authority.lease, &mut *directory_buffer)?;
     platform::validate_root_preallocated(&operation.authority.root, &mut *directory_buffer)?;
+    crate::forget_window_files(&operation.authority)?;
     crate::confirm_observation_window(&operation.authority, true)?;
     validate_publication_directory(directory, &operation, Some(directory_buffer))?;
     Ok(operation)
@@ -1137,6 +1143,20 @@ impl TransientStage {
 
     pub fn size(&self) -> u64 {
         self.position
+    }
+
+    /// Runs `work` in one batch validation window of the stage directory, so
+    /// its writes share one ancestry validation. A displacement fails when the
+    /// window closes; sealing validates fully afterwards. Linux stages are
+    /// unnamed and need no window.
+    pub fn batch_validated<T>(&mut self, work: impl FnOnce(&mut Self) -> T) -> io::Result<T> {
+        #[cfg(target_os = "linux")]
+        return Ok(work(self));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let directory = self.destination().directory.clone();
+            directory.batch_validated(|| work(self))
+        }
     }
 
     pub fn seal(mut self) -> Result<TransientStageSealed, TransientStageSealFailure> {

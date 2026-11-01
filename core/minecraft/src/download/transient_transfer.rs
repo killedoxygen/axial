@@ -2490,14 +2490,13 @@ async fn run_attempt(
     contract: &TransferContract,
     cancellation: TransferCancellation,
 ) -> AttemptOutcome {
-    let admission = match process_physical_work()
-        .admit(PhysicalWorkRequest::foreground(
-            PhysicalIoClass::Heavy,
-            STREAM_SCRATCH_BYTES,
-        ))
+    // Frames are reserved before the request; the writer worker is admitted
+    // concurrently, so small bodies buffer fully and hold a worker only to write.
+    let _scratch = match process_physical_work()
+        .reserve_scratch(STREAM_SCRATCH_BYTES)
         .await
     {
-        Ok(admission) => admission,
+        Ok(scratch) => scratch,
         Err(_) => {
             return AttemptOutcome::Discarded {
                 failure: TransferFailureKind::WorkerStopped,
@@ -2506,29 +2505,38 @@ async fn run_attempt(
         }
     };
     let (messages, receiver) = tokio::sync::mpsc::channel(FRAME_CAPACITY);
-    let (ready, readiness) = tokio::sync::oneshot::channel();
+    let (abort_admission, mut admission_aborted) = tokio::sync::oneshot::channel::<()>();
     let mut attempt_cancellation = AttemptCancellationGuard::new();
     let writer_cancellation = WriterCancellation {
         transfer: cancellation.thread_cancellation(),
         attempt: attempt_cancellation.flag(),
     };
     let writer_contract = contract.clone();
-    let writer = tokio::spawn(admission.run(move |_| {
-        run_writer(
-            destination,
-            writer_contract,
-            receiver,
-            ready,
-            writer_cancellation,
-        )
-    }));
+    let writer = tokio::spawn(async move {
+        let work = process_physical_work();
+        let admission = tokio::select! {
+            biased;
+            _ = &mut admission_aborted => None,
+            admission = work.admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Write, 0)) => {
+                admission.ok()
+            }
+        };
+        let Some(admission) = admission else {
+            return Ok(WriterExit::Discarded {
+                failure: TransferFailureKind::WorkerStopped,
+                destination,
+            });
+        };
+        admission
+            .run(move |_| run_writer(destination, writer_contract, receiver, writer_cancellation))
+            .await
+    });
 
     let producer = AssertUnwindSafe(run_producer(
         client,
         url,
         contract,
         messages.clone(),
-        readiness,
         cancellation.clone(),
     ))
     .catch_unwind()
@@ -2537,6 +2545,7 @@ async fn run_attempt(
     let producer = producer.unwrap_or(ProducerExit::Failed(TransferFailureKind::WorkerStopped));
     if matches!(producer, ProducerExit::Failed(_)) {
         attempt_cancellation.cancel();
+        let _ = abort_admission.send(());
     }
     drop(messages);
     let writer_exit = writer.await;
@@ -2561,15 +2570,8 @@ async fn run_producer(
     url: &reqwest::Url,
     contract: &TransferContract,
     messages: tokio::sync::mpsc::Sender<WriterMessage>,
-    mut readiness: tokio::sync::oneshot::Receiver<()>,
     mut cancellation: TransferCancellation,
 ) -> ProducerExit {
-    match wait_for_writer(&mut cancellation, &messages, &mut readiness).await {
-        Some(Ok(())) => {}
-        Some(Err(_)) => return ProducerExit::Failed(TransferFailureKind::WorkerStopped),
-        None => return ProducerExit::Failed(wait_interruption(&cancellation, &messages)),
-    }
-
     let request = client
         .inner
         .get(url.clone())
@@ -2597,6 +2599,8 @@ async fn run_producer(
     }
 
     let mut produced = 0_u64;
+    // Small response chunks are coalesced so each stage write carries a full frame.
+    let mut pending = Vec::with_capacity(FRAME_BYTES);
     loop {
         let chunk = match wait_for_writer(&mut cancellation, &messages, response.chunk()).await {
             Some(Ok(chunk)) => chunk,
@@ -2606,28 +2610,27 @@ async fn run_producer(
         let Some(chunk) = chunk else {
             break;
         };
-        for slice in chunk.chunks(FRAME_BYTES) {
-            produced = match admit_bytes(contract.bytes, produced, slice.len()) {
-                Ok(produced) => produced,
-                Err(failure) => return ProducerExit::Failed(failure),
-            };
-            let frame = slice.to_vec().into_boxed_slice();
-            match wait_for_writer(
-                &mut cancellation,
-                &messages,
-                messages.send(WriterMessage::Frame(frame)),
-            )
-            .await
-            {
-                Some(Ok(())) => {}
-                Some(Err(_)) => {
-                    return ProducerExit::Failed(TransferFailureKind::ChannelClosed);
-                }
-                None => {
-                    return ProducerExit::Failed(wait_interruption(&cancellation, &messages));
+        produced = match admit_bytes(contract.bytes, produced, chunk.len()) {
+            Ok(produced) => produced,
+            Err(failure) => return ProducerExit::Failed(failure),
+        };
+        let mut remaining = &chunk[..];
+        while !remaining.is_empty() {
+            let taken = remaining.len().min(FRAME_BYTES - pending.len());
+            pending.extend_from_slice(&remaining[..taken]);
+            remaining = &remaining[taken..];
+            if pending.len() == FRAME_BYTES {
+                let frame = std::mem::replace(&mut pending, Vec::with_capacity(FRAME_BYTES));
+                if let Err(failure) = send_frame(&mut cancellation, &messages, frame).await {
+                    return ProducerExit::Failed(failure);
                 }
             }
         }
+    }
+    if !pending.is_empty()
+        && let Err(failure) = send_frame(&mut cancellation, &messages, pending).await
+    {
+        return ProducerExit::Failed(failure);
     }
 
     if let Some(declared) = declared_length
@@ -2654,6 +2657,19 @@ async fn run_producer(
         Some(Ok(())) => ProducerExit::Finished,
         Some(Err(_)) => ProducerExit::Failed(TransferFailureKind::ChannelClosed),
         None => ProducerExit::Failed(wait_interruption(&cancellation, &messages)),
+    }
+}
+
+async fn send_frame(
+    cancellation: &mut TransferCancellation,
+    messages: &tokio::sync::mpsc::Sender<WriterMessage>,
+    frame: Vec<u8>,
+) -> Result<(), TransferFailureKind> {
+    let message = WriterMessage::Frame(frame.into_boxed_slice());
+    match wait_for_writer(cancellation, messages, messages.send(message)).await {
+        Some(Ok(())) => Ok(()),
+        Some(Err(_)) => Err(TransferFailureKind::ChannelClosed),
+        None => Err(wait_interruption(cancellation, messages)),
     }
 }
 
@@ -2761,7 +2777,6 @@ fn run_writer(
     destination: TransientDestination,
     contract: TransferContract,
     mut receiver: tokio::sync::mpsc::Receiver<WriterMessage>,
-    ready: tokio::sync::oneshot::Sender<()>,
     cancellation: WriterCancellation,
 ) -> WriterExit {
     if cancellation.is_cancelled() {
@@ -2785,113 +2800,133 @@ fn run_writer(
             };
         }
     };
-    if cancellation.is_cancelled() || ready.send(()).is_err() {
+    if cancellation.is_cancelled() {
         return discard_writer_stage(stage, TransferFailureKind::Cancelled);
     }
 
     let mut written = 0_u64;
     let mut hashers = WriterHashers::new(&contract.digests);
-    loop {
-        if cancellation.is_cancelled() {
+    let received = stage.batch_validated(|stage| {
+        receive_frames(
+            stage,
+            &contract,
+            &mut receiver,
+            &cancellation,
+            &mut written,
+            &mut hashers,
+        )
+    });
+    let (producer_bytes, declared_length) = match received {
+        Ok(Ok(finish)) => finish,
+        Ok(Err(failure)) => return discard_writer_stage(stage, failure),
+        Err(_) if cancellation.is_cancelled() => {
             return discard_writer_stage(stage, TransferFailureKind::Cancelled);
         }
+        Err(error) => {
+            return discard_writer_stage(stage, TransferFailureKind::StageWrite(error.kind()));
+        }
+    };
+    if producer_bytes != written {
+        return discard_writer_stage(
+            stage,
+            TransferFailureKind::ProducerWorkerMismatch {
+                producer: producer_bytes,
+                writer: written,
+            },
+        );
+    }
+    if let Some(declared) = declared_length
+        && declared != written
+    {
+        return discard_writer_stage(
+            stage,
+            TransferFailureKind::ContentLengthMismatch {
+                declared,
+                observed: written,
+            },
+        );
+    }
+    if !contract.bytes.admits_final(written) {
+        return discard_writer_stage(stage, final_size_failure(contract.bytes, written));
+    }
+    let digests = hashers.finish();
+    if let Some(expected) = contract.digests.sha1.as_ref()
+        && digests.sha1.as_ref() != Some(expected)
+    {
+        return discard_writer_stage(
+            stage,
+            TransferFailureKind::DigestMismatch(TransferDigestAlgorithm::Sha1),
+        );
+    }
+    if let Some(expected) = contract.digests.sha512.as_ref()
+        && digests.sha512.as_ref() != Some(expected)
+    {
+        return discard_writer_stage(
+            stage,
+            TransferFailureKind::DigestMismatch(TransferDigestAlgorithm::Sha512),
+        );
+    }
+    if cancellation.is_cancelled() {
+        return discard_writer_stage(stage, TransferFailureKind::Cancelled);
+    }
+    let sealed = match stage.seal() {
+        Ok(sealed) => sealed,
+        Err(failure) => {
+            let kind = failure.error().kind();
+            return discard_writer_stage(
+                failure.into_stage(),
+                TransferFailureKind::StageSeal(kind),
+            );
+        }
+    };
+    WriterExit::Verified {
+        sealed,
+        verification: WriterVerification {
+            bytes: written,
+            declared_length,
+            digests,
+        },
+    }
+}
+
+/// Receives frames into the stage until the producer finishes.
+fn receive_frames(
+    stage: &mut TransientStage,
+    contract: &TransferContract,
+    receiver: &mut tokio::sync::mpsc::Receiver<WriterMessage>,
+    cancellation: &WriterCancellation,
+    written: &mut u64,
+    hashers: &mut WriterHashers,
+) -> Result<(u64, Option<u64>), TransferFailureKind> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(TransferFailureKind::Cancelled);
+        }
         let Some(message) = receiver.blocking_recv() else {
-            let failure = if cancellation.is_cancelled() {
+            return Err(if cancellation.is_cancelled() {
                 TransferFailureKind::Cancelled
             } else {
                 TransferFailureKind::ChannelClosed
-            };
-            return discard_writer_stage(stage, failure);
+            });
         };
         if cancellation.is_cancelled() {
-            return discard_writer_stage(stage, TransferFailureKind::Cancelled);
+            return Err(TransferFailureKind::Cancelled);
         }
         match message {
             WriterMessage::Frame(frame) => {
-                written = match admit_bytes(contract.bytes, written, frame.len()) {
-                    Ok(written) => written,
-                    Err(failure) => return discard_writer_stage(stage, failure),
-                };
-                if let Err(error) = stage.write_all(&frame) {
-                    return discard_writer_stage(
-                        stage,
-                        TransferFailureKind::StageWrite(error.kind()),
-                    );
-                }
+                *written = admit_bytes(contract.bytes, *written, frame.len())?;
+                stage
+                    .write_all(&frame)
+                    .map_err(|error| TransferFailureKind::StageWrite(error.kind()))?;
                 if cancellation.is_cancelled() {
-                    return discard_writer_stage(stage, TransferFailureKind::Cancelled);
+                    return Err(TransferFailureKind::Cancelled);
                 }
                 hashers.update(&frame);
             }
             WriterMessage::Finish {
                 producer_bytes,
                 declared_length,
-            } => {
-                if producer_bytes != written {
-                    return discard_writer_stage(
-                        stage,
-                        TransferFailureKind::ProducerWorkerMismatch {
-                            producer: producer_bytes,
-                            writer: written,
-                        },
-                    );
-                }
-                if let Some(declared) = declared_length
-                    && declared != written
-                {
-                    return discard_writer_stage(
-                        stage,
-                        TransferFailureKind::ContentLengthMismatch {
-                            declared,
-                            observed: written,
-                        },
-                    );
-                }
-                if !contract.bytes.admits_final(written) {
-                    return discard_writer_stage(
-                        stage,
-                        final_size_failure(contract.bytes, written),
-                    );
-                }
-                let digests = hashers.finish();
-                if let Some(expected) = contract.digests.sha1.as_ref()
-                    && digests.sha1.as_ref() != Some(expected)
-                {
-                    return discard_writer_stage(
-                        stage,
-                        TransferFailureKind::DigestMismatch(TransferDigestAlgorithm::Sha1),
-                    );
-                }
-                if let Some(expected) = contract.digests.sha512.as_ref()
-                    && digests.sha512.as_ref() != Some(expected)
-                {
-                    return discard_writer_stage(
-                        stage,
-                        TransferFailureKind::DigestMismatch(TransferDigestAlgorithm::Sha512),
-                    );
-                }
-                if cancellation.is_cancelled() {
-                    return discard_writer_stage(stage, TransferFailureKind::Cancelled);
-                }
-                let sealed = match stage.seal() {
-                    Ok(sealed) => sealed,
-                    Err(failure) => {
-                        let kind = failure.error().kind();
-                        return discard_writer_stage(
-                            failure.into_stage(),
-                            TransferFailureKind::StageSeal(kind),
-                        );
-                    }
-                };
-                return WriterExit::Verified {
-                    sealed,
-                    verification: WriterVerification {
-                        bytes: written,
-                        declared_length,
-                        digests,
-                    },
-                };
-            }
+            } => return Ok((producer_bytes, declared_length)),
         }
     }
 }
