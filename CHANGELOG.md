@@ -10,15 +10,6 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ## [0.4.0-rc.3] - 2026-11-01
 
-### Distribution
-- Windows packages build again; source files keep LF line endings on every platform
-
-### Security
-- Builds use Node 26 LTS and pnpm 11.28.10, which fixes three pnpm advisories (GHSA-c59q-g84q-2gj5, GHSA-vq4v-j7r6-jq4m, GHSA-vx52-2968-3vc6)
-- Rust dependencies refreshed to their latest compatible releases
-
-## [0.4.0-rc.2] - 2026-11-01
-
 ### Onboarding
 - First run takes two steps: sign in with Microsoft or pick an offline name and look, then choose a color and what runs in the background, with the player's 3D character alongside
 - Memory starts at the system recommendation instead of being asked up front; anonymous stats stay off until turned on
@@ -41,9 +32,14 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ### Security
 - Updated tokio, libz-sys and p256 for RustSec advisories
+- Builds use Node 26 LTS and pnpm 11.28.10, which fixes three pnpm advisories (GHSA-c59q-g84q-2gj5, GHSA-vq4v-j7r6-jq4m, GHSA-vx52-2968-3vc6)
+- Rust dependencies refreshed to their latest compatible releases
 
 ### Release integrity
 - Releases are exposed only after their version, notes, complete platform asset set, and checksums agree
+
+### Distribution
+- Source files keep LF line endings on every platform, so Windows packages build from the same checked bytes
 
 ## [0.4.0-rc.1] - 2026-10-11
 
