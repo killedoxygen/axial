@@ -1,7 +1,13 @@
-import type { ContentUpdate, InstanceContentEntry } from '../../types-content';
+import type { ContentUpdate, InstanceContentEntry, InstanceContentPack } from '../../types-content';
 
 export interface ModProvenance {
+  /** Managed mods by filename. */
   entries: Map<string, InstanceContentEntry>;
+  /** Managed content of every kind, for the resource and shader pack panes. */
+  managed: InstanceContentEntry[];
+  /** Modpacks this instance came from. */
+  packs: InstanceContentPack[];
+  /** Available updates for every managed kind, by canonical id. */
   updates: Map<string, ContentUpdate>;
   updateError?: string;
 }

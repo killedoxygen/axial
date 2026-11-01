@@ -1,19 +1,27 @@
 import type { JSX } from 'preact';
 import { contentRevision } from '../../../content-activity';
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
 import { Button, Input } from '../../../ui/Atoms';
 import { SelectField } from '../../../ui/Select';
 import { openContextMenu } from '../../../ui/ContextMenu';
-import { SelectionActionTray, SelectionCheckbox } from '../../../ui/SelectionActionTray';
-import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../../ui/selection';
+import { SelectionActionTray } from '../../../ui/SelectionActionTray';
+import { selectionMenuItem, useSelection } from '../../../ui/selection';
 import { navigate } from '../../../ui-state';
-import { formatBytes } from '../../../format';
 import type { EnrichedInstance, InstanceMod } from '../../../types-instance';
+import type { ContentFileMetadata } from '../../../generated/ContentFileMetadata';
 import { modBaseName } from '../../../utils';
-import type { ResourceLoadState } from '../resources';
+import { fetchModMetadata, modIconUrl, type ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
 import { ResourceMutationStatus, ResourceStatus } from '../components/resource-bits';
+import {
+  ContentRow,
+  compareContentRows,
+  contentRowMatches,
+  fileDisplayName,
+  type ContentRowView,
+} from '../components/content-row';
+import { PackOrigin, packMembership } from '../components/pack-origin';
 import { resourceMutationState } from '../bulk-actions';
 import {
   applyModUpdates,
@@ -42,7 +50,21 @@ export function ModsPane({
   const [provenance, setProvenance] = useState<ModProvenance | null>(() => cachedModProvenance(inst.id));
   const [provenanceError, setProvenanceError] = useState('');
   const [provenanceStamp, setProvenanceStamp] = useState(0);
+  const [metadata, setMetadata] = useState<Map<string, ContentFileMetadata>>(() => new Map());
   const resourceRevision = useRef({ instanceId: inst.id, revision: contentRevision.value });
+
+  // Jar metadata is best-effort display text; rows fall back to filenames without it.
+  useEffect(() => {
+    let alive = true;
+    void fetchModMetadata(inst.id)
+      .then((next) => {
+        if (alive) setMetadata(next);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [inst.id, provenanceStamp, contentRevision.value]);
 
   useEffect(() => {
     let alive = true;
@@ -80,15 +102,40 @@ export function ModsPane({
     return { entry, update };
   };
 
+  function modRow(mod: InstanceMod): ContentRowView {
+    const { entry, update } = provenanceFor(mod);
+    const details = metadata.get(mod.name);
+    return {
+      key: mod.name,
+      title: entry?.title ?? details?.title ?? fileDisplayName(mod.name),
+      fileName: mod.name,
+      details: [details?.version, details?.authors.join(', ')].filter((text): text is string => Boolean(text)),
+      iconUrl: details?.icon ? modIconUrl(inst.id, mod.name) : undefined,
+      fallbackIcon: 'puzzle',
+      managed: Boolean(entry),
+      pack: membership.get(`mods/${modBaseName(mod.name)}`),
+      enabled: mod.enabled,
+      size: mod.size,
+      update: update && {
+        version: update.latest_version_number,
+        disabled: busy,
+        onClick: () => void applyModUpdates(inst, [update]),
+      },
+    };
+  }
+
   const mods = resources.data?.mods ?? [];
-  const filteredMods = mods.filter((mod) => {
-    const needle = q.trim().toLowerCase();
-    const title = provenanceFor(mod).entry?.title ?? '';
-    const matchesSearch = mod.name.toLowerCase().includes(needle) || title.toLowerCase().includes(needle);
-    const matchesFilter = filter === 'all' || (filter === 'enabled' ? mod.enabled : !mod.enabled);
-    return matchesSearch && matchesFilter;
-  });
-  const pendingUpdates = provenance ? [...provenance.updates.values()] : [];
+  const packs = provenance?.packs ?? [];
+  const membership = useMemo(() => packMembership(packs), [packs]);
+  const rows = mods
+    .map((mod) => ({ mod, view: modRow(mod) }))
+    .sort((left, right) => compareContentRows(left.view, right.view));
+  const filteredRows = rows.filter(
+    ({ mod, view }) =>
+      contentRowMatches(view, q) && (filter === 'all' || (filter === 'enabled' ? mod.enabled : !mod.enabled)),
+  );
+  const filteredMods = filteredRows.map(({ mod }) => mod);
+  const pendingUpdates = provenance ? [...provenance.updates.values()].filter((update) => update.kind === 'mod') : [];
   const selection = useSelection(
     filteredMods,
     useCallback((mod: InstanceMod) => mod.name, []),
@@ -144,6 +191,7 @@ export function ModsPane({
           </Button>
         </div>
       </div>
+      <PackOrigin packs={packs} instanceId={inst.id} />
       {pendingUpdates.length > 0 && (
         <div class="cp-mods-updates" role="status">
           <Icon name="arrow-up" size={14} color="var(--accent)" />
@@ -164,18 +212,8 @@ export function ModsPane({
           {provenanceError || provenance?.updateError}
         </div>
       ) : null}
-      <div class="cp-mods-table">
-        <div class="cp-mods-table-head" aria-hidden="true">
-          <span />
-          <span />
-          <span />
-          <span>Name</span>
-          <span>Source</span>
-          <span>Size</span>
-          <span>State</span>
-          <span />
-        </div>
-        {resources.status === 'ready' && filteredMods.length === 0 ? (
+      <div class="cp-content-list">
+        {resources.status === 'ready' && filteredRows.length === 0 ? (
           <div class="cp-mods-empty-row">
             <strong>{mods.length === 0 ? 'No mods installed in this instance' : 'No mods match this filter'}</strong>
             {mods.length === 0 ? (
@@ -193,64 +231,20 @@ export function ModsPane({
             )}
           </div>
         ) : (
-          filteredMods.map((mod) => {
-            const { entry, update } = provenanceFor(mod);
-            return (
-              <div
-                class="cp-mods-table-row cp-selection-row"
-                data-disabled={!mod.enabled}
-                data-selected={selection.isSelected(mod.name)}
-                key={mod.name}
-                onContextMenu={(e) =>
-                  openContextMenu(
-                    e,
-                    modMenuItems(inst, mod, refreshAll, selectionMenuItem(selection, mod.name), { entry, update }),
-                  )
-                }
-              >
-                <span>
-                  <SelectionCheckbox
-                    selected={selection.isSelected(mod.name)}
-                    label={selectionToggleLabel(selection.isSelected(mod.name), mod.name)}
-                    onToggle={(e) => {
-                      e.stopPropagation();
-                      selection.toggle(mod.name);
-                    }}
-                  />
-                </span>
-                <span>
-                  <Icon name="puzzle" size={15} color="var(--text-dim)" />
-                </span>
-                <span class="cp-mods-file-icon">JAR</span>
-                <span class="cp-mod-name-cell">
-                  <span class="cp-resource-name" title={mod.name}>
-                    {entry?.title ?? mod.name}
-                  </span>
-                  {update && (
-                    <button
-                      type="button"
-                      class="cp-mod-update"
-                      title={`Update to ${update.latest_version_number}`}
-                      disabled={busy}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void applyModUpdates(inst, [update]);
-                      }}
-                    >
-                      <Icon name="arrow-up" size={11} stroke={2.4} />
-                      Update
-                    </button>
-                  )}
-                </span>
-                <span class="cp-mod-source" data-provider={entry ? entry.provider : 'local'}>
-                  {entry ? 'Modrinth' : 'Local'}
-                </span>
-                <span>{formatBytes(mod.size)}</span>
-                <span>{mod.enabled ? 'Enabled' : 'Disabled'}</span>
-                <span />
-              </div>
-            );
-          })
+          filteredRows.map(({ mod, view }) => (
+            <ContentRow
+              key={mod.name}
+              view={view}
+              selected={selection.isSelected(mod.name)}
+              onToggle={() => selection.toggle(mod.name)}
+              onMenu={(e) =>
+                openContextMenu(
+                  e,
+                  modMenuItems(inst, mod, refreshAll, selectionMenuItem(selection, mod.name), provenanceFor(mod)),
+                )
+              }
+            />
+          ))
         )}
       </div>
       <SelectionActionTray

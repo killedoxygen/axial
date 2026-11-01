@@ -115,8 +115,6 @@ function failed(installTarget: InstallQueueInstallItemViewModel): DownloadFailur
     operationId: 'failed-operation',
     item: installItems.installItemFromQueueInstallItem(installTarget),
     displayName: 'Loader',
-    instanceId: null,
-    instanceName: null,
     failedAt: 1,
     viewModel: {
       state_id: 'failed',
@@ -299,7 +297,7 @@ function detailHarness(inst: EnrichedInstance) {
       LaunchOutcomeNotice: 'LaunchOutcomeNotice',
     },
     ...Object.fromEntries(
-      ['Mods', 'Worlds', 'Screenshots', 'Logs', 'Settings'].map((name) => [
+      ['Mods', 'Packs', 'Worlds', 'Screenshots', 'Logs', 'Settings'].map((name) => [
         `./tabs/${name}Pane`,
         { [`${name}Pane`]: `${name}Pane` },
       ]),

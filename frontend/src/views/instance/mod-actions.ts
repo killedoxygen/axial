@@ -32,7 +32,7 @@ export async function fetchModProvenance(
   const generation = beginModProvenanceRefresh(instanceId);
   const cached = cachedModProvenance(instanceId);
   if (cached) {
-    const refreshing: ModProvenance = { entries: cached.entries, updates: new Map() };
+    const refreshing: ModProvenance = { ...cached, updates: new Map(), updateError: undefined };
     cacheModProvenance(instanceId, refreshing);
     onData(refreshing);
   }
@@ -41,7 +41,7 @@ export async function fetchModProvenance(
   const entries = new Map(
     content.entries.filter((entry) => entry.kind === 'mod').map((entry) => [entry.filename, entry]),
   );
-  const listed: ModProvenance = { entries, updates: new Map() };
+  const listed: ModProvenance = { entries, managed: content.entries, packs: content.packs ?? [], updates: new Map() };
   cacheModProvenance(instanceId, listed);
   onData(listed);
   try {
@@ -49,9 +49,9 @@ export async function fetchModProvenance(
     if (!isCurrentModProvenanceRefresh(instanceId, generation)) return;
     const updates = new Map<string, ContentUpdate>();
     for (const update of res.updates) {
-      if (update.kind === 'mod') updates.set(update.canonical_id, update);
+      updates.set(update.canonical_id, update);
     }
-    const checked: ModProvenance = { entries, updates };
+    const checked: ModProvenance = { ...listed, updates };
     cacheModProvenance(instanceId, checked);
     onData(checked);
   } catch (err) {

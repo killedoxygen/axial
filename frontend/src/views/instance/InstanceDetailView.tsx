@@ -26,6 +26,7 @@ import { fetchInstanceResources, type ResourceLoadState } from './resources';
 import { LOG_RESOURCE_POLL_MS } from './logs';
 import { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
 import { ModsPane } from './tabs/ModsPane';
+import { PacksPane } from './tabs/PacksPane';
 import { WorldsPane } from './tabs/WorldsPane';
 import { ScreenshotsPane } from './tabs/ScreenshotsPane';
 import { LogsPane } from './tabs/LogsPane';
@@ -33,11 +34,13 @@ import { SettingsPane } from './tabs/SettingsPane';
 import { InstallBarrierPane, LaunchOutcomeNotice, LaunchSplitButton } from './components/launch';
 import { useTheme } from '../../hooks/use-theme';
 
-type Tab = 'mods' | 'worlds' | 'screenshots' | 'logs' | 'settings';
+type Tab = 'mods' | 'resourcepacks' | 'shaderpacks' | 'worlds' | 'screenshots' | 'logs' | 'settings';
 type TabSelection = { instanceId: string; tab: Tab } | null;
 
 const TABS: Array<{ id: Tab; icon: IconName; label: string }> = [
   { id: 'mods', icon: 'puzzle', label: 'Mods' },
+  { id: 'resourcepacks', icon: 'image', label: 'Resource packs' },
+  { id: 'shaderpacks', icon: 'palette', label: 'Shaders' },
   { id: 'worlds', icon: 'globe', label: 'Worlds' },
   { id: 'screenshots', icon: 'image', label: 'Screenshots' },
   { id: 'logs', icon: 'terminal', label: 'Logs' },
@@ -143,8 +146,10 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
   const v = versionById(inst.version_id);
   const showModsTab = inst.version_display.supports_mods;
   const currentTab = selectedTabForCurrentInstance ?? defaultTabFor(inst);
-  const activeTab: Tab = !showModsTab && currentTab === 'mods' ? 'worlds' : currentTab;
-  const visibleTabs = showModsTab ? TABS : TABS.filter((t) => t.id !== 'mods');
+  // Mods and shader loaders both need a mod loader; resource packs work everywhere.
+  const modTabs: Tab[] = ['mods', 'shaderpacks'];
+  const activeTab: Tab = !showModsTab && modTabs.includes(currentTab) ? 'worlds' : currentTab;
+  const visibleTabs = showModsTab ? TABS : TABS.filter((t) => !modTabs.includes(t.id));
   const auroraHue = guardedInstanceHue(inst, theme);
   const launchAction = inst.launch_action;
   const installStatus = instanceInstallStatus(inst, v);
@@ -349,6 +354,9 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
         )}
         {!installLocked && activeTab === 'mods' && (
           <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />
+        )}
+        {!installLocked && (activeTab === 'resourcepacks' || activeTab === 'shaderpacks') && (
+          <PacksPane key={activeTab} inst={inst} folder={activeTab} />
         )}
         {!installLocked && activeTab === 'worlds' && (
           <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />

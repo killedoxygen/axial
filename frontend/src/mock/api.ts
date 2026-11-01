@@ -6,6 +6,9 @@ import type { FeatureFlagViewModel, FlagsResponse } from '../types-flags';
 import type { UpdateFlow } from '../generated/UpdateFlow';
 import type { UpdateInfo } from '../generated/UpdateInfo';
 import type { UpdateSnapshot } from '../generated/UpdateSnapshot';
+import type { ContentFileMetadata } from '../generated/ContentFileMetadata';
+import type { InstancePackInfo } from '../generated/InstancePackInfo';
+import type { InstallQueueFailureViewModel } from '../types-install';
 import type { Version } from '../types-version';
 import type {
   CanonicalContent,
@@ -16,6 +19,7 @@ import type {
   ContentSelection,
   ContentUpdatesResponse,
   InstanceContentEntry,
+  InstanceContentPack,
   InstanceContentResponse,
   ModpackFilesPlan,
   ModpackTarget,
@@ -504,27 +508,226 @@ function mockConflictsFor(canonicalIds: string[], installed: InstanceContentEntr
   );
 }
 
+function mockEntry(
+  canonicalId: string,
+  title: string,
+  kind: ContentKind,
+  version: string,
+  filename: string,
+): InstanceContentEntry {
+  const projectId = canonicalId.replace('modrinth:', '');
+  return {
+    canonical_id: canonicalId,
+    title,
+    kind,
+    provider: 'modrinth',
+    project_id: projectId,
+    version_id: `${projectId}-${version}`,
+    filename,
+    enabled: true,
+  };
+}
+
 const mockInstanceContent: Record<string, InstanceContentEntry[]> = {
   'mock-fabric-lab': [
+    { ...mockEntry('modrinth:P7dR8mSH', 'Fabric API', 'mod', '0.129.0', 'fabric-api-0.129.0+1.21.5.jar') },
+    mockEntry('modrinth:AANobbMI', 'Sodium', 'mod', '0.7.2', 'sodium-fabric-0.7.2+mc1.21.5.jar'),
+    mockEntry('modrinth:gvQqBUqZ', 'Lithium', 'mod', '0.17.2', 'lithium-fabric-0.17.2+mc1.21.5.jar'),
+    mockEntry('modrinth:YL57xq9U', 'Iris Shaders', 'mod', '1.9.1', 'iris-fabric-1.9.1+mc1.21.5.jar'),
+    mockEntry('modrinth:mOgUt4GM', 'Mod Menu', 'mod', '14.0.0', 'modmenu-14.0.0.jar'),
+    mockEntry('modrinth:faithful32', 'Faithful 32x', 'resource_pack', '1.21.4', 'Faithful 32x - 1.21.4.zip'),
+    mockEntry(
+      'modrinth:complementary',
+      'Complementary Shaders',
+      'shader_pack',
+      'r5.4',
+      'ComplementaryReimagined_r5.4.zip',
+    ),
+  ],
+};
+
+const mockInstancePacks: Record<string, InstanceContentPack[]> = {
+  'mock-fabric-lab': [
     {
-      canonical_id: 'modrinth:P7dR8mSH',
-      title: 'Fabric API',
-      kind: 'mod',
-      provider: 'modrinth',
-      project_id: 'P7dR8mSH',
-      version_id: 'fabric-api-mock-1',
-      filename: 'fabric-api.jar',
-      enabled: true,
+      canonical_id: 'modrinth:1KVo5zza',
+      project_id: '1KVo5zza',
+      title: 'Fabulously Optimized',
+      version_id: '1KVo5zza-6.4.0',
+      version_number: '6.4.0',
+      paths: [
+        'mods/fabric-api-0.129.0+1.21.5.jar',
+        'mods/sodium-fabric-0.7.2+mc1.21.5.jar',
+        'mods/lithium-fabric-0.17.2+mc1.21.5.jar',
+        'mods/iris-fabric-1.9.1+mc1.21.5.jar',
+        'mods/entityculling-fabric-1.7.4-mc1.21.5.jar',
+        'resourcepacks/Faithful 32x - 1.21.4.zip',
+      ],
     },
   ],
 };
 
 const mockLocalMods: Record<string, InstanceMod[]> = {
   'mock-fabric-lab': [
+    { name: 'entityculling-fabric-1.7.4-mc1.21.5.jar', size: 312_000, modified_at: daysAgo(12), enabled: true },
+    { name: 'appleskin-fabric-mc1.21.5-3.0.6.jar', size: 1_020_000, modified_at: daysAgo(20), enabled: true },
     { name: 'localcraft-tweaks-1.2.3.jar', size: 182_000, modified_at: daysAgo(30), enabled: true },
     { name: 'handmade-patch.jar.disabled', size: 96_000, modified_at: daysAgo(45), enabled: false },
   ],
 };
+
+/** What each jar's own fabric.mod.json reports, keyed by its enabled filename. */
+const mockModMetadata: Record<string, ContentFileMetadata> = {
+  'fabric-api-0.129.0+1.21.5.jar': {
+    title: 'Fabric API',
+    version: '0.129.0+1.21.5',
+    authors: ['FabricMC'],
+    icon: true,
+  },
+  'sodium-fabric-0.7.2+mc1.21.5.jar': {
+    title: 'Sodium',
+    version: '0.7.2+mc1.21.5',
+    authors: ['JellySquid', 'IMS'],
+    icon: true,
+  },
+  'lithium-fabric-0.17.2+mc1.21.5.jar': {
+    title: 'Lithium',
+    version: '0.17.2+mc1.21.5',
+    authors: ['2No2Name'],
+    icon: true,
+  },
+  'iris-fabric-1.9.1+mc1.21.5.jar': {
+    title: 'Iris',
+    version: '1.9.1+mc1.21.5',
+    authors: ['coderbot', 'IMS'],
+    icon: true,
+  },
+  'modmenu-14.0.0.jar': { title: 'Mod Menu', version: '14.0.0', authors: ['Prospector', 'Terraformers'], icon: true },
+  'entityculling-fabric-1.7.4-mc1.21.5.jar': {
+    title: 'EntityCulling',
+    version: '1.7.4',
+    authors: ['tr7zw'],
+    icon: true,
+  },
+  'appleskin-fabric-mc1.21.5-3.0.6.jar': {
+    title: 'AppleSkin',
+    version: '3.0.6+mc1.21.5',
+    authors: ['squeek502'],
+    icon: true,
+  },
+  'localcraft-tweaks-1.2.3.jar': { title: 'Localcraft Tweaks', version: '1.2.3', authors: ['you'], icon: false },
+  'handmade-patch.jar': { authors: [], icon: false },
+};
+
+const mockLocalPacks: Record<string, Record<'resourcepacks' | 'shaderpacks', InstancePackInfo[]>> = {
+  'mock-fabric-lab': {
+    resourcepacks: [
+      {
+        name: 'Stay True.zip',
+        directory: false,
+        size: 8_400_000,
+        modified_at: daysAgo(18),
+        enabled: true,
+        metadata: {
+          description: 'A vanilla-styled overhaul that keeps the game feeling like home',
+          authors: [],
+          icon: true,
+        },
+      },
+      {
+        name: 'Unpacked tweaks',
+        directory: true,
+        modified_at: '',
+        enabled: true,
+        metadata: { description: 'Personal texture fixes', authors: [], icon: false },
+      },
+    ],
+    shaderpacks: [
+      {
+        name: 'BSL_v8.4.01.zip',
+        directory: false,
+        size: 5_200_000,
+        modified_at: daysAgo(9),
+        enabled: true,
+        metadata: { authors: [], icon: false },
+      },
+    ],
+  },
+};
+
+const mockPackMetadata: Record<string, ContentFileMetadata> = {
+  'Faithful 32x - 1.21.4.zip': {
+    description: 'Faithful 32x for 1.21.4, the classic look at twice the detail',
+    authors: [],
+    icon: true,
+  },
+};
+
+function mockPacks(instanceId: string, folder: 'resourcepacks' | 'shaderpacks'): InstancePackInfo[] {
+  findInstance(instanceId);
+  const kind = folder === 'resourcepacks' ? 'resource_pack' : 'shader_pack';
+  const managed = (mockInstanceContent[instanceId] ?? [])
+    .filter((entry) => entry.kind === kind)
+    .map(
+      (entry, index): InstancePackInfo => ({
+        name: entry.enabled ? entry.filename : `${entry.filename}.disabled`,
+        directory: false,
+        size: 3_100_000 + index * 1_700_000,
+        modified_at: daysAgo(index + 3),
+        enabled: entry.enabled,
+        metadata: mockPackMetadata[entry.filename] ?? { authors: [], icon: false },
+      }),
+    );
+  return [...managed, ...(mockLocalPacks[instanceId]?.[folder] ?? [])].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function mockDeletePack(instanceId: string, folder: 'resourcepacks' | 'shaderpacks', name: string): unknown {
+  const local = mockLocalPacks[instanceId];
+  if (local) local[folder] = local[folder].filter((pack) => pack.name !== name);
+  return { status: 'ok' };
+}
+
+function mockModMetadataList(instanceId: string): Array<{ name: string; metadata: ContentFileMetadata }> {
+  return mockInstanceResources(instanceId).mods.map((mod) => ({
+    name: mod.name,
+    metadata: mockModMetadata[modBaseName(mod.name)] ?? { authors: [], icon: false },
+  }));
+}
+
+let mockQueueFailures: InstallQueueFailureViewModel[] = [
+  {
+    failed_at_ms: Date.parse('2026-07-06T19:42:00.000Z'),
+    queue_id: 'mock-failed-content',
+    install_id: 'mock-failed-content',
+    operation_id: '5b0e6a35-1d43-4c5e-9a54-1f4b9f0f3c21',
+    label: 'Install Simple Voice Chat',
+    install_item: {
+      version_id: MOCK_FABRIC_VERSION_ID,
+      content: {
+        instance_id: 'mock-fabric-lab',
+        label: 'Install Simple Voice Chat',
+        action: {
+          kind: 'install',
+          selections: [{ canonical_id: 'modrinth:9eGKb6K1', kind: 'mod' }],
+          allow_incompatible: false,
+        },
+      },
+    },
+    failure_view_model: {
+      state_id: 'failed',
+      title: 'Install failed',
+      tone: 'err',
+      summary: 'Simple Voice Chat is incompatible with Lithium, which is already installed.',
+      details: [],
+      retry_action: { action: 'retry', label: 'Retry', enabled: true },
+      dismiss_action: { action: 'dismiss', label: 'Dismiss', enabled: true },
+    },
+  },
+];
+
+function mockDismissFailure(operationId: string): InstallQueueStateResponse {
+  mockQueueFailures = mockQueueFailures.filter((failure) => failure.operation_id !== operationId);
+  return mockEmptyInstallQueue();
+}
 
 function mockCatalogItem(canonicalId: string): CanonicalContent | undefined {
   return Object.values(mockContentCatalog)
@@ -737,7 +940,7 @@ function mockContentInstall(body: unknown): InstallQueueStateResponse {
 }
 
 function mockInstanceContentList(instanceId: string): InstanceContentResponse {
-  return { entries: mockInstanceContent[instanceId] ?? [] };
+  return { entries: mockInstanceContent[instanceId] ?? [], packs: mockInstancePacks[instanceId] ?? [] };
 }
 
 function mockContentUninstall(instanceId: string, canonicalId: string): InstallQueueStateResponse {
@@ -756,7 +959,7 @@ function mockEmptyInstallQueue(message?: string, detail?: string): InstallQueueS
     queue_epoch: 'mock-queue',
     revision: 0,
     registry_revision: 0,
-    failures: [],
+    failures: mockQueueFailures,
     active: null,
     items: [],
     view_model: {
@@ -1016,6 +1219,14 @@ const handlers: Record<string, Handler> = {
   'GET /instances/{id}/content': (_body, path) => mockInstanceContentList(instanceIdFromContentPath(path)),
   'GET /instances/{id}/content/updates': (_body, path) => mockContentUpdates(instanceIdFromSubPath(path)),
   'GET /instances/{id}/resources': (_body, path) => mockInstanceResources(instanceIdFromSubPath(path)),
+  'GET /instances/{id}/mods/metadata': (_body, path) => mockModMetadataList(instanceIdFromSubPath(path)),
+  'GET /instances/{id}/resourcepacks': (_body, path) => mockPacks(instanceIdFromSubPath(path), 'resourcepacks'),
+  'GET /instances/{id}/shaderpacks': (_body, path) => mockPacks(instanceIdFromSubPath(path), 'shaderpacks'),
+  'DELETE /instances/{id}/resourcepacks/{name}': (_body, path) =>
+    mockDeletePack(instanceIdFromSubPath(path), 'resourcepacks', lastPathSegment(path)),
+  'DELETE /instances/{id}/shaderpacks/{name}': (_body, path) =>
+    mockDeletePack(instanceIdFromSubPath(path), 'shaderpacks', lastPathSegment(path)),
+  'DELETE /install/queue/failures/{id}': (_body, path) => mockDismissFailure(lastPathSegment(path)),
   'PUT /instances/{id}/mods/{name}': (body, path) =>
     mockSetModEnabled(instanceIdFromSubPath(path), modNameFromPath(path), body),
   'DELETE /instances/{id}/mods/{name}': (_body, path) =>
@@ -1218,7 +1429,15 @@ function handlerKey(method: string, path: string): string {
   if (/^\/instances\/[^/]+\/content\/uninstall$/.test(path)) return `${method} /instances/{id}/content/uninstall`;
   if (/^\/instances\/[^/]+\/content\/updates$/.test(path)) return `${method} /instances/{id}/content/updates`;
   if (/^\/instances\/[^/]+\/resources$/.test(path)) return `${method} /instances/{id}/resources`;
+  if (/^\/instances\/[^/]+\/mods\/metadata$/.test(path)) return `${method} /instances/{id}/mods/metadata`;
   if (/^\/instances\/[^/]+\/mods\/[^/]+$/.test(path)) return `${method} /instances/{id}/mods/{name}`;
+  if (/^\/instances\/[^/]+\/(resourcepacks|shaderpacks)$/.test(path)) {
+    return `${method} /instances/{id}/${path.split('/')[3]}`;
+  }
+  if (/^\/instances\/[^/]+\/(resourcepacks|shaderpacks)\/[^/]+$/.test(path)) {
+    return `${method} /instances/{id}/${path.split('/')[3]}/{name}`;
+  }
+  if (/^\/install\/queue\/failures\/[^/]+$/.test(path)) return `${method} /install/queue/failures/{id}`;
   if (/^\/instances\/[^/]+$/.test(path) && path !== '/instances/create-view') return `${method} /instances/{id}`;
   return `${method} ${path}`;
 }
@@ -1235,6 +1454,10 @@ function instanceIdFromContentPath(path: string | undefined): string {
 function instanceIdFromSubPath(path: string | undefined): string {
   const match = /^\/instances\/([^/]+)\//.exec(path ?? '');
   return match ? decodeURIComponent(match[1]) : '';
+}
+
+function lastPathSegment(path: string | undefined): string {
+  return decodeURIComponent((path ?? '').split('/').pop() ?? '');
 }
 
 function modNameFromPath(path: string | undefined): string {
