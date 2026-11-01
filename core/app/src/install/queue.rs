@@ -3361,6 +3361,16 @@ fn validate_content_request(
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         })
     }
+    /// A file-imported pack is named by its archive's SHA-512.
+    fn pack(value: &str) -> bool {
+        canonical(value)
+            || value.strip_prefix("local:").is_some_and(|hash| {
+                hash.len() == 128
+                    && hash
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            })
+    }
     if !text(label, 256) {
         return Err(InstallError::InvalidRequest);
     }
@@ -3389,7 +3399,7 @@ fn validate_content_request(
         InstallQueueContentActionRequest::Uninstall { canonical_ids } => {
             !canonical_ids.is_empty()
                 && canonical_ids.len() <= 256
-                && canonical_ids.iter().all(|id| canonical(id))
+                && canonical_ids.iter().all(|id| pack(id))
                 && canonical_ids
                     .iter()
                     .collect::<std::collections::BTreeSet<_>>()
@@ -3402,7 +3412,7 @@ fn validate_content_request(
             selected_file_ids,
             include_overrides,
         } => {
-            canonical(canonical_id)
+            pack(canonical_id)
                 && text(version_id, 256)
                 && selected_file_ids.len() <= 500
                 && selected_file_ids.iter().all(|id| text(id, 2048))
@@ -3725,6 +3735,51 @@ pub(crate) mod tests {
     use super::*;
     use crate::library::LibraryOpenOutcome;
     use serde_json::Value;
+
+    #[test]
+    fn local_pack_ids_are_admitted_only_as_exact_archive_hashes_for_pack_actions() {
+        let local = format!("local:{}", "ab".repeat(64));
+        let modpack = |id: &str| InstallQueueContentActionRequest::Modpack {
+            canonical_id: id.into(),
+            version_id: "ab".repeat(64),
+            selected_file_ids: Vec::new(),
+            include_overrides: true,
+        };
+        validate_content_request("Setting up pack", &modpack(&local)).unwrap();
+        validate_content_request(
+            "Remove pack",
+            &InstallQueueContentActionRequest::Uninstall {
+                canonical_ids: vec![local.clone()],
+            },
+        )
+        .unwrap();
+        for id in [
+            format!("local:{}", "AB".repeat(64)),
+            format!("local:{}", "ab".repeat(63)),
+            "local:../x".into(),
+            "other:abc".into(),
+        ] {
+            assert!(
+                validate_content_request("Pack", &modpack(&id)).is_err(),
+                "{id}"
+            );
+        }
+        assert!(
+            validate_content_request(
+                "Install",
+                &InstallQueueContentActionRequest::Install {
+                    selections: vec![crate::content::resolve::ResolutionSelection {
+                        canonical_id: local,
+                        version_id: None,
+                        kind: ContentKind::Mod,
+                    }],
+                    allow_incompatible: false,
+                    replace_files: Vec::new(),
+                },
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn content_refusals_keep_their_cause_and_block_futile_retries() {

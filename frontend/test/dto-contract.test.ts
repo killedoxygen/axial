@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { contentCompatResponse, contentPageResponse, resolutionPlanResponse } from '../src/dto-content';
+import {
+  contentCompatResponse,
+  contentPageResponse,
+  instanceContentResponse,
+  resolutionPlanResponse,
+} from '../src/dto-content';
 import { dtoRecord } from '../src/dto-contract';
 import { configResponse, instancesResponse } from '../src/dto-core';
 import { installQueueStateResponse } from '../src/dto-install';
@@ -36,14 +41,48 @@ test('content plans accept omitted empty dependencies from the live Rust respons
     total_download_bytes: 971552,
   };
   assert.deepEqual(resolutionPlanResponse(plan).items[0]?.dependencies, []);
-  const parse = (dependencies: unknown) =>
-    resolutionPlanResponse({ ...plan, items: [{ ...item, dependencies }] });
+  const parse = (dependencies: unknown) => resolutionPlanResponse({ ...plan, items: [{ ...item, dependencies }] });
   assert.deepEqual(parse([]).items[0]?.dependencies, []);
   const dependencies = [{ project_id: 'fabric-api', kind: 'required' }];
   assert.equal(parse(dependencies).items[0]?.dependencies[0]?.project_id, 'fabric-api');
   for (const invalid of [null, {}, 'none', [null], [{ kind: 'unknown' }]]) {
     assert.throws(() => parse(invalid), /Content (plan dependencies|dependency)/);
   }
+});
+
+test('instance content keeps a local modpack provider from the live Rust response', () => {
+  // Captured from /instances/{id}/content after importing an unpublished .mrpack.
+  const hash =
+    '3bc14fa86e4be2e65df007db609cfba4575d9757ec2aa1636af567c9ea44c58eec623a23a170b4e953917c1849c64ccafd2390e8b88985e7c36f30667f5824e0';
+  const response = instanceContentResponse({
+    entries: [
+      {
+        canonical_id: 'modrinth:yfDziwn1',
+        enabled: true,
+        filename: 'SodiumTranslations.zip',
+        kind: 'resource_pack',
+        project_id: 'yfDziwn1',
+        provider: 'modrinth',
+        title: 'Translations for Sodium',
+        version_id: 'bo4O33l6',
+      },
+    ],
+    packs: [
+      {
+        canonical_id: `local:${hash}`,
+        paths: ['resourcepacks/SodiumTranslations.zip', 'config/axial-smoke.txt', 'options.txt'],
+        project_id: hash,
+        provider: 'local',
+        title: 'Private Smoke Pack',
+        version_id: hash,
+        version_number: '1.0.0',
+      },
+    ],
+  });
+  assert.equal(response.entries[0]?.provider, 'modrinth');
+  assert.equal(response.packs[0]?.provider, 'local');
+  assert.equal(response.packs[0]?.title, 'Private Smoke Pack');
+  assert.throws(() => instanceContentResponse({ entries: [], packs: [{ ...response.packs[0], provider: 'other' }] }));
 });
 
 test('content compatibility maps the Rust empty Vanilla key without accepting malformed loaders', () => {
@@ -58,8 +97,7 @@ test('content compatibility maps the Rust empty Vanilla key without accepting ma
     complete: true,
     drops: [],
   };
-  const parse = (loader: unknown) =>
-    contentCompatResponse({ candidates: [{ ...candidate, loader }] }).candidates[0]!;
+  const parse = (loader: unknown) => contentCompatResponse({ candidates: [{ ...candidate, loader }] }).candidates[0]!;
   assert.equal(parse('').loader, 'vanilla');
   assert.equal(parse('').selection_id, 'vanilla|1.20.1');
   for (const loader of ['vanilla', 'fabric', 'quilt', 'forge', 'neoforge']) {
