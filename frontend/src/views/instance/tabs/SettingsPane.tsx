@@ -314,7 +314,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
             inherit={
               windowOverridden
                 ? undefined
-                : { active: true, label: `Inherits global (${globalWidth} × ${globalHeight})` }
+                : { active: true, label: `Global size\n${globalWidth} × ${globalHeight}` }
             }
             onCommit={(w, h) => commit({ window_width: w, window_height: h }, { label: 'window size' })}
           />

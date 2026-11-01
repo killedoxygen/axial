@@ -129,6 +129,9 @@
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
+.cp-notice-copy > .cp-btn {
+  margin-top: 8px;
+}
 .cp-notice-details {
   margin-top: 8px;
   max-width: 100%;
@@ -391,6 +394,13 @@
   top: 10px;
   right: 10px;
   z-index: 2;
+}
+/* Selection boxes appear on hover or focus, and stay visible once anything is selected. */
+.cp-cover-grid:not([data-selecting='true']) .cp-icard:not(:hover):not(:focus-within) .cp-icard-select {
+  opacity: 0;
+}
+.cp-icard-select {
+  transition: opacity 140ms ease;
 }
 .cp-icard-play {
   position: absolute;

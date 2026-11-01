@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect } from 'preact/hooks';
 import { Button } from '../../ui/Atoms';
+import { Icon } from '../../ui/Icons';
 import { instances } from '../../store';
 import { checkInstanceDeletionFlow, recoverInstanceDeletionFlow } from '../instance/instance-actions';
 import {
@@ -17,7 +18,10 @@ export function PendingRemovalsNotice(): JSX.Element | null {
   const error = deletionDiscoveryError.value;
   if (pending.length === 0 && !error) return null;
   return (
-    <div class="cp-notice" aria-live="polite">
+    <div class="cp-notice" data-tone={error ? 'error' : 'warned'} aria-live="polite">
+      <div class="cp-notice-mark">
+        <Icon name="alert" size={16} />
+      </div>
       <div class="cp-notice-copy">
         <strong>Unfinished instance removals</strong>
         {error && <p>{error}</p>}

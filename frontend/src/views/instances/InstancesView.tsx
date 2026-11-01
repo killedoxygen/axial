@@ -185,7 +185,7 @@ export function InstancesView(): JSX.Element {
           )}
         </div>
       ) : view === 'grid' ? (
-        <div class="cp-cover-grid">
+        <div class="cp-cover-grid" data-selecting={selection.selectedCount > 0}>
           {filtered.map((i) => (
             <InstanceCard
               key={i.id}

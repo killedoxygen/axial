@@ -201,6 +201,7 @@ function harness() {
       },
       'preact/hooks': { useEffect: () => undefined },
       '../../ui/Atoms': { Button: 'Button' },
+      '../../ui/Icons': { Icon: 'Icon' },
       '../../store': store,
       '../instance/instance-actions': actions,
       '../instance/deletions': helper,
