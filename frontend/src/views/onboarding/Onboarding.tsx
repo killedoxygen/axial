@@ -14,7 +14,11 @@ import { config, systemInfo } from '../../store';
 import { showOnboardingOverlay } from '../../ui-state';
 import { toast } from '../../toast';
 import { clampPlayerNameInput } from '../../player-name';
-import { refreshAccountSkin } from '../../player-skin';
+import { launcherSkinAccountKey, minecraftProfileSkinTextureSrc, refreshAccountSkin, setSelectedSkin } from '../../player-skin';
+import { DEFAULT_SKINS } from '../../default-skins';
+import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
+import { activeMinecraftCape, activeMinecraftSkin, capeFileUrl } from '../accounts/api';
+import { LazySkinThreePreview } from '../accounts/LazySkinThreePreview';
 import { errMessage, getMemoryRecommendation, validateUsername } from '../../utils';
 import { hasNativeDesktopRuntime } from '../../native';
 import type { AuthStatusRecord } from '../accounts/types';
@@ -132,6 +136,42 @@ function Stepper({
   );
 }
 
+const AVATAR_FIT = { top: 0.16, bottom: 0.1, side: 0.12 };
+
+/** The player's character, shown beside every step and updated live. */
+function Avatar({
+  src,
+  capeSrc,
+  variant,
+  name,
+  nametag,
+}: {
+  src: string;
+  capeSrc?: string;
+  variant: 'classic' | 'slim';
+  name: string;
+  nametag: string | null;
+}): JSX.Element {
+  return (
+    <div class="cp-ob-avatar" aria-hidden="true">
+      <div class="cp-ob-avatar-glow" />
+      <div class="cp-ob-avatar-figure" key={src}>
+        <LazySkinThreePreview
+          src={src}
+          capeSrc={capeSrc}
+          name={name}
+          nametag={nametag}
+          variant={variant}
+          side="front"
+          showOuterLayers
+          fitPadding={AVATAR_FIT}
+          showHint={false}
+        />
+      </div>
+    </div>
+  );
+}
+
 export function Onboarding(): JSX.Element | null {
   const totalGB = systemInfo.value?.total_memory_mb ? Math.floor(systemInfo.value.total_memory_mb / 1024) : 16;
   const rec = getMemoryRecommendation(totalGB);
@@ -148,6 +188,8 @@ export function Onboarding(): JSX.Element | null {
   const [dissolving, setDissolving] = useState(false);
   // The focused input hint shows Enter because arrow keys move the text cursor.
   const [nameFocused, setNameFocused] = useState(false);
+  // Null until the player picks a face; only then is an existing account's look replaced.
+  const [skinId, setSkinId] = useState<string | null>(null);
   const { status: authStatus, state: authState } = accountsSnapshot.value;
   const onlineAfterOnboarding = statusOnlineReady(authStatus);
   const microsoftSignInAvailable = hasNativeDesktopRuntime() || authStatus?.login_available !== false;
@@ -247,6 +289,10 @@ export function Onboarding(): JSX.Element | null {
         } else if (!(await createOfflineAccount(username.trim()))) {
           throw new Error(accountsNotice.value ?? 'Could not create the offline account. Try again.');
         }
+        const offline = activeAccount();
+        if (offline && (skinId !== null || !existing)) {
+          setSelectedSkin(`default:${skinId ?? DEFAULT_SKINS[0].id}`, launcherSkinAccountKey(offline.account_id));
+        }
         patch.username = username.trim();
         patch.launch_auth_mode = 'offline';
       }
@@ -324,6 +370,28 @@ export function Onboarding(): JSX.Element | null {
     };
   });
 
+  const chosenSkin = DEFAULT_SKINS.find((skin) => skin.id === skinId) ?? DEFAULT_SKINS[0];
+  const signedInProfile = onlineAfterOnboarding ? (activeAccount()?.minecraft_profile ?? authStatus?.minecraft_profile ?? null) : null;
+  const profileSkin = activeMinecraftSkin(signedInProfile ?? undefined);
+  const profileCape = activeMinecraftCape(signedInProfile ?? undefined);
+  const profileSkinSrc = signedInProfile && profileSkin ? minecraftProfileSkinTextureSrc(signedInProfile) : null;
+  const avatar = profileSkinSrc ? (
+    <Avatar
+      src={profileSkinSrc}
+      capeSrc={profileCape ? capeFileUrl(profileCape) : undefined}
+      variant={profileSkin?.variant === 'slim' ? 'slim' : 'classic'}
+      name={signedInProfile?.name ?? 'Player'}
+      nametag={signedInProfile?.name ?? null}
+    />
+  ) : (
+    <Avatar
+      src={chosenSkin.src}
+      variant={chosenSkin.variant}
+      name={chosenSkin.name}
+      nametag={username.trim() || null}
+    />
+  );
+
   let headline = '';
   let subline: JSX.Element | null = null;
   let widget: JSX.Element;
@@ -335,42 +403,25 @@ export function Onboarding(): JSX.Element | null {
     const authStateText = authSignedIn
       ? 'Signed in'
       : microsoftLogin.busy
-        ? 'Starting'
+        ? 'Waiting for browser'
         : authState === 'loading'
           ? 'Checking'
           : authUnavailable
             ? 'Unavailable'
-            : 'Sign in';
+            : null;
     const authProfileName = authStatus?.minecraft_profile?.name ?? authStatus?.username ?? '';
     const authLabel =
-      authSignedIn && authProfileName ? `Signed in as ${authProfileName}` : 'Sign in with your Minecraft account';
-    headline = 'What should Minecraft call you?';
+      authSignedIn && authProfileName ? `Welcome back, ${authProfileName}` : 'Sign in with Microsoft';
+    headline = "Who's playing?";
+    subline = (
+      <p class="cp-ob-subline">
+        {authSignedIn
+          ? 'Your Minecraft profile and skin are ready.'
+          : 'Sign in to bring your Minecraft profile and skin, or pick a name to play offline.'}
+      </p>
+    );
     widget = (
       <div class="cp-ob-widget cp-ob-namefield">
-        <div class="cp-ob-feedback" data-state={showNameError ? 'error' : nameValid ? 'hint' : 'idle'}>
-          {showNameError ? (
-            <span class="cp-ob-feedback-error">{nameError}</span>
-          ) : nameValid ? (
-            <span class="cp-ob-feedback-hint">
-              Press <kbd>Enter</kbd>
-              {!nameFocused && (
-                <>
-                  {' '}
-                  or <kbd>→</kbd>
-                </>
-              )}{' '}
-              to continue
-            </span>
-          ) : null}
-        </div>
-        <Input
-          value={username}
-          onChange={(v) => setUsername(clampPlayerNameInput(v))}
-          placeholder="Your name"
-          autoFocus
-          onFocus={() => setNameFocused(true)}
-          onBlur={() => setNameFocused(false)}
-        />
         <button
           class="cp-ob-msa"
           data-state={
@@ -387,12 +438,62 @@ export function Onboarding(): JSX.Element | null {
         >
           <MicrosoftMark class="cp-ob-msa-mark" />
           <span class="cp-ob-msa-label">{authLabel}</span>
-          <span class="cp-ob-msa-state">{authStateText}</span>
+          {authStateText && <span class="cp-ob-msa-state">{authStateText}</span>}
         </button>
         {microsoftLogin.message && (
           <div class="cp-ob-auth-message" data-tone={microsoftLogin.message.tone}>
             {microsoftLogin.message.text}
           </div>
+        )}
+        {!authSignedIn && (
+          <>
+            <div class="cp-ob-divider">
+              <span>or play offline</span>
+            </div>
+            <Input
+              value={username}
+              onChange={(v) => setUsername(clampPlayerNameInput(v))}
+              placeholder="Pick a player name"
+              autoFocus
+              onFocus={() => setNameFocused(true)}
+              onBlur={() => setNameFocused(false)}
+            />
+            <div class="cp-ob-feedback" data-state={showNameError ? 'error' : nameValid ? 'hint' : 'idle'}>
+              {showNameError ? (
+                <span class="cp-ob-feedback-error">{nameError}</span>
+              ) : nameValid ? (
+                <span class="cp-ob-feedback-hint">
+                  Press <kbd>Enter</kbd>
+                  {!nameFocused && (
+                    <>
+                      {' '}
+                      or <kbd>→</kbd>
+                    </>
+                  )}{' '}
+                  to continue
+                </span>
+              ) : null}
+            </div>
+            <div class="cp-ob-looks" role="radiogroup" aria-label="Your look in Axial">
+              {DEFAULT_SKINS.map((skin) => (
+                <button
+                  key={skin.id}
+                  type="button"
+                  role="radio"
+                  class="cp-ob-look"
+                  aria-checked={chosenSkin.id === skin.id}
+                  title={skin.name}
+                  onClick={() => {
+                    setSkinId(skin.id);
+                    Sound.ui('soft');
+                  }}
+                >
+                  <PlayerHeadPreview textureSrc={skin.src} size={30} radius={7} ariaLabel={skin.name} />
+                </button>
+              ))}
+            </div>
+            <p class="cp-ob-looks-note">Your look in Axial. Sign in to use your own skin in game.</p>
+          </>
         )}
       </div>
     );
@@ -470,6 +571,7 @@ export function Onboarding(): JSX.Element | null {
       </div>
 
       <main class="cp-ob-main">
+        {avatar}
         <div class="cp-ob-column">
           <div class="cp-ob-stage" key={stage}>
             <h1 class="cp-ob-headline">
