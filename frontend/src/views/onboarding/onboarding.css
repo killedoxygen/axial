@@ -459,7 +459,6 @@ button.cp-ob-stepper-item:focus-visible {
   font-size: 10.5px;
   font-weight: 600;
   letter-spacing: 0;
-  text-transform: uppercase;
   padding: 3px 8px;
   border-radius: 999px;
   background: var(--surface-3);
@@ -484,8 +483,9 @@ button.cp-ob-stepper-item:focus-visible {
 .cp-ob-prefs {
   display: flex;
   flex-direction: column;
+  gap: 4px;
   margin: 4px 0 0;
-  padding: 0;
+  padding: 8px 4px;
   list-style: none;
   border-radius: var(--r-sm);
   background: var(--surface-2);
@@ -497,10 +497,6 @@ button.cp-ob-stepper-item:focus-visible {
   gap: 12px;
   padding: 10px 14px;
   color: var(--text-dim);
-}
-
-.cp-ob-pref + .cp-ob-pref {
-  border-top: 1px solid color-mix(in oklab, var(--text) 6%, transparent);
 }
 
 .cp-ob-pref-text {
@@ -569,23 +565,19 @@ button.cp-ob-stepper-item:focus-visible {
 .cp-ob-avatar {
   position: relative;
   flex-shrink: 0;
-  width: clamp(220px, 26vw, 320px);
-  height: min(460px, 62vh);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: clamp(260px, 30vw, 360px);
+  height: min(520px, 70vh);
   animation: cp-ob-stage-in 480ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 
-.cp-ob-avatar-glow {
-  position: absolute;
-  inset: 12% 4% 6%;
-  border-radius: 50%;
-  background: radial-gradient(closest-side, color-mix(in oklab, var(--accent) 30%, transparent), transparent);
-  filter: blur(18px);
-  transition: background 320ms ease;
-}
-
 .cp-ob-avatar-figure {
-  position: absolute;
-  inset: 0;
+  position: relative;
+  flex: 1;
+  width: 100%;
+  min-height: 0;
   animation: cp-ob-avatar-swap 420ms cubic-bezier(0.34, 1.4, 0.64, 1) both;
 }
 
@@ -606,7 +598,6 @@ button.cp-ob-stepper-item:focus-visible {
   }
 }
 
-/* Sign-in leads; offline play is the alternative below it. */
 .cp-ob-msa[data-state='ready'] {
   background: color-mix(in oklab, var(--accent) 12%, var(--surface-2));
   border-color: color-mix(in oklab, var(--accent) 34%, transparent);
@@ -617,33 +608,37 @@ button.cp-ob-stepper-item:focus-visible {
   background: color-mix(in oklab, var(--accent) 18%, var(--surface-2));
 }
 
-.cp-ob-divider {
+.cp-ob-namefield {
+  gap: 28px;
+}
+
+.cp-ob-offline {
   display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cp-ob-offline .cp-ob-feedback {
+  margin: 0;
+}
+
+.cp-ob-looks-label {
+  margin-top: 8px;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+
+.cp-ob-avatar-caption {
+  display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 12px;
-  color: var(--text-mute);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.cp-ob-divider::before,
-.cp-ob-divider::after {
-  content: '';
-  flex: 1;
-  height: 1px;
-  background: color-mix(in oklab, var(--text) 8%, transparent);
-}
-
-.cp-ob-namefield .cp-ob-feedback {
-  margin: -6px 0 0;
+  gap: 6px;
 }
 
 .cp-ob-looks {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 10px;
 }
 
 .cp-ob-look {
@@ -672,12 +667,6 @@ button.cp-ob-stepper-item:focus-visible {
   box-shadow: var(--focus-ring);
 }
 
-.cp-ob-looks-note {
-  margin: -4px 0 0;
-  color: var(--text-mute);
-  font-size: 12px;
-}
-
 .cp-ob-avatar-figure .cp-skin-three {
   width: 100%;
   height: 100%;
@@ -685,4 +674,17 @@ button.cp-ob-stepper-item:focus-visible {
   border-radius: 0;
   box-shadow: none;
   overflow: visible;
+}
+
+/* Both steps start at the character's top edge, so the headline does not jump. */
+@media (min-width: 901px) {
+  .cp-ob-column {
+    align-self: stretch;
+    justify-content: center;
+  }
+  .cp-ob-stage {
+    min-height: min(520px, 70vh);
+    justify-content: flex-start;
+    padding-top: 40px;
+  }
 }

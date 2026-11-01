@@ -16,20 +16,12 @@
 .cp-accent-readout-labels {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
+  gap: 16px;
 }
 .cp-accent-readout strong {
   color: var(--text);
   font-variant-numeric: tabular-nums;
   font-weight: 600;
-}
-.cp-accent-sep {
-  display: inline-block;
-  width: 3px;
-  height: 3px;
-  border-radius: 999px;
-  background: var(--text-mute);
-  opacity: 0.6;
 }
 .cp-accent-chip {
   width: 26px;
@@ -40,20 +32,6 @@
   flex-shrink: 0;
 }
 .cp-accent-presets {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding-top: 10px;
-  border-top: 1px dashed var(--line);
-}
-.cp-accent-presets-label {
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0;
-  font-weight: 600;
-  color: var(--text-mute);
-}
-.cp-accent-presets-head {
   display: flex;
   align-items: center;
   justify-content: space-between;

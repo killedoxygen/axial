@@ -116,7 +116,6 @@ export function AccentField({
           <span>
             hue <strong>{hue}°</strong>
           </span>
-          <span class="cp-accent-sep" />
           <span>
             chroma <strong>{vibrancy}%</strong>
           </span>
@@ -124,13 +123,7 @@ export function AccentField({
       </div>
       {showPresets && (
         <div class="cp-accent-presets">
-          <div class="cp-accent-presets-head">
-            <div class="cp-accent-presets-label">Presets</div>
-            <Button variant="secondary" size="sm" icon="refresh" onClick={resetToDefault}>
-              Reset
-            </Button>
-          </div>
-          <div class="cp-swatch-row">
+          <div class="cp-swatch-row" role="group" aria-label="Accent presets">
             {Object.entries(PRESET_HUES).map(([id, h]) => {
               const active = local.theme === id;
               return (
@@ -146,6 +139,9 @@ export function AccentField({
               );
             })}
           </div>
+          <Button variant="secondary" size="sm" icon="refresh" onClick={resetToDefault}>
+            Reset
+          </Button>
         </div>
       )}
     </div>

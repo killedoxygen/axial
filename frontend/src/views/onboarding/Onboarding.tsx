@@ -145,16 +145,17 @@ function Avatar({
   variant,
   name,
   nametag,
+  caption,
 }: {
   src: string;
   capeSrc?: string;
   variant: 'classic' | 'slim';
   name: string;
   nametag: string | null;
+  caption: string;
 }): JSX.Element {
   return (
-    <div class="cp-ob-avatar" aria-hidden="true">
-      <div class="cp-ob-avatar-glow" />
+    <div class="cp-ob-avatar">
       <div class="cp-ob-avatar-figure" key={src}>
         <LazySkinThreePreview
           src={src}
@@ -167,6 +168,14 @@ function Avatar({
           fitPadding={AVATAR_FIT}
           showHint={false}
         />
+      </div>
+      <div class="cp-skinhall__caption cp-ob-avatar-caption">
+        <span class="cp-skinhall__caption-status">{caption}</span>
+        <span class="cp-skinhall__hint" aria-hidden="true">
+          <Icon name="arrow-left" size={10} />
+          <Icon name="arrow-right" size={10} />
+          <span>Drag to rotate</span>
+        </span>
       </div>
     </div>
   );
@@ -382,6 +391,7 @@ export function Onboarding(): JSX.Element | null {
       variant={profileSkin?.variant === 'slim' ? 'slim' : 'classic'}
       name={signedInProfile?.name ?? 'Player'}
       nametag={signedInProfile?.name ?? null}
+      caption="Your Minecraft skin"
     />
   ) : (
     <Avatar
@@ -389,6 +399,7 @@ export function Onboarding(): JSX.Element | null {
       variant={chosenSkin.variant}
       name={chosenSkin.name}
       nametag={username.trim() || null}
+      caption={`${chosenSkin.name}, a default look`}
     />
   );
 
@@ -415,9 +426,7 @@ export function Onboarding(): JSX.Element | null {
     headline = "Who's playing?";
     subline = (
       <p class="cp-ob-subline">
-        {authSignedIn
-          ? 'Your Minecraft profile and skin are ready.'
-          : 'Sign in to bring your Minecraft profile and skin, or pick a name to play offline.'}
+        {authSignedIn ? 'Your Minecraft profile and skin are ready.' : 'Sign in to bring your Minecraft profile and skin.'}
       </p>
     );
     widget = (
@@ -447,9 +456,8 @@ export function Onboarding(): JSX.Element | null {
         )}
         {!authSignedIn && (
           <>
-            <div class="cp-ob-divider">
-              <span>or play offline</span>
-            </div>
+            <div class="cp-ob-offline">
+            <p class="cp-ob-subline">No account? Pick a name to play offline.</p>
             <Input
               value={username}
               onChange={(v) => setUsername(clampPlayerNameInput(v))}
@@ -474,6 +482,7 @@ export function Onboarding(): JSX.Element | null {
                 </span>
               ) : null}
             </div>
+            <span class="cp-ob-looks-label">Your look in Axial</span>
             <div class="cp-ob-looks" role="radiogroup" aria-label="Your look in Axial">
               {DEFAULT_SKINS.map((skin) => (
                 <button
@@ -488,11 +497,11 @@ export function Onboarding(): JSX.Element | null {
                     Sound.ui('soft');
                   }}
                 >
-                  <PlayerHeadPreview textureSrc={skin.src} size={30} radius={7} ariaLabel={skin.name} />
+                  <PlayerHeadPreview textureSrc={skin.src} size={40} radius={8} ariaLabel={skin.name} />
                 </button>
               ))}
             </div>
-            <p class="cp-ob-looks-note">Your look in Axial. Sign in to use your own skin in game.</p>
+            </div>
           </>
         )}
       </div>
