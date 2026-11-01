@@ -140,7 +140,7 @@ export function parseToolchainManifest(source) {
       reference: requireString(
         parsed.linux_ci_image.reference,
         "linux_ci_image.reference",
-        /^ghcr\.io\/mateoltd\/axial-linux-ci@sha256:[0-9a-f]{64}$/,
+        /^ghcr\.io\/killedoxygen\/axial-linux-ci@sha256:[0-9a-f]{64}$/,
       ),
       source_revision: requireString(
         parsed.linux_ci_image.source_revision,
