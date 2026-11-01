@@ -1,7 +1,19 @@
 # Axial
 
-The application is being rebuilt on `feat/clean-rewrite`, preserving its current interface and all non-Guardian features.
+Axial is a Minecraft launcher for vanilla and modded instances. It installs games and loaders (Fabric, Quilt, Forge, NeoForge), manages mods, resource packs, worlds and screenshots, installs modpacks, and launches the game with Microsoft or offline accounts.
 
-Start with the [implementation plan](docs/rewrite/delivery.md). The original runnable project is preserved under [legacy](legacy/README.md); run its development commands from that directory.
+This is a pre-release. It uses its own profile and does not import data from earlier Axial versions.
 
-The replacement is not yet release-ready. Do not point it at an existing user profile or shared writable game library.
+## Development
+
+Requirements: the Rust toolchain from `rust-toolchain.toml`, Node and pnpm (versions in `toolchain.json`), and [Task](https://taskfile.dev).
+
+```sh
+pnpm --dir frontend install
+task dev:desktop   # desktop app with the development interface
+task dev:api       # local API only, with an independent development profile
+task check         # lint, contracts, frontend tests and a workspace check
+task test          # Rust test suite
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the layout and [docs/CONVENTIONS.md](docs/CONVENTIONS.md) before contributing. The previous implementation is kept for reference under `legacy/`.

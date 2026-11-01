@@ -1,9 +1,23 @@
-# Current architecture
+# Architecture
 
-The repository is in an incomplete rewrite, on `feat/clean-rewrite`. The preserved application is under `legacy/`; its architecture is documented in [legacy/docs/ARCHITECTURE.md](../legacy/docs/ARCHITECTURE.md).
+Axial is one desktop process: a Tauri shell hosts the Preact interface, which talks to an in-process HTTP API on loopback.
 
-The replacement currently consists of feature-owned Rust source under `core/app`, retained capability and domain leaf crates under `core/fs`, `core/resource`, `core/minecraft` and `core/performance`, local HTTP transport under `apps/api`, and native shell source under `apps/desktop`. The existing Preact interface is retained under `frontend`.
+| Path | Role |
+|---|---|
+| `apps/desktop` | Tauri shell: windows, native sign-in, updater, Discord presence and process lifetime. |
+| `apps/api` | Authenticated loopback HTTP API; thin adapters over `core/app`. Also runs headless (`task dev:api`). |
+| `core/app` | Application features, one module per feature (`install`, `launch`, `instances`, `content`, `accounts`, `settings`, ...). Owns SQLite state, OS-keyring credentials, operation recovery and the public wire types. |
+| `core/minecraft` | Minecraft and loader domain: version metadata, downloads, Java runtimes, loader installers and processors, managed game-file publication. |
+| `core/fs` | Capability-scoped filesystem: root/lease admission, staged writes, atomic promotion, observation windows and crash-recoverable file effects. |
+| `core/resource` | Process-wide physical work admission (worker and I/O budgets). |
+| `core/performance` | Performance mode catalog, rule resolution and managed mod bundles. |
+| `frontend` | Preact interface. `frontend/src/generated` holds wire types generated from `core/app` (`task contracts:generate`). |
+| `acceptance` | Fixtures and fake providers used by integration tests. |
+| `scripts` | Build, release, dependency-policy and asset-provenance tooling. |
+| `legacy` | The previous implementation, kept for reference only. It is not a build dependency. |
 
-The source is not yet a fully connected application. `core/app/src/lib.rs` shows the currently compiled application modules; unregistered source is not build evidence. Composition and routes are being integrated explicitly, with shared build writers serialized by `scripts/cargo-target.mjs`.
+## Key rules
 
-The target boundaries and rationale are in [the architecture decision](adr/0007-feature-owned-rewrite.md). The [current integration status](rewrite/results/integration.md) distinguishes evidence from remaining work. All non-Guardian behavior and the existing UI remain required.
+- Each behaviour, piece of state and wire contract has one owner module. HTTP routes do not contain product logic.
+- All game-file writes go through `core/fs` capabilities: stage, verify, then promote. Interrupted operations are settled on the next start from their durable records.
+- Wire types are generated from Rust; the frontend never hand-mirrors backend state.
