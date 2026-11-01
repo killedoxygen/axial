@@ -550,6 +550,7 @@ const mockInstancePacks: Record<string, InstanceContentPack[]> = {
   'mock-fabric-lab': [
     {
       canonical_id: 'modrinth:1KVo5zza',
+      provider: 'modrinth',
       project_id: '1KVo5zza',
       title: 'Fabulously Optimized',
       version_id: '1KVo5zza-6.4.0',

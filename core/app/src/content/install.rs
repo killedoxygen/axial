@@ -8,7 +8,7 @@
 use super::{
     catalog::{ContentError, ContentResult, ContentService},
     model::{CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId},
-    packs::{PackFileSelection, PackPlan, ResolvedPack, validate_download_url},
+    packs::{LocalPacks, PackFileSelection, PackPlan, ResolvedPack, validate_download_url},
     provenance::{
         ContentManifest, LiveManagedContent, MANIFEST_FILE, MAX_MANIFEST_BYTES,
         ManagedContentFileName, ManifestEntry, PackInstallation, PackInstalledFile,
@@ -495,8 +495,14 @@ pub struct ContentMutations {
     resuming: Arc<Mutex<HashSet<InstanceId>>>,
     performance: Option<crate::performance::mutation::PerformanceService>,
     progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
+    local_packs: LocalPacks,
     #[cfg(test)]
-    transfer_fixture: Option<(reqwest::Url, axial_minecraft::download::TransferClient)>,
+    /// Serves one recorded download URL from a loopback origin.
+    transfer_fixture: Option<(
+        String,
+        reqwest::Url,
+        axial_minecraft::download::TransferClient,
+    )>,
 }
 
 impl ContentMutations {
@@ -509,6 +515,7 @@ impl ContentMutations {
             resuming: Arc::new(Mutex::new(HashSet::new())),
             performance: None,
             progress: None,
+            local_packs: LocalPacks::default(),
             #[cfg(test)]
             transfer_fixture: None,
         }
@@ -560,6 +567,18 @@ impl ContentMutations {
         canonical_id: &CanonicalId,
         version: super::packs::PackVersion<'_>,
     ) -> Result<super::packs::ResolvedPack, MutationError> {
+        if canonical_id.provider() == Some(ProviderId::Local) {
+            return self
+                .local_packs
+                .get(canonical_id)
+                .filter(|pack| match version {
+                    super::packs::PackVersion::Exact(id) => id == pack.version_id,
+                    super::packs::PackVersion::Newest(_) => true,
+                })
+                .ok_or(MutationError::Pack(
+                    super::packs::PackError::SelectionChanged,
+                ));
+        }
         Ok(super::packs::resolve_pack(
             service,
             &self._client,
@@ -598,6 +617,22 @@ impl ContentMutations {
                     .await
             })
             .map_err(|_| MutationError::Unavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_transfer_fixture(
+        mut self,
+        recorded: &str,
+        url: reqwest::Url,
+        client: axial_minecraft::download::TransferClient,
+    ) -> Self {
+        self.transfer_fixture = Some((recorded.into(), url, client));
+        self
+    }
+
+    /// Hold a file-imported pack until an instance is created from it.
+    pub fn retain_local_pack(&self, pack: ResolvedPack) {
+        self.local_packs.retain(pack);
     }
 
     /// Check a completed creation handoff without downloading the archive
@@ -727,7 +762,7 @@ impl ContentMutations {
         }
         let mut entry = ManifestEntry::provenance(
             canonical_id.clone(),
-            ProviderId::Modrinth,
+            canonical_id.provider().ok_or(MutationError::Changed)?,
             canonical_id.project_id().into(),
             version_id,
             Some(plan.index().name.clone()),
@@ -3115,8 +3150,8 @@ async fn apply_streamed(
                     };
                     let transfer = async {
                         #[cfg(test)]
-                        if let Some((url, client)) = &owner.transfer_fixture {
-                            if raw_url == url.as_str() {
+                        if let Some((recorded, url, client)) = &owner.transfer_fixture {
+                            if &raw_url == recorded {
                                 return Some((client.clone(), url.clone()));
                             }
                         }
@@ -3283,7 +3318,7 @@ fn report_progress(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         instances::{
@@ -3316,7 +3351,7 @@ mod tests {
         metadata_provider(responses).await
     }
 
-    async fn metadata_provider(
+    pub(crate) async fn metadata_provider(
         responses: Vec<String>,
     ) -> (ContentService, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4404,7 +4439,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        owner.transfer_fixture = Some((url.clone(), client));
+        owner.transfer_fixture = Some((url.to_string(), url.clone(), client));
         for (index, bytes) in payloads.iter().enumerate() {
             let version = format!("v{index}");
             let (service, provider) = metadata_provider(vec![
@@ -4955,7 +4990,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_modpack_file_resolves_only_to_its_published_provider_version() {
+    async fn local_modpack_file_keeps_a_published_identity_or_becomes_a_local_pack() {
+        let (_root, owner, _id) = fixture().await;
         let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
         writer
             .start_file(
@@ -4987,9 +5023,10 @@ mod tests {
             serde_json::json!([version]).to_string(),
         ])
         .await;
-        let target = crate::instances::from_pack::modpack_file_target(&service, bytes.clone())
-            .await
-            .unwrap();
+        let target =
+            crate::instances::from_pack::modpack_file_target(&service, &owner, bytes.clone())
+                .await
+                .unwrap();
         provider.await.unwrap();
         assert_eq!(
             serde_json::to_value(&target).unwrap(),
@@ -5003,12 +5040,38 @@ mod tests {
         );
         assert_eq!(target.loader.as_deref(), Some("fabric"));
 
+        // Unpublished bytes are a local pack identified by their SHA-512 and
+        // held for creation; nothing else is requested from the provider.
         let (service, provider) = metadata_provider(vec!["{}".into()]).await;
-        assert!(matches!(
-            crate::instances::from_pack::modpack_file_target(&service, bytes).await,
-            Err(super::super::packs::PackError::Unpublished)
-        ));
+        let target = crate::instances::from_pack::modpack_file_target(&service, &owner, bytes)
+            .await
+            .unwrap();
         provider.await.unwrap();
+        assert_eq!(target.canonical_id.as_str(), format!("local:{hash}"));
+        assert_eq!(target.version_id, hash);
+        assert_eq!(target.name, "Fixture pack");
+        assert_eq!(target.loader.as_deref(), Some("fabric"));
+        let retained = owner
+            .resolve_pack(
+                &service,
+                &target.canonical_id,
+                super::super::packs::PackVersion::Exact(&target.version_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retained.archive.fingerprint(), archive.fingerprint());
+        assert!(matches!(
+            owner
+                .resolve_pack(
+                    &service,
+                    &target.canonical_id,
+                    super::super::packs::PackVersion::Exact("other"),
+                )
+                .await,
+            Err(MutationError::Pack(
+                super::super::packs::PackError::SelectionChanged
+            ))
+        ));
         // A jar is not a pack; it is refused before any provider request.
         let (service, provider) = metadata_provider(Vec::new()).await;
         let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
@@ -5018,6 +5081,7 @@ mod tests {
         assert!(matches!(
             crate::instances::from_pack::modpack_file_target(
                 &service,
+                &owner,
                 writer.finish().unwrap().into_inner()
             )
             .await,
@@ -5715,7 +5779,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            owner.transfer_fixture = Some((url.clone(), client));
+            owner.transfer_fixture = Some((url.to_string(), url.clone(), client));
             let initial = plan(&owner, &instance.id, &url, "v1", ORIGINAL).await;
             let installed = owner
                 .install(initial, false)

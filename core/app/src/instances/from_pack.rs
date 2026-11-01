@@ -2,22 +2,33 @@
 //! provider summary. Queue admission remains with installation coordination.
 
 use super::{
-    create::{CreateInstanceRequest, CreateTarget, SetupIntent},
+    create::{CreateInstanceRequest, CreateTarget, InstanceService, NativeEffect, SetupIntent},
     directory::RegisteredInstance,
     model::{Instance, InstanceError, InstanceResult},
     setup::{CreateInstanceResponse, CreateResultView, SetupService},
 };
 use crate::content::catalog::ContentService;
 use crate::content::install::{ContentMutations, MutationError};
-use crate::content::model::CanonicalId;
+use crate::content::model::{CanonicalId, ProviderId};
 use crate::content::packs::{
-    PackArchive, PackError, PackIndex, PackPlan, PackResult, PackVersion, resolve_pack_version,
+    MAX_PACK_ARCHIVE_BYTES, PackArchive, PackError, PackIndex, PackPlan, PackResult, PackVersion,
+    ResolvedPack, read_local_pack, resolve_pack_version,
 };
+use crate::files::PortableName;
 use crate::install::model::{InstallQueueContentActionRequest, InstallQueueRequest};
 use crate::tasks::CancellationToken;
 use axial_minecraft::loaders::{build_id_for, installed_version_id_for};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256, Sha512};
 use std::sync::Arc;
+
+/// The reserved launcher name of a file-imported pack archive kept in the
+/// instance until its setup settles. Pack destinations can never use it.
+const STORED_ARCHIVE: &str = ".axial-pack-setup.mrpack";
+
+pub(super) fn stored_archive_name() -> PortableName {
+    PortableName::new_exact(STORED_ARCHIVE).expect("fixed portable name")
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ModpackTarget {
@@ -64,42 +75,54 @@ pub fn target_from_pack_index(
     }
 }
 
-/// A local `.mrpack` is accepted as the exact primary file of a published
-/// Modrinth pack version. Creation, setup resume and updates then use that
-/// provider identity through the ordinary modpack path.
+/// A local `.mrpack` whose exact bytes are a published Modrinth version's
+/// primary file keeps that provider identity, so updates and setup resume use
+/// the provider. Any other valid archive becomes a local pack: it is held until
+/// creation stores a copy in the instance. Both then use the ordinary modpack path.
 pub async fn modpack_file_target(
     service: &ContentService,
+    mutations: &ContentMutations,
     bytes: Vec<u8>,
 ) -> PackResult<ModpackTarget> {
-    use sha2::{Digest, Sha512};
-    let hash = format!("{:x}", Sha512::digest(&bytes));
-    let archive = PackArchive::read(bytes)?;
-    let identity = service
+    let bytes: Arc<[u8]> = bytes.into();
+    let hash = format!("{:x}", Sha512::digest(bytes.as_ref()));
+    let archive = PackArchive::read(bytes.clone())?;
+    let published = service
         .identify(std::slice::from_ref(&hash))
         .await
         .map_err(|_| PackError::Provider)?
-        .remove(&hash)
-        .ok_or(PackError::Unpublished)?;
-    let canonical_id = CanonicalId::for_project(identity.provider, &identity.project_id);
-    let (content, version) = resolve_pack_version(
-        service,
-        &canonical_id,
-        PackVersion::Exact(&identity.version_id),
-    )
-    .await?;
-    if version
-        .primary_file()
-        .and_then(|file| file.sha512.as_deref())
-        != Some(hash.as_str())
-    {
-        return Err(PackError::Unpublished);
+        .remove(&hash);
+    if let Some(identity) = published {
+        let canonical_id = CanonicalId::for_project(identity.provider, &identity.project_id);
+        let (content, version) = resolve_pack_version(
+            service,
+            &canonical_id,
+            PackVersion::Exact(&identity.version_id),
+        )
+        .await?;
+        if version
+            .primary_file()
+            .and_then(|file| file.sha512.as_deref())
+            == Some(hash.as_str())
+        {
+            return Ok(target_from_pack_index(
+                content.canonical_id,
+                version.id,
+                content.title,
+                archive.index(),
+            ));
+        }
     }
-    Ok(target_from_pack_index(
-        content.canonical_id,
-        version.id,
-        content.title,
-        archive.index(),
-    ))
+    drop(archive);
+    let pack = read_local_pack(bytes)?;
+    let target = target_from_pack_index(
+        pack.canonical_id.clone(),
+        pack.version_id.clone(),
+        pack.name.clone(),
+        pack.archive.index(),
+    );
+    mutations.retain_local_pack(pack);
+    Ok(target)
 }
 
 /// Private retained creation input. The client selection is only a consistency
@@ -312,6 +335,8 @@ impl SetupService {
             )
             .await
             .map_err(pack_mutation_error)?;
+        let archive = (pack.canonical_id.provider() == Some(ProviderId::Local))
+            .then(|| pack.archive.bytes().clone());
         let prepared = PreparedPackCreation::new(
             pack.canonical_id,
             pack.version_id,
@@ -325,6 +350,7 @@ impl SetupService {
             plan_id: uuid::Uuid::new_v4().to_string(),
             request_json: serde_json::to_string(&stored)
                 .map_err(|_| InstanceError::InvalidInput)?,
+            archive,
         };
         let service = Arc::clone(self);
         let work = self
@@ -345,9 +371,14 @@ impl SetupService {
 }
 
 impl StoredPackSetup {
+    fn local(&self) -> bool {
+        self.canonical_id.provider() == Some(ProviderId::Local)
+    }
+
     pub(super) async fn install(
         &self,
         admitted: &RegisteredInstance,
+        instances: &InstanceService,
         content: &ContentService,
         mutations: &ContentMutations,
         prepared: Option<PreparedPackCreation>,
@@ -375,14 +406,18 @@ impl StoredPackSetup {
             let prepared = match prepared {
                 Some(prepared) => prepared,
                 None => {
-                    let pack = mutations
-                        .resolve_pack(
-                            content,
-                            &self.canonical_id,
-                            PackVersion::Exact(&self.version_id),
-                        )
-                        .await
-                        .map_err(pack_mutation_error)?;
+                    let pack = if self.local() {
+                        read_stored_archive(admitted)?
+                    } else {
+                        mutations
+                            .resolve_pack(
+                                content,
+                                &self.canonical_id,
+                                PackVersion::Exact(&self.version_id),
+                            )
+                            .await
+                            .map_err(pack_mutation_error)?
+                    };
                     PreparedPackCreation::new(
                         pack.canonical_id,
                         pack.version_id,
@@ -405,8 +440,68 @@ impl StoredPackSetup {
                 .await
                 .map_err(pack_mutation_error)?;
         }
+        if self.local() {
+            remove_stored_archive(instances, admitted)?;
+        }
         Ok(())
     }
+}
+
+/// The stored copy must be the exact archive this setup accepted.
+fn read_stored_archive(admitted: &RegisteredInstance) -> InstanceResult<ResolvedPack> {
+    let file = admitted
+        .game_directory()
+        .open_file(&stored_archive_name())
+        .map_err(|_| InstanceError::SetupUnavailable)?;
+    let revision = file
+        .revision()
+        .map_err(|_| InstanceError::DirectoryUnavailable)?;
+    let bytes = file
+        .read_bounded(MAX_PACK_ARCHIVE_BYTES)
+        .map_err(|_| InstanceError::SetupUnavailable)?;
+    file.validate_revision(&revision)
+        .map_err(|_| InstanceError::Conflict)?;
+    read_local_pack(bytes).map_err(pack_error)
+}
+
+/// Settling the setup retires its stored copy. Only the exact bytes observed
+/// here are removed; unresolved effects stay with the instance owner.
+fn remove_stored_archive(
+    instances: &InstanceService,
+    admitted: &RegisteredInstance,
+) -> InstanceResult<()> {
+    let root = admitted.game_directory();
+    let file = match root.open_file(&stored_archive_name()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(InstanceError::DirectoryUnavailable),
+    };
+    let digest = (|| {
+        let revision = file.revision()?;
+        let mut reader = file.reader(MAX_PACK_ARCHIVE_BYTES)?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut reader, &mut digest)?;
+        reader.finish()?;
+        file.validate_revision(&revision)?;
+        std::io::Result::Ok(axial_fs::ExpectedFileContent::new(
+            revision,
+            digest.finalize().into(),
+        ))
+    })()
+    .map_err(|_| InstanceError::DirectoryUnavailable)?;
+    let owner = instances.for_operation(admitted.record().instance.id.clone());
+    let (outcome, pin) = file.park(digest, root).into_parts();
+    let effect = match outcome {
+        axial_fs::FileParkOutcome::Parked(parked) => match parked.remove() {
+            axial_fs::FileRemovalOutcome::Removed => return Ok(()),
+            outcome => NativeEffect::FileRemove(outcome, pin),
+        },
+        axial_fs::FileParkOutcome::NoEffect { .. }
+        | axial_fs::FileParkOutcome::Preserved { .. } => return Err(InstanceError::Conflict),
+        outcome => NativeEffect::FilePark(outcome, pin),
+    };
+    owner.retain(effect);
+    Err(InstanceError::SettlementRequired)
 }
 
 pub(super) fn pack_setup_result(success: bool) -> CreateResultView {
@@ -435,9 +530,10 @@ fn pack_error(error: PackError) -> InstanceError {
     match error {
         PackError::SelectionChanged | PackError::Conflict(_) => InstanceError::Conflict,
         PackError::Cancelled => InstanceError::Cancelled,
-        PackError::Invalid(_) | PackError::Unsupported | PackError::TooLarge => {
-            InstanceError::InvalidInput
-        }
+        PackError::Invalid(_)
+        | PackError::Unsupported
+        | PackError::TooLarge
+        | PackError::DisallowedHost => InstanceError::InvalidInput,
         _ => InstanceError::SetupUnavailable,
     }
 }
@@ -605,6 +701,7 @@ mod tests {
                 SetupIntent {
                     plan_id: "03b50763-6b11-4b43-9a17-4a2bd61a006b".into(),
                     request_json: serde_json::to_string(&stored).unwrap(),
+                    archive: None,
                 },
             )
             .unwrap()
@@ -641,6 +738,223 @@ mod tests {
         assert_eq!(resumed.archive_fingerprint, stored.archive_fingerprint);
         assert_eq!(resumed.install, stored.install);
         assert_eq!(service.registry().list().unwrap().len(), 1);
+    }
+
+    /// A loopback origin standing in for `cdn.modrinth.com`, answering each
+    /// download with the next body.
+    async fn member_origin(
+        bodies: Vec<&'static [u8]>,
+    ) -> (
+        reqwest::Url,
+        axial_minecraft::download::TransferClient,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = reqwest::Url::parse(&format!(
+            "http://{}/member.zip",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let task = tokio::spawn(async move {
+            for body in bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut chunk = [0; 1024];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0 && request.len() + count <= 8192);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+        });
+        let client = axial_minecraft::download::TransferClient::build(
+            axial_minecraft::download::TransferClientConfig::bounded(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+                vec![
+                    axial_minecraft::download::TransferOrigin::from_loopback_http_for_test_support(
+                        &url,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        (url, client, task)
+    }
+
+    #[tokio::test]
+    async fn local_pack_setup_resumes_from_its_stored_copy_and_retires_it() {
+        use sha1::Sha1;
+        const MEMBER: &[u8] = b"member bytes";
+        const CDN: &str = "https://cdn.modrinth.com/data/private/member.zip";
+        let (_root, service) = super::super::create::tests::fixture();
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let index = serde_json::json!({"formatVersion":1,"game":"minecraft","versionId":"2.0",
+            "name":"Private pack","dependencies":{"minecraft":"1.21.4"},"files":[{
+                "path":"resourcepacks/member.zip","downloads":[CDN],"fileSize":MEMBER.len(),
+                "hashes":{"sha1":format!("{:x}", Sha1::digest(MEMBER)),
+                    "sha512":format!("{:x}", Sha512::digest(MEMBER))}}]});
+        for (path, bytes) in [
+            ("modrinth.index.json", serde_json::to_vec(&index).unwrap()),
+            ("overrides/config/fixture.txt", b"defaults".to_vec()),
+        ] {
+            zip.start_file(path, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&bytes).unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        let pack = read_local_pack(bytes.clone()).unwrap();
+        let prepared = PreparedPackCreation::new(
+            pack.canonical_id.clone(),
+            pack.version_id.clone(),
+            pack.archive.clone(),
+            "vanilla|1.21.4",
+        )
+        .unwrap();
+        let stored = StoredPackSetup::new(
+            &prepared,
+            &target(),
+            InstallQueueRequest::Vanilla {
+                version_id: "1.21.4".into(),
+            },
+        )
+        .unwrap();
+        let id = service
+            .create_admitted(
+                CreateInstanceRequest {
+                    name: "Private pack".into(),
+                    selection_id: "vanilla|1.21.4".into(),
+                    ..Default::default()
+                },
+                target(),
+                service.creation_admission_for_tests().await.unwrap(),
+                SetupIntent {
+                    plan_id: uuid::Uuid::new_v4().to_string(),
+                    request_json: serde_json::to_string(&stored).unwrap(),
+                    archive: Some(pack.archive.bytes().clone()),
+                },
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap()
+            .record()
+            .instance
+            .id
+            .clone();
+        let game = super::super::create::tests::payload_path(&service, &id);
+        assert_eq!(std::fs::read(game.join(STORED_ARCHIVE)).unwrap(), bytes);
+        drop((pack, prepared));
+
+        // After a restart nothing is retained in memory: the setup reads the
+        // stored copy. A payload failing its hashes installs nothing.
+        let (url, client, origin) = member_origin(vec![b"member BYTES", MEMBER]).await;
+        let mutations = ContentMutations::new(
+            service.directories().clone(),
+            crate::network::ProviderClient::new(crate::network::ClientConfig::default()).unwrap(),
+            crate::tasks::TaskOwner::new(16).unwrap(),
+        )
+        .with_transfer_fixture(CDN, url, client);
+        let (content, provider) =
+            crate::content::install::tests::metadata_provider(vec!["{}".into(), "{}".into()]).await;
+        let install = || async {
+            let admitted = service
+                .directories()
+                .admit_for_setup_settlement(&id)
+                .unwrap();
+            stored
+                .install(
+                    &admitted,
+                    &service,
+                    &content,
+                    &mutations,
+                    None,
+                    &CancellationToken::new(),
+                )
+                .await
+        };
+        assert!(install().await.is_err());
+        assert!(!game.join("resourcepacks/member.zip").exists());
+        assert!(!game.join("config/fixture.txt").exists());
+        assert!(!crate::content::install::has_pending(service.registry().storage(), &id).unwrap());
+        assert_eq!(std::fs::read(game.join(STORED_ARCHIVE)).unwrap(), bytes);
+
+        install().await.unwrap();
+        origin.await.unwrap();
+        provider.await.unwrap();
+        assert_eq!(
+            std::fs::read(game.join("resourcepacks/member.zip")).unwrap(),
+            MEMBER
+        );
+        assert_eq!(
+            std::fs::read(game.join("config/fixture.txt")).unwrap(),
+            b"defaults"
+        );
+        assert!(!game.join(STORED_ARCHIVE).exists());
+        let manifest = crate::content::provenance::ContentManifest::decode_managed(Some(
+            &std::fs::read(game.join(crate::content::provenance::MANIFEST_FILE)).unwrap(),
+        ))
+        .unwrap();
+        let entry = manifest.find(&stored.canonical_id).unwrap();
+        assert_eq!(entry.provider(), ProviderId::Local);
+        assert_eq!(entry.title(), Some("Private pack"));
+        assert_eq!(entry.version_number(), Some("2.0"));
+        assert_eq!(
+            entry.pack_paths().collect::<Vec<_>>(),
+            vec!["resourcepacks/member.zip", "config/fixture.txt"]
+        );
+        // The settled setup is idempotent without its stored copy.
+        install().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stored_archive_keeps_an_untouched_setup_removable() {
+        let (_root, service) = super::super::create::tests::fixture();
+        let admitted = service
+            .create_admitted(
+                CreateInstanceRequest {
+                    name: "Abandoned pack".into(),
+                    selection_id: "vanilla|1.21.4".into(),
+                    ..Default::default()
+                },
+                target(),
+                service.creation_admission_for_tests().await.unwrap(),
+                SetupIntent {
+                    plan_id: uuid::Uuid::new_v4().to_string(),
+                    request_json: "{}".into(),
+                    archive: Some(Arc::from(b"archive".as_slice())),
+                },
+            )
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap();
+        let id = admitted.record().instance.id.clone();
+        let snapshot = service
+            .delete_pristine_setup_admitted(admitted, uuid::Uuid::new_v4())
+            .unwrap()
+            .join()
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            snapshot.status,
+            super::super::delete::DeletionStatus::Removed
+        );
+        assert!(!super::super::create::tests::payload_path(&service, &id).exists());
     }
 
     #[test]

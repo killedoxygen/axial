@@ -55,14 +55,30 @@ test('pack membership maps recorded instance paths to the pack that placed them'
   const members = packMembership([
     {
       canonical_id: 'modrinth:fo',
+      provider: 'modrinth',
       project_id: 'fo',
       title: 'Fabulously Optimized',
       version_id: 'v',
       paths: ['mods/sodium.jar'],
     },
-    { canonical_id: 'modrinth:x', project_id: 'x', version_id: 'v', paths: ['resourcepacks/pack.zip'] },
+    {
+      canonical_id: 'modrinth:x',
+      provider: 'modrinth',
+      project_id: 'x',
+      version_id: 'v',
+      paths: ['resourcepacks/pack.zip'],
+    },
+    {
+      canonical_id: 'local:ab',
+      provider: 'local',
+      project_id: 'ab',
+      title: 'Private pack',
+      version_id: 'ab',
+      paths: ['mods/private.jar'],
+    },
   ]);
   assert.equal(members.get('mods/sodium.jar'), 'Fabulously Optimized');
   assert.equal(members.get('resourcepacks/pack.zip'), 'modpack');
+  assert.equal(members.get('mods/private.jar'), 'Private pack');
   assert.equal(members.get('mods/other.jar'), undefined);
 });

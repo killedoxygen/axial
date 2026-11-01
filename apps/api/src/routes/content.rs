@@ -71,7 +71,8 @@ pub fn router(state: Arc<ContentRoutes>) -> Router {
 
 const MAX_MODPACK_FILE_BYTES: usize = 128 * 1024 * 1024;
 
-/// Identify a local `.mrpack`; creation then uses the ordinary modpack route.
+/// Read a local `.mrpack` as its published Modrinth version or as a local
+/// pack; creation then uses the ordinary modpack route.
 async fn modpack_file(
     State(state): State<Arc<ContentRoutes>>,
     body: axum::body::Body,
@@ -80,13 +81,17 @@ async fn modpack_file(
     let bytes = axum::body::to_bytes(body, MAX_MODPACK_FILE_BYTES)
         .await
         .map_err(|_| error(413, "This modpack is larger than the 128 MB import limit."))?;
-    axial_app::instances::from_pack::modpack_file_target(&state.service, bytes.to_vec())
-        .await
-        .map(Json)
-        .map_err(|failure| match failure {
-            PackError::Unpublished => error(
+    axial_app::instances::from_pack::modpack_file_target(
+        &state.service,
+        &state.mutations,
+        bytes.to_vec(),
+    )
+    .await
+    .map(Json)
+    .map_err(|failure| match failure {
+            PackError::DisallowedHost => error(
                 422,
-                "This modpack isn't published on Modrinth, so it can't be imported yet.",
+                "This modpack downloads files from a site other than Modrinth, GitHub or GitLab, so it can't be imported.",
             ),
             PackError::Provider | PackError::Download => unavailable(),
             PackError::TooLarge => error(413, "This modpack exceeds the supported size limit."),
@@ -434,8 +439,9 @@ async fn installed(
         .filter(|entry| entry.kind() == ContentKind::Modpack)
         .map(|entry| {
             let mut value = json!({
-                "canonical_id":entry.canonical_id(),"project_id":entry.project_id(),
-                "version_id":entry.version_id(),"paths":entry.pack_paths().collect::<Vec<_>>(),
+                "canonical_id":entry.canonical_id(),"provider":entry.provider(),
+                "project_id":entry.project_id(),"version_id":entry.version_id(),
+                "paths":entry.pack_paths().collect::<Vec<_>>(),
             });
             if let Some(title) = entry.title() {
                 value["title"] = json!(title);

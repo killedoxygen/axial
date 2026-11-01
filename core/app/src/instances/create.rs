@@ -176,6 +176,9 @@ pub struct PendingCreation {
 pub(crate) struct SetupIntent {
     pub plan_id: String,
     pub request_json: String,
+    /// A file-imported pack archive, stored in the instance before it becomes
+    /// visible so an interrupted setup can resume from the same bytes.
+    pub archive: Option<Arc<[u8]>>,
 }
 
 pub(crate) struct DuplicateSource {
@@ -215,6 +218,8 @@ pub(crate) enum NativeEffect {
     StageSeal(crate::files::StageSealFailure),
     StageDiscard(axial_fs::StageDiscardOutcome, GenerationPin),
     FilePublish(axial_fs::FilePromotionOutcome, GenerationPin),
+    FilePark(axial_fs::FileParkOutcome, GenerationPin),
+    FileRemove(axial_fs::FileRemovalOutcome, GenerationPin),
 }
 
 impl InstanceService {
@@ -508,6 +513,51 @@ impl InstanceService {
                         axial_fs::FilePromotionResolution::Indeterminate(obligation) => {
                             Some(FilePublish(
                                 axial_fs::FilePromotionOutcome::AppliedUnverified(obligation),
+                                pin,
+                            ))
+                        }
+                    }
+                }
+            },
+            // Parking is only ever followed by removal of the parked file.
+            FilePark(outcome, pin) => match outcome {
+                axial_fs::FileParkOutcome::Parked(parked) => {
+                    self.settle_effect(FileRemove(parked.remove(), pin))
+                }
+                axial_fs::FileParkOutcome::AppliedUnverified(obligation) => {
+                    match obligation.reconcile() {
+                        axial_fs::FileParkResolution::Parked(parked) => {
+                            self.settle_effect(FileRemove(parked.remove(), pin))
+                        }
+                        axial_fs::FileParkResolution::Indeterminate(obligation) => Some(FilePark(
+                            axial_fs::FileParkOutcome::AppliedUnverified(obligation),
+                            pin,
+                        )),
+                        axial_fs::FileParkResolution::NoEffect(_)
+                        | axial_fs::FileParkResolution::Preserved { .. } => None,
+                    }
+                }
+                axial_fs::FileParkOutcome::NoEffect { .. }
+                | axial_fs::FileParkOutcome::Preserved { .. } => None,
+            },
+            FileRemove(outcome, pin) => match outcome {
+                axial_fs::FileRemovalOutcome::Removed => None,
+                axial_fs::FileRemovalOutcome::NoEffect { parked, .. } => match parked.remove() {
+                    axial_fs::FileRemovalOutcome::Removed => None,
+                    outcome => Some(FileRemove(outcome, pin)),
+                },
+                axial_fs::FileRemovalOutcome::AppliedUnverified(obligation) => {
+                    match obligation.reconcile() {
+                        axial_fs::FileRemovalResolution::Removed => None,
+                        axial_fs::FileRemovalResolution::NoEffect(parked) => {
+                            match parked.remove() {
+                                axial_fs::FileRemovalOutcome::Removed => None,
+                                outcome => Some(FileRemove(outcome, pin)),
+                            }
+                        }
+                        axial_fs::FileRemovalResolution::Indeterminate(obligation) => {
+                            Some(FileRemove(
+                                axial_fs::FileRemovalOutcome::AppliedUnverified(obligation),
                                 pin,
                             ))
                         }
@@ -946,6 +996,7 @@ impl InstanceService {
         let parent = self.ensure_parent(&pin)?;
         let stage_name = PortableName::new_exact(&format!("stage-{}", instance.id))
             .map_err(|_| InstanceError::InvalidId)?;
+        let archive = setup.as_ref().and_then(|setup| setup.archive.clone());
         let record = self.registry().storage().transaction(|tx| -> InstanceResult<_> {
             let record = match &source {
                 Some(DuplicateSource { source, .. }) => self.registry().reserve_duplicate(tx, source.record(), instance.id.clone(), Some(&instance.name), &pin.library_id().to_string())?,
@@ -1018,6 +1069,14 @@ impl InstanceService {
                     self.fresh_directory(
                         &stage,
                         &PortableName::new_exact(name).expect("fixed portable name"),
+                    )?;
+                }
+                if let Some(archive) = &archive {
+                    super::copy::write_file(
+                        self,
+                        &stage,
+                        &super::from_pack::stored_archive_name(),
+                        archive,
                     )?;
                 }
             }
@@ -1901,6 +1960,7 @@ pub(crate) mod tests {
         let setup = SetupIntent {
             plan_id: uuid::Uuid::new_v4().to_string(),
             request_json: "{}".into(),
+            archive: None,
         };
         let admitted = service
             .create_admitted(
@@ -1938,6 +1998,7 @@ pub(crate) mod tests {
                 SetupIntent {
                     plan_id: uuid::Uuid::new_v4().to_string(),
                     request_json: "{}".into(),
+                    archive: None,
                 },
             )
             .unwrap()

@@ -3547,10 +3547,10 @@ fn content_failure(error: &MutationError) -> InstallError {
         MutationError::Content(
             ContentError::Parse(_) | ContentError::ProviderMetadataInvalid(_),
         )
-        | MutationError::Pack(PackError::Invalid(_) | PackError::Unsupported) => {
-            InstallError::ContentInvalid
-        }
-        MutationError::Pack(PackError::NoMatchingVersion | PackError::Unpublished)
+        | MutationError::Pack(
+            PackError::Invalid(_) | PackError::Unsupported | PackError::DisallowedHost,
+        ) => InstallError::ContentInvalid,
+        MutationError::Pack(PackError::NoMatchingVersion)
         | MutationError::Content(ContentError::Unavailable | ContentError::Invalid(_)) => {
             InstallError::ContentUnavailable
         }

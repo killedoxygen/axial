@@ -150,6 +150,38 @@ pub(crate) fn copy_file(
             });
         }
     };
+    publish(service, stage)?;
+    budget.bytes -= bytes;
+    Ok(())
+}
+
+/// Create `name` in a directory still being built, holding exactly `bytes`.
+pub(crate) fn write_file(
+    service: &InstanceService,
+    destination: &ScopedDirectory,
+    name: &PortableName,
+    bytes: &[u8],
+) -> InstanceResult<()> {
+    let mut stage = match destination.stage(name) {
+        StageCreateOutcome::Created(stage) => stage,
+        StageCreateOutcome::NoEffect(_) => return Err(InstanceError::DirectoryUnavailable),
+        unresolved => {
+            service.retain(NativeEffect::StageCreate(unresolved));
+            return Err(InstanceError::SettlementRequired);
+        }
+    };
+    if stage.write_all(bytes).is_err() {
+        let (discard, pin) = stage.discard().into_parts();
+        if !matches!(discard, axial_fs::StageDiscardOutcome::Discarded) {
+            service.retain(NativeEffect::StageDiscard(discard, pin));
+            return Err(InstanceError::SettlementRequired);
+        }
+        return Err(InstanceError::DirectoryUnavailable);
+    }
+    publish(service, stage)
+}
+
+fn publish(service: &InstanceService, stage: crate::files::StagedFile) -> InstanceResult<()> {
     let sealed = match stage.seal() {
         Ok(sealed) => sealed,
         Err(error) => {
@@ -159,10 +191,7 @@ pub(crate) fn copy_file(
     };
     let (outcome, pin) = sealed.publish().into_parts();
     match outcome {
-        axial_fs::FilePromotionOutcome::Applied(_) => {
-            budget.bytes -= bytes;
-            Ok(())
-        }
+        axial_fs::FilePromotionOutcome::Applied(_) => Ok(()),
         unresolved => {
             service.retain(NativeEffect::FilePublish(unresolved, pin));
             Err(InstanceError::SettlementRequired)

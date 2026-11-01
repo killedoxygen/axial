@@ -6,7 +6,7 @@
 use super::catalog::ContentService;
 use super::model::{
     CanonicalContent, CanonicalId, ContentKind, ContentVersion, DependencyKind, FileRef,
-    LoaderGameFilter, VersionIdentity,
+    LoaderGameFilter, ProviderId, VersionIdentity,
 };
 use super::resolve::{
     ContentResolution, ResolutionSelection, ResolutionTarget, pick_filtered_version, pick_version,
@@ -23,10 +23,10 @@ use axial_minecraft::loaders::LoaderComponentId;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use url::{Host, Url};
 
 const INDEX_FILE: &str = "modrinth.index.json";
@@ -37,8 +37,19 @@ pub(crate) const MAX_OVERRIDE_ENTRY_BYTES: u64 = 128 << 20;
 pub(crate) const MAX_OVERRIDE_TOTAL_BYTES: u64 = 512 << 20;
 const MAX_ARCHIVE_ENTRIES: usize = 30_000;
 const MAX_INDEX_FILES: usize = 10_000;
+/// Declared payload bytes across every indexed file of one pack.
+const MAX_INDEX_DOWNLOAD_BYTES: u64 = 4 << 30;
+/// Download hosts the Modrinth pack format permits. A pack imported from a
+/// file has no provider review, so each of its files must use one of them.
+const LOCAL_DOWNLOAD_HOSTS: [&str; 4] = [
+    "cdn.modrinth.com",
+    "github.com",
+    "raw.githubusercontent.com",
+    "gitlab.com",
+];
 const MAX_OVERRIDE_FILES: usize = 10_000;
 const MAX_SELECTION_FILES: usize = 500;
+const MAX_RETAINED_LOCAL_PACKS: usize = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {
@@ -62,8 +73,8 @@ pub enum PackError {
     Download,
     #[error("modpack provider metadata could not be resolved")]
     Provider,
-    #[error("this modpack file is not a published Modrinth modpack version")]
-    Unpublished,
+    #[error("a modpack file downloads from a host that is not allowed")]
+    DisallowedHost,
 }
 
 pub type PackResult<T> = Result<T, PackError>;
@@ -245,6 +256,24 @@ impl PackArchive {
         &self.fingerprint
     }
 
+    pub(crate) fn bytes(&self) -> &Arc<[u8]> {
+        &self.bytes
+    }
+
+    /// An archive without provider review must carry the format's complete
+    /// integrity facts and use only its permitted download hosts.
+    pub fn check_local(&self) -> PackResult<()> {
+        for file in &self.index.files {
+            if file.sha1.is_none() || file.sha512.is_none() || file.size.is_none() {
+                return Err(PackError::Invalid("file is missing its hashes or size"));
+            }
+            if !allowed_local_host(&file.url) {
+                return Err(PackError::DisallowedHost);
+            }
+        }
+        Ok(())
+    }
+
     /// Full imports may include overrides. Selected imports must be created
     /// from a reviewed file preview and cannot include arbitrary config files.
     pub fn plan_all(&self, include_overrides: bool) -> PackResult<PackPlan> {
@@ -305,6 +334,53 @@ pub struct ResolvedPack {
     pub version_id: String,
     pub name: String,
     pub archive: PackArchive,
+}
+
+/// A pack read from a file. Its identity is the archive's SHA-512, so the
+/// same bytes resolve to the same pack again from a stored copy.
+pub fn read_local_pack(bytes: impl Into<Arc<[u8]>>) -> PackResult<ResolvedPack> {
+    let bytes = bytes.into();
+    let hash = format!("{:x}", Sha512::digest(bytes.as_ref()));
+    let archive = PackArchive::read(bytes)?;
+    archive.check_local()?;
+    Ok(ResolvedPack {
+        canonical_id: CanonicalId::for_project(ProviderId::Local, &hash),
+        version_id: hash,
+        name: archive.index().name.clone(),
+        archive,
+    })
+}
+
+/// File-imported packs awaiting instance creation, newest first. Count and
+/// archive bytes are bounded; an evicted pack must be chosen again.
+#[derive(Clone, Default)]
+pub(crate) struct LocalPacks(Arc<Mutex<VecDeque<ResolvedPack>>>);
+
+impl LocalPacks {
+    pub(crate) fn retain(&self, pack: ResolvedPack) {
+        let mut packs = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        packs.retain(|retained| retained.canonical_id != pack.canonical_id);
+        packs.push_front(pack);
+        let mut bytes = 0u64;
+        let keep = packs
+            .iter()
+            .take(MAX_RETAINED_LOCAL_PACKS)
+            .take_while(|pack| {
+                bytes += pack.archive.bytes.len() as u64;
+                bytes <= MAX_PACK_ARCHIVE_BYTES
+            })
+            .count();
+        packs.truncate(keep);
+    }
+
+    pub(crate) fn get(&self, canonical_id: &CanonicalId) -> Option<ResolvedPack> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .find(|pack| &pack.canonical_id == canonical_id)
+            .cloned()
+    }
 }
 
 /// Queue admission resolves only bounded provider metadata. Archive transfer
@@ -822,6 +898,7 @@ pub fn parse_pack_index(raw: &str) -> PackResult<PackIndex> {
     if dto.files.len() > MAX_INDEX_FILES {
         return Err(PackError::TooLarge);
     }
+    let mut declared_bytes = 0u64;
     let mut files = Vec::new();
     for file in dto.files {
         if file.env.as_ref().and_then(|e| e.client.as_deref()) == Some("unsupported") {
@@ -833,18 +910,26 @@ pub fn parse_pack_index(raw: &str) -> PackResult<PackIndex> {
         if sha1.is_none() && sha512.is_none() {
             return Err(PackError::Invalid("file has no integrity hash"));
         }
-        if file
-            .file_size
-            .is_some_and(|size| size > MAX_PACK_FILE_BYTES)
-        {
-            return Err(PackError::TooLarge);
+        if let Some(size) = file.file_size {
+            declared_bytes = declared_bytes.saturating_add(size);
+            if size > MAX_PACK_FILE_BYTES || declared_bytes > MAX_INDEX_DOWNLOAD_BYTES {
+                return Err(PackError::TooLarge);
+            }
         }
-        let url = file
+        // Prefer a mirror on a permitted host, so a file-imported pack can
+        // list other mirrors as long as one of them is allowed.
+        let urls = file
             .downloads
             .iter()
-            .find_map(|url| validate_download_url(url).ok())
+            .filter_map(|url| validate_download_url(url).ok())
+            .map(|url| url.to_string())
+            .collect::<Vec<_>>();
+        let url = urls
+            .iter()
+            .find(|url| allowed_local_host(url))
+            .or(urls.first())
             .ok_or(PackError::Invalid("file has no public HTTPS download"))?
-            .to_string();
+            .clone();
         files.push(PackFile {
             path: file.path,
             url,
@@ -1097,6 +1182,13 @@ fn bounded_text(value: &str, fallback: &str) -> String {
     } else {
         value
     }
+}
+
+fn allowed_local_host(raw: &str) -> bool {
+    Url::parse(raw).is_ok_and(|url| {
+        url.port().is_none()
+            && matches!(url.host(), Some(Host::Domain(domain)) if LOCAL_DOWNLOAD_HOSTS.contains(&domain))
+    })
 }
 
 pub fn validate_download_url(raw: &str) -> PackResult<Url> {
@@ -1460,6 +1552,204 @@ mod tests {
             selected().finish(&resolution),
             Err(PackError::SelectionChanged)
         ));
+    }
+
+    fn local(files: serde_json::Value) -> PackResult<ResolvedPack> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(INDEX_FILE, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let index = serde_json::json!({"formatVersion":1,"game":"minecraft","name":"Private",
+            "versionId":"1.0","dependencies":{"minecraft":"1.21.1","fabric-loader":"0.16.10"},
+            "files":files});
+        writer
+            .write_all(&serde_json::to_vec(&index).unwrap())
+            .unwrap();
+        writer
+            .start_file(
+                "overrides/config/a.txt",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(b"defaults").unwrap();
+        read_local_pack(writer.finish().unwrap().into_inner())
+    }
+
+    fn member(path: &str, downloads: &[&str]) -> serde_json::Value {
+        serde_json::json!({"path":path, "hashes":{"sha1":"a".repeat(40), "sha512":"b".repeat(128)},
+            "env":{"client":"required","server":"optional"}, "downloads":downloads, "fileSize":4})
+    }
+
+    #[test]
+    fn local_pack_identity_is_the_archive_sha512_and_requires_permitted_hosts() {
+        let pack = local(serde_json::json!([
+            member("mods/a.jar", &["https://cdn.modrinth.com/data/a/a.jar"]),
+            member(
+                "mods/b.jar",
+                &[
+                    "https://mirror.example.com/b.jar",
+                    "https://github.com/owner/repo/releases/download/v1/b.jar"
+                ]
+            ),
+            member(
+                "resourcepacks/c.zip",
+                &["https://raw.githubusercontent.com/o/r/main/c.zip"]
+            ),
+            member(
+                "shaderpacks/d.zip",
+                &["https://gitlab.com/o/r/-/raw/main/d.zip"]
+            ),
+        ]))
+        .unwrap();
+        let hash = pack.canonical_id.project_id().to_string();
+        assert_eq!(pack.canonical_id.as_str(), format!("local:{hash}"));
+        assert_eq!(pack.canonical_id.provider(), Some(ProviderId::Local));
+        assert_eq!((hash.len(), &pack.version_id), (128, &hash));
+        assert_eq!(
+            hash,
+            format!("{:x}", Sha512::digest(pack.archive.bytes().as_ref()))
+        );
+        assert_eq!(pack.name, "Private");
+        let index = pack.archive.index();
+        assert_eq!(
+            (index.minecraft.as_str(), index.version.as_str()),
+            ("1.21.1", "1.0")
+        );
+        assert_eq!(
+            index
+                .loader
+                .as_ref()
+                .map(|l| (l.component_id, l.version.as_str())),
+            Some((LoaderComponentId::Fabric, "0.16.10"))
+        );
+        // A permitted mirror wins over an earlier unpermitted one.
+        assert_eq!(
+            index.files[1].url,
+            "https://github.com/owner/repo/releases/download/v1/b.jar"
+        );
+        assert_eq!(pack.archive.plan_all(true).unwrap().destinations().len(), 5);
+
+        for downloads in [
+            &["https://cdn.example.com/a.jar"][..],
+            &["https://cdn.modrinth.com.example.com/a.jar"],
+            &["https://cdn.modrinth.com:8443/a.jar"],
+            &["https://evil.github.com/a.jar"],
+        ] {
+            assert!(
+                matches!(
+                    local(serde_json::json!([member("mods/a.jar", downloads)])),
+                    Err(PackError::DisallowedHost)
+                ),
+                "{downloads:?}"
+            );
+        }
+        assert!(matches!(
+            local(serde_json::json!([member(
+                "mods/a.jar",
+                &["http://cdn.modrinth.com/a.jar"]
+            )])),
+            Err(PackError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn local_pack_index_is_validated_strictly_and_bounded() {
+        let allowed = ["https://cdn.modrinth.com/data/a/a.jar"];
+        for field in ["sha1", "sha512"] {
+            let mut file = member("mods/a.jar", &allowed);
+            file["hashes"].as_object_mut().unwrap().remove(field);
+            assert!(matches!(
+                local(serde_json::json!([file])),
+                Err(PackError::Invalid(_))
+            ));
+        }
+        let mut file = member("mods/a.jar", &allowed);
+        file.as_object_mut().unwrap().remove("fileSize");
+        assert!(matches!(
+            local(serde_json::json!([file])),
+            Err(PackError::Invalid(_))
+        ));
+        let mut file = member("mods/a.jar", &allowed);
+        file["hashes"]["sha512"] = "z".repeat(128).into();
+        assert!(matches!(
+            local(serde_json::json!([file])),
+            Err(PackError::Invalid(_))
+        ));
+        for path in [
+            "/mods/a.jar",
+            "../a.jar",
+            "mods/../../a.jar",
+            "mods\\a.jar",
+            "axial.content.json",
+            ".axial-pack-setup.mrpack",
+            "mods/a.jar.disabled",
+        ] {
+            assert!(
+                local(serde_json::json!([member(path, &allowed)])).is_err(),
+                "{path}"
+            );
+        }
+        // Client-unsupported members are not installed.
+        let mut server = member("mods/server.jar", &["https://cdn.example.com/s.jar"]);
+        server["env"]["client"] = "unsupported".into();
+        assert!(
+            local(serde_json::json!([server]))
+                .unwrap()
+                .archive
+                .index()
+                .files
+                .is_empty()
+        );
+
+        let many = (0..=MAX_INDEX_FILES)
+            .map(|n| member(&format!("config/{n}.txt"), &allowed))
+            .collect::<Vec<_>>();
+        assert!(matches!(local(many.into()), Err(PackError::TooLarge)));
+        let mut huge = member("mods/a.jar", &allowed);
+        huge["fileSize"] = (MAX_PACK_FILE_BYTES + 1).into();
+        assert!(matches!(
+            local(serde_json::json!([huge])),
+            Err(PackError::TooLarge)
+        ));
+        let total = (0..9)
+            .map(|n| {
+                let mut file = member(&format!("mods/{n}.jar"), &allowed);
+                file["fileSize"] = MAX_PACK_FILE_BYTES.into();
+                file
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(local(total.into()), Err(PackError::TooLarge)));
+        for index in [
+            serde_json::json!({"formatVersion":2,"dependencies":{"minecraft":"1.21.1"}}),
+            serde_json::json!({"game":"other","dependencies":{"minecraft":"1.21.1"}}),
+            serde_json::json!({"dependencies":{"minecraft":"1.21.1","unknown-loader":"1"}}),
+        ] {
+            assert!(matches!(archive(index, &[]), Err(PackError::Unsupported)));
+        }
+    }
+
+    #[test]
+    fn retained_local_packs_are_bounded_newest_first() {
+        let packs = LocalPacks::default();
+        let created = (0..3)
+            .map(|n| {
+                local(serde_json::json!([member(
+                    &format!("mods/{n}.jar"),
+                    &["https://cdn.modrinth.com/a.jar"]
+                )]))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for pack in &created {
+            packs.retain(pack.clone());
+        }
+        assert!(packs.get(&created[0].canonical_id).is_none());
+        assert!(packs.get(&created[1].canonical_id).is_some());
+        packs.retain(created[1].clone());
+        packs.retain(created[0].clone());
+        assert!(packs.get(&created[2].canonical_id).is_none());
+        assert!(packs.get(&created[1].canonical_id).is_some());
+        assert!(packs.get(&created[0].canonical_id).is_some());
     }
 
     #[test]

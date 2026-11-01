@@ -17,7 +17,7 @@ export function packLabel(pack: InstanceContentPack): string {
   return pack.version_number ? `${title} ${pack.version_number}` : title;
 }
 
-/** Names the modpack an instance was installed from, with a link to its page. */
+/** Names the modpack an instance was installed from, linking packs that have a Modrinth page. */
 export function PackOrigin({
   packs,
   instanceId,
@@ -34,13 +34,17 @@ export function PackOrigin({
         {packs.map((pack, index) => (
           <Fragment key={pack.canonical_id}>
             {index > 0 && ', '}
-            <button
-              type="button"
-              class="cp-pack-origin-link"
-              onClick={() => navigate({ name: 'content', id: pack.canonical_id, target: instanceId })}
-            >
-              {packLabel(pack)}
-            </button>
+            {pack.provider === 'local' ? (
+              packLabel(pack)
+            ) : (
+              <button
+                type="button"
+                class="cp-pack-origin-link"
+                onClick={() => navigate({ name: 'content', id: pack.canonical_id, target: instanceId })}
+              >
+                {packLabel(pack)}
+              </button>
+            )}
           </Fragment>
         ))}
       </span>

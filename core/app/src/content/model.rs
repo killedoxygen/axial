@@ -51,12 +51,15 @@ impl ContentKind {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
     Modrinth,
+    /// A modpack archive imported from a file; its project ID is the archive's SHA-512.
+    Local,
 }
 
 impl ProviderId {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Modrinth => "modrinth",
+            Self::Local => "local",
         }
     }
 }
@@ -132,6 +135,14 @@ impl CanonicalId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn provider(&self) -> Option<ProviderId> {
+        match self.0.split_once(':')?.0 {
+            "modrinth" => Some(ProviderId::Modrinth),
+            "local" => Some(ProviderId::Local),
+            _ => None,
+        }
     }
 
     /// The provider-local project id (the part after the provider prefix).

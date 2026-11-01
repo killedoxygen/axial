@@ -4509,6 +4509,7 @@ async fn detached_setup_ready_resume(refuse_acknowledgement: bool) {
                 SetupIntent {
                     plan_id: uuid::Uuid::new_v4().to_string(),
                     request_json: request_json.clone(),
+                    archive: None,
                 },
             )
             .unwrap()

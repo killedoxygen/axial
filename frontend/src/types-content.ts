@@ -1,6 +1,7 @@
 export type { RequiredRefusal } from './generated/RequiredRefusal';
 export type ContentKind = 'mod' | 'modpack' | 'resource_pack' | 'shader_pack';
-export type ProviderId = 'modrinth';
+/** `local` identifies a modpack imported from a file that is not on Modrinth. */
+export type ProviderId = 'modrinth' | 'local';
 export type ReleaseChannel = 'release' | 'beta' | 'alpha';
 export type ContentSort = 'relevance' | 'downloads' | 'follows' | 'newest' | 'updated';
 
@@ -205,6 +206,7 @@ export interface InstanceContentEntry {
 /** Modpack provenance. Its paths mark which instance files the pack placed. */
 export interface InstanceContentPack {
   canonical_id: string;
+  provider: ProviderId;
   project_id: string;
   title?: string;
   version_id: string;

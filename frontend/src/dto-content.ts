@@ -268,6 +268,7 @@ export function instanceContentResponse(value: unknown): InstanceContentResponse
       const pack = dtoRecord(value, 'Instance modpack');
       return {
         canonical_id: dtoString(pack.canonical_id, 'Instance modpack id'),
+        provider: dtoEnum(pack.provider, 'Instance modpack provider', ['modrinth', 'local'] as const),
         project_id: dtoString(pack.project_id, 'Instance modpack project'),
         title: dtoOptionalString(pack.title, 'Instance modpack title'),
         version_id: dtoString(pack.version_id, 'Instance modpack version'),

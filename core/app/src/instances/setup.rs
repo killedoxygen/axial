@@ -169,6 +169,7 @@ impl SetupWork {
                 stored
                     .install(
                         &self.admitted,
+                        &self.instances,
                         &content,
                         &mutations,
                         self.prepared_pack.clone(),
@@ -365,6 +366,7 @@ impl SetupService {
             plan_id: request.plan_id,
             request_json: serde_json::to_string(&stored)
                 .map_err(|_| InstanceError::InvalidInput)?,
+            archive: None,
         };
         let service = Arc::clone(self);
         let work = self
@@ -2327,6 +2329,7 @@ pub(crate) mod tests {
                 SetupIntent {
                     plan_id: uuid::Uuid::new_v4().to_string(),
                     request_json: request_json.clone(),
+                    archive: None,
                 },
             )
             .unwrap()

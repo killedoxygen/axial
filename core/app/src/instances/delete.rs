@@ -535,16 +535,24 @@ impl super::create::InstanceService {
 struct PristineSetupProof(Vec<(crate::files::ScopedDirectory, axial_fs::DirectoryRevision)>);
 
 impl PristineSetupProof {
+    /// Creation may also have stored a file-imported pack archive for setup.
     fn capture(root: &crate::files::ScopedDirectory) -> std::io::Result<Self> {
         let root_revision = root.revision()?;
-        let listing = root.entries(INITIAL_DIRECTORIES.len())?;
+        let archive = super::from_pack::stored_archive_name();
+        let listing = root.entries(INITIAL_DIRECTORIES.len() + 1)?;
+        let directories = listing
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind() == axial_fs::EntryKind::Directory)
+            .count();
         if listing.state() != axial_fs::DirectoryListingState::Complete
-            || listing.entries().len() != INITIAL_DIRECTORIES.len()
-            || listing.entries().iter().any(|entry| {
-                entry.kind() != axial_fs::EntryKind::Directory
-                    || !entry
-                        .utf8_name()
-                        .is_some_and(|name| INITIAL_DIRECTORIES.contains(&name))
+            || directories != INITIAL_DIRECTORIES.len()
+            || listing.entries().iter().any(|entry| match entry.kind() {
+                axial_fs::EntryKind::Directory => !entry
+                    .utf8_name()
+                    .is_some_and(|name| INITIAL_DIRECTORIES.contains(&name)),
+                axial_fs::EntryKind::File => entry.utf8_name() != Some(archive.as_str()),
+                _ => true,
             })
         {
             return Err(std::io::Error::other("setup payload differs from creation"));
@@ -1099,6 +1107,7 @@ mod tests {
                 super::super::create::SetupIntent {
                     plan_id: uuid::Uuid::new_v4().to_string(),
                     request_json: "{}".into(),
+                    archive: None,
                 },
             )
             .unwrap()
