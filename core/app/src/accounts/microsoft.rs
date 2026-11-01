@@ -434,9 +434,16 @@ impl fmt::Debug for DeviceProofKey {
 
 impl DeviceProofKey {
     fn new() -> Result<Self, MicrosoftAuthError> {
-        let signing_key = SigningKey::random(&mut OsRng);
+        // Rejection-samples a nonzero scalar below the curve order from OS randomness.
+        let signing_key = loop {
+            let mut secret = zeroize::Zeroizing::new([0_u8; 32]);
+            OsRng.fill_bytes(secret.as_mut());
+            if let Ok(key) = SigningKey::from_slice(secret.as_ref()) {
+                break key;
+            }
+        };
         let public_key = VerifyingKey::from(&signing_key);
-        let encoded_point = public_key.to_encoded_point(false);
+        let encoded_point = public_key.to_sec1_point(false);
         let x = encoded_point
             .x()
             .map(|value| URL_SAFE_NO_PAD.encode(value))
@@ -1070,6 +1077,23 @@ pub fn validate_profile(profile: &MinecraftProfile) -> Result<(), MicrosoftAuthE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_proof_signature_verifies_against_the_published_key() {
+        use p256::ecdsa::signature::Verifier;
+
+        let key = DeviceProofKey::new().unwrap();
+        let mut point = vec![4_u8];
+        point.extend(URL_SAFE_NO_PAD.decode(&key.x).unwrap());
+        point.extend(URL_SAFE_NO_PAD.decode(&key.y).unwrap());
+        let published = VerifyingKey::from_sec1_bytes(&point).unwrap();
+        let signature: Signature = key.signing_key.sign(b"payload");
+        let raw = [signature.r().to_bytes(), signature.s().to_bytes()].concat();
+        assert_eq!(raw.len(), 64);
+        let decoded = Signature::from_slice(&raw).unwrap();
+        assert!(published.verify(b"payload", &decoded).is_ok());
+        assert_ne!(DeviceProofKey::new().unwrap().x, key.x);
+    }
 
     fn assert_safe_request_error(error: MicrosoftAuthError, step: MicrosoftAuthStep) {
         assert_eq!(error.kind(), MicrosoftAuthErrorKind::Request);
