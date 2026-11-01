@@ -145,7 +145,7 @@
       "id": "loader-marks",
       "source": {
         "kind": "upstream",
-        "locator": "https://github.com/mateoltd/axial/tree/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static",
+        "locator": "https://github.com/killedoxygen/axial/tree/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static",
         "revision": "4897a626eb0d01b7c6a2c237e6babcc091538e90"
       },
       "rights": {
@@ -164,7 +164,7 @@
           "mode": "100644",
           "sha256": "724a6ace8aab39ffeca373e847782c5ff56abc0bc898f962519bd9aa0b696f8e",
           "generator": null,
-          "locator": "https://raw.githubusercontent.com/mateoltd/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/fabric_icon.svg",
+          "locator": "https://raw.githubusercontent.com/killedoxygen/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/fabric_icon.svg",
           "upstream_sha256": "724a6ace8aab39ffeca373e847782c5ff56abc0bc898f962519bd9aa0b696f8e"
         },
         {
@@ -172,7 +172,7 @@
           "mode": "100644",
           "sha256": "48b1a0bd969b3f96dc9a154b1041c954aa6b76334873b6d332fffc47b4e7d908",
           "generator": null,
-          "locator": "https://raw.githubusercontent.com/mateoltd/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/forge_icon.svg",
+          "locator": "https://raw.githubusercontent.com/killedoxygen/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/forge_icon.svg",
           "upstream_sha256": "48b1a0bd969b3f96dc9a154b1041c954aa6b76334873b6d332fffc47b4e7d908"
         },
         {
@@ -180,7 +180,7 @@
           "mode": "100644",
           "sha256": "cdccab15e2e71a10ad21d1e4cd766c29fa10dbb48768266e713b0c4b694a5dac",
           "generator": null,
-          "locator": "https://raw.githubusercontent.com/mateoltd/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/neoforge_icon.svg",
+          "locator": "https://raw.githubusercontent.com/killedoxygen/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/neoforge_icon.svg",
           "upstream_sha256": "cdccab15e2e71a10ad21d1e4cd766c29fa10dbb48768266e713b0c4b694a5dac"
         },
         {
@@ -188,7 +188,7 @@
           "mode": "100644",
           "sha256": "bee418e2d25ef96bff9a5fd74851548098744580028042aaaf29baadfbef1fc5",
           "generator": null,
-          "locator": "https://raw.githubusercontent.com/mateoltd/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/quilt_icon.svg",
+          "locator": "https://raw.githubusercontent.com/killedoxygen/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/quilt_icon.svg",
           "upstream_sha256": "bee418e2d25ef96bff9a5fd74851548098744580028042aaaf29baadfbef1fc5"
         },
         {
@@ -196,7 +196,7 @@
           "mode": "100644",
           "sha256": "34abce831779c6bc43e91214e7e57c8ed8c4c3e0e63b58e38d6e7f9132585b28",
           "generator": null,
-          "locator": "https://raw.githubusercontent.com/mateoltd/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/vanilla_icon.svg",
+          "locator": "https://raw.githubusercontent.com/killedoxygen/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/vanilla_icon.svg",
           "upstream_sha256": "34abce831779c6bc43e91214e7e57c8ed8c4c3e0e63b58e38d6e7f9132585b28"
         }
       ]

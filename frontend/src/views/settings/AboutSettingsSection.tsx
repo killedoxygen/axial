@@ -46,7 +46,7 @@ function displayReleaseChannel(version: string): string {
 
 async function openHomepage(): Promise<void> {
   try {
-    await openExternalURL('https://github.com/mateoltd/axial');
+    await openExternalURL('https://github.com/killedoxygen/axial');
     toast('Opened homepage');
   } catch (err: unknown) {
     toast(`Failed to open homepage: ${errMessage(err)}`, 'error');

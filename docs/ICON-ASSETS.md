@@ -46,7 +46,7 @@ explicit visual approval and native macOS packaging verification.
 
 Loader identity retains `vanilla_icon.svg`, `fabric_icon.svg`, `forge_icon.svg`,
 `neoforge_icon.svg` and `quilt_icon.svg` under `frontend/static/`, byte-for-byte
-from [Axial's historical source](https://github.com/mateoltd/axial/tree/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static).
+from [Axial's historical source](https://github.com/killedoxygen/axial/tree/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static).
 Keep their original view boxes, monochrome CSS masks and Forge/Quilt optical
 offsets in creation rows and instance tiles. Preserve these recognizable marks;
 do not replace them with neutral glyphs or new brand geometry. A visual change

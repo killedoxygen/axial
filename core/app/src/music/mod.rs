@@ -22,8 +22,8 @@ use tokio::sync::watch;
 pub const MUSIC_MAX_BYTES: u64 = 32 * 1024 * 1024;
 pub const MUSIC_FILES: [&str; 2] = ["vapor-halo.mp3", "sublunar-hum.mp3"];
 const MUSIC_SOURCES: [&str; 2] = [
-    "https://github.com/mateoltd/axial/releases/download/music-v2/vapor-halo.mp3",
-    "https://github.com/mateoltd/axial/releases/download/music-v2/sublunar-hum.mp3",
+    "https://github.com/killedoxygen/axial/releases/download/music-v2/vapor-halo.mp3",
+    "https://github.com/killedoxygen/axial/releases/download/music-v2/sublunar-hum.mp3",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
